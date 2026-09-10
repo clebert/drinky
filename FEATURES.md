@@ -431,9 +431,10 @@ to OpenRouter through a login or an API key, and to Gemini on the Gemini Enterpr
 
 ## Editing & text
 
-- Enter sends. Shift+Enter or Ctrl+J makes a newline. Esc cancels, Ctrl+C clears, and Ctrl+D quits.
-  The intro line shows these bindings after the accent `Drinky` title and closes with
-  `/help: Commands`. It wraps with no row bound, so a narrow window keeps every hint.
+- Enter sends. Shift+Enter or Ctrl+J makes a newline. Tab opens the prompt history. Esc cancels,
+  Ctrl+C clears, and Ctrl+D quits. The intro line shows these bindings after the accent `Drinky`
+  title and closes with `/help: Commands`. It wraps with no row bound, so a narrow window keeps
+  every hint.
 - A second Ctrl+C within 500 ms quits. Ctrl+D quits at an empty editor or a closed stdin. Ctrl+D
   with a draft warns first and quits on the second press.
 - The caret moves by grapheme cluster, by wrapped row with a sticky column, and to the start or end
@@ -461,6 +462,26 @@ to OpenRouter through a login or an API key, and to Gemini on the Gemini Enterpr
 - The width and grapheme tables come from Unicode 17.0.0. `zig build unicode` regenerates them, and
   the official conformance corpus checks them.
 
+## Prompt history
+
+- Tab at the idle prompt opens `Prompt history`, a picker over the submitted prompts of every
+  project, newest first. The history is on by default. During a turn, Tab explains that the picker
+  cannot open. In every other state Tab does nothing.
+- Enter appends the selected prompt to the draft as editable literal text, after one blank line when
+  the draft is not empty, and it never replaces the draft. Esc, Ctrl+C, or Ctrl+D closes the list
+  and keeps the draft.
+- Only a submitted terminal prompt without a leading slash enters the history, once its turn starts.
+  A failed or canceled turn keeps the entry. A cleared draft, a slash line, a skill line, a steering
+  message, a Telegram message, a retry, and a shorten request stay out.
+- A selection alone changes no order. The complete prompt that the user submits moves to the top,
+  and a repeated prompt keeps one entry.
+- The store keeps 100 exact entries of at most 8 KiB each in the owner-only
+  `~/.drinky/prompt_history.json`, which every project shares. The file can contain sensitive prompt
+  text. Drinky reads it each time Tab opens the picker, so a prompt from another instance shows
+  without a restart. An oversized prompt starts its turn and stays out with a warning.
+- No key deletes one entry. Delete the file to clear every entry. A false `prompt_history.enabled`
+  turns the history off at the next start and keeps the file, and Tab then names the setting.
+
 ## Files & configuration
 
 - The compiled core is minimal, so the user owns the guidance that steers a turn.
@@ -483,10 +504,10 @@ to OpenRouter through a login or an API key, and to Gemini on the Gemini Enterpr
   source loads at most 32 files and 64 KiB, and one file loads once even when two paths reach it.
   Drinky reports what it skips.
 - `~/.drinky/config.json` is optional. It holds the user instruction paths, the request and bash
-  limits, a default effort level, the skills that a path requires, and the interface settings.
-  Drinky reads it only at startup, so a change applies at the next start. It holds no secrets. API
-  keys come from `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, and `XAI_API_KEY`, and the key file
-  credential from `GOOGLE_APPLICATION_CREDENTIALS` and `GOOGLE_CLOUD_LOCATION`.
+  limits, a default effort level, the skills that a path requires, the interface settings, and the
+  prompt history switch. Drinky reads it only at startup, so a change applies at the next start. It
+  holds no secrets. API keys come from `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, and `XAI_API_KEY`, and
+  the key file credential from `GOOGLE_APPLICATION_CREDENTIALS` and `GOOGLE_CLOUD_LOCATION`.
 - Drinky reports an unknown key, an unknown effort level, and an interface value that it cannot use,
   so a typo never looks like an applied setting.
 - A required skill whose name no discovered skill carries guards nothing in that project. It reports

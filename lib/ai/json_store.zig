@@ -1,7 +1,9 @@
 //! A keyed JSON object file: one top-level object that maps each key to that
 //! key's entry. The credential store uses the account as the key. The app state
-//! store uses the project. This module owns the file shape only. The caller owns
-//! its entry fields (passed as `anytype`), so nothing here knows an entry shape.
+//! store uses the project. The prompt history uses the encoded prompt itself as
+//! the key, so the key is the payload and the entry stays empty. This module
+//! owns the file shape only. The caller owns its entry fields (passed as
+//! `anytype`), so nothing here knows an entry shape.
 //!
 //! Every write holds the owner-only `{path}.lock` sibling across its load,
 //! merge, and atomic rename. Lock contention ends with `error.StoreBusy` after
@@ -35,6 +37,12 @@ pub const File = struct {
     /// object.
     pub fn entry(self: *const File, key: []const u8) ?std.json.ObjectMap {
         return json.object(self.parsed.value.object.get(key));
+    }
+
+    /// Every top-level key in file order, which is the write order. The keys
+    /// borrow the file.
+    pub fn keys(self: *const File) []const []const u8 {
+        return self.parsed.value.object.keys();
     }
 };
 
@@ -319,6 +327,28 @@ test "File reads keyed entries" {
         "x",
         keyed.entry("openai-sub-login").?.get("access").?.string,
     );
+}
+
+// A save appends its key last, so the file order is the write order. A caller
+// that reads the order back needs the keys as the file holds them, and a key
+// whose value is no object still counts as a key.
+test "File lists its keys in file order" {
+    const gpa = std.testing.allocator;
+
+    var keyed: File = .{
+        .parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            gpa,
+            "{\"third\":{},\"first\":42,\"second\":{\"a\":1}}",
+            .{},
+        ),
+    };
+    defer keyed.deinit();
+    const keys = keyed.keys();
+    try std.testing.expectEqual(@as(usize, 3), keys.len);
+    try std.testing.expectEqualStrings("third", keys[0]);
+    try std.testing.expectEqualStrings("first", keys[1]);
+    try std.testing.expectEqualStrings("second", keys[2]);
 }
 
 test "serialize adds an entry, preserving other keys" {

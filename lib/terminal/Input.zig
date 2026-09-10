@@ -30,6 +30,9 @@ pub const Key = union(enum) {
     enter,
     /// Shift+Enter (Kitty protocol): a literal newline that does not submit.
     newline,
+    /// The Tab key without a modifier. A legacy terminal reports Ctrl+I as the
+    /// same byte, so that byte reads as Tab too.
+    tab,
     /// The Escape key (Kitty protocol reports it as `CSI 27 u`).
     escape,
     backspace,
@@ -57,6 +60,7 @@ const paste_flush_len = 1 << 20;
 const sequence_flush_len = 64;
 
 const escape_start = 0x1b;
+const tab_key = 9;
 const enter_key = 13;
 const escape_key = 27;
 const shift_bit = 0b001;
@@ -117,8 +121,9 @@ fn decode(data: []const u8) ?Decoded {
     switch (byte) {
         escape_start => return decodeEscape(data),
         '\r' => return .{ .key = .enter, .consumed = 1 },
+        '\t' => return .{ .key = .tab, .consumed = 1 },
         0x08, 0x7f => return .{ .key = .backspace, .consumed = 1 },
-        0x01...0x07, 0x09...0x0c, 0x0e...0x1a => return .{
+        0x01...0x07, 0x0a...0x0c, 0x0e...0x1a => return .{
             .key = .{ .ctrl = byte + 0x60 },
             .consumed = 1,
         },
@@ -225,6 +230,10 @@ fn mapCsiU(parameters: []const u8) Key {
     const ctrl = modifiers & ctrl_bit != 0;
     if (codepoint == enter_key and shift) return .newline;
     if (codepoint == escape_key) return .escape;
+    // Drinky asks for the disambiguate flag alone, so a plain Tab arrives as its
+    // byte. The report stays decoded for a terminal that sends it anyway. A
+    // modified Tab binds nothing, so it never reads as Tab.
+    if (codepoint == tab_key) return if (modifiers == 0) .tab else .unknown;
     if (ctrl) {
         const letter = asciiLetter(codepoint) orelse return .unknown;
         return .{ .ctrl = letter };
@@ -280,6 +289,30 @@ test "kitty csi-u keys" {
     try expectKeys("\x1b[67;5u", &.{.{ .ctrl = 'c' }});
     try expectKeys("\x1b[106;5u", &.{.{ .ctrl = 'j' }});
     try expectKeys("\x1b[13u", &.{.unknown});
+}
+
+// A legacy terminal reports Tab and Ctrl+I as one byte, and Drinky reads that
+// byte as Tab. The Kitty protocol tells the two apart, so its Ctrl+I stays a
+// control key. A modified Tab binds nothing, so every modified report stays
+// unknown and never opens what Tab opens.
+test "tab decodes as its own key, and a modified tab stays unknown" {
+    try expectKeys("\t", &.{.tab});
+    try expectKeys("\x1b[105;5u", &.{.{ .ctrl = 'i' }});
+    try expectKeys("\x1b[9u", &.{.tab});
+    try expectKeys("\x1b[Z", &.{.unknown});
+    try expectKeys("\x1b[9;2u", &.{.unknown});
+    // Every modifier field the protocol defines: shift through the caps and num
+    // lock bits, alone and in every combination.
+    for (2..257) |modifier| {
+        var sequence_buffer: [16]u8 = undefined;
+        const sequence = try std.fmt.bufPrint(&sequence_buffer, "\x1b[9;{d}u", .{modifier});
+        var input = Input.init(std.testing.allocator);
+        defer input.deinit();
+        try input.feed(sequence);
+        const key = input.next() orelse return error.MissingKey;
+        try std.testing.expect(key != .tab);
+        try std.testing.expectEqual(@as(?Key, null), input.next());
+    }
 }
 
 test "malformed or truncated utf-8 decodes as unknown with forward progress" {

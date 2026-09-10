@@ -33,6 +33,8 @@ gauge: ui.status.Gauge = .{},
 /// The configured default reasoning-effort level, or null when the file names
 /// none or names an unknown level. The caller falls back to a compiled default.
 default_effort: ?ai.llm.Effort = null,
+/// Whether Drinky records and opens the global prompt history.
+prompt_history_enabled: bool = true,
 /// The user instruction files that `config.json` names, in the configured order,
 /// with the messages the load produced. Owned.
 user_instructions: ai.instructions.Result,
@@ -83,6 +85,9 @@ const File = struct {
     bash: Bash = .{},
     interface: Interface = .{},
     default_effort: ?JsonString = null,
+    // Last on purpose: the leaf walk keeps the file order, so this row closes
+    // the generated key list.
+    prompt_history: PromptHistory = .{},
 
     /// A JSON value that must be a string. The default parser for `[]const u8`
     /// also accepts an array of numbers, which turns a mistyped path into bytes
@@ -148,6 +153,12 @@ const File = struct {
         window_pages: usize = layout.window_pages_default,
         gauge_percent_warning: f64 = gauge_default.percent_warning,
         gauge_percent_error: f64 = gauge_default.percent_error,
+    };
+
+    /// Whether Drinky records and opens the global prompt history. A false
+    /// value leaves the saved history file unchanged.
+    const PromptHistory = struct {
+        enabled: bool = true,
     };
 };
 
@@ -321,6 +332,11 @@ const keys = [_]Key{
             "that the model does not support onto the nearest one it does. Only a new " ++
             "project reads it.",
     },
+    .{
+        .path = "prompt_history.enabled",
+        .description = "Whether Drinky records and opens the global prompt history. A false " ++
+            "value leaves the saved history unchanged.",
+    },
 };
 
 /// One leaf key of `File`, with its JSON type and its default. A null default
@@ -353,6 +369,7 @@ fn jsonTypeName(comptime T: type) []const u8 {
     };
     const unsupported = "the config field type " ++ @typeName(inner) ++ " has no JSON type";
     return switch (@typeInfo(inner)) {
+        .bool => "boolean",
         .int => "integer",
         .float => "number",
         .pointer => "array",
@@ -367,6 +384,7 @@ fn maybeDefaultText(comptime field: std.builtin.Type.StructField) ?[]const u8 {
     const pointer = field.default_value_ptr orelse return null;
     const value = @as(*const field.type, @ptrCast(@alignCast(pointer))).*;
     return switch (@typeInfo(field.type)) {
+        .bool => if (value) "true" else "false",
         .int, .float => std.fmt.comptimePrint("{d}", .{value}),
         // "unset", never "none": a provider spells a reasoning level `none`, so
         // that word reads as a value rather than as the absence of one.
@@ -710,6 +728,7 @@ fn loadFromData(gpa: std.mem.Allocator, io: std.Io, options: *const DataOptions)
         .window_pages = window_pages,
         .gauge = gauge,
         .default_effort = default_effort,
+        .prompt_history_enabled = parsed.value.prompt_history.enabled,
         .user_instructions = user_instructions,
         .required_skills = required_skills,
         .dropped_effort = dropped_effort,
@@ -1188,6 +1207,43 @@ test "a stale default_models key reads as an unknown key" {
     defer config.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), config.unknown_keys.len);
     try std.testing.expectEqualStrings("default_models", config.unknown_keys[0]);
+}
+
+// The history is on by default. A false value turns the whole feature off for
+// the next start, and the document states the type and the default so the model
+// writes the key with a JSON boolean and never with a string.
+test "load reads prompt_history.enabled and documents it last" {
+    var absent = try loadDataForTest("{}");
+    defer absent.deinit(std.testing.allocator);
+    try std.testing.expect(absent.prompt_history_enabled);
+
+    var enabled = try loadDataForTest(
+        \\{ "prompt_history": { "enabled": true } }
+    );
+    defer enabled.deinit(std.testing.allocator);
+    try std.testing.expect(enabled.prompt_history_enabled);
+
+    var disabled = try loadDataForTest(
+        \\{ "prompt_history": { "enabled": false } }
+    );
+    defer disabled.deinit(std.testing.allocator);
+    try std.testing.expect(!disabled.prompt_history_enabled);
+
+    // The document reports the boolean type and the true default, and the
+    // section sits last in `File`, so its row closes the key list.
+    const row = "- `prompt_history.enabled` — boolean, default: true.";
+    const row_index = std.mem.indexOf(u8, key_lines, row) orelse return error.MissingRow;
+    try std.testing.expect(std.mem.indexOfPos(u8, key_lines, row_index + row.len, "\n- `") == null);
+    try std.testing.expect(isLeafPath("prompt_history.enabled"));
+
+    // A typo inside the section reaches the report like a typo in any section.
+    var typo = try loadDataForTest(
+        \\{ "prompt_history": { "enabld": false } }
+    );
+    defer typo.deinit(std.testing.allocator);
+    try std.testing.expect(typo.prompt_history_enabled);
+    try std.testing.expectEqual(@as(usize, 1), typo.unknown_keys.len);
+    try std.testing.expectEqualStrings("prompt_history.enabld", typo.unknown_keys[0]);
 }
 
 test "load resolves default_effort, dropping an unknown level" {

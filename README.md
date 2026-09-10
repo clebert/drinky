@@ -94,6 +94,16 @@ complete command list.
 - `/status` — state the session.
 - `/system` — show the complete system prompt.
 
+## Prompt history
+
+Tab at the idle prompt opens a picker over the prompts you submitted, in every project, newest
+first. Enter appends the selected prompt to the draft as editable text. The history is on by
+default, and only a submitted terminal prompt without a leading slash enters it.
+
+Drinky keeps the 100 most recent prompts of at most 8 KiB each in the owner-only
+`~/.drinky/prompt_history.json`, so the file can contain sensitive text. Delete the file to clear
+the history, or set `prompt_history.enabled` to `false` in `~/.drinky/config.json` to turn it off.
+
 ## Telegram remote control
 
 Create a bot with BotFather, run `/remote`, and paste the token. Drinky shows a pairing code, and
@@ -119,11 +129,11 @@ Herdr pane label. This needs no setup.
 ## Configuration
 
 The `~/.drinky/config.json` file is optional. It controls instruction files, request and bash
-limits, required skills, a default effort level, and interface settings. Drinky reads the file only
-at startup and never writes it. You can keep it in version control.
+limits, required skills, a default effort level, interface settings, and the prompt history switch.
+Drinky reads the file only at startup and never writes it. You can keep it in version control.
 
-The config file holds no secrets. Credentials, project state, and cached model information live in
-separate files under `~/.drinky/`.
+The config file holds no secrets. Credentials, project state, the prompt history, and cached model
+information live in separate files under `~/.drinky/`.
 
 ## Security
 

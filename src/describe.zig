@@ -129,6 +129,8 @@ fn writeKeys(writer: *std.Io.Writer, options: *const Options) !void {
         \\The prompt takes these keys:
         \\
         \\- Enter sends the line.
+        \\- Tab opens the prompt history picker over the draft. Enter there appends the selected
+        \\  prompt to the draft as editable text, and Esc closes the list and keeps the draft.
         \\- Ctrl+C clears the editor. A second press within {d} milliseconds quits Drinky.
         \\- Ctrl+D quits at an empty editor. Ctrl+D with a draft warns first and quits on the
         \\  second press.
@@ -144,6 +146,8 @@ fn writeKeys(writer: *std.Io.Writer, options: *const Options) !void {
         \\A running turn takes these keys:
         \\
         \\- Enter queues the line as a steering message.
+        \\- Tab opens no prompt history. Drinky shows the notice `Prompt history cannot open while
+        \\  a turn runs.` instead.
         \\- Ctrl+P moves the queued steering messages back into the editor.
         \\- Esc cancels the turn. Esc with a draft warns first and cancels on the second press.
         \\- Ctrl+D cancels the turn at once.
@@ -252,6 +256,20 @@ test "the document states every command, key, and discovery rule" {
     // turn owns steering and its cancel.
     try std.testing.expect(std.mem.indexOf(u8, text[prompt..login], "within 500 milli") != null);
     try std.testing.expect(std.mem.indexOf(u8, text[prompt..login], "Ctrl+N asks") != null);
+    // Tab acts at the prompt alone, and a turn answers it with a notice. The
+    // document states both, so the model never promises the list during a turn.
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        text[prompt..login],
+        "- Tab opens the prompt history picker over the draft.",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        text[turn..],
+        "- Tab opens no prompt history. Drinky shows the notice " ++
+            "`Prompt history cannot open while\n  a turn runs.` instead.",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "`prompt_history.enabled`") != null);
     try std.testing.expect(std.mem.indexOf(u8, text[login..turn], "replays a callback URL") != null);
     try std.testing.expect(std.mem.indexOf(u8, text[login..turn], "cancels the sign-in") != null);
     try std.testing.expect(std.mem.indexOf(u8, text[turn..], "Ctrl+P moves") != null);

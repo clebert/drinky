@@ -21,6 +21,7 @@ const Config = @import("Config.zig");
 const describe = @import("describe.zig");
 const Herdr = @import("Herdr.zig");
 const layout = @import("layout.zig");
+const PromptHistory = @import("PromptHistory.zig");
 const remote = @import("remote/root.zig");
 const Retry = @import("Retry.zig");
 const Session = @import("Session.zig");
@@ -60,6 +61,16 @@ const shorten_request_text =
 /// picker names the account, so the row names the work alone.
 const fetch_wait_text = "Drinky fetches the model list.";
 
+/// The notices of Tab where no prompt-history picker can open.
+const prompt_history_turn_notice = "Prompt history cannot open while a turn runs.";
+const prompt_history_empty_notice = "Prompt history is empty.";
+/// The warning of a submitted prompt that the history cannot take. The turn runs
+/// anyway.
+const prompt_history_oversized_notice = std.fmt.comptimePrint(
+    "Drinky did not add the prompt to history because it exceeds {d} KiB.",
+    .{@divExact(PromptHistory.entry_bytes_max, 1024)},
+);
+
 /// Two models for the tests, which build what they need because Drinky compiles
 /// no model in.
 const test_anthropic_model = ai.testing.model("claude-opus-5");
@@ -71,6 +82,7 @@ const test_openai_model = ai.testing.model("gpt-5.6-sol");
 const intro_keys = [_][]const u8{
     "Enter: Send",
     "Shift+Enter: New line",
+    "Tab: Prompt history",
     "Esc: Cancel",
     "Ctrl+C: Clear",
     "Ctrl+D: Quit",
@@ -114,6 +126,12 @@ accounts: ai.Accounts,
 /// The machine-local choices of this project: read once at startup, written
 /// whenever the account, the model, or the effort level changes.
 state: State,
+/// The global prompt history: read when Tab opens its picker, written when a
+/// terminal prompt starts a turn. It owns its enabled state.
+prompt_history: PromptHistory,
+/// The resolved path of `config.json`. The disabled-history notice names it, so
+/// the user edits the file that Drinky reads. It borrows `run` storage.
+config_path: []const u8,
 /// The working directory the status line shows, with the home directory
 /// abbreviated to `~`. Owned, and fixed for the session, because Drinky never
 /// changes its working directory.
@@ -736,6 +754,14 @@ pub fn run(
         .project = self.project_instructions.projectRoot() orelse cwd,
     });
     defer self.state.deinit();
+    // The history has no project key, so every project shares the one file.
+    self.prompt_history = try PromptHistory.open(gpa, io, &.{
+        .working_directory = cwd,
+        .home = home,
+        .enabled = config.prompt_history_enabled,
+    });
+    defer self.prompt_history.deinit();
+    self.config_path = config.path;
 
     const user_skills = try std.fs.path.resolve(gpa, &.{ cwd, home, ".agents", "skills" });
     defer gpa.free(user_skills);
@@ -945,6 +971,8 @@ fn initFields(self: *App, gpa: std.mem.Allocator, io: std.Io) void {
         // It needs the writer that the caller reads back.
         .session = undefined,
         .state = .inert(gpa, io),
+        .prompt_history = .inert(gpa, io),
+        .config_path = "",
         .directory_label = "",
         .working_directory = "",
         .home_directory = "",
@@ -1612,6 +1640,7 @@ fn handleKey(self: *App, event: *const terminal.Input.Key) !void {
     if (try self.editKey(event)) return;
     switch (event.*) {
         .enter => try self.submit(),
+        .tab => try self.openPromptHistory(),
         // Esc owns the waiting retry, and it keeps the editor text.
         .escape => self.clearRetry(),
         .ctrl => |letter| switch (letter) {
@@ -1733,11 +1762,13 @@ fn submitLoginLine(self: *App) !void {
 /// and Ctrl+P recalls the queue. Esc and Ctrl+D cancel the turn and keep the
 /// draft. Esc warns first over a draft, because a reflex Esc while the user
 /// types can mean a dismiss or a clear. Ctrl+D cancels at once, so the legacy
-/// exit attempt Esc+Ctrl+D still works. Ctrl+C clears a draft first.
+/// exit attempt Esc+Ctrl+D still works. Ctrl+C clears a draft first. A turn
+/// cannot host a picker, so Tab states that and changes nothing.
 fn handleTurnKey(self: *App, event: *const terminal.Input.Key) !void {
     if (try self.editKey(event)) return;
     switch (event.*) {
         .enter => try self.submitSteering(),
+        .tab => try self.reportNotice(.information, prompt_history_turn_notice, .{}),
         .escape => try self.warnOrCancel(),
         .ctrl => |letter| switch (letter) {
             'c' => try self.clearOrCancel(),
@@ -2031,6 +2062,10 @@ fn submit(self: *App) !void {
     // rollback above stays correct.
     var prompt = self.session.editor.detachTrimmed();
     self.session.retainTurnPrompt(&prompt, base);
+    // The turn and its recovery state stand, so the history takes the prompt
+    // last. Only this path records: a Telegram message, a steering line, a
+    // retry, and a skill line each start their turn elsewhere.
+    try self.recordPromptHistory(text);
 }
 
 /// Apply the outcome of a submitted command line.
@@ -3881,10 +3916,114 @@ fn handleFetchKey(self: *App, event: *const terminal.Input.Key) !void {
 fn confirmPicker(self: *App) !void {
     const picking = &self.session.mode.picking;
     const cursor = picking.picker.cursor;
-    var context = self.commandContext();
-    const outcome = try picking.select(&context, cursor);
-    if (!keepsPicker(outcome)) self.session.closePicker();
-    try self.applyOutcome(outcome);
+    switch (picking.purpose) {
+        .command => |*command| {
+            var context = self.commandContext();
+            const outcome = try command.select(&context, cursor);
+            if (!keepsPicker(outcome)) self.session.closePicker();
+            try self.applyOutcome(outcome);
+        },
+        .prompt_history => try self.appendPromptHistory(cursor),
+    }
+}
+
+/// Enter on a prompt-history row: append the exact entry behind the row to the
+/// editor as literal text. The picker owns the labels, and the history holds the
+/// entries the labels were built from, so the row indexes the entry. The source
+/// draft lives until the append consumes it, and one deferred free covers the
+/// consumed and the unconsumed case. A failed reserve keeps the picker open over
+/// the unchanged draft. The store stays untouched: the submitted prompt records
+/// its own use.
+fn appendPromptHistory(self: *App, row: usize) !void {
+    var source = try ui.Editor.Draft.fromText(self.gpa, self.prompt_history.entries.items[row]);
+    defer source.deinit(self.gpa);
+    try self.session.appendPromptHistory(&source);
+}
+
+/// Tab at the idle prompt: read the history file and open the picker over its
+/// prompts, newest first. Each open reads the file again, so a prompt from
+/// another instance shows without a watcher. A disabled history names its key,
+/// an empty one says so, and a file Drinky cannot read names the error. None of
+/// the three opens a list, and the draft stays as it is in every case.
+fn openPromptHistory(self: *App) !void {
+    std.debug.assert(self.session.mode == .prompt);
+    if (!self.prompt_history.enabled) return self.reportNotice(
+        .information,
+        "Prompt history is disabled. Set prompt_history.enabled to true in {s}.",
+        .{self.config_path},
+    );
+    self.prompt_history.load() catch |err| return self.reportNotice(
+        .failure,
+        "Drinky could not read prompt history from {s} because of error {s}.",
+        .{ self.prompt_history.path, @errorName(err) },
+    );
+    const entries = self.prompt_history.entries.items;
+    if (entries.len == 0) return self.reportNotice(.information, prompt_history_empty_notice, .{});
+    // The session takes the labels, and it frees them when the open fails.
+    try self.session.openPromptHistory(try promptLabels(self.gpa, entries));
+}
+
+/// One owned label per prompt, in the order of `prompts`. A failed build frees
+/// every label it built. The caller owns the result.
+fn promptLabels(gpa: std.mem.Allocator, prompts: []const []const u8) ![]const []const u8 {
+    const labels = try gpa.alloc([]const u8, prompts.len);
+    var built: usize = 0;
+    errdefer {
+        for (labels[0..built]) |label| gpa.free(label);
+        gpa.free(labels);
+    }
+    for (prompts) |prompt| {
+        labels[built] = try promptLabel(gpa, prompt);
+        built += 1;
+    }
+    return labels;
+}
+
+/// The one-row label of a saved prompt: the prompt with every line break folded
+/// to one space. CRLF, a lone CR, and LF each fold to one space, so the row
+/// holds the whole prompt in order and no break can open a row of its own. The
+/// caller owns the result.
+fn promptLabel(gpa: std.mem.Allocator, prompt: []const u8) ![]u8 {
+    // Every byte takes one byte of the label, except that a CRLF pair takes one.
+    const label = try gpa.alloc(u8, prompt.len - std.mem.count(u8, prompt, "\r\n"));
+    var written: usize = 0;
+    var index: usize = 0;
+    while (index < prompt.len) : (index += 1) {
+        const byte = prompt[index];
+        if (byte == '\r' and index + 1 < prompt.len and prompt[index + 1] == '\n') index += 1;
+        label[written] = if (byte == '\r' or byte == '\n') ' ' else byte;
+        written += 1;
+    }
+    std.debug.assert(written == label.len);
+    return label;
+}
+
+/// Record a submitted terminal prompt as the most recently used one, after its
+/// turn started. A line that starts with a slash after the outer trim is a
+/// command, a skill line, or a refused line sent as typed, so it stays out. No
+/// result here can touch the turn: an oversized prompt and a failed write each
+/// take the footer alone, and a failure stays out of memory.
+fn recordPromptHistory(self: *App, text: []const u8) !void {
+    std.debug.assert(text.len > 0);
+    if (text[0] == '/') return;
+    self.prompt_history.record(text) catch |err| switch (err) {
+        error.PromptTooLarge => try self.reportNotice(
+            .warning,
+            prompt_history_oversized_notice,
+            .{},
+        ),
+        // Memory ran out before or inside the write, so the file is not the cause.
+        error.OutOfMemory => try self.reportNotice(
+            .failure,
+            "Drinky could not add the prompt to history because of error {s}.",
+            .{@errorName(err)},
+        ),
+        else => try self.reportNotice(
+            .failure,
+            "Drinky could not save prompt history to {s} because of error {s}.",
+            .{ self.prompt_history.path, @errorName(err) },
+        ),
+    };
 }
 
 /// Whether `outcome` continues inside the open picker.
@@ -3943,13 +4082,647 @@ fn expectModel(self: *const App, expected: []const u8) !void {
 // wraps, so its width costs no hint at a narrow window.
 test "the intro line holds every key hint and closes on the command list" {
     try std.testing.expectEqualStrings(
-        "Enter: Send · Shift+Enter: New line · Esc: Cancel · Ctrl+C: Clear · Ctrl+D: Quit · " ++
-            "/help: Commands",
+        "Enter: Send · Shift+Enter: New line · Tab: Prompt history · Esc: Cancel · " ++
+            "Ctrl+C: Clear · Ctrl+D: Quit · /help: Commands",
         intro_text,
     );
-    try std.testing.expectEqual(@as(usize, 98), terminal.width.ofText(intro_text));
+    try std.testing.expectEqual(@as(usize, 120), terminal.width.ofText(intro_text));
     for (intro_keys) |hint|
         try std.testing.expect(std.mem.indexOf(u8, intro_text, hint) != null);
+}
+
+/// Test scaffolding: a signed-in app whose turn worker fails before any provider
+/// request, over the prompt history of a temporary home directory. The caller
+/// frees it with `deinitHistoryTest`.
+fn initHistoryTest(
+    self: *App,
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    out: *std.Io.Writer.Allocating,
+    home: []const u8,
+    enabled: bool,
+) !void {
+    self.initForTest(gpa);
+    self.accounts = ai.testing.accounts(.{ .anthropic = "sk-ant" });
+    self.agent = ai.Agent.init(gpa, io, self.accounts.client(.anthropic_api_key), .{
+        .model = test_anthropic_model,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    // No round runs, so the worker fails before it reaches the network.
+    self.agent.rounds_max = 0;
+    self.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
+    self.session.account_shown = .anthropic_api_key;
+    self.prompt_history = try PromptHistory.open(gpa, io, &.{
+        .working_directory = "/work",
+        .home = home,
+        .enabled = enabled,
+    });
+    self.config_path = "/home/.drinky/config.json";
+}
+
+fn deinitHistoryTest(self: *App) void {
+    self.dropRetry();
+    self.drainQueue();
+    self.input.deinit();
+    self.prompt_history.deinit();
+    self.session.deinit();
+    self.agent.deinit();
+}
+
+/// Test scaffolding: join the fast-failing worker of the turn that runs and
+/// apply its result, so the session returns to the prompt.
+fn finishHistoryTurn(self: *App) !void {
+    const result = self.awaitTurnFuture() orelse return error.TestExpectedTurn;
+    defer self.freeWorkerResult(&result);
+    try self.finishWorkerResult(&result);
+}
+
+/// Test scaffolding: the entries the history holds now, newest first.
+fn expectHistory(self: *App, expected: []const []const u8) !void {
+    try self.prompt_history.load();
+    const entries = self.prompt_history.entries.items;
+    try std.testing.expectEqual(expected.len, entries.len);
+    for (expected, entries) |want, got| try std.testing.expectEqualStrings(want, got);
+}
+
+fn expectNoHistoryFile(self: *const App) !void {
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().statFile(self.io, self.prompt_history.path, .{}),
+    );
+}
+
+// Tab is the one key of the history, and the idle prompt is the one place it
+// acts. The list opens over the draft, newest prompt first, with no row tagged,
+// and Esc leaves it as any first step. A page, a picker, a sign-in, a bot, and
+// the token prompt each own their keys, so Tab does nothing there.
+test "Tab opens the prompt history over the idle prompt alone" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+
+    var app: App = undefined;
+    try app.initHistoryTest(gpa, io, &out, home, true);
+    defer app.deinitHistoryTest();
+    defer app.controller.deinit();
+    try app.prompt_history.record("older");
+    try app.prompt_history.record("newer");
+
+    try app.session.editor.insert("typed");
+    try app.handleKeys("\t");
+    try std.testing.expect(app.session.mode == .picking);
+    const picker = &app.session.mode.picking.picker;
+    try std.testing.expectEqualStrings("Prompt history", picker.title);
+    try std.testing.expectEqual(@as(usize, 2), picker.options.len);
+    try std.testing.expectEqualStrings("newer", picker.options[0]);
+    try std.testing.expectEqualStrings("older", picker.options[1]);
+    try std.testing.expectEqual(@as(usize, 0), picker.cursor);
+    try std.testing.expect(picker.marked == null);
+    try std.testing.expect(app.session.mode.picking.purpose == .prompt_history);
+    try std.testing.expectEqualStrings("typed", app.session.editor.visible());
+    // Tab inside the list is no key of the list.
+    try app.handleKeys("\t");
+    try std.testing.expect(app.session.mode == .picking);
+    try std.testing.expectEqual(@as(usize, 0), app.session.mode.picking.picker.cursor);
+    try app.handleKey(&.escape);
+    try std.testing.expect(app.session.mode == .prompt);
+    try std.testing.expectEqualStrings(
+        "You canceled the prompt history selection.",
+        app.session.notice.?.content,
+    );
+    try std.testing.expectEqualStrings("typed", app.session.editor.visible());
+
+    // A page keeps its keys.
+    try app.session.openPage(&.{ .title = "Test page", .content = "body" });
+    try app.handleKey(&.tab);
+    try std.testing.expect(app.session.mode == .viewing);
+    app.session.closePage();
+
+    // A command picker keeps its keys.
+    try app.runCommand("/help");
+    try app.handleKey(&.tab);
+    try std.testing.expect(app.session.mode == .picking);
+    try std.testing.expectEqualStrings("Command", app.session.mode.picking.picker.title);
+    try app.session.cancelPicker();
+
+    // An attached bot holds the input.
+    app.session.input.owner = .external;
+    try app.handleKey(&.tab);
+    try std.testing.expect(app.session.mode == .prompt);
+    try std.testing.expect(app.session.notice == null);
+    app.session.input.owner = .terminal;
+
+    // A sign-in holds the editor.
+    var signals: LoginTestSignals = .{};
+    try beginLoginForTest(&app, .xai_sub_login, null, &signals);
+    try app.handleKey(&.tab);
+    try std.testing.expect(app.session.mode == .prompt);
+    try std.testing.expect(app.login != null);
+    app.dropLogin();
+    app.syncInputState();
+
+    // The token prompt holds the editor.
+    try app.runCommand("/remote");
+    try app.handleKeys("\r");
+    try std.testing.expectEqual(remote.Controller.State.token_prompt, app.controller.state());
+    try app.handleKey(&.tab);
+    try std.testing.expect(app.session.mode == .prompt);
+    try std.testing.expectEqual(remote.Controller.State.token_prompt, app.controller.state());
+    try std.testing.expect(app.session.notice == null);
+    try app.handleKey(&.escape);
+    try std.testing.expectEqual(remote.Controller.State.idle, app.controller.state());
+}
+
+// A turn owns the editor for steering, and a picker cannot open over it. Tab
+// then states the restriction and changes nothing: not the draft, not the turn,
+// and not the file.
+test "Tab during a turn shows its notice and changes no draft or turn state" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+
+    var app: App = undefined;
+    try app.initHistoryTest(gpa, io, &out, home, true);
+    defer app.deinitHistoryTest();
+    app.session.beginTurn(7);
+    try app.session.editor.insert("draft");
+
+    try app.handleKeys("\t");
+    try std.testing.expect(app.session.mode == .turn);
+    try std.testing.expectEqual(@as(u64, 7), app.session.mode.turn.generation);
+    const notice = app.session.notice.?;
+    try std.testing.expectEqual(ai.command.Outcome.Severity.information, notice.severity);
+    try std.testing.expectEqualStrings(
+        "Prompt history cannot open while a turn runs.",
+        notice.content,
+    );
+    try std.testing.expectEqualStrings("draft", app.session.editor.visible());
+    try app.expectNoHistoryFile();
+}
+
+// A false setting turns the feature off and leaves the file alone. Tab then
+// names the key and the file, so the user can turn it on again.
+test "a disabled history explains the setting on Tab and records nothing" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+    var directory = try tmp.dir.createDirPathOpen(io, ".drinky", .{});
+    directory.close(io);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".drinky/prompt_history.json",
+        .data = "{\"dmFsaWQ\":{}}",
+    });
+
+    var app: App = undefined;
+    try app.initHistoryTest(gpa, io, &out, home, false);
+    defer app.deinitHistoryTest();
+
+    // The intro keeps the hint, because the key still answers: it names the
+    // setting that turns the history on.
+    try std.testing.expect(std.mem.indexOf(u8, intro_text, "Tab: Prompt history") != null);
+    try app.session.editor.insert("typed");
+    try app.handleKeys("\t");
+    try std.testing.expect(app.session.mode == .prompt);
+    const notice = app.session.notice.?;
+    try std.testing.expectEqual(ai.command.Outcome.Severity.information, notice.severity);
+    try std.testing.expectEqualStrings(
+        "Prompt history is disabled. Set prompt_history.enabled to true in " ++
+            "/home/.drinky/config.json.",
+        notice.content,
+    );
+    try std.testing.expectEqualStrings("typed", app.session.editor.visible());
+
+    try app.handleKey(&.enter);
+    try std.testing.expect(app.session.mode == .turn);
+    try std.testing.expect(app.session.notice == null);
+    try app.finishHistoryTurn();
+    const data = try tmp.dir.readFileAlloc(io, ".drinky/prompt_history.json", gpa, .unlimited);
+    defer gpa.free(data);
+    try std.testing.expectEqualStrings("{\"dmFsaWQ\":{}}", data);
+}
+
+// A list with no row is no list, so Tab states the fact instead. A file Drinky
+// cannot read is a failure that names the file and the error, and it opens no
+// list either, so no selection can land on a half-read file.
+test "an empty or unreadable history opens no picker and keeps the draft" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+
+    var app: App = undefined;
+    try app.initHistoryTest(gpa, io, &out, home, true);
+    defer app.deinitHistoryTest();
+
+    try app.session.editor.insert("typed");
+    try app.handleKeys("\t");
+    try std.testing.expect(app.session.mode == .prompt);
+    try std.testing.expectEqual(
+        ai.command.Outcome.Severity.information,
+        app.session.notice.?.severity,
+    );
+    try std.testing.expectEqualStrings("Prompt history is empty.", app.session.notice.?.content);
+    try std.testing.expectEqualStrings("typed", app.session.editor.visible());
+
+    var directory = try tmp.dir.createDirPathOpen(io, ".drinky", .{});
+    directory.close(io);
+    try tmp.dir.writeFile(io, .{ .sub_path = ".drinky/prompt_history.json", .data = "{ not json" });
+    try app.handleKeys("\t");
+    try std.testing.expect(app.session.mode == .prompt);
+    const notice = app.session.notice.?;
+    try std.testing.expectEqual(ai.command.Outcome.Severity.failure, notice.severity);
+    const expected = try std.fmt.allocPrint(
+        gpa,
+        "Drinky could not read prompt history from {s} because of error CorruptStore.",
+        .{app.prompt_history.path},
+    );
+    defer gpa.free(expected);
+    try std.testing.expectEqualStrings(expected, notice.content);
+    try std.testing.expectEqualStrings("typed", app.session.editor.visible());
+}
+
+// Every row holds one line, so a line break inside a prompt folds to a space
+// and a long prompt cuts with the ellipsis of every picker. The entry behind the
+// row keeps its bytes.
+test "a history label folds its line breaks and cuts like every picker row" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+
+    var app: App = undefined;
+    try app.initHistoryTest(gpa, io, &out, home, true);
+    defer app.deinitHistoryTest();
+    try app.prompt_history.record("one\r\ntwo\rthree\nfour");
+    const long = "start " ++ "x" ** 200 ++ " end";
+    try app.prompt_history.record(long);
+
+    try app.handleKeys("\t");
+    const picker = &app.session.mode.picking.picker;
+    try std.testing.expectEqualStrings(long, picker.options[0]);
+    try std.testing.expectEqualStrings("one two three four", picker.options[1]);
+    try std.testing.expectEqualStrings(long, app.prompt_history.entries.items[0]);
+    try std.testing.expectEqualStrings(
+        "one\r\ntwo\rthree\nfour",
+        app.prompt_history.entries.items[1],
+    );
+
+    try app.session.paint(.{ .columns = 40, .rows = 24 });
+    // Two options make two rows, and the long one ends in the ellipsis.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, picker.content.items, "\n"));
+    try std.testing.expect(std.mem.indexOf(u8, picker.content.items, "…") != null);
+    try std.testing.expect(std.mem.indexOf(u8, picker.content.items, "\u{FFFD}") == null);
+    try std.testing.expect(std.mem.indexOf(u8, picker.content.items, "one two three four") != null);
+}
+
+// The labels transfer to the session at the open, and the session frees them
+// when its open fails. A sweep of every allocation of the open proves that no
+// failure frees a label twice or leaks one, and that no failure opens a list.
+test "a failed prompt history open frees its labels once" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const gpa = failing.allocator();
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(std.testing.allocator, io, &tmp, "");
+    defer std.testing.allocator.free(home);
+
+    var app: App = undefined;
+    try app.initHistoryTest(gpa, io, &out, home, true);
+    defer app.deinitHistoryTest();
+    try app.prompt_history.record("one\r\ntwo");
+    try app.prompt_history.record("three");
+
+    var step: usize = 0;
+    while (true) : (step += 1) {
+        failing.fail_index = failing.alloc_index + step;
+        const result = app.openPromptHistory();
+        failing.fail_index = std.math.maxInt(usize);
+        if (result) |_| {
+            if (app.session.mode == .picking) break;
+        } else |err| try std.testing.expectEqual(error.OutOfMemory, err);
+        try std.testing.expect(app.session.mode == .prompt);
+        // The open makes a handful of allocations, so a sweep past this count
+        // found a step that never fails.
+        if (step == 64) return error.TestSweepTooLong;
+    }
+    try std.testing.expectEqualStrings("three", app.session.mode.picking.picker.options[0]);
+    try std.testing.expectEqualStrings("one two", app.session.mode.picking.picker.options[1]);
+}
+
+// Enter appends the exact entry to the draft and writes nothing: a selection is
+// no use. The complete prompt that the user then submits records its own use, so
+// a combined draft enters the history as one prompt and the selected source
+// keeps its place.
+test "a selection appends without a write, and the submitted draft records itself" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+
+    var app: App = undefined;
+    try app.initHistoryTest(gpa, io, &out, home, true);
+    defer app.deinitHistoryTest();
+    try app.prompt_history.record("alpha\nbeta");
+    try app.prompt_history.record("gamma");
+    const before = try tmp.dir.readFileAlloc(io, ".drinky/prompt_history.json", gpa, .unlimited);
+    defer gpa.free(before);
+
+    // Down to the older row, then Enter. The bytes after Enter in the same chunk
+    // still reach the editor, because Enter ends no layer.
+    try app.session.editor.insert("typed");
+    app.session.dirty = false;
+    try app.handleKeys("\t\x1b[B\r!");
+    try std.testing.expect(app.session.mode == .prompt);
+    try std.testing.expect(app.session.dirty);
+    try std.testing.expectEqualStrings("typed\n\nalpha\nbeta!", app.session.editor.visible());
+    try std.testing.expectEqual(@as(usize, 0), app.session.editor.draft.atoms.items.len);
+    const after = try tmp.dir.readFileAlloc(io, ".drinky/prompt_history.json", gpa, .unlimited);
+    defer gpa.free(after);
+    try std.testing.expectEqualStrings(before, after);
+    try app.expectHistory(&.{ "gamma", "alpha\nbeta" });
+
+    // The submitted draft is the one new prompt, and the source stays in place.
+    try app.submit();
+    try std.testing.expect(app.session.mode == .turn);
+    try app.expectHistory(&.{ "typed\n\nalpha\nbeta!", "gamma", "alpha\nbeta" });
+    try app.finishHistoryTurn();
+
+    // A selection into an empty draft that the user sends unchanged moves that
+    // entry to the top.
+    app.session.editor.clear();
+    try app.handleKeys("\t\x1b[B\x1b[B\r");
+    try std.testing.expectEqualStrings("alpha\nbeta", app.session.editor.visible());
+    try app.submit();
+    try app.expectHistory(&.{ "alpha\nbeta", "typed\n\nalpha\nbeta!", "gamma" });
+    try app.finishHistoryTurn();
+}
+
+// Esc, Ctrl+C, and Ctrl+D each close the list alone. The draft under it stays,
+// because a cancel decides against the list and not against the text.
+test "every cancel key of the history picker keeps the draft" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+
+    var app: App = undefined;
+    try app.initHistoryTest(gpa, io, &out, home, true);
+    defer app.deinitHistoryTest();
+    try app.prompt_history.record("saved");
+    try app.session.editor.insert("typed");
+
+    for ([_]terminal.Input.Key{ .escape, .{ .ctrl = 'c' }, .{ .ctrl = 'd' } }) |key| {
+        try app.handleKeys("\t");
+        try std.testing.expect(app.session.mode == .picking);
+        try app.handleKey(&key);
+        try std.testing.expect(app.session.mode == .prompt);
+        try std.testing.expect(app.running);
+        try std.testing.expectEqualStrings(
+            "You canceled the prompt history selection.",
+            app.session.notice.?.content,
+        );
+        try std.testing.expectEqualStrings("typed", app.session.editor.visible());
+    }
+    try app.expectHistory(&.{"saved"});
+}
+
+// The record follows a successful start and nothing else. A start that fails
+// records nothing, and a turn that fails after its start keeps its entry, because
+// the prompt was used whatever the model did with it.
+test "a plain prompt enters the history at its successful start alone" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+
+    var app: App = undefined;
+    try app.initHistoryTest(gpa, io, &out, home, true);
+    defer app.deinitHistoryTest();
+
+    try app.session.editor.insert("  hello\nworld  ");
+    app.turn_generation = std.math.maxInt(u64);
+    try std.testing.expectError(error.GenerationExhausted, app.submit());
+    try std.testing.expect(app.session.mode == .prompt);
+    try app.expectNoHistoryFile();
+
+    app.turn_generation = 0;
+    try app.submit();
+    try std.testing.expect(app.session.mode == .turn);
+    try std.testing.expect(app.session.notice == null);
+    try app.expectHistory(&.{"hello\nworld"});
+    try app.finishHistoryTurn();
+    try std.testing.expect(app.session.mode == .prompt);
+    try std.testing.expectEqualStrings("hello\nworld", app.session.editor.visible());
+    try app.expectHistory(&.{"hello\nworld"});
+}
+
+// A line that starts with a slash is a command line, a skill line, or a refused
+// line that the user sends as typed. None of them is a reusable prompt, so none
+// enters the history, and the outer trim decides what starts with a slash.
+test "every outer-trimmed slash line stays out of the history" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+    var skill = try tmp.dir.createDirPathOpen(io, "skills/demo", .{});
+    skill.close(io);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "skills/demo/SKILL.md",
+        .data = "---\nname: demo\ndescription: a test skill\n---\nbody\n",
+    });
+    const user_skills = try tmpPath(gpa, io, &tmp, "skills");
+    defer gpa.free(user_skills);
+
+    var app: App = undefined;
+    try app.initHistoryTest(gpa, io, &out, home, true);
+    defer app.deinitHistoryTest();
+    app.skills = try ai.skills.discover(gpa, io, &.{
+        .user_root = user_skills,
+        .project_start = home,
+        .project_root = null,
+    });
+    defer app.skills.deinit();
+
+    // A command that runs.
+    try app.session.editor.insert("/status");
+    try app.submit();
+    try std.testing.expect(app.session.mode == .prompt);
+    try app.expectNoHistoryFile();
+
+    // A skill line that starts a turn.
+    try app.session.editor.insert("  /skill:demo apply it");
+    try app.submit();
+    try std.testing.expect(app.session.mode == .turn);
+    try app.expectNoHistoryFile();
+    try app.finishHistoryTurn();
+    app.session.editor.clear();
+
+    // A refused line that the second Enter sends to the model as typed.
+    try app.session.editor.insert(" /nope tell me about this");
+    try app.handleKey(&.enter);
+    try std.testing.expect(app.session.confirmations.contains(.message));
+    try app.handleKey(&.enter);
+    try std.testing.expect(app.session.mode == .turn);
+    try app.expectNoHistoryFile();
+    try app.finishHistoryTurn();
+}
+
+// Only `submit` records, so the paths that a Telegram message, a steering line,
+// a retry, and a shorten request share with the terminal never write. Ctrl+C
+// clears a draft and records nothing, and its double press still quits.
+test "no path but a submitted terminal prompt records history" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+
+    var app: App = undefined;
+    try app.initHistoryTest(gpa, io, &out, home, true);
+    defer app.deinitHistoryTest();
+
+    // The shared start of a terminal prompt and a Telegram message.
+    try app.session.editor.insert("direct");
+    {
+        const base = try app.startUserTurn("direct");
+        var prompt = app.session.editor.detachTrimmed();
+        app.session.retainTurnPrompt(&prompt, base);
+    }
+    try app.expectNoHistoryFile();
+    // A steering line during that turn.
+    try app.session.editor.insert("steer this");
+    try app.handleKey(&.enter);
+    try std.testing.expect(app.session.hasSteering());
+    try app.expectNoHistoryFile();
+    try app.finishHistoryTurn();
+    app.session.editor.clear();
+
+    // A retry attempt and a shorten request.
+    app.setRetry(.{ .failure = try gpa.dupe(u8, "The provider is overloaded.") });
+    try app.sendRetryTurn();
+    try app.expectNoHistoryFile();
+    try app.finishHistoryTurn();
+    app.session.editor.clear();
+    try app.sendShortenTurn();
+    try app.expectNoHistoryFile();
+    try app.finishHistoryTurn();
+    app.session.editor.clear();
+
+    // Ctrl+C clears and records nothing. The second press quits.
+    try app.session.editor.insert("cleared");
+    try app.handleKey(&.{ .ctrl = 'c' });
+    try std.testing.expectEqualStrings("", app.session.editor.visible());
+    try std.testing.expect(app.running);
+    try app.expectNoHistoryFile();
+    try app.handleKey(&.{ .ctrl = 'c' });
+    try std.testing.expect(!app.running);
+}
+
+// The history is a convenience beside the turn. A prompt the file cannot take
+// starts its turn as every prompt does, and the footer states why the history
+// skipped it. A file that refuses the write does the same, with its path and the
+// error, and the turn keeps running.
+test "a history failure warns and never touches the started turn" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+
+    var app: App = undefined;
+    try app.initHistoryTest(gpa, io, &out, home, true);
+    defer app.deinitHistoryTest();
+
+    const oversized = try gpa.alloc(u8, PromptHistory.entry_bytes_max + 1);
+    defer gpa.free(oversized);
+    @memset(oversized, 'x');
+    try app.session.editor.insert(oversized);
+    try app.submit();
+    try std.testing.expect(app.session.mode == .turn);
+    try std.testing.expect(app.turn_future != null);
+    const warning = app.session.notice.?;
+    try std.testing.expectEqual(ai.command.Outcome.Severity.warning, warning.severity);
+    try std.testing.expectEqualStrings(
+        "Drinky did not add the prompt to history because it exceeds 8 KiB.",
+        warning.content,
+    );
+    try std.testing.expectEqualStrings(oversized, app.session.transcript.blocks()[0].content.user.items);
+    try app.expectNoHistoryFile();
+    try app.finishHistoryTurn();
+    app.session.editor.clear();
+
+    var directory = try tmp.dir.createDirPathOpen(io, ".drinky", .{});
+    directory.close(io);
+    try tmp.dir.writeFile(io, .{ .sub_path = ".drinky/prompt_history.json", .data = "{ not json" });
+    try app.session.editor.insert("hello");
+    try app.submit();
+    try std.testing.expect(app.session.mode == .turn);
+    try std.testing.expect(app.turn_future != null);
+    const failure = app.session.notice.?;
+    try std.testing.expectEqual(ai.command.Outcome.Severity.failure, failure.severity);
+    const expected = try std.fmt.allocPrint(
+        gpa,
+        "Drinky could not save prompt history to {s} because of error CorruptStore.",
+        .{app.prompt_history.path},
+    );
+    defer gpa.free(expected);
+    try std.testing.expectEqualStrings(expected, failure.content);
+    const blocks = app.session.transcript.blocks();
+    try std.testing.expectEqualStrings("hello", blocks[blocks.len - 1].content.user.items);
+    try app.finishHistoryTurn();
+    const data = try tmp.dir.readFileAlloc(io, ".drinky/prompt_history.json", gpa, .unlimited);
+    defer gpa.free(data);
+    try std.testing.expectEqualStrings("{ not json", data);
 }
 
 const LoginTestSignals = struct {

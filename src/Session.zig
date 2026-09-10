@@ -30,6 +30,10 @@ const retry_title = "Failed turn";
 const retry_controls = "Ctrl+N: Try again · Esc: Dismiss";
 /// The control that returns pending steering to the editor.
 const steering_controls = "Ctrl+P: Edit all";
+/// The title and the cancellation of the picker that Tab opens over the saved
+/// prompts.
+const prompt_history_title = "Prompt history";
+const prompt_history_cancellation = "You canceled the prompt history selection.";
 /// The row bound of a caption above the editor: the title row and the control
 /// rows that fit. The bound keeps the chrome from crowding the input out of a
 /// narrow window. A control segment past the bound drops whole. `App` builds
@@ -379,14 +383,10 @@ const ActiveTool = struct {
 
 const Picking = struct {
     picker: ui.Picker,
-    /// The command handler a confirmed row goes to.
-    selector: *const fn (
-        *ai.command.Context,
-        ai.command.Outcome.Pick.Selection,
-    ) anyerror!ai.command.Outcome,
-    /// The value the command set on this picker. It reaches the selector beside
-    /// the tapped row and names the earlier choice this picker belongs to.
-    payload: usize,
+    /// What a confirmed row does. A command picker carries the handler of its
+    /// command, and the prompt-history picker carries nothing, because the app
+    /// appends the selected entry itself.
+    purpose: Purpose,
     /// The borrowed sentence that identifies the canceled selection.
     cancellation_message: []const u8,
     /// The handler that builds this picker again, or null where the picker
@@ -399,20 +399,39 @@ const Picking = struct {
     /// work in progress. The result of the fetch rebuilds the list.
     wait_tick: ?u64,
 
+    /// Who acts on a confirmed row. The shape cannot hold a history purpose
+    /// beside command data, so no history row can reach a command handler.
+    const Purpose = union(enum) {
+        command: Command,
+        /// The app appends the selected exact prompt to the editor.
+        prompt_history,
+
+        /// The handler of a command picker and the value the command set on it.
+        const Command = struct {
+            selector: *const fn (
+                *ai.command.Context,
+                ai.command.Outcome.Pick.Selection,
+            ) anyerror!ai.command.Outcome,
+            /// It reaches the selector beside the tapped row and names the
+            /// earlier choice this picker belongs to.
+            payload: usize,
+
+            pub fn select(
+                self: *const Command,
+                context: *ai.command.Context,
+                row: usize,
+            ) anyerror!ai.command.Outcome {
+                return self.selector(context, .{ .payload = self.payload, .row = row });
+            }
+        };
+    };
+
     /// The motion of the separators, or null while the list holds its rows. A
     /// fetch reports no progress, so the segment keeps its length, and the list
     /// paints no caret, so it carries no blink clock.
     fn activity(self: *const Picking) ?ui.paint.Activity {
         const tick = self.wait_tick orelse return null;
         return .{ .motion_tick = tick, .progress_age_ticks = 0 };
-    }
-
-    pub fn select(
-        self: *const Picking,
-        context: *ai.command.Context,
-        row: usize,
-    ) anyerror!ai.command.Outcome {
-        return self.selector(context, .{ .payload = self.payload, .row = row });
     }
 };
 
@@ -1302,15 +1321,14 @@ fn enterPicker(
     self.deinitMode();
     self.mode = .{ .picking = .{
         .picker = picker,
-        .selector = pick.select,
-        .payload = pick.payload,
+        .purpose = .{ .command = .{ .selector = pick.select, .payload = pick.payload } },
         .cancellation_message = pick.cancellation_message,
         .reopen = pick.reopen,
         .trail = trail,
         .wait_tick = null,
     } };
-    // The one place that enters picker mode marks the frame. `applyOutcome`
-    // marks its own outcomes, but a step back reaches this function alone.
+    // Every entry into picker mode marks the frame itself. `applyOutcome` marks
+    // its own outcomes, but a step back reaches this function alone.
     self.dirty = true;
 }
 
@@ -1324,6 +1342,43 @@ pub fn closePicker(self: *Session) void {
         },
         else => {},
     }
+}
+
+/// Enter picker mode over the saved prompts, newest first, and keep the editor
+/// draft under the list. Takes ownership of `labels`. The list is the one step
+/// of its command, so Esc cancels it. The caller appends the selected exact
+/// entry through `appendPromptHistory`.
+pub fn openPromptHistory(self: *Session, labels: []const []const u8) !void {
+    std.debug.assert(self.mode == .prompt);
+    errdefer {
+        for (labels) |label| self.gpa.free(label);
+        self.gpa.free(labels);
+    }
+    // No row holds a value in use, so the list opens on its first row untagged.
+    const picker = try ui.Picker.init(self.gpa, prompt_history_title, labels, .{});
+    self.mode = .{ .picking = .{
+        .picker = picker,
+        .purpose = .prompt_history,
+        .cancellation_message = prompt_history_cancellation,
+        .reopen = null,
+        .trail = .{},
+        .wait_tick = null,
+    } };
+    self.dirty = true;
+}
+
+/// Append the selected prompt to the editor draft, close the picker, and record
+/// the edit. The append puts one blank line before it in a non-empty draft and
+/// leaves the caret at the end, so the next frame scrolls the tail into view.
+/// The reserve is the one step that can fail: the picker then stays open over
+/// the unchanged draft, and the caller still owns `source`. A consumed `source`
+/// is empty.
+pub fn appendPromptHistory(self: *Session, source: *ui.Editor.Draft) !void {
+    std.debug.assert(self.mode == .picking and self.mode.picking.purpose == .prompt_history);
+    try self.editor.reserveDrafts(&.{source.*});
+    self.editor.appendDraft(source);
+    self.closePicker();
+    self.markEdited();
 }
 
 /// Open a picker with no row that states `text` in place of its rows, as the
@@ -3680,6 +3735,151 @@ test "a picked line replaces the draft in the editor" {
 
     try session.paint(.{ .columns = 80, .rows = 24 });
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "/skill:demo") != null);
+}
+
+/// Test helper: the owned labels of a prompt-history picker.
+fn labelsForTest(gpa: std.mem.Allocator, labels: []const []const u8) ![]const []const u8 {
+    const options = try gpa.alloc([]const u8, labels.len);
+    for (labels, 0..) |label, index| options[index] = try gpa.dupe(u8, label);
+    return options;
+}
+
+// A history picker belongs to no command, so its purpose carries no selector and
+// no payload. A command picker keeps both. The list opens on its first row with
+// no current value, because no row is in use, and it keeps the draft under it.
+test "the prompt history picker opens over the draft with a purpose of its own" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
+    defer session.deinit();
+
+    const step = struct {
+        fn open(_: *ai.command.Context) anyerror!ai.command.Outcome {
+            unreachable;
+        }
+    }.open;
+    try session.applyOutcome(.{ .pick = try pickForTest(gpa, "Command", step) });
+    try std.testing.expect(session.mode.picking.purpose == .command);
+    try std.testing.expectEqual(@as(usize, 0), session.mode.picking.purpose.command.payload);
+    session.closePicker();
+
+    try session.editor.insert("draft");
+    try session.openPromptHistory(try labelsForTest(gpa, &.{ "newest", "older", "oldest" }));
+    const picking = &session.mode.picking;
+    try std.testing.expect(picking.purpose == .prompt_history);
+    try std.testing.expectEqualStrings("Prompt history", picking.picker.title);
+    try std.testing.expectEqualStrings("newest", picking.picker.options[0]);
+    try std.testing.expectEqual(@as(usize, 0), picking.picker.cursor);
+    try std.testing.expect(picking.picker.marked == null);
+    try std.testing.expect(!picking.picker.can_step_back);
+    try std.testing.expect(picking.reopen == null);
+    try std.testing.expectEqual(@as(usize, 0), picking.trail.len);
+    try std.testing.expect(session.stepAbove() == null);
+    try std.testing.expectEqualStrings("draft", session.editor.visible());
+
+    try session.paint(.{ .columns = 80, .rows = 24 });
+    try expectPainted(gpa, out.written(), "Prompt history");
+    try expectPainted(gpa, out.written(), " > newest");
+    try expectPainted(gpa, out.written(), "Esc: Cancel");
+
+    // Esc cancels the one step, and the draft survives it.
+    try session.cancelPicker();
+    try std.testing.expect(session.mode == .prompt);
+    try std.testing.expectEqualStrings(
+        "You canceled the prompt history selection.",
+        session.notice.?.content,
+    );
+    try std.testing.expectEqualStrings("draft", session.editor.visible());
+}
+
+// A selected prompt joins the draft after one blank line, as a recalled steering
+// message does. The text is literal and editable, so a multiline prompt of the
+// maximum size lands with no atom, and the caret ends after it.
+test "a selected prompt appends to the draft as literal text and marks the edit" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
+    defer session.deinit();
+
+    // A prompt of the entry limit: many lines, so the appended tail sits far
+    // below the first row of the editor.
+    const entry = try gpa.alloc(u8, 8 * 1024);
+    defer gpa.free(entry);
+    @memset(entry, 'x');
+    for (0..entry.len / 64) |row| entry[row * 64] = '\n';
+    @memcpy(entry[0..5], "first");
+    @memcpy(entry[entry.len - 4 ..], "last");
+
+    try session.editor.insert("typed");
+    try session.openPromptHistory(try labelsForTest(gpa, &.{"first x…"}));
+    session.dirty = false;
+    var source = try ui.Editor.Draft.fromText(gpa, entry);
+    defer source.deinit(gpa);
+    try session.appendPromptHistory(&source);
+
+    try std.testing.expect(session.mode == .prompt);
+    try std.testing.expect(session.dirty);
+    // The source moved in whole, and a consumed source is empty.
+    try std.testing.expectEqual(@as(usize, 0), source.visible.items.len);
+    const expected = try std.mem.concat(gpa, u8, &.{ "typed\n\n", entry });
+    defer gpa.free(expected);
+    try std.testing.expectEqualStrings(expected, session.editor.visible());
+    try std.testing.expectEqual(@as(usize, 0), session.editor.draft.atoms.items.len);
+    try std.testing.expectEqual(expected.len, session.editor.caret);
+    const expanded = try session.editor.expanded(.none);
+    defer gpa.free(expanded);
+    try std.testing.expectEqualStrings(expected, expanded);
+
+    // The next frame scrolls the appended tail into view, and the text stays
+    // editable: a typed byte lands after it.
+    try session.paint(.{ .columns = 80, .rows = 24 });
+    try expectPainted(gpa, out.written(), "last");
+    try std.testing.expect(session.editor.scroll > 0);
+    try session.editor.insertCodepoint('!');
+    try std.testing.expect(std.mem.endsWith(u8, session.editor.visible(), "last!"));
+}
+
+// A selection into an empty draft adds no separator, so the prompt lands as the
+// user first typed it.
+test "a selected prompt into an empty draft takes no separator" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
+    defer session.deinit();
+
+    try session.openPromptHistory(try labelsForTest(gpa, &.{"one two"}));
+    var source = try ui.Editor.Draft.fromText(gpa, "one\r\ntwo");
+    defer source.deinit(gpa);
+    try session.appendPromptHistory(&source);
+    try std.testing.expectEqualStrings("one\r\ntwo", session.editor.visible());
+}
+
+// The reserve is the one fallible step of the append. A failed reserve leaves
+// the picker open over the unchanged draft, and the caller still owns the source.
+test "a failed reserve keeps the prompt history picker open and the draft unchanged" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const gpa = failing.allocator();
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
+    defer session.deinit();
+
+    try session.editor.insert("typed");
+    try session.openPromptHistory(try labelsForTest(gpa, &.{"row"}));
+    var source = try ui.Editor.Draft.fromText(std.testing.allocator, "x" ** 4096);
+    defer source.deinit(std.testing.allocator);
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    try std.testing.expectError(error.OutOfMemory, session.appendPromptHistory(&source));
+    failing.fail_index = std.math.maxInt(usize);
+    failing.resize_fail_index = std.math.maxInt(usize);
+
+    try std.testing.expect(session.mode == .picking);
+    try std.testing.expectEqualStrings("typed", session.editor.visible());
+    try std.testing.expectEqual(@as(usize, 4096), source.visible.items.len);
 }
 
 test "opening a picker over a turn releases its retained prompt" {
