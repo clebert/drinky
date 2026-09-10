@@ -325,8 +325,10 @@ service account key file.
   working directory, with `~` for the home directory, or whole when it sits under neither.
 - While the model streams the arguments, the call reports `Received:` with the bytes so far and
   `Status: Streaming`. A call that waits for another call reports `Status: Queued`.
-- A running command or search adds a row with its elapsed time and its timeout. Every other tool
-  runs under no timeout, so its box keeps one row.
+- A running command or search adds a row with its elapsed time and its timeout. Both count in whole
+  seconds, because a change above the viewport reprints the window. Such a row therefore reprints
+  the window at most once a second. Every other tool runs under no timeout, so its box keeps one
+  row.
 - A finished call keeps its call row and one line below it: a line of measures, or the sentence of a
   failure. A call with nothing to state, like `describe_drinky`, keeps the call row alone.
 - `read` reports `Lines: 42`, or `Lines: 594–648 of 2868` when a window cut the file. `write`
@@ -338,7 +340,7 @@ service account key file.
   takes no `Error:` prefix, because the line names its own state. The box still paints the failure,
   and the model still reads the result as one.
 - Every duration in the interface takes one shape: whole milliseconds below a second, then seconds
-  with one decimal, then whole minutes and seconds.
+  with one decimal, then whole minutes and seconds. The row of a running call is the one exception.
 
 ### Editor and status line
 

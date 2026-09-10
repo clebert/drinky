@@ -30,13 +30,6 @@ extension seams.
 
 ## Improvements
 
-- **A live tool timer in whole seconds** — the live row of a running tool states its time and its
-  timeout in whole seconds, so a row above the viewport resets the window at most once per second.
-  _The viewport is the visible screen, and the window is the retained eight pages. The View resets
-  the window for a changed row inside the window but above the viewport, and the live row ticks
-  every frame under one second and every 100 ms after. The reset epoch of the layout covers a
-  rewrite above the window alone. Both spans of the live row take the unit, as in
-  `Time: 3s · Timeout: 30s`, and the finished box keeps the exact span._
 - **Bill a long prompt at the long-context rate** — the session cost applies the long-context rates
   of a model to a request whose prompt reaches the threshold of that model. _The rates come from
   `pricing.overrides` of the public metadata entry. Take the override that names

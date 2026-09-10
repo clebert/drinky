@@ -125,10 +125,10 @@ test lines {
 /// prints every digit of its minute count. A negative span reads as zero, so a
 /// clock that steps backward cannot print a span that runs the wrong way.
 ///
-/// Every span in the interface takes this one shape, so no two spans read in
-/// two vocabularies. Each tier measures in a unit that its spans fill: a search
-/// that ends in 42 milliseconds states that span, rather than the `0.0s` that
-/// tenths alone can offer it.
+/// Every finished span in the interface takes this one shape, so no two spans
+/// read in two vocabularies. Each tier measures in a unit that its spans fill: a
+/// search that ends in 42 milliseconds states that span, rather than the `0.0s`
+/// that tenths alone can offer it.
 pub fn duration(buffer: []u8, milliseconds: i64) []const u8 {
     const total: u64 = @intCast(@max(milliseconds, 0));
     if (total < std.time.ms_per_s)
@@ -140,7 +140,32 @@ pub fn duration(buffer: []u8, milliseconds: i64) []const u8 {
             @mod(tenths, 10),
         }) catch unreachable;
     }
-    const seconds = @divFloor(total, std.time.ms_per_s);
+    return durationSeconds(buffer, milliseconds, .down);
+}
+
+/// How a whole-second span reads a fraction of a second.
+pub const Rounding = enum {
+    /// Down, so the whole seconds never pass the span.
+    down,
+    /// Up, so the span never passes the whole seconds.
+    up,
+};
+
+/// The `milliseconds` span in whole seconds: whole seconds below a minute, else
+/// whole minutes and seconds. It counts in whole seconds where `duration`
+/// counts in milliseconds and tenths, and it keeps the coarse tier of
+/// `duration`, so the two read in one vocabulary.
+///
+/// A row that a running clock rewrites takes this shape. Such a row changes at
+/// most once per second, and a repaint of it can cost a whole frame.
+pub fn durationSeconds(buffer: []u8, milliseconds: i64, rounding: Rounding) []const u8 {
+    const total: u64 = @intCast(@max(milliseconds, 0));
+    const seconds = switch (rounding) {
+        .down => @divFloor(total, std.time.ms_per_s),
+        .up => std.math.divCeil(u64, total, std.time.ms_per_s) catch unreachable,
+    };
+    if (seconds < std.time.s_per_min)
+        return std.fmt.bufPrint(buffer, "{d}s", .{seconds}) catch unreachable;
     return std.fmt.bufPrint(buffer, "{d}m {d}s", .{
         @divFloor(seconds, std.time.s_per_min),
         @mod(seconds, std.time.s_per_min),
@@ -162,6 +187,34 @@ test duration {
     try std.testing.expectEqualStrings("2m 5s", duration(&buffer, 125_400));
     // A backward clock step reads as no time at all, never as a negative span.
     try std.testing.expectEqualStrings("0ms", duration(&buffer, -1));
+}
+
+test durationSeconds {
+    var buffer: [24]u8 = undefined;
+    try std.testing.expectEqualStrings("0s", durationSeconds(&buffer, 0, .down));
+    // Every span below a second reads as no whole second, so a row holds one
+    // text for that whole second.
+    try std.testing.expectEqualStrings("0s", durationSeconds(&buffer, 999, .down));
+    try std.testing.expectEqualStrings("1s", durationSeconds(&buffer, 1_000, .down));
+    try std.testing.expectEqualStrings("30s", durationSeconds(&buffer, 30_400, .down));
+    try std.testing.expectEqualStrings("59s", durationSeconds(&buffer, 59_999, .down));
+    // The coarse tier keeps the shape of `duration`, so the two agree there.
+    try std.testing.expectEqualStrings("1m 0s", durationSeconds(&buffer, 60_000, .down));
+    try std.testing.expectEqualStrings("2m 5s", durationSeconds(&buffer, 125_400, .down));
+    try std.testing.expectEqualStrings("60m 0s", durationSeconds(&buffer, 3_600_000, .down));
+    try std.testing.expectEqualStrings("0s", durationSeconds(&buffer, -1, .down));
+
+    // A limit keeps the fraction it holds, so it rounds the other way. A whole
+    // second reads the same under both roundings.
+    try std.testing.expectEqualStrings("0s", durationSeconds(&buffer, 0, .up));
+    try std.testing.expectEqualStrings("1s", durationSeconds(&buffer, 1, .up));
+    try std.testing.expectEqualStrings("2s", durationSeconds(&buffer, 1_500, .up));
+    try std.testing.expectEqualStrings("30s", durationSeconds(&buffer, 30_000, .up));
+    // The ceiling carries the span into the coarse tier, so this span reads as
+    // `1m 0s` and never as `60s`.
+    try std.testing.expectEqualStrings("1m 0s", durationSeconds(&buffer, 59_001, .up));
+    try std.testing.expectEqualStrings("1m 31s", durationSeconds(&buffer, 90_500, .up));
+    try std.testing.expectEqualStrings("0s", durationSeconds(&buffer, -1, .up));
 }
 
 test bytes {

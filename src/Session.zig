@@ -350,20 +350,27 @@ const ActiveTool = struct {
     }
 
     /// The text of this call's box at `now_ms`. A call under a timeout rebuilds
-    /// its two rows, because the time it has run changes between frames.
+    /// its two rows, because the time it has run can change between frames.
+    ///
+    /// Both spans count in whole seconds. A row above the viewport cannot
+    /// repaint in place, so each change of it costs a whole frame, and a finer
+    /// count spends one on every frame. The run time rounds down and the limit
+    /// rounds up, so the printed time stays at or below the real time, and the
+    /// printed limit at or above the real limit. The row therefore never counts
+    /// past its own limit while the call runs.
     fn text(self: *ActiveTool, gpa: std.mem.Allocator, now_ms: i64) ![]const u8 {
         const timeout_ms = self.timeout_ms orelse return self.box;
         var elapsed_buffer: [24]u8 = undefined;
         var limit_buffer: [24]u8 = undefined;
         // Every timeout arrives clamped, so it always fits a signed span and the
         // row always names a real wait.
-        const limit = ai.format.duration(&limit_buffer, @intCast(timeout_ms));
+        const limit = ai.format.durationSeconds(&limit_buffer, @intCast(timeout_ms), .up);
         self.rows.clearRetainingCapacity();
         // `Time` names the same measure the finished box reports, so a call does
         // not rename its own run time when it ends.
         try self.rows.print(gpa, "{s}\nTime: {s} · Timeout: {s}", .{
             self.box,
-            ai.format.duration(&elapsed_buffer, now_ms - self.started_ms),
+            ai.format.durationSeconds(&elapsed_buffer, now_ms - self.started_ms, .down),
             limit,
         });
         return self.rows.items;
@@ -4343,7 +4350,7 @@ test "a running command reports its run time against its timeout" {
     const painted = out.written();
     try expectPainted(gpa, painted, "Tool: bash · Command: zig build test");
     try std.testing.expect(
-        std.mem.indexOf(u8, painted, "Time: 12.4s · Timeout: 2m 0s") != null,
+        std.mem.indexOf(u8, painted, "Time: 12s · Timeout: 2m 0s") != null,
     );
 }
 
@@ -4371,7 +4378,7 @@ test "a running search reports its run time against its timeout" {
     const painted = out.written();
     try expectPainted(gpa, painted, "Tool: grep · Pattern: columns");
     try std.testing.expect(
-        std.mem.indexOf(u8, painted, "Time: 4.5s · Timeout: 10.0s") != null,
+        std.mem.indexOf(u8, painted, "Time: 4s · Timeout: 10s") != null,
     );
 }
 
@@ -4391,7 +4398,27 @@ test "a command that names its own timeout reports it" {
         .input_json = try gpa.dupe(u8, "{\"command\":\"sleep 5\",\"timeout_seconds\":5}"),
     } });
     try session.paint(.{ .columns = 60, .rows = 24 });
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "Timeout: 5.0s") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "Timeout: 5s") != null);
+}
+
+// The configured timeout counts milliseconds, so it can name a fraction of a
+// second. The row rounds that limit up, because a row that states less than the
+// command really gets promises the wrong wait.
+test "a fractional configured timeout rounds up to the whole second" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
+    defer session.deinit();
+    session.bash_timeout_ms = 1_500;
+    session.beginTurn(1);
+
+    try applyEvent(&session, 1, .{ .tool_start = .{
+        .name = try gpa.dupe(u8, "bash"),
+        .input_json = try gpa.dupe(u8, "{\"command\":\"sleep 2\"}"),
+    } });
+    try session.paint(.{ .columns = 60, .rows = 24 });
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "Timeout: 2s") != null);
 }
 
 // Every other tool ends on its own, so its box stays one row and reports no
@@ -4477,7 +4504,58 @@ test "a command that asks for no limit reports the smallest one" {
     session.clock_ms = 500;
     try session.paint(.{ .columns = 60, .rows = 24 });
     try std.testing.expect(
-        std.mem.indexOf(u8, out.written(), "Time: 500ms · Timeout: 1.0s") != null,
+        std.mem.indexOf(u8, out.written(), "Time: 0s · Timeout: 1s") != null,
+    );
+}
+
+// A live row above the viewport cannot repaint in place, so every change of it
+// costs a screen reset. The row counts in whole seconds, so the frames inside
+// one second of its run write the same text and the screen holds. Each row
+// counts from its own start, so a second costs at most one reset per row, and
+// the rows that share a start turn over in one frame.
+test "a live tool row above the viewport holds its text for a whole second" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
+    defer session.deinit();
+    session.bash_timeout_ms = 120_000;
+    session.beginTurn(1);
+
+    // Eight running calls fill more rows than the viewport holds, so the oldest
+    // rows sit above it while the window still keeps them. They start together,
+    // so one second of the clock changes every one of them.
+    session.clock_ms = 0;
+    for (0..8) |index| {
+        var buffer: [40]u8 = undefined;
+        const input_json = std.fmt.bufPrint(
+            &buffer,
+            "{{\"command\":\"sleep {d}\"}}",
+            .{index},
+        ) catch unreachable;
+        try applyEvent(&session, 1, .{ .tool_start = .{
+            .name = try gpa.dupe(u8, "bash"),
+            .input_json = try gpa.dupe(u8, input_json),
+        } });
+    }
+
+    const size: terminal.View.Size = .{ .columns = 40, .rows = 8 };
+    session.clock_ms = 1_000;
+    try session.paint(size);
+
+    var painted = out.written().len;
+    session.clock_ms = 1_900;
+    try session.paint(size);
+    try std.testing.expect(
+        std.mem.indexOf(u8, out.written()[painted..], terminal.escape.screen_reset) == null,
+    );
+
+    // The row still reports the time, so the next second reaches the screen.
+    painted = out.written().len;
+    session.clock_ms = 2_000;
+    try session.paint(size);
+    try std.testing.expect(
+        std.mem.indexOf(u8, out.written()[painted..], terminal.escape.screen_reset) != null,
     );
 }
 
