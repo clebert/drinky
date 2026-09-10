@@ -1,6 +1,6 @@
 //! The credential lifecycle for the ChatGPT-subscription (Codex) account: the
 //! shared `auth` lifecycle instantiated over `oauth`'s protocol for the
-//! `"openai-sub-login"` entry in `<home>/.drinky/auth.json`.
+//! `"openai-plan"` entry in `<home>/.drinky/auth.json`.
 
 const std = @import("std");
 
@@ -15,7 +15,7 @@ const oauth = @import("oauth.zig");
 const Auth = @This();
 
 /// The top-level key this account's credentials live under in `auth.json`.
-const account_key = llm.Account.openai_sub_login.id();
+const account_key = llm.Account.openai_plan.id();
 
 gpa: std.mem.Allocator,
 io: std.Io,
@@ -36,7 +36,7 @@ pub fn deinit(self: *Auth) void {
 }
 
 /// Load stored tokens. Returns false when the file is absent or holds no
-/// `openai-sub-login` entry (this account is simply not logged in).
+/// `openai-plan` entry (this account is simply not logged in).
 pub fn load(self: *Auth) !bool {
     return auth.load(self, account_key);
 }
@@ -107,7 +107,7 @@ test "load distinguishes signed out from corrupt credentials" {
     // both simply signed out. An own entry that lacks a field is corrupt, not
     // ignored.
     try std.testing.expect(!try subject.load());
-    try json_store.save(gpa, io, subject.path, "anthropic-sub-login", .{ .access = "a" }, .{});
+    try json_store.save(gpa, io, subject.path, "anthropic-plan", .{ .access = "a" }, .{});
     try std.testing.expect(!try subject.load());
     try json_store.save(
         gpa,

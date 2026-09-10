@@ -375,19 +375,19 @@ test "a stored entry reads back the account, the effort level, and one model per
     try writeForTest(io, &tmp,
         \\{ "/elsewhere": { "account": "openai-api-key", "effort": "low",
         \\    "models": { "openai-api-key": "gpt-5.6-luna" } },
-        \\  "/work": { "account": "anthropic-sub-login", "effort": "max",
-        \\    "models": { "anthropic-sub-login": "claude-opus-5",
+        \\  "/work": { "account": "anthropic-plan", "effort": "max",
+        \\    "models": { "anthropic-plan": "claude-opus-5",
         \\      "openai-api-key": "gpt-5.6-luna" } } }
     );
 
     var state = try openForTest(gpa, io, home);
     defer state.deinit();
-    try std.testing.expectEqual(ai.llm.Account.anthropic_sub_login, state.start.account.?);
+    try std.testing.expectEqual(ai.llm.Account.anthropic_plan, state.start.account.?);
     try std.testing.expectEqual(ai.llm.Effort.max, state.start.effort.?);
     // Every account the entry names keeps its own model, not only the active one.
     try std.testing.expectEqualStrings(
         "claude-opus-5",
-        state.models.get(.anthropic_sub_login).?.name(),
+        state.models.get(.anthropic_plan).?.name(),
     );
     try std.testing.expectEqualStrings("gpt-5.6-luna", state.models.get(.openai_api_key).?.name());
     // An account the entry does not name remembers no model.

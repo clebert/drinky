@@ -1,5 +1,5 @@
 //! The credential lifecycle for subscription OAuth: the shared `auth` lifecycle
-//! instantiated over `oauth`'s protocol for the `"anthropic-sub-login"`
+//! instantiated over `oauth`'s protocol for the `"anthropic-plan"`
 //! entry in `<home>/.drinky/auth.json`.
 
 const std = @import("std");
@@ -15,7 +15,7 @@ const oauth = @import("oauth.zig");
 const Auth = @This();
 
 /// The top-level key this account's credentials live under in `auth.json`.
-const account_key = llm.Account.anthropic_sub_login.id();
+const account_key = llm.Account.anthropic_plan.id();
 
 gpa: std.mem.Allocator,
 io: std.Io,
@@ -923,7 +923,7 @@ test "load accepts a credential from before principal markers" {
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "auth.json",
         .data =
-        \\{"anthropic-sub-login":
+        \\{"anthropic-plan":
         \\  {"access":"a","refresh":"r","expires_ms":1}}
         ,
     });
@@ -952,7 +952,7 @@ test "load rejects an entry missing a credential field" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "auth.json",
-        .data = "{\"anthropic-sub-login\":{\"access\":\"a\"}}",
+        .data = "{\"anthropic-plan\":{\"access\":\"a\"}}",
     });
     var path_buf: [128]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/auth.json", .{tmp.sub_path});

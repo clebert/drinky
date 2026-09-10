@@ -726,7 +726,7 @@ const test_info: Info = .{
     .context_window = 1_000_000,
     .model = "claude-opus-4-8",
     .effort = "xhigh",
-    .account = .anthropic_sub_login,
+    .account = .anthropic_plan,
     .quota = .{
         .primary = .{ .used_percent = 11.6, .window_minutes = 300, .reset_seconds = 3180 },
         .secondary = .{ .used_percent = 73.6, .window_minutes = 10080, .reset_seconds = 580_769 },
@@ -750,7 +750,7 @@ test "the summary states every part of the line in full, in the order of the lin
     try expectSummary(
         "~/github/clebert/drinky (main) · Context: 21% (206k/1.0M) · Cost: ~$0.39 · " ++
             "5h: 12% (53m) · Week: 74% (6d) · Cache: 87% · " ++
-            "Model: anthropic-sub-login/claude-opus-4-8 · Effort: xhigh",
+            "Model: anthropic-plan/claude-opus-4-8 · Effort: xhigh",
         &test_info,
     );
 
@@ -758,7 +758,7 @@ test "the summary states every part of the line in full, in the order of the lin
     idle.turn_active = false;
     try expectSummary(
         "~/github/clebert/drinky (main) · Context: 21% (206k/1.0M) · Cost: ~$0.39 · " ++
-            "Model: anthropic-sub-login/claude-opus-4-8 · Effort: xhigh",
+            "Model: anthropic-plan/claude-opus-4-8 · Effort: xhigh",
         &idle,
     );
 
@@ -777,7 +777,7 @@ test "the summary states every part of the line in full, in the order of the lin
     no_model.context_window = null;
     no_model.directory = "";
     try expectSummary(
-        "Context: 206k · Cost: ~$0.39 · Model: anthropic-sub-login/none · Effort: xhigh",
+        "Context: 206k · Cost: ~$0.39 · Model: anthropic-plan/none · Effort: xhigh",
         &no_model,
     );
 
@@ -786,7 +786,7 @@ test "the summary states every part of the line in full, in the order of the lin
     empty.branch = null;
     try expectSummary(
         "~/github/clebert/drinky · Context: 0% (0/1.0M) · Cost: ~$0.39 · " ++
-            "Model: anthropic-sub-login/claude-opus-4-8 · Effort: xhigh",
+            "Model: anthropic-plan/claude-opus-4-8 · Effort: xhigh",
         &empty,
     );
 }
@@ -884,7 +884,7 @@ test render {
         // The model value and the effort level carry their own intensity, so a
         // style sequence sits between them and the muted text around them.
         "Model: ",
-        "anthropic-sub-login/claude-opus-4-8",
+        "anthropic-plan/claude-opus-4-8",
         " · Effort: ",
         "xhigh",
     });
@@ -940,44 +940,44 @@ test "a narrow window shortens fields before it gives up parts" {
     }{
         .{
             // The directory shortens before any complete part goes.
-            .columns = 172,
+            .columns = 167,
             .shows = &.{ "~/…/drinky (main)", "Context: 21% (206k/1.0M)", "Cache: 87%" },
             .hides = &.{"~/github"},
         },
         .{
             // The context gauge shortens before any complete part goes.
-            .columns = 157,
+            .columns = 152,
             .shows = &.{ "Context: 21%", "5h: 12% (53m)", "Week: 74% (6d)", "Cache: 87%" },
             .hides = &.{"(206k/1.0M)"},
         },
         .{
             // Both countdowns go together, so the two windows always read alike.
-            .columns = 147,
+            .columns = 142,
             .shows = &.{ "Cost: ~$0.39", "5h: 12%", "Week: 74%", "Cache: 87%" },
             .hides = &.{ "(53m)", "(6d)" },
         },
         .{
-            .columns = 137,
+            .columns = 132,
             .shows = &.{ "Cost: ~$0.39", "5h: 12%", "Week: 74%" },
             .hides = &.{"Cache:"},
         },
         .{
             // The longest window goes first.
-            .columns = 122,
+            .columns = 117,
             .shows = &.{ "Cost: ~$0.39", "5h: 12%" },
             .hides = &.{ "Week:", "Cache:" },
         },
         .{
             // The session cost outlives every measurement of one request.
-            .columns = 112,
-            .shows = &.{ "~/…/drinky (main)", "Cost: ~$0.39", "anthropic-sub-login/" },
+            .columns = 107,
+            .shows = &.{ "~/…/drinky (main)", "Cost: ~$0.39", "anthropic-plan/" },
             .hides = &.{ "5h:", "Week:", "Cache:" },
         },
         .{
             // The account prefix goes, and the model name stays whole.
-            .columns = 87,
+            .columns = 82,
             .shows = &.{ "~/…/drinky (main)", "claude-opus-4-8", "Effort: " },
-            .hides = &.{ "anthropic-sub-login", "Cost:" },
+            .hides = &.{ "anthropic-plan", "Cost:" },
         },
         .{
             // The branch is a detail of the place, so it goes while the
@@ -997,7 +997,7 @@ test "a narrow window shortens fields before it gives up parts" {
             .columns = 32,
             .model = null,
             .shows = &.{ "Context: 21%", "Model: ", "none" },
-            .hides = &.{ "anthropic-sub-login", "Effort:" },
+            .hides = &.{ "anthropic-plan", "Effort:" },
         },
         .{
             .columns = 32,
@@ -1135,7 +1135,7 @@ test "the model value and the effort level leave the faint intensity" {
     const reset = comptime attribute.sequence(.reset);
     const muted = comptime role.sequence(.muted);
     try expectShows(painted, &.{
-        reset ++ "anthropic-sub-login/claude-opus-4-8" ++ muted,
+        reset ++ "anthropic-plan/claude-opus-4-8" ++ muted,
         reset ++ "xhigh" ++ muted,
     });
     // Each label keeps the muted role of the line.
@@ -1198,7 +1198,7 @@ test "a long branch keeps 16 columns and a whole grapheme" {
     defer out.deinit();
     // The width that the shortened branch needs, and one column less than the
     // whole branch needs.
-    try renderForTest(gpa, &info, 182, &out);
+    try renderForTest(gpa, &info, 177, &out);
 
     const painted = out.written();
     try expectShows(painted, &.{
@@ -1320,7 +1320,7 @@ test "an account with no model shows the value in the warning role" {
     try expectShows(painted, &.{
         "Model: ",
         comptime attribute.sequence(.reset) ++ role.sequence(.warning) ++
-            "anthropic-sub-login/none" ++ role.sequence(.muted),
+            "anthropic-plan/none" ++ role.sequence(.muted),
         " · Effort: ",
         "xhigh",
     });
@@ -1347,7 +1347,7 @@ test "quota windows show the used share, labeled by length" {
     var info = test_info;
     info.directory = "";
     info.model = "gpt-5.6-sol";
-    info.account = .openai_sub_login;
+    info.account = .openai_plan;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     try renderForTest(gpa, &info, 160, &out);
@@ -1545,7 +1545,7 @@ test "a running turn hides the cache, quota, and credits until this turn reports
     info.credits = null;
     try expectSummary(
         "~/github/clebert/drinky (main) · Context: 21% (206k/1.0M) · Cost: ~$0.39 · " ++
-            "Model: anthropic-sub-login/claude-opus-4-8 · Effort: xhigh",
+            "Model: anthropic-plan/claude-opus-4-8 · Effort: xhigh",
         &info,
     );
 }

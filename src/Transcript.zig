@@ -283,7 +283,7 @@ pub fn dropAccount(self: *Transcript, account: ai.llm.Account) usize {
 
 // The account slot the tests stream reasoning under, and the one that projects
 // the same transcript without that reasoning.
-const test_account: ai.llm.Account = .anthropic_sub_login;
+const test_account: ai.llm.Account = .anthropic_plan;
 const other_account: ai.llm.Account = .openai_api_key;
 
 // The setup of a request that `account` sends and that replays its reasoning.
@@ -571,6 +571,6 @@ test "dropAccount removes the reasoning of one account for good" {
     const own = try transcript.projection(replaying(test_account));
     try std.testing.expectEqual(@as(usize, 1), own.len);
     // A slot that produced no block leaves the record as it is.
-    try std.testing.expectEqual(@as(usize, 0), transcript.dropAccount(.anthropic_api_login));
+    try std.testing.expectEqual(@as(usize, 0), transcript.dropAccount(.anthropic_api));
     try std.testing.expectEqual(@as(usize, 2), transcript.blocks().len);
 }

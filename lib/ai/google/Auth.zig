@@ -1,4 +1,4 @@
-//! The credential of the `google-cloud-keyfile` account. `init` reads a service account
+//! The credential of the `google-cloud-key` account. `init` reads a service account
 //! key file once and parses its RSA key. `accessToken` mints a short-lived
 //! access token from a signed JWT on demand and caches it. Nothing persists:
 //! the key file is the credential, so the account has no login and no logout.

@@ -641,7 +641,7 @@ test "a row too wide for the window is cut and marked" {
     // A long row and a current value, because only a list with a current value
     // carries the tag.
     var picker = try testPicker(gpa, &.{
-        "anthropic-sub-login/claude-sonnet-5",
+        "anthropic-plan/claude-sonnet-5",
         "two\nrows in one option",
     }, 0);
     defer picker.deinit();

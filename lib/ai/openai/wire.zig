@@ -120,20 +120,20 @@ fn writeItem(
         .message => |*message| try writeMessage(stringify, message),
         // Only this exact account's complete Responses proof can replay here.
         .reasoning => |*reasoning| switch (reasoning.replay) {
-            inline .openai_sub_login,
+            inline .openai_plan,
             .openai_api_key,
-            .xai_sub_login,
+            .xai_plan,
             .xai_api_key,
-            .openrouter_api_login,
+            .openrouter_api,
             .openrouter_api_key,
             => |proof, tag| {
                 if (tag == account and proof.replayable(account.replaysPlainReasoning()))
                     try writeReasoning(stringify, &proof);
             },
-            .anthropic_sub_login,
+            .anthropic_plan,
             .anthropic_api_key,
-            .anthropic_api_login,
-            .google_cloud_keyfile,
+            .anthropic_api,
+            .google_cloud_key,
             => {},
         },
         .tool_call => |*call| try writeToolCall(stringify, call),
@@ -429,7 +429,7 @@ test "a synthetic error result emits one function_call_output with one Error pre
 test "reasoning replays only the active account's complete proof" {
     const items = [_]llm.Item{
         .{ .reasoning = .{
-            .replay = .{ .openai_sub_login = .{
+            .replay = .{ .openai_plan = .{
                 .text = "weigh it",
                 .id = "rs_1",
                 .encrypted_content = "enc",
@@ -443,7 +443,7 @@ test "reasoning replays only the active account's complete proof" {
             } },
         } },
         .{ .reasoning = .{
-            .replay = .{ .openai_sub_login = .{
+            .replay = .{ .openai_plan = .{
                 .text = "no blob",
                 .id = "rs_2",
                 .encrypted_content = "",
@@ -457,7 +457,7 @@ test "reasoning replays only the active account's complete proof" {
         .system = "s",
         .items = &items,
         .tools = &.{},
-    }, .openai_sub_login);
+    }, .openai_plan);
     defer std.testing.allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
@@ -556,7 +556,7 @@ const golden_items = [_]llm.Item{
         .arguments_json = "{\"path\":\"b\"}",
     } },
     .{ .tool_result = .{ .call_id = "call_2", .content = "denied", .is_error = true } },
-    .{ .reasoning = .{ .replay = .{ .openai_sub_login = .{
+    .{ .reasoning = .{ .replay = .{ .openai_plan = .{
         .text = "foreign",
         .id = "rs_3",
         .encrypted_content = "enc3",
@@ -594,7 +594,7 @@ test "an OpenRouter request requires parameters and replays its own proof" {
             .encrypted_content = "enc",
             .raw_text = "raw reasoning",
         } } } },
-        .{ .reasoning = .{ .replay = .{ .openrouter_api_login = .{
+        .{ .reasoning = .{ .replay = .{ .openrouter_api = .{
             .text = "foreign summary",
             .id = "rs_foreign",
             .encrypted_content = "",
@@ -641,9 +641,9 @@ test "an OpenRouter request requires parameters and replays its own proof" {
     try std.testing.expectEqualStrings("plain reasoning", plain_part.get("text").?.string);
 
     inline for (.{
-        llm.Account.openai_sub_login,
+        llm.Account.openai_plan,
         llm.Account.openai_api_key,
-        llm.Account.xai_sub_login,
+        llm.Account.xai_plan,
         llm.Account.xai_api_key,
     }) |account| {
         const direct = try serialize(std.testing.allocator, &.{

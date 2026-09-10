@@ -121,18 +121,17 @@ to OpenRouter through a login or an API key, and to Gemini on the Gemini Enterpr
 
 ## Accounts
 
-- An account identifier reads `vendor-product-source`: `anthropic-sub-login`, `anthropic-api-login`,
-  `anthropic-api-key`, `openai-sub-login`, `openai-api-key`, `xai-sub-login`, `xai-api-key`,
-  `openrouter-api-login`, `openrouter-api-key`, and `google-cloud-keyfile`. The product is `sub` for
-  a subscription, `api` for the developer API, or `cloud` for the cloud platform. The source is
-  `login`, `key`, or `keyfile`.
-- A model under an account reads `account/model`, as in `openrouter-api-login/openai/gpt-5.6-sol`.
-  The status line, the pickers, the events, and the store files hold the same identifiers.
+- An account identifier reads `vendor-product`: `anthropic-plan`, `anthropic-api`,
+  `anthropic-api-key`, `openai-plan`, `openai-api-key`, `xai-plan`, `xai-api-key`, `openrouter-api`,
+  `openrouter-api-key`, and `google-cloud-key`. The product is `plan` for a subscription, `api` for
+  the developer API, or `cloud` for the cloud platform. A `-key` suffix marks a credential that an
+  environment variable holds or names. An identifier without it signs in through a login.
+- A model under an account reads `account/model`, as in `openrouter-api/openai/gpt-5.6-sol`. The
+  status line, the pickers, the events, and the store files hold the same identifiers.
 - Drinky supports Anthropic, OpenAI, and xAI, each as a subscription account or an API-key account.
-  The `anthropic-api-login` account adds a login that mints and stores a platform key. OpenRouter
-  adds a login that mints a key and an API-key account. Both spend the credit of one OpenRouter
-  account.
-- The `google-cloud-keyfile` account reads the service account key file that
+  The `anthropic-api` account adds a login that mints and stores a platform key. OpenRouter adds a
+  login that mints a key and an API-key account. Both spend the credit of one OpenRouter account.
+- The `google-cloud-key` account reads the service account key file that
   `GOOGLE_APPLICATION_CREDENTIALS` names and sends its requests to the Agent Platform location that
   `GOOGLE_CLOUD_LOCATION` names: `eu`, `us`, or `global`. A multi-region keeps the processing inside
   its jurisdiction. Drinky mints the access token itself and runs no network request at startup.
@@ -180,8 +179,8 @@ to OpenRouter through a login or an API key, and to Gemini on the Gemini Enterpr
   unknown principal stops before the model request.
 - A request that the provider rejects with 401 renews the credential once and repeats. The renewal
   takes the token that another instance saved, or refreshes the token in memory. The
-  `google-cloud-keyfile` account mints a new token from its key file. An API-key account holds one
-  fixed secret, so a rejected request ends the turn.
+  `google-cloud-key` account mints a new token from its key file. An API-key account holds one fixed
+  secret, so a rejected request ends the turn.
 - A service account key that Google rejects ends the turn and says so. The account stays configured,
   because the key file is the credential.
 - When another instance saved a replacement, Drinky reloads it and keeps the account active. Without
@@ -250,8 +249,8 @@ to OpenRouter through a login or an API key, and to Gemini on the Gemini Enterpr
 - Drinky requests summarized reasoning at the resolved effort and replays it verbatim on later
   turns. An OpenRouter request asks for no encrypted reasoning, because that request reaches fewer
   endpoints, so its reply replays the summary or the raw reasoning text instead.
-- An `anthropic-sub-login` or `anthropic-api-login` request carries the Claude Code client identity.
-  An `anthropic-api-key` request goes straight to the platform API.
+- An `anthropic-plan` or `anthropic-api` request carries the Claude Code client identity. An
+  `anthropic-api-key` request goes straight to the platform API.
 - Every Anthropic request asks for the input of a tool call as the model writes it.
 - A request times out after 30 s to the response head. A streamed event must arrive within 60 s for
   Anthropic and 300 s for OpenAI, xAI, OpenRouter, and the Agent Platform, whose streams are silent

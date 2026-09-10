@@ -74,7 +74,7 @@ test "the picker lists only signed-in accounts, and none reports an error" {
             }
             try std.testing.expectEqualStrings("Sign out", pick.title);
             try std.testing.expectEqual(@as(usize, 1), pick.options.len);
-            try std.testing.expectEqualStrings("openai-sub-login", pick.options[0]);
+            try std.testing.expectEqualStrings("openai-plan", pick.options[0]);
         },
         else => return error.ExpectedPick,
     }
@@ -97,7 +97,7 @@ test "select names the chosen signed-in account, rejecting out of range" {
 
     switch (try select(&context, .{ .payload = 0, .row = 0 })) {
         .logout => |account| try std.testing.expectEqual(
-            llm.Account.anthropic_sub_login,
+            llm.Account.anthropic_plan,
             account,
         ),
         else => return error.ExpectedLogout,

@@ -45,25 +45,26 @@ zig build -Doptimize=ReleaseSafe
 
 ## Sign in
 
-An account reads `vendor-product-source`, and a model under it reads `account/model`, as in
-`anthropic-sub-login/claude-opus-4-8`.
+An account reads `vendor-product`, and a model under it reads `account/model`, as in
+`anthropic-plan/claude-opus-4-8`. A `-key` suffix marks a credential that an environment variable
+holds or names.
 
-| Account                | Credential                                                   |
-| ---------------------- | ------------------------------------------------------------ |
-| `anthropic-sub-login`  | Claude Pro or Max login                                      |
-| `anthropic-api-login`  | Anthropic Console login, which mints and stores an API key   |
-| `anthropic-api-key`    | `ANTHROPIC_API_KEY`                                          |
-| `openai-sub-login`     | ChatGPT login                                                |
-| `openai-api-key`       | `OPENAI_API_KEY`                                             |
-| `xai-sub-login`        | SuperGrok or X Premium login with a device code              |
-| `xai-api-key`          | `XAI_API_KEY`                                                |
-| `openrouter-api-login` | OpenRouter login, which mints and stores an API key          |
-| `openrouter-api-key`   | `OPENROUTER_API_KEY`                                         |
-| `google-cloud-keyfile` | `GOOGLE_APPLICATION_CREDENTIALS` and `GOOGLE_CLOUD_LOCATION` |
+| Account              | Credential                                                   |
+| -------------------- | ------------------------------------------------------------ |
+| `anthropic-plan`     | Claude Pro or Max login                                      |
+| `anthropic-api`      | Anthropic Console login, which mints and stores an API key   |
+| `anthropic-api-key`  | `ANTHROPIC_API_KEY`                                          |
+| `openai-plan`        | ChatGPT login                                                |
+| `openai-api-key`     | `OPENAI_API_KEY`                                             |
+| `xai-plan`           | SuperGrok or X Premium login with a device code              |
+| `xai-api-key`        | `XAI_API_KEY`                                                |
+| `openrouter-api`     | OpenRouter login, which mints and stores an API key          |
+| `openrouter-api-key` | `OPENROUTER_API_KEY`                                         |
+| `google-cloud-key`   | `GOOGLE_APPLICATION_CREDENTIALS` and `GOOGLE_CLOUD_LOCATION` |
 
-Run `/login` to sign in with a `login` account. Set the variable of a `key` account by hand. For
-`google-cloud-keyfile`, set `GOOGLE_APPLICATION_CREDENTIALS` to an Agent Platform service account
-key file and `GOOGLE_CLOUD_LOCATION` to `eu`, `us`, or `global`.
+Run `/login` to sign in with an account that has no `-key` suffix. Set the variable of a `-key`
+account by hand. For `google-cloud-key`, set `GOOGLE_APPLICATION_CREDENTIALS` to an Agent Platform
+service account key file and `GOOGLE_CLOUD_LOCATION` to `eu`, `us`, or `global`.
 
 Drinky is not affiliated with Anthropic, OpenAI, xAI, OpenRouter, or Google.
 

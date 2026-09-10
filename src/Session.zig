@@ -706,7 +706,7 @@ pub fn init(
         .stats_shown = .{},
         .model_shown = model,
         .effort_shown = effort,
-        .account_shown = .anthropic_sub_login,
+        .account_shown = .anthropic_plan,
         .directory_shown = "",
         .branch_root = null,
         .branch_buffer = undefined,
@@ -4858,7 +4858,7 @@ test "an account switch hides the reasoning of the other account" {
     defer out.deinit();
     var session: Session = Session.init(gpa, &out.writer, test_model, replaying_effort);
     defer session.deinit();
-    session.showSetup(.anthropic_sub_login, test_model, replaying_effort);
+    session.showSetup(.anthropic_plan, test_model, replaying_effort);
     session.beginTurn(1);
 
     try applyEvent(&session, 1, .{ .thinking = try gpa.dupe(u8, "weigh it") });
@@ -4884,7 +4884,7 @@ test "an account switch hides the reasoning of the other account" {
     try std.testing.expectEqual(@as(usize, 2), session.transcript.blocks().len);
 
     const restored_start = out.written().len;
-    session.showSetup(.anthropic_sub_login, test_model, replaying_effort);
+    session.showSetup(.anthropic_plan, test_model, replaying_effort);
     try session.paint(.{ .columns = 80, .rows = 24 });
     try expectPainted(gpa, out.written()[restored_start..], "weigh it");
 }
@@ -4898,7 +4898,7 @@ test "a model that replays no reasoning hides it" {
     defer out.deinit();
     var session: Session = Session.init(gpa, &out.writer, test_model, replaying_effort);
     defer session.deinit();
-    session.showSetup(.anthropic_sub_login, test_model, replaying_effort);
+    session.showSetup(.anthropic_plan, test_model, replaying_effort);
     session.beginTurn(1);
 
     try applyEvent(&session, 1, .{ .thinking = try gpa.dupe(u8, "weigh it") });
@@ -4908,7 +4908,7 @@ test "a model that replays no reasoning hides it" {
     try expectPainted(gpa, out.written(), "weigh it");
 
     const silent_start = out.written().len;
-    session.showSetup(.anthropic_sub_login, test_model_closed, replaying_effort);
+    session.showSetup(.anthropic_plan, test_model_closed, replaying_effort);
     try std.testing.expect(session.view.force_reset);
     try session.paint(.{ .columns = 80, .rows = 24 });
     const silent = try terminal.View.plainText(gpa, out.written()[silent_start..]);
@@ -4921,7 +4921,7 @@ test "a model that replays no reasoning hides it" {
 
     // The model returns the block, because the proof stayed in the record.
     const restored_start = out.written().len;
-    session.showSetup(.anthropic_sub_login, test_model, .low);
+    session.showSetup(.anthropic_plan, test_model, .low);
     try std.testing.expect(session.view.force_reset);
     try session.paint(.{ .columns = 80, .rows = 24 });
     try expectPainted(gpa, out.written()[restored_start..], "weigh it");
@@ -4937,7 +4937,7 @@ test "a setup change that hides no block keeps the scrollback" {
     defer out.deinit();
     var session: Session = Session.init(gpa, &out.writer, test_model, replaying_effort);
     defer session.deinit();
-    session.showSetup(.anthropic_sub_login, test_model, replaying_effort);
+    session.showSetup(.anthropic_plan, test_model, replaying_effort);
     session.beginTurn(1);
 
     try applyEvent(&session, 1, .{ .text = try gpa.dupe(u8, "the answer") });
@@ -4973,7 +4973,7 @@ test "dropped account reasoning leaves the transcript for good" {
     defer out.deinit();
     var session: Session = Session.init(gpa, &out.writer, test_model, replaying_effort);
     defer session.deinit();
-    session.showSetup(.anthropic_sub_login, test_model, replaying_effort);
+    session.showSetup(.anthropic_plan, test_model, replaying_effort);
     session.beginTurn(1);
 
     try applyEvent(&session, 1, .{ .thinking = try gpa.dupe(u8, "weigh it") });
@@ -4981,7 +4981,7 @@ test "dropped account reasoning leaves the transcript for good" {
     try finishTurn(&session, 0);
     try session.paint(.{ .columns = 80, .rows = 24 });
 
-    try std.testing.expectEqual(@as(usize, 1), session.dropAccountReasoning(.anthropic_sub_login));
+    try std.testing.expectEqual(@as(usize, 1), session.dropAccountReasoning(.anthropic_plan));
     try std.testing.expect(session.view.force_reset);
     try std.testing.expectEqual(@as(usize, 1), session.transcript.blocks().len);
 
@@ -4994,7 +4994,7 @@ test "dropped account reasoning leaves the transcript for good" {
 
     // A slot with nothing left to drop keeps the screen as it is.
     session.view.force_reset = false;
-    try std.testing.expectEqual(@as(usize, 0), session.dropAccountReasoning(.anthropic_sub_login));
+    try std.testing.expectEqual(@as(usize, 0), session.dropAccountReasoning(.anthropic_plan));
     try std.testing.expect(!session.view.force_reset);
 }
 
@@ -5007,7 +5007,7 @@ test "a conversation clear drops every block and keeps the request setup" {
     defer out.deinit();
     var session: Session = Session.init(gpa, &out.writer, test_model, replaying_effort);
     defer session.deinit();
-    session.showSetup(.anthropic_sub_login, test_model, replaying_effort);
+    session.showSetup(.anthropic_plan, test_model, replaying_effort);
     session.beginTurn(1);
 
     try applyEvent(&session, 1, .{ .thinking = try gpa.dupe(u8, "weigh it") });
@@ -5029,7 +5029,7 @@ test "a conversation clear drops every block and keeps the request setup" {
     try std.testing.expect(session.view.force_reset);
     try std.testing.expectEqual(@as(f64, 0), session.stats_shown.cost);
     try std.testing.expect(!session.hasSteering());
-    try std.testing.expectEqual(@as(?ai.llm.Account, .anthropic_sub_login), session.account_shown);
+    try std.testing.expectEqual(@as(?ai.llm.Account, .anthropic_plan), session.account_shown);
     try std.testing.expectEqualStrings(test_model.name(), session.model_shown.?.name());
     try std.testing.expectEqual(replaying_effort, session.effort_shown);
 

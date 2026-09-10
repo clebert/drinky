@@ -428,8 +428,8 @@ test "the vendor wins every field it states and the aggregator fills the rest" {
     var vendor = vendorModel("gpt-5.6-sol", 272_000, .high);
     vendor.tokens_max = null;
     const vendor_models = [_]Model{vendor};
-    catalog.accounts.set(.openai_sub_login, try gpa.dupe(Model, &vendor_models));
-    defer gpa.free(catalog.accounts.get(.openai_sub_login));
+    catalog.accounts.set(.openai_plan, try gpa.dupe(Model, &vendor_models));
+    defer gpa.free(catalog.accounts.get(.openai_plan));
 
     var public = Model.init("gpt-5.6-sol") catch unreachable;
     public.context_window = 1_050_000;
@@ -440,7 +440,7 @@ test "the vendor wins every field it states and the aggregator fills the rest" {
     catalog.metadata = try gpa.dupe(Metadata.Entry, &entries);
     defer gpa.free(catalog.metadata);
 
-    const merged = catalog.find(.openai_sub_login, "gpt-5.6-sol").?;
+    const merged = catalog.find(.openai_plan, "gpt-5.6-sol").?;
     try std.testing.expectEqual(@as(?u64, 272_000), merged.context_window);
     // The vendor named a level, so its list stands whole.
     try std.testing.expect(merged.offers(.high));
@@ -609,7 +609,7 @@ test "a stored model survives a round trip through both files" {
     };
     var alias = Model.init("grok-4.20") catch unreachable;
     alias.serveAs("grok-4.20-0309-reasoning") catch unreachable;
-    try written.setAccount(.anthropic_sub_login, &.{ model, alias });
+    try written.setAccount(.anthropic_plan, &.{ model, alias });
 
     var bare = Model.init("public-only") catch unreachable;
     bare.context_window = 200_000;
@@ -620,7 +620,7 @@ test "a stored model survives a round trip through both files" {
     var read = try init(gpa, io, home);
     defer read.deinit();
 
-    const restored = read.find(.anthropic_sub_login, "claude-opus-4-8").?;
+    const restored = read.find(.anthropic_plan, "claude-opus-4-8").?;
     try std.testing.expectEqual(@as(?u64, 1_000_000), restored.context_window);
     try std.testing.expectEqual(@as(?u32, 128_000), restored.tokens_max);
     try std.testing.expectEqual(Model.Thinking.supported, restored.thinking);
@@ -644,7 +644,7 @@ test "a stored model survives a round trip through both files" {
     // reads as the model of the alias after a restart.
     try std.testing.expectEqualStrings(
         "grok-4.20-0309-reasoning",
-        read.accounts.get(.anthropic_sub_login)[1].servedName(),
+        read.accounts.get(.anthropic_plan)[1].servedName(),
     );
     // The metadata file survives its own round trip, under its vendor.
     try std.testing.expectEqual(@as(usize, 1), read.metadata.len);
@@ -655,10 +655,10 @@ test "a stored model survives a round trip through both files" {
 
     // A dropped account leaves the file without its key, and the metadata
     // stands, because it belongs to no principal.
-    read.dropAccount(.anthropic_sub_login);
+    read.dropAccount(.anthropic_plan);
     var reopened = try init(gpa, io, home);
     defer reopened.deinit();
-    try std.testing.expect(reopened.isEmpty(.anthropic_sub_login));
+    try std.testing.expect(reopened.isEmpty(.anthropic_plan));
     try std.testing.expectEqual(@as(usize, 1), reopened.metadata.len);
 }
 
@@ -805,7 +805,7 @@ test "an OpenRouter account reads the public list and never the account cache" {
     catalog.accounts.set(.openrouter_api_key, try gpa.dupe(Model, &stray));
     defer gpa.free(catalog.accounts.get(.openrouter_api_key));
     try std.testing.expect(catalog.isEmpty(.openrouter_api_key));
-    try std.testing.expect(catalog.isEmpty(.openrouter_api_login));
+    try std.testing.expect(catalog.isEmpty(.openrouter_api));
 
     var listed_model = Model.init("openai/gpt-5.6-sol") catch unreachable;
     listed_model.context_window = 1_050_000;
@@ -815,10 +815,10 @@ test "an OpenRouter account reads the public list and never the account cache" {
     defer gpa.free(catalog.metadata);
 
     try std.testing.expect(!catalog.isEmpty(.openrouter_api_key));
-    try std.testing.expect(!catalog.isEmpty(.openrouter_api_login));
+    try std.testing.expect(!catalog.isEmpty(.openrouter_api));
     try std.testing.expectEqualStrings(
         "openai/gpt-5.6-sol",
-        catalog.find(.openrouter_api_login, "openai/gpt-5.6-sol").?.name(),
+        catalog.find(.openrouter_api, "openai/gpt-5.6-sol").?.name(),
     );
 
     var listed: std.ArrayList(Model) = .empty;

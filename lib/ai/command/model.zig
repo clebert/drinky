@@ -851,26 +851,26 @@ test "a fetch that meets a replaced credential hands its account to the app" {
     const gpa = std.testing.allocator;
     var accounts = testing.accounts(.{}, .{ .anthropic = true });
     defer testing.deinitAccounts(&accounts);
-    var agent = testing.agent(gpa, .{ .anthropic_sub_login = undefined });
+    var agent = testing.agent(gpa, .{ .anthropic_plan = undefined });
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
 
-    const outcome = try fetchOutcome(&context, .anthropic_sub_login, &.{
+    const outcome = try fetchOutcome(&context, .anthropic_plan, &.{
         .models_error = error.CredentialReplaced,
     });
     try std.testing.expectEqual(
-        llm.Account.anthropic_sub_login,
+        llm.Account.anthropic_plan,
         outcome.credential_replaced,
     );
 
     // The metadata request runs even then. A failed cache write of that metadata
     // changes no principal, so the transition stands alone.
-    const with_save_failure = try fetchOutcome(&context, .anthropic_sub_login, &.{
+    const with_save_failure = try fetchOutcome(&context, .anthropic_plan, &.{
         .models_error = error.CredentialReplaced,
         .metadata_save_error = error.StoreBusy,
     });
     try std.testing.expectEqual(
-        llm.Account.anthropic_sub_login,
+        llm.Account.anthropic_plan,
         with_save_failure.credential_replaced,
     );
 }
@@ -905,7 +905,7 @@ test "one provider alone opens the account step at once" {
     defer freePick(gpa, &pick);
     try std.testing.expectEqualStrings("Account", pick.title);
     try std.testing.expectEqual(@as(usize, 2), pick.options.len);
-    try std.testing.expectEqualStrings("anthropic-sub-login", pick.options[0]);
+    try std.testing.expectEqualStrings("anthropic-plan", pick.options[0]);
     try std.testing.expectEqualStrings("anthropic-api-key", pick.options[1]);
     try std.testing.expectEqual(@as(usize, 1), pick.current.?);
 }
@@ -1249,7 +1249,7 @@ test "a provider row opens its accounts, and an account row opens its models" {
     const anthropic_models = try expectPick(try selectRow(&anthropic_accounts, &context, 0));
     defer freePick(gpa, &anthropic_models);
     try std.testing.expectEqualStrings(
-        "Model: anthropic-sub-login",
+        "Model: anthropic-plan",
         anthropic_models.title,
     );
     // The subscription is not the active account, so no row is the current one.
@@ -1287,7 +1287,7 @@ test "each step names the opener that builds it again" {
     const anthropic_models = try expectPick(try selectRow(&anthropic_accounts, &context, 0));
     defer freePick(gpa, &anthropic_models);
     try std.testing.expect(
-        anthropic_models.reopen.? == modelStepOf(.anthropic_sub_login).open,
+        anthropic_models.reopen.? == modelStepOf(.anthropic_plan).open,
     );
 
     // An opener builds the same picker again: the same rows, and the same
@@ -1295,7 +1295,7 @@ test "each step names the opener that builds it again" {
     const reopened = try expectPick(try anthropic_accounts.reopen.?(&context));
     defer freePick(gpa, &reopened);
     try std.testing.expectEqualStrings("Account", reopened.title);
-    try std.testing.expectEqualStrings("anthropic-sub-login", reopened.options[0]);
+    try std.testing.expectEqualStrings("anthropic-plan", reopened.options[0]);
     try std.testing.expect(reopened.reopen.? == accountStepOf(.anthropic));
 
     // A step that the flow skipped opens no picker, so it enters no trail and
@@ -1561,16 +1561,16 @@ test "the active mark matches the account, not just the model name" {
     // under two accounts. The mark must land inside the active account's list.
     var accounts = testing.accounts(.{ .anthropic = "sk-ant" }, .{ .anthropic = true });
     defer testing.deinitAccounts(&accounts);
-    try testing.seed(&accounts, .anthropic_sub_login, &.{"claude-sonnet-4-6"});
+    try testing.seed(&accounts, .anthropic_plan, &.{"claude-sonnet-4-6"});
     try testing.seed(&accounts, .anthropic_api_key, &.{"claude-sonnet-4-6"});
-    var agent = testing.agent(gpa, .{ .anthropic_sub_login = undefined });
+    var agent = testing.agent(gpa, .{ .anthropic_plan = undefined });
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
 
     const anthropic_accounts = try expectPick(try run(&context));
     defer freePick(gpa, &anthropic_accounts);
     try std.testing.expectEqualStrings(
-        "anthropic-sub-login",
+        "anthropic-plan",
         anthropic_accounts.options[anthropic_accounts.current.?],
     );
 
@@ -1593,7 +1593,7 @@ fn runUnderOom(gpa: std.mem.Allocator) !void {
         .{ .anthropic = true },
     );
     defer testing.deinitAccounts(&accounts);
-    try testing.seed(&accounts, .anthropic_sub_login, &.{"claude-opus-5"});
+    try testing.seed(&accounts, .anthropic_plan, &.{"claude-opus-5"});
     var agent = testing.agent(gpa, .{ .anthropic_api_key = "sk-ant" });
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };

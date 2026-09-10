@@ -123,7 +123,7 @@ fn writeContents(stringify: *std.json.Stringify, items: []const llm.Item) !void 
             // The signature of this account waits for the next part. A foreign
             // arm belongs to another account and writes nothing.
             switch (item.reasoning.replay) {
-                .google_cloud_keyfile => |signature| if (signature.signature.len != 0) {
+                .google_cloud_key => |signature| if (signature.signature.len != 0) {
                     pending_signature = signature.signature;
                 },
                 else => {},
@@ -205,19 +205,19 @@ const golden_items = [_]llm.Item{
     .{ .message = .{ .role = .user, .text = "first" } },
     .{ .message = .{ .role = .user, .text = "second" } },
     .{ .reasoning = .{ .replay = .{
-        .google_cloud_keyfile = .{ .text = "weigh", .signature = "sig1" },
+        .google_cloud_key = .{ .text = "weigh", .signature = "sig1" },
     } } },
     .{ .tool_call = .{ .call_id = "call_1", .name = "read", .arguments_json = "{\"path\":\"a.zig\"}" } },
     .{ .message = .{ .role = .assistant, .text = "checking" } },
     .{ .tool_result = .{ .call_id = "call_1", .content = "contents", .is_error = false } },
     .{ .message = .{ .role = .user, .text = "steer" } },
     .{ .reasoning = .{ .replay = .{
-        .google_cloud_keyfile = .{ .text = "", .signature = "sig2" },
+        .google_cloud_key = .{ .text = "", .signature = "sig2" },
     } } },
     .{ .message = .{ .role = .assistant, .text = "all set" } },
     .{ .message = .{ .role = .user, .text = "again" } },
     .{ .reasoning = .{ .replay = .{
-        .google_cloud_keyfile = .{ .text = "", .signature = "dropped" },
+        .google_cloud_key = .{ .text = "", .signature = "dropped" },
     } } },
     .{ .message = .{ .role = .user, .text = "more" } },
     .{ .reasoning = .{ .replay = .{ .openai_api_key = .{
@@ -228,7 +228,7 @@ const golden_items = [_]llm.Item{
     .{ .tool_call = .{ .call_id = "call_1", .name = "write", .arguments_json = "" } },
     .{ .tool_result = .{ .call_id = "call_1", .content = "done", .is_error = true } },
     .{ .reasoning = .{ .replay = .{
-        .google_cloud_keyfile = .{ .text = "", .signature = "tail" },
+        .google_cloud_key = .{ .text = "", .signature = "tail" },
     } } },
 };
 

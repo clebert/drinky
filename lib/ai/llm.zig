@@ -4,43 +4,42 @@
 
 const std = @import("std");
 
-/// A configured account. Its tag holds three segments: the vendor that serves
-/// the requests, the product the user buys, and the source of the credential.
-/// `sub` is a consumer subscription, `api` is the developer API, and `cloud` is
-/// the cloud platform of the vendor. `login` is an interactive OAuth login,
-/// `key` is an environment variable, and `keyfile` is a service account key
-/// file. This is the tag `provider.Client`/`Stream` key on. It is also the
-/// origin stamped on stored reasoning, so only the exact account that produced
-/// a blob replays it. At startup any account with a login is preferred over an
-/// environment credential, across vendors. Within a tier, declaration order
-/// decides.
+/// A configured account. Its tag names the vendor that serves the requests and
+/// the product the user buys. `plan` is a consumer subscription, `api` is the
+/// developer API, and `cloud` is the cloud platform of the vendor. A `key`
+/// suffix marks a credential that an environment variable holds or names, and
+/// a tag without it signs in through an interactive OAuth login. This is the
+/// tag `provider.Client`/`Stream` key on. It is also the origin stamped on
+/// stored reasoning, so only the exact account that produced a blob replays
+/// it. At startup any account with a login is preferred over an environment
+/// credential, across vendors. Within a tier, declaration order decides.
 pub const Account = enum {
     /// Claude Pro/Max subscription OAuth, authorized with a `Bearer` token and
     /// the Claude Code identity headers.
-    anthropic_sub_login,
+    anthropic_plan,
     /// Anthropic Console (Developer Platform), authorized with an `x-api-key`
     /// key that an OAuth login mints and stores. It sends the Claude Code system
     /// prompt like the subscription, so it reaches every model.
-    anthropic_api_login,
+    anthropic_api,
     /// Per-token platform API, authorized with `x-api-key`.
     anthropic_api_key,
     /// ChatGPT (Codex) subscription OAuth.
-    openai_sub_login,
+    openai_plan,
     /// Per-token platform API, authorized with a `Bearer` key.
     openai_api_key,
     /// SuperGrok or X Premium subscription OAuth, authorized with a `Bearer`
     /// token on the public xAI API.
-    xai_sub_login,
+    xai_plan,
     /// Per-token xAI API, authorized with a `Bearer` key.
     xai_api_key,
     /// OpenRouter OAuth login, authorized with a minted `Bearer` key.
-    openrouter_api_login,
+    openrouter_api,
     /// Per-token OpenRouter API, authorized with a `Bearer` key.
     openrouter_api_key,
     /// Gemini models on the Agent Platform of Google Cloud, authorized with an
     /// access token that Drinky mints from a service account key file. It goes
     /// last, so the startup order prefers every other account.
-    google_cloud_keyfile,
+    google_cloud_key,
 
     /// The identifier of each account: its tag with `-` in place of `_`.
     const ids: std.EnumArray(Account, []const u8) = table: {
@@ -55,7 +54,7 @@ pub const Account = enum {
         break :table built;
     };
 
-    /// The identifier, as in `anthropic-api-login`. It is the key of every store
+    /// The identifier, as in `anthropic-api`. It is the key of every store
     /// entry and the spelling of every message, so one string names an account
     /// everywhere. `id/model` names a model under the account.
     pub fn id(self: Account) []const u8 {
@@ -76,17 +75,17 @@ pub const Account = enum {
     /// then authorizes with a minted `x-api-key` key.
     pub fn hasLogin(self: Account) bool {
         return switch (self) {
-            .anthropic_sub_login,
-            .openai_sub_login,
-            .anthropic_api_login,
-            .xai_sub_login,
-            .openrouter_api_login,
+            .anthropic_plan,
+            .openai_plan,
+            .anthropic_api,
+            .xai_plan,
+            .openrouter_api,
             => true,
             .anthropic_api_key,
             .openai_api_key,
             .xai_api_key,
             .openrouter_api_key,
-            .google_cloud_keyfile,
+            .google_cloud_key,
             => false,
         };
     }
@@ -96,14 +95,14 @@ pub const Account = enum {
     /// configuration problem of the user and not a rotated credential.
     pub fn hasRefreshCredential(self: Account) bool {
         return switch (self) {
-            .anthropic_sub_login, .openai_sub_login, .xai_sub_login => true,
-            .anthropic_api_login,
+            .anthropic_plan, .openai_plan, .xai_plan => true,
+            .anthropic_api,
             .anthropic_api_key,
             .openai_api_key,
             .xai_api_key,
-            .openrouter_api_login,
+            .openrouter_api,
             .openrouter_api_key,
-            .google_cloud_keyfile,
+            .google_cloud_key,
             => false,
         };
     }
@@ -117,12 +116,12 @@ pub const Account = enum {
             .openai_api_key => "OPENAI_API_KEY",
             .xai_api_key => "XAI_API_KEY",
             .openrouter_api_key => "OPENROUTER_API_KEY",
-            .google_cloud_keyfile => "GOOGLE_APPLICATION_CREDENTIALS and GOOGLE_CLOUD_LOCATION",
-            .anthropic_sub_login,
-            .openai_sub_login,
-            .anthropic_api_login,
-            .xai_sub_login,
-            .openrouter_api_login,
+            .google_cloud_key => "GOOGLE_APPLICATION_CREDENTIALS and GOOGLE_CLOUD_LOCATION",
+            .anthropic_plan,
+            .openai_plan,
+            .anthropic_api,
+            .xai_plan,
+            .openrouter_api,
             => null,
         };
     }
@@ -130,11 +129,11 @@ pub const Account = enum {
     /// The vendor this account belongs to: the first segment of its tag.
     pub fn provider(self: Account) Provider {
         return switch (self) {
-            .anthropic_api_key, .anthropic_sub_login, .anthropic_api_login => .anthropic,
-            .openai_api_key, .openai_sub_login => .openai,
-            .xai_api_key, .xai_sub_login => .xai,
-            .openrouter_api_login, .openrouter_api_key => .openrouter,
-            .google_cloud_keyfile => .google,
+            .anthropic_api_key, .anthropic_plan, .anthropic_api => .anthropic,
+            .openai_api_key, .openai_plan => .openai,
+            .xai_api_key, .xai_plan => .xai,
+            .openrouter_api, .openrouter_api_key => .openrouter,
+            .google_cloud_key => .google,
         };
     }
 
@@ -207,31 +206,31 @@ pub const Item = union(enum) {
         replay: Replay,
 
         pub const Replay = union(Account) {
-            anthropic_sub_login: Anthropic,
-            anthropic_api_login: Anthropic,
+            anthropic_plan: Anthropic,
+            anthropic_api: Anthropic,
             anthropic_api_key: Anthropic,
-            openai_sub_login: OpenAi,
+            openai_plan: OpenAi,
             openai_api_key: OpenAi,
             /// The xAI accounts speak the Responses protocol, so their proof
             /// has the OpenAI shape.
-            xai_sub_login: OpenAi,
+            xai_plan: OpenAi,
             xai_api_key: OpenAi,
             /// The OpenRouter accounts speak the Responses protocol, so their
             /// proof has the OpenAI shape.
-            openrouter_api_login: OpenAi,
+            openrouter_api: OpenAi,
             openrouter_api_key: OpenAi,
             /// The `thoughtSignature` of one part. The text stays empty, because
             /// no wire needs the thought text back.
-            google_cloud_keyfile: Signature,
+            google_cloud_key: Signature,
 
             pub fn dupe(
                 self: *const Replay,
                 gpa: std.mem.Allocator,
             ) !Replay {
                 return switch (self.*) {
-                    inline .anthropic_sub_login,
+                    inline .anthropic_plan,
                     .anthropic_api_key,
-                    .anthropic_api_login,
+                    .anthropic_api,
                     => |proof, tag| switch (proof) {
                         .signature => |signature| @unionInit(Replay, @tagName(tag), .{
                             .signature = try signature.dupe(gpa),
@@ -242,14 +241,14 @@ pub const Item = union(enum) {
                             .{ .redacted = try gpa.dupe(u8, data) },
                         ),
                     },
-                    .google_cloud_keyfile => |signature| .{
-                        .google_cloud_keyfile = try signature.dupe(gpa),
+                    .google_cloud_key => |signature| .{
+                        .google_cloud_key = try signature.dupe(gpa),
                     },
-                    inline .openai_sub_login,
+                    inline .openai_plan,
                     .openai_api_key,
-                    .xai_sub_login,
+                    .xai_plan,
                     .xai_api_key,
-                    .openrouter_api_login,
+                    .openrouter_api,
                     .openrouter_api_key,
                     => |proof, tag| openai: {
                         const text_copy = try gpa.dupe(u8, proof.text);
@@ -271,18 +270,18 @@ pub const Item = union(enum) {
 
             pub fn deinit(self: *const Replay, gpa: std.mem.Allocator) void {
                 switch (self.*) {
-                    inline .anthropic_sub_login,
+                    inline .anthropic_plan,
                     .anthropic_api_key,
-                    .anthropic_api_login,
+                    .anthropic_api,
                     => |proof| switch (proof) {
                         .signature => |signature| signature.deinit(gpa),
                         .redacted => |data| gpa.free(data),
                     },
-                    inline .openai_sub_login,
+                    inline .openai_plan,
                     .openai_api_key,
-                    .xai_sub_login,
+                    .xai_plan,
                     .xai_api_key,
-                    .openrouter_api_login,
+                    .openrouter_api,
                     .openrouter_api_key,
                     => |proof| {
                         gpa.free(proof.text);
@@ -290,7 +289,7 @@ pub const Item = union(enum) {
                         gpa.free(proof.encrypted_content);
                         gpa.free(proof.raw_text);
                     },
-                    .google_cloud_keyfile => |signature| signature.deinit(gpa),
+                    .google_cloud_key => |signature| signature.deinit(gpa),
                 }
             }
         };
@@ -528,9 +527,9 @@ pub const Event = union(enum) {
             account: Account,
         ) ?Item.Reasoning.Replay {
             return switch (account) {
-                inline .anthropic_sub_login,
+                inline .anthropic_plan,
                 .anthropic_api_key,
-                .anthropic_api_login,
+                .anthropic_api,
                 => |tag| switch (self.*) {
                     .signature => |signature| if (signature.signature.len != 0)
                         @unionInit(
@@ -550,11 +549,11 @@ pub const Event = union(enum) {
                         null,
                     .encrypted => null,
                 },
-                inline .openai_sub_login,
+                inline .openai_plan,
                 .openai_api_key,
-                .xai_sub_login,
+                .xai_plan,
                 .xai_api_key,
-                .openrouter_api_login,
+                .openrouter_api,
                 .openrouter_api_key,
                 => |tag| switch (self.*) {
                     .encrypted => |encrypted| if (encrypted.replayable(
@@ -565,9 +564,9 @@ pub const Event = union(enum) {
                         null,
                     .signature, .redacted => null,
                 },
-                .google_cloud_keyfile => switch (self.*) {
+                .google_cloud_key => switch (self.*) {
                     .signature => |signature| if (signature.signature.len != 0)
-                        .{ .google_cloud_keyfile = signature }
+                        .{ .google_cloud_key = signature }
                     else
                         null,
                     .redacted, .encrypted => null,
@@ -644,35 +643,35 @@ test "reasoning proofs bind only to compatible exact accounts" {
         .id = "rs_1",
         .encrypted_content = "enc",
     } };
-    const openai_replay = encrypted.replay(.openai_sub_login).?;
-    try std.testing.expectEqual(Account.openai_sub_login, std.meta.activeTag(openai_replay));
-    try std.testing.expectEqualStrings("rs_1", openai_replay.openai_sub_login.id);
-    try std.testing.expectEqualStrings("hmm", openai_replay.openai_sub_login.text);
-    try std.testing.expect(encrypted.replay(.anthropic_sub_login) == null);
+    const openai_replay = encrypted.replay(.openai_plan).?;
+    try std.testing.expectEqual(Account.openai_plan, std.meta.activeTag(openai_replay));
+    try std.testing.expectEqualStrings("rs_1", openai_replay.openai_plan.id);
+    try std.testing.expectEqualStrings("hmm", openai_replay.openai_plan.text);
+    try std.testing.expect(encrypted.replay(.anthropic_plan) == null);
     try std.testing.expect(encrypted.replay(.openrouter_api_key) != null);
     try std.testing.expectEqual(
         Account.openrouter_api_key,
         std.meta.activeTag(encrypted.replay(.openrouter_api_key).?),
     );
     // An xAI proof has the same shape and binds to its own account alone.
-    const xai_replay = encrypted.replay(.xai_sub_login).?;
-    try std.testing.expectEqual(Account.xai_sub_login, std.meta.activeTag(xai_replay));
-    try std.testing.expectEqualStrings("enc", xai_replay.xai_sub_login.encrypted_content);
+    const xai_replay = encrypted.replay(.xai_plan).?;
+    try std.testing.expectEqual(Account.xai_plan, std.meta.activeTag(xai_replay));
+    try std.testing.expectEqualStrings("enc", xai_replay.xai_plan.encrypted_content);
     try std.testing.expect(signature.replay(.xai_api_key) == null);
 
     const redacted: Event.Reasoning = .{ .redacted = "secret" };
     try std.testing.expectEqualStrings(
         "secret",
-        redacted.replay(.anthropic_sub_login).?.anthropic_sub_login.redacted,
+        redacted.replay(.anthropic_plan).?.anthropic_plan.redacted,
     );
 
     // The key file account takes a signature alone, and only one with bytes.
-    const google_replay = signature.replay(.google_cloud_keyfile).?;
-    try std.testing.expectEqualStrings("sig", google_replay.google_cloud_keyfile.signature);
-    try std.testing.expect(redacted.replay(.google_cloud_keyfile) == null);
-    try std.testing.expect(encrypted.replay(.google_cloud_keyfile) == null);
+    const google_replay = signature.replay(.google_cloud_key).?;
+    try std.testing.expectEqualStrings("sig", google_replay.google_cloud_key.signature);
+    try std.testing.expect(redacted.replay(.google_cloud_key) == null);
+    try std.testing.expect(encrypted.replay(.google_cloud_key) == null);
     const unsigned: Event.Reasoning = .{ .signature = .{ .text = "hmm", .signature = "" } };
-    try std.testing.expect(unsigned.replay(.google_cloud_keyfile) == null);
+    try std.testing.expect(unsigned.replay(.google_cloud_key) == null);
     try std.testing.expect(unsigned.replay(.anthropic_api_key) == null);
 }
 
@@ -682,7 +681,7 @@ test "only an account that replays plain reasoning takes a summary without encry
         .id = "rs_1",
         .encrypted_content = "",
     } };
-    inline for (.{ Account.openrouter_api_login, Account.openrouter_api_key }) |account| {
+    inline for (.{ Account.openrouter_api, Account.openrouter_api_key }) |account| {
         const maybe_replay = reasoning.replay(account);
         try std.testing.expect(maybe_replay != null);
         try std.testing.expectEqualStrings("think", @field(maybe_replay.?, @tagName(account)).text);
@@ -690,12 +689,12 @@ test "only an account that replays plain reasoning takes a summary without encry
     // OpenAI and xAI ask for the encrypted blob, and their backend rejects a
     // reasoning item that carries none, so such a proof replays nowhere.
     inline for (.{
-        Account.openai_sub_login,
+        Account.openai_plan,
         Account.openai_api_key,
-        Account.xai_sub_login,
+        Account.xai_plan,
         Account.xai_api_key,
         Account.anthropic_api_key,
-        Account.google_cloud_keyfile,
+        Account.google_cloud_key,
     }) |account| {
         try std.testing.expect(reasoning.replay(account) == null);
     }
@@ -732,14 +731,14 @@ test "raw reasoning owns its text and frees every allocation on failure" {
 test "a replay copies and frees every arm" {
     const gpa = std.testing.allocator;
     const google: Item.Reasoning.Replay = .{
-        .google_cloud_keyfile = .{ .text = "think", .signature = "sig" },
+        .google_cloud_key = .{ .text = "think", .signature = "sig" },
     };
     const copy = try google.dupe(gpa);
     defer copy.deinit(gpa);
-    try std.testing.expectEqualStrings("think", copy.google_cloud_keyfile.text);
-    try std.testing.expectEqualStrings("sig", copy.google_cloud_keyfile.signature);
+    try std.testing.expectEqualStrings("think", copy.google_cloud_key.text);
+    try std.testing.expectEqualStrings("sig", copy.google_cloud_key.signature);
     try std.testing.expect(
-        copy.google_cloud_keyfile.signature.ptr != google.google_cloud_keyfile.signature.ptr,
+        copy.google_cloud_key.signature.ptr != google.google_cloud_key.signature.ptr,
     );
 
     const xai: Item.Reasoning.Replay = .{
@@ -761,57 +760,63 @@ test "an account identifier starts with its provider and parses back" {
         try std.testing.expect(std.mem.indexOfScalar(u8, account.id(), '_') == null);
         try std.testing.expect(std.mem.indexOfScalar(u8, account.id(), '/') == null);
         try std.testing.expectEqual(account, Account.parse(account.id()).?);
+        // A `-key` suffix marks a credential that an environment variable holds
+        // or names.
+        try std.testing.expectEqual(
+            !account.hasLogin(),
+            std.mem.endsWith(u8, account.id(), "-key"),
+        );
     }
-    try std.testing.expectEqualStrings("anthropic-sub-login", Account.anthropic_sub_login.id());
-    try std.testing.expectEqualStrings("anthropic-api-login", Account.anthropic_api_login.id());
+    try std.testing.expectEqualStrings("anthropic-plan", Account.anthropic_plan.id());
+    try std.testing.expectEqualStrings("anthropic-api", Account.anthropic_api.id());
     try std.testing.expectEqualStrings("anthropic-api-key", Account.anthropic_api_key.id());
-    try std.testing.expectEqualStrings("openai-sub-login", Account.openai_sub_login.id());
+    try std.testing.expectEqualStrings("openai-plan", Account.openai_plan.id());
     try std.testing.expectEqualStrings("openai-api-key", Account.openai_api_key.id());
-    try std.testing.expectEqualStrings("xai-sub-login", Account.xai_sub_login.id());
+    try std.testing.expectEqualStrings("xai-plan", Account.xai_plan.id());
     try std.testing.expectEqualStrings("xai-api-key", Account.xai_api_key.id());
-    try std.testing.expectEqualStrings("openrouter-api-login", Account.openrouter_api_login.id());
+    try std.testing.expectEqualStrings("openrouter-api", Account.openrouter_api.id());
     try std.testing.expectEqualStrings("openrouter-api-key", Account.openrouter_api_key.id());
-    try std.testing.expectEqualStrings("google-cloud-keyfile", Account.google_cloud_keyfile.id());
+    try std.testing.expectEqualStrings("google-cloud-key", Account.google_cloud_key.id());
     // The tag spelling is not the identifier, so a store key never holds it.
-    try std.testing.expect(Account.parse("anthropic_sub_login") == null);
-    try std.testing.expect(Account.parse("anthropic-sub-login/claude-fable-5-1") == null);
+    try std.testing.expect(Account.parse("anthropic_plan") == null);
+    try std.testing.expect(Account.parse("anthropic-plan/claude-fable-5-1") == null);
     try std.testing.expect(Account.parse("") == null);
 }
 
 test "Account.provider maps each account to its vendor" {
     try std.testing.expectEqual(Provider.anthropic, Account.anthropic_api_key.provider());
-    try std.testing.expectEqual(Provider.anthropic, Account.anthropic_sub_login.provider());
+    try std.testing.expectEqual(Provider.anthropic, Account.anthropic_plan.provider());
     try std.testing.expectEqual(Provider.openai, Account.openai_api_key.provider());
-    try std.testing.expectEqual(Provider.openai, Account.openai_sub_login.provider());
-    try std.testing.expectEqual(Provider.anthropic, Account.anthropic_api_login.provider());
-    try std.testing.expectEqual(Provider.xai, Account.xai_sub_login.provider());
+    try std.testing.expectEqual(Provider.openai, Account.openai_plan.provider());
+    try std.testing.expectEqual(Provider.anthropic, Account.anthropic_api.provider());
+    try std.testing.expectEqual(Provider.xai, Account.xai_plan.provider());
     try std.testing.expectEqual(Provider.xai, Account.xai_api_key.provider());
-    try std.testing.expectEqual(Provider.openrouter, Account.openrouter_api_login.provider());
+    try std.testing.expectEqual(Provider.openrouter, Account.openrouter_api.provider());
     try std.testing.expectEqual(Provider.openrouter, Account.openrouter_api_key.provider());
-    try std.testing.expectEqual(Provider.google, Account.google_cloud_keyfile.provider());
+    try std.testing.expectEqual(Provider.google, Account.google_cloud_key.provider());
 }
 
 test "account credential flags and environment variables" {
-    try std.testing.expect(Account.anthropic_sub_login.hasLogin());
-    try std.testing.expect(Account.openai_sub_login.hasLogin());
-    try std.testing.expect(Account.anthropic_api_login.hasLogin());
-    try std.testing.expect(Account.xai_sub_login.hasLogin());
-    try std.testing.expect(Account.openrouter_api_login.hasLogin());
+    try std.testing.expect(Account.anthropic_plan.hasLogin());
+    try std.testing.expect(Account.openai_plan.hasLogin());
+    try std.testing.expect(Account.anthropic_api.hasLogin());
+    try std.testing.expect(Account.xai_plan.hasLogin());
+    try std.testing.expect(Account.openrouter_api.hasLogin());
     try std.testing.expect(!Account.anthropic_api_key.hasLogin());
     try std.testing.expect(!Account.openai_api_key.hasLogin());
     try std.testing.expect(!Account.xai_api_key.hasLogin());
     try std.testing.expect(!Account.openrouter_api_key.hasLogin());
-    try std.testing.expect(!Account.google_cloud_keyfile.hasLogin());
-    try std.testing.expect(Account.anthropic_sub_login.hasRefreshCredential());
-    try std.testing.expect(Account.openai_sub_login.hasRefreshCredential());
-    try std.testing.expect(Account.xai_sub_login.hasRefreshCredential());
-    try std.testing.expect(!Account.anthropic_api_login.hasRefreshCredential());
+    try std.testing.expect(!Account.google_cloud_key.hasLogin());
+    try std.testing.expect(Account.anthropic_plan.hasRefreshCredential());
+    try std.testing.expect(Account.openai_plan.hasRefreshCredential());
+    try std.testing.expect(Account.xai_plan.hasRefreshCredential());
+    try std.testing.expect(!Account.anthropic_api.hasRefreshCredential());
     try std.testing.expect(!Account.anthropic_api_key.hasRefreshCredential());
     try std.testing.expect(!Account.openai_api_key.hasRefreshCredential());
     try std.testing.expect(!Account.xai_api_key.hasRefreshCredential());
-    try std.testing.expect(!Account.openrouter_api_login.hasRefreshCredential());
+    try std.testing.expect(!Account.openrouter_api.hasRefreshCredential());
     try std.testing.expect(!Account.openrouter_api_key.hasRefreshCredential());
-    try std.testing.expect(!Account.google_cloud_keyfile.hasRefreshCredential());
+    try std.testing.expect(!Account.google_cloud_key.hasRefreshCredential());
     try std.testing.expectEqualStrings(
         "ANTHROPIC_API_KEY",
         Account.anthropic_api_key.credentialEnv().?,
@@ -824,15 +829,15 @@ test "account credential flags and environment variables" {
     );
     try std.testing.expectEqualStrings(
         "GOOGLE_APPLICATION_CREDENTIALS and GOOGLE_CLOUD_LOCATION",
-        Account.google_cloud_keyfile.credentialEnv().?,
+        Account.google_cloud_key.credentialEnv().?,
     );
-    try std.testing.expect(Account.anthropic_api_login.credentialEnv() == null);
+    try std.testing.expect(Account.anthropic_api.credentialEnv() == null);
     // An account names a variable exactly when it has no login.
     for (std.enums.values(Account)) |account|
         try std.testing.expectEqual(account.hasLogin(), account.credentialEnv() == null);
     // The key file account goes last, so the startup order prefers every other one.
     const accounts = std.enums.values(Account);
-    try std.testing.expectEqual(Account.google_cloud_keyfile, accounts[accounts.len - 1]);
+    try std.testing.expectEqual(Account.google_cloud_key, accounts[accounts.len - 1]);
 }
 
 test "a rejection a retry cannot clear outranks one it can" {

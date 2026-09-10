@@ -534,7 +534,7 @@ pub fn document(
         \\no effect. The next start still succeeds and shows a warning that names each ignored key.
         \\The file holds no secret. An API key comes from the ANTHROPIC_API_KEY, the
         \\OPENAI_API_KEY, the XAI_API_KEY, or the OPENROUTER_API_KEY variable. The
-        \\google-cloud-keyfile account reads the service account key file that
+        \\google-cloud-key account reads the service account key file that
         \\GOOGLE_APPLICATION_CREDENTIALS names.
         \\GOOGLE_CLOUD_LOCATION is eu, us, or global.
         \\{s}
@@ -1202,7 +1202,7 @@ test "load reads the required skills in file order" {
 // them and keeps running.
 test "a stale default_models key reads as an unknown key" {
     var config = try loadDataForTest(
-        \\{ "default_models": { "anthropic-sub-login": "claude-sonnet-5" } }
+        \\{ "default_models": { "anthropic-plan": "claude-sonnet-5" } }
     );
     defer config.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), config.unknown_keys.len);

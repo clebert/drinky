@@ -1,6 +1,6 @@
 //! The credential lifecycle for the OpenRouter OAuth account: the shared
 //! `auth` login and store instantiated over `oauth`'s protocol for the
-//! `"openrouter-api-login"` entry in `<home>/.drinky/auth.json`. The login mints an
+//! `"openrouter-api"` entry in `<home>/.drinky/auth.json`. The login mints an
 //! API key and stores it. The key needs no refresh, so there is no
 //! `accessToken`: `apiKey` returns the stored key for the `Bearer` header.
 
@@ -16,7 +16,7 @@ const oauth = @import("oauth.zig");
 const Auth = @This();
 
 /// The top-level key this account's credential lives under in `auth.json`.
-const account_key = llm.Account.openrouter_api_login.id();
+const account_key = llm.Account.openrouter_api.id();
 
 gpa: std.mem.Allocator,
 io: std.Io,
@@ -86,7 +86,7 @@ test "load reads the stored api key" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "auth.json",
-        .data = "{\"openrouter-api-login\":{\"api_key\":\"sk-or-v1-x\"}}",
+        .data = "{\"openrouter-api\":{\"api_key\":\"sk-or-v1-x\"}}",
     });
     var path_buf: [128]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/auth.json", .{tmp.sub_path});
@@ -108,7 +108,7 @@ test "load rejects an entry missing the api key" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "auth.json",
-        .data = "{\"openrouter-api-login\":{}}",
+        .data = "{\"openrouter-api\":{}}",
     });
     var path_buf: [128]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/auth.json", .{tmp.sub_path});

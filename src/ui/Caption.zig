@@ -262,7 +262,7 @@ test "the first overflow separates the title from the complete control legend" {
 test "a narrow caption cuts its one-row title and packs whole controls" {
     const gpa = std.testing.allocator;
     const caption: Caption = .{
-        .title = "Model: anthropic-sub-login",
+        .title = "Model: anthropic-plan",
         .controls = "↑/↓: Move · Enter: Select · Esc: Cancel",
     };
     try std.testing.expectEqual(@as(usize, 4), caption.rows(14));
@@ -296,7 +296,7 @@ test "a lone overwide control segment cuts and never wraps on" {
 test "a bounded split drops the control segments past its row bound" {
     const gpa = std.testing.allocator;
     const caption: Caption = .{
-        .title = "Model: anthropic-sub-login",
+        .title = "Model: anthropic-plan",
         .controls = "↑/↓: Move · Enter: Select · Esc: Cancel",
         .rows_max = 3,
     };
@@ -312,7 +312,7 @@ test "a bounded split drops the control segments past its row bound" {
 test "a bounded caption keeps one title row before the controls" {
     const gpa = std.testing.allocator;
     const caption: Caption = .{
-        .title = "Model: anthropic-sub-login",
+        .title = "Model: anthropic-plan",
         .controls = "Esc: Close",
         .rows_max = 2,
     };

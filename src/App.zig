@@ -816,7 +816,7 @@ pub fn run(
     // account ran here. A name the account no longer offers, and an account
     // that no fetch ran for, resolve to no model, and the status line says so.
     const active = self.startAccount();
-    const start_account = active orelse .anthropic_sub_login;
+    const start_account = active orelse .anthropic_plan;
     const start_client = if (active) |account| self.accounts.client(account) else null;
     const start_model = self.accountModel(start_account);
     const start_effort = self.startEffort(config.default_effort);
@@ -4221,7 +4221,7 @@ test "Tab opens the prompt history over the idle prompt alone" {
 
     // A sign-in holds the editor.
     var signals: LoginTestSignals = .{};
-    try beginLoginForTest(&app, .xai_sub_login, null, &signals);
+    try beginLoginForTest(&app, .xai_plan, null, &signals);
     try app.handleKey(&.tab);
     try std.testing.expect(app.session.mode == .prompt);
     try std.testing.expect(app.login != null);
@@ -4785,7 +4785,7 @@ test "a sign-in prompt records its URL and user code in transcript events" {
     app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     var signals: LoginTestSignals = .{};
-    try beginLoginForTest(&app, .anthropic_sub_login, null, &signals);
+    try beginLoginForTest(&app, .anthropic_plan, null, &signals);
     defer app.dropLogin();
 
     var prompt: LoginPrompt = .{ .app = &app, .generation = app.login.?.generation };
@@ -4807,12 +4807,12 @@ test "a sign-in prompt records its URL and user code in transcript events" {
     try std.testing.expect(std.mem.indexOf(
         u8,
         authorization,
-        "anthropic-sub-login:\n\nhttps://example.test/\x1b]52;c;b3duZWQ=\x07\n\nIf the browser",
+        "anthropic-plan:\n\nhttps://example.test/\x1b]52;c;b3duZWQ=\x07\n\nIf the browser",
     ) != null);
     try std.testing.expect(std.mem.indexOf(u8, authorization, "URL:") == null);
     try std.testing.expect(std.mem.indexOf(u8, device, "asks for one: AB\x1bCD") != null);
     try std.testing.expectEqualStrings(
-        "Drinky could not open the browser for the sign-in to anthropic-sub-login. " ++
+        "Drinky could not open the browser for the sign-in to anthropic-plan. " ++
             "Open the URL above.",
         app.session.notice.?.content,
     );
@@ -4832,17 +4832,17 @@ test "a sign-in caption names the account and Enter refuses a device login line"
     app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     var signals: LoginTestSignals = .{};
-    try beginLoginForTest(&app, .xai_sub_login, null, &signals);
+    try beginLoginForTest(&app, .xai_plan, null, &signals);
     defer app.dropLogin();
 
     // A device-code login takes no line, so its caption offers no Enter.
     const caption = app.session.input.caption.?;
-    try std.testing.expectEqualStrings("Sign in: xai-sub-login", caption.title);
+    try std.testing.expectEqualStrings("Sign in: xai-plan", caption.title);
     try std.testing.expectEqualStrings(login_device_controls, caption.controls);
     try app.session.editor.insert("not a callback");
     try app.handleKey(&.enter);
     try std.testing.expectEqualStrings(
-        "The sign-in to xai-sub-login does not accept a callback URL. " ++
+        "The sign-in to xai-plan does not accept a callback URL. " ++
             "Complete the sign-in in the browser.",
         app.session.notice.?.content,
     );
@@ -4856,7 +4856,7 @@ test "a sign-in caption names the account and Enter refuses a device login line"
     try std.testing.expect(app.session.input.caption == null);
     try std.testing.expect(signals.stopped.load(.acquire));
     try std.testing.expectEqualStrings(
-        "You canceled the sign-in to xai-sub-login.",
+        "You canceled the sign-in to xai-plan.",
         app.session.notice.?.content,
     );
     try std.testing.expectEqualStrings("not a callbackx", app.session.editor.visible());
@@ -4885,7 +4885,7 @@ test "Enter replays a callback URL from the raw editor" {
     app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     var signals: LoginTestSignals = .{};
-    try beginLoginForTest(&app, .anthropic_sub_login, .{
+    try beginLoginForTest(&app, .anthropic_plan, .{
         .port = server.socket.address.getPort(),
         .binding = .state,
     }, &signals);
@@ -4921,7 +4921,7 @@ test "a sign-in cancel drops the rest of one exit attempt" {
     app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     var signals: LoginTestSignals = .{};
-    try beginLoginForTest(&app, .anthropic_sub_login, null, &signals);
+    try beginLoginForTest(&app, .anthropic_plan, null, &signals);
     defer app.dropLogin();
 
     try app.handleKeys("\x1b\x04");
@@ -4967,7 +4967,7 @@ test "a committed sign-in adopts its account at the terminal event" {
     try tmp.dir.writeFile(io, .{
         .sub_path = ".drinky/auth.json",
         .data =
-        \\{ "anthropic-sub-login":
+        \\{ "anthropic-plan":
         \\    { "access": "a", "refresh": "r", "expires_ms": 4102444800000 } }
         ,
     });
@@ -4988,23 +4988,23 @@ test "a committed sign-in adopts its account at the terminal event" {
     app.session.account_shown = null;
     // Reasoning of an earlier principal in the same slot stands above the URL
     // event. The sign-in drops it, and the result line must still find its event.
-    try app.session.transcript.appendStream(.thinking, .anthropic_sub_login, "old reasoning");
+    try app.session.transcript.appendStream(.thinking, .anthropic_plan, "old reasoning");
     app.session.transcript.endMessage();
 
     const generation = try reserveGeneration(&app.login_generation);
     app.login = .{
         .future = try io.concurrent(
             completeLoginForTest,
-            .{ &app, .anthropic_sub_login, generation },
+            .{ &app, .anthropic_plan, generation },
         ),
-        .callback = ai.Accounts.callback(.anthropic_sub_login),
+        .callback = ai.Accounts.callback(.anthropic_plan),
         .generation = generation,
-        .title = try gpa.dupe(u8, "Sign in: anthropic-sub-login"),
-        .attempt = .{ .account = .anthropic_sub_login },
+        .title = try gpa.dupe(u8, "Sign in: anthropic-plan"),
+        .attempt = .{ .account = .anthropic_plan },
     };
     app.syncInputState();
     try std.testing.expectEqualStrings(
-        "Sign in: anthropic-sub-login",
+        "Sign in: anthropic-plan",
         app.session.input.caption.?.title,
     );
 
@@ -5014,15 +5014,15 @@ test "a committed sign-in adopts its account at the terminal event" {
     _ = try app.applyBatch(events[0..count]);
 
     try std.testing.expect(app.login == null);
-    try std.testing.expectEqual(ai.llm.Account.anthropic_sub_login, app.activeAccount().?);
-    try std.testing.expectEqual(ai.llm.Account.anthropic_sub_login, app.session.account_shown.?);
+    try std.testing.expectEqual(ai.llm.Account.anthropic_plan, app.activeAccount().?);
+    try std.testing.expectEqual(ai.llm.Account.anthropic_plan, app.session.account_shown.?);
     try std.testing.expect(app.session.input.caption == null);
     // The old reasoning went, and the result took the place of the URL event.
     const blocks = app.session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 1), blocks.len);
     try std.testing.expectEqualStrings(
-        "Drinky signed in to anthropic-sub-login. Fetch the model list of " ++
-            "anthropic-sub-login with /model.",
+        "Drinky signed in to anthropic-plan. Fetch the model list of " ++
+            "anthropic-plan with /model.",
         blocks[0].content.event.text.items,
     );
 }
@@ -5039,7 +5039,7 @@ test "a canceled sign-in rewrites its URL event into the cancel line" {
     app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     var signals: LoginTestSignals = .{};
-    try beginLoginForTest(&app, .xai_sub_login, null, &signals);
+    try beginLoginForTest(&app, .xai_plan, null, &signals);
     defer app.dropLogin();
 
     var prompt: LoginPrompt = .{ .app = &app, .generation = app.login.?.generation };
@@ -5059,7 +5059,7 @@ test "a canceled sign-in rewrites its URL event into the cancel line" {
     const blocks = app.session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 1), blocks.len);
     try std.testing.expectEqualStrings(
-        "You canceled the sign-in to xai-sub-login.",
+        "You canceled the sign-in to xai-plan.",
         blocks[0].content.event.text.items,
     );
     // The block sits at the bottom of the window, so the frame repaints it in
@@ -5162,11 +5162,11 @@ test "a canceled sign-in reads as a decision, not a failure" {
     defer app.session.deinit();
 
     const block_count = app.session.transcript.blocks().len;
-    try app.reportLoginFailure(.{ .account = .anthropic_sub_login }, error.Canceled);
+    try app.reportLoginFailure(.{ .account = .anthropic_plan }, error.Canceled);
     const notice = app.session.notice.?;
     try std.testing.expectEqual(ai.command.Outcome.Severity.information, notice.severity);
     try std.testing.expectEqualStrings(
-        "You canceled the sign-in to anthropic-sub-login.",
+        "You canceled the sign-in to anthropic-plan.",
         notice.content,
     );
     try std.testing.expectEqual(block_count, app.session.transcript.blocks().len);
@@ -5184,37 +5184,37 @@ test "a login the provider refused reads as a sentence, not an error name" {
 
     // A rejection names the one action that helps. An unavailable service does
     // not, because the same sign-in works later.
-    try app.reportLoginFailure(.{ .account = .anthropic_sub_login }, error.TokenGrantRejected);
+    try app.reportLoginFailure(.{ .account = .anthropic_plan }, error.TokenGrantRejected);
     try std.testing.expectEqualStrings(
         "The provider rejected the authorization. Start the sign-in again.",
         app.session.notice.?.content,
     );
-    try app.reportLoginFailure(.{ .account = .anthropic_sub_login }, error.AuthorizationFailed);
+    try app.reportLoginFailure(.{ .account = .anthropic_plan }, error.AuthorizationFailed);
     try std.testing.expectEqualStrings(
         "The provider did not authorize Drinky. Start the sign-in again.",
         app.session.notice.?.content,
     );
     // A refused device-code grant reads the same way, and a grant that ran out
     // names the wait.
-    try app.reportLoginFailure(.{ .account = .anthropic_sub_login }, error.AuthorizationDenied);
+    try app.reportLoginFailure(.{ .account = .anthropic_plan }, error.AuthorizationDenied);
     try std.testing.expectEqualStrings(
         "The provider did not authorize Drinky. Start the sign-in again.",
         app.session.notice.?.content,
     );
-    try app.reportLoginFailure(.{ .account = .anthropic_sub_login }, error.DeviceCodeExpired);
+    try app.reportLoginFailure(.{ .account = .anthropic_plan }, error.DeviceCodeExpired);
     try std.testing.expectEqualStrings(
         "Drinky stopped the sign-in because the authorization did not arrive in time.",
         app.session.notice.?.content,
     );
     // A stale tab and a stale paste both deliver a redirect of an earlier
     // sign-in, so the sentence names neither source.
-    try app.reportLoginFailure(.{ .account = .anthropic_sub_login }, error.StateMismatch);
+    try app.reportLoginFailure(.{ .account = .anthropic_plan }, error.StateMismatch);
     try std.testing.expectEqualStrings(
         "The response belongs to another sign-in. Start the sign-in again.",
         app.session.notice.?.content,
     );
     try app.reportLoginFailure(
-        .{ .account = .anthropic_sub_login },
+        .{ .account = .anthropic_plan },
         error.TokenServiceUnavailable,
     );
     try std.testing.expectEqualStrings(
@@ -5222,7 +5222,7 @@ test "a login the provider refused reads as a sentence, not an error name" {
         app.session.notice.?.content,
     );
     // A failure with no single cause still wraps its error name in a sentence.
-    try app.reportLoginFailure(.{ .account = .anthropic_sub_login }, error.TokenRequestFailed);
+    try app.reportLoginFailure(.{ .account = .anthropic_plan }, error.TokenRequestFailed);
     try std.testing.expectEqualStrings(
         "Drinky could not sign in because of error TokenRequestFailed.",
         app.session.notice.?.content,
@@ -5255,7 +5255,7 @@ test "OAuth callback bounds have friendly failure notices" {
     };
     for (cases) |case| {
         const failure, const message = case;
-        try app.reportLoginFailure(.{ .account = .anthropic_sub_login }, failure);
+        try app.reportLoginFailure(.{ .account = .anthropic_plan }, failure);
         const notice = app.session.notice.?;
         try std.testing.expectEqual(ai.command.Outcome.Severity.failure, notice.severity);
         try std.testing.expectEqualStrings(message, notice.content);
@@ -6705,7 +6705,7 @@ test "mid-turn Enter queues a message but refuses a slash line or a blank line" 
 /// The status answer of the test app: no place, because the test names no
 /// directory, then the numbers and the agent of its signed-in session.
 const test_status_line = "Context: 0% (0/1.0M) · Cost: ~$0.00 · " ++
-    "Model: anthropic-sub-login/claude-opus-5 · Effort: low";
+    "Model: anthropic-plan/claude-opus-5 · Effort: low";
 
 // The status answer reads the snapshot of the session and opens no picker, so it
 // is the one command that a turn hosts. Its event stays in the terminal, because
@@ -7468,7 +7468,7 @@ test "an account-switch command clears the quota snapshot and records the projec
     const anthropic_client = ai.provider.Client.init(
         gpa,
         io,
-        .{ .anthropic_sub_login = undefined },
+        .{ .anthropic_plan = undefined },
         .{},
     );
     var app: App = undefined;
@@ -7488,7 +7488,7 @@ test "an account-switch command clears the quota snapshot and records the projec
         .project = "/work",
     });
     defer app.state.deinit();
-    try app.state.seed(.anthropic_sub_login, test_anthropic_model, .low);
+    try app.state.seed(.anthropic_plan, test_anthropic_model, .low);
 
     app.agent.stats.quota = .{
         .secondary = .{ .used_percent = 77, .window_minutes = 10080 },
@@ -7524,7 +7524,7 @@ test "an account-switch command clears the quota snapshot and records the projec
     // to it even after a restart.
     try std.testing.expectEqualStrings(
         test_anthropic_model.name(),
-        listed.get("anthropic-sub-login").?.string,
+        listed.get("anthropic-plan").?.string,
     );
 }
 
@@ -7540,7 +7540,7 @@ test "an account switch projects the conversation for the new account" {
     const anthropic_client = ai.provider.Client.init(
         gpa,
         io,
-        .{ .anthropic_sub_login = undefined },
+        .{ .anthropic_plan = undefined },
         .{},
     );
     var app: App = undefined;
@@ -7557,13 +7557,13 @@ test "an account switch projects the conversation for the new account" {
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, test_anthropic_model, .high);
     defer app.session.deinit();
-    app.session.showSetup(.anthropic_sub_login, test_anthropic_model, .high);
+    app.session.showSetup(.anthropic_plan, test_anthropic_model, .high);
 
-    const replay: ai.llm.Item.Reasoning.Replay = .{ .anthropic_sub_login = .{
+    const replay: ai.llm.Item.Reasoning.Replay = .{ .anthropic_plan = .{
         .signature = .{ .text = "weigh it", .signature = "proof" },
     } };
     try app.agent.items.append(gpa, .{ .reasoning = .{ .replay = try replay.dupe(gpa) } });
-    try app.session.transcript.appendStream(.thinking, .anthropic_sub_login, "weigh it");
+    try app.session.transcript.appendStream(.thinking, .anthropic_plan, "weigh it");
     try app.session.transcript.appendStream(.model, null, "the answer");
     try app.session.paint(.{ .columns = 80, .rows = 24 });
 
@@ -7907,7 +7907,7 @@ test "the logout of the last account signs out and opens the login picker" {
     try tmp.dir.writeFile(io, .{
         .sub_path = ".drinky/auth.json",
         .data =
-        \\{ "anthropic-sub-login":
+        \\{ "anthropic-plan":
         \\    { "access": "a", "refresh": "r", "expires_ms": 4102444800000 } }
         ,
     });
@@ -7916,8 +7916,8 @@ test "the logout of the last account signs out and opens the login picker" {
     app.initForTest(gpa);
     app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
     defer app.accounts.deinit();
-    try std.testing.expect(app.accounts.isAuthenticated(.anthropic_sub_login));
-    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_sub_login), .{
+    try std.testing.expect(app.accounts.isAuthenticated(.anthropic_plan));
+    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_plan), .{
         .model = test_anthropic_model,
         .system = "",
         .retry = .{},
@@ -7927,23 +7927,23 @@ test "the logout of the last account signs out and opens the login picker" {
     app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
 
-    try app.applyOutcome(.{ .logout = .anthropic_sub_login });
+    try app.applyOutcome(.{ .logout = .anthropic_plan });
 
     // The credential is gone and no account remains to adopt.
-    try std.testing.expect(!app.accounts.isAuthenticated(.anthropic_sub_login));
+    try std.testing.expect(!app.accounts.isAuthenticated(.anthropic_plan));
     try std.testing.expect(app.agent.client == null);
     try std.testing.expect(app.session.account_shown == null);
 
     // The event names the way back in, and the picker it names is open.
     try std.testing.expectEqualStrings(
-        "Drinky signed out of anthropic-sub-login. Select an account to sign in.",
+        "Drinky signed out of anthropic-plan. Select an account to sign in.",
         app.session.transcript.blocks()[0].content.event.text.items,
     );
     try std.testing.expect(app.session.mode == .picking);
     const picker = app.session.mode.picking.picker;
     try std.testing.expectEqualStrings("Sign in", picker.title);
     try std.testing.expectEqual(std.enums.values(ai.llm.Account).len, picker.options.len);
-    try std.testing.expectEqualStrings("anthropic-sub-login", picker.options[0]);
+    try std.testing.expectEqualStrings("anthropic-plan", picker.options[0]);
 }
 
 // The next account can offer no model, because no fetch ran for it. The logout
@@ -7965,7 +7965,7 @@ test "the logout of the active account adopts a next account with no model" {
     try tmp.dir.writeFile(io, .{
         .sub_path = ".drinky/auth.json",
         .data =
-        \\{ "anthropic-sub-login":
+        \\{ "anthropic-plan":
         \\    { "access": "a", "refresh": "r", "expires_ms": 4102444800000 } }
         ,
     });
@@ -7974,7 +7974,7 @@ test "the logout of the active account adopts a next account with no model" {
     app.initForTest(gpa);
     app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{ .anthropic = "key" });
     defer app.accounts.deinit();
-    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_sub_login), .{
+    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_plan), .{
         .model = test_anthropic_model,
         .system = "",
         .retry = .{},
@@ -7984,7 +7984,7 @@ test "the logout of the active account adopts a next account with no model" {
     app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
 
-    try app.applyOutcome(.{ .logout = .anthropic_sub_login });
+    try app.applyOutcome(.{ .logout = .anthropic_plan });
 
     // The session moved to the remaining account and holds no model. The report
     // names that account, because the transcript is the durable record of the
@@ -7992,7 +7992,7 @@ test "the logout of the active account adopts a next account with no model" {
     try std.testing.expectEqual(ai.llm.Account.anthropic_api_key, app.session.account_shown.?);
     try std.testing.expect(app.agent.model == null);
     try std.testing.expectEqualStrings(
-        "Drinky signed out of anthropic-sub-login. Drinky now uses anthropic-api-key. " ++
+        "Drinky signed out of anthropic-plan. Drinky now uses anthropic-api-key. " ++
             "Fetch the model list of anthropic-api-key with /model.",
         app.session.transcript.blocks()[0].content.event.text.items,
     );
@@ -8016,7 +8016,7 @@ test "the logout of the active account names the pick where the next list stands
     try tmp.dir.writeFile(io, .{
         .sub_path = ".drinky/auth.json",
         .data =
-        \\{ "anthropic-sub-login":
+        \\{ "anthropic-plan":
         \\    { "access": "a", "refresh": "r", "expires_ms": 4102444800000 } }
         ,
     });
@@ -8028,7 +8028,7 @@ test "the logout of the active account names the pick where the next list stands
     // A fetch cached the list of the account that follows, and this project ran
     // no model on it.
     try ai.testing.seedAccount(&app.accounts, .anthropic_api_key, &.{"claude-sonnet-5"});
-    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_sub_login), .{
+    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_plan), .{
         .model = test_anthropic_model,
         .system = "",
         .retry = .{},
@@ -8038,12 +8038,12 @@ test "the logout of the active account names the pick where the next list stands
     app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
 
-    try app.applyOutcome(.{ .logout = .anthropic_sub_login });
+    try app.applyOutcome(.{ .logout = .anthropic_plan });
 
     try std.testing.expectEqual(ai.llm.Account.anthropic_api_key, app.session.account_shown.?);
     try std.testing.expect(app.agent.model == null);
     try std.testing.expectEqualStrings(
-        "Drinky signed out of anthropic-sub-login. Drinky now uses anthropic-api-key. " ++
+        "Drinky signed out of anthropic-plan. Drinky now uses anthropic-api-key. " ++
             "Select a model of anthropic-api-key with /model.",
         app.session.transcript.blocks()[0].content.event.text.items,
     );
@@ -8064,7 +8064,7 @@ test "a principal replacement drops old evidence before the restored turn" {
     try tmp.dir.writeFile(io, .{
         .sub_path = ".drinky/auth.json",
         .data =
-        \\{ "anthropic-sub-login":
+        \\{ "anthropic-plan":
         \\    { "access": "replacement", "refresh": "replacement",
         \\      "expires_ms": 4102444800000,
         \\      "account_uuid": "other", "organization_uuid": "other" } }
@@ -8075,7 +8075,7 @@ test "a principal replacement drops old evidence before the restored turn" {
     app.initForTest(gpa);
     app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
     defer app.accounts.deinit();
-    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_sub_login), .{
+    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_plan), .{
         .model = test_anthropic_model,
         .system = "",
         .retry = .{},
@@ -8084,10 +8084,10 @@ test "a principal replacement drops old evidence before the restored turn" {
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
-    app.session.account_shown = .anthropic_sub_login;
+    app.session.account_shown = .anthropic_plan;
     app.session.beginTurn(1);
 
-    const replay: ai.llm.Item.Reasoning.Replay = .{ .anthropic_sub_login = .{
+    const replay: ai.llm.Item.Reasoning.Replay = .{ .anthropic_plan = .{
         .signature = .{ .text = "thought", .signature = "proof" },
     } };
     try app.agent.items.append(gpa, .{ .reasoning = .{ .replay = try replay.dupe(gpa) } });
@@ -8107,8 +8107,8 @@ test "a principal replacement drops old evidence before the restored turn" {
     try std.testing.expectEqual(@as(usize, 0), app.agent.items.items.len);
     try std.testing.expect(app.agent.stats.quota == null);
     try std.testing.expect(app.agent.stats.credits == null);
-    try std.testing.expectEqual(ai.llm.Account.anthropic_sub_login, app.activeAccount().?);
-    try std.testing.expectEqual(ai.llm.Account.anthropic_sub_login, app.session.account_shown.?);
+    try std.testing.expectEqual(ai.llm.Account.anthropic_plan, app.activeAccount().?);
+    try std.testing.expectEqual(ai.llm.Account.anthropic_plan, app.session.account_shown.?);
     try std.testing.expect(app.session.mode == .prompt);
     // The list of the replaced principal went with its metadata, so the account
     // offers no model.
@@ -8123,7 +8123,7 @@ test "a principal replacement drops old evidence before the restored turn" {
         "Try the turn again.",
     ) == null);
     try std.testing.expectEqualStrings(
-        "Fetch the model list of anthropic-sub-login with /model.",
+        "Fetch the model list of anthropic-plan with /model.",
         blocks[1].content.event.text.items,
     );
 }
@@ -8148,7 +8148,7 @@ test "a fetch that meets a replaced credential drops the evidence of the old pri
     try tmp.dir.writeFile(io, .{
         .sub_path = ".drinky/auth.json",
         .data =
-        \\{ "anthropic-sub-login":
+        \\{ "anthropic-plan":
         \\    { "access": "replacement", "refresh": "replacement",
         \\      "expires_ms": 4102444800000,
         \\      "account_uuid": "other", "organization_uuid": "other" } }
@@ -8159,8 +8159,8 @@ test "a fetch that meets a replaced credential drops the evidence of the old pri
     app.initForTest(gpa);
     app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
     defer app.accounts.deinit();
-    try ai.testing.seedAccount(&app.accounts, .anthropic_sub_login, &.{"claude-opus-5"});
-    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_sub_login), .{
+    try ai.testing.seedAccount(&app.accounts, .anthropic_plan, &.{"claude-opus-5"});
+    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_plan), .{
         .model = test_anthropic_model,
         .system = "",
         .retry = .{},
@@ -8169,33 +8169,33 @@ test "a fetch that meets a replaced credential drops the evidence of the old pri
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
-    app.session.account_shown = .anthropic_sub_login;
+    app.session.account_shown = .anthropic_plan;
 
-    const replay: ai.llm.Item.Reasoning.Replay = .{ .anthropic_sub_login = .{
+    const replay: ai.llm.Item.Reasoning.Replay = .{ .anthropic_plan = .{
         .signature = .{ .text = "thought", .signature = "proof" },
     } };
     try app.agent.items.append(gpa, .{ .reasoning = .{ .replay = try replay.dupe(gpa) } });
-    try app.session.transcript.appendStream(.thinking, .anthropic_sub_login, "thought");
+    try app.session.transcript.appendStream(.thinking, .anthropic_plan, "thought");
 
-    try app.applyOutcome(.{ .credential_replaced = .anthropic_sub_login });
+    try app.applyOutcome(.{ .credential_replaced = .anthropic_plan });
 
     // The proofs of the replaced principal leave the history and the interface,
     // so the next request under the new credential carries none of them.
     try std.testing.expectEqual(@as(usize, 0), app.agent.items.items.len);
     // The cached list belongs to that principal too, so the account offers no
     // model until the next fetch.
-    try std.testing.expect(app.accounts.catalog.isEmpty(.anthropic_sub_login));
+    try std.testing.expect(app.accounts.catalog.isEmpty(.anthropic_plan));
     try std.testing.expect(app.agent.model == null);
-    try std.testing.expectEqual(ai.llm.Account.anthropic_sub_login, app.activeAccount().?);
+    try std.testing.expectEqual(ai.llm.Account.anthropic_plan, app.activeAccount().?);
 
     // The report states the replacement and names the step, so the user reads
     // an action and no error name. No turn ran, so it names no retry.
     const blocks = app.session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 1), blocks.len);
     try std.testing.expectEqualStrings(
-        "Drinky found a replacement credential for anthropic-sub-login. " ++
+        "Drinky found a replacement credential for anthropic-plan. " ++
             "Drinky removed the prior account evidence. " ++
-            "Fetch the model list of anthropic-sub-login with /model.",
+            "Fetch the model list of anthropic-plan with /model.",
         blocks[0].content.event.text.items,
     );
     try std.testing.expect(!blocks[0].content.event.is_error);
@@ -8219,7 +8219,7 @@ test "a fetch that meets a replaced credential on an idle account names that acc
     try tmp.dir.writeFile(io, .{
         .sub_path = ".drinky/auth.json",
         .data =
-        \\{ "openai-sub-login":
+        \\{ "openai-plan":
         \\    { "access": "a", "refresh": "r", "expires_ms": 4102444800000,
         \\      "account_id": "account" } }
         ,
@@ -8229,7 +8229,7 @@ test "a fetch that meets a replaced credential on an idle account names that acc
     app.initForTest(gpa);
     app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{ .anthropic = "sk-anthropic" });
     defer app.accounts.deinit();
-    try ai.testing.seedAccount(&app.accounts, .openai_sub_login, &.{"gpt-5.6-sol"});
+    try ai.testing.seedAccount(&app.accounts, .openai_plan, &.{"gpt-5.6-sol"});
     // The session runs the `anthropic-api-key` account. The fetch runs on the OpenAI
     // subscription, which the user stepped to in the picker.
     app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_api_key), .{
@@ -8243,21 +8243,21 @@ test "a fetch that meets a replaced credential on an idle account names that acc
     defer app.session.deinit();
     app.session.account_shown = .anthropic_api_key;
 
-    try app.applyOutcome(.{ .credential_replaced = .openai_sub_login });
+    try app.applyOutcome(.{ .credential_replaced = .openai_plan });
 
     // The replacement reached another account, so the session keeps its own
     // account and its own model.
     try std.testing.expectEqual(ai.llm.Account.anthropic_api_key, app.activeAccount().?);
     try app.expectModel(test_anthropic_model.name());
     // The cached list belongs to the replaced principal, so it goes.
-    try std.testing.expect(app.accounts.catalog.isEmpty(.openai_sub_login));
+    try std.testing.expect(app.accounts.catalog.isEmpty(.openai_plan));
 
     const blocks = app.session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 1), blocks.len);
     try std.testing.expectEqualStrings(
-        "Drinky found a replacement credential for openai-sub-login. " ++
+        "Drinky found a replacement credential for openai-plan. " ++
             "Drinky removed the prior account evidence. " ++
-            "Fetch the model list of openai-sub-login with /model.",
+            "Fetch the model list of openai-plan with /model.",
         blocks[0].content.event.text.items,
     );
     try std.testing.expect(!blocks[0].content.event.is_error);
@@ -8278,7 +8278,7 @@ test "token request failures keep the credential before a grant rejection remove
     try tmp.dir.writeFile(io, .{
         .sub_path = ".drinky/auth.json",
         .data =
-        \\{ "anthropic-sub-login":
+        \\{ "anthropic-plan":
         \\    { "access": "a", "refresh": "r", "expires_ms": 4102444800000 } }
         ,
     });
@@ -8287,7 +8287,7 @@ test "token request failures keep the credential before a grant rejection remove
     app.initForTest(gpa);
     app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
     defer app.accounts.deinit();
-    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_sub_login), .{
+    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_plan), .{
         .model = test_anthropic_model,
         .system = "",
         .retry = .{},
@@ -8296,7 +8296,7 @@ test "token request failures keep the credential before a grant rejection remove
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
-    app.session.account_shown = .anthropic_sub_login;
+    app.session.account_shown = .anthropic_plan;
 
     for ([_]anyerror{
         error.TokenRequestFailed,
@@ -8313,20 +8313,20 @@ test "token request failures keep the credential before a grant rejection remove
         defer app.freeWorkerResult(&result);
         try app.finishWorkerResult(&result);
 
-        try std.testing.expect(app.accounts.isAuthenticated(.anthropic_sub_login));
+        try std.testing.expect(app.accounts.isAuthenticated(.anthropic_plan));
         try std.testing.expectEqual(
-            ai.llm.Account.anthropic_sub_login,
+            ai.llm.Account.anthropic_plan,
             app.activeAccount().?,
         );
         try std.testing.expectEqual(
-            ai.llm.Account.anthropic_sub_login,
+            ai.llm.Account.anthropic_plan,
             app.session.account_shown.?,
         );
     }
     {
         var file = (try ai.json_store.open(gpa, io, app.accounts.anthropic_auth.path)).?;
         defer file.deinit();
-        try std.testing.expect(file.entry("anthropic-sub-login") != null);
+        try std.testing.expect(file.entry("anthropic-plan") != null);
     }
     try std.testing.expectEqual(@as(usize, 2), app.session.transcript.blocks().len);
 
@@ -8343,12 +8343,12 @@ test "token request failures keep the credential before a grant rejection remove
         try app.finishWorkerResult(&result);
     }
 
-    try std.testing.expect(!app.accounts.isAuthenticated(.anthropic_sub_login));
+    try std.testing.expect(!app.accounts.isAuthenticated(.anthropic_plan));
     try std.testing.expect(app.agent.client == null);
     try std.testing.expect(app.session.account_shown == null);
     var file = (try ai.json_store.open(gpa, io, app.accounts.anthropic_auth.path)).?;
     defer file.deinit();
-    try std.testing.expect(file.entry("anthropic-sub-login") == null);
+    try std.testing.expect(file.entry("anthropic-plan") == null);
 
     const blocks = app.session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 4), blocks.len);
@@ -8364,12 +8364,12 @@ test "token request failures keep the credential before a grant rejection remove
         "/login",
     ) == null);
     try std.testing.expectEqualStrings(
-        "Drinky signed out of anthropic-sub-login. Select an account to sign in.",
+        "Drinky signed out of anthropic-plan. Select an account to sign in.",
         blocks[3].content.event.text.items,
     );
     try std.testing.expect(app.session.mode == .picking);
     try std.testing.expectEqualStrings(
-        "anthropic-sub-login",
+        "anthropic-plan",
         app.session.mode.picking.picker.options[0],
     );
 }
@@ -8389,7 +8389,7 @@ test "a replacement saved before invalidation keeps the account active" {
     try tmp.dir.writeFile(io, .{
         .sub_path = ".drinky/auth.json",
         .data =
-        \\{ "anthropic-sub-login":
+        \\{ "anthropic-plan":
         \\    { "access": "old_access", "refresh": "old_refresh",
         \\      "expires_ms": 4102444800000 } }
         ,
@@ -8399,12 +8399,12 @@ test "a replacement saved before invalidation keeps the account active" {
     app.initForTest(gpa);
     app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
     defer app.accounts.deinit();
-    try ai.testing.seedAccount(&app.accounts, .anthropic_sub_login, &.{"claude-opus-5"});
+    try ai.testing.seedAccount(&app.accounts, .anthropic_plan, &.{"claude-opus-5"});
     // The model of the replaced principal. Its list goes with the credential, so
     // the reload leaves the account with no model at all.
     var discovered = test_anthropic_model;
     discovered.context_window = 1;
-    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_sub_login), .{
+    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_plan), .{
         .model = discovered,
         .system = "",
         .retry = .{},
@@ -8413,13 +8413,13 @@ test "a replacement saved before invalidation keeps the account active" {
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
-    app.session.account_shown = .anthropic_sub_login;
+    app.session.account_shown = .anthropic_plan;
     // The block of that proof stands above the turn, so only the replacement can
     // take it out again.
-    try app.session.transcript.appendStream(.thinking, .anthropic_sub_login, "thought");
+    try app.session.transcript.appendStream(.thinking, .anthropic_plan, "thought");
     app.session.beginTurn(1);
 
-    try ai.json_store.save(gpa, io, app.accounts.anthropic_auth.path, "anthropic-sub-login", .{
+    try ai.json_store.save(gpa, io, app.accounts.anthropic_auth.path, "anthropic-plan", .{
         .access = "new_access",
         .refresh = "new_refresh",
         .expires_ms = 4102444800000,
@@ -8427,7 +8427,7 @@ test "a replacement saved before invalidation keeps the account active" {
 
     // The replacement can belong to another principal, so this proof of the
     // replaced credential must not survive the reload.
-    const replay: ai.llm.Item.Reasoning.Replay = .{ .anthropic_sub_login = .{
+    const replay: ai.llm.Item.Reasoning.Replay = .{ .anthropic_plan = .{
         .signature = .{ .text = "thought", .signature = "proof" },
     } };
     try app.agent.items.append(gpa, .{ .reasoning = .{ .replay = try replay.dupe(gpa) } });
@@ -8442,9 +8442,9 @@ test "a replacement saved before invalidation keeps the account active" {
     defer app.freeWorkerResult(&result);
     try app.finishWorkerResult(&result);
 
-    try std.testing.expect(app.accounts.isAuthenticated(.anthropic_sub_login));
+    try std.testing.expect(app.accounts.isAuthenticated(.anthropic_plan));
     try std.testing.expectEqual(
-        ai.llm.Account.anthropic_sub_login,
+        ai.llm.Account.anthropic_plan,
         app.activeAccount().?,
     );
     try std.testing.expectEqualStrings(
@@ -8469,7 +8469,7 @@ test "a replacement saved before invalidation keeps the account active" {
     ) == null);
     try std.testing.expectEqualStrings(
         "Drinky reloaded the refresh credential that another Drinky instance saved. " ++
-            "Fetch the model list of anthropic-sub-login with /model.",
+            "Fetch the model list of anthropic-plan with /model.",
         blocks[1].content.event.text.items,
     );
 }
@@ -8489,7 +8489,7 @@ test "a rejected refresh credential hands the session to another account" {
     try tmp.dir.writeFile(io, .{
         .sub_path = ".drinky/auth.json",
         .data =
-        \\{ "anthropic-sub-login":
+        \\{ "anthropic-plan":
         \\    { "access": "a", "refresh": "r", "expires_ms": 4102444800000 } }
         ,
     });
@@ -8500,7 +8500,7 @@ test "a rejected refresh credential hands the session to another account" {
     defer app.accounts.deinit();
     try ai.testing.seedAccount(&app.accounts, .openai_api_key, &.{"gpt-5.6-sol"});
     try app.state.record(.openai_api_key, test_openai_model, .low);
-    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_sub_login), .{
+    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_plan), .{
         .model = test_anthropic_model,
         .system = "",
         .retry = .{},
@@ -8509,7 +8509,7 @@ test "a rejected refresh credential hands the session to another account" {
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
-    app.session.account_shown = .anthropic_sub_login;
+    app.session.account_shown = .anthropic_plan;
     app.session.beginTurn(1);
 
     var result: WorkerResult = .{
@@ -8522,7 +8522,7 @@ test "a rejected refresh credential hands the session to another account" {
     defer app.freeWorkerResult(&result);
     try app.finishWorkerResult(&result);
 
-    try std.testing.expect(!app.accounts.isAuthenticated(.anthropic_sub_login));
+    try std.testing.expect(!app.accounts.isAuthenticated(.anthropic_plan));
     try std.testing.expectEqual(ai.llm.Account.openai_api_key, app.activeAccount().?);
     try std.testing.expectEqual(ai.llm.Account.openai_api_key, app.session.account_shown.?);
     try app.expectModel(test_openai_model.name());
@@ -8536,7 +8536,7 @@ test "a rejected refresh credential hands the session to another account" {
         "/login",
     ) == null);
     try std.testing.expectEqualStrings(
-        "Drinky signed out of anthropic-sub-login. " ++
+        "Drinky signed out of anthropic-plan. " ++
             "Drinky now uses openai-api-key/gpt-5.6-sol.",
         blocks[1].content.event.text.items,
     );
@@ -8560,7 +8560,7 @@ test "a rejected refresh credential names the account with no model it hands the
     try tmp.dir.writeFile(io, .{
         .sub_path = ".drinky/auth.json",
         .data =
-        \\{ "anthropic-sub-login":
+        \\{ "anthropic-plan":
         \\    { "access": "a", "refresh": "r", "expires_ms": 4102444800000 } }
         ,
     });
@@ -8571,7 +8571,7 @@ test "a rejected refresh credential names the account with no model it hands the
     // offers no model.
     app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{ .openai = "sk-openai" });
     defer app.accounts.deinit();
-    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_sub_login), .{
+    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_plan), .{
         .model = test_anthropic_model,
         .system = "",
         .retry = .{},
@@ -8580,7 +8580,7 @@ test "a rejected refresh credential names the account with no model it hands the
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
-    app.session.account_shown = .anthropic_sub_login;
+    app.session.account_shown = .anthropic_plan;
     app.session.beginTurn(1);
 
     var result: WorkerResult = .{
@@ -8593,13 +8593,13 @@ test "a rejected refresh credential names the account with no model it hands the
     defer app.freeWorkerResult(&result);
     try app.finishWorkerResult(&result);
 
-    try std.testing.expect(!app.accounts.isAuthenticated(.anthropic_sub_login));
+    try std.testing.expect(!app.accounts.isAuthenticated(.anthropic_plan));
     try std.testing.expectEqual(ai.llm.Account.openai_api_key, app.activeAccount().?);
     try std.testing.expect(app.agent.model == null);
 
     const blocks = app.session.transcript.blocks();
     try std.testing.expectEqualStrings(
-        "Drinky signed out of anthropic-sub-login. Drinky now uses openai-api-key. " ++
+        "Drinky signed out of anthropic-plan. Drinky now uses openai-api-key. " ++
             "Fetch the model list of openai-api-key with /model.",
         blocks[blocks.len - 1].content.event.text.items,
     );
@@ -10539,7 +10539,7 @@ test "the status answer states the branch inside a Herdr pane" {
     defer gpa.free(text);
     try std.testing.expectEqualStrings(
         "~/project (topic) · Context: 0% (0/1.0M) · Cost: ~$0.00 · " ++
-            "Model: anthropic-sub-login/claude-opus-5 · Effort: low",
+            "Model: anthropic-plan/claude-opus-5 · Effort: low",
         text,
     );
 }
@@ -11496,7 +11496,7 @@ test "a credential rejection returns the Telegram prompt to the editor" {
     try tmp.dir.writeFile(io, .{
         .sub_path = ".drinky/auth.json",
         .data =
-        \\{ "anthropic-sub-login":
+        \\{ "anthropic-plan":
         \\    { "access": "a", "refresh": "r", "expires_ms": 4102444800000 } }
         ,
     });
@@ -11516,13 +11516,13 @@ test "a credential rejection returns the Telegram prompt to the editor" {
     app.agent.deinit();
     app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
     defer app.accounts.deinit();
-    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_sub_login), .{
+    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_plan), .{
         .model = test_anthropic_model,
         .system = "",
         .retry = .{},
         .environ = .empty,
     });
-    app.session.account_shown = .anthropic_sub_login;
+    app.session.account_shown = .anthropic_plan;
     try app.controller.store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
     try app.controller.attachSaved(0);
     try server.waitForLongPoll();

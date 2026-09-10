@@ -497,16 +497,16 @@ test "a model names the levels its provider stated alone" {
 // limit, and no request of that vendor carries one, so no such model is capped.
 test outputLimitUnknown {
     var model = try init("claude-opus-5");
-    try std.testing.expect(model.outputLimitUnknown(.anthropic_sub_login));
-    try std.testing.expect(model.outputLimitUnknown(.anthropic_api_login));
+    try std.testing.expect(model.outputLimitUnknown(.anthropic_plan));
+    try std.testing.expect(model.outputLimitUnknown(.anthropic_api));
     try std.testing.expect(model.outputLimitUnknown(.anthropic_api_key));
-    try std.testing.expect(!model.outputLimitUnknown(.openai_sub_login));
+    try std.testing.expect(!model.outputLimitUnknown(.openai_plan));
     try std.testing.expect(!model.outputLimitUnknown(.openai_api_key));
-    try std.testing.expect(!model.outputLimitUnknown(.xai_sub_login));
+    try std.testing.expect(!model.outputLimitUnknown(.xai_plan));
     try std.testing.expect(!model.outputLimitUnknown(.xai_api_key));
-    try std.testing.expect(!model.outputLimitUnknown(.openrouter_api_login));
+    try std.testing.expect(!model.outputLimitUnknown(.openrouter_api));
     try std.testing.expect(!model.outputLimitUnknown(.openrouter_api_key));
-    try std.testing.expect(!model.outputLimitUnknown(.google_cloud_keyfile));
+    try std.testing.expect(!model.outputLimitUnknown(.google_cloud_key));
 
     // A stated limit answers the question for every account.
     model.tokens_max = 64_000;

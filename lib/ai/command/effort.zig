@@ -113,7 +113,7 @@ fn freeRows(rows: []const []const u8) void {
 
 test "the picker lists every level, preselecting the current one" {
     const gpa = std.testing.allocator;
-    var agent = testing.agent(gpa, .{ .anthropic_sub_login = undefined });
+    var agent = testing.agent(gpa, .{ .anthropic_plan = undefined });
     defer agent.deinit();
     agent.setEffort(.high);
     var context = contextForTest(&agent);
@@ -136,7 +136,7 @@ test "the picker lists every level, preselecting the current one" {
 // fold before the choice. A tie folds to the lower level.
 test "the picker marks a level that the model folds" {
     const gpa = std.testing.allocator;
-    var agent = testing.agent(gpa, .{ .anthropic_sub_login = undefined });
+    var agent = testing.agent(gpa, .{ .anthropic_plan = undefined });
     defer agent.deinit();
     var model = model_testing.model("subset");
     model.efforts = .initEmpty();
@@ -162,7 +162,7 @@ test "the picker marks a level that the model folds" {
 // no row. The wish stands, and the request carries the nearest named level.
 test "a model that names fewer levels still offers every level" {
     const gpa = std.testing.allocator;
-    var agent = testing.agent(gpa, .{ .anthropic_sub_login = undefined });
+    var agent = testing.agent(gpa, .{ .anthropic_plan = undefined });
     defer agent.deinit();
     var model = model_testing.model("subset");
     model.efforts = .initEmpty();
@@ -183,7 +183,7 @@ test "a model that names fewer levels still offers every level" {
 
 test "a model that names no level keeps every row" {
     const gpa = std.testing.allocator;
-    var agent = testing.agent(gpa, .{ .anthropic_sub_login = undefined });
+    var agent = testing.agent(gpa, .{ .anthropic_plan = undefined });
     defer agent.deinit();
     agent.model = model_testing.bareModel("bare");
     var context = contextForTest(&agent);
@@ -207,7 +207,7 @@ test "a model that names no level keeps every row" {
 // picker stands while no account is active.
 test "the picker stands while no account is active" {
     const gpa = std.testing.allocator;
-    var agent = testing.agent(gpa, .{ .anthropic_sub_login = undefined });
+    var agent = testing.agent(gpa, .{ .anthropic_plan = undefined });
     defer agent.deinit();
     agent.setEffort(.high);
     agent.signOut();
@@ -225,7 +225,7 @@ test "the picker stands while no account is active" {
 // before that, so the picker stands without a model too.
 test "the picker stands while the account offers no model" {
     const gpa = std.testing.allocator;
-    var agent = testing.agent(gpa, .{ .anthropic_sub_login = undefined });
+    var agent = testing.agent(gpa, .{ .anthropic_plan = undefined });
     defer agent.deinit();
     agent.model = null;
     var context = contextForTest(&agent);
@@ -242,7 +242,7 @@ test "the picker stands while the account offers no model" {
 
 test "select applies the level at a row index, rejecting out of range" {
     const gpa = std.testing.allocator;
-    var agent = testing.agent(gpa, .{ .anthropic_sub_login = undefined });
+    var agent = testing.agent(gpa, .{ .anthropic_plan = undefined });
     defer agent.deinit();
     var context = contextForTest(&agent);
 

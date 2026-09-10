@@ -18,18 +18,18 @@ pub fn accounts(
     ready: struct {
         anthropic: bool = false,
         openai: bool = false,
-        anthropic_api_login: bool = false,
+        anthropic_api: bool = false,
         xai: bool = false,
         openrouter: bool = false,
         google: bool = false,
     },
 ) Accounts {
     var registry = model_testing.accounts(environment);
-    registry.anthropic_sub_login_ready = ready.anthropic;
-    registry.openai_sub_login_ready = ready.openai;
-    registry.anthropic_api_login_ready = ready.anthropic_api_login;
-    registry.xai_sub_login_ready = ready.xai;
-    registry.openrouter_api_login_ready = ready.openrouter;
+    registry.anthropic_plan_ready = ready.anthropic;
+    registry.openai_plan_ready = ready.openai;
+    registry.anthropic_api_ready = ready.anthropic_api;
+    registry.xai_plan_ready = ready.xai;
+    registry.openrouter_api_ready = ready.openrouter;
     if (ready.google) registry.google_auth = .{
         .gpa = registry.gpa,
         .io = registry.io,
