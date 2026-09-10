@@ -1,15 +1,17 @@
 //! The bottom status line. It shows the working directory with its branch, then
-//! the session numbers, on the left. It shows `account/model` and the effort on
-//! the right. A notice temporarily replaces the line. The renderer uses a
-//! caller-built `Info` snapshot.
+//! the session numbers, on the left. It shows `Model: account/model` and the
+//! effort on the right. A notice temporarily replaces the line. The renderer
+//! uses a caller-built `Info` snapshot.
 //!
 //! A narrow window first shortens fields in one fixed order. It then removes
 //! complete parts in another fixed order. The context gauge never goes.
 //!
 //! The line paints muted. Two kinds of field leave that role. A gauge takes a
 //! color when it fills past a threshold, and an identity field takes the normal
-//! intensity. Color means pressure. Intensity means identity. A notice takes the
-//! role of its severity, and an information notice takes the accent role.
+//! intensity. Color means pressure. Intensity means identity. A model value that
+//! can run no turn takes the warning color, because it blocks the next send. A
+//! notice takes the role of its severity, and an information notice takes the
+//! accent role.
 
 const std = @import("std");
 
@@ -44,8 +46,8 @@ pub const Info = struct {
     /// The active model, or null when the account offers none yet.
     model: ?[]const u8,
     effort: []const u8,
-    /// The active account. Null shows "Account: Signed out" instead of the
-    /// identifier and the effort.
+    /// The active account. Null writes `signed out` as the model value, and the
+    /// effort stays, because `/effort` sets a level while signed out.
     account: ?ai.llm.Account,
     /// A subscription's allowance, or null when the active provider reports
     /// none (an API key, or a non-subscription turn). Each window whose duration
@@ -102,10 +104,10 @@ pub const Gauge = struct {
 /// so the whole line always fits and the writer can never fail.
 pub const directory_bytes_max = 96;
 
-/// The right-side indicator shown while no account is active.
-const signed_out_label = "Account: Signed out";
-/// The model slot of an account that offers no model yet.
-const no_model_label = "No model";
+/// The model value while no account is active.
+const signed_out_value = "signed out";
+/// The model value of an account that offers no model yet.
+const no_model_value = "none";
 
 /// Joins the account identifier and the model name into one identifier.
 const account_model_separator = "/";
@@ -221,7 +223,7 @@ fn reduce(parts: *Parts, reduction: Reduction) void {
 const Run = struct { start: usize, end: usize, name: role.Name };
 
 /// The runs one side can hold: the context gauge and the two quota windows on
-/// the left, the model and the effort value on the right.
+/// the left, the model value and the effort level on the right.
 const runs_max = 3;
 
 /// One side of the line under construction: its bytes, and the runs that leave
@@ -393,40 +395,39 @@ pub fn writeNumbers(out: *std.Io.Writer, info: *const Info) !void {
     try out.writeAll(line.text());
 }
 
-/// The agent: `account/model · Effort: level`, or the signed-out indicator.
-/// `account/model` is one identifier, so it takes one run in the normal
-/// intensity. A narrow line drops the account and keeps the model, which still
-/// names something real. An account with no model writes its identifier alone,
-/// then the warning in the model slot. The effort level carries its own label,
-/// so a part that goes away never leaves a bare value behind.
+/// The agent: `Model: account/model · Effort: level`. Every state of the
+/// account writes one label and one value, so the three read alike. The value
+/// takes one run. That run holds the normal intensity, and the warning color
+/// for a value that can run no turn, because it blocks the next send. A narrow
+/// line drops the account and keeps the value, which still names the state.
+/// Each part carries its own label, so a part that goes away never leaves a
+/// bare value behind.
 fn writeRight(line: *Line, info: *const Info, parts: *const Parts) !void {
-    const account = info.account orelse return line.out.writeAll(signed_out_label);
-    const identity_start = line.offset();
-    const model = info.model orelse {
-        if (parts.account) {
-            try line.out.writeAll(account.id());
-            line.mark(identity_start, .text);
-            try line.out.writeAll(separator);
-        }
-        // An account with no model can run nothing, and the user passes that
-        // state by fetching a list, so it warns rather than fails.
-        const warning_start = line.offset();
-        try line.out.writeAll(no_model_label);
-        line.mark(warning_start, .warning);
-        try writeEffort(line, info, parts);
-        return;
+    try line.out.writeAll("Model: ");
+    const value_start = line.offset();
+    const account = info.account orelse {
+        try line.out.writeAll(signed_out_value);
+        line.mark(value_start, .warning);
+        return writeEffort(line, info, parts);
     };
     if (parts.account) {
         try line.out.writeAll(account.id());
         try line.out.writeAll(account_model_separator);
     }
+    // An account with no model can run nothing, and the user passes that state
+    // by fetching a list, so it warns rather than fails.
+    const model = info.model orelse {
+        try line.out.writeAll(no_model_value);
+        line.mark(value_start, .warning);
+        return writeEffort(line, info, parts);
+    };
     try line.out.writeAll(model);
-    line.mark(identity_start, .text);
+    line.mark(value_start, .text);
     try writeEffort(line, info, parts);
 }
 
-/// The effort level, which follows the identifier whether the account offers a
-/// model or not.
+/// The effort level, which follows the model value in every state of the
+/// account.
 fn writeEffort(line: *Line, info: *const Info, parts: *const Parts) !void {
     if (parts.effort) {
         try line.out.writeAll(separator);
@@ -749,7 +750,7 @@ test "the summary states every part of the line in full, in the order of the lin
     try expectSummary(
         "~/github/clebert/drinky (main) · Context: 21% (206k/1.0M) · Cost: ~$0.39 · " ++
             "5h: 12% (53m) · Week: 74% (6d) · Cache: 87% · " ++
-            "anthropic-sub-login/claude-opus-4-8 · Effort: xhigh",
+            "Model: anthropic-sub-login/claude-opus-4-8 · Effort: xhigh",
         &test_info,
     );
 
@@ -757,15 +758,17 @@ test "the summary states every part of the line in full, in the order of the lin
     idle.turn_active = false;
     try expectSummary(
         "~/github/clebert/drinky (main) · Context: 21% (206k/1.0M) · Cost: ~$0.39 · " ++
-            "anthropic-sub-login/claude-opus-4-8 · Effort: xhigh",
+            "Model: anthropic-sub-login/claude-opus-4-8 · Effort: xhigh",
         &idle,
     );
 
+    // The three states of the account read as one field with one value.
     var signed_out = idle;
     signed_out.account = null;
     signed_out.context_tokens = null;
     try expectSummary(
-        "~/github/clebert/drinky (main) · Context: Unknown · Cost: ~$0.39 · Account: Signed out",
+        "~/github/clebert/drinky (main) · Context: Unknown · Cost: ~$0.39 · " ++
+            "Model: signed out · Effort: xhigh",
         &signed_out,
     );
 
@@ -774,7 +777,7 @@ test "the summary states every part of the line in full, in the order of the lin
     no_model.context_window = null;
     no_model.directory = "";
     try expectSummary(
-        "Context: 206k · Cost: ~$0.39 · anthropic-sub-login · No model · Effort: xhigh",
+        "Context: 206k · Cost: ~$0.39 · Model: anthropic-sub-login/none · Effort: xhigh",
         &no_model,
     );
 
@@ -783,7 +786,7 @@ test "the summary states every part of the line in full, in the order of the lin
     empty.branch = null;
     try expectSummary(
         "~/github/clebert/drinky · Context: 0% (0/1.0M) · Cost: ~$0.39 · " ++
-            "anthropic-sub-login/claude-opus-4-8 · Effort: xhigh",
+            "Model: anthropic-sub-login/claude-opus-4-8 · Effort: xhigh",
         &empty,
     );
 }
@@ -878,8 +881,9 @@ test render {
         // wait until it starts again.
         "5h: 12% (53m) · Week: 74% (6d)",
         "Cache: 87%",
-        // The identifier and the effort value carry their own intensity, so a
+        // The model value and the effort level carry their own intensity, so a
         // style sequence sits between them and the muted text around them.
+        "Model: ",
         "anthropic-sub-login/claude-opus-4-8",
         " · Effort: ",
         "xhigh",
@@ -928,66 +932,88 @@ test "a narrow window shortens fields before it gives up parts" {
         columns: usize,
         shows: []const []const u8,
         hides: []const []const u8,
+        /// The model of this row, so a row can pin the tail of the ladder for
+        /// an account that offers none.
+        model: ?[]const u8 = test_info.model,
+        /// The account of this row. Null pins the tail while signed out.
+        account: ?ai.llm.Account = test_info.account,
     }{
         .{
             // The directory shortens before any complete part goes.
-            .columns = 165,
+            .columns = 172,
             .shows = &.{ "~/…/drinky (main)", "Context: 21% (206k/1.0M)", "Cache: 87%" },
             .hides = &.{"~/github"},
         },
         .{
             // The context gauge shortens before any complete part goes.
-            .columns = 150,
+            .columns = 157,
             .shows = &.{ "Context: 21%", "5h: 12% (53m)", "Week: 74% (6d)", "Cache: 87%" },
             .hides = &.{"(206k/1.0M)"},
         },
         .{
             // Both countdowns go together, so the two windows always read alike.
-            .columns = 140,
+            .columns = 147,
             .shows = &.{ "Cost: ~$0.39", "5h: 12%", "Week: 74%", "Cache: 87%" },
             .hides = &.{ "(53m)", "(6d)" },
         },
         .{
-            .columns = 130,
+            .columns = 137,
             .shows = &.{ "Cost: ~$0.39", "5h: 12%", "Week: 74%" },
             .hides = &.{"Cache:"},
         },
         .{
             // The longest window goes first.
-            .columns = 115,
+            .columns = 122,
             .shows = &.{ "Cost: ~$0.39", "5h: 12%" },
             .hides = &.{ "Week:", "Cache:" },
         },
         .{
             // The session cost outlives every measurement of one request.
-            .columns = 105,
+            .columns = 112,
             .shows = &.{ "~/…/drinky (main)", "Cost: ~$0.39", "anthropic-sub-login/" },
             .hides = &.{ "5h:", "Week:", "Cache:" },
         },
         .{
             // The account prefix goes, and the model name stays whole.
-            .columns = 80,
+            .columns = 87,
             .shows = &.{ "~/…/drinky (main)", "claude-opus-4-8", "Effort: " },
             .hides = &.{ "anthropic-sub-login", "Cost:" },
         },
         .{
             // The branch is a detail of the place, so it goes while the
             // directory stays.
-            .columns = 60,
+            .columns = 67,
             .shows = &.{ "~/…/drinky · Context: 21%", "claude-opus-4-8", "Effort: " },
             .hides = &.{"(main)"},
         },
         .{
-            .columns = 40,
+            .columns = 47,
             .shows = &.{ "Context: 21%", "claude-opus-4-8" },
             .hides = &.{ "drinky", "Effort:" },
+        },
+        .{
+            // The tail of the ladder still names the state of the account, so
+            // an account with no model and no account at all stay distinct.
+            .columns = 32,
+            .model = null,
+            .shows = &.{ "Context: 21%", "Model: ", "none" },
+            .hides = &.{ "anthropic-sub-login", "Effort:" },
+        },
+        .{
+            .columns = 32,
+            .account = null,
+            .shows = &.{ "Context: 21%", "Model: ", "signed out" },
+            .hides = &.{"Effort:"},
         },
     };
 
     for (steps) |step| {
         var out: std.Io.Writer.Allocating = .init(gpa);
         defer out.deinit();
-        try renderForTest(gpa, &test_info, step.columns, &out);
+        var info = test_info;
+        info.model = step.model;
+        info.account = step.account;
+        try renderForTest(gpa, &info, step.columns, &out);
         const painted = out.written();
         try expectShows(painted, step.shows);
         try expectHides(painted, step.hides);
@@ -1096,7 +1122,7 @@ test "the color follows the share that the line prints" {
     });
 }
 
-test "the identifier and the effort value leave the faint intensity" {
+test "the model value and the effort level leave the faint intensity" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
@@ -1112,19 +1138,11 @@ test "the identifier and the effort value leave the faint intensity" {
         reset ++ "anthropic-sub-login/claude-opus-4-8" ++ muted,
         reset ++ "xhigh" ++ muted,
     });
-    // The label keeps the muted role of the line.
-    try expectHides(painted, &.{ reset ++ "Effort", reset ++ "claude-opus-4-8" });
-
-    // An account with no model paints its identifier alone, then the warning.
-    var no_model = test_info;
-    no_model.model = null;
-    var no_model_out: std.Io.Writer.Allocating = .init(gpa);
-    defer no_model_out.deinit();
-    try renderForTest(gpa, &no_model, 200, &no_model_out);
-    try expectShows(no_model_out.written(), &.{
-        reset ++ "anthropic-sub-login" ++ muted ++ " · " ++ reset ++
-            comptime role.sequence(.warning) ++ "No model" ++ muted,
-        reset ++ "xhigh" ++ muted,
+    // Each label keeps the muted role of the line.
+    try expectHides(painted, &.{
+        reset ++ "Model",
+        reset ++ "Effort",
+        reset ++ "claude-opus-4-8",
     });
 }
 
@@ -1180,7 +1198,7 @@ test "a long branch keeps 16 columns and a whole grapheme" {
     defer out.deinit();
     // The width that the shortened branch needs, and one column less than the
     // whole branch needs.
-    try renderForTest(gpa, &info, 175, &out);
+    try renderForTest(gpa, &info, 182, &out);
 
     const painted = out.written();
     try expectShows(painted, &.{
@@ -1261,7 +1279,9 @@ test "an information notice takes the information symbol in the accent role" {
     ) == null);
 }
 
-test "a signed-out status shows the indicator in place of the model" {
+// The effort states the intention of the user, and `/effort` sets a level while
+// signed out, so the level stays on the line with no account behind it.
+test "a signed-out status names the state in the model value and keeps the effort" {
     const gpa = std.testing.allocator;
     var info = test_info;
     info.account = null;
@@ -1270,15 +1290,23 @@ test "a signed-out status shows the indicator in place of the model" {
     defer out.deinit();
     try renderForTest(gpa, &info, 120, &out);
 
+    // The value takes its own run, so the reset opens it, the muted role closes
+    // it, and the escape bytes of that run sit behind the label.
     const painted = out.written();
-    try expectShows(painted, &.{"Account: Signed out"});
+    try expectShows(painted, &.{
+        "Model: ",
+        comptime attribute.sequence(.reset) ++ role.sequence(.warning) ++ "signed out" ++
+            role.sequence(.muted),
+        " · Effort: ",
+        "xhigh",
+    });
     // No prompt tokens sent yet: the cache figure is absent, never a 0/0 rate.
-    try expectHides(painted, &.{ "claude-opus-4-8", "Effort:", "Cache" });
+    try expectHides(painted, &.{ "claude-opus-4-8", "Cache" });
 }
 
-// Drinky compiles no model in, so a signed-in account can offer none. The slot
+// Drinky compiles no model in, so a signed-in account can offer none. The value
 // names that state and warns, because the user passes it with one fetch.
-test "an account with no model shows the label in the warning role" {
+test "an account with no model shows the value in the warning role" {
     const gpa = std.testing.allocator;
     var info = test_info;
     info.model = null;
@@ -1287,14 +1315,16 @@ test "an account with no model shows the label in the warning role" {
     defer out.deinit();
     try renderForTest(gpa, &info, 200, &out);
 
+    // One run covers the account and the empty slot, so the whole value warns.
     const painted = out.written();
     try expectShows(painted, &.{
-        "anthropic-sub-login",
-        comptime role.sequence(.warning) ++ "No model",
+        "Model: ",
+        comptime attribute.sequence(.reset) ++ role.sequence(.warning) ++
+            "anthropic-sub-login/none" ++ role.sequence(.muted),
         " · Effort: ",
         "xhigh",
     });
-    try expectHides(painted, &.{ "claude-opus-4-8", "anthropic-sub-login/" });
+    try expectHides(painted, &.{ "claude-opus-4-8", "signed out" });
 }
 
 // A share needs a limit. A model whose window no source states shows the tokens
@@ -1395,7 +1425,7 @@ test "the summary states the credit pool of a running turn" {
     info.credits = .{ .total = 10, .used = 2.864085024 };
     try expectSummary(
         "~/github/clebert/drinky (main) · Context: 21% (206k/1.0M) · Cost: ~$0.39 · " ++
-            "Credits: $7.14 · Cache: 87% · openrouter-api-key/openai/gpt-5.6-sol · " ++
+            "Credits: $7.14 · Cache: 87% · Model: openrouter-api-key/openai/gpt-5.6-sol · " ++
             "Effort: xhigh",
         &info,
     );
@@ -1448,13 +1478,13 @@ test "a narrow window drops the credit pool before the session cost" {
     info.credits = .{ .total = 10, .used = 2.86 };
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    try renderForTest(gpa, &info, 120, &out);
+    try renderForTest(gpa, &info, 127, &out);
     try expectShows(out.written(), &.{ "Cost: ~$0.39", "Credits: $7.14" });
     try expectHides(out.written(), &.{"Cache:"});
 
     var out2: std.Io.Writer.Allocating = .init(gpa);
     defer out2.deinit();
-    try renderForTest(gpa, &info, 110, &out2);
+    try renderForTest(gpa, &info, 117, &out2);
     try expectShows(out2.written(), &.{ "~/…/drinky (main)", "Context: 21%", "Cost: ~$0.39" });
     try expectHides(out2.written(), &.{ "Credits:", "Cache:" });
 }
@@ -1515,7 +1545,7 @@ test "a running turn hides the cache, quota, and credits until this turn reports
     info.credits = null;
     try expectSummary(
         "~/github/clebert/drinky (main) · Context: 21% (206k/1.0M) · Cost: ~$0.39 · " ++
-            "anthropic-sub-login/claude-opus-4-8 · Effort: xhigh",
+            "Model: anthropic-sub-login/claude-opus-4-8 · Effort: xhigh",
         &info,
     );
 }

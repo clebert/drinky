@@ -5932,7 +5932,7 @@ test "mid-turn Enter queues a message but refuses a slash line or a blank line" 
 /// The status answer of the test app: no place, because the test names no
 /// directory, then the numbers and the agent of its signed-in session.
 const test_status_line = "Context: 0% (0/1.0M) · Cost: ~$0.00 · " ++
-    "anthropic-sub-login/claude-opus-5 · Effort: low";
+    "Model: anthropic-sub-login/claude-opus-5 · Effort: low";
 
 // The status answer reads the snapshot of the session and opens no picker, so it
 // is the one command that a turn hosts. Its event stays in the terminal, because
@@ -9766,7 +9766,7 @@ test "the status answer states the branch inside a Herdr pane" {
     defer gpa.free(text);
     try std.testing.expectEqualStrings(
         "~/project (topic) · Context: 0% (0/1.0M) · Cost: ~$0.00 · " ++
-            "anthropic-sub-login/claude-opus-5 · Effort: low",
+            "Model: anthropic-sub-login/claude-opus-5 · Effort: low",
         text,
     );
 }
@@ -10652,7 +10652,8 @@ test "a /status from Telegram gets one reply and no terminal event, also during 
     try app.controller.attachSaved(0);
     try server.waitForLongPoll();
     const blocks_before = app.session.transcript.blocks().len;
-    const status_wrapped = "ℹ ~/work/drinky · Context: 0 · Cost: ~$0.00 · Account: Signed out";
+    const status_wrapped =
+        "ℹ ~/work/drinky · Context: 0 · Cost: ~$0.00 · Model: signed out · Effort: low";
 
     // The answer states the full place and every field of the line, under the
     // information symbol, and it names no bot.

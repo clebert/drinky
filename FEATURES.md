@@ -103,14 +103,15 @@ to OpenRouter through a login or an API key, and to Gemini on the Gemini Enterpr
 - Each request resolves the level against its model in silence. A level that the model does not name
   folds to the nearest one it names. A tie takes the lower level. A model that takes no level drops
   it. The effort picker marks each such level, so the fold is visible before the choice.
-- An account with no model shows its identifier, then `No model` in the warning color. A send then
-  refuses and names the command that fixes it.
+- An account with no model reads `Model: account/none` in the warning color. A send then refuses and
+  names the command that fixes it.
 - Each account keeps the model it ran in this project. A switch, a login, and a restart return to
   it. An account with no cached list returns to no model, and a model that the account no longer
   offers drops in silence.
 - A restart resumes on the account, model, and effort level that this project used last.
-- `/model` refuses while signed out, because the status line hides the model then. `/effort` works
-  while signed out, and the next sign-in adopts the level.
+- `/model` refuses while signed out, because no account is signed in. The status line reads
+  `Model: signed out` in the warning color. `/effort` works while signed out, so the line keeps the
+  level, and the next sign-in adopts it.
 - The session cost counts every attempt, a canceled or rejected one included. A reply that reports
   its charge, as OpenRouter does, adds that charge, and every other reply adds its usage at public
   rates. A prompt that reaches the long-context threshold of its model bills the whole request at
@@ -211,9 +212,9 @@ to OpenRouter through a login or an API key, and to Gemini on the Gemini Enterpr
   skill row marks a configured name that no discovered skill carries.
 - **/status** — state the session in full: the directory with its branch, the context gauge, the
   cost, the quota, the credit pool, and the cache-hit rate of a running turn, and
-  `account/model · Effort: level`. The answer takes the words of the status line and reaches the
-  channel that asked alone: a terminal event that the chat never sees, or a Telegram reply that the
-  terminal never records.
+  `Model: account/model · Effort: level`. The answer takes the words of the status line and reaches
+  the channel that asked alone: a terminal event that the chat never sees, or a Telegram reply that
+  the terminal never records.
 - **/system** — show the complete system prompt as rendered Markdown in a scrollable full-window
   page. `M` toggles the exact source.
 - **/skill** — pick one of the discovered skills. Each row holds the first sentence of the
@@ -362,9 +363,10 @@ to OpenRouter through a login or an API key, and to Gemini on the Gemini Enterpr
 - The open input area grows to about a quarter of the screen and labels hidden rows `↑ Hidden: N`
   and `↓ Hidden: N`.
 - The bottom line shows `directory (branch)`, the context gauge, the cost, the quota, the credit
-  pool, and the cache-hit rate on the left, and `account/model · Effort: level` on the right. The
-  identifier and the effort value take the normal intensity, so the two settings that the user
-  changes stand out.
+  pool, and the cache-hit rate on the left, and `Model: account/model · Effort: level` on the right.
+  The model value and the effort level take the normal intensity, so the two settings that the user
+  changes stand out. A model value that can run no turn takes the warning color instead, account
+  prefix and all.
 - One temporary notice replaces the bottom line until the next user action. The notice keeps one
   row, so it never moves the editor. An information notice opens with `ℹ` in the accent color. A
   warning or a failure opens with `⚠` and carries its color.
