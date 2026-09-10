@@ -14,7 +14,8 @@ service account key file.
 
 - A prompt runs one turn to the end. Drinky streams the reply, runs the tool calls, and sends the
   results back until the model stops.
-- A turn runs at most 1000 tool rounds, so a runaway loop ends.
+- A turn fails after 1000 tool rounds or when one reply asks for more than 64 tool calls, so a
+  runaway model stops.
 - Read-only tool calls of one reply run in parallel. A `write`, `edit`, or `bash` call runs alone,
   in call order.
 - Enter during a turn queues a steering message. The turn takes it at the next tool round.

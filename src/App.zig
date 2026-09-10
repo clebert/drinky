@@ -1409,6 +1409,10 @@ fn turnFailureText(err: anyerror) ?[]const u8 {
         error.IncompleteReply => "Drinky did not receive the complete model response.",
         error.UncorrelatedReply => "Drinky could not match a streamed part of the response to " ++
             "the item it belongs to. The provider changed the order of its stream.",
+        error.TooManyToolCalls => std.fmt.comptimePrint(
+            "Drinky stopped the reply because it asked for more than {d} tool calls.",
+            .{ai.Agent.tool_calls_max},
+        ),
         error.TooManyToolRounds => "The turn reached the limit for tool rounds.",
         // The next step depends on the transition that follows this failure, so
         // the app names it in a later event.
@@ -4301,6 +4305,7 @@ test "a turn failure the agent named itself reads as a sentence, not an error na
         error.EmptyReply,
         error.IncompleteReply,
         error.UncorrelatedReply,
+        error.TooManyToolCalls,
         error.TooManyToolRounds,
         error.CredentialReplaced,
         error.TokenGrantRejected,
@@ -4313,6 +4318,10 @@ test "a turn failure the agent named itself reads as a sentence, not an error na
         try std.testing.expect(std.mem.indexOf(u8, text, " ") != null);
         try std.testing.expect(!std.mem.eql(u8, text, @errorName(err)));
     }
+    try std.testing.expectEqualStrings(
+        "Drinky stopped the reply because it asked for more than 64 tool calls.",
+        turnFailureText(error.TooManyToolCalls).?,
+    );
     // A credential the turn can still use names the retry, not a sign-in.
     for ([_]anyerror{
         error.TokenServiceUnavailable,

@@ -37,14 +37,6 @@ extension seams.
   every frame under one second and every 100 ms after. The reset epoch of the layout covers a
   rewrite above the window alone. Both spans of the live row take the unit, as in
   `Time: 3s · Timeout: 30s`, and the finished box keeps the exact span._
-- **Stop a reply that asks for too many tool calls** — the agent fails the turn when one reply asks
-  for more than 64 tool calls, so a model in a loop stops after one more call. _The count is a
-  constant on the agent, beside the round cap. Every call counts once, at its complete item, because
-  OpenAI can deliver a call with no opening event. The stop aborts the stream when the call past the
-  limit completes, and the turn unwinds as a cancel does: the unfinished reply drops, the finished
-  rounds stay, and the usage so far is recorded. The disposition is a failure, not a cancel, so the
-  transcript shows `Drinky stopped the reply because it asked for more than 64 tool calls.` and
-  Ctrl+N carries that sentence to the model._
 - **A cap on concurrent read-only calls** — at most 32 read-only calls of one reply run at a time,
   so a burst of calls spawns a bounded number of threads. _The process `Io.Threaded` has no
   concurrency limit, and a limit set there fails a call past it instead of queuing the call, so the

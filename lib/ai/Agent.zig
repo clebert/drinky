@@ -18,6 +18,8 @@ const Agent = @This();
 
 /// The placeholder shown for a redacted reasoning block (its content is encrypted).
 const redacted_notice = "[redacted thinking]";
+/// The per-reply bound on complete tool calls. A call past this bound aborts the stream.
+pub const tool_calls_max: usize = 64;
 
 /// The conservative content for a reserved tool-result slot whose real result
 /// never arrived. It does not claim the call never started. One wording covers a
@@ -1146,11 +1148,16 @@ fn readReplyWith(
     errdefer for (reply_items.items) |item| freeItem(gpa, item);
     var reply_invalid = false;
     var maybe_stop: ?llm.Event.Stop = null;
+    var tool_call_count: usize = 0;
 
     while (try stream.next()) |event| {
         if (event == .stop) {
             maybe_stop = event.stop;
             break;
+        }
+        if (event == .item and event.item == .tool_call) {
+            if (tool_call_count == tool_calls_max) return error.TooManyToolCalls;
+            tool_call_count += 1;
         }
         if (reply_invalid) continue;
         self.appendReplyEvent(
@@ -1840,6 +1847,7 @@ test "an unpriced model adds no cost to the session total" {
 const ScriptedStream = struct {
     events: []const llm.Event,
     index: usize = 0,
+    maybe_events_read: ?*usize = null,
     terminal_error: ?anyerror = null,
     usage_so_far: llm.Usage = .{},
     quota: ?llm.Quota = null,
@@ -1855,7 +1863,10 @@ const ScriptedStream = struct {
             if (self.terminal_error) |terminal_error| return terminal_error;
             return null;
         }
-        defer self.index += 1;
+        defer {
+            self.index += 1;
+            if (self.maybe_events_read) |events_read| events_read.* = self.index;
+        }
         return self.events[self.index];
     }
 
@@ -4061,6 +4072,54 @@ test "the round cap retains the completed rounds and fails the turn" {
     try std.testing.expectEqual(@as(usize, rounds_max), handler.checkpoint_count);
     // Prompt plus one tool_call/tool_result pair per completed round.
     try std.testing.expectEqual(@as(usize, 1 + 2 * rounds_max), agent.items.items.len);
+}
+
+test "a reply past the tool call cap aborts and fails the turn" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+    var handler: CaptureHandler = .{ .gpa = gpa };
+    defer handler.deinit();
+
+    var call_ids: [tool_calls_max + 1][8]u8 = undefined;
+    var overflow_events: [tool_calls_max + 2]llm.Event = undefined;
+    for (0..tool_calls_max + 1) |index| {
+        const call_id = try std.fmt.bufPrint(&call_ids[index], "t{d}", .{index});
+        overflow_events[index] = .{ .item = .{ .tool_call = .{
+            .call_id = call_id,
+            .name = "write",
+            .arguments_json = "{}",
+        } } };
+    }
+    overflow_events[tool_calls_max + 1] = .{
+        .stop = .{ .usage = .{ .input = 71, .output = 9 } },
+    };
+
+    // Round one commits before the next reply exceeds the call cap. The running
+    // usage belongs to the failed reply, but its terminal usage is never read.
+    var overflow_events_read: usize = 0;
+    var fetch: ScriptedFetch = .{ .attempts = &.{
+        .{ .stream = .{ .events = &tool_round_events } },
+        .{ .stream = .{
+            .events = &overflow_events,
+            .maybe_events_read = &overflow_events_read,
+            .usage_so_far = .{ .input = 71 },
+        } },
+    } };
+    agent.rounds_max = 2;
+    const outcome = agent.runTurnWith(&fetch, fake_tools, "go", &handler);
+
+    switch (outcome.disposition) {
+        .failed => |err| try std.testing.expectEqual(error.TooManyToolCalls, err),
+        else => return error.UnexpectedDisposition,
+    }
+    try std.testing.expectEqual(@as(usize, 2), fetch.sends);
+    try std.testing.expectEqual(tool_calls_max + 1, overflow_events_read);
+    try std.testing.expectEqual(@as(usize, 1), handler.tool_result_count);
+    try std.testing.expectEqual(@as(usize, 1), handler.checkpoint_count);
+    try std.testing.expectEqual(@as(usize, 3), agent.items.items.len);
+    try std.testing.expectEqual(@as(u64, 71), agent.stats.cache_usage.input);
+    try std.testing.expectEqual(@as(u64, 0), agent.stats.cache_usage.output);
 }
 
 test "run commits a no-tool reply and ends the turn" {
