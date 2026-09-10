@@ -6,12 +6,14 @@
 //! A narrow window first shortens fields in one fixed order. It then removes
 //! complete parts in another fixed order. The context gauge never goes.
 //!
-//! The line paints muted. Two kinds of field leave that role. A gauge takes a
-//! color when it fills past a threshold, and an identity field takes the normal
-//! intensity. Color means pressure. Intensity means identity. A model value that
-//! can run no turn takes the warning color, because it blocks the next send. A
-//! notice takes the role of its severity, and an information notice takes the
-//! accent role.
+//! The line paints muted. Every field but the place writes one label and one
+//! value. The label keeps the muted role, and the value alone can leave it. The
+//! run covers the whole value, its bracketed detail included. A cut that takes
+//! the value away takes its run too. A gauge value takes a color when it fills
+//! past a threshold, and an identity value takes the normal intensity.
+//! Color means pressure. Intensity means identity. A model value that can run no
+//! turn takes the warning color, because it blocks the next send. A notice takes
+//! the role of its severity, and an information notice takes the accent role.
 
 const std = @import("std");
 
@@ -103,6 +105,9 @@ pub const Gauge = struct {
 /// The longest directory the caller passes. It bounds the left scratch buffer,
 /// so the whole line always fits and the writer can never fail.
 pub const directory_bytes_max = 96;
+
+/// The label of the context gauge. Every form of the gauge carries it.
+const context_label = "Context: ";
 
 /// The model value while no account is active.
 const signed_out_value = "signed out";
@@ -563,12 +568,13 @@ fn writeBranch(out: *std.Io.Writer, branch: []const u8, form: Parts.Branch) !voi
 /// window. The one "now" number. The rest is session-cumulative. A model switch
 /// leaves no valid measurement, because a tokenizer belongs to its model.
 fn writeContext(line: *Line, info: *const Info, form: Parts.Context) !void {
-    const context = info.context_tokens orelse return line.out.writeAll("Context: Unknown");
+    const context = info.context_tokens orelse
+        return line.out.writeAll(context_label ++ "Unknown");
     // A model whose limit no source states shows the tokens alone. The share
     // and its pressure color need a limit, and Drinky states no figure it
     // cannot know.
     const window = info.context_window orelse {
-        try line.out.writeAll("Context: ");
+        try line.out.writeAll(context_label);
         return writeTokens(&line.out, context);
     };
     const percent = if (window > 0)
@@ -578,8 +584,9 @@ fn writeContext(line: *Line, info: *const Info, form: Parts.Context) !void {
     // The line prints the rounded share and colors that same number, so a row
     // never shows one figure and the color of another.
     const shown = @round(percent);
-    const start = line.offset();
-    try line.out.print("Context: {d:.0}%", .{shown});
+    try line.out.writeAll(context_label);
+    const value_start = line.offset();
+    try line.out.print("{d:.0}%", .{shown});
     if (form == .full) {
         try line.out.writeAll(" (");
         try writeTokens(&line.out, context);
@@ -587,7 +594,7 @@ fn writeContext(line: *Line, info: *const Info, form: Parts.Context) !void {
         try writeTokens(&line.out, window);
         try line.out.writeByte(')');
     }
-    line.mark(start, pressureRole(info.gauge, shown));
+    line.mark(value_start, pressureRole(info.gauge, shown));
 }
 
 /// The session cost behind its separator. The cost is an estimate at public
@@ -620,9 +627,10 @@ fn writeCache(line: *Line, info: *const Info) !void {
 }
 
 /// Append one identified quota window as ` · <label>: N% (<wait>)`, or nothing
-/// for an absent one. The used share drives the number and the color, so the
-/// allowance and the context window read the same way. The bracket holds the
-/// wait until the window starts again, the one figure the user cannot derive.
+/// for an absent one. The used share drives the number and the color of the
+/// value, so the allowance and the context window read the same way. The
+/// bracket holds the wait until the window starts again, the one figure the
+/// user cannot derive.
 fn writeQuotaWindow(
     line: *Line,
     window: *const ai.llm.Quota.Window,
@@ -631,15 +639,15 @@ fn writeQuotaWindow(
 ) !void {
     const label = quotaLabel(window.window_minutes) orelse return;
     const used = @round(@max(0.0, @min(100.0, window.used_percent)));
-    try line.out.writeAll(separator);
-    const start = line.offset();
-    try line.out.print("{s}: {d:.0}%", .{ label, used });
+    try line.out.print("{s}{s}: ", .{ separator, label });
+    const value_start = line.offset();
+    try line.out.print("{d:.0}%", .{used});
     if (wait_seconds) |seconds| {
         try line.out.writeAll(" (");
         try writeWait(&line.out, seconds);
         try line.out.writeByte(')');
     }
-    line.mark(start, pressureRole(gauge, used));
+    line.mark(value_start, pressureRole(gauge, used));
 }
 
 /// The seconds left on a window that stated `reset_seconds` when its response
@@ -864,6 +872,22 @@ fn expectHides(painted: []const u8, texts: []const []const u8) !void {
     }
 }
 
+/// Fail when `painted` holds a run of any colored role. A role that the line
+/// takes up later needs no entry here. The search skips the plain text role,
+/// because its empty sequence matches every row. It skips the muted role,
+/// because the line itself paints muted. No other role writes a part of the
+/// muted bytes, so a muted row trips nothing, wherever a run starts. Two roles
+/// can share one sequence, and the message then names the first of them.
+fn expectNoColor(painted: []const u8) !void {
+    inline for (comptime std.enums.values(role.Name)) |name| {
+        if (comptime !role.paints(name) or name == .muted) continue;
+        if (std.mem.indexOf(u8, painted, role.sequence(name)) != null) {
+            std.debug.print("the status line took the {s} role\n", .{@tagName(name)});
+            return error.TestExpectedColorless;
+        }
+    }
+}
+
 test render {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -1057,18 +1081,22 @@ test "a gauge takes a color when it fills past its threshold" {
     defer out.deinit();
     try renderForTest(gpa, &info, 200, &out);
 
-    // The color covers the whole field, so the label and the bracket carry it
-    // too. The two gauges use one rule, and each one names its own fill.
+    // The label keeps the muted role of the line, and the color covers the
+    // value with its bracket. The two gauges use one rule, and each one names
+    // its own fill.
     const painted = out.written();
     try expectShows(painted, &.{
-        comptime role.sequence(.warning) ++ "Context: 75% (750k/1.0M)",
-        comptime role.sequence(.@"error") ++ "5h: 90%",
+        comptime "Context: " ++ attribute.sequence(.reset) ++ role.sequence(.warning) ++
+            "75% (750k/1.0M)" ++ role.sequence(.muted),
+        comptime "5h: " ++ attribute.sequence(.reset) ++ role.sequence(.@"error") ++
+            "90%" ++ role.sequence(.muted),
     });
-    // The weekly window stays under the warning share, so it keeps the muted
-    // role of the line.
+    // No run opens on a label, and the weekly window stays under the warning
+    // share, so its value keeps the muted role of the line.
     try expectHides(painted, &.{
-        comptime role.sequence(.warning) ++ "Week:",
-        comptime role.sequence(.@"error") ++ "Week:",
+        comptime attribute.sequence(.reset) ++ "Context:",
+        comptime attribute.sequence(.reset) ++ "5h:",
+        comptime attribute.sequence(.reset) ++ "74%",
     });
 }
 
@@ -1090,15 +1118,12 @@ test "a configured pair moves the shares at which a gauge takes a color" {
 
     const painted = out.written();
     try expectShows(painted, &.{
-        comptime role.sequence(.warning) ++ "Context: 21%",
-        comptime role.sequence(.@"error") ++ "5h: 50%",
+        comptime "Context: " ++ attribute.sequence(.reset) ++ role.sequence(.warning) ++ "21%",
+        comptime "5h: " ++ attribute.sequence(.reset) ++ role.sequence(.@"error") ++ "50%",
     });
-    // The weekly window stays under the configured warning share, so it keeps
-    // the muted role of the line.
-    try expectHides(painted, &.{
-        comptime role.sequence(.warning) ++ "Week:",
-        comptime role.sequence(.@"error") ++ "Week:",
-    });
+    // The weekly window stays under the configured warning share, so its value
+    // keeps the muted role of the line.
+    try expectHides(painted, &.{comptime attribute.sequence(.reset) ++ "19%"});
 }
 
 test "the color follows the share that the line prints" {
@@ -1117,8 +1142,8 @@ test "the color follows the share that the line prints" {
 
     const painted = out.written();
     try expectShows(painted, &.{
-        comptime role.sequence(.warning) ++ "Context: 75%",
-        comptime role.sequence(.@"error") ++ "5h: 90%",
+        comptime "Context: " ++ attribute.sequence(.reset) ++ role.sequence(.warning) ++ "75%",
+        comptime "5h: " ++ attribute.sequence(.reset) ++ role.sequence(.@"error") ++ "90%",
     });
 }
 
@@ -1146,21 +1171,32 @@ test "the model value and the effort level leave the faint intensity" {
     });
 }
 
-test "a cut keeps the color of the run it lands in" {
+test "a cut keeps the color it lands in and drops the color it takes away" {
     const gpa = std.testing.allocator;
     var info = test_info;
     info.context_tokens = 950_000;
+    const label_columns = terminal.width.ofText(context_label);
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    try renderForTest(gpa, &info, 10, &out);
+    // The label, one column of the share, and the mark of the cut.
+    try renderForTest(gpa, &info, label_columns + 2, &out);
 
-    // Nine columns of the gauge stay, and the mark of the cut takes the last
-    // column. The mark belongs to the line, so it paints muted.
+    // The cut lands inside the value, so the tail of the run keeps its color.
+    // The mark belongs to the line, so it paints muted.
     const painted = out.written();
     try expectShows(painted, &.{
-        comptime role.sequence(.@"error") ++ "Context: ",
+        comptime role.sequence(.muted) ++ context_label ++ attribute.sequence(.reset) ++
+            role.sequence(.@"error") ++ "9",
         comptime role.sequence(.muted) ++ paint.ellipsis,
     });
+
+    // One column less takes the whole share away. The color follows the share,
+    // so the run goes with it and the label alone stays muted.
+    var label_out: std.Io.Writer.Allocating = .init(gpa);
+    defer label_out.deinit();
+    try renderForTest(gpa, &info, label_columns + 1, &label_out);
+    try expectShows(label_out.written(), &.{context_label});
+    try expectNoColor(label_out.written());
 }
 
 test "shortening the directory never costs columns" {
@@ -1462,10 +1498,10 @@ test "the credit pool takes no color at any used share" {
         defer out.deinit();
         try renderForTest(gpa, &info, 200, &out);
         try expectShows(out.written(), &.{"Credits: $"});
-        try expectHides(out.written(), &.{
-            comptime role.sequence(.warning) ++ "Credits:",
-            comptime role.sequence(.@"error") ++ "Credits:",
-        });
+        // The pool is the one field that no share colors. Nothing else on this
+        // row is colored, so the whole row proves it: neither the label nor the
+        // amount can open a colored run.
+        try expectNoColor(out.written());
     }
 }
 

@@ -364,9 +364,10 @@ to OpenRouter through a login or an API key, and to Gemini on the Gemini Enterpr
   and `↓ Hidden: N`.
 - The bottom line shows `directory (branch)`, the context gauge, the cost, the quota, the credit
   pool, and the cache-hit rate on the left, and `Model: account/model · Effort: level` on the right.
-  The model value and the effort level take the normal intensity, so the two settings that the user
-  changes stand out. A model value that can run no turn takes the warning color instead, account
-  prefix and all.
+  Every field but the place writes `label: value`, and the label always keeps the muted role of the
+  line. The model value and the effort level take the normal intensity, so the two settings that the
+  user changes stand out. A model value that can run no turn takes the warning color instead,
+  account prefix and all.
 - One temporary notice replaces the bottom line until the next user action. The notice keeps one
   row, so it never moves the editor. An information notice opens with `ℹ` in the accent color. A
   warning or a failure opens with `⚠` and carries its color.
@@ -390,7 +391,8 @@ to OpenRouter through a login or an API key, and to Gemini on the Gemini Enterpr
   show the last turn. The cache-hit rate measures one request.
 - The context gauge and each quota window take the warning color from 75% used and the error color
   from 90% used. The config sets both shares. A color on this line always means pressure, and the
-  color follows the printed share.
+  color follows the printed share. The color covers the value with its bracketed detail, and the
+  label stays muted. A cut that takes the share away takes its color too.
 - A narrow window shortens the directory, the branch, the context gauge, and the countdowns before
   it removes parts, and it always keeps the context gauge. The per-request measurements go before
   the session cost, longest window first. A detail goes before its head: the account prefix before
