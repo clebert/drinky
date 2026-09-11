@@ -7,6 +7,7 @@
 const std = @import("std");
 
 const auth = @import("../auth.zig");
+const json_store = @import("../json_store.zig");
 const llm = @import("../llm.zig");
 const net = @import("../net.zig");
 const oauth_callback = @import("../oauth_callback.zig");
@@ -23,11 +24,9 @@ io: std.Io,
 timeouts: net.Timeouts,
 path: []const u8,
 tokens: ?oauth.Tokens,
-/// Whether a committed credential still needs a store retry. The shared
-/// lifecycle keeps this field for every account, and a busy store sets it. A
-/// minted key never refreshes, so nothing reads it back here: the key of a
-/// failed save lives in memory until Drinky exits.
-save_pending: bool = false,
+/// Where the key in memory stands against the store. A minted key never
+/// refreshes, so only a reread of the store retries a pending save here.
+persistence: auth.Persistence = .saved,
 
 pub fn init(
     gpa: std.mem.Allocator,
@@ -48,6 +47,13 @@ pub fn deinit(self: *Auth) void {
 /// no OpenRouter OAuth credential.
 pub fn load(self: *Auth) !bool {
     return auth.load(self, account_key);
+}
+
+/// Settle the key on the open store `maybe_file`, or on an absent store
+/// when null, so a change in another instance shows here. The call reports
+/// what changed.
+pub fn reread(self: *Auth, maybe_file: ?*const json_store.File) !auth.Change {
+    return auth.reread(self, account_key, maybe_file);
 }
 
 /// The stored API key for the `Bearer` header, or null when signed out.

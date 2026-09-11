@@ -172,7 +172,7 @@ to OpenRouter through a login or an API key, and to Gemini on the Gemini Enterpr
 - The tokens and the minted keys live in the owner-only `~/.drinky/auth.json`, one entry per account
   under its identifier, saved atomically.
 - Drinky refreshes and saves an expired access token. When the store is busy, Drinky keeps the
-  refreshed token in memory and retries the save before the next request.
+  refreshed token in memory and retries the save before the next request or at the next `/login`.
 - An Anthropic subscription login saves stable account and organization IDs from the OAuth profile,
   and an xAI login saves the user ID of its id token. When another Drinky instance saved a token for
   the same principal, Drinky takes that token and refreshes only an expired one. A different or
@@ -188,7 +188,8 @@ to OpenRouter through a login or an API key, and to Gemini on the Gemini Enterpr
   picker.
 - A token failure that is not a rejection ends the turn, names the reason, and keeps the account
   signed in.
-- A login whose save fails stays signed in until Drinky exits, and says so.
+- A login whose save fails stays signed in until Drinky exits, and says so. Such a credential does
+  not follow the store, so a sign-in or a sign-out from another instance leaves it alone.
 
 ## Slash commands
 
@@ -201,7 +202,10 @@ to OpenRouter through a login or an API key, and to Gemini on the Gemini Enterpr
   of that account, except the OpenRouter author step holds that row.
 - **/effort** — set the reasoning-effort level, from the next turn on. The picker lists every level
   and marks a level that the active model folds or drops.
-- **/login** — sign in, switch to a signed-in account, or name the environment variables to set.
+- **/login** — sign in, switch to a signed-in account, or name the environment variables to set. The
+  picker shows a sign-in, a sign-out, or a replacement from another Drinky instance. A sign-out of
+  the active account hands the session to the next account, and a replaced principal takes its
+  evidence along.
 - **/logout** — drop the credentials of a signed-in account and hand the session to another account.
 - **/new** — clear the conversation, the usage stats, and the steering. The configuration stays. The
   next paint clears the terminal scrollback, so the empty conversation starts on a clean screen. The

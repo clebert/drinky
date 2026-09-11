@@ -2418,6 +2418,14 @@ fn applyOutcome(self: *App, outcome: ai.command.Outcome) !void {
         // list runs a registry entry through this path, so no listed command may
         // return a prompt: the `/skill` row writes an editor line instead.
         .prompt => unreachable,
+        // The picker must show the store as it stands, so the store is read
+        // again first, and the session settles on what changed there. The picker
+        // then opens on the settled registry, and the mirror below follows a
+        // moved account.
+        .login_picker => {
+            try self.rereadAccounts();
+            try self.openLoginPicker();
+        },
         // A sign-in starts and changes nothing yet. Its worker reports through
         // `applyLoginEvent`, which mirrors the committed outcome.
         .login => |account| return self.startLogin(account),
@@ -2807,8 +2815,87 @@ fn recordModelStep(
 /// at a different place.
 fn settleCredentialReplacement(self: *App, account: ai.llm.Account) void {
     self.accounts.dropPrincipalMetadata(account);
+    self.settleReplacedPrincipal(account);
+}
+
+/// Forget what the replaced principal of `account` produced, and move the agent
+/// onto the replacement where the session runs that account. A client borrows
+/// into the credential of its account, so the move gives it the new one.
+fn settleReplacedPrincipal(self: *App, account: ai.llm.Account) void {
     self.dropAccountEvidence(account);
     if (self.isActive(account)) self.adopt(account);
+}
+
+/// Read the credential store again and settle the session on what another
+/// Drinky instance changed there. The registry settled itself already, so this
+/// moves the agent and the transcript to match it. A read that failed leaves
+/// the registry as it was, and an event names the failure.
+///
+/// The active account leaves last, so the hand-off adopts an account that
+/// settled already, and the transcript reads every other move before the one
+/// that moves the session. The caller opens the login picker where no account
+/// remains.
+fn rereadAccounts(self: *App) !void {
+    const report = self.accounts.reread();
+    var maybe_left: ?ai.llm.Account = null;
+    for (std.enums.values(ai.llm.Account)) |account| switch (report.changes.get(account)) {
+        // A sign-in reaches an account that the session does not run.
+        .unchanged, .signed_in => {},
+        // A rotation keeps the principal and its evidence. A client that
+        // borrows a key points at the bytes the store held before, so the
+        // active client takes the rotated one. A subscription client points at
+        // its `Auth`, so the rebind moves nothing there.
+        .rotated => if (self.isActive(account)) self.rebindClient(account),
+        .replaced => {
+            self.settleReplacedPrincipal(account);
+            try self.reportModelStep(
+                account,
+                "Drinky found a replacement credential for {s}. " ++
+                    "Drinky removed the prior account evidence. ",
+                .{account.id()},
+            );
+        },
+        // The evidence goes as after a logout here. Only the active account
+        // moves the session, and it does so once every other account settled.
+        .signed_out => {
+            self.dropAccountEvidence(account);
+            if (self.isActive(account)) {
+                maybe_left = account;
+            } else try self.recordEvent(
+                .information,
+                "Another Drinky instance signed out of {s}.",
+                .{account.id()},
+            );
+        },
+    };
+    if (maybe_left) |account| try self.recordHandOff(
+        "Another Drinky instance signed out of {s}. ",
+        account,
+        self.handOff(),
+    );
+    if (report.read_error) |err| try self.recordEvent(
+        .failure,
+        "Drinky could not read the credential file {s} because of error {s}. " ++
+            "The account list shows the credentials from the last read.",
+        .{ self.accounts.storePath(), @errorName(err) },
+    );
+    for (std.enums.values(ai.llm.Account)) |account| {
+        const err = report.entry_errors.get(account) orelse continue;
+        try self.recordEvent(
+            .failure,
+            "Drinky could not read the credential of {s} in {s} because of error {s}. " ++
+                "The account stays as it was.",
+            .{ account.id(), self.accounts.storePath(), @errorName(err) },
+        );
+    }
+}
+
+/// Point the client of the active `account` at the credential its store holds
+/// now. The account and the model stay, so nothing else moves. A client
+/// borrows into the credential of its account, so a credential that moved in
+/// memory needs this.
+fn rebindClient(self: *App, account: ai.llm.Account) void {
+    self.agent.switchTo(self.accounts.client(account).?, self.agent.model);
 }
 
 /// Accept the replacement that a turn met. That turn failed on the account it
@@ -2885,36 +2972,45 @@ fn handOff(self: *App) ?ai.llm.Account {
     return maybe_next;
 }
 
-/// Report where the session went after `account` left it. The next account
-/// starts on the model it ran last here, and on no model where it ran none, so
-/// that report names `/model`. When no account remains, the login picker opens
-/// so the user chooses how to sign back in.
+/// Report where the session went after a sign-out here took `account` from it.
+/// When no account remains, the login picker opens so the user chooses how to
+/// sign back in.
 fn reportHandOff(self: *App, account: ai.llm.Account, maybe_next: ?ai.llm.Account) !void {
-    const next = maybe_next orelse {
-        try self.recordEvent(
-            .information,
-            "Drinky signed out of {s}. Select an account to sign in.",
-            .{account.id()},
-        );
-        return self.openLoginPicker();
-    };
-    if (self.agent.model) |model| return self.recordEvent(
-        .information,
-        "Drinky signed out of {s}. Drinky now uses {s}/{s}.",
-        .{ account.id(), next.id(), model.name() },
-    );
-    return self.reportModelStep(
-        next,
-        "Drinky signed out of {s}. Drinky now uses {s}. ",
-        .{ account.id(), next.id() },
-    );
+    try self.recordHandOff("Drinky signed out of {s}. ", account, maybe_next);
+    if (maybe_next == null) try self.openLoginPicker();
 }
 
-/// Open the login picker through the session alone. A route through
-/// `applyOutcome` cycles the inferred error sets of `logoutAccount` back to
-/// itself.
+/// Record where the session went after `account` left it. `lead` states how
+/// the account left and takes its identifier. The next account starts on the
+/// model it ran last here, and on no model where it ran none, so that report
+/// names `/model`. Where no account remains, the line names the login picker,
+/// and the caller opens it.
+fn recordHandOff(
+    self: *App,
+    comptime lead: []const u8,
+    account: ai.llm.Account,
+    maybe_next: ?ai.llm.Account,
+) !void {
+    const next = maybe_next orelse return self.recordEvent(
+        .information,
+        lead ++ "Select an account to sign in.",
+        .{account.id()},
+    );
+    if (self.agent.model) |model| return self.recordEvent(
+        .information,
+        lead ++ "Drinky now uses {s}/{s}.",
+        .{ account.id(), next.id(), model.name() },
+    );
+    return self.reportModelStep(next, lead ++ "Drinky now uses {s}. ", .{ account.id(), next.id() });
+}
+
+/// Open the login picker on the registry as it stands, through the session
+/// alone. No reread runs here: a reread can hand the session off, and that
+/// hand-off leads back to this picker. A route through `applyOutcome` cycles
+/// the inferred error sets of `logoutAccount` back to itself.
 fn openLoginPicker(self: *App) !void {
-    if (try self.dispatchCommand("/login")) |outcome| try self.session.applyOutcome(outcome);
+    var context = self.commandContext();
+    try self.session.applyOutcome(try ai.command.login.picker(&context));
 }
 
 /// Drop `account`'s credentials. A logout of the active account hands the
@@ -8263,6 +8359,531 @@ test "a fetch that meets a replaced credential on an idle account names that acc
     try std.testing.expect(!blocks[0].content.event.is_error);
 }
 
+// The client of a minted key borrows the key bytes of its store. The reread that
+// opens the login picker must leave an unchanged key where it is, and it must
+// move the client onto a replaced key, so no request reads freed memory.
+test "the login picker rereads the store and keeps the active Console key live" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+
+    var store = try tmp.dir.createDirPathOpen(io, ".drinky", .{});
+    store.close(io);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".drinky/auth.json",
+        .data =
+        \\{ "anthropic-api": { "api_key": "minted-first" } }
+        ,
+    });
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
+    defer app.accounts.deinit();
+    try ai.testing.seedAccount(&app.accounts, .anthropic_api, &.{"claude-opus-5"});
+    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_api), .{
+        .model = test_anthropic_model,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
+    defer app.session.deinit();
+    app.session.account_shown = .anthropic_api;
+
+    // The store holds the same key: the client keeps the very bytes it borrowed.
+    const borrowed = app.agent.client.?.credentials.anthropic_api;
+    try app.applyOutcome(.login_picker);
+    try std.testing.expect(app.session.mode == .picking);
+    try std.testing.expectEqualStrings("Sign in", app.session.mode.picking.picker.title);
+    try std.testing.expectEqualStrings(
+        "anthropic-api (Active)",
+        app.session.mode.picking.picker.options[1],
+    );
+    try std.testing.expectEqual(borrowed.ptr, app.agent.client.?.credentials.anthropic_api.ptr);
+    try std.testing.expectEqual(
+        borrowed.ptr,
+        app.accounts.anthropic_console_auth.tokens.?.api_key.ptr,
+    );
+    try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
+    app.session.closePicker();
+
+    // Another instance signed in again and minted another key. The client moves
+    // onto the key the store now holds, and the evidence and the list of the
+    // prior key go.
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".drinky/auth.json",
+        .data =
+        \\{ "anthropic-api": { "api_key": "minted-again" } }
+        ,
+    });
+    try app.applyOutcome(.login_picker);
+    try std.testing.expect(app.session.mode == .picking);
+    const replaced = app.agent.client.?.credentials.anthropic_api;
+    try std.testing.expectEqualStrings("minted-again", replaced);
+    try std.testing.expectEqual(
+        replaced.ptr,
+        app.accounts.anthropic_console_auth.tokens.?.api_key.ptr,
+    );
+    try std.testing.expect(app.accounts.catalog.isEmpty(.anthropic_api));
+    try std.testing.expect(app.agent.model == null);
+    const blocks = app.session.transcript.blocks();
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    try std.testing.expectEqualStrings(
+        "Drinky found a replacement credential for anthropic-api. " ++
+            "Drinky removed the prior account evidence. " ++
+            "Fetch the model list of anthropic-api with /model.",
+        blocks[0].content.event.text.items,
+    );
+}
+
+// A sign-out in another instance takes the credential of the active account.
+// The session must leave that account before the picker opens, as it does after
+// a logout here, so the picker never marks a signed-out account as active.
+test "the login picker hands the session off an account another instance signed out" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+
+    var store = try tmp.dir.createDirPathOpen(io, ".drinky", .{});
+    store.close(io);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".drinky/auth.json",
+        .data =
+        \\{ "anthropic-plan":
+        \\    { "access": "a", "refresh": "r", "expires_ms": 4102444800000 } }
+        ,
+    });
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{ .anthropic = "key" });
+    defer app.accounts.deinit();
+    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_plan), .{
+        .model = test_anthropic_model,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
+    defer app.session.deinit();
+    app.session.account_shown = .anthropic_plan;
+    // The block of that account stands in the transcript, as after a turn.
+    try app.session.transcript.appendStream(.thinking, .anthropic_plan, "thought");
+
+    try tmp.dir.writeFile(io, .{ .sub_path = ".drinky/auth.json", .data = "{}" });
+    try app.applyOutcome(.login_picker);
+
+    // The session moved to the remaining account, and the evidence went with
+    // the credential.
+    try std.testing.expect(!app.accounts.isAuthenticated(.anthropic_plan));
+    try std.testing.expectEqual(ai.llm.Account.anthropic_api_key, app.activeAccount().?);
+    try std.testing.expectEqual(ai.llm.Account.anthropic_api_key, app.session.account_shown.?);
+    try std.testing.expect(app.agent.model == null);
+    const blocks = app.session.transcript.blocks();
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    try std.testing.expectEqualStrings(
+        "Another Drinky instance signed out of anthropic-plan. " ++
+            "Drinky now uses anthropic-api-key. " ++
+            "Fetch the model list of anthropic-api-key with /model.",
+        blocks[0].content.event.text.items,
+    );
+    // The picker shows the store as it stands.
+    try std.testing.expect(app.session.mode == .picking);
+    const picker = app.session.mode.picking.picker;
+    try std.testing.expectEqualStrings("anthropic-plan", picker.options[0]);
+    try std.testing.expectEqualStrings("anthropic-api-key (Active)", picker.options[2]);
+}
+
+// The last account can leave this way too. The session signs out, and the
+// picker that the user asked for opens once, so Esc leaves it at the prompt.
+test "the login picker signs out when another instance signed out the last account" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+
+    var store = try tmp.dir.createDirPathOpen(io, ".drinky", .{});
+    store.close(io);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".drinky/auth.json",
+        .data =
+        \\{ "openai-plan":
+        \\    { "access": "a", "refresh": "r", "expires_ms": 4102444800000,
+        \\      "account_id": "account" } }
+        ,
+    });
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
+    defer app.accounts.deinit();
+    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.openai_plan), .{
+        .model = test_anthropic_model,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
+    defer app.session.deinit();
+    app.session.account_shown = .openai_plan;
+
+    try tmp.dir.writeFile(io, .{ .sub_path = ".drinky/auth.json", .data = "{}" });
+    try app.applyOutcome(.login_picker);
+
+    try std.testing.expect(app.agent.client == null);
+    try std.testing.expect(app.session.account_shown == null);
+    try std.testing.expectEqualStrings(
+        "Another Drinky instance signed out of openai-plan. Select an account to sign in.",
+        app.session.transcript.blocks()[0].content.event.text.items,
+    );
+    try std.testing.expect(app.session.mode == .picking);
+    try std.testing.expectEqual(@as(usize, 0), app.session.mode.picking.trail.len);
+    try std.testing.expectEqualStrings("openai-plan", app.session.mode.picking.picker.options[3]);
+}
+
+// A sign-in and a rotation in another instance move nothing here. The picker
+// shows the sign-in, and the rotated token serves the next request.
+test "the login picker shows a sign-in from another instance and keeps a rotated token" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+
+    var store = try tmp.dir.createDirPathOpen(io, ".drinky", .{});
+    store.close(io);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".drinky/auth.json",
+        .data =
+        \\{ "anthropic-plan":
+        \\    { "access": "a", "refresh": "r", "expires_ms": 4102444800000,
+        \\      "account_uuid": "user", "organization_uuid": "org" } }
+        ,
+    });
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
+    defer app.accounts.deinit();
+    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_plan), .{
+        .model = test_anthropic_model,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
+    defer app.session.deinit();
+    app.session.account_shown = .anthropic_plan;
+    try app.session.transcript.appendStream(.thinking, .anthropic_plan, "thought");
+
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".drinky/auth.json",
+        .data =
+        \\{ "anthropic-plan":
+        \\    { "access": "a2", "refresh": "r2", "expires_ms": 4102444800000,
+        \\      "account_uuid": "user", "organization_uuid": "org" },
+        \\  "xai-plan":
+        \\    { "access": "x", "refresh": "xr", "expires_ms": 4102444800000 } }
+        ,
+    });
+    try app.applyOutcome(.login_picker);
+
+    try std.testing.expectEqual(ai.llm.Account.anthropic_plan, app.activeAccount().?);
+    try app.expectModel(test_anthropic_model.name());
+    try std.testing.expectEqualStrings("r2", app.accounts.anthropic_auth.tokens.?.refresh);
+    // The evidence of the same principal stays, and no event reports a move.
+    try std.testing.expectEqual(@as(usize, 1), app.session.transcript.blocks().len);
+    try std.testing.expect(app.session.transcript.blocks()[0].content == .thinking);
+    const picker = app.session.mode.picking.picker;
+    try std.testing.expectEqualStrings("anthropic-plan (Active)", picker.options[0]);
+    try std.testing.expectEqualStrings("xai-plan (Signed in)", picker.options[5]);
+}
+
+// The hand-off adopts the first authenticated account. That account can have
+// changed in the same reread, so it settles first, and the transcript reads the
+// replacement before the move onto it.
+test "the login picker settles every other account before the active one leaves" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+
+    var store = try tmp.dir.createDirPathOpen(io, ".drinky", .{});
+    store.close(io);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".drinky/auth.json",
+        .data =
+        \\{ "anthropic-plan":
+        \\    { "access": "a", "refresh": "r", "expires_ms": 4102444800000 },
+        \\  "openai-plan":
+        \\    { "access": "o", "refresh": "or", "expires_ms": 4102444800000,
+        \\      "account_id": "first" } }
+        ,
+    });
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
+    defer app.accounts.deinit();
+    try ai.testing.seedAccount(&app.accounts, .openai_plan, &.{"gpt-5.6-sol"});
+    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_plan), .{
+        .model = test_anthropic_model,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
+    defer app.session.deinit();
+    app.session.account_shown = .anthropic_plan;
+
+    // Another instance signed the active subscription out and signed in to
+    // ChatGPT as another account.
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".drinky/auth.json",
+        .data =
+        \\{ "openai-plan":
+        \\    { "access": "o2", "refresh": "or2", "expires_ms": 4102444800000,
+        \\      "account_id": "second" } }
+        ,
+    });
+    try app.applyOutcome(.login_picker);
+
+    try std.testing.expectEqual(ai.llm.Account.openai_plan, app.activeAccount().?);
+    try std.testing.expect(app.accounts.catalog.isEmpty(.openai_plan));
+    try std.testing.expect(app.agent.model == null);
+    const blocks = app.session.transcript.blocks();
+    try std.testing.expectEqual(@as(usize, 2), blocks.len);
+    try std.testing.expectEqualStrings(
+        "Drinky found a replacement credential for openai-plan. " ++
+            "Drinky removed the prior account evidence. " ++
+            "Fetch the model list of openai-plan with /model.",
+        blocks[0].content.event.text.items,
+    );
+    try std.testing.expectEqualStrings(
+        "Another Drinky instance signed out of anthropic-plan. " ++
+            "Drinky now uses openai-plan. " ++
+            "Fetch the model list of openai-plan with /model.",
+        blocks[1].content.event.text.items,
+    );
+}
+
+// A rotation keeps the principal, but the credential moved in memory, so the
+// active client takes the rotated one. A subscription client reads its store
+// through a pointer, and no store that borrows its key names a principal today,
+// so this pins that the renewal moves nothing the user can see.
+test "the login picker points the active client at a rotated credential" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+
+    var store = try tmp.dir.createDirPathOpen(io, ".drinky", .{});
+    store.close(io);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".drinky/auth.json",
+        .data =
+        \\{ "openai-plan":
+        \\    { "access": "o", "refresh": "or", "expires_ms": 4102444800000,
+        \\      "account_id": "account" } }
+        ,
+    });
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
+    defer app.accounts.deinit();
+    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.openai_plan), .{
+        .model = test_anthropic_model,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
+    defer app.session.deinit();
+    app.session.account_shown = .openai_plan;
+
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".drinky/auth.json",
+        .data =
+        \\{ "openai-plan":
+        \\    { "access": "o2", "refresh": "or2", "expires_ms": 4102444800000,
+        \\      "account_id": "account" } }
+        ,
+    });
+    try app.applyOutcome(.login_picker);
+
+    // The client reads the store it pointed at before, and the model stays.
+    try std.testing.expectEqual(
+        &app.accounts.openai_auth,
+        app.agent.client.?.credentials.openai_plan,
+    );
+    try std.testing.expectEqualStrings("or2", app.accounts.openai_auth.tokens.?.refresh);
+    try app.expectModel(test_anthropic_model.name());
+    try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
+}
+
+// One entry that does not decode must not hide the other accounts. The event
+// names that account alone, and the rest of the picker shows the store.
+test "the login picker reports one entry it cannot read and settles the rest" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+
+    var store = try tmp.dir.createDirPathOpen(io, ".drinky", .{});
+    store.close(io);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".drinky/auth.json",
+        .data =
+        \\{ "anthropic-plan":
+        \\    { "access": "a", "refresh": "r", "expires_ms": 4102444800000 } }
+        ,
+    });
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
+    defer app.accounts.deinit();
+    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_plan), .{
+        .model = test_anthropic_model,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
+    defer app.session.deinit();
+    app.session.account_shown = .anthropic_plan;
+
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".drinky/auth.json",
+        .data =
+        \\{ "anthropic-plan": { "access": 1 },
+        \\  "xai-plan":
+        \\    { "access": "x", "refresh": "xr", "expires_ms": 4102444800000 } }
+        ,
+    });
+    try app.applyOutcome(.login_picker);
+
+    try std.testing.expectEqual(ai.llm.Account.anthropic_plan, app.activeAccount().?);
+    try std.testing.expectEqualStrings("r", app.accounts.anthropic_auth.tokens.?.refresh);
+    const picker = app.session.mode.picking.picker;
+    try std.testing.expectEqualStrings("anthropic-plan (Active)", picker.options[0]);
+    try std.testing.expectEqualStrings("xai-plan (Signed in)", picker.options[5]);
+    const blocks = app.session.transcript.blocks();
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    try std.testing.expect(blocks[0].content.event.is_error);
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        blocks[0].content.event.text.items,
+        "Drinky could not read the credential of anthropic-plan in ",
+    ));
+    try std.testing.expect(std.mem.endsWith(
+        u8,
+        blocks[0].content.event.text.items,
+        "because of error BadCredentials. The account stays as it was.",
+    ));
+}
+
+// A store that Drinky cannot read must not end the session. The picker opens
+// on the registry as it stands, and the event names the failure.
+test "the login picker opens over an unreadable credential file and reports it" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+
+    var store = try tmp.dir.createDirPathOpen(io, ".drinky", .{});
+    store.close(io);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".drinky/auth.json",
+        .data =
+        \\{ "anthropic-plan":
+        \\    { "access": "a", "refresh": "r", "expires_ms": 4102444800000 } }
+        ,
+    });
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
+    defer app.accounts.deinit();
+    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_plan), .{
+        .model = test_anthropic_model,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
+    defer app.session.deinit();
+    app.session.account_shown = .anthropic_plan;
+
+    try tmp.dir.writeFile(io, .{ .sub_path = ".drinky/auth.json", .data = "not json" });
+    try app.applyOutcome(.login_picker);
+
+    try std.testing.expectEqual(ai.llm.Account.anthropic_plan, app.activeAccount().?);
+    try std.testing.expect(app.accounts.isAuthenticated(.anthropic_plan));
+    try std.testing.expect(app.session.mode == .picking);
+    try std.testing.expectEqualStrings(
+        "anthropic-plan (Active)",
+        app.session.mode.picking.picker.options[0],
+    );
+    const blocks = app.session.transcript.blocks();
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    try std.testing.expect(blocks[0].content.event.is_error);
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        blocks[0].content.event.text.items,
+        "Drinky could not read the credential file ",
+    ));
+    try std.testing.expect(std.mem.endsWith(
+        u8,
+        blocks[0].content.event.text.items,
+        "because of error BadCredentials. " ++
+            "The account list shows the credentials from the last read.",
+    ));
+}
+
 test "token request failures keep the credential before a grant rejection removes it" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -9095,7 +9716,7 @@ test "Enter sends a plain message and drops the waiting retry" {
 
     try app.session.editor.insert("also check the tests");
     // The two steps that `submit` runs once its sign-in gate passes. A test client
-    // is signed out, so the gate would stop the send before any turn.
+    // is signed out, so the gate stops the send before any turn.
     {
         const base = try app.startUserTurn("also check the tests");
         var prompt = app.session.editor.detachTrimmed();

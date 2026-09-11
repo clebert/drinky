@@ -7,8 +7,12 @@
 const std = @import("std");
 
 const Accounts = @import("Accounts.zig");
+const anthropic = @import("anthropic/root.zig");
 const llm = @import("llm.zig");
 const Model = @import("Model.zig");
+const openai = @import("openai/root.zig");
+const openrouter = @import("openrouter/root.zig");
+const xai = @import("xai/root.zig");
 
 /// A fully described model: a window, an output limit, every effort level, a
 /// reasoning, and a price. A test that needs another shape starts
@@ -29,6 +33,18 @@ pub fn bareModel(name: []const u8) Model {
     return Model.init(name) catch unreachable;
 }
 
+/// A credential store with no file behind it, so a test keeps its credential in
+/// memory alone, exactly as a catalog with no path keeps its models.
+fn memoryStore(comptime Store: type) Store {
+    return .{
+        .gpa = std.testing.allocator,
+        .io = std.testing.io,
+        .timeouts = .{},
+        .path = "",
+        .tokens = null,
+    };
+}
+
 /// A registry stubbed to the given environment, which offers no model until a
 /// `seedAccount` call. It owns no store, so a caller frees only what it seeds.
 pub fn accounts(environment: Accounts.Environment) Accounts {
@@ -36,11 +52,11 @@ pub fn accounts(environment: Accounts.Environment) Accounts {
         .gpa = std.testing.allocator,
         .io = std.testing.io,
         .timeouts = .{},
-        .anthropic_auth = undefined,
-        .anthropic_console_auth = undefined,
-        .openai_auth = undefined,
-        .xai_auth = undefined,
-        .openrouter_auth = undefined,
+        .anthropic_auth = memoryStore(anthropic.Auth),
+        .anthropic_console_auth = memoryStore(anthropic.ConsoleAuth),
+        .openai_auth = memoryStore(openai.Auth),
+        .xai_auth = memoryStore(xai.Auth),
+        .openrouter_auth = memoryStore(openrouter.Auth),
         .google_auth = null,
         .google_error = null,
         .environment = environment,

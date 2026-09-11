@@ -45,6 +45,11 @@ pub const Outcome = union(enum) {
     /// takes an argument lands here, so the user completes it and sends it. The
     /// bytes transfer to the caller.
     editor_text: []const u8,
+    /// Open the account picker of `/login`. The picker must show the credential
+    /// store as it stands, so the app reads the store again first and settles
+    /// the session on what another Drinky instance changed there. It then
+    /// builds the picker with `login.picker`.
+    login_picker,
     /// Authenticate this account, then switch to it. The app owns the worker,
     /// the callback editor, and the final account change.
     login: llm.Account,

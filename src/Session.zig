@@ -1228,6 +1228,7 @@ pub fn applyOutcome(self: *Session, outcome: ai.command.Outcome) !void {
         // The app intercepts prompt, account, fetch, conversation, and
         // inspection actions. They never reach the io-free session.
         .prompt,
+        .login_picker,
         .login,
         .logout,
         .switch_account,

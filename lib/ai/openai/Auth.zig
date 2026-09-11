@@ -22,8 +22,8 @@ io: std.Io,
 timeouts: net.Timeouts,
 path: []const u8,
 tokens: ?oauth.Tokens,
-/// Whether a refreshed credential still needs a store retry.
-save_pending: bool = false,
+/// Where the credential in memory stands against the store.
+persistence: auth.Persistence = .saved,
 
 pub fn init(gpa: std.mem.Allocator, io: std.Io, home: []const u8, timeouts: net.Timeouts) !Auth {
     const path = try std.fs.path.join(gpa, &.{ home, ".drinky", "auth.json" });
@@ -39,6 +39,13 @@ pub fn deinit(self: *Auth) void {
 /// `openai-plan` entry (this account is simply not logged in).
 pub fn load(self: *Auth) !bool {
     return auth.load(self, account_key);
+}
+
+/// Settle the credential on the open store `maybe_file`, or on an absent store
+/// when null, so a change in another instance shows here. The call reports
+/// what changed.
+pub fn reread(self: *Auth, maybe_file: ?*const json_store.File) !auth.Change {
+    return auth.reread(self, account_key, maybe_file);
 }
 
 /// A valid access token, refreshed and persisted first if it has expired.

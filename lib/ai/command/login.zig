@@ -1,6 +1,9 @@
 //! `/login`: a picker over every account (also the first-run bootstrap and the
-//! fall-through after the last logout). `run` and `select` index the same
-//! enum-order account list. The command takes no argument.
+//! fall-through after the last logout). The picker shows the credential store
+//! as it stands, so `run` asks the app to read the store again, and the app
+//! builds the picker with `picker` once the session settled on what it found.
+//! `picker` and `select` index the same enum-order account list. The command
+//! takes no argument.
 
 const std = @import("std");
 
@@ -11,7 +14,15 @@ const testing = @import("testing.zig");
 pub const name = "login";
 pub const summary = "sign in or switch the account";
 
+/// Hand the open to the app. The registry table fixes the signature, and the
+/// rows come from `picker` once the app settled the session on the store.
 pub fn run(context: *Context) !Context.Outcome {
+    _ = context;
+    return .login_picker;
+}
+
+/// The picker over every account, on the registry as it stands.
+pub fn picker(context: *Context) !Context.Outcome {
     var options: Context.Outcome.Options = .{ .gpa = context.gpa };
     errdefer options.deinit();
     for (std.enums.values(llm.Account)) |account| try writeRow(&options, context, account);
@@ -77,6 +88,19 @@ fn isActive(context: *const Context, account: llm.Account) bool {
     return client.account() == account;
 }
 
+// The rows must show the store as it stands, and only the app can settle the
+// session on a change there, so the command hands the open to the app.
+test "run asks the app to read the store before it opens the picker" {
+    const gpa = std.testing.allocator;
+    var accounts = testing.accounts(.{ .anthropic = "sk-ant" }, .{});
+    defer testing.deinitAccounts(&accounts);
+    var agent = testing.agent(gpa, .{ .anthropic_api_key = "sk-ant" });
+    defer agent.deinit();
+    var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
+
+    try std.testing.expectEqual(Context.Outcome.login_picker, try run(&context));
+}
+
 test "the picker lists every account, marking the active and authenticated ones" {
     const gpa = std.testing.allocator;
     var accounts = testing.accounts(.{ .anthropic = "sk-ant" }, .{ .anthropic = true });
@@ -85,7 +109,7 @@ test "the picker lists every account, marking the active and authenticated ones"
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
 
-    switch (try run(&context)) {
+    switch (try picker(&context)) {
         .pick => |pick| {
             defer {
                 for (pick.options) |option| gpa.free(option);

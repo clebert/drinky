@@ -78,6 +78,18 @@ pub const Refresh = struct {
     metadata_save_error: ?anyerror = null,
 };
 
+/// What one reread of the credential store changed. An account without a login
+/// never changes here, because its credential comes from the environment.
+pub const Reread = struct {
+    changes: std.EnumArray(llm.Account, auth.Change) = .initFill(.unchanged),
+    /// Why Drinky could not read the file, or null when it could. No store
+    /// settles on a file that Drinky cannot read.
+    read_error: ?anyerror = null,
+    /// Why the entry of an account did not decode, or null. Every other store
+    /// settles on its own entry.
+    entry_errors: std.EnumArray(llm.Account, ?anyerror) = .initFill(null),
+};
+
 /// The credentials of the accounts without a login, each null when its
 /// environment variable is unset. The values are borrowed for the process
 /// lifetime (they point into the environment), so they are never freed here.
@@ -211,6 +223,100 @@ pub fn loadError(self: *const Accounts, account: llm.Account) ?anyerror {
         .google_cloud_key => self.google_error,
         else => null,
     };
+}
+
+/// The credential file that every login store shares.
+pub fn storePath(self: *const Accounts) []const u8 {
+    return self.anthropic_auth.path;
+}
+
+/// Reread every login store, so a sign-in, a sign-out, or a replacement in
+/// another Drinky instance shows here. The registry settles itself: a signed-out
+/// account and a replaced principal leave with their model list, exactly as
+/// after a logout or an invalidation here. The caller settles the session on
+/// the report, because a client borrows into the credential of its account and
+/// the evidence of a replaced principal must go.
+///
+/// The stores share one file, so the reread opens it once. A file that Drinky
+/// cannot read settles no store. An entry that does not decode settles no store
+/// of its own account, and every other store still settles. The report names
+/// both failures. A registry whose stores hold no path keeps its credentials in
+/// memory alone, exactly as a catalog with no path keeps its models.
+pub fn reread(self: *Accounts) Reread {
+    var report: Reread = .{};
+    if (self.storePath().len == 0) return report;
+    var maybe_file = auth.openStore(self.gpa, self.io, self.storePath()) catch |err| {
+        report.read_error = err;
+        return report;
+    };
+    defer if (maybe_file) |*file| file.deinit();
+    const file: ?*const json_store.File = if (maybe_file) |*opened| opened else null;
+    self.anthropic_plan_ready = self.rereadStore(
+        &report,
+        file,
+        .anthropic_plan,
+        &self.anthropic_auth,
+        self.anthropic_plan_ready,
+    );
+    self.anthropic_api_ready = self.rereadStore(
+        &report,
+        file,
+        .anthropic_api,
+        &self.anthropic_console_auth,
+        self.anthropic_api_ready,
+    );
+    self.openai_plan_ready = self.rereadStore(
+        &report,
+        file,
+        .openai_plan,
+        &self.openai_auth,
+        self.openai_plan_ready,
+    );
+    self.xai_plan_ready = self.rereadStore(
+        &report,
+        file,
+        .xai_plan,
+        &self.xai_auth,
+        self.xai_plan_ready,
+    );
+    self.openrouter_api_ready = self.rereadStore(
+        &report,
+        file,
+        .openrouter_api,
+        &self.openrouter_auth,
+        self.openrouter_api_ready,
+    );
+    return report;
+}
+
+/// Settle one store on the open store `file` into `report`, and return whether
+/// its account is ready afterwards. `ready` is the state before the reread,
+/// which a store that did not change keeps.
+fn rereadStore(
+    self: *Accounts,
+    report: *Reread,
+    file: ?*const json_store.File,
+    account: llm.Account,
+    store: anytype,
+    ready: bool,
+) bool {
+    const change = store.reread(file) catch |err| failed: {
+        report.entry_errors.set(account, err);
+        break :failed .unchanged;
+    };
+    report.changes.set(account, change);
+    switch (change) {
+        .unchanged => return ready,
+        .signed_in, .rotated => return true,
+        .replaced => {
+            self.catalog.dropAccount(account);
+            return true;
+        },
+        .signed_out => {
+            self.catalog.dropAccount(account);
+            return false;
+        },
+    }
 }
 
 /// The first authenticated account, or null when none is. The session's active
@@ -608,45 +714,18 @@ pub fn dropPrincipalMetadata(self: *Accounts, account: llm.Account) void {
     self.catalog.dropAccount(account);
 }
 
+/// The shared memory registry with the two readiness flags that the tests here
+/// vary. A test that needs a real store replaces the one store it reads.
 fn testAccounts(environment: Environment, anthropic_ready: bool, openai_ready: bool) Accounts {
-    return .{
-        .gpa = std.testing.allocator,
-        .io = std.testing.io,
-        .timeouts = .{},
-        .anthropic_auth = undefined,
-        .anthropic_console_auth = undefined,
-        .openai_auth = undefined,
-        .xai_auth = undefined,
-        .openrouter_auth = undefined,
-        .google_auth = null,
-        .google_error = null,
-        .environment = environment,
-        .anthropic_plan_ready = anthropic_ready,
-        .openai_plan_ready = openai_ready,
-        .xai_plan_ready = false,
-        .anthropic_api_ready = false,
-        .openrouter_api_ready = false,
-        .catalog = testCatalog(),
-    };
-}
-
-/// A catalog with no file behind it, so a test reads and writes memory alone.
-fn testCatalog() Catalog {
-    return .{
-        .gpa = std.testing.allocator,
-        .io = std.testing.io,
-        .models_path = "",
-        .metadata_path = "",
-        .accounts = .initFill(&.{}),
-        .metadata = &.{},
-    };
+    var accounts = testing.accounts(environment);
+    accounts.anthropic_plan_ready = anthropic_ready;
+    accounts.openai_plan_ready = openai_ready;
+    return accounts;
 }
 
 /// Give `account` one model, as a fetch does.
 fn seedModel(accounts: *Accounts, account: llm.Account, name: []const u8) !void {
-    const seeded = try accounts.gpa.dupe(Model, &.{testing.model(name)});
-    accounts.gpa.free(accounts.catalog.accounts.get(account));
-    accounts.catalog.accounts.set(account, seeded);
+    try testing.seedAccount(accounts, account, &.{name});
 }
 
 test "isAuthenticated and firstAuthenticated read keys and readiness, subscription first" {
@@ -1028,6 +1107,125 @@ test "xAI invalidation forgets a rejected credential and reloads a replacement" 
     var file = (try json_store.open(gpa, io, accounts.xai_auth.path)).?;
     defer file.deinit();
     try std.testing.expect(file.entry("xai-plan") == null);
+}
+
+// The registry settles itself on the store, as after a logout or an
+// invalidation here, and it reports each change so the session can follow.
+test "a reread settles every login store and reports each change" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var directory = try tmp.dir.createDirPathOpen(io, ".drinky", .{});
+    directory.close(io);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".drinky/auth.json",
+        .data =
+        \\{ "anthropic-plan":
+        \\    { "access": "a", "refresh": "r", "expires_ms": 4102444800000,
+        \\      "account_uuid": "user-1", "organization_uuid": "org-1" },
+        \\  "anthropic-api": { "api_key": "minted" } }
+        ,
+    });
+    var home_buffer: [128]u8 = undefined;
+    const home = try std.fmt.bufPrint(&home_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+
+    var accounts = try Accounts.init(gpa, io, home, .{}, .{});
+    defer accounts.deinit();
+    try seedModel(&accounts, .anthropic_plan, "claude-opus-5");
+    try seedModel(&accounts, .anthropic_api, "claude-opus-5");
+    try seedModel(&accounts, .openai_plan, "gpt-5.6-sol");
+
+    // The same file again: nothing changed, and every list stays.
+    const same = accounts.reread();
+    try std.testing.expect(same.read_error == null);
+    for (std.enums.values(llm.Account)) |account|
+        try std.testing.expectEqual(auth.Change.unchanged, same.changes.get(account));
+    try std.testing.expect(!accounts.catalog.isEmpty(.anthropic_plan));
+
+    // Another instance refreshed the subscription, signed the Console key out,
+    // and signed in to OpenAI.
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".drinky/auth.json",
+        .data =
+        \\{ "anthropic-plan":
+        \\    { "access": "a2", "refresh": "r2", "expires_ms": 4102444800000,
+        \\      "account_uuid": "user-1", "organization_uuid": "org-1" },
+        \\  "openai-plan":
+        \\    { "access": "o", "refresh": "or", "expires_ms": 4102444800000,
+        \\      "account_id": "account" } }
+        ,
+    });
+    const changed = accounts.reread();
+    try std.testing.expect(changed.read_error == null);
+    try std.testing.expectEqual(auth.Change.rotated, changed.changes.get(.anthropic_plan));
+    try std.testing.expectEqual(auth.Change.signed_out, changed.changes.get(.anthropic_api));
+    try std.testing.expectEqual(auth.Change.signed_in, changed.changes.get(.openai_plan));
+    try std.testing.expectEqual(auth.Change.unchanged, changed.changes.get(.xai_plan));
+    try std.testing.expect(accounts.isAuthenticated(.anthropic_plan));
+    try std.testing.expectEqualStrings("r2", accounts.anthropic_auth.tokens.?.refresh);
+    try std.testing.expect(!accounts.isAuthenticated(.anthropic_api));
+    try std.testing.expect(accounts.isAuthenticated(.openai_plan));
+    // A rotation keeps the principal and its list. A sign-out takes the list.
+    try std.testing.expect(!accounts.catalog.isEmpty(.anthropic_plan));
+    try std.testing.expect(accounts.catalog.isEmpty(.anthropic_api));
+    try std.testing.expect(!accounts.catalog.isEmpty(.openai_plan));
+
+    // Another principal took the subscription slot, so its list goes.
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".drinky/auth.json",
+        .data =
+        \\{ "anthropic-plan":
+        \\    { "access": "b", "refresh": "rb", "expires_ms": 4102444800000,
+        \\      "account_uuid": "user-2", "organization_uuid": "org-2" } }
+        ,
+    });
+    const replaced = accounts.reread();
+    try std.testing.expectEqual(auth.Change.replaced, replaced.changes.get(.anthropic_plan));
+    try std.testing.expectEqual(auth.Change.signed_out, replaced.changes.get(.openai_plan));
+    try std.testing.expect(accounts.isAuthenticated(.anthropic_plan));
+    try std.testing.expect(accounts.catalog.isEmpty(.anthropic_plan));
+
+    // A file that Drinky cannot read changes nothing and names the failure.
+    try tmp.dir.writeFile(io, .{ .sub_path = ".drinky/auth.json", .data = "not json" });
+    const failed = accounts.reread();
+    try std.testing.expectEqual(@as(?anyerror, error.BadCredentials), failed.read_error);
+    for (std.enums.values(llm.Account)) |account| {
+        try std.testing.expectEqual(auth.Change.unchanged, failed.changes.get(account));
+        try std.testing.expect(failed.entry_errors.get(account) == null);
+    }
+    try std.testing.expect(accounts.isAuthenticated(.anthropic_plan));
+    try std.testing.expectEqualStrings("rb", accounts.anthropic_auth.tokens.?.refresh);
+
+    // An entry that does not decode keeps its own account and names the
+    // failure there, and every other store still settles.
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".drinky/auth.json",
+        .data =
+        \\{ "anthropic-plan": { "access": 1 },
+        \\  "anthropic-api": { "api_key": "minted" } }
+        ,
+    });
+    const partial = accounts.reread();
+    try std.testing.expect(partial.read_error == null);
+    try std.testing.expectEqual(
+        @as(?anyerror, error.BadCredentials),
+        partial.entry_errors.get(.anthropic_plan),
+    );
+    try std.testing.expect(partial.entry_errors.get(.anthropic_api) == null);
+    try std.testing.expectEqual(auth.Change.unchanged, partial.changes.get(.anthropic_plan));
+    try std.testing.expectEqual(auth.Change.signed_in, partial.changes.get(.anthropic_api));
+    try std.testing.expectEqualStrings("rb", accounts.anthropic_auth.tokens.?.refresh);
+    try std.testing.expect(accounts.isAuthenticated(.anthropic_api));
+}
+
+test "a registry with no store keeps its credentials in memory alone" {
+    var accounts = testAccounts(.{}, true, false);
+    const report = accounts.reread();
+    try std.testing.expect(report.read_error == null);
+    for (std.enums.values(llm.Account)) |account|
+        try std.testing.expectEqual(auth.Change.unchanged, report.changes.get(account));
+    try std.testing.expect(accounts.isAuthenticated(.anthropic_plan));
 }
 
 test "a principal replacement drops the list of that account alone" {
