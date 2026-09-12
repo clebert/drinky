@@ -134,8 +134,14 @@ fn writeKeys(writer: *std.Io.Writer, options: *const Options) !void {
         \\- Ctrl+C clears the editor. A second press within {d} milliseconds quits Drinky.
         \\- Ctrl+D quits at an empty editor. Ctrl+D with a draft warns first and quits on the
         \\  second press.
-        \\- Ctrl+N asks the model to continue a failed turn that committed work.
-        \\- Esc discards a waiting retry.
+        \\- Ctrl+N acts on the recovery offer that the caption above the editor names. Under
+        \\  `Failed turn`, Ctrl+N asks the model to continue from the committed work. Under
+        \\  `Canceled turn`, Ctrl+N removes the canceled turn from the conversation and returns
+        \\  its prompt and steering messages to the editor as editable text. Tool changes stay.
+        \\  A turn that ran `write`, `edit`, or `bash` warns first and removes on the second
+        \\  press. The chat and the prompt history keep their records of the removed turn.
+        \\- Esc dismisses a waiting recovery offer. A dismissed canceled turn stays in the
+        \\  conversation.
         \\
         \\A sign-in takes these keys:
         \\
@@ -148,7 +154,8 @@ fn writeKeys(writer: *std.Io.Writer, options: *const Options) !void {
         \\- Enter queues the line as a steering message.
         \\- Tab opens no prompt history. Drinky shows the notice `Prompt history cannot open while
         \\  a turn runs.` instead.
-        \\- Ctrl+P moves the queued steering messages back into the editor.
+        \\- Ctrl+P moves the queued steering messages back into the editor, above the draft and
+        \\  in the order the user sent them.
         \\- Esc cancels the turn. Esc with a draft warns first and cancels on the second press.
         \\- Ctrl+D cancels the turn at once.
         \\- Ctrl+C clears a draft, and it cancels the turn at an empty editor.
@@ -252,10 +259,20 @@ test "the document states every command, key, and discovery rule" {
     const turn = std.mem.indexOf(u8, text, "A running turn takes these keys:").?;
     try std.testing.expect(prompt < login);
     try std.testing.expect(login < turn);
-    // The prompt owns quitting and retry. A sign-in owns callback replay. The
-    // turn owns steering and its cancel.
+    // The prompt owns quitting and the two recovery offers. A sign-in owns
+    // callback replay. The turn owns steering and its cancel.
     try std.testing.expect(std.mem.indexOf(u8, text[prompt..login], "within 500 milli") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text[prompt..login], "Ctrl+N asks") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        text[prompt..login],
+        "Under\n  `Failed turn`, Ctrl+N asks the model to continue",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        text[prompt..login],
+        "`Canceled turn`, Ctrl+N removes the canceled turn",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, text[prompt..login], "Tool changes stay.") != null);
     // Tab acts at the prompt alone, and a turn answers it with a notice. The
     // document states both, so the model never promises the list during a turn.
     try std.testing.expect(std.mem.indexOf(

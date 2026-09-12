@@ -76,6 +76,13 @@ pub const Entry = struct {
         /// Whether an event stays when an abnormal turn rewinds its model tail.
         /// Other flagged blocks ignore this field.
         survives_rewind: bool,
+        /// Whether an event belongs to the turn that recorded it, so a deliberate
+        /// removal of that whole turn takes the event with it. A provider retry
+        /// event sets both flags: it happened during the turn, so it survives a
+        /// rewind of the tail, and it goes with a removal of the turn. A session
+        /// event and a command event set neither. Other flagged blocks ignore
+        /// this field, because the removal takes every one of them.
+        turn_owned: bool,
         /// Whether a remote mirror of the transcript sends this event. An event
         /// that stands in the chat already, or that a send to the chat caused,
         /// stays in the terminal. Other flagged blocks ignore this field.
@@ -137,6 +144,9 @@ pub const Entry = struct {
         /// Whether an event survives an abnormal turn rewind. Every other
         /// variant ignores it.
         survives_rewind: bool = false,
+        /// Whether an event goes with a deliberate removal of the turn that
+        /// recorded it. Every other variant ignores it.
+        turn_owned: bool = false,
         /// Whether a remote mirror of the transcript sends an event. Every
         /// other variant ignores it.
         mirrored: bool = true,
@@ -217,6 +227,7 @@ pub const Entry = struct {
             .is_warning = options.is_warning,
             .fit = options.fit,
             .survives_rewind = options.survives_rewind,
+            .turn_owned = options.turn_owned,
             .mirrored = options.mirrored,
             .base_len = text.len,
         };
@@ -273,6 +284,7 @@ pub const Entry = struct {
         flagged.is_warning = options.is_warning;
         flagged.fit = options.fit;
         flagged.survives_rewind = options.survives_rewind;
+        flagged.turn_owned = options.turn_owned;
         flagged.mirrored = options.mirrored;
         flagged.repeats = 1;
         flagged.base_len = text.len;
@@ -323,6 +335,7 @@ pub const Entry = struct {
         if (flagged.is_error != options.is_error) return false;
         if (flagged.is_warning != options.is_warning) return false;
         if (flagged.survives_rewind != options.survives_rewind) return false;
+        if (flagged.turn_owned != options.turn_owned) return false;
         if (flagged.mirrored != options.mirrored) return false;
         return std.mem.eql(u8, eventText(flagged), text);
     }
@@ -355,6 +368,19 @@ pub const Entry = struct {
         return switch (self.content) {
             .event => |event| event.survives_rewind,
             .intro, .user, .user_note, .thinking, .model, .tool_result => false,
+        };
+    }
+
+    /// Whether a deliberate removal of the turn that recorded this block takes
+    /// it. Every message, note, reasoning, answer, and tool box of a turn goes
+    /// with it. An event goes only when it belongs to the turn, so a session
+    /// event and a command event inside the range stay. An intro stands outside
+    /// every turn.
+    pub fn turnOwned(self: *const Entry) bool {
+        return switch (self.content) {
+            .event => |event| event.turn_owned,
+            .user, .user_note, .thinking, .model, .tool_result => true,
+            .intro => false,
         };
     }
 
@@ -971,6 +997,8 @@ test "a repeated event states one count and matches its own text" {
     // event never share a block.
     try std.testing.expect(!entry.statesEvent(.{ .is_error = true, .mirrored = false }, "no route to host"));
     try std.testing.expect(!entry.statesEvent(.{ .is_error = true, .is_warning = true }, "no route to host"));
+    // Two events with another ownership cannot collapse into one block either.
+    try std.testing.expect(!entry.statesEvent(.{ .is_error = true, .turn_owned = true }, "no route to host"));
     try std.testing.expect(!entry.statesEvent(.{}, "no route to host"));
     try std.testing.expect(!entry.statesEvent(.{ .is_error = true }, "other"));
 

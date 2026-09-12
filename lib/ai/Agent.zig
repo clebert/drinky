@@ -441,6 +441,47 @@ pub fn dropAccountEvidence(self: *Agent, account: llm.Account) void {
     }
 }
 
+/// How many items before `index` hold a replay proof of `account`.
+/// `dropAccountEvidence` removes them, so a position at `index` moves up by this
+/// count. The caller keeps `index` within the history.
+pub fn producedBefore(self: *const Agent, account: llm.Account, index: usize) usize {
+    std.debug.assert(index <= self.items.items.len);
+    var count: usize = 0;
+    for (self.items.items[0..index]) |item| {
+        const reasoning = switch (item) {
+            .reasoning => |value| value,
+            else => continue,
+        };
+        count += @intFromBool(std.meta.activeTag(reasoning.replay) == account);
+    }
+    return count;
+}
+
+/// The bounds of one turn in the history. The named fields keep the two
+/// confusable positions apart at the call site.
+pub const HistorySpan = struct {
+    /// The history length before the turn appended its first message.
+    base: usize,
+    /// The history length after the turn, which must still be the whole history.
+    end: usize,
+};
+
+/// Remove one canceled turn from the history: every item from `span.base` on.
+/// The history must end at `span.end` still. The caller keeps the span true
+/// through every change of the history, so a span that moved is a programming
+/// error. Call this only between turns, when no worker can own the history. The
+/// removed replies measured the context, so the measurement goes with them, and
+/// the guard searches the shortened history again for its skill proofs. The
+/// session cost, the billing reports, and the cache key stay, because a provider
+/// billed the removed work.
+pub fn rewindHistory(self: *Agent, span: HistorySpan) void {
+    std.debug.assert(span.base <= span.end);
+    std.debug.assert(span.end == self.items.items.len);
+    self.rollback(span.base);
+    self.measured_context = null;
+    self.refreshContext();
+}
+
 /// Remove replay proofs produced by one account slot. A successful credential
 /// replacement calls this before that slot can represent another principal. A
 /// dropped proof shortens the history, so the measured context no longer
@@ -2749,6 +2790,61 @@ test "rollback frees every item appended since the base" {
     agent.rollback(base);
     try std.testing.expectEqual(base, agent.items.items.len);
     try std.testing.expectEqualStrings("keep me", agent.items.items[base - 1].message.text);
+}
+
+// A revision removes one canceled turn from the history. The removed replies
+// measured the context, so the gauge goes blank with them, and the cost, the
+// billing reports, and the cache key stay, because the provider billed the work.
+test "rewindHistory removes a turn and keeps the billing evidence" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+
+    try agent.appendUser("earlier");
+    const base = agent.items.items.len;
+    try agent.appendUser("fix it");
+    try appendProof(&agent, .anthropic_plan);
+    try agent.appendUser("and test");
+    const end = agent.items.items.len;
+    seedContext(&agent, 1200);
+    agent.stats.cost = 0.25;
+    agent.stats.quota = .{ .primary = .{ .used_percent = 25, .window_minutes = 300 } };
+    const cache_key = agent.cache_key;
+    try std.testing.expectEqual(@as(?u64, 1200), agent.stats.context_tokens);
+
+    agent.rewindHistory(.{ .base = base, .end = end });
+    try std.testing.expectEqual(base, agent.items.items.len);
+    try std.testing.expectEqualStrings("earlier", agent.items.items[0].message.text);
+    try std.testing.expect(agent.measured_context == null);
+    try std.testing.expect(agent.stats.context_tokens == null);
+    try std.testing.expectEqual(@as(f64, 0.25), agent.stats.cost);
+    try std.testing.expect(agent.stats.quota != null);
+    try std.testing.expectEqualSlices(u8, &cache_key, &agent.cache_key);
+
+    // An emptied history states zero again.
+    agent.rewindHistory(.{ .base = 0, .end = base });
+    try std.testing.expectEqual(@as(?u64, 0), agent.stats.context_tokens);
+}
+
+// A revision anchors positions in the history. An evidence removal takes proofs
+// out below them, and each position moves up by the proofs below it alone.
+test "producedBefore counts the proofs of one account below an index" {
+    const gpa = std.testing.allocator;
+    var agent = scriptedAgent(gpa);
+    defer agent.deinit();
+
+    try appendProof(&agent, .anthropic_plan);
+    try agent.appendUser("fix it");
+    try appendProof(&agent, .openai_api_key);
+    try appendProof(&agent, .anthropic_plan);
+    try agent.appendUser("and test");
+
+    try std.testing.expectEqual(@as(usize, 0), agent.producedBefore(.anthropic_plan, 0));
+    try std.testing.expectEqual(@as(usize, 1), agent.producedBefore(.anthropic_plan, 2));
+    try std.testing.expectEqual(@as(usize, 1), agent.producedBefore(.anthropic_plan, 3));
+    try std.testing.expectEqual(@as(usize, 2), agent.producedBefore(.anthropic_plan, 5));
+    try std.testing.expectEqual(@as(usize, 1), agent.producedBefore(.openai_api_key, 5));
+    try std.testing.expectEqual(@as(usize, 0), agent.producedBefore(.xai_plan, 5));
 }
 
 fn readReplyUnderOom(allocator: std.mem.Allocator) !void {

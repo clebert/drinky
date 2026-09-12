@@ -19,8 +19,8 @@ to OpenRouter through a login or an API key, and to Gemini on the Gemini Enterpr
 - Read-only tool calls of one reply run in parallel, at most 32 at a time. A `write`, `edit`, or
   `bash` call runs alone, in call order.
 - Enter during a turn queues a steering message. The turn takes it at the next tool round.
-- Ctrl+P moves the queued messages back into the editor. A message that the turn did not take
-  returns to the editor when the turn ends.
+- Ctrl+P moves the queued messages back into the editor, above the draft and in the order you sent
+  them. A message that the turn did not take returns the same way when the turn ends.
 - Esc or Ctrl+D cancels the turn and keeps the draft. Esc with a draft warns first and cancels on
   the second press. Ctrl+C clears the draft first and cancels only at an empty editor.
 - A canceled or failed turn keeps the finished rounds, drops the unfinished tail, and returns
@@ -33,6 +33,14 @@ to OpenRouter through a login or an API key, and to Gemini on the Gemini Enterpr
 - A failed turn that committed work shows a `Failed turn` caption above the editor. Ctrl+N asks the
   model to continue, and Esc discards the retry. The retry never takes the editor text, and the
   start of any turn drops it.
+- A canceled turn that committed work shows a `Canceled turn` caption above the editor. Ctrl+N
+  removes the turn from the conversation and the transcript. The prompt and the taken steering
+  messages return to the editor as editable text, above the draft and in their order. Enter sends
+  the revised prompt. Esc keeps the turn, and a new turn or `/new` drops the offer. Ctrl+N acts on
+  the one offer that the caption names, so a failed turn and a canceled turn never offer together.
+- The removal undoes no tool change and no billed usage. A turn that ran `write`, `edit`, or `bash`
+  warns first and removes on the second Ctrl+N. The chat and the prompt history keep their records
+  of the removed turn, and a cancellation from the chat offers no removal.
 - A reply that the output cap cuts short stays, and Drinky reports the cut.
 - A refusal, an empty reply, and the round cap read as a plain sentence, not as an internal error.
 - Reasoning streams into its own block. Encrypted reasoning shows as `[redacted thinking]`.
@@ -601,7 +609,9 @@ to OpenRouter through a login or an API key, and to Gemini on the Gemini Enterpr
   `Drinky asked the model to shorten the last answer.`
 - The `Shorten` button never leaves its message, so the newest answer alone answers a tap. A tap on
   an older answer gets `This answer is not the newest one.`, and a tap during a turn gets
-  `A turn runs. Wait for its end.` A `/new` and a detach make every button of the chat stale.
+  `A turn runs. Wait for its end.` A `/new` and a detach make every button of the chat stale. The
+  chat keeps the messages of a removed canceled turn as a record, and the button of the answer
+  before it stays live, because that answer is still the newest.
 - An answer that stands last waits, because its message can still take that button. A tool that
   starts ends the wait, and so does the end of the turn.
 - A notice that a tap causes goes out as a toast. The detach leaves the chat as it stands, buttons
@@ -633,8 +643,8 @@ to OpenRouter through a login or an API key, and to Gemini on the Gemini Enterpr
 ## Herdr
 
 - Inside a Herdr pane, Drinky reports its state over the Herdr socket: `working` during a turn,
-  `blocked` while a failed turn waits for Ctrl+N, and `idle` otherwise. Herdr can then notify the
-  user of a turn end and a failure, and the work survives a closed lid.
+  `blocked` while a failed or a canceled turn waits for Ctrl+N, and `idle` otherwise. Herdr can then
+  notify the user of a turn end and a failure, and the work survives a closed lid.
 - The channel carries state outward alone, and nothing outside Drinky drives the session. Drinky
   releases the pane on exit. A Herdr that Drinky cannot reach never stops or slows the work.
 - Inside a Herdr pane, the status line shows neither the directory nor the branch, because the pane

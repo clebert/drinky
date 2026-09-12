@@ -24,6 +24,7 @@ const layout = @import("layout.zig");
 const PromptHistory = @import("PromptHistory.zig");
 const remote = @import("remote/root.zig");
 const Retry = @import("Retry.zig");
+const Revision = @import("Revision.zig");
 const Session = @import("Session.zig");
 const sources = @import("sources.zig");
 const State = @import("State.zig");
@@ -204,11 +205,16 @@ login: ?Login,
 /// events in the queue, so each event names its sign-in.
 login_generation: u64,
 /// The retry context of the latest failed turn, or null when none waits. It
-/// lives at the prompt alone, because the start of any turn takes it.
+/// lives at the prompt alone, because the start of any turn takes it. It never
+/// coexists with `revision`: `setRetry` and `setRevision` each clear the other.
 retry: ?Retry,
 /// Whether the live turn is a retry attempt. Its failure arms the context again,
 /// because the committed work that it continues from is still in history.
 turn_retry: bool,
+/// The revision context of the latest canceled turn, or null when none waits.
+/// It lives at the prompt alone, because the start of any turn takes it, and it
+/// never coexists with `retry`.
+revision: ?Revision,
 /// The pending frame timer, or null when none is armed (idle or clean).
 tick_future: ?std.Io.Future(void),
 /// A frame timer is armed and its `.tick` has not been drained yet.
@@ -1011,6 +1017,7 @@ fn initFields(self: *App, gpa: std.mem.Allocator, io: std.Io) void {
         .login_generation = 0,
         .retry = null,
         .turn_retry = false,
+        .revision = null,
         .tick_future = null,
         .tick_pending = false,
         .frame_grid = .reset(0),
@@ -1058,6 +1065,7 @@ fn shutdownTasks(self: *App) void {
     // Shutdown is teardown, not an interactive cancel: free the worker result's
     // owned terminal text and leave the session untouched.
     self.dropRetry();
+    self.dropRevision();
     if (self.cancelTurnFuture()) |result| self.freeWorkerResult(&result);
     if (self.pending_turn_result) |result| {
         self.freeWorkerResult(&result);
@@ -1202,19 +1210,46 @@ fn armRetry(self: *App, result: *const WorkerResult, attempt: bool) !void {
     self.setRetry(.{ .failure = failure });
 }
 
-/// Replace the retry context and mirror its caption into the session. This is
-/// the one place that moves both together, so the caption cannot outlive it. A
-/// retry that ends takes the buttons off its message in the chat too.
+/// Replace the recovery offer with `retry` and mirror its caption into the
+/// session. This is the one place that moves both together, so the caption
+/// cannot outlive it. A revision that waits goes first, because the two offers
+/// cannot coexist.
 ///
-/// The call frees the context that it replaces, so a caller builds `maybe_retry`
-/// and every byte in it first. `armRetry` duplicates the failure sentence before
-/// it arrives here for exactly that reason.
-fn setRetry(self: *App, maybe_retry: ?Retry) void {
-    // A failed edit costs the buttons of the chat alone, never the retry.
-    if (self.retry != null and maybe_retry == null) self.mirror.dismissRetry(&self.controller) catch {};
+/// The call frees the context that it replaces, so a caller builds `retry` and
+/// every byte in it first. `armRetry` duplicates the failure sentence before it
+/// arrives here for exactly that reason.
+fn setRetry(self: *App, retry: Retry) void {
+    self.dismissOffer();
+    self.retry = retry;
+    self.session.prompt_offer = .retry;
+    self.session.dirty = true;
+}
+
+/// Replace the recovery offer with `revision` and mirror its caption into the
+/// session. A retry that waits goes first, because the two offers cannot
+/// coexist. Infallible, so a cancellation publishes the context before a later
+/// error returns.
+fn setRevision(self: *App, revision: Revision) void {
+    self.dismissOffer();
+    self.revision = revision;
+    self.session.prompt_offer = .revision;
+    self.session.dirty = true;
+}
+
+/// Dismiss whichever recovery offer waits at the prompt, and its caption. The
+/// editor keeps its text, because the offer owns none of it. A retry that ends
+/// takes the buttons off its message in the chat too, and a failed edit costs
+/// the buttons alone. A revision has no remote controls, and a warning that its
+/// first Ctrl+N armed goes with it, so no confirmation outlives its offer. Esc,
+/// `/new`, and every turn start come here, and each successful Ctrl+N action
+/// comes here at its commit point.
+fn dismissOffer(self: *App) void {
+    std.debug.assert(self.retry == null or self.revision == null);
+    if (self.retry != null) self.mirror.dismissRetry(&self.controller) catch {};
     self.dropRetry();
-    self.retry = maybe_retry;
-    self.session.retry_shown = maybe_retry != null;
+    self.dropRevision();
+    self.session.cancelConfirmation(.revision);
+    self.session.prompt_offer = .none;
     self.session.dirty = true;
 }
 
@@ -1233,11 +1268,19 @@ fn dropRetry(self: *App) void {
     self.retry = null;
 }
 
-/// Discard the retry context and its caption. The editor keeps its text because
-/// Esc dismisses the retry alone.
+/// Free the revision context and forget it. Teardown uses this, because it
+/// touches no session state.
+fn dropRevision(self: *App) void {
+    const revision = if (self.revision) |*revision| revision else return;
+    revision.deinit(self.gpa);
+    self.revision = null;
+}
+
+/// Discard a waiting retry alone. A tap on `Dismiss` in the chat comes here,
+/// because the buttons of the chat name the retry and never a revision.
 fn clearRetry(self: *App) void {
     if (self.retry == null) return;
-    self.setRetry(null);
+    self.dismissOffer();
 }
 
 /// Cancel and reap `maybe_future`'s task, then clear the handle. A no-op when null.
@@ -1313,11 +1356,13 @@ fn runLoop(self: *App) !void {
 }
 
 /// The state that Herdr shows for this pane, read from the model after a batch.
-/// A turn works. A failed turn that waits for Ctrl+N blocks, because the user
-/// must decide on it. Everything else, the pickers included, is idle.
+/// A turn works. A failed turn or a canceled turn that waits for Ctrl+N blocks,
+/// because the user must decide on it. Everything else, the pickers included,
+/// is idle.
 fn herdrState(self: *const App) Herdr.State {
+    std.debug.assert(self.retry == null or self.revision == null);
     if (self.session.mode == .turn) return .working;
-    if (self.retry != null) return .blocked;
+    if (self.retry != null or self.revision != null) return .blocked;
     return .idle;
 }
 
@@ -1616,6 +1661,11 @@ fn handleKey(self: *App, event: *const terminal.Input.Key) !void {
     // other user action clears the warning and its one-shot confirmation.
     const confirms_quit = editor_live and at_prompt and event.* == .ctrl and event.ctrl == 'd';
     if (!confirms_quit) self.session.cancelConfirmation(.quit);
+    // Only a second Ctrl+N at the prompt can confirm the revision warning. Every
+    // other user action clears the warning and its one-shot confirmation, and
+    // keeps the offer.
+    const confirms_revision = editor_live and at_prompt and event.* == .ctrl and event.ctrl == 'n';
+    if (!confirms_revision) self.session.cancelConfirmation(.revision);
     // Clear before the key routes, so a notice produced by this action survives it.
     self.session.clearNotice();
     // A sign-in keeps the raw terminal and editor. It owns every key until its
@@ -1641,8 +1691,9 @@ fn handleKey(self: *App, event: *const terminal.Input.Key) !void {
     switch (event.*) {
         .enter => try self.submit(),
         .tab => try self.openPromptHistory(),
-        // Esc owns the waiting retry, and it keeps the editor text.
-        .escape => self.clearRetry(),
+        // Esc owns the waiting recovery offer, and it keeps the editor text. A
+        // dismissed revision keeps the canceled turn in both histories.
+        .escape => self.dismissOffer(),
         .ctrl => |letter| switch (letter) {
             'c' => {
                 self.clearOrQuit();
@@ -1663,7 +1714,14 @@ fn handleKey(self: *App, event: *const terminal.Input.Key) !void {
                     .{},
                 );
             },
-            'n' => try self.retryTurn(),
+            // Ctrl+N acts on the one recovery offer that the caption names. A
+            // failed turn continues, and a canceled turn leaves the
+            // conversation. Without an offer the key does nothing.
+            'n' => switch (self.session.prompt_offer) {
+                .none => {},
+                .retry => try self.retryTurn(),
+                .revision => try self.reviseTurn(),
+            },
             else => {},
         },
         else => {},
@@ -1876,10 +1934,12 @@ fn returnLateSteering(self: *App) !void {
 /// completion or failure. Queued events retain their generation and cannot affect
 /// a successor.
 fn cancelTurn(self: *App) !void {
-    // Preflight editor capacity to restore every rich draft before the join. An
-    // OOM then cannot leave an already-canceled worker's drafts unrecoverable.
-    // The mirror is consumer-owned and stable here.
+    // Preflight editor capacity to restore every rich draft before the join, and
+    // the storage that a revision capture fills. An OOM then cannot leave an
+    // already-canceled worker's drafts unrecoverable. The mirror is
+    // consumer-owned and stable here.
     try self.session.reserveSteeringRestore();
+    try self.session.reserveRevisionCapture();
     const result = self.cancelTurnFuture() orelse return;
     switch (result.outcome.disposition) {
         // The joined outcome is authoritative. Sync the usage a queued `.usage`
@@ -1903,13 +1963,34 @@ fn cancelTurn(self: *App) !void {
             // A canceled turn can leave another branch checked out behind it.
             self.refreshBranch();
             try self.settleChatMessages(receipt);
+            // A committed turn that the terminal canceled can leave the
+            // conversation later, so its messages move out before the receipt
+            // frees their shells. A cancellation from the chat offers no
+            // revision, because the chat holds the input and the text of its
+            // messages.
+            var maybe_capture: ?Session.RevisionCapture = null;
+            if (committed and self.session.input.owner == .terminal)
+                maybe_capture = self.session.takeCanceledRevision(receipt);
             self.session.cancelReceipt(receipt, result.progress_sequence_committed);
             self.agent.steering.clear();
             if (committed) {
-                self.session.abortTurn() catch |err| {
+                const aborted = self.session.abortTurn();
+                // The context stands before the error of a lost event returns,
+                // and it names the transcript end after that event, whether the
+                // event landed or not.
+                if (maybe_capture) |capture| self.setRevision(.{
+                    .history = .{ .base = receipt.history_base, .end = receipt.history_end },
+                    .transcript_base = capture.transcript_base,
+                    .transcript_end = self.session.transcript.blocks().len,
+                    .prompt = capture.prompt,
+                    .steering = capture.steering,
+                    .mutated = capture.mutated,
+                });
+                aborted catch |err| {
                     if (maybe_progress_error == null) maybe_progress_error = err;
                 };
             } else {
+                std.debug.assert(maybe_capture == null);
                 self.session.endTurn();
             }
             try self.endMirrorTurn(.canceled);
@@ -2220,6 +2301,58 @@ fn startRetryTurn(self: *App) !usize {
     return base;
 }
 
+/// The warning of the first Ctrl+N over a canceled turn that changed the system.
+/// The removal takes the turn out of the conversation, and the changes of its
+/// tools stay, so the user decides with that fact in view.
+const revision_warning = "Press Ctrl+N again to remove the canceled turn. Tool changes stay.";
+
+/// Ctrl+N at the prompt with a waiting revision: remove the canceled turn from
+/// the agent history and the transcript, and return its messages to the editor
+/// above the text that the editor holds, in their order. The removal starts no
+/// turn: Enter sends the revised draft. A turn that committed a call of a tool
+/// that changes the system warns first and removes on the next Ctrl+N alone.
+///
+/// Every fallible step runs before the first mutation, so a failure keeps both
+/// histories, every draft, and the offer. The anchors of the offer hold by
+/// contract: every operation that shortens a history between turns dismisses
+/// the offer or moves its anchors, so a stale anchor is a programming error.
+fn reviseTurn(self: *App) !void {
+    std.debug.assert(self.session.mode == .prompt);
+    const revision = if (self.revision) |*revision| revision else return;
+    if (revision.mutated and !self.session.takeConfirmation(.revision)) {
+        // Arm last, so a failed warning leaves no confirmation that no row shows.
+        try self.reportNotice(.warning, revision_warning, .{});
+        self.session.armConfirmation(.revision);
+        return;
+    }
+    try self.session.editor.reserveComposition(&revision.prompt, revision.steering.items);
+    // The transcript range holds before the agent rewinds, so the two histories
+    // cannot come apart on the way to a failed assertion.
+    std.debug.assert(revision.transcript_base <= revision.transcript_end);
+    std.debug.assert(revision.transcript_end <= self.session.transcript.blocks().len);
+    const cursor = self.mirror.transcriptCursor();
+    self.agent.rewindHistory(revision.history);
+
+    // Both histories rewind from here, and nothing below can fail.
+    var taken = self.revision.?;
+    self.revision = null;
+    defer taken.deinit(self.gpa);
+    self.session.stats_shown = self.agent.stats;
+    const removal = self.session.removeTurn(.{
+        .range_base = taken.transcript_base,
+        .range_end = taken.transcript_end,
+        .mirror_cursor = cursor,
+    });
+    // The blocks below the cursor of the mirror left, so the cursor follows
+    // them, and the chat keeps every message it holds as a record. The live
+    // `Shorten` button stays, because only a completed turn arms it, so it
+    // names an answer outside the range or none.
+    self.mirror.retreat(removal.removed_before_cursor_count);
+    self.session.editor.prependComposition(&taken.prompt, taken.steering.items);
+    self.session.markEdited();
+    self.dismissOffer();
+}
+
 /// A tap on `Shorten` in the chat: record the line that names the request, then
 /// spawn its turn over the request. Drinky wrote that line, so it takes the note
 /// kind, like the line of a retry attempt, and the request stays out of the
@@ -2250,11 +2383,13 @@ fn runTurn(self: *App, text: []const u8) !void {
     self.session.beginTurn(generation);
     self.prompt_marked = false;
     self.steering_marked_count = 0;
-    // Every turn start takes the waiting retry, not the attempt alone. A message
-    // that the user sends instead of the attempt moves the conversation on, so the
-    // context it named is stale. The drop runs after the spawn, because a start
-    // that fails must leave the context for another try.
-    self.setRetry(null);
+    // Every turn start takes the waiting recovery offer, not the attempt alone.
+    // A message that the user sends instead of the attempt moves the
+    // conversation on, so the context it named is stale, and a canceled turn
+    // that another turn follows stays in the conversation. The drop runs after
+    // the spawn, because a start that fails must leave the offer for another
+    // try.
+    self.dismissOffer();
     // A turn cannot host a picker, so the start of one makes the open picker of
     // the chat stale.
     self.chat_picker.close();
@@ -2399,8 +2534,9 @@ fn applyOutcome(self: *App, outcome: ai.command.Outcome) !void {
             // The intro line is the legend of the interface, so the empty
             // conversation opens on it again.
             try self.session.transcript.append(.intro, .{}, intro_text);
-            // The cleared conversation holds no work to continue from.
-            self.clearRetry();
+            // The cleared conversation holds no work to continue from, and no
+            // canceled turn to remove.
+            self.dismissOffer();
             // The attach event brackets every Telegram message, and the clear
             // took it, so the new conversation opens on a bracket of its own.
             // The mirror starts over at it, so the chat gets it first. The
@@ -3041,12 +3177,25 @@ fn adopt(self: *App, account: ai.llm.Account) void {
 /// Forget everything the principal behind `account` produced: the replay proofs
 /// in history, and the reasoning blocks that hold them in the transcript. Both
 /// sides drop together, so the interface never shows a block that no request
-/// carries.
+/// carries. Every position over the two histories moves up by the items that
+/// left below it alone: the cursor of the mirror, and the anchors of a waiting
+/// revision, which keeps its offer.
 fn dropAccountEvidence(self: *App, account: ai.llm.Account) void {
+    const transcript = &self.session.transcript;
+    // The cursor can stand past the list, as the flush clamps it too.
+    const cursor = @min(self.mirror.transcriptCursor(), transcript.blocks().len);
+    const cursor_removed = transcript.producedBefore(account, cursor);
+    if (self.revision) |*revision| {
+        revision.history.base -= self.agent.producedBefore(account, revision.history.base);
+        revision.history.end -= self.agent.producedBefore(account, revision.history.end);
+        revision.transcript_base -= transcript.producedBefore(account, revision.transcript_base);
+        revision.transcript_end -= transcript.producedBefore(account, revision.transcript_end);
+    }
     self.agent.dropAccountEvidence(account);
-    // The blocks left below the cursor of the mirror, so the cursor moves back
-    // with them and the block behind them still goes out.
-    self.mirror.retreat(self.session.dropAccountReasoning(account));
+    self.session.dropAccountReasoning(account);
+    // Only a block below the cursor moves a block that the chat holds, so only
+    // that count moves the cursor back, and no block goes out twice.
+    self.mirror.retreat(cursor_removed);
 }
 
 /// The shared refusal path for a command that the active state does not allow.
@@ -5864,6 +6013,7 @@ test "cancel restores steering before event allocation failure" {
     try app.submitSteering();
     try spawnCommittedCanceledTurn(&app);
     try app.session.reserveSteeringRestore();
+    try app.session.reserveRevisionCapture();
     failing.fail_index = failing.alloc_index;
     failing.resize_fail_index = failing.resize_index;
 
@@ -5879,7 +6029,11 @@ test "cancel restores steering before event allocation failure" {
     try std.testing.expectEqual(@as(usize, 0), taken.len);
 }
 
-test "ctrl+p recalls the steering queue after in-progress editor text" {
+// Regression: Ctrl+P appended the queued messages after the in-progress text,
+// so an older message followed a newer draft. Every automatic restore keeps
+// chronology, and the queue came before the draft, so the recall prepends the
+// queue in submission order and leaves the draft as the last message.
+test "ctrl+p recalls the steering queue before in-progress editor text" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -5906,8 +6060,10 @@ test "ctrl+p recalls the steering queue after in-progress editor text" {
 
     // Through the key binding, so the turn-mode route to the pull stays covered.
     try app.handleKey(&.{ .ctrl = 'p' });
-    try std.testing.expectEqualStrings("draft\n\nfix it\n\nand test", app.session.editor.visible());
+    try std.testing.expectEqualStrings("fix it\n\nand test\n\ndraft", app.session.editor.visible());
     try std.testing.expectEqual(@as(usize, 0), app.session.steering.items.len);
+    // The caret lands at the end, so the user continues the draft.
+    try std.testing.expectEqual(app.session.editor.visible().len, app.session.editor.caret);
 }
 
 test "ctrl+p restores a steered paste as a live placeholder atom" {
@@ -7683,6 +7839,58 @@ test "an account switch projects the conversation for the new account" {
     try std.testing.expect(std.mem.indexOf(u8, switched, "switched") != null);
 }
 
+// Regression: the evidence removal moved the mirror cursor back by every
+// dropped block, also by a block above the cursor. The blocks below the cursor
+// then went out to the chat a second time. Only a dropped block below the
+// cursor moves a block that the chat holds, so only that count retreats.
+//
+// No ordinary sequence leaves the cursor below a dropped block: `open` starts at
+// the committed frontier, and `flush` advances the cursor before it sends. The
+// test sets the lag itself.
+test "account evidence removal retreats the mirror only over dropped blocks below the cursor" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = test_anthropic_model,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .high);
+    defer app.session.deinit();
+    app.session.showSetup(.anthropic_plan, test_anthropic_model, .high);
+
+    // The chat holds the answer and the event. The reasoning of one account
+    // stands below the answer, and another run of it stands above the cursor.
+    try app.session.transcript.appendStream(.thinking, .anthropic_plan, "weigh it");
+    try app.session.transcript.appendStream(.model, null, "the answer");
+    try app.session.transcript.append(.event, .{}, "You attached @bot.");
+    try app.session.transcript.appendStream(.thinking, .anthropic_plan, "weigh again");
+    app.mirror.cursor = 3;
+
+    app.dropAccountEvidence(.anthropic_plan);
+
+    // Only the block below the cursor moves the answer and the event up, so
+    // the cursor follows them by one and no block goes out again.
+    try std.testing.expectEqual(@as(usize, 2), app.session.transcript.blocks().len);
+    try std.testing.expectEqual(@as(usize, 2), app.mirror.cursor);
+
+    // A cursor above the block count clamps instead of indexing past the list.
+    // The clamped cursor stands above the one dropped block, so the cursor moves
+    // back by one, and the flush clamps it to the list at the next step.
+    try app.session.transcript.appendStream(.thinking, .anthropic_plan, "once more");
+    app.mirror.cursor = 9;
+    app.dropAccountEvidence(.anthropic_plan);
+    try std.testing.expectEqual(@as(usize, 2), app.session.transcript.blocks().len);
+    try std.testing.expectEqual(@as(usize, 8), app.mirror.cursor);
+}
+
 test "startup resumes on the account, model, and effort level this project used last" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -9375,7 +9583,7 @@ test "a committed failure arms a retry that Esc dismisses" {
 
     try std.testing.expect(app.session.mode == .prompt);
     try std.testing.expectEqualStrings("The provider is overloaded.", app.retry.?.failure);
-    try std.testing.expect(app.session.retry_shown);
+    try std.testing.expectEqual(Session.PromptOffer.retry, app.session.prompt_offer);
 
     // The caption names the failed state and the two keys that own the retry.
     // Enter belongs to the editor text, so the controls leave it out.
@@ -9391,7 +9599,7 @@ test "a committed failure arms a retry that Esc dismisses" {
     try app.session.editor.insert("keep this text");
     try app.handleKey(&.escape);
     try std.testing.expect(app.retry == null);
-    try std.testing.expect(!app.session.retry_shown);
+    try std.testing.expectEqual(Session.PromptOffer.none, app.session.prompt_offer);
     try std.testing.expectEqualStrings("keep this text", app.session.editor.visible());
 
     // A prompt with no retry leaves Ctrl+N without an attempt to send.
@@ -9439,7 +9647,7 @@ test "an uncommitted human failure returns to the editor and arms no retry" {
 
     try std.testing.expectEqualStrings("write the docs", app.session.editor.visible());
     try std.testing.expect(app.retry == null);
-    try std.testing.expect(!app.session.retry_shown);
+    try std.testing.expectEqual(Session.PromptOffer.none, app.session.prompt_offer);
     const blocks = app.session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 1), blocks.len);
     try std.testing.expect(blocks[0].content.event.is_error);
@@ -9489,7 +9697,7 @@ test "an uncommitted skill failure returns its line and arms no retry" {
     }
     try std.testing.expect(app.session.mode == .prompt);
     try std.testing.expect(app.retry == null);
-    try std.testing.expect(!app.session.retry_shown);
+    try std.testing.expectEqual(Session.PromptOffer.none, app.session.prompt_offer);
     try std.testing.expectEqualStrings(
         "/skill:demo apply it\n\nand keep the format",
         app.session.editor.visible(),
@@ -9537,7 +9745,7 @@ test "Ctrl+N sends the attempt and keeps the editor text" {
 
     try std.testing.expect(app.session.mode == .turn);
     try std.testing.expect(app.retry == null);
-    try std.testing.expect(!app.session.retry_shown);
+    try std.testing.expectEqual(Session.PromptOffer.none, app.session.prompt_offer);
     // The attempt sends and clears nothing of the editor, and it retains no draft,
     // because the editor holds no part of it.
     try std.testing.expectEqualStrings("a draft that stays", app.session.editor.visible());
@@ -9557,7 +9765,7 @@ test "Ctrl+N sends the attempt and keeps the editor text" {
     }
     // The attempt continues committed work, so its own failure arms the context
     // again. Its line rewinds, and only the failure event stays.
-    try std.testing.expect(app.session.retry_shown);
+    try std.testing.expectEqual(Session.PromptOffer.retry, app.session.prompt_offer);
     try std.testing.expect(std.mem.indexOf(u8, app.retry.?.failure, "SignedOut") != null);
     try std.testing.expectEqualStrings("a draft that stays", app.session.editor.visible());
     const blocks = app.session.transcript.blocks();
@@ -9640,7 +9848,7 @@ test "a signed-out Ctrl+N names the sign-in and keeps the retry" {
     app.setRetry(.{ .failure = try gpa.dupe(u8, "The provider is overloaded.") });
     try app.handleKey(&.{ .ctrl = 'n' });
     try std.testing.expect(app.retry != null);
-    try std.testing.expect(app.session.retry_shown);
+    try std.testing.expectEqual(Session.PromptOffer.retry, app.session.prompt_offer);
     try std.testing.expect(app.turn_future == null);
     try std.testing.expectEqualStrings(
         "Sign in with /login before you try the turn again.",
@@ -9676,7 +9884,7 @@ test "Ctrl+N refuses while the account offers no model" {
 
     try std.testing.expect(app.turn_future == null);
     try std.testing.expect(app.retry != null);
-    try std.testing.expect(app.session.retry_shown);
+    try std.testing.expectEqual(Session.PromptOffer.retry, app.session.prompt_offer);
     try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
     try std.testing.expectEqualStrings(no_model_refusal, app.session.notice.?.content);
 }
@@ -9712,7 +9920,7 @@ test "Enter sends a plain message and drops the waiting retry" {
     defer app.dropRetry();
 
     app.retry = .{ .failure = try gpa.dupe(u8, "The provider did not respond in time.") };
-    app.session.retry_shown = true;
+    app.session.prompt_offer = .retry;
 
     try app.session.editor.insert("also check the tests");
     // The two steps that `submit` runs once its sign-in gate passes. A test client
@@ -9727,7 +9935,7 @@ test "Enter sends a plain message and drops the waiting retry" {
     // carries the failure sentence.
     try std.testing.expect(app.session.mode == .turn);
     try std.testing.expect(app.retry == null);
-    try std.testing.expect(!app.session.retry_shown);
+    try std.testing.expectEqual(Session.PromptOffer.none, app.session.prompt_offer);
     try std.testing.expectEqualStrings("", app.session.editor.visible());
     {
         const blocks = app.session.transcript.blocks();
@@ -9743,7 +9951,7 @@ test "Enter sends a plain message and drops the waiting retry" {
     // The turn committed nothing, so the human text returns and no context arms.
     try std.testing.expectEqualStrings("also check the tests", app.session.editor.visible());
     try std.testing.expect(app.retry == null);
-    try std.testing.expect(!app.session.retry_shown);
+    try std.testing.expectEqual(Session.PromptOffer.none, app.session.prompt_offer);
     const blocks = app.session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 1), blocks.len);
     try std.testing.expect(blocks[0].content.event.is_error);
@@ -9786,7 +9994,24 @@ test "the Herdr state follows the turn and the waiting retry" {
     try std.testing.expectEqual(Herdr.State.blocked, app.herdrState());
     // The attempt is a turn again, and it takes the context.
     app.session.beginTurn(2);
-    app.setRetry(null);
+    app.dismissOffer();
+    try std.testing.expectEqual(Herdr.State.working, app.herdrState());
+    app.session.endTurn();
+    try std.testing.expectEqual(Herdr.State.idle, app.herdrState());
+
+    // A canceled turn with committed work waits for Ctrl+N too, and the user
+    // must decide on it the same way. The next turn takes the offer.
+    app.setRevision(.{
+        .history = .{ .base = 0, .end = 0 },
+        .transcript_base = 0,
+        .transcript_end = 0,
+        .prompt = .empty,
+        .steering = .empty,
+        .mutated = false,
+    });
+    try std.testing.expectEqual(Herdr.State.blocked, app.herdrState());
+    app.session.beginTurn(3);
+    app.dismissOffer();
     try std.testing.expectEqual(Herdr.State.working, app.herdrState());
     app.session.endTurn();
     try std.testing.expectEqual(Herdr.State.idle, app.herdrState());
@@ -9797,7 +10022,9 @@ test "the Herdr state follows the turn and the waiting retry" {
 }
 
 // A cancellation is the user's own stop, so it arms no retry. Esc during an attempt
-// ends the recovery, and the committed work behind it stays in history.
+// ends the recovery, and the committed work behind it stays in history. An
+// attempt and a shorten request retain no prompt of the user, so their
+// cancellation offers no revision either.
 test "canceling an attempt ends the recovery" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -9825,7 +10052,8 @@ test "canceling an attempt ends the recovery" {
 
     try std.testing.expect(app.session.mode == .prompt);
     try std.testing.expect(app.retry == null);
-    try std.testing.expect(!app.session.retry_shown);
+    try std.testing.expect(app.revision == null);
+    try std.testing.expectEqual(Session.PromptOffer.none, app.session.prompt_offer);
     try std.testing.expect(!app.turn_retry);
     const blocks = app.session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 1), blocks.len);
@@ -9833,6 +10061,1292 @@ test "canceling an attempt ends the recovery" {
         "You canceled the turn.",
         blocks[0].content.event.text.items,
     );
+
+    // The state of a live shorten request: a note names it, and no prompt waits.
+    try app.session.transcript.append(.user_note, .{}, shorten_note_text);
+    app.session.beginTurn(2);
+    app.session.markTurnBase(1);
+    try spawnCommittedCanceledTurn(&app);
+    try app.cancelTurn();
+    try std.testing.expect(app.revision == null);
+    try std.testing.expectEqual(Session.PromptOffer.none, app.session.prompt_offer);
+    try std.testing.expect(app.session.mode == .prompt);
+}
+
+/// Test scaffolding: the prompt of one staged turn, where it came from, and
+/// the tool of its committed round.
+const StagedTurn = struct {
+    /// The rich draft of the prompt. The stage takes it.
+    prompt: *ui.Editor.Draft,
+    source: Session.Message.Source = .terminal,
+    /// The tool of the committed round, or null for a round of the answer alone.
+    tool: ?[]const u8 = null,
+};
+
+/// Test scaffolding: the state of turn 1 over `staged.prompt`, as `submit` does
+/// past its gates, after it committed one round: the answer, and the call of
+/// `staged.tool` with its result. The user box and the two agent messages stand
+/// in both histories. `result` then holds the cancellation of that turn, whose
+/// receipt names the history span, and no worker runs yet, so a test adjusts
+/// the result before it spawns the fake worker through `spawnStagedTurn`. The
+/// caller keeps `result` alive until it cancels the turn.
+fn stageCommittedPromptTurn(app: *App, result: *WorkerResult, staged: StagedTurn) !void {
+    const gpa = app.gpa;
+    const history_base = app.agent.items.items.len;
+    const base = app.session.transcript.blocks().len;
+    const text = try staged.prompt.expanded(gpa, .whole_prompt);
+    defer gpa.free(text);
+    try app.session.transcript.append(.user, .{}, text);
+    try app.agent.items.append(gpa, .{ .message = .{
+        .role = .user,
+        .text = try gpa.dupe(u8, text),
+    } });
+    try app.agent.items.append(gpa, .{ .message = .{
+        .role = .assistant,
+        .text = try gpa.dupe(u8, "the answer"),
+    } });
+    app.session.beginTurn(1);
+    switch (staged.source) {
+        .terminal => app.session.retainTurnPrompt(staged.prompt, base),
+        .external => |id| app.session.retainExternalTurnPrompt(staged.prompt, base, id),
+    }
+
+    _ = try app.session.applyTurnEvent(&.{
+        .generation = 1,
+        .progress_sequence = 1,
+        .payload = .{ .text = try gpa.dupe(u8, "the answer") },
+    });
+    var sequence: u64 = 1;
+    if (staged.tool) |tool| {
+        _ = try app.session.applyTurnEvent(&.{
+            .generation = 1,
+            .progress_sequence = 2,
+            .progress_sequence_committed = 1,
+            .payload = .{ .tool_start = .{
+                .name = try gpa.dupe(u8, tool),
+                .input_json = try gpa.dupe(u8, "{}"),
+            } },
+        });
+        _ = try app.session.applyTurnEvent(&.{
+            .generation = 1,
+            .progress_sequence = 3,
+            .progress_sequence_committed = 1,
+            .payload = .{ .tool_result = .{
+                .name = try gpa.dupe(u8, tool),
+                .summary = .{ .text = try gpa.dupe(u8, "Lines: 1") },
+                .is_error = false,
+            } },
+        });
+        sequence = 3;
+    }
+    result.* = .{
+        .outcome = .{ .receipt = .{
+            .history_base = history_base,
+            .history_end = app.agent.items.items.len,
+            .steering_committed_count = 0,
+        }, .disposition = .canceled },
+        .error_text = null,
+        .generation = 1,
+        .progress_sequence = sequence,
+        .progress_sequence_committed = sequence,
+    };
+}
+
+/// Test scaffolding: spawn the fake worker of a staged turn. Reaped by
+/// `cancelTurn`.
+fn spawnStagedTurn(app: *App, result: *const WorkerResult) !void {
+    app.turn_future = try app.io.concurrent(fakeWorker, .{result});
+}
+
+/// Test scaffolding: stage turn 1 over the typed `prompt` with the committed
+/// call of `maybe_tool`, and spawn its fake worker at once.
+fn beginCommittedPromptTurn(
+    app: *App,
+    result: *WorkerResult,
+    prompt: []const u8,
+    maybe_tool: ?[]const u8,
+) !void {
+    var draft = try ui.Editor.Draft.fromText(app.gpa, prompt);
+    errdefer draft.deinit(app.gpa);
+    try stageCommittedPromptTurn(app, result, .{ .prompt = &draft, .tool = maybe_tool });
+    try spawnStagedTurn(app, result);
+}
+
+/// Test scaffolding: assert that the canceled turn of `beginCommittedPromptTurn`
+/// stands in both histories as it was left: the two agent messages above
+/// `history_base`, and the blocks of the turn above `transcript_base` up to the
+/// cancellation event.
+fn expectCanceledTurnStands(app: *const App, history_base: usize, transcript_base: usize) !void {
+    try std.testing.expectEqual(history_base + 2, app.agent.items.items.len);
+    const blocks = app.session.transcript.blocks();
+    try std.testing.expect(blocks.len > transcript_base);
+    try std.testing.expect(blocks[transcript_base].content == .user);
+    const last = blocks[blocks.len - 1];
+    try std.testing.expectEqualStrings("You canceled the turn.", last.content.event.text.items);
+}
+
+// A cancellation of a turn that committed work keeps that work, because the
+// finished rounds stand in history. The prompt of the user does not return, but
+// the cancellation offers its revision: the caption names the canceled turn and
+// the two keys that own the offer, and the context anchors the turn in both
+// histories. Esc, Ctrl+C at an empty editor, and Ctrl+D each cancel the same
+// way, so each one offers the same revision.
+test "a committed cancellation offers the revision of the turn" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    defer app.drainQueue();
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = test_anthropic_model,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
+    defer app.session.deinit();
+    defer app.dropRevision();
+    try app.session.transcript.append(.intro, .{}, intro_text);
+
+    for ([_]terminal.Input.Key{ .escape, .{ .ctrl = 'c' }, .{ .ctrl = 'd' } }) |key| {
+        app.agent.resetConversation();
+        app.session.transcript.truncate(1);
+        var result: WorkerResult = undefined;
+        try beginCommittedPromptTurn(&app, &result, "fix it", "read");
+        try app.handleKey(&key);
+
+        try std.testing.expect(app.session.mode == .prompt);
+        try std.testing.expect(app.turn_future == null);
+        try std.testing.expectEqualStrings("", app.session.editor.visible());
+        try std.testing.expectEqual(Session.PromptOffer.revision, app.session.prompt_offer);
+        try std.testing.expect(app.retry == null);
+        try std.testing.expectEqual(Herdr.State.blocked, app.herdrState());
+        // [intro, user "fix it", model, the read box, the cancellation event]
+        try expectCanceledTurnStands(&app, 0, 1);
+        try std.testing.expectEqual(@as(usize, 5), app.session.transcript.blocks().len);
+        const revision = app.revision.?;
+        try std.testing.expectEqual(@as(usize, 0), revision.history.base);
+        try std.testing.expectEqual(@as(usize, 2), revision.history.end);
+        try std.testing.expectEqual(@as(usize, 1), revision.transcript_base);
+        try std.testing.expectEqual(@as(usize, 5), revision.transcript_end);
+        try std.testing.expectEqualStrings("fix it", revision.prompt.visible.items);
+        try std.testing.expectEqual(@as(usize, 0), revision.steering.items.len);
+        try std.testing.expect(!revision.mutated);
+        app.dismissOffer();
+    }
+
+    // The caption names the canceled state and the two keys that own the
+    // revision. Enter belongs to the editor text, so the controls leave it out.
+    var result: WorkerResult = undefined;
+    try beginCommittedPromptTurn(&app, &result, "fix it", "read");
+    try app.cancelTurn();
+    try app.session.paint(.{ .columns = 80, .rows = 24 });
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "Canceled turn") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        out.written(),
+        "Ctrl+N: Remove and edit · Esc: Keep turn",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "Failed turn") == null);
+}
+
+// An uncommitted cancellation has nothing to revise: the rewind takes the
+// optimistic blocks, and the prompt returns to the editor at once with the
+// uncommitted steering above the draft. A cancellation that lost the race
+// against the worker ends as the completion of that worker, so it offers
+// nothing either.
+test "an uncommitted cancellation restores the prompt and offers no revision" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    defer app.drainQueue();
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = test_anthropic_model,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
+    defer app.session.deinit();
+    defer app.dropRevision();
+
+    // The prompt is a paste, so the return must keep its atom.
+    const payload = "line\n" ** 15;
+    try app.session.transcript.append(.user, .{}, payload);
+    app.session.beginTurn(1);
+    try app.session.editor.paste(payload, true);
+    var prompt = app.session.editor.detachTrimmed();
+    app.session.retainTurnPrompt(&prompt, 0);
+    try seedSteering(&app, "and test");
+    try app.session.editor.insert("draft");
+    try spawnCanceledTurn(&app);
+    try app.cancelTurn();
+
+    try std.testing.expect(app.revision == null);
+    try std.testing.expectEqual(Session.PromptOffer.none, app.session.prompt_offer);
+    try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
+    try std.testing.expectEqual(@as(usize, 1), app.session.editor.draft.atoms.items.len);
+    const expanded = try app.session.editor.expanded(.none);
+    defer gpa.free(expanded);
+    try std.testing.expectEqualStrings(payload ++ "\n\nand test\n\ndraft", expanded);
+    app.session.editor.clear();
+
+    // The worker completed first, so the cancellation resolves as that
+    // completion once the fence arrives, and no revision waits.
+    var result: WorkerResult = undefined;
+    var draft = try ui.Editor.Draft.fromText(gpa, "fix it");
+    try stageCommittedPromptTurn(&app, &result, .{ .prompt = &draft });
+    result.outcome.disposition = .completed;
+    result.terminal_queued = true;
+    try spawnStagedTurn(&app, &result);
+    try app.cancelTurn();
+    try std.testing.expect(app.session.mode == .turn);
+    try std.testing.expect(app.revision == null);
+    try app.queue.putOne(io, .{ .turn = .{
+        .generation = 1,
+        .progress_sequence = 2,
+        .progress_sequence_committed = 1,
+        .payload = .turn_ended,
+    } });
+    var batch: [queue_capacity]UiEvent = undefined;
+    const count = try app.queue.get(io, &batch, 1);
+    _ = try app.applyBatch(batch[0..count]);
+    try std.testing.expect(app.session.mode == .prompt);
+    try std.testing.expect(app.revision == null);
+    try std.testing.expectEqual(Session.PromptOffer.none, app.session.prompt_offer);
+}
+
+// The chat holds the input and the text of its messages, so a cancellation
+// from the chat offers no revision, and the prompt of the chat drops. Once the
+// terminal took the input back, a cancellation there can revise a turn that a
+// Telegram message started, and the prompt returns into the terminal editor.
+test "a cancellation offers a revision only while the terminal holds the input" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    defer app.drainQueue();
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = test_anthropic_model,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
+    defer app.session.deinit();
+    defer app.dropRevision();
+
+    // The state of a turn that a Telegram message started while the bot holds
+    // the input.
+    var result: WorkerResult = undefined;
+    var external = try ui.Editor.Draft.fromText(gpa, "from the chat");
+    try stageCommittedPromptTurn(&app, &result, .{
+        .prompt = &external,
+        .source = .{ .external = 7 },
+    });
+    try spawnStagedTurn(&app, &result);
+    app.session.input.owner = .external;
+    try app.cancelTurn();
+    try std.testing.expect(app.revision == null);
+    try std.testing.expectEqual(Session.PromptOffer.none, app.session.prompt_offer);
+    try std.testing.expectEqualStrings("", app.session.editor.visible());
+    try expectCanceledTurnStands(&app, 0, 0);
+
+    // The terminal detached before the cancellation, so the terminal owns the
+    // input, and the message of the chat returns like a typed one.
+    app.agent.resetConversation();
+    app.session.transcript.truncate(0);
+    app.session.input.owner = .terminal;
+    external = try ui.Editor.Draft.fromText(gpa, "from the chat");
+    try stageCommittedPromptTurn(&app, &result, .{
+        .prompt = &external,
+        .source = .{ .external = 8 },
+    });
+    try spawnStagedTurn(&app, &result);
+    try app.cancelTurn();
+    try std.testing.expectEqual(Session.PromptOffer.revision, app.session.prompt_offer);
+    try std.testing.expectEqualStrings("from the chat", app.revision.?.prompt.visible.items);
+    try app.handleKey(&.{ .ctrl = 'n' });
+    try std.testing.expectEqualStrings("from the chat", app.session.editor.visible());
+    try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
+}
+
+// Esc keeps the canceled turn in both histories and dismisses the offer alone,
+// so every byte of the editor stays. An ordinary key keeps the offer, and it
+// clears only a warning that a first Ctrl+N raised, so the next Ctrl+N warns
+// again. A safe command keeps the offer too.
+test "Esc keeps the canceled turn while editing and a safe command keep the revision" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    defer app.drainQueue();
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = test_anthropic_model,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
+    defer app.session.deinit();
+    defer app.dropRevision();
+
+    var result: WorkerResult = undefined;
+    try beginCommittedPromptTurn(&app, &result, "fix it", "write");
+    try app.cancelTurn();
+    try std.testing.expect(app.revision.?.mutated);
+
+    // The first Ctrl+N warns and arms. A key between two presses clears the
+    // warning and the confirmation and keeps the offer, so the next Ctrl+N warns
+    // again instead of a removal.
+    try app.handleKey(&.{ .ctrl = 'n' });
+    try std.testing.expectEqualStrings(revision_warning, app.session.notice.?.content);
+    try std.testing.expect(app.session.confirmations.contains(.revision));
+    try expectCanceledTurnStands(&app, 0, 0);
+    try app.handleKey(&.{ .char = 'x' });
+    try std.testing.expect(app.session.notice == null);
+    try std.testing.expect(!app.session.confirmations.contains(.revision));
+    try std.testing.expectEqual(Session.PromptOffer.revision, app.session.prompt_offer);
+    try app.handleKey(&.{ .ctrl = 'n' });
+    try std.testing.expectEqualStrings(revision_warning, app.session.notice.?.content);
+    try expectCanceledTurnStands(&app, 0, 0);
+
+    // A safe command keeps the offer, and its event lands after the range. The
+    // picker covers the caption, and its Esc closes the picker alone.
+    app.session.editor.clear();
+    try app.runCommand("/effort");
+    try std.testing.expect(app.session.mode == .picking);
+    try app.handleKey(&.escape);
+    try std.testing.expect(app.session.mode == .prompt);
+    try std.testing.expectEqual(Session.PromptOffer.revision, app.session.prompt_offer);
+    try app.runCommand("/effort");
+    try app.handleKey(&.down);
+    try app.handleKey(&.enter);
+    try std.testing.expect(app.session.mode == .prompt);
+    try std.testing.expectEqual(ai.llm.Effort.medium, app.agent.effort);
+    try std.testing.expectEqual(Session.PromptOffer.revision, app.session.prompt_offer);
+    try std.testing.expect(app.revision != null);
+    const blocks = app.session.transcript.blocks();
+    try std.testing.expectEqual(@as(usize, 5), blocks.len);
+    try std.testing.expect(blocks[4].content == .event);
+    try std.testing.expect(!blocks[4].content.event.turn_owned);
+
+    // Esc dismisses the offer, keeps the turn, and keeps the editor text.
+    try app.session.editor.insert("keep this text");
+    try app.handleKey(&.escape);
+    try std.testing.expect(app.revision == null);
+    try std.testing.expectEqual(Session.PromptOffer.none, app.session.prompt_offer);
+    try std.testing.expectEqual(Herdr.State.idle, app.herdrState());
+    try std.testing.expectEqualStrings("keep this text", app.session.editor.visible());
+    try std.testing.expectEqual(@as(usize, 2), app.agent.items.items.len);
+    try std.testing.expectEqual(@as(usize, 5), app.session.transcript.blocks().len);
+    // Ctrl+N has no offer to act on now.
+    try app.handleKey(&.{ .ctrl = 'n' });
+    try std.testing.expect(app.session.mode == .prompt);
+    try std.testing.expect(app.session.notice == null);
+    try std.testing.expectEqual(@as(usize, 5), app.session.transcript.blocks().len);
+}
+
+// A dismissal that no key causes, as a Telegram message that starts a turn or a
+// Telegram `/new` does, takes an armed revision confirmation with the offer, so
+// no confirmation outlives its offer.
+test "a dismissal of the revision takes its armed confirmation" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    defer app.drainQueue();
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = test_anthropic_model,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
+    defer app.session.deinit();
+    defer app.dropRevision();
+
+    var result: WorkerResult = undefined;
+    try beginCommittedPromptTurn(&app, &result, "fix it", "write");
+    try app.cancelTurn();
+    try app.handleKey(&.{ .ctrl = 'n' });
+    try std.testing.expect(app.session.confirmations.contains(.revision));
+
+    app.dismissOffer();
+    try std.testing.expect(!app.session.confirmations.contains(.revision));
+    try std.testing.expect(app.revision == null);
+    try std.testing.expectEqual(Session.PromptOffer.none, app.session.prompt_offer);
+}
+
+// A prompt-history selection is an explicit insertion after the text the user
+// typed, so it appends, and it keeps the waiting revision.
+test "a prompt-history insertion appends after the draft and keeps the revision" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+
+    var app: App = undefined;
+    try app.initHistoryTest(gpa, io, &out, home, true);
+    defer app.deinitHistoryTest();
+    defer app.controller.deinit();
+    defer app.dropRevision();
+    try app.prompt_history.record("older prompt");
+
+    var result: WorkerResult = undefined;
+    try beginCommittedPromptTurn(&app, &result, "fix it", null);
+    try app.cancelTurn();
+    try std.testing.expectEqual(Session.PromptOffer.revision, app.session.prompt_offer);
+
+    try app.session.editor.insert("typed");
+    try app.handleKeys("\t");
+    try std.testing.expect(app.session.mode == .picking);
+    try app.handleKey(&.enter);
+    try std.testing.expect(app.session.mode == .prompt);
+    try std.testing.expectEqualStrings("typed\n\nolder prompt", app.session.editor.visible());
+    try std.testing.expectEqual(Session.PromptOffer.revision, app.session.prompt_offer);
+    try std.testing.expect(app.revision != null);
+}
+
+// The start of any turn takes the offer with it: the canceled turn stays in
+// the conversation that the new turn continues. A start that fails leaves the
+// offer for another try. `/new` clears the conversation and the offer together,
+// and it frees every saved draft.
+test "a turn start and /new dismiss the revision and a failed start keeps it" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    defer app.drainQueue();
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = test_anthropic_model,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
+    defer app.session.deinit();
+    defer app.dropRevision();
+
+    var result: WorkerResult = undefined;
+    try beginCommittedPromptTurn(&app, &result, "fix it", null);
+    try app.cancelTurn();
+    try std.testing.expect(app.revision != null);
+
+    // The exhausted generation stops the start before the spawn, and the
+    // rollback of the optimistic user box leaves the turn as it stands.
+    app.turn_generation = std.math.maxInt(u64);
+    try std.testing.expectError(error.GenerationExhausted, app.startUserTurn("next"));
+    try std.testing.expect(app.revision != null);
+    try std.testing.expectEqual(Session.PromptOffer.revision, app.session.prompt_offer);
+    try std.testing.expectEqual(@as(usize, 3), app.session.transcript.blocks().len);
+    app.turn_generation = 1;
+
+    // A start that spawns takes the offer and rewinds nothing.
+    const base = try app.startUserTurn("next");
+    try std.testing.expect(app.revision == null);
+    try std.testing.expectEqual(Session.PromptOffer.none, app.session.prompt_offer);
+    try std.testing.expectEqual(@as(usize, 3), base);
+    try std.testing.expectEqual(@as(usize, 2), app.agent.items.items.len);
+    {
+        const finished = app.awaitTurnFuture().?;
+        defer app.freeWorkerResult(&finished);
+        try app.finishWorkerResult(&finished);
+    }
+    try std.testing.expect(app.session.mode == .prompt);
+
+    // `/new` clears the conversation and the offer together.
+    try beginCommittedPromptTurn(&app, &result, "fix it", null);
+    try app.cancelTurn();
+    try std.testing.expect(app.revision != null);
+    try app.applyOutcome(.new_conversation);
+    try std.testing.expect(app.revision == null);
+    try std.testing.expectEqual(Session.PromptOffer.none, app.session.prompt_offer);
+    try std.testing.expectEqual(@as(usize, 0), app.agent.items.items.len);
+    try std.testing.expectEqual(@as(usize, 1), app.session.transcript.blocks().len);
+}
+
+// A credential change removes the reasoning of one account from both histories,
+// and the blocks of a canceled turn move up with them. The anchors of the
+// revision move by the removed items below each one alone, so the offer stays
+// and Ctrl+N still removes exactly the turn.
+test "account evidence removal rebases the revision anchors and keeps the offer" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    defer app.drainQueue();
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = test_anthropic_model,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+        .effort = .high,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .high);
+    defer app.session.deinit();
+    defer app.dropRevision();
+    app.session.showSetup(.anthropic_plan, test_anthropic_model, .high);
+
+    // Reasoning of the account before the turn and inside the turn, in both
+    // histories, and a block of another account that stays.
+    const replay: ai.llm.Item.Reasoning.Replay = .{ .anthropic_plan = .{
+        .signature = .{ .text = "earlier", .signature = "proof" },
+    } };
+    try app.agent.items.append(gpa, .{ .reasoning = .{ .replay = try replay.dupe(gpa) } });
+    try app.session.transcript.appendStream(.thinking, .anthropic_plan, "earlier");
+    try app.session.transcript.appendStream(.model, null, "earlier answer");
+    var result: WorkerResult = undefined;
+    var draft = try ui.Editor.Draft.fromText(gpa, "fix it");
+    try stageCommittedPromptTurn(&app, &result, .{ .prompt = &draft });
+    try app.agent.items.append(gpa, .{ .reasoning = .{ .replay = try replay.dupe(gpa) } });
+    result.outcome.receipt.history_end += 1;
+    _ = try app.session.applyTurnEvent(&.{
+        .generation = 1,
+        .progress_sequence = 2,
+        .progress_sequence_committed = 1,
+        .payload = .{ .thinking = try gpa.dupe(u8, "weigh it") },
+    });
+    result.progress_sequence = 2;
+    result.progress_sequence_committed = 2;
+    try spawnStagedTurn(&app, &result);
+    try app.cancelTurn();
+    {
+        const revision = app.revision.?;
+        // Agent: [proof, user, assistant, proof]. Transcript: [thinking, model,
+        // user, model, thinking, canceled].
+        try std.testing.expectEqual(@as(usize, 1), revision.history.base);
+        try std.testing.expectEqual(@as(usize, 4), revision.history.end);
+        try std.testing.expectEqual(@as(usize, 2), revision.transcript_base);
+        try std.testing.expectEqual(@as(usize, 6), revision.transcript_end);
+    }
+
+    app.dropAccountEvidence(.anthropic_plan);
+    try std.testing.expectEqual(Session.PromptOffer.revision, app.session.prompt_offer);
+    {
+        const revision = app.revision.?;
+        // Agent: [user, assistant]. Transcript: [model, user, model, canceled].
+        try std.testing.expectEqual(@as(usize, 0), revision.history.base);
+        try std.testing.expectEqual(@as(usize, 2), revision.history.end);
+        try std.testing.expectEqual(@as(usize, 1), revision.transcript_base);
+        try std.testing.expectEqual(@as(usize, 4), revision.transcript_end);
+    }
+
+    try app.handleKey(&.{ .ctrl = 'n' });
+    try std.testing.expect(app.revision == null);
+    try std.testing.expectEqual(@as(usize, 0), app.agent.items.items.len);
+    const blocks = app.session.transcript.blocks();
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    try std.testing.expectEqualStrings("earlier answer", blocks[0].content.model.items);
+    try std.testing.expectEqualStrings("fix it", app.session.editor.visible());
+}
+
+// A credential replacement that a fetch met takes the same path through the
+// command outcome. Its report lands after the range, and the removal keeps it.
+test "a credential replacement rebases both canonical ranges of the revision" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+
+    var store = try tmp.dir.createDirPathOpen(io, ".drinky", .{});
+    store.close(io);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".drinky/auth.json",
+        .data =
+        \\{ "anthropic-plan":
+        \\    { "access": "replacement", "refresh": "replacement",
+        \\      "expires_ms": 4102444800000,
+        \\      "account_uuid": "other", "organization_uuid": "other" } }
+        ,
+    });
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    defer app.drainQueue();
+    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
+    defer app.accounts.deinit();
+    try ai.testing.seedAccount(&app.accounts, .anthropic_plan, &.{"claude-opus-5"});
+    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_plan), .{
+        .model = test_anthropic_model,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+        .effort = .high,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .high);
+    defer app.session.deinit();
+    defer app.dropRevision();
+    app.session.showSetup(.anthropic_plan, test_anthropic_model, .high);
+
+    const replay: ai.llm.Item.Reasoning.Replay = .{ .anthropic_plan = .{
+        .signature = .{ .text = "earlier", .signature = "proof" },
+    } };
+    try app.agent.items.append(gpa, .{ .reasoning = .{ .replay = try replay.dupe(gpa) } });
+    try app.session.transcript.appendStream(.thinking, .anthropic_plan, "earlier");
+    var result: WorkerResult = undefined;
+    try beginCommittedPromptTurn(&app, &result, "fix it", null);
+    try app.cancelTurn();
+
+    try app.applyOutcome(.{ .credential_replaced = .anthropic_plan });
+    try std.testing.expectEqual(Session.PromptOffer.revision, app.session.prompt_offer);
+    const revision = app.revision.?;
+    try std.testing.expectEqual(@as(usize, 0), revision.history.base);
+    try std.testing.expectEqual(@as(usize, 2), revision.history.end);
+    try std.testing.expectEqual(@as(usize, 0), revision.transcript_base);
+    try std.testing.expectEqual(@as(usize, 3), revision.transcript_end);
+    // [user, model, canceled, the report of the replacement]
+    try std.testing.expectEqual(@as(usize, 4), app.session.transcript.blocks().len);
+
+    try app.handleKey(&.{ .ctrl = 'n' });
+    try std.testing.expectEqual(@as(usize, 0), app.agent.items.items.len);
+    const blocks = app.session.transcript.blocks();
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        blocks[0].content.event.text.items,
+        "replacement credential",
+    ) != null);
+}
+
+// Ctrl+N over a turn of read-only calls removes the turn on the first press:
+// the agent history rewinds to the base of the turn, the transcript loses the
+// prompt, the committed round, and the cancellation event, and the prompt
+// returns to the editor above the text the editor holds. The removal starts no
+// turn, resets the screen, blanks the context gauge, and keeps the cost. A
+// second Ctrl+N does nothing, because the offer is gone.
+test "Ctrl+N after read-only calls removes the canceled turn on the first press" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    defer app.drainQueue();
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = test_anthropic_model,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
+    defer app.session.deinit();
+    defer app.dropRevision();
+    try app.session.transcript.append(.intro, .{}, intro_text);
+    try app.session.transcript.append(.user, .{}, "earlier");
+    try app.agent.items.append(gpa, .{ .message = .{
+        .role = .user,
+        .text = try gpa.dupe(u8, "earlier"),
+    } });
+
+    var result: WorkerResult = undefined;
+    try beginCommittedPromptTurn(&app, &result, "fix it", "read");
+    // The turn measured the context and billed its work.
+    app.agent.measured_context = .{
+        .tokens = 1200,
+        .model = test_anthropic_model,
+        .account = .anthropic_plan,
+        .reasoning = test_anthropic_model.reasoning(.low),
+    };
+    app.agent.stats.context_tokens = 1200;
+    app.agent.stats.cost = 0.75;
+    try app.session.editor.insert("draft");
+    try app.cancelTurn();
+    try std.testing.expectEqual(@as(?u64, 1200), app.session.stats_shown.context_tokens);
+    try app.session.paint(.{ .columns = 80, .rows = 24 });
+    // The chat holds every block. Only a completed turn arms the `Shorten`
+    // button, so the live serial names the answer of an earlier turn, which
+    // stands outside the range.
+    app.mirror.cursor = app.session.transcript.blocks().len;
+    app.mirror.answer_serial = 5;
+
+    const removed_start = out.written().len;
+    try app.handleKey(&.{ .ctrl = 'n' });
+    try std.testing.expect(app.session.mode == .prompt);
+    try std.testing.expect(app.turn_future == null);
+    try std.testing.expect(app.revision == null);
+    try std.testing.expectEqual(Session.PromptOffer.none, app.session.prompt_offer);
+    try std.testing.expect(app.session.notice == null);
+    try std.testing.expectEqual(Herdr.State.idle, app.herdrState());
+    try std.testing.expectEqualStrings("fix it\n\ndraft", app.session.editor.visible());
+    try std.testing.expectEqual(app.session.editor.visible().len, app.session.editor.caret);
+
+    // Both histories hold what stood before the turn alone.
+    try std.testing.expectEqual(@as(usize, 1), app.agent.items.items.len);
+    try std.testing.expectEqualStrings("earlier", app.agent.items.items[0].message.text);
+    const blocks = app.session.transcript.blocks();
+    try std.testing.expectEqual(@as(usize, 2), blocks.len);
+    try std.testing.expect(blocks[0].content == .intro);
+    try std.testing.expectEqualStrings("earlier", blocks[1].content.user.items);
+
+    // The measurement no longer describes the history, and the cost stays.
+    try std.testing.expect(app.agent.measured_context == null);
+    try std.testing.expect(app.agent.stats.context_tokens == null);
+    try std.testing.expect(app.session.stats_shown.context_tokens == null);
+    try std.testing.expectEqual(@as(f64, 0.75), app.agent.stats.cost);
+    try std.testing.expectEqual(@as(f64, 0.75), app.session.stats_shown.cost);
+
+    // The cursor of the mirror follows the removed blocks, and the button of
+    // the earlier answer stays live, because that answer is still the newest.
+    try std.testing.expectEqual(@as(usize, 2), app.mirror.cursor);
+    try std.testing.expect(app.mirror.namesAnswer(5));
+
+    // The removal repaints deeply, so no row of the turn stays reachable.
+    try std.testing.expect(app.session.view.force_reset);
+    try app.session.paint(.{ .columns = 80, .rows = 24 });
+    const painted = try terminal.View.plainText(gpa, out.written()[removed_start..]);
+    defer gpa.free(painted);
+    try std.testing.expect(std.mem.indexOf(u8, out.written()[removed_start..], terminal.escape.screen_reset) != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "the answer") == null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "You canceled the turn.") == null);
+
+    // The offer is gone, so a second Ctrl+N changes nothing.
+    try app.handleKey(&.{ .ctrl = 'n' });
+    try std.testing.expectEqualStrings("fix it\n\ndraft", app.session.editor.visible());
+    try std.testing.expectEqual(@as(usize, 2), app.session.transcript.blocks().len);
+    try std.testing.expect(app.turn_future == null);
+}
+
+// A turn that committed a call of a tool that changes the system warns first,
+// because the removal takes the turn out of the conversation while the change
+// stays. Every `bash` call counts, whatever its command, and a call that failed
+// counts too, because the call ran. The second consecutive Ctrl+N removes the
+// turn.
+test "Ctrl+N after a mutating call warns first and removes on the second press" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    defer app.drainQueue();
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = test_anthropic_model,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
+    defer app.session.deinit();
+    defer app.dropRevision();
+
+    for ([_][]const u8{ "write", "edit", "bash" }) |tool| {
+        var result: WorkerResult = undefined;
+        try beginCommittedPromptTurn(&app, &result, "fix it", tool);
+        try app.cancelTurn();
+        try std.testing.expect(app.revision.?.mutated);
+
+        // The first press changes no history and shows the warning alone.
+        try app.handleKey(&.{ .ctrl = 'n' });
+        try std.testing.expectEqualStrings(revision_warning, app.session.notice.?.content);
+        try std.testing.expectEqual(ai.command.Outcome.Severity.warning, app.session.notice.?.severity);
+        try expectCanceledTurnStands(&app, 0, 0);
+        try std.testing.expectEqual(@as(usize, 4), app.session.transcript.blocks().len);
+        try std.testing.expectEqualStrings("", app.session.editor.visible());
+        try std.testing.expectEqual(Session.PromptOffer.revision, app.session.prompt_offer);
+
+        // The second press removes the turn and appends no event of its own.
+        try app.handleKey(&.{ .ctrl = 'n' });
+        try std.testing.expect(app.revision == null);
+        try std.testing.expect(app.session.notice == null);
+        try std.testing.expectEqual(@as(usize, 0), app.agent.items.items.len);
+        try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
+        try std.testing.expectEqualStrings("fix it", app.session.editor.visible());
+        app.session.editor.clear();
+    }
+
+    // A failed mutating call still ran, so it still requires the confirmation.
+    var result: WorkerResult = undefined;
+    var draft = try ui.Editor.Draft.fromText(gpa, "fix it");
+    try stageCommittedPromptTurn(&app, &result, .{ .prompt = &draft });
+    _ = try app.session.applyTurnEvent(&.{
+        .generation = 1,
+        .progress_sequence = 2,
+        .progress_sequence_committed = 1,
+        .payload = .{ .tool_start = .{
+            .name = try gpa.dupe(u8, "bash"),
+            .input_json = try gpa.dupe(u8, "{\"command\":\"ls\"}"),
+        } },
+    });
+    _ = try app.session.applyTurnEvent(&.{
+        .generation = 1,
+        .progress_sequence = 3,
+        .progress_sequence_committed = 1,
+        .payload = .{ .tool_result = .{
+            .name = try gpa.dupe(u8, "bash"),
+            .summary = .{ .text = try gpa.dupe(u8, "Time: 0ms · Exit code: 1") },
+            .is_error = true,
+        } },
+    });
+    result.progress_sequence = 3;
+    result.progress_sequence_committed = 3;
+    try spawnStagedTurn(&app, &result);
+    try app.cancelTurn();
+    try std.testing.expect(app.revision.?.mutated);
+    try app.handleKey(&.{ .ctrl = 'n' });
+    try std.testing.expectEqualStrings(revision_warning, app.session.notice.?.content);
+    try std.testing.expectEqual(@as(usize, 4), app.session.transcript.blocks().len);
+}
+
+// The removal takes exactly the turn: a provider retry event of the turn goes,
+// because it happened during the turn, while a session event that landed inside
+// the range and a command event after the range stay. The same retry event
+// survives the abnormal rewind of the cancellation itself, because it records a
+// request that happened.
+test "Ctrl+N removes the retry event of the turn and keeps the events of the session" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    defer app.drainQueue();
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = test_anthropic_model,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
+    defer app.session.deinit();
+    defer app.dropRevision();
+    try app.session.transcript.append(.event, .{}, "before the turn");
+
+    var result: WorkerResult = undefined;
+    var draft = try ui.Editor.Draft.fromText(gpa, "fix it");
+    try stageCommittedPromptTurn(&app, &result, .{ .prompt = &draft });
+    // A session event lands inside the turn, and a retry of the next request
+    // follows the committed round. Nothing commits after them, so the rewind of
+    // the cancellation meets both.
+    try app.recordAsyncEvent(.information, .{}, "You attached @bot.", .{});
+    _ = try app.session.applyTurnEvent(&.{
+        .generation = 1,
+        .progress_sequence = 2,
+        .progress_sequence_committed = 1,
+        .payload = .{ .stream_reset = .{ .attempt = 2, .cause = .{ .failure = error.Timeout } } },
+    });
+    _ = try app.session.applyTurnEvent(&.{
+        .generation = 1,
+        .progress_sequence = 3,
+        .progress_sequence_committed = 1,
+        .payload = .{ .text = try gpa.dupe(u8, "partial") },
+    });
+    result.progress_sequence = 3;
+    result.progress_sequence_committed = 1;
+    try spawnStagedTurn(&app, &result);
+    try app.cancelTurn();
+
+    // The rewind took the partial reply and kept the retry event.
+    // [before, user, model, attached, retry, canceled]
+    const kept = app.session.transcript.blocks();
+    try std.testing.expectEqual(@as(usize, 6), kept.len);
+    try std.testing.expect(std.mem.indexOf(u8, kept[4].content.event.text.items, "retry attempt 2") != null);
+    try std.testing.expectEqualStrings("You canceled the turn.", kept[5].content.event.text.items);
+    // A safe command reports after the range.
+    try app.applyOutcome(try ai.command.Outcome.reportEvent(gpa, .information, "changed", .{}));
+    try std.testing.expectEqual(@as(usize, 7), app.session.transcript.blocks().len);
+    // The chat holds every block up to the retry event.
+    app.mirror.cursor = 5;
+
+    try app.handleKey(&.{ .ctrl = 'n' });
+    const blocks = app.session.transcript.blocks();
+    try std.testing.expectEqual(@as(usize, 3), blocks.len);
+    try std.testing.expectEqualStrings("before the turn", blocks[0].content.event.text.items);
+    try std.testing.expectEqualStrings("You attached @bot.", blocks[1].content.event.text.items);
+    try std.testing.expectEqualStrings("changed", blocks[2].content.event.text.items);
+    // The user box, the answer, and the retry event left below the cursor, so
+    // the cursor stands past the preserved event and sends it no second time.
+    try std.testing.expectEqual(@as(usize, 2), app.mirror.cursor);
+}
+
+// Every restored message keeps its place in time: the prompt, then the
+// committed steering, then the uncommitted steering that the cancellation
+// returned, then the text the user typed since. A paste keeps its atom and its
+// exact payload, and the uncommitted steering returns once.
+test "a revision restores the prompt and the committed steering above the editor text" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    defer app.drainQueue();
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = test_anthropic_model,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
+    defer app.session.deinit();
+    defer app.dropRevision();
+
+    // The prompt is a paste, and two steering messages follow it: the first
+    // commits with the round, the second stays queued.
+    const payload = "line\n" ** 15;
+    var result: WorkerResult = undefined;
+    try app.session.editor.paste(payload, true);
+    var prompt = app.session.editor.detachTrimmed();
+    try stageCommittedPromptTurn(&app, &result, .{ .prompt = &prompt });
+    try seedSteering(&app, "and test");
+    _ = try app.session.applyTurnEvent(&.{
+        .generation = 1,
+        .progress_sequence = 2,
+        .progress_sequence_committed = 1,
+        .payload = .{ .steering_consumed = .{
+            .text = try gpa.dupe(u8, "and test"),
+            .count = 1,
+        } },
+    });
+    _ = try app.session.applyTurnEvent(&.{
+        .generation = 1,
+        .progress_sequence = 3,
+        .progress_sequence_committed = 2,
+        .payload = .{ .text = try gpa.dupe(u8, "second answer") },
+    });
+    try app.session.editor.insert("later");
+    try app.submitSteering();
+    try app.session.editor.insert("draft");
+    result.outcome.receipt.steering_committed_count = 1;
+    result.progress_sequence = 3;
+    result.progress_sequence_committed = 3;
+    try spawnStagedTurn(&app, &result);
+    try app.cancelTurn();
+
+    // The uncommitted message returned above the draft, and the revision holds
+    // the prompt and the committed message.
+    try std.testing.expectEqualStrings("later\n\ndraft", app.session.editor.visible());
+    try std.testing.expectEqual(@as(usize, 1), app.revision.?.steering.items.len);
+    try std.testing.expectEqualStrings("and test", app.revision.?.steering.items[0].visible.items);
+    try std.testing.expectEqual(@as(usize, 1), app.revision.?.prompt.atoms.items.len);
+
+    try app.handleKey(&.{ .ctrl = 'n' });
+    try std.testing.expectEqual(@as(usize, 1), app.session.editor.draft.atoms.items.len);
+    try std.testing.expectEqual(@as(u64, 1), app.session.editor.draft.atoms.items[0].id);
+    const expanded = try app.session.editor.expanded(.none);
+    defer gpa.free(expanded);
+    try std.testing.expectEqualStrings(payload ++ "\n\nand test\n\nlater\n\ndraft", expanded);
+    try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
+    try std.testing.expect(app.session.mode == .prompt);
+    try std.testing.expect(app.turn_future == null);
+}
+
+// The prompt history keeps the entry of the removed prompt, because the user
+// sent it. Enter over the revised draft records the revised prompt as a new
+// entry.
+test "a revision keeps the prompt-history entry and a revised Enter records a new one" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+
+    var app: App = undefined;
+    try app.initHistoryTest(gpa, io, &out, home, true);
+    defer app.deinitHistoryTest();
+    defer app.controller.deinit();
+    defer app.dropRevision();
+    try app.prompt_history.record("fix it");
+
+    var result: WorkerResult = undefined;
+    try beginCommittedPromptTurn(&app, &result, "fix it", null);
+    try app.cancelTurn();
+    try app.handleKey(&.{ .ctrl = 'n' });
+    try std.testing.expectEqualStrings("fix it", app.session.editor.visible());
+    try app.expectHistory(&.{"fix it"});
+
+    try app.handleKeys(" now");
+    try app.handleKey(&.enter);
+    try std.testing.expect(app.session.mode == .turn);
+    try app.expectHistory(&.{ "fix it now", "fix it" });
+    try app.finishHistoryTurn();
+}
+
+// An allocation failure in the preflight keeps both histories, every draft,
+// and the offer, so the next Ctrl+N can remove the turn. A stale anchor is a
+// programming error and asserts instead, so no test drives one.
+test "a failed revision changes nothing and keeps the offer" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const gpa = failing.allocator();
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    defer app.drainQueue();
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = test_anthropic_model,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
+    defer app.session.deinit();
+    defer app.dropRevision();
+
+    var result: WorkerResult = undefined;
+    try beginCommittedPromptTurn(&app, &result, "fix it", null);
+    try app.cancelTurn();
+
+    // The cancellation reserved the editor for the prompt, so a fresh editor
+    // stands in for one whose capacity the user spent. The reserve of the editor
+    // is then the first allocation of the removal.
+    app.session.editor.deinit();
+    app.session.editor = ui.Editor.init(gpa);
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    try std.testing.expectError(error.OutOfMemory, app.handleKey(&.{ .ctrl = 'n' }));
+    failing.fail_index = std.math.maxInt(usize);
+    failing.resize_fail_index = std.math.maxInt(usize);
+    try std.testing.expect(app.revision != null);
+    try std.testing.expectEqual(Session.PromptOffer.revision, app.session.prompt_offer);
+    try std.testing.expectEqualStrings("fix it", app.revision.?.prompt.visible.items);
+    try std.testing.expectEqualStrings("", app.session.editor.visible());
+    try expectCanceledTurnStands(&app, 0, 0);
+
+    // The offer still works once memory returns.
+    try app.handleKey(&.{ .ctrl = 'n' });
+    try std.testing.expect(app.revision == null);
+    try std.testing.expectEqualStrings("fix it", app.session.editor.visible());
+    try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
+}
+
+// The storage of the capture reserves before the worker joins, so an
+// allocation failure there leaves the turn active with every draft in place.
+// A failure after the join, in the cancellation event, still leaves the
+// context published, and the context names the transcript end without that
+// event, so Ctrl+N removes exactly what stands.
+test "the revision survives an allocation failure around the cancellation" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const gpa = failing.allocator();
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    defer app.drainQueue();
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = test_anthropic_model,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
+    defer app.session.deinit();
+    defer app.dropRevision();
+
+    var result: WorkerResult = undefined;
+    var draft = try ui.Editor.Draft.fromText(gpa, "fix it");
+    try stageCommittedPromptTurn(&app, &result, .{ .prompt = &draft });
+    try seedSteering(&app, "and test");
+    _ = try app.session.applyTurnEvent(&.{
+        .generation = 1,
+        .progress_sequence = 2,
+        .progress_sequence_committed = 1,
+        .payload = .{ .steering_consumed = .{
+            .text = try gpa.dupe(u8, "and test"),
+            .count = 1,
+        } },
+    });
+    result.outcome.receipt.steering_committed_count = 1;
+    result.progress_sequence = 2;
+    result.progress_sequence_committed = 2;
+    try spawnStagedTurn(&app, &result);
+
+    // The restore reserve holds, so the capture reserve is the allocation that
+    // fails, and the turn stays active.
+    try app.session.reserveSteeringRestore();
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    try std.testing.expectError(error.OutOfMemory, app.cancelTurn());
+    try std.testing.expect(app.session.mode == .turn);
+    try std.testing.expect(app.turn_future != null);
+    try std.testing.expect(app.revision == null);
+    try std.testing.expectEqual(@as(usize, 1), app.session.steering.items.len);
+    try std.testing.expectEqualStrings("and test", app.session.steering.items[0].draft.visible.items);
+    try std.testing.expectEqualStrings("fix it", app.session.turn_prompt.?.draft.visible.items);
+
+    // Both reserves hold, so the cancellation event is the allocation that
+    // fails. The context stands with every moved draft, and the transcript end
+    // names the list without the event.
+    failing.fail_index = std.math.maxInt(usize);
+    failing.resize_fail_index = std.math.maxInt(usize);
+    try app.session.reserveRevisionCapture();
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    try std.testing.expectError(error.OutOfMemory, app.cancelTurn());
+    failing.fail_index = std.math.maxInt(usize);
+    failing.resize_fail_index = std.math.maxInt(usize);
+    try std.testing.expect(app.session.mode == .prompt);
+    try std.testing.expectEqual(Session.PromptOffer.revision, app.session.prompt_offer);
+    const revision = app.revision.?;
+    try std.testing.expectEqualStrings("fix it", revision.prompt.visible.items);
+    try std.testing.expectEqual(@as(usize, 1), revision.steering.items.len);
+    try std.testing.expectEqualStrings("and test", revision.steering.items[0].visible.items);
+    // [user, model, user "and test"] and no cancellation event.
+    try std.testing.expectEqual(@as(usize, 3), app.session.transcript.blocks().len);
+    try std.testing.expectEqual(@as(usize, 3), revision.transcript_end);
+
+    try app.handleKey(&.{ .ctrl = 'n' });
+    try std.testing.expectEqualStrings("fix it\n\nand test", app.session.editor.visible());
+    try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
+    try std.testing.expectEqual(@as(usize, 0), app.agent.items.items.len);
+}
+
+// A removed item can carry the proof that a skill is loaded, so the guard
+// searches the shortened history again after the removal.
+test "a revision makes the skill guard search the shortened history again" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    defer app.drainQueue();
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = test_anthropic_model,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
+    defer app.session.deinit();
+    defer app.dropRevision();
+    try app.skill_guard.add(.{ .glob = "**/*.zig", .skill = "zig-style", .source = "/skills/SKILL.md" });
+    app.agent.skill_guard = &app.skill_guard;
+
+    var result: WorkerResult = undefined;
+    try beginCommittedPromptTurn(&app, &result, "fix it", null);
+    try app.cancelTurn();
+    app.skill_guard.rule_items[0].loaded.store(true, .monotonic);
+
+    try app.handleKey(&.{ .ctrl = 'n' });
+    try std.testing.expect(!app.skill_guard.rules()[0].loaded.load(.monotonic));
+}
+
+// The two offers never coexist: a failure that arms a retry takes a waiting
+// revision, and a cancellation that offers a revision takes a waiting retry.
+// Ctrl+N then acts on the one offer that the caption names.
+test "a retry and a revision replace each other and Ctrl+N acts on the one that waits" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    defer app.drainQueue();
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = test_anthropic_model,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
+    defer app.session.deinit();
+    defer app.dropRetry();
+    defer app.dropRevision();
+
+    // A cancellation over a waiting retry replaces it with the revision.
+    app.setRetry(.{ .failure = try gpa.dupe(u8, "The provider is overloaded.") });
+    var result: WorkerResult = undefined;
+    try beginCommittedPromptTurn(&app, &result, "fix it", null);
+    // The retry stays through the fake start, because the fake worker spawns
+    // outside `runTurn`.
+    try std.testing.expect(app.retry != null);
+    try app.cancelTurn();
+    try std.testing.expect(app.retry == null);
+    try std.testing.expect(app.revision != null);
+    try std.testing.expectEqual(Session.PromptOffer.revision, app.session.prompt_offer);
+
+    // A committed failure over the waiting revision replaces it with the retry.
+    app.session.beginTurn(2);
+    var failed: WorkerResult = .{
+        .outcome = .{
+            .receipt = .{
+                .history_base = 2,
+                .history_end = 3,
+                .steering_committed_count = 0,
+            },
+            .disposition = .{ .failed = error.ApiError },
+        },
+        .error_text = try gpa.dupe(u8, "The provider is overloaded."),
+    };
+    defer app.freeWorkerResult(&failed);
+    try app.finishWorkerResult(&failed);
+    try std.testing.expect(app.revision == null);
+    try std.testing.expect(app.retry != null);
+    try std.testing.expectEqual(Session.PromptOffer.retry, app.session.prompt_offer);
+    try std.testing.expectEqual(Herdr.State.blocked, app.herdrState());
+
+    // Ctrl+N over the retry continues: the signed-out worker reports the
+    // failure of the attempt, and the transcript keeps the canceled turn.
+    try app.session.editor.insert("keep");
+    try app.handleKey(&.{ .ctrl = 'n' });
+    try std.testing.expect(app.session.mode == .prompt);
+    try std.testing.expectEqualStrings(
+        "Sign in with /login before you try the turn again.",
+        app.session.notice.?.content,
+    );
+    try std.testing.expect(app.retry != null);
+    try std.testing.expectEqualStrings("keep", app.session.editor.visible());
+    try std.testing.expectEqual(@as(usize, 2), app.agent.items.items.len);
 }
 
 // A retry belongs to the conversation, not to one configuration: an account switch
@@ -9872,7 +11386,7 @@ test "a retry survives an account switch and Ctrl+N routes to it" {
     app.setRetry(.{ .failure = try gpa.dupe(u8, "The provider is overloaded.") });
     try app.applyOutcome(.{ .switch_account = .openai_api_key });
     try std.testing.expect(app.retry != null);
-    try std.testing.expect(app.session.retry_shown);
+    try std.testing.expectEqual(Session.PromptOffer.retry, app.session.prompt_offer);
     try app.expectModel(test_openai_model.name());
     try std.testing.expectEqual(@as(usize, 1), app.session.transcript.blocks().len);
 
@@ -9884,13 +11398,13 @@ test "a retry survives an account switch and Ctrl+N routes to it" {
         app.handleKey(&.{ .ctrl = 'n' }),
     );
     try std.testing.expect(app.retry != null);
-    try std.testing.expect(app.session.retry_shown);
+    try std.testing.expectEqual(Session.PromptOffer.retry, app.session.prompt_offer);
     try std.testing.expect(app.session.mode == .prompt);
     try std.testing.expectEqual(@as(usize, 1), app.session.transcript.blocks().len);
 
     try app.applyOutcome(.new_conversation);
     try std.testing.expect(app.retry == null);
-    try std.testing.expect(!app.session.retry_shown);
+    try std.testing.expectEqual(Session.PromptOffer.none, app.session.prompt_offer);
     // The event of the account switch goes, and the intro line takes its place.
     try std.testing.expectEqual(@as(usize, 1), app.session.transcript.blocks().len);
     try std.testing.expect(app.session.transcript.blocks()[0].content == .intro);
@@ -9937,7 +11451,7 @@ test "a skill line runs while a retry waits and takes the context with it" {
     defer app.skills.deinit();
 
     app.retry = .{ .failure = try gpa.dupe(u8, "The provider is overloaded.") };
-    app.session.retry_shown = true;
+    app.session.prompt_offer = .retry;
 
     try app.session.editor.insert("/skill:demo apply it");
     const prompt = (try app.dispatchCommand("/skill:demo apply it")).?.prompt;
@@ -9947,7 +11461,7 @@ test "a skill line runs while a retry waits and takes the context with it" {
     // The line ran, and its turn took the waiting context with it.
     try std.testing.expect(app.session.notice == null);
     try std.testing.expect(app.retry == null);
-    try std.testing.expect(!app.session.retry_shown);
+    try std.testing.expectEqual(Session.PromptOffer.none, app.session.prompt_offer);
     try std.testing.expect(app.turn_future != null);
     const blocks = app.session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 2), blocks.len);
@@ -11432,6 +12946,13 @@ test "a committed cancel drains queued progress into the transcript before rewin
         blocks[3].content.event.text.items,
     );
     try std.testing.expectEqual(@as(f64, 2.5), app.session.stats_shown.cost);
+    // The committed turn with its prompt leaves the revision offer, whose range
+    // covers the drained round and the cancellation event.
+    defer app.dropRevision();
+    const revision = app.revision.?;
+    try std.testing.expectEqual(@as(usize, 0), revision.transcript_base);
+    try std.testing.expectEqual(@as(usize, 4), revision.transcript_end);
+    try std.testing.expectEqualStrings("prompt", revision.prompt.visible.items);
 }
 
 test "the frame grid holds a fixed period through a late wake and a slow paint" {
@@ -12772,7 +14293,7 @@ test "the failed turn message dismisses the retry from the chat and stands at th
     try std.testing.expect(app.retry != null);
     try app.handleChatTap("901", .{ .dismiss = 2 });
     try std.testing.expect(app.retry == null);
-    try std.testing.expect(!app.session.retry_shown);
+    try std.testing.expectEqual(Session.PromptOffer.none, app.session.prompt_offer);
     // The edit that takes the buttons off keeps the text and the symbol.
     try std.testing.expectEqualStrings(
         "{\"chat_id\":99,\"message_id\":70,\"text\":\"⚠ Failed turn\"," ++

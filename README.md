@@ -105,6 +105,17 @@ Drinky keeps the 100 most recent prompts of at most 8 KiB each in the owner-only
 `~/.drinky/prompt_history.json`, so the file can contain sensitive text. Delete the file to clear
 the history, or set `prompt_history.enabled` to `false` in `~/.drinky/config.json` to turn it off.
 
+## Recover a turn
+
+A turn that failed or that you canceled after it committed work leaves a caption above the editor,
+and Ctrl+N acts on it. Under `Failed turn`, Ctrl+N asks the model to continue from the committed
+work. Under `Canceled turn`, Ctrl+N removes the turn from the conversation and returns your prompt
+and steering messages to the editor as editable text. Enter then sends the revised prompt.
+
+The removal undoes no file change and no billed usage. A turn that ran `write`, `edit`, or `bash`
+warns first and removes on the second Ctrl+N. Esc keeps the turn, and the next turn or `/new` drops
+the offer.
+
 ## Telegram remote control
 
 Create a bot with BotFather, run `/remote`, and paste the token. Drinky shows a pairing code, and

@@ -248,7 +248,9 @@ pub fn detachTrimmed(self: *Editor) Draft {
 
 /// Reserve visible-buffer and atom-list capacity to append every draft in
 /// `drafts`, each after a blank-line separator, so a following `appendDraft` per
-/// entry cannot fail. Checked additions guard the totals.
+/// entry cannot fail. Checked additions guard the totals. The prompt-history
+/// insertion is the one production consumer, because every automatic restore
+/// composes above the draft instead.
 pub fn reserveDrafts(self: *Editor, drafts: []const Draft) !void {
     return self.reserveComposition(null, drafts);
 }
@@ -277,8 +279,10 @@ pub fn reserveComposition(self: *Editor, lead: ?*const Draft, drafts: []const Dr
 /// Move `source`'s content to the end of the draft and leave `source` empty. A
 /// blank-line separator comes first when the draft is already non-empty. The move
 /// preserves the atoms and their stable IDs (payloads move by pointer). Infallible
-/// once `reserveDrafts` has covered it, so recall after a reservation cannot
-/// half-complete.
+/// once `reserveDrafts` has covered it, so an insertion after a reservation
+/// cannot half-complete. The prompt-history selection is the one production
+/// consumer: it is an explicit insertion after the text the user typed, and every
+/// automatic restore uses `prependComposition` to keep chronology.
 pub fn appendDraft(self: *Editor, source: *Draft) void {
     self.moveEnd();
     if (self.draft.visible.items.len > 0) self.insert(draft_separator) catch unreachable;

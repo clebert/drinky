@@ -95,8 +95,10 @@ pub fn replaceEvent(
 }
 
 /// How many blocks before `index` `account` produced. `dropAccount` removes
-/// them, so the block at `index` moves up by this count.
+/// them, so the block at `index` moves up by this count. The caller keeps
+/// `index` within the list.
 pub fn producedBefore(self: *const Transcript, account: ai.llm.Account, index: usize) usize {
+    std.debug.assert(index <= self.entries.items.len);
     var count: usize = 0;
     for (self.entries.items[0..index]) |*entry| count += @intFromBool(entry.account() == account);
     return count;
@@ -214,6 +216,61 @@ pub fn rewind(self: *Transcript, entry_count: usize) void {
         }
     }
     self.entries.shrinkRetainingCapacity(retained_count);
+}
+
+/// What one deliberate removal of a turn took: the count of removed blocks, and
+/// how many of them stood below a cursor over the list, so that cursor can move
+/// back by exactly the blocks that left below it.
+pub const Removal = struct {
+    removed_count: usize,
+    removed_before_cursor_count: usize,
+
+    /// The range of one turn and the cursor to account for. The named fields
+    /// keep the three positions apart at the call site.
+    pub const Options = struct {
+        /// The block count before the turn appended its first block.
+        range_base: usize,
+        /// The block count after the last block of the turn.
+        range_end: usize,
+        /// The cursor of a mirror over the list. A cursor above the block count
+        /// clamps, like the cursor of `Mirror.flush`.
+        mirror_cursor: usize,
+    };
+};
+
+/// Remove the blocks of one canceled turn from `[range_base, range_end)`: every
+/// message, note, reasoning, answer, and tool box, and every event that belongs
+/// to the turn. An event of the session or of a command inside the range stays,
+/// and every block after the range stays. This ends the open message, because a
+/// removal moves the blocks behind it. Allocation-free.
+pub fn removeTurn(self: *Transcript, options: Removal.Options) Removal {
+    std.debug.assert(options.range_base <= options.range_end);
+    std.debug.assert(options.range_end <= self.entries.items.len);
+    self.endMessage();
+    const cursor = @min(options.mirror_cursor, self.entries.items.len);
+    var removal: Removal = .{ .removed_count = 0, .removed_before_cursor_count = 0 };
+    var retained_count = options.range_base;
+    for (options.range_base..options.range_end) |index| {
+        const entry = &self.entries.items[index];
+        if (entry.turnOwned()) {
+            entry.deinit(self.gpa);
+            removal.removed_count += 1;
+            if (index < cursor) removal.removed_before_cursor_count += 1;
+            continue;
+        }
+        self.entries.items[retained_count] = entry.*;
+        retained_count += 1;
+    }
+    // The blocks after the range move down by the removed count, and they move
+    // toward the front, so the forward copy is safe.
+    const tail = self.entries.items[options.range_end..];
+    std.mem.copyForwards(
+        ui.block.Entry,
+        self.entries.items[retained_count .. retained_count + tail.len],
+        tail,
+    );
+    self.entries.shrinkRetainingCapacity(retained_count + tail.len);
+    return removal;
 }
 
 /// Every block above the live tail, oldest first: the canonical record, hidden
@@ -438,6 +495,62 @@ test "rewind preserves only marked events after its checkpoint" {
         entries[0].content.event.text.items,
     );
     try std.testing.expectEqualStrings("keep retry", entries[1].content.event.text.items);
+}
+
+// A removal takes the turn alone: its messages, notes, reasoning, answers, tool
+// boxes, and the events that belong to it. A session event inside the range and
+// every block after the range stay in their order. The cursor prefix counts only
+// the removed blocks below the cursor, so a cursor before the range does not
+// move, one inside the range moves over the removed blocks before it, and one
+// after the range moves over every removed block.
+test "removeTurn takes the turn-owned blocks of its range and counts the cursor prefix" {
+    const gpa = std.testing.allocator;
+    var transcript = Transcript.init(gpa);
+    defer transcript.deinit();
+
+    try transcript.append(.intro, .{}, "legend");
+    try transcript.append(.user, .{}, "fix it");
+    try transcript.appendStream(.thinking, test_account, "weigh it");
+    try transcript.appendStream(.model, null, "answer");
+    try transcript.append(.event, .{ .survives_rewind = true, .turn_owned = true }, "retry");
+    try transcript.append(.event, .{ .survives_rewind = true }, "You attached @bot.");
+    try transcript.append(.tool_result, .{}, "Tool: read");
+    try transcript.append(.user_note, .{}, "Skill: demo");
+    try transcript.append(.event, .{ .turn_owned = true }, "You canceled the turn.");
+    try transcript.append(.event, .{}, "Drinky changed the model.");
+    try std.testing.expectEqual(@as(usize, 10), transcript.blocks().len);
+
+    // Seven of the eight blocks in the range go. The cursor at 6 stands above
+    // four removed blocks: the user box, the reasoning, the answer, and the
+    // retry event. The session event at 5 stays, so it does not count.
+    const removal = transcript.removeTurn(.{ .range_base = 1, .range_end = 9, .mirror_cursor = 6 });
+    try std.testing.expectEqual(@as(usize, 7), removal.removed_count);
+    try std.testing.expectEqual(@as(usize, 4), removal.removed_before_cursor_count);
+    try std.testing.expect(!transcript.streaming());
+
+    const entries = transcript.blocks();
+    try std.testing.expectEqual(@as(usize, 3), entries.len);
+    try std.testing.expect(entries[0].content == .intro);
+    try std.testing.expectEqualStrings("You attached @bot.", entries[1].content.event.text.items);
+    try std.testing.expectEqualStrings(
+        "Drinky changed the model.",
+        entries[2].content.event.text.items,
+    );
+
+    // A cursor before the range moves over no block, a cursor past the whole
+    // list clamps and moves over every removed block, and an empty range takes
+    // nothing.
+    try transcript.append(.user, .{}, "again");
+    const before = transcript.removeTurn(.{ .range_base = 3, .range_end = 4, .mirror_cursor = 1 });
+    try std.testing.expectEqual(@as(usize, 1), before.removed_count);
+    try std.testing.expectEqual(@as(usize, 0), before.removed_before_cursor_count);
+    try transcript.append(.user, .{}, "once more");
+    const after = transcript.removeTurn(.{ .range_base = 3, .range_end = 4, .mirror_cursor = 99 });
+    try std.testing.expectEqual(@as(usize, 1), after.removed_count);
+    try std.testing.expectEqual(@as(usize, 1), after.removed_before_cursor_count);
+    const empty = transcript.removeTurn(.{ .range_base = 3, .range_end = 3, .mirror_cursor = 3 });
+    try std.testing.expectEqual(@as(usize, 0), empty.removed_count);
+    try std.testing.expectEqual(@as(usize, 3), transcript.blocks().len);
 }
 
 test "reasoning collects into a thinking block that the answer run does not extend" {

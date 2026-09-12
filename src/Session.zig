@@ -22,12 +22,22 @@ const Session = @This();
 /// cut short, so a partial answer never reads as a complete one.
 const truncated_event =
     "The response is incomplete. The model reached an output or context limit.";
+/// The flags of an event that reports how its own turn ended: a cutoff, a
+/// failure, or a cancellation. Each one belongs to that turn, so a removal of
+/// the turn takes it.
+const turn_event_options: ui.block.Entry.Options = .{ .turn_owned = true };
+const turn_failure_options: ui.block.Entry.Options = .{ .is_error = true, .turn_owned = true };
 
 /// The semantic title above the editor while a retry waits.
 const retry_title = "Failed turn";
 /// The controls of a waiting retry. Enter sends the editor text as a separate
 /// message, and that turn drops the retry.
 const retry_controls = "Ctrl+N: Try again · Esc: Dismiss";
+/// The semantic title above the editor while a revision waits.
+const revision_title = "Canceled turn";
+/// The controls of a waiting revision. Ctrl+N removes the canceled turn and
+/// returns its messages to the editor. Esc keeps the turn in both histories.
+const revision_controls = "Ctrl+N: Remove and edit · Esc: Keep turn";
 /// The control that returns pending steering to the editor.
 const steering_controls = "Ctrl+P: Edit all";
 /// The title and the cancellation of the picker that Tab opens over the saved
@@ -173,6 +183,10 @@ steering: std.ArrayList(Message),
 /// reserve step sizes it, so the infallible restore filters the chat entries
 /// out without an allocation.
 restorable: std.ArrayList(ui.Editor.Draft),
+/// The storage that one canceled-turn capture fills with the committed steering
+/// drafts, in order. The reserve step sizes it, so the capture allocates nothing,
+/// and the capture hands the list to the revision context whole.
+revision_steering: std.ArrayList(ui.Editor.Draft),
 /// The events that arrived while a reply streamed, oldest first. An append then
 /// splits the streamed message and a stream reset cannot discard the part
 /// before it, so each waits for the next message boundary. Every content is
@@ -201,9 +215,10 @@ steering_uncommitted: ?UncommittedSteering,
 /// a queued message. Every other terminal frees it because the prompt belongs
 /// to committed history.
 turn_prompt: ?Message,
-/// Whether a retry context waits at the prompt. `App` owns that context and
-/// mirrors this bit, so the editor caption names its state and controls.
-retry_shown: bool,
+/// The recovery offer that waits at the prompt. `App` owns the context of the
+/// offer and mirrors it here, so the editor caption names its state and
+/// controls, and Ctrl+N acts on the one offer that the caption names.
+prompt_offer: PromptOffer,
 /// Who holds the input, and the caption of that state. `App` sets it from the
 /// state it owns, and the session knows the three owners alone.
 input: Input,
@@ -245,8 +260,15 @@ const Turn = struct {
     progress_sequence_applied: u64,
     /// The worker progress frontier that `transcript_checkpoint` mirrors.
     progress_sequence_checkpoint: u64,
+    /// The transcript length before the turn appended its first block. It never
+    /// moves, so a canceled turn that committed work can name its whole range.
+    transcript_base: usize,
     /// The transcript length after the newest applied event known to be committed.
     transcript_checkpoint: usize,
+    /// Whether the turn committed a call of a tool that changes the system. A
+    /// `tool_start` reports a committed call before dispatch, so the fact covers
+    /// a call of a round that a later rollback removed too.
+    mutated: bool,
     activity_tick: u64,
     /// The motion tick observed at the latest accepted progress event.
     progress_tick_last: u64,
@@ -488,6 +510,18 @@ const Trail = struct {
     }
 };
 
+/// The recovery offer at the prompt, as the caption above the editor names it. A
+/// failed turn and a canceled turn each leave one, and the two cannot coexist.
+pub const PromptOffer = enum {
+    none,
+    /// A failed turn that committed work waits. Ctrl+N asks the model to
+    /// continue from that work.
+    retry,
+    /// A canceled turn that committed work waits. Ctrl+N removes the turn from
+    /// both histories and returns its messages to the editor.
+    revision,
+};
+
 /// Who holds the input. The terminal is the editor. An external owner is a
 /// source that `App` reads, and the editor is then inactive: every exit key
 /// returns the input to the terminal, and Enter states who holds it. While no
@@ -592,6 +626,10 @@ pub const Confirmation = enum {
     /// One more Ctrl+D quits over a draft. The first Ctrl+D with a draft arms
     /// it, because the quit discards the draft.
     quit,
+    /// One more Ctrl+N removes a canceled turn that committed a call of a tool
+    /// that changes the system. The first Ctrl+N arms it, because the removal
+    /// takes the turn out of the conversation while its changes stay.
+    revision,
 };
 
 /// A turn worker's message to the render consumer, tagged with the generation it
@@ -713,13 +751,14 @@ pub fn init(
         .branch_length = 0,
         .steering = .empty,
         .restorable = .empty,
+        .revision_steering = .empty,
         .pending_events = .empty,
         .steering_retained_count = 0,
         .steering_consumed_count = 0,
         .steering_committed_count = 0,
         .steering_uncommitted = null,
         .turn_prompt = null,
-        .retry_shown = false,
+        .prompt_offer = .none,
         .input = .{},
         .clock_ms = 0,
         .boot_clock_ms = 0,
@@ -738,6 +777,8 @@ pub fn deinit(self: *Session) void {
     self.clearSteering();
     self.steering.deinit(self.gpa);
     self.restorable.deinit(self.gpa);
+    // A capture hands the list over whole, so it holds no draft here.
+    self.revision_steering.deinit(self.gpa);
     for (self.pending_events.items) |pending| self.gpa.free(pending.message.content);
     self.pending_events.deinit(self.gpa);
     self.transcript.deinit();
@@ -804,21 +845,32 @@ fn projectionSetup(self: *const Session) Transcript.Setup {
     };
 }
 
-/// Forget the reasoning blocks that `account` produced, and return how many left.
-/// A credential replacement removes the replay proofs of that account slot from
-/// history for good, so the blocks that hold that reasoning leave the interface
-/// with them. Commands and credential changes run between turns, so this cannot
-/// discard live turn state. The count lets a cursor over the transcript move
-/// back with the blocks that the removal shifted.
-pub fn dropAccountReasoning(self: *Session, account: ai.llm.Account) usize {
+/// Forget the reasoning blocks that `account` produced. A credential
+/// replacement removes the replay proofs of that account slot from history for
+/// good, so the blocks that hold that reasoning leave the interface with them.
+/// Commands and credential changes run between turns, so this cannot discard
+/// live turn state. The caller counts the blocks below its cursor with
+/// `Transcript.producedBefore` first, so that cursor moves back with them.
+pub fn dropAccountReasoning(self: *Session, account: ai.llm.Account) void {
     std.debug.assert(self.mode == .prompt);
     // Only a block the active projection showed can leave a row on the screen.
     const was_shown = Transcript.shows(account, self.projectionSetup());
-    const removed = self.transcript.dropAccount(account);
-    if (removed == 0) return 0;
+    if (self.transcript.dropAccount(account) == 0) return;
     if (was_shown) self.view.resetScreen();
     self.dirty = true;
-    return removed;
+}
+
+/// Remove the blocks of one canceled turn from the transcript, and report how
+/// many left below the cursor of a mirror. Only the prompt can remove, because
+/// a turn owns the transcript tail. The terminal cannot erase one row of its
+/// scrollback, so the next paint clears the screen and the scrollback and
+/// prints the conversation again without the turn.
+pub fn removeTurn(self: *Session, options: Transcript.Removal.Options) Transcript.Removal {
+    std.debug.assert(self.mode == .prompt);
+    const removal = self.transcript.removeTurn(options);
+    self.view.resetScreen();
+    self.dirty = true;
+    return removal;
 }
 
 /// Clear the transient notice. The regular footer returns on the next frame.
@@ -834,7 +886,7 @@ pub fn clearNotice(self: *Session) void {
 /// that can arm one are the modes whose key raises its warning.
 pub fn armConfirmation(self: *Session, confirmation: Confirmation) void {
     switch (confirmation) {
-        .quit => std.debug.assert(self.mode == .prompt),
+        .quit, .revision => std.debug.assert(self.mode == .prompt),
         .message => std.debug.assert(self.mode == .prompt or self.mode == .turn),
         .turn_cancel => std.debug.assert(self.mode == .turn),
     }
@@ -970,6 +1022,7 @@ pub fn applyTurnEvent(self: *Session, event: *const TurnEvent) !bool {
             try self.flushPendingEvents();
             try self.pushTool(turn, tool);
             turn.calls += 1;
+            if (ai.tool.mutates(tool.name)) turn.mutated = true;
             // One committed call replaces its own streamed row. A sibling call
             // of the same reply keeps its row while this one runs.
             try self.dropStreamedTool(turn, tool.name);
@@ -984,9 +1037,11 @@ pub fn applyTurnEvent(self: *Session, event: *const TurnEvent) !bool {
             self.clearStreamedTools(turn);
             const text = try retryEventText(self.gpa, &retry);
             defer self.gpa.free(text);
+            // The request happened, so the event survives a rewind of the tail.
+            // It happened in this turn, so a removal of the turn takes it.
             try self.transcript.append(
                 .event,
-                .{ .survives_rewind = true },
+                .{ .survives_rewind = true, .turn_owned = true },
                 text,
             );
         },
@@ -1003,7 +1058,7 @@ pub fn applyTurnEvent(self: *Session, event: *const TurnEvent) !bool {
                 .{ mismatch.served, mismatch.requested },
             );
             defer self.gpa.free(text);
-            try self.transcript.append(.event, .{ .is_warning = true }, text);
+            try self.transcript.append(.event, .{ .is_warning = true, .turn_owned = true }, text);
         },
         .steering_consumed => |consumed| {
             // Show the folded batch and hide its rows from the queue view, but
@@ -1520,25 +1575,25 @@ fn takeRestorable(self: *Session, messages: []Message) []ui.Editor.Draft {
     return self.restorable.items;
 }
 
-/// Preflight enough editor capacity to recall any queue suffix, appended or
-/// prepended: both consumers need at most one separator per draft. The mirror is
-/// consumer-owned and remains stable until `recallSteering` or
-/// `recallLateSteering`.
+/// Preflight enough editor capacity to recall any queue suffix above the
+/// in-progress line: the composition needs at most one separator per draft and
+/// one before the line. The mirror is consumer-owned and remains stable until
+/// `recallSteering` or `recallLateSteering`.
 pub fn reserveSteeringRecall(self: *Session) !void {
-    try self.editor.reserveDrafts(try self.collectRestorable(self.steering.items));
+    try self.editor.reserveComposition(null, try self.collectRestorable(self.steering.items));
 }
 
-/// Recall the queue-length suffix into the editor in submission order. The
-/// remaining prefix is in flight and stays hidden until consumed or restored. An
-/// external message of the suffix drops while its source holds the input.
-/// Infallible after `reserveSteeringRecall`.
+/// Recall the queue-length suffix into the editor in submission order and above
+/// the in-progress line, because the queue came before the line. The remaining
+/// prefix is in flight and stays hidden until consumed or restored, and a later
+/// restore puts it above the suffix. An external message of the suffix drops
+/// while its source holds the input. Infallible after `reserveSteeringRecall`.
 pub fn recallSteering(self: *Session, pending_count: usize) void {
     std.debug.assert(pending_count <= self.steering.items.len);
     const pending_start = self.steering.items.len - pending_count;
-    for (self.steering.items[pending_start..]) |*message| {
-        if (self.restores(message)) self.editor.appendDraft(&message.draft);
-        message.deinit(self.gpa);
-    }
+    const pending = self.steering.items[pending_start..];
+    self.editor.prependComposition(null, self.takeRestorable(pending));
+    for (pending) |*message| message.deinit(self.gpa);
     self.steering.shrinkRetainingCapacity(pending_start);
     self.steering_retained_count = self.steering.items.len;
     self.steering_consumed_count = @min(self.steering_consumed_count, self.steering.items.len);
@@ -1547,10 +1602,9 @@ pub fn recallSteering(self: *Session, pending_count: usize) void {
 }
 
 /// Return the whole steering mirror to the editor, in submission order and
-/// above the in-progress line. The recall is automatic, so it composes like the
-/// other automatic returns instead of the caret-anchored Ctrl+P recall. An
-/// external message drops while its source holds the input. Returns how many
-/// drafts went back. Infallible after `reserveSteeringRecall`.
+/// above the in-progress line, like every other restore. An external message
+/// drops while its source holds the input. Returns how many drafts went back.
+/// Infallible after `reserveSteeringRecall`.
 pub fn recallLateSteering(self: *Session) usize {
     const drafts = self.takeRestorable(self.steering.items);
     const count = drafts.len;
@@ -1559,12 +1613,15 @@ pub fn recallLateSteering(self: *Session) usize {
     return count;
 }
 
-/// Set the live turn's initial transcript checkpoint, so an abnormal exit that
-/// commits nothing removes the blocks that the turn appended. A turn whose request
-/// never sat in the editor, such as a retry that Ctrl+N sent, needs this alone.
+/// Set the live turn's transcript base and its initial checkpoint, so an
+/// abnormal exit that commits nothing removes the blocks that the turn appended,
+/// and a cancellation that committed work knows where the turn began. A turn
+/// whose request never sat in the editor, such as a retry that Ctrl+N sent, needs
+/// this alone.
 pub fn markTurnBase(self: *Session, transcript_base: usize) void {
     const turn = self.activeTurn() orelse unreachable;
     std.debug.assert(transcript_base <= self.transcript.blocks().len);
+    turn.transcript_base = transcript_base;
     turn.transcript_checkpoint = transcript_base;
 }
 
@@ -1612,6 +1669,58 @@ pub fn reserveSteeringRestore(self: *Session) !void {
     try self.editor.reserveComposition(lead, try self.collectRestorable(self.steering.items));
 }
 
+/// Preflight the storage that a canceled-turn capture fills, so `takeCanceledRevision`
+/// allocates nothing after the worker is canceled. It sizes the storage for
+/// every steering draft, because the receipt says only later how many committed.
+pub fn reserveRevisionCapture(self: *Session) !void {
+    try self.revision_steering.ensureTotalCapacity(self.gpa, self.steering.items.len);
+}
+
+/// What a canceled turn that committed work leaves for its revision: where its
+/// blocks began, whether it changed the system, and the rich drafts of the
+/// messages that it took from the user.
+pub const RevisionCapture = struct {
+    /// The transcript length before the turn appended its first block.
+    transcript_base: usize,
+    /// Whether the turn committed a call of a tool that changes the system.
+    mutated: bool,
+    /// The rich draft of the prompt. Owned.
+    prompt: ui.Editor.Draft,
+    /// The rich drafts of the committed steering messages that a restore moves,
+    /// in submission order. Owned.
+    steering: std.ArrayList(ui.Editor.Draft),
+};
+
+/// Move the user messages of the canceled turn out of the session, so a later
+/// revision can return them to the editor: the retained prompt and every
+/// committed steering draft that a restore moves. Each message keeps an empty
+/// draft shell in its place, so the receipt counts still match and `cancelReceipt`
+/// frees the shells without the payloads. Null when the turn retains no prompt
+/// that a restore moves: a retry attempt has none, and an external prompt stays
+/// with its source while that source holds the input. Such a turn cannot be
+/// revised whole, so it keeps every draft. Runs after the canceled progress
+/// applied and before `cancelReceipt`. Infallible after `reserveRevisionCapture`.
+pub fn takeCanceledRevision(self: *Session, receipt: *const ai.Agent.Receipt) ?RevisionCapture {
+    const turn = self.activeTurn() orelse unreachable;
+    const prompt = self.restorablePrompt() orelse return null;
+    const committed_count = @min(receipt.steering_committed_count, self.steering.items.len);
+    self.revision_steering.clearRetainingCapacity();
+    for (self.steering.items[0..committed_count]) |*message| {
+        if (!self.restores(message)) continue;
+        self.revision_steering.appendAssumeCapacity(message.draft);
+        message.draft = .empty;
+    }
+    const capture: RevisionCapture = .{
+        .transcript_base = turn.transcript_base,
+        .mutated = turn.mutated,
+        .prompt = prompt.*,
+        .steering = self.revision_steering,
+    };
+    prompt.* = .empty;
+    self.revision_steering = .empty;
+    return capture;
+}
+
 /// Preflight only the drafts a known failed receipt will restore. This avoids
 /// capacity for a prompt or steering prefix already committed to history.
 pub fn reserveFailureRestore(self: *Session, receipt: *const ai.Agent.Receipt) !void {
@@ -1657,7 +1766,9 @@ pub fn beginTurn(self: *Session, generation: u64) void {
         .generation = generation,
         .progress_sequence_applied = 0,
         .progress_sequence_checkpoint = 0,
+        .transcript_base = self.transcript.blocks().len,
         .transcript_checkpoint = self.transcript.blocks().len,
+        .mutated = false,
         .activity_tick = 0,
         .progress_tick_last = 0,
         .caret_tick = 0,
@@ -1750,7 +1861,7 @@ pub fn abortTurn(self: *Session) !void {
     const maybe_flush_error = self.flushRunningTools();
     self.endTurn();
     self.dirty = true;
-    try self.transcript.append(.event, .{}, "You canceled the turn.");
+    try self.transcript.append(.event, turn_event_options, "You canceled the turn.");
     if (maybe_flush_error) |flush_error| return flush_error;
 }
 
@@ -1760,7 +1871,7 @@ pub fn endTurnWithReceipt(self: *Session, receipt: *const ai.Agent.Receipt) !voi
     self.applyReceiptNormal(receipt);
     self.dropTurnPrompt();
     if (receipt.truncated)
-        try self.transcript.append(.event, .{ .is_error = true }, truncated_event);
+        try self.transcript.append(.event, turn_failure_options, truncated_event);
     self.transcript.endMessage();
     self.endTurn();
 }
@@ -1779,8 +1890,8 @@ pub fn failTurnWithReceipt(
     // failure, so its error waits for the event.
     const maybe_flush_error = self.flushRunningTools();
     if (receipt.truncated)
-        try self.transcript.append(.event, .{ .is_error = true }, truncated_event);
-    if (error_text) |text| try self.transcript.append(.event, .{ .is_error = true }, text);
+        try self.transcript.append(.event, turn_failure_options, truncated_event);
+    if (error_text) |text| try self.transcript.append(.event, turn_failure_options, text);
     self.transcript.endMessage();
     self.endTurn();
     if (maybe_flush_error) |flush_error| return flush_error;
@@ -1912,11 +2023,7 @@ pub fn paint(self: *Session, size: terminal.View.Size) !void {
             break :prompt .{
                 .prompt = .{
                     .caption = self.inputCaption(&caption_title_buffer, 0) orelse
-                        if (self.retry_shown) .{
-                            .title = retry_title,
-                            .controls = retry_controls,
-                            .rows_max = editor_caption_rows_max,
-                        } else null,
+                        self.offerCaption(),
                     .editor = &self.editor,
                 },
             };
@@ -1962,6 +2069,25 @@ pub fn paint(self: *Session, size: terminal.View.Size) !void {
         .status = &status,
     } };
     try layout.project(self.gpa, &self.view, size, &scene);
+}
+
+/// The caption of the recovery offer that waits at the prompt, or null while
+/// none waits. Each offer names its own state and the two keys that own it.
+/// Enter belongs to the editor text, so no offer lists it.
+fn offerCaption(self: *const Session) ?ui.Caption {
+    return switch (self.prompt_offer) {
+        .none => null,
+        .retry => .{
+            .title = retry_title,
+            .controls = retry_controls,
+            .rows_max = editor_caption_rows_max,
+        },
+        .revision => .{
+            .title = revision_title,
+            .controls = revision_controls,
+            .rows_max = editor_caption_rows_max,
+        },
+    };
 }
 
 /// The caption of the current input state, or null for the regular captions of
@@ -3519,6 +3645,302 @@ test "cancelReceipt drops the committed prefix and restores the uncommitted suff
     try std.testing.expectEqualStrings("restore me", session.editor.visible());
 }
 
+// The capture of a canceled turn moves the prompt and the committed steering
+// drafts out, and each message keeps an empty shell in its place. The receipt
+// counts still match, so `cancelReceipt` frees the shells and never the moved
+// payloads, and the uncommitted suffix still returns to the editor.
+test "takeCanceledRevision moves the committed drafts out and leaves empty shells" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
+    defer session.deinit();
+    try session.transcript.append(.event, .{}, "before the turn");
+    session.beginTurn(1);
+
+    // A pasted prompt keeps its atom, so the capture must move the payload by
+    // pointer and never copy or free it.
+    const payload = "line\n" ** 15;
+    try session.editor.paste(payload, true);
+    var prompt = session.editor.detachTrimmed();
+    session.retainTurnPrompt(&prompt, 1);
+    try queueSteeringText(&session, "committed");
+    try queueSteeringText(&session, "restore me");
+    try applyEvent(&session, 1, .{ .steering_consumed = .{
+        .text = try gpa.dupe(u8, "committed\n\nrestore me"),
+        .count = 2,
+    } });
+    try applyFinishedToolRound(&session);
+
+    try session.reserveSteeringRestore();
+    try session.reserveRevisionCapture();
+    const receipt: ai.Agent.Receipt = .{
+        .history_base = 0,
+        .history_end = 3,
+        .steering_committed_count = 1,
+    };
+    var capture = session.takeCanceledRevision(&receipt).?;
+    defer {
+        capture.prompt.deinit(gpa);
+        for (capture.steering.items) |*draft| draft.deinit(gpa);
+        capture.steering.deinit(gpa);
+    }
+    try std.testing.expectEqual(@as(usize, 1), capture.transcript_base);
+    try std.testing.expect(capture.mutated);
+    try std.testing.expectEqual(@as(usize, 1), capture.prompt.atoms.items.len);
+    const expanded = try capture.prompt.expanded(gpa, .none);
+    defer gpa.free(expanded);
+    try std.testing.expectEqualStrings(payload, expanded);
+    try std.testing.expectEqual(@as(usize, 1), capture.steering.items.len);
+    try std.testing.expectEqualStrings("committed", capture.steering.items[0].visible.items);
+
+    // The shells stand where the messages stood, so the counts hold.
+    try std.testing.expectEqual(@as(usize, 2), session.steering.items.len);
+    try std.testing.expectEqual(@as(usize, 0), session.steering.items[0].draft.visible.items.len);
+    try std.testing.expectEqual(@as(usize, 0), session.turn_prompt.?.draft.visible.items.len);
+    try std.testing.expectEqual(@as(usize, 0), session.turn_prompt.?.draft.atoms.items.len);
+
+    // The receipt frees the shells and returns the uncommitted suffix alone.
+    session.cancelReceipt(&receipt, 3);
+    try session.abortTurn();
+    try std.testing.expectEqualStrings("restore me", session.editor.visible());
+    try std.testing.expectEqual(@as(usize, 0), session.steering.items.len);
+    try std.testing.expect(session.turn_prompt == null);
+    // The moved payloads stand untouched in the capture.
+    try std.testing.expectEqualStrings("committed", capture.steering.items[0].visible.items);
+    try std.testing.expectEqual(@as(usize, 1), capture.prompt.atoms.items.len);
+}
+
+// A turn that retains no prompt that a restore moves cannot be revised whole:
+// a retry attempt or a shorten request retains none, and an external prompt
+// stays with its source while that source holds the input. Such a turn keeps
+// every draft for the receipt. Once the source let go, the prompt captures.
+test "takeCanceledRevision captures nothing without a restorable prompt" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
+    defer session.deinit();
+    const receipt: ai.Agent.Receipt = .{
+        .history_base = 0,
+        .history_end = 1,
+        .steering_committed_count = 1,
+    };
+
+    // A turn with no prompt at all, like a retry attempt. The receipt then
+    // resolves every draft as it stands.
+    session.beginTurn(1);
+    session.markTurnBase(0);
+    try queueSteeringText(&session, "committed");
+    try session.reserveRevisionCapture();
+    try std.testing.expect(session.takeCanceledRevision(&receipt) == null);
+    try std.testing.expectEqualStrings("committed", session.steering.items[0].draft.visible.items);
+    try session.reserveSteeringRestore();
+    session.cancelReceipt(&receipt, 0);
+    session.endTurn();
+    try std.testing.expectEqual(@as(usize, 0), session.steering.items.len);
+
+    // An external prompt while its source holds the input.
+    session.input.owner = .external;
+    session.beginTurn(2);
+    var external = try ui.Editor.Draft.fromText(gpa, "from the chat");
+    session.retainExternalTurnPrompt(&external, 0, 7);
+    try queueSteeringText(&session, "typed");
+    try session.reserveRevisionCapture();
+    try std.testing.expect(session.takeCanceledRevision(&receipt) == null);
+    try std.testing.expectEqualStrings("from the chat", session.turn_prompt.?.draft.visible.items);
+    try std.testing.expectEqualStrings("typed", session.steering.items[0].draft.visible.items);
+
+    // The source let go, so the prompt returns like a typed one.
+    session.input.owner = .terminal;
+    var capture = session.takeCanceledRevision(&receipt).?;
+    defer {
+        capture.prompt.deinit(gpa);
+        for (capture.steering.items) |*draft| draft.deinit(gpa);
+        capture.steering.deinit(gpa);
+    }
+    try std.testing.expectEqualStrings("from the chat", capture.prompt.visible.items);
+    try std.testing.expectEqual(@as(usize, 1), capture.steering.items.len);
+    try std.testing.expect(!capture.mutated);
+    session.endTurn();
+}
+
+// The base of a turn never moves, while the checkpoint advances with every
+// committed round, so a canceled turn that committed work names its whole
+// range. A tool that changes the system sets the fact of the turn, and a
+// read-only tool does not.
+test "a turn keeps its transcript base and records a mutating call" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
+    defer session.deinit();
+    try session.transcript.append(.event, .{}, "before the turn");
+    session.beginTurn(1);
+    try std.testing.expectEqual(@as(usize, 1), session.mode.turn.transcript_base);
+    session.markTurnBase(0);
+    try std.testing.expectEqual(@as(usize, 0), session.mode.turn.transcript_base);
+    try std.testing.expectEqual(@as(usize, 0), session.mode.turn.transcript_checkpoint);
+    try std.testing.expect(!session.mode.turn.mutated);
+
+    for ([_][]const u8{ "read", "find", "grep", "describe_drinky" }) |name| {
+        try applyEvent(&session, 1, .{ .tool_start = .{
+            .name = try gpa.dupe(u8, name),
+            .input_json = try gpa.dupe(u8, "{}"),
+        } });
+        try std.testing.expect(!session.mode.turn.mutated);
+    }
+    // The committed frontier moves the checkpoint and leaves the base.
+    _ = try session.applyTurnEvent(&.{
+        .generation = 1,
+        .progress_sequence = 1,
+        .progress_sequence_committed = 0,
+        .payload = .{ .text = try gpa.dupe(u8, "answer") },
+    });
+    _ = try session.applyTurnEvent(&.{
+        .generation = 1,
+        .progress_sequence = 2,
+        .progress_sequence_committed = 1,
+        .payload = .{ .tool_start = .{
+            .name = try gpa.dupe(u8, "bash"),
+            .input_json = try gpa.dupe(u8, "{\"command\":\"ls\"}"),
+        } },
+    });
+    try std.testing.expect(session.mode.turn.mutated);
+    try std.testing.expectEqual(@as(usize, 0), session.mode.turn.transcript_base);
+    try std.testing.expect(session.mode.turn.transcript_checkpoint > 0);
+    session.endTurn();
+
+    // Every mutating tool sets the fact, also a call that a later rollback
+    // removes.
+    for ([_][]const u8{ "write", "edit" }) |name| {
+        session.beginTurn(2);
+        try applyEvent(&session, 2, .{ .tool_start = .{
+            .name = try gpa.dupe(u8, name),
+            .input_json = try gpa.dupe(u8, "{}"),
+        } });
+        try std.testing.expect(session.mode.turn.mutated);
+        session.endTurn();
+    }
+}
+
+// The events that report how a turn went belong to that turn, so a removal of
+// the turn takes them. A session event and a command event belong to the
+// session, so they stay. A retry event sets both flags, because it happened
+// during the turn and survives a rewind of the tail.
+test "the events of a turn are turn-owned and the events of the session are not" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
+    defer session.deinit();
+
+    session.beginTurn(1);
+    _ = try session.applyTurnEvent(&.{
+        .generation = 1,
+        .progress_sequence = 1,
+        .payload = .{ .stream_reset = .{ .attempt = 2, .cause = .{ .failure = error.Timeout } } },
+    });
+    _ = try session.applyTurnEvent(&.{
+        .generation = 1,
+        .progress_sequence = 2,
+        .payload = .{ .model_mismatch = .{
+            .requested = try gpa.dupe(u8, "claude-opus-5"),
+            .served = try gpa.dupe(u8, "claude-sonnet-4-6"),
+        } },
+    });
+    try session.recordAsyncEvent(.{
+        .content = try gpa.dupe(u8, "You attached @bot."),
+        .severity = .information,
+    }, .{});
+    try session.applyOutcome(try ai.command.Outcome.reportEvent(gpa, .information, "changed", .{}));
+    // The committed frontier passes every event above, so the rewind of the
+    // failure keeps them all and takes the partial answer alone.
+    _ = try session.applyTurnEvent(&.{
+        .generation = 1,
+        .progress_sequence = 3,
+        .progress_sequence_committed = 2,
+        .payload = .{ .text = try gpa.dupe(u8, "partial") },
+    });
+    try session.failTurnWithReceipt(&.{
+        .history_base = 0,
+        .history_end = 1,
+        .steering_committed_count = 0,
+        .truncated = true,
+    }, "The provider is overloaded.");
+    session.beginTurn(2);
+    try session.abortTurn();
+
+    const blocks = session.transcript.blocks();
+    try std.testing.expectEqual(@as(usize, 7), blocks.len);
+    const retry = blocks[0].content.event;
+    try std.testing.expect(retry.turn_owned and retry.survives_rewind);
+    try std.testing.expect(blocks[1].content.event.turn_owned);
+    try std.testing.expect(!blocks[2].content.event.turn_owned);
+    try std.testing.expect(blocks[2].content.event.survives_rewind);
+    try std.testing.expect(!blocks[3].content.event.turn_owned);
+    try std.testing.expectEqualStrings(truncated_event, blocks[4].content.event.text.items);
+    try std.testing.expect(blocks[4].content.event.turn_owned);
+    try std.testing.expect(blocks[5].content.event.turn_owned);
+    try std.testing.expectEqualStrings("You canceled the turn.", blocks[6].content.event.text.items);
+    try std.testing.expect(blocks[6].content.event.turn_owned);
+    for (blocks) |*block| try std.testing.expect(block.turnOwned() == block.content.event.turn_owned);
+}
+
+// The removal of a turn reaches the terminal as a deep repaint, because no row
+// of the scrollback can leave on its own.
+test "removeTurn resets the screen and marks the session dirty" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
+    defer session.deinit();
+    try session.transcript.append(.user, .{}, "fix it");
+    try session.transcript.append(.event, .{ .turn_owned = true }, "You canceled the turn.");
+    try session.paint(.{ .columns = 80, .rows = 24 });
+    session.dirty = false;
+
+    const removal = session.removeTurn(.{ .range_base = 0, .range_end = 2, .mirror_cursor = 2 });
+    try std.testing.expectEqual(@as(usize, 2), removal.removed_count);
+    try std.testing.expectEqual(@as(usize, 2), removal.removed_before_cursor_count);
+    try std.testing.expectEqual(@as(usize, 0), session.transcript.blocks().len);
+    try std.testing.expect(session.view.force_reset);
+    try std.testing.expect(session.dirty);
+    const removed_start = out.written().len;
+    try session.paint(.{ .columns = 80, .rows = 24 });
+    const painted = out.written()[removed_start..];
+    try std.testing.expect(std.mem.indexOf(u8, painted, terminal.escape.screen_reset) != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "fix it") == null);
+}
+
+// Each recovery offer names its own state and controls above the editor, and
+// no offer lists Enter, because Enter belongs to the editor text.
+test "the prompt caption names the waiting recovery offer" {
+    const gpa = std.testing.allocator;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
+    defer session.deinit();
+
+    session.prompt_offer = .revision;
+    try session.paint(.{ .columns = 80, .rows = 24 });
+    try expectPainted(gpa, out.written(), "Canceled turn");
+    try expectPainted(gpa, out.written(), "Ctrl+N: Remove and edit · Esc: Keep turn");
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "Failed turn") == null);
+
+    const retry_start = out.written().len;
+    session.prompt_offer = .retry;
+    session.dirty = true;
+    try session.paint(.{ .columns = 80, .rows = 24 });
+    try expectPainted(gpa, out.written()[retry_start..], "Failed turn");
+    try expectPainted(gpa, out.written()[retry_start..], "Ctrl+N: Try again · Esc: Dismiss");
+
+    // The confirmation of the revision arms at the prompt alone, like the quit.
+    session.armConfirmation(.revision);
+    try std.testing.expect(session.takeConfirmation(.revision));
+    try std.testing.expect(!session.takeConfirmation(.revision));
+}
+
 // A steered large paste contributes one to the caption without exposing its
 // marker or payload. The rich draft still carries both for recall.
 test "the steering caption counts a paste without showing its content" {
@@ -4982,7 +5404,7 @@ test "dropped account reasoning leaves the transcript for good" {
     try finishTurn(&session, 0);
     try session.paint(.{ .columns = 80, .rows = 24 });
 
-    try std.testing.expectEqual(@as(usize, 1), session.dropAccountReasoning(.anthropic_plan));
+    session.dropAccountReasoning(.anthropic_plan);
     try std.testing.expect(session.view.force_reset);
     try std.testing.expectEqual(@as(usize, 1), session.transcript.blocks().len);
 
@@ -4995,8 +5417,9 @@ test "dropped account reasoning leaves the transcript for good" {
 
     // A slot with nothing left to drop keeps the screen as it is.
     session.view.force_reset = false;
-    try std.testing.expectEqual(@as(usize, 0), session.dropAccountReasoning(.anthropic_plan));
+    session.dropAccountReasoning(.anthropic_plan);
     try std.testing.expect(!session.view.force_reset);
+    try std.testing.expectEqual(@as(usize, 1), session.transcript.blocks().len);
 }
 
 // A conversation clear drops every block from the screen and the scrollback,

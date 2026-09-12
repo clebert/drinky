@@ -456,6 +456,13 @@ fn nextSerial(self: *Mirror) u64 {
     return self.serial;
 }
 
+/// The count of leading blocks that the chat holds or that the mirror skipped.
+/// A removal of blocks reads it first, so it can count the removed blocks below
+/// it and move the cursor back by exactly them.
+pub fn transcriptCursor(self: *const Mirror) usize {
+    return self.cursor;
+}
+
 /// Move the cursor back over `count` blocks that left the transcript below it,
 /// so the blocks behind them still go out once.
 pub fn retreat(self: *Mirror, count: usize) void {
