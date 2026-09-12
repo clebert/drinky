@@ -27,6 +27,10 @@ extension seams.
   terminal trace, the exit status, and the crash report of macOS. One trace names errno 49, and one
   crash report names `EBADF` with `SIGABRT`. Their relation stays unproven. Prefer a fix in the
   standard library over a workaround in Drinky._
+- **Extra blank rows in Anthropic reasoning** — Investigate a reasoning passage that shows three
+  blank rows where one paragraph separator belongs. _Observed with `anthropic-api/claude-fable-5-1`.
+  A transcript copy cannot distinguish doubled block-boundary newlines from an invisible Unicode
+  byte. Capture raw SSE frames before a fix._
 
 ## Improvements
 
