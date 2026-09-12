@@ -34,6 +34,12 @@ extension seams.
 
 ## Improvements
 
+- **Make prompt history opt-in** — Prompt history stays disabled unless `prompt_history.enabled` is
+  `true`, and an existing history file stays unchanged.
+- **Open the model flow after sign-in** — Every successful sign-in opens the account model flow at
+  its fetch or refresh step, with the remembered model or author preselected when possible.
+- **Normalize prompt history duplicates** — Prompts that differ only in line endings, trailing line
+  whitespace, or edge blank lines share one entry containing the latest submitted text.
 - **Show a model that no source describes** — such a model takes a disabled picker row that names
   what it lacks, and its selection opens the hint for the config key. _`Catalog.merge` returns null
   and the caller drops the model today, so it leaves the picker with no line. A picker row carries
@@ -42,6 +48,16 @@ extension seams.
 
 ## Features
 
+- **Open prompt history with `/prompt`** — `/prompt` opens the editable picker in the terminal and
+  an inline keyboard in Telegram, where a selection immediately starts its saved prompt. _Plain
+  Telegram messages that start a turn enter history. Steering messages and skill commands stay out._
+- **Revise a canceled turn in Telegram** — A canceled turn offers `Revise`, which removes that turn
+  from the model conversation and waits for the next Telegram message. _The offer has no `Keep`
+  button. Without a tap, a new message or `/new` keeps the canceled turn and dismisses the offer.
+  The chat keeps the original messages and reactions, and the canceled summary states
+  `Removed from conversation`. A stale tap reports that the revision is unavailable. After `write`,
+  `edit`, or `bash`, the first tap warns that tool changes stay and the second tap removes the
+  turn._
 - **Model metadata in the config** — the config describes a model that no provider and no OpenRouter
   entry describes, so the user can unblock any model. _The provider wins every field it states, the
   config wins over OpenRouter, and OpenRouter fills the rest. The `provider` field of an entry names
