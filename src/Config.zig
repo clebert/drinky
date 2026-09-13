@@ -34,7 +34,7 @@ gauge: ui.status.Gauge = .{},
 /// none or names an unknown level. The caller falls back to a compiled default.
 default_effort: ?ai.llm.Effort = null,
 /// Whether Drinky records and opens the global prompt history.
-prompt_history_enabled: bool = true,
+prompt_history_enabled: bool = false,
 /// The user instruction files that `config.json` names, in the configured order,
 /// with the messages the load produced. Owned.
 user_instructions: ai.instructions.Result,
@@ -161,7 +161,7 @@ const File = struct {
     /// Whether Drinky records and opens the global prompt history. A false
     /// value leaves the saved history file unchanged.
     const PromptHistory = struct {
-        enabled: bool = true,
+        enabled: bool = false,
     };
 };
 
@@ -1249,13 +1249,13 @@ test "a stale default_models key reads as an unknown key" {
     try std.testing.expectEqualStrings("default_models", config.unknown_keys[0]);
 }
 
-// The history is on by default. A false value turns the whole feature off for
+// The history is off by default. A true value turns the whole feature on for
 // the next start, and the document states the type and the default so the model
 // writes the key with a JSON boolean and never with a string.
 test "load reads prompt_history.enabled and documents it last" {
     var absent = try loadDataForTest("{}");
     defer absent.deinit(std.testing.allocator);
-    try std.testing.expect(absent.prompt_history_enabled);
+    try std.testing.expect(!absent.prompt_history_enabled);
 
     var enabled = try loadDataForTest(
         \\{ "prompt_history": { "enabled": true } }
@@ -1269,9 +1269,9 @@ test "load reads prompt_history.enabled and documents it last" {
     defer disabled.deinit(std.testing.allocator);
     try std.testing.expect(!disabled.prompt_history_enabled);
 
-    // The document reports the boolean type and the true default, and the
-    // section sits last in `File`, so its row closes the key list.
-    const row = "- `prompt_history.enabled` — boolean, default: true.";
+    // The document reports the boolean type and the false default. The section
+    // sits last in `File`, so its row closes the key list.
+    const row = "- `prompt_history.enabled` — boolean, default: false.";
     const row_index = std.mem.indexOf(u8, key_lines, row) orelse return error.MissingRow;
     try std.testing.expect(std.mem.indexOfPos(u8, key_lines, row_index + row.len, "\n- `") == null);
     try std.testing.expect(isLeafPath("prompt_history.enabled"));
@@ -1281,7 +1281,7 @@ test "load reads prompt_history.enabled and documents it last" {
         \\{ "prompt_history": { "enabld": false } }
     );
     defer typo.deinit(std.testing.allocator);
-    try std.testing.expect(typo.prompt_history_enabled);
+    try std.testing.expect(!typo.prompt_history_enabled);
     try std.testing.expectEqual(@as(usize, 1), typo.unknown_keys.len);
     try std.testing.expectEqualStrings("prompt_history.enabld", typo.unknown_keys[0]);
 }

@@ -2488,6 +2488,7 @@ fn commandContext(self: *App) ai.command.Context {
         .io = self.io,
         .agent = &self.agent,
         .accounts = &self.accounts,
+        .remembered_models = &self.state.models,
         .skill_registry = &self.skills,
         .remote_bots = self.controller.usernames(),
     };
@@ -2777,9 +2778,8 @@ fn endLoginInput(self: *App) void {
     self.syncInputState();
 }
 
-/// Adopt a committed sign-in and report its persistence outcome. The account
-/// switch and the evidence drop complete before any fallible presentation, so a
-/// failed line never leaves a half-switched session.
+/// Adopt a committed sign-in, report its persistence outcome, and open the
+/// account model flow. The account switch and the evidence drop finish first.
 fn completeLogin(
     self: *App,
     attempt: LoginAttempt,
@@ -2804,14 +2804,12 @@ fn completeLogin(
             "Drinky signed in and now uses {s}/{s}.",
             .{ account.id(), model.name() },
         );
-    } else {
-        try self.recordModelStep(
-            maybe_index,
-            account,
-            "Drinky signed in to {s}. ",
-            .{account.id()},
-        );
-    }
+    } else try self.recordEventAt(
+        maybe_index,
+        .information,
+        "Drinky signed in to {s}.",
+        .{account.id()},
+    );
     switch (login.*) {
         .saved => {},
         .memory_only => |failure| try self.recordEvent(
@@ -2822,6 +2820,8 @@ fn completeLogin(
         ),
     }
     try self.mirrorAgentState();
+    var context = self.commandContext();
+    try self.session.applyOutcome(try ai.command.model.forAccount(&context, account));
 }
 
 /// Cancel and join a sign-in during shutdown, then discard its result.
@@ -2926,26 +2926,12 @@ fn reportModelStep(
     comptime lead: []const u8,
     lead_args: anytype,
 ) !void {
-    return self.recordModelStep(null, account, lead, lead_args);
-}
-
-/// `reportModelStep` in place of the event at `maybe_index`, or as a new event
-/// when null. The result of a sign-in replaces its URL event this way.
-fn recordModelStep(
-    self: *App,
-    maybe_index: ?usize,
-    account: ai.llm.Account,
-    comptime lead: []const u8,
-    lead_args: anytype,
-) !void {
-    if (self.accounts.offersModel(account)) return self.recordEventAt(
-        maybe_index,
+    if (self.accounts.offersModel(account)) return self.recordEvent(
         .information,
         lead ++ "Select a model of {s} with /model.",
         lead_args ++ .{account.id()},
     );
-    return self.recordEventAt(
-        maybe_index,
+    return self.recordEvent(
         .information,
         lead ++ "Fetch the model list of {s} with /model.",
         lead_args ++ .{account.id()},
@@ -5204,9 +5190,9 @@ fn completeLoginForTest(app: *App, account: ai.llm.Account, generation: u64) Log
 
 // The terminal event of a sign-in joins its worker, and the joined result moves
 // the session onto the account. The result line takes the place of the URL
-// event, so the attempt costs the transcript one line. The caption goes with the
-// sign-in.
-test "a committed sign-in adopts its account at the terminal event" {
+// event, so the attempt costs the transcript one line. The model flow opens at
+// the fetch row, and the caption goes with the sign-in.
+test "a committed sign-in adopts its account and opens its model flow" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -5273,14 +5259,121 @@ test "a committed sign-in adopts its account at the terminal event" {
     try std.testing.expectEqual(ai.llm.Account.anthropic_plan, app.activeAccount().?);
     try std.testing.expectEqual(ai.llm.Account.anthropic_plan, app.session.account_shown.?);
     try std.testing.expect(app.session.input.caption == null);
+    try std.testing.expect(app.session.mode == .picking);
+    const picker = &app.session.mode.picking.picker;
+    try std.testing.expectEqualStrings("Model: anthropic-plan", picker.title);
+    try std.testing.expectEqual(@as(usize, 1), picker.options.len);
+    try std.testing.expectEqualStrings("Fetch the model list", picker.options[0].name);
+    try std.testing.expectEqual(@as(usize, 0), picker.cursor);
+    try std.testing.expect(!picker.can_step_back);
     // The old reasoning went, and the result took the place of the URL event.
     const blocks = app.session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 1), blocks.len);
     try std.testing.expectEqualStrings(
-        "Drinky signed in to anthropic-plan. Fetch the model list of " ++
-            "anthropic-plan with /model.",
+        "Drinky signed in to anthropic-plan.",
         blocks[0].content.event.text.items,
     );
+}
+
+// A cached model makes the first row a refresh. The remembered model is the
+// marked row and the initial selection after a successful sign-in.
+test "a sign-in opens a cached model flow on the remembered model" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{ .anthropic = "sk-ant" });
+    defer app.accounts.deinit();
+    try ai.testing.seedAccount(&app.accounts, .anthropic_api_key, &.{
+        "claude-fable-5",
+        test_anthropic_model.name(),
+    });
+    app.state.models.set(.anthropic_api_key, test_anthropic_model);
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = null,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, null, .low);
+    defer app.session.deinit();
+
+    try app.completeLogin(.{ .account = .anthropic_api_key }, &.{
+        .saved = "/home/.drinky/auth.json",
+    });
+
+    try app.expectModel(test_anthropic_model.name());
+    try std.testing.expect(app.session.mode == .picking);
+    const picker = &app.session.mode.picking.picker;
+    try std.testing.expectEqualStrings("Model: anthropic-api-key", picker.title);
+    try std.testing.expectEqualStrings("Refresh the model list", picker.options[0].name);
+    try std.testing.expectEqualStrings(
+        test_anthropic_model.name(),
+        picker.options[picker.marked.?].name,
+    );
+    try std.testing.expectEqual(picker.marked.?, picker.cursor);
+    try std.testing.expectEqualStrings(
+        "Drinky signed in and now uses anthropic-api-key/claude-opus-5.",
+        app.session.transcript.blocks()[0].content.event.text.items,
+    );
+}
+
+// When the exact OpenRouter model is absent, the remembered author gets the
+// cursor. No author is current until a model selection activates one.
+test "an OpenRouter sign-in preselects the remembered author" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpPath(gpa, io, &tmp, "");
+    defer gpa.free(home);
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{ .openrouter = "sk-or" });
+    defer app.accounts.deinit();
+    const metadata = try gpa.alloc(ai.Metadata.Entry, 2);
+    metadata[0] = .{
+        .provider = .openrouter,
+        .model = ai.testing.model("anthropic/claude-fable-5"),
+    };
+    metadata[1] = .{
+        .provider = .openrouter,
+        .model = ai.testing.model("openai/gpt-5.6-sol"),
+    };
+    app.accounts.catalog.metadata = metadata;
+    app.state.models.set(.openrouter_api_key, ai.testing.model("openai/removed-model"));
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = null,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, null, .low);
+    defer app.session.deinit();
+
+    try app.completeLogin(.{ .account = .openrouter_api_key }, &.{
+        .saved = "/home/.drinky/auth.json",
+    });
+
+    try std.testing.expect(app.agent.model == null);
+    try std.testing.expect(app.session.mode == .picking);
+    const picker = &app.session.mode.picking.picker;
+    try std.testing.expectEqualStrings("Author: openrouter-api-key", picker.title);
+    try std.testing.expectEqualStrings("Refresh the model list", picker.options[0].name);
+    try std.testing.expect(picker.marked == null);
+    try std.testing.expectEqualStrings("openai", picker.options[picker.cursor].name);
 }
 
 // A cancel closes the attempt in the transcript: the URL event becomes the line
@@ -11946,6 +12039,9 @@ test "Esc opens the step above the picker and cancels at the first step" {
     try app.handleKey(&.enter);
     const listed_models = &app.session.mode.picking.picker;
     try std.testing.expectEqualStrings("Model: openai-api-key", listed_models.title);
+    // The remembered model gets the cursor. It is not current under the inactive account.
+    try std.testing.expect(listed_models.marked == null);
+    try std.testing.expectEqual(@as(usize, 1), listed_models.cursor);
     try std.testing.expect(listed_models.can_step_back);
 
     // Two Escape bytes in one chunk. The first opens the step above, and the
@@ -12050,6 +12146,7 @@ test "a fetch wakeup rebuilds the model step over the fetched list" {
     defer app.accounts.deinit();
     defer app.agent.deinit();
     defer app.session.deinit();
+    app.state.models.set(.anthropic_api_key, ai.testing.model("claude-opus-5"));
 
     const result: ai.Accounts.Refresh = .{ .count = 1, .metadata_error = error.ConnectionTimedOut };
     try spawnFakeFetch(&app, &result);
@@ -12074,6 +12171,8 @@ test "a fetch wakeup rebuilds the model step over the fetched list" {
     try std.testing.expectEqual(@as(usize, 2), rebuilt.options.len);
     try std.testing.expectEqualStrings("Refresh the model list", rebuilt.options[0].name);
     try std.testing.expectEqualStrings("claude-opus-5", rebuilt.options[1].name);
+    try std.testing.expect(rebuilt.marked == null);
+    try std.testing.expectEqual(@as(usize, 1), rebuilt.cursor);
     try std.testing.expect(rebuilt.can_step_back);
     // The missed metadata states itself in the scrollback beside the list.
     const blocks = app.session.transcript.blocks();

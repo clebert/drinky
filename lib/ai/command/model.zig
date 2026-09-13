@@ -1,8 +1,9 @@
-//! `/model`: a stepped picker that ends on one model. The steps are the
-//! provider, the account, the author, and the model. An OpenRouter account
-//! opens the author step. A step that offers one row alone opens the next step
-//! at once, so the user answers an open question only. A selection always
-//! chooses a model together with its account. The command takes no argument.
+//! The model selection flow is a stepped picker that ends on one model. The
+//! `/model` command starts at the provider. A successful sign-in opens its
+//! account's model or author list. The first row fetches or refreshes the list.
+//! A remembered choice preselects its row. Only an active model is current. A
+//! step with one row opens the next step at once. A selection always chooses a
+//! model together with its account. The command takes no argument.
 //!
 //! Every step names the opener that builds it again, so Esc in a later step
 //! returns to it. The app keeps the trail, and a step that the flow skipped
@@ -110,7 +111,7 @@ fn accountStep(context: *Context, vendor: llm.Provider) !Context.Outcome {
     var buffer: [std.enums.values(llm.Account).len]llm.Account = undefined;
     const list = authenticatedAccounts(context.accounts, vendor, &buffer);
     std.debug.assert(list.len > 0);
-    if (list.len == 1) return nextStep(context, list[0]);
+    if (list.len == 1) return forAccount(context, list[0]);
 
     var options: Context.Outcome.Options = .{ .gpa = context.gpa };
     errdefer options.deinit();
@@ -161,14 +162,14 @@ fn selectAccountOf(comptime vendor: llm.Provider) Selector {
                 "Select a valid account.",
                 .{},
             );
-            return nextStep(context, list[index]);
+            return forAccount(context, list[index]);
         }
     }.select;
 }
 
-/// The step that follows the account: the author step of an OpenRouter account,
-/// or the model step of every other account.
-fn nextStep(context: *Context, account: llm.Account) !Context.Outcome {
+/// Open the model flow of one authenticated account. A remembered model
+/// preselects its model row. OpenRouter preselects its author first.
+pub fn forAccount(context: *Context, account: llm.Account) !Context.Outcome {
     if (account.provider() == .openrouter) return authorStep(context, account);
     return modelStep(context, account);
 }
@@ -183,6 +184,7 @@ const AuthorRow = struct {
 /// author. An author row opens the models of that author.
 fn authorStep(context: *Context, account: llm.Account) !Context.Outcome {
     const gpa = context.gpa;
+    const preferred_model = rememberedModel(context, account);
     var list: std.ArrayList(Model) = .empty;
     defer list.deinit(gpa);
     try context.accounts.listModels(account, &list, gpa);
@@ -200,6 +202,7 @@ fn authorStep(context: *Context, account: llm.Account) !Context.Outcome {
     var options: Context.Outcome.Options = .{ .gpa = gpa };
     errdefer options.deinit();
     var current: ?usize = null;
+    var preselected: ?usize = null;
     const lead = leadRows(context);
     if (lead > 0) try options.print("{s}", .{firstRow(list.items.len)});
     for (grouped, 0..) |author, index| {
@@ -208,6 +211,7 @@ fn authorStep(context: *Context, account: llm.Account) !Context.Outcome {
             format.pluralSuffix(author.count),
         });
         if (isActiveAuthor(context, account, list.items, author)) current = index + lead;
+        if (isPreferredAuthor(preferred_model, author.name)) preselected = index + lead;
     }
     const step: ModelStep = switch (account) {
         inline else => |tag| authorStepOf(tag),
@@ -218,6 +222,7 @@ fn authorStep(context: *Context, account: llm.Account) !Context.Outcome {
         .cancellation_message = cancellation_message,
         .options = try options.toOwnedSlice(),
         .current = current,
+        .preselected = preselected,
         .reopen = step.open,
     } };
 }
@@ -287,6 +292,11 @@ fn isActiveAuthor(
     return false;
 }
 
+fn isPreferredAuthor(preferred_model: ?*const Model, author_name: []const u8) bool {
+    const model = preferred_model orelse return false;
+    return std.mem.eql(u8, Metadata.authorOf(model.name()), author_name);
+}
+
 fn authorStepOf(comptime account: llm.Account) ModelStep {
     return .{
         .select = struct {
@@ -325,6 +335,7 @@ fn authorStepOf(comptime account: llm.Account) ModelStep {
 /// key of the author as the payload.
 fn authorModelsStep(context: *Context, account: llm.Account, first: usize) !Context.Outcome {
     const gpa = context.gpa;
+    const preferred_model = rememberedModel(context, account);
     var list: std.ArrayList(Model) = .empty;
     defer list.deinit(gpa);
     try context.accounts.listModels(account, &list, gpa);
@@ -338,10 +349,12 @@ fn authorModelsStep(context: *Context, account: llm.Account, first: usize) !Cont
     var options: Context.Outcome.Options = .{ .gpa = gpa };
     errdefer options.deinit();
     var current: ?usize = null;
+    var preselected: ?usize = null;
     for (list.items[first..], 0..) |*model, index| {
         if (!std.mem.eql(u8, Metadata.authorOf(model.name()), author_name)) break;
         try row(&options, account, model);
         if (isActive(context, account, model.name())) current = index;
+        if (isPreferred(preferred_model, model)) preselected = index;
     }
     const step: ModelStep = switch (account) {
         inline else => |tag| authorModelsOf(tag),
@@ -352,6 +365,7 @@ fn authorModelsStep(context: *Context, account: llm.Account, first: usize) !Cont
         .cancellation_message = cancellation_message,
         .options = try options.toOwnedSlice(),
         .current = current,
+        .preselected = preselected,
         .payload = authorKey(author_name),
         .reopen = step.open,
     } };
@@ -397,6 +411,7 @@ fn authorModelsOf(comptime account: llm.Account) ModelStep {
 /// notice that names the terminal.
 fn modelStep(context: *Context, account: llm.Account) !Context.Outcome {
     const gpa = context.gpa;
+    const preferred_model = rememberedModel(context, account);
     var list: std.ArrayList(Model) = .empty;
     defer list.deinit(gpa);
     try context.accounts.listModels(account, &list, gpa);
@@ -410,11 +425,13 @@ fn modelStep(context: *Context, account: llm.Account) !Context.Outcome {
     var options: Context.Outcome.Options = .{ .gpa = gpa };
     errdefer options.deinit();
     var current: ?usize = null;
+    var preselected: ?usize = null;
     const lead = leadRows(context);
     if (lead > 0) try options.print("{s}", .{firstRow(list.items.len)});
     for (list.items, 0..) |*model, index| {
         try row(&options, account, model);
         if (isActive(context, account, model.name())) current = index + lead;
+        if (isPreferred(preferred_model, model)) preselected = index + lead;
     }
     const step: ModelStep = switch (account) {
         inline else => |tag| modelStepOf(tag),
@@ -425,6 +442,7 @@ fn modelStep(context: *Context, account: llm.Account) !Context.Outcome {
         .cancellation_message = cancellation_message,
         .options = try options.toOwnedSlice(),
         .current = current,
+        .preselected = preselected,
         .reopen = step.open,
     } };
 }
@@ -560,6 +578,17 @@ fn isActive(context: *const Context, account: llm.Account, model_name: []const u
     return active_account == account and model.sameName(model_name);
 }
 
+fn rememberedModel(context: *const Context, account: llm.Account) ?*const Model {
+    const remembered_models = context.remembered_models orelse return null;
+    const maybe_model = remembered_models.getPtrConst(account);
+    return if (maybe_model.*) |*model| model else null;
+}
+
+fn isPreferred(preferred_model: ?*const Model, model: *const Model) bool {
+    const preferred = preferred_model orelse return false;
+    return model.sameName(preferred.name());
+}
+
 /// Whether the session already runs `model` under `account`, description and
 /// all. A fetch replaces the description of a model and keeps its name, so a
 /// comparison of names alone leaves the session on the description that the
@@ -590,7 +619,7 @@ pub fn fetchOutcome(
 ) !Context.Outcome {
     if (result.models_error) |err|
         return fetchFailure(context.gpa, account, err, result.metadata_save_error);
-    var outcome = try nextStep(context, account);
+    var outcome = try forAccount(context, account);
     errdefer freePick(context.gpa, &outcome.pick);
     outcome.pick.report = try fetchReport(context.gpa, account, result);
     return outcome;
@@ -1028,7 +1057,28 @@ test "an OpenRouter account opens the author step then the models of that author
     accounts.catalog.metadata = metadata;
     var agent = testing.agent(gpa, .{ .openrouter_api_key = "sk-or" });
     defer agent.deinit();
-    var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
+    var remembered_models = std.EnumArray(llm.Account, ?Model).initFill(null);
+    remembered_models.set(.openrouter_api_key, openai_old);
+    var context: Context = .{
+        .gpa = gpa,
+        .io = undefined,
+        .agent = &agent,
+        .accounts = &accounts,
+        .remembered_models = &remembered_models,
+    };
+
+    const preferred_authors = try expectPick(try forAccount(&context, .openrouter_api_key));
+    defer freePick(gpa, &preferred_authors);
+    try std.testing.expectEqual(@as(?usize, 1), preferred_authors.preselected);
+    try std.testing.expect(preferred_authors.current == null);
+    const preferred_models = try expectPick(try selectRow(
+        &preferred_authors,
+        &context,
+        preferred_authors.preselected.?,
+    ));
+    defer freePick(gpa, &preferred_models);
+    try std.testing.expectEqual(@as(?usize, 1), preferred_models.preselected);
+    try std.testing.expect(preferred_models.current == null);
 
     const authors = try expectPick(try run(&context));
     defer freePick(gpa, &authors);

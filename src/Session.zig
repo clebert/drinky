@@ -1372,6 +1372,7 @@ fn enterPicker(
     errdefer freePickerOptions(self.gpa, rows);
     const picker = try ui.Picker.init(self.gpa, pick.title, rows, .{
         .current = pick.current,
+        .preselected = pick.preselected,
         .position = position,
         .can_step_back = trail.len > 0,
     });

@@ -1,9 +1,8 @@
 //! A keyed JSON object file: one top-level object that maps each key to that
 //! key's entry. The credential store uses the account as the key. The app state
-//! store uses the project. The prompt history uses the encoded prompt itself as
-//! the key, so the key is the payload and the entry stays empty. This module
-//! owns the file shape only. The caller owns its entry fields (passed as
-//! `anytype`), so nothing here knows an entry shape.
+//! store uses the project. The prompt history uses a normalized prompt key.
+//! This module owns the file shape only. The caller owns its entry fields
+//! (passed as `anytype`), so nothing here knows an entry shape.
 //!
 //! Every write holds the owner-only `{path}.lock` sibling across its load,
 //! merge, and atomic rename. Lock contention ends with `error.StoreBusy` after

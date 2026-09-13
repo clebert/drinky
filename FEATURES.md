@@ -182,8 +182,10 @@ server through `DS4_BASE_URL`.
   Enter. Esc or Ctrl+D cancels the sign-in and keeps the draft. Ctrl+C clears a draft first and
   cancels only at an empty editor.
 - The result of a sign-in replaces its URL event, so one attempt costs the transcript one line: the
-  account it signed in to, the cancel, or the failure. A browser that does not open leaves a footer
-  notice, and the URL event still holds the URL.
+  account it signed in to, the cancel, or the failure. A successful sign-in opens that account's
+  model or author list. The first row fetches or refreshes that list. Drinky puts the cursor on the
+  remembered model or author when possible. Only an active model appears as current. A browser that
+  does not open leaves a footer notice, and the URL event still holds the URL.
 - When no browser opens, the recorded URL still works, and the callback waits five minutes. When the
   browser cannot reach the callback, Enter on the callback URL from its address bar replays it to
   the listener. Enter on any other line is refused with a notice that names the sign-in.
@@ -220,9 +222,10 @@ server through `DS4_BASE_URL`.
   Enter runs the command at once, and a bare `/` opens the same list. Esc returns to the list from
   any picker that a row opened.
 - **/model** — switch the account and the model together, from the next turn on. The picker steps
-  through the provider, the account, the author, and the model, and skips a step with one row. An
-  OpenRouter account opens the author step. The model step starts with a row that fetches the list
-  of that account, except the OpenRouter author step holds that row.
+  through the provider, the account, the author, and the model, and skips a step with one row. In
+  the terminal, each list puts the cursor on the remembered choice when available. For OpenRouter,
+  press Enter on the author to open its model list. The model step starts with a row that fetches
+  the list, except the OpenRouter author step holds that row.
 - **/effort** — set the reasoning-effort level, from the next turn on. The picker lists every level
   and marks a level that the active model folds or drops.
 - **/login** — sign in, switch to a signed-in account, or name the environment variables to set. The
@@ -495,18 +498,19 @@ server through `DS4_BASE_URL`.
 
 ## Prompt history
 
-- Tab at the idle prompt opens `Prompt history`, a picker over the submitted prompts of every
-  project, newest first. The history is on by default. During a turn, Tab explains that the picker
-  cannot open. In every other state Tab does nothing.
+- Prompt history stays off unless `prompt_history.enabled` is `true`. Tab at the idle prompt opens
+  `Prompt history`, a picker over the submitted prompts of every project, newest first. During a
+  turn, Tab explains that the picker cannot open. In every other state Tab does nothing.
 - Enter appends the selected prompt to the draft as editable literal text, after one blank line when
   the draft is not empty, and it never replaces the draft. Esc, Ctrl+C, or Ctrl+D closes the list
   and keeps the draft.
 - Only a submitted terminal prompt without a leading slash enters the history, once its turn starts.
   A failed or canceled turn keeps the entry. A cleared draft, a slash line, a skill line, a steering
   message, a Telegram message, a retry, and a shorten request stay out.
-- A selection alone changes no order. The complete prompt that the user submits moves to the top,
-  and a repeated prompt keeps one entry.
-- The store keeps 100 exact entries of at most 8 KiB each in the owner-only
+- A selection alone changes no order. The complete prompt that the user submits moves to the top.
+  Prompts with equivalent line endings, trailing spaces or tabs, and edge blank lines share one
+  entry. The entry contains the latest submitted text.
+- The store keeps 100 entries of at most 8 KiB each in the owner-only
   `~/.drinky/prompt_history.json`, which every project shares. The file can contain sensitive prompt
   text. Drinky reads it each time Tab opens the picker, so a prompt from another instance shows
   without a restart. An oversized prompt starts its turn and stays out with a warning.

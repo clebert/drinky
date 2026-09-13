@@ -7,6 +7,7 @@ const llm = @import("../llm.zig");
 const skills = @import("../skills.zig");
 const Accounts = @import("../Accounts.zig");
 const Agent = @import("../Agent.zig");
+const Model = @import("../Model.zig");
 
 const Context = @This();
 
@@ -16,6 +17,9 @@ io: std.Io,
 agent: *Agent,
 /// For account-qualified model selection.
 accounts: *Accounts,
+/// The model each account used last in this project. Null in command tests
+/// that do not need a remembered model.
+remembered_models: ?*const std.EnumArray(llm.Account, ?Model) = null,
 /// Runtime-discovered skills. Null in the command tests that do not need them.
 skill_registry: ?*const skills.Registry = null,
 /// The username of every saved Telegram bot, in the order of the store. The
@@ -142,15 +146,16 @@ pub const Outcome = union(enum) {
     /// A request to open a picker. A selection routes straight to `select`.
     /// `options` (each row and the slice) transfers to the app. The app frees
     /// them when the picker closes. The request borrows the title and the
-    /// cancellation message. `current`, if set, is the row to mark and
-    /// preselect. A row carries its extra and occupancy tag as fields, so the
-    /// picker never reads chrome out of the name.
+    /// cancellation message. `current`, if set, is the row in use.
+    /// `preselected`, if set, moves the initial cursor without marking that row
+    /// as current. A row carries its extra and occupancy tag as fields.
     pub const Pick = struct {
         select: *const fn (*Context, Selection) anyerror!Outcome,
         title: []const u8,
         cancellation_message: []const u8,
         options: []const Option,
         current: ?usize,
+        preselected: ?usize = null,
         /// A value the command sets on this picker and reads back from the
         /// selection, beside the tapped row. It names the earlier choice that
         /// this picker belongs to. A command that never sets it leaves zero,

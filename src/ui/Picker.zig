@@ -100,11 +100,13 @@ pub const Position = struct {
 
 /// How a list opens.
 pub const Start = struct {
-    /// The row that holds the value already in use. It carries the tag, and the
-    /// highlight opens on it. Null tags no row.
+    /// The row that holds the value already in use. It carries the tag. The
+    /// highlight opens on it when no preselection exists. Null tags no row.
     current: ?usize = null,
-    /// Where the user left this list, over `current`. Null opens the list on
-    /// `current`, at the top.
+    /// The initial highlighted row. A value overrides the current row.
+    preselected: ?usize = null,
+    /// The saved cursor and scroll. A value overrides the initial rows. Null
+    /// opens on the preselected row, current row, or row zero in that order.
     position: ?Position = null,
     /// Whether a step stands above this list. It selects the key hint alone, and
     /// the caller owns what Esc then does.
@@ -166,7 +168,9 @@ pub fn init(
 ) !Picker {
     // A rebuilt list can be shorter than the one the position came from.
     const rows_max = options.len -| 1;
-    const opened: Position = start.position orelse .{ .cursor = start.current orelse 0 };
+    const opened: Position = start.position orelse .{
+        .cursor = start.preselected orelse start.current orelse 0,
+    };
     var self: Picker = .{
         .gpa = gpa,
         .title = title,
@@ -774,13 +778,19 @@ test "a list that waits drops its rows, states the wait, and moves its separator
 
 // A list that the user returns to opens on the row they left, over the row that
 // carries the tag. The rebuilt list can be shorter, so the row clamps.
-test "the opening row takes the cursor over the current value, inside the list" {
+test "the opening row applies the preselection, current value, and saved position" {
     const gpa = std.testing.allocator;
     const labels = [_][]const u8{ "alpha", "beta", "gamma" };
 
     for ([_]struct { start: Start, cursor: usize, scroll: usize = 0, marked: ?usize }{
         .{ .start = .{}, .cursor = 0, .marked = null },
         .{ .start = .{ .current = 2 }, .cursor = 2, .marked = 2 },
+        .{ .start = .{ .preselected = 1 }, .cursor = 1, .marked = null },
+        .{
+            .start = .{ .current = 2, .preselected = 1 },
+            .cursor = 1,
+            .marked = 2,
+        },
         .{
             .start = .{ .current = 2, .position = .{ .cursor = 1 } },
             .cursor = 1,

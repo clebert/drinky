@@ -3,12 +3,10 @@
 //! no project key splits it, because a reusable prompt belongs to the user and
 //! not to a directory.
 //!
-//! The file is a keyed JSON object. Each key is one exact prompt, encoded as
-//! canonical URL-safe Base64 without padding, and each value is an empty
-//! object. The encoding keeps every byte of a paste, and it makes a repeat
-//! compare byte for byte. The file order runs from the least recently used
-//! prompt to the most recently used one. A repeated prompt moves to the end, so
-//! the file holds one copy of it.
+//! The file is a keyed JSON object. Each key holds the SHA-256 digest of the
+//! normalized prompt. Its value holds the latest exact prompt as URL-safe
+//! Base64. The file order runs from the least recently used prompt to the most
+//! recently used one. A repeated prompt moves to the end.
 //!
 //! Drinky reads the file when Tab opens the picker, so a change in another
 //! instance reaches a running one without a watcher. A write happens once per
@@ -33,8 +31,8 @@ path: []const u8,
 /// Whether Drinky reads and writes the file. A disabled history loads nothing,
 /// records nothing, and leaves the file as it is.
 enabled: bool,
-/// The prompts of the last `load`, newest first. Each is the exact prompt. A
-/// picker row indexes this list. Owned.
+/// The prompts of the last `load`, newest first. Each is the latest submitted
+/// text of one normalized prompt. A picker row indexes this list. Owned.
 entries: std.ArrayList([]const u8),
 
 /// The number of prompts the file keeps. A record drops the least recently used
@@ -46,8 +44,10 @@ pub const entry_bytes_max = 8 * 1024;
 
 const codec = std.base64.url_safe_no_pad;
 
-/// The value under every key. It carries nothing, because the key is the payload.
-const Entry = struct {};
+/// The Base64 form of the latest submitted prompt under one normalized key.
+const Entry = struct {
+    prompt: []const u8,
+};
 
 /// The inputs `open` needs to find `prompt_history.json`. `home` can be
 /// relative, so it resolves against the working directory the app knows.
@@ -100,31 +100,122 @@ pub fn load(self: *PromptHistory) !void {
     defer file.deinit();
     errdefer self.clearEntries();
     const keys = file.keys();
-    try self.entries.ensureTotalCapacity(self.gpa, keys.len);
+    const first = keys.len -| entries_max;
+    const count = keys.len - first;
+    try self.entries.ensureTotalCapacity(self.gpa, count);
     // The file holds the newest prompt last, and the list holds it first.
-    for (0..keys.len) |offset| {
-        const prompt = try decodeAlloc(self.gpa, keys[keys.len - 1 - offset]);
-        self.entries.appendAssumeCapacity(prompt);
+    for (0..count) |offset| {
+        const index = keys.len - 1 - offset;
+        self.entries.appendAssumeCapacity(try promptAlloc(self.gpa, &file, keys[index]));
     }
 }
 
-/// Record `prompt` as the most recently used one. A prompt already in the file
-/// moves to that position, and a new prompt past the count drops the least
-/// recently used one. A prompt above `entry_bytes_max` is `error.PromptTooLarge`
-/// and changes nothing. A disabled history records nothing.
+/// Record `prompt` as the most recently used one. Prompts that differ only in
+/// line endings, trailing spaces or tabs, or edge blank lines share one entry.
+/// The newest submitted text becomes its value. A prompt above
+/// `entry_bytes_max` is `error.PromptTooLarge` and changes nothing. A disabled
+/// history records nothing.
 pub fn record(self: *const PromptHistory, prompt: []const u8) !void {
     if (!self.enabled) return;
     if (prompt.len > entry_bytes_max) return error.PromptTooLarge;
-    const key = try encodeAlloc(self.gpa, prompt);
+    const normalized = try normalizeAlloc(self.gpa, prompt);
+    defer self.gpa.free(normalized);
+    const key = try normalizedKeyAlloc(self.gpa, normalized);
     defer self.gpa.free(key);
-    try ai.json_store.save(self.gpa, self.io, self.path, key, Entry{}, .{
-        .keys_max = entries_max,
-    });
+    const encoded_prompt = try encodeAlloc(self.gpa, prompt);
+    defer self.gpa.free(encoded_prompt);
+    try ai.json_store.save(
+        self.gpa,
+        self.io,
+        self.path,
+        key,
+        Entry{ .prompt = encoded_prompt },
+        .{ .keys_max = entries_max },
+    );
 }
 
 fn clearEntries(self: *PromptHistory) void {
     for (self.entries.items) |entry| self.gpa.free(entry);
     self.entries.clearRetainingCapacity();
+}
+
+/// Decode the prompt in a current entry.
+fn promptAlloc(
+    gpa: std.mem.Allocator,
+    file: *const ai.json_store.File,
+    key: []const u8,
+) ![]u8 {
+    const entry = file.entry(key) orelse return error.CorruptStore;
+    const value = entry.get("prompt") orelse return error.CorruptStore;
+    return switch (value) {
+        .string => |encoded| decodeAlloc(gpa, encoded) catch |err| switch (err) {
+            error.PromptTooLarge => error.CorruptStore,
+            else => err,
+        },
+        else => error.CorruptStore,
+    };
+}
+
+fn normalizeAlloc(gpa: std.mem.Allocator, prompt: []const u8) ![]u8 {
+    var normalized: std.ArrayList(u8) = .empty;
+    defer normalized.deinit(gpa);
+    try normalized.ensureTotalCapacity(gpa, prompt.len);
+
+    var has_line = false;
+    var blank_lines: usize = 0;
+    var line_start: usize = 0;
+    var index: usize = 0;
+    while (index < prompt.len) {
+        const byte = prompt[index];
+        if (byte != '\r' and byte != '\n') {
+            index += 1;
+            continue;
+        }
+        try appendNormalizedLine(
+            gpa,
+            &normalized,
+            prompt[line_start..index],
+            &has_line,
+            &blank_lines,
+        );
+        index += 1;
+        if (byte == '\r' and index < prompt.len and prompt[index] == '\n') index += 1;
+        line_start = index;
+    }
+    try appendNormalizedLine(
+        gpa,
+        &normalized,
+        prompt[line_start..],
+        &has_line,
+        &blank_lines,
+    );
+    return normalized.toOwnedSlice(gpa);
+}
+
+fn appendNormalizedLine(
+    gpa: std.mem.Allocator,
+    normalized: *std.ArrayList(u8),
+    raw_line: []const u8,
+    has_line: *bool,
+    blank_lines: *usize,
+) !void {
+    const line = std.mem.trimEnd(u8, raw_line, " \t");
+    if (line.len == 0) {
+        if (has_line.*) blank_lines.* += 1;
+        return;
+    }
+    if (has_line.*) try normalized.appendNTimes(gpa, '\n', blank_lines.* + 1);
+    try normalized.appendSlice(gpa, line);
+    has_line.* = true;
+    blank_lines.* = 0;
+}
+
+fn normalizedKeyAlloc(gpa: std.mem.Allocator, normalized: []const u8) ![]u8 {
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(normalized, &digest, .{});
+    const key = try gpa.alloc(u8, codec.Encoder.calcSize(digest.len));
+    _ = codec.Encoder.encode(key, &digest);
+    return key;
 }
 
 fn encodeAlloc(gpa: std.mem.Allocator, prompt: []const u8) ![]u8 {
@@ -134,7 +225,9 @@ fn encodeAlloc(gpa: std.mem.Allocator, prompt: []const u8) ![]u8 {
 }
 
 fn decodeAlloc(gpa: std.mem.Allocator, key: []const u8) ![]u8 {
-    const prompt = try gpa.alloc(u8, try codec.Decoder.calcSizeForSlice(key));
+    const size = try codec.Decoder.calcSizeForSlice(key);
+    if (size > entry_bytes_max) return error.PromptTooLarge;
+    const prompt = try gpa.alloc(u8, size);
     errdefer gpa.free(prompt);
     try codec.Decoder.decode(prompt, key);
     return prompt;
@@ -192,10 +285,8 @@ test "an absent file loads an empty list, and two projects share one file" {
     try expectEntries(&first, &.{});
 }
 
-// The key is the prompt itself, so every byte of a paste survives the file, and
-// the value carries nothing. A reader ignores the value, so a value of another
-// type never makes the history corrupt.
-test "a record survives a reload byte for byte under an empty object value" {
+// The value encodes the prompt, so every byte of a paste survives the file.
+test "a record survives a reload byte for byte under its normalized key" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -214,18 +305,14 @@ test "a record survives a reload byte for byte under an empty object value" {
     defer file.deinit();
     const keys = file.keys();
     try std.testing.expectEqual(@as(usize, 1), keys.len);
-    try std.testing.expectEqual(@as(usize, 0), file.entry(keys[0]).?.count());
-    // The key is canonical URL-safe Base64 without padding, so it holds no
-    // byte that JSON escapes.
-    for (keys[0]) |byte| try std.testing.expect(std.ascii.isAlphanumeric(byte) or
-        byte == '-' or byte == '_');
-
-    // A foreign value under a valid key still loads the key.
-    const foreign = try std.fmt.allocPrint(gpa, "{{\"{s}\":42}}", .{keys[0]});
-    defer gpa.free(foreign);
-    try writeForTest(io, &tmp, foreign);
-    try history.load();
-    try expectEntries(&history, &.{exact});
+    try std.testing.expectEqual(
+        codec.Encoder.calcSize(std.crypto.hash.sha2.Sha256.digest_length),
+        keys[0].len,
+    );
+    const encoded = file.entry(keys[0]).?.get("prompt").?.string;
+    const decoded = try decodeAlloc(gpa, encoded);
+    defer gpa.free(decoded);
+    try std.testing.expectEqualStrings(exact, decoded);
 }
 
 test "a repeated record moves to the newest position without a second entry" {
@@ -249,6 +336,30 @@ test "a repeated record moves to the newest position without a second entry" {
     try expectEntries(&history, &.{ "one", "three", "two" });
 }
 
+// Line endings, line-end spaces, and blank edge lines do not make distinct
+// prompts. A new record replaces the entry with the latest text.
+test "a normalized repeat keeps the latest submitted text" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpHome(gpa, io, &tmp);
+    defer gpa.free(home);
+
+    var history = try openForTest(gpa, io, home, "/work");
+    defer history.deinit();
+    try history.record("\n\nalpha  \r\nbeta\t\r\n\t\r\n");
+    try history.record("other");
+    const latest = "alpha\nbeta\n\n";
+    try history.record(latest);
+    try history.load();
+    try expectEntries(&history, &.{ latest, "other" });
+
+    var file = (try ai.json_store.open(gpa, io, history.path)).?;
+    defer file.deinit();
+    try std.testing.expectEqual(@as(usize, 2), file.keys().len);
+}
+
 test "the entry past the count drops the least recently used one" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -265,9 +376,11 @@ test "the entry past the count drops the least recently used one" {
         if (index > 0) try data.writer.writeByte(',');
         var prompt_buffer: [16]u8 = undefined;
         const prompt = try std.fmt.bufPrint(&prompt_buffer, "prompt {d}", .{index});
-        var key_buffer: [32]u8 = undefined;
-        const key = codec.Encoder.encode(&key_buffer, prompt);
-        try data.writer.print("\"{s}\":{{}}", .{key});
+        const key = try normalizedKeyAlloc(gpa, prompt);
+        defer gpa.free(key);
+        const encoded = try encodeAlloc(gpa, prompt);
+        defer gpa.free(encoded);
+        try data.writer.print("\"{s}\":{{\"prompt\":\"{s}\"}}", .{ key, encoded });
     }
     try data.writer.writeByte('}');
     try writeForTest(io, &tmp, data.written());
@@ -316,15 +429,49 @@ test "an entry of the limit is accepted and one above it is refused" {
     try std.testing.expectEqualStrings(before, after);
 }
 
+// An oversized stored value is corrupt file data. It does not describe the
+// next submitted prompt, so that prompt can still enter the file.
+test "an oversized stored prompt does not describe the next prompt" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmpHome(gpa, io, &tmp);
+    defer gpa.free(home);
+
+    var history = try openForTest(gpa, io, home, "/work");
+    defer history.deinit();
+    const key = try normalizedKeyAlloc(gpa, "stored");
+    defer gpa.free(key);
+    const oversized = try gpa.alloc(u8, entry_bytes_max + 1);
+    defer gpa.free(oversized);
+    @memset(oversized, 'x');
+    const encoded = try encodeAlloc(gpa, oversized);
+    defer gpa.free(encoded);
+    const data = try std.fmt.allocPrint(
+        gpa,
+        "{{\"{s}\":{{\"prompt\":\"{s}\"}}}}",
+        .{ key, encoded },
+    );
+    defer gpa.free(data);
+    try writeForTest(io, &tmp, data);
+
+    try history.record("valid");
+    try std.testing.expectError(error.CorruptStore, history.load());
+    try expectEntries(&history, &.{});
+}
+
 // The two fixed limits bound the file, so the module can promise a size without
-// a byte budget of its own. The encoder states the key size, and the shape of a
-// minified object states the rest.
+// a byte budget of its own. The encoders state both payload sizes.
 test "the fixed limits keep a Drinky-written file below the documented budget" {
-    const key_bytes = codec.Encoder.calcSize(entry_bytes_max);
-    // The quotes, the colon, the empty object, and the comma of one key.
-    const key_overhead_bytes = "\"\":{},".len;
-    const file_bytes_max = 2 + entries_max * (key_bytes + key_overhead_bytes);
-    try std.testing.expectEqual(@as(usize, 10_923), key_bytes);
+    const key_bytes = codec.Encoder.calcSize(std.crypto.hash.sha2.Sha256.digest_length);
+    const prompt_bytes = codec.Encoder.calcSize(entry_bytes_max);
+    // The quotes, punctuation, field name, object braces, and comma of one entry.
+    const entry_overhead_bytes = "\"\":{\"prompt\":\"\"},".len;
+    const file_bytes_max = 2 + entries_max *
+        (key_bytes + prompt_bytes + entry_overhead_bytes);
+    try std.testing.expectEqual(@as(usize, 43), key_bytes);
+    try std.testing.expectEqual(@as(usize, 10_923), prompt_bytes);
     try std.testing.expect(file_bytes_max < 1_100_000);
 }
 
@@ -403,8 +550,8 @@ test "a corrupt file fails every action and stays byte-identical" {
     try std.testing.expectEqualStrings("{ not json", data);
 }
 
-// A key that no encoder wrote is a read failure, and a failed read leaves no
-// entry behind: a picker never shows half of a file.
+// A value that no encoder wrote is a read failure. The failed read leaves no
+// entry behind, so a picker never shows half of a file.
 test "invalid Base64 data fails the read and leaves no entry" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -415,13 +562,26 @@ test "invalid Base64 data fails the read and leaves no entry" {
 
     var history = try openForTest(gpa, io, home, "/work");
     defer history.deinit();
-    try history.record("valid");
-    // Base64 spells a valid key, then a key with a byte outside the alphabet,
-    // and then a key of an impossible length.
-    try writeForTest(io, &tmp, "{\"dmFsaWQ\":{},\"not base64!\":{}}");
+    const key = try normalizedKeyAlloc(gpa, "valid");
+    defer gpa.free(key);
+
+    const invalid_character = try std.fmt.allocPrint(
+        gpa,
+        "{{\"{s}\":{{\"prompt\":\"not base64!\"}}}}",
+        .{key},
+    );
+    defer gpa.free(invalid_character);
+    try writeForTest(io, &tmp, invalid_character);
     try std.testing.expectError(error.InvalidCharacter, history.load());
     try expectEntries(&history, &.{});
-    try writeForTest(io, &tmp, "{\"dmFsaWQ\":{},\"A\":{}}");
+
+    const invalid_padding = try std.fmt.allocPrint(
+        gpa,
+        "{{\"{s}\":{{\"prompt\":\"A\"}}}}",
+        .{key},
+    );
+    defer gpa.free(invalid_padding);
+    try writeForTest(io, &tmp, invalid_padding);
     try std.testing.expectError(error.InvalidPadding, history.load());
     try expectEntries(&history, &.{});
 }

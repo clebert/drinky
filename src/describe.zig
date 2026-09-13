@@ -129,8 +129,9 @@ fn writeKeys(writer: *std.Io.Writer, options: *const Options) !void {
         \\The prompt takes these keys:
         \\
         \\- Enter sends the line.
-        \\- Tab opens the prompt history picker over the draft. Enter there appends the selected
-        \\  prompt to the draft as editable text, and Esc closes the list and keeps the draft.
+        \\- Tab opens the prompt history picker over the draft when `prompt_history.enabled` is `true`.
+        \\  Enter there appends the selected prompt to the draft as editable text.
+        \\  Esc closes the list and keeps the draft.
         \\- Ctrl+C clears the editor. A second press within {d} milliseconds quits Drinky.
         \\- Ctrl+D quits at an empty editor. Ctrl+D with a draft warns first and quits on the
         \\  second press.
@@ -274,12 +275,13 @@ test "the document states every command, key, and discovery rule" {
         "`Canceled turn`, Ctrl+N removes the canceled turn",
     ) != null);
     try std.testing.expect(std.mem.indexOf(u8, text[prompt..login], "Tool changes stay.") != null);
-    // Tab acts at the prompt alone, and a turn answers it with a notice. The
-    // document states both, so the model never promises the list during a turn.
+    // Tab opens the enabled history at the prompt alone. A turn answers it with
+    // a notice, so the model never promises the list during a turn.
     try std.testing.expect(std.mem.indexOf(
         u8,
         text[prompt..login],
-        "- Tab opens the prompt history picker over the draft.",
+        "- Tab opens the prompt history picker over the draft when " ++
+            "`prompt_history.enabled` is `true`.",
     ) != null);
     try std.testing.expect(std.mem.indexOf(
         u8,

@@ -22,6 +22,10 @@ extension seams.
 
 ## Bugs
 
+- **Silent OAuth callback replay** — A pasted callback URL can clear from the editor without
+  completing the sign-in or reporting the cause. _Observed with `openrouter-api` in Safari after the
+  plain-HTTP callback failed. Repeated callback URL pastes produced no notice. A new sign-in
+  accepted its URL._
 - **Abort after a wake of macOS** — Investigate a process abort after a sleep or a network change
   while a Telegram bot is attached. _Wait for another occurrence before more work. Capture the
   terminal trace, the exit status, and the crash report of macOS. One trace names errno 49, and one
@@ -34,12 +38,6 @@ extension seams.
 
 ## Improvements
 
-- **Make prompt history opt-in** — Prompt history stays disabled unless `prompt_history.enabled` is
-  `true`, and an existing history file stays unchanged.
-- **Open the model flow after sign-in** — Every successful sign-in opens the account model flow at
-  its fetch or refresh step, with the remembered model or author preselected when possible.
-- **Normalize prompt history duplicates** — Prompts that differ only in line endings, trailing line
-  whitespace, or edge blank lines share one entry containing the latest submitted text.
 - **Show a model that no source describes** — such a model takes a disabled picker row that names
   what it lacks, and its selection opens the hint for the config key. _`Catalog.merge` returns null
   and the caller drops the model today, so it leaves the picker with no line. A picker row carries

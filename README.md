@@ -66,10 +66,12 @@ holds or names. The local `ds4` account is the exception: it has no product and 
 | `google-cloud-key`   | `GOOGLE_APPLICATION_CREDENTIALS` and `GOOGLE_CLOUD_LOCATION` |
 | `ds4`                | none                                                         |
 
-Run `/login` to sign in with an account that has no `-key` suffix. Set the variable of a `-key`
-account by hand. For `google-cloud-key`, set `GOOGLE_APPLICATION_CREDENTIALS` to an Agent Platform
-service account key file and `GOOGLE_CLOUD_LOCATION` to `eu`, `us`, or `global`. For `ds4`, set
-`DS4_BASE_URL` to the local base URL, ending at `/v1`.
+Run `/login` to sign in with an account that has no `-key` suffix. A successful sign-in opens its
+model or author list. The first row fetches or refreshes that list. Drinky puts the cursor on the
+remembered model or OpenRouter author when that row is available. Only an active model appears as
+current. Set the variable of a `-key` account by hand. For `google-cloud-key`, set the Agent
+Platform service account key file in `GOOGLE_APPLICATION_CREDENTIALS`. Set `GOOGLE_CLOUD_LOCATION`
+to `eu`, `us`, or `global`. For `ds4`, set `DS4_BASE_URL` to the local base URL, ending at `/v1`.
 
 Drinky is not affiliated with Anthropic, OpenAI, xAI, OpenRouter, DeepSeek, Google, or DwarfStar.
 
@@ -102,13 +104,15 @@ complete command list.
 
 ## Prompt history
 
-Tab at the idle prompt opens a picker over the prompts you submitted, in every project, newest
-first. Enter appends the selected prompt to the draft as editable text. The history is on by
-default, and only a submitted terminal prompt without a leading slash enters it.
+Set `prompt_history.enabled` to `true` in `~/.drinky/config.json` to enable the history. Tab at the
+idle prompt opens submitted prompts from every project, newest first. Enter appends the selected
+prompt to the draft as editable text. Only a submitted terminal prompt without a leading slash
+enters the history.
 
 Drinky keeps the 100 most recent prompts of at most 8 KiB each in the owner-only
-`~/.drinky/prompt_history.json`, so the file can contain sensitive text. Delete the file to clear
-the history, or set `prompt_history.enabled` to `false` in `~/.drinky/config.json` to turn it off.
+`~/.drinky/prompt_history.json`, so the file can contain sensitive text. Equivalent line endings,
+trailing spaces or tabs, and edge blank lines share one entry. The entry keeps the latest submitted
+text. Delete the file to clear the history. Disabling the history leaves the file unchanged.
 
 ## Recover a turn
 
