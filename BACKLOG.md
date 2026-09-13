@@ -22,10 +22,6 @@ extension seams.
 
 ## Bugs
 
-- **Silent OAuth callback replay** — A pasted callback URL can clear from the editor without
-  completing the sign-in or reporting the cause. _Observed with `openrouter-api` in Safari after the
-  plain-HTTP callback failed. Repeated callback URL pastes produced no notice. A new sign-in
-  accepted its URL._
 - **Abort after a wake of macOS** — Investigate a process abort after a sleep or a network change
   while a Telegram bot is attached. _Wait for another occurrence before more work. Capture the
   terminal trace, the exit status, and the crash report of macOS. One trace names errno 49, and one

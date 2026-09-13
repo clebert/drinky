@@ -436,7 +436,10 @@ const BrowserWait = struct {
 };
 
 /// Open the loopback listener, show the URL, and wait for the redirect. The
-/// caller owns the returned code and state.
+/// caller owns the returned code and state. The one callback path of a
+/// path-bound login reaches the listener, and the prompt reports the path of
+/// that listener, so a pasted line of another path is refused before it can
+/// reach the listener.
 fn receiveRedirect(
     auth: anytype,
     prompt: anytype,

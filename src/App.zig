@@ -538,6 +538,9 @@ const LoginEvent = struct {
     const Authorization = struct {
         url: []u8,
         code: ?[]u8,
+        /// The one callback path that the listener of this sign-in answers on,
+        /// or null for a login that binds its redirect with `state`.
+        callback_path: ?[]u8,
     };
 
     fn deinit(self: *const LoginEvent, gpa: std.mem.Allocator) void {
@@ -545,6 +548,7 @@ const LoginEvent = struct {
             .authorization => |authorization| {
                 gpa.free(authorization.url);
                 if (authorization.code) |code| gpa.free(code);
+                if (authorization.callback_path) |callback_path| gpa.free(callback_path);
             },
             .browser_launch_failed, .ended => {},
         }
@@ -557,12 +561,23 @@ const LoginPrompt = struct {
     app: *App,
     generation: u64,
 
-    pub fn showAuthorization(self: *LoginPrompt, url: []const u8) !void {
-        try self.show(url, null);
+    /// The optional strings of an authorization event beside its URL. No login
+    /// reports a user code and a callback path together.
+    const Runtime = struct {
+        code: ?[]const u8 = null,
+        callback_path: ?[]const u8 = null,
+    };
+
+    pub fn showAuthorization(
+        self: *LoginPrompt,
+        url: []const u8,
+        callback_path: ?[]const u8,
+    ) !void {
+        try self.show(url, &.{ .callback_path = callback_path });
     }
 
     pub fn showDeviceCode(self: *LoginPrompt, url: []const u8, code: []const u8) !void {
-        try self.show(url, code);
+        try self.show(url, &.{ .code = code });
     }
 
     pub fn showBrowserLaunchFailed(self: *LoginPrompt) !void {
@@ -572,19 +587,27 @@ const LoginPrompt = struct {
         } });
     }
 
-    fn show(self: *LoginPrompt, url: []const u8, maybe_code: ?[]const u8) !void {
+    /// Copy the runtime strings of an authorization event for the consumer and
+    /// queue it. No login reports a user code and a callback path together.
+    fn show(self: *LoginPrompt, url: []const u8, runtime: *const Runtime) !void {
         const url_copy = try self.app.gpa.dupe(u8, url);
         errdefer self.app.gpa.free(url_copy);
-        const maybe_code_copy = if (maybe_code) |code|
+        const maybe_code_copy = if (runtime.code) |code|
             try self.app.gpa.dupe(u8, code)
         else
             null;
         errdefer if (maybe_code_copy) |code_copy| self.app.gpa.free(code_copy);
+        const maybe_path_copy = if (runtime.callback_path) |callback_path|
+            try self.app.gpa.dupe(u8, callback_path)
+        else
+            null;
+        errdefer if (maybe_path_copy) |path_copy| self.app.gpa.free(path_copy);
         try self.app.queue.putOne(self.app.io, .{ .login = .{
             .generation = self.generation,
             .payload = .{ .authorization = .{
                 .url = url_copy,
                 .code = maybe_code_copy,
+                .callback_path = maybe_path_copy,
             } },
         } });
     }
@@ -608,6 +631,10 @@ const LoginWorkerResult = struct {
 const Login = struct {
     future: std.Io.Future(LoginWorkerResult),
     callback: ?ai.Accounts.Callback,
+    /// The one callback path that the listener of this sign-in answers on,
+    /// reported with its authorization event. Owned. The paste filter refuses
+    /// every line that names another path.
+    callback_path: ?[]u8 = null,
     generation: u64,
     /// The caption title of the editor, `Sign in: {account}`. Owned, and the
     /// session borrows it.
@@ -1797,7 +1824,17 @@ fn submitLoginLine(self: *App) !void {
         "The sign-in to {s} does not accept a callback URL. Complete the sign-in in the browser.",
         .{account.id()},
     );
-    if (!ai.oauth_callback.holdsRedirect(text, callback.binding)) return self.reportNotice(
+    // A path-bound login answers on one random path, and the listener reports
+    // that path with the authorization event. Until that report arrives, no
+    // line can be its redirect.
+    const accepted = switch (callback.binding) {
+        .state => ai.oauth_callback.holdsStateRedirect(text),
+        .path => if (login.callback_path) |callback_path|
+            ai.oauth_callback.holdsPathRedirect(&.{ .line = text, .path = callback_path })
+        else
+            false,
+    };
+    if (!accepted) return self.reportNotice(
         .warning,
         "The line is not the callback URL for the sign-in to {s}. " ++
             "Paste the complete callback URL from the browser.",
@@ -2709,6 +2746,11 @@ fn applyLoginEvent(self: *App, event: *const LoginEvent) !void {
         .authorization => |authorization| {
             try self.recordLoginAuthorization(login.attempt.account, &authorization);
             login.attempt.event_index = self.session.transcript.blocks().len - 1;
+            if (authorization.callback_path) |callback_path| {
+                const owned = try self.gpa.dupe(u8, callback_path);
+                if (login.callback_path) |previous| self.gpa.free(previous);
+                login.callback_path = owned;
+            }
         },
         .browser_launch_failed => try self.reportNotice(
             .warning,
@@ -2772,8 +2814,12 @@ fn resolveLogin(self: *App, result: *const LoginWorkerResult) !void {
 }
 
 /// Forget the sign-in and move the input state off its caption. The caption
-/// borrows the title, so this runs before the title goes.
+/// borrows the title, so this runs before the title goes. The reported callback
+/// path belongs to the paste filter, which stops with the sign-in.
 fn endLoginInput(self: *App) void {
+    if (self.login) |*login| {
+        if (login.callback_path) |callback_path| self.gpa.free(callback_path);
+    }
     self.login = null;
     self.syncInputState();
 }
@@ -5031,7 +5077,7 @@ test "a sign-in prompt records its URL and user code in transcript events" {
     defer app.dropLogin();
 
     var prompt: LoginPrompt = .{ .app = &app, .generation = app.login.?.generation };
-    try prompt.showAuthorization("https://example.test/\x1b]52;c;b3duZWQ=\x07");
+    try prompt.showAuthorization("https://example.test/\x1b]52;c;b3duZWQ=\x07", null);
     try prompt.showDeviceCode("https://example.test/activate", "AB\x1bCD");
     try prompt.showBrowserLaunchFailed();
 
@@ -5152,6 +5198,78 @@ test "Enter replays a callback URL from the raw editor" {
     try std.testing.expectEqualStrings("", app.session.editor.visible());
 }
 
+// A path-bound listener answers on one random path, and the paste filter
+// demands that path. A line of an earlier sign-in names another path, and the
+// listener skips such a line and waits on, so the paste must keep the line and
+// report why.
+test "a pasted line of another callback path keeps the editor and warns" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try address.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    var redirect_future = try io.concurrent(
+        ai.oauth_callback.receive,
+        .{ gpa, io, &server, @as(?[]const u8, "/deadbeef") },
+    );
+    errdefer if (redirect_future.cancel(io)) |redirect| {
+        gpa.free(redirect.code);
+        if (redirect.state) |state| gpa.free(state);
+    } else |_| {};
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
+    defer app.session.deinit();
+    var signals: LoginTestSignals = .{};
+    try beginLoginForTest(&app, .openrouter_api, .{
+        .port = server.socket.address.getPort(),
+        .binding = .path,
+    }, &signals);
+    defer app.dropLogin();
+
+    const refusal = "The line is not the callback URL for the sign-in to openrouter-api. " ++
+        "Paste the complete callback URL from the browser.";
+
+    // Until the worker reports the one path of its listener, no line can be
+    // its redirect, and even the eventual right path stays in the editor.
+    const early = "http://localhost:53694/deadbeef?code=early-code";
+    try app.session.editor.insert(early);
+    try app.handleKey(&.enter);
+    try std.testing.expectEqualStrings(early, app.session.editor.visible());
+    try std.testing.expectEqualStrings(refusal, app.session.notice.?.content);
+    app.session.editor.clear();
+
+    // The listener reports the one path it answers on with the URL event.
+    var prompt: LoginPrompt = .{ .app = &app, .generation = app.login.?.generation };
+    try prompt.showAuthorization(
+        "https://openrouter.ai/auth?callback_url=http%3A%2F%2Flocalhost%3A53694%2Fdeadbeef",
+        "/deadbeef",
+    );
+    var events: [1]UiEvent = undefined;
+    const count = try app.queue.get(app.io, &events, events.len);
+    _ = try app.applyBatch(events[0..count]);
+    try std.testing.expectEqualStrings("/deadbeef", app.login.?.callback_path.?);
+
+    const stale = "http://localhost:53694/other?code=stale-code";
+    try app.session.editor.insert(stale);
+    try app.handleKey(&.enter);
+    try std.testing.expectEqualStrings(stale, app.session.editor.visible());
+    try std.testing.expectEqualStrings(refusal, app.session.notice.?.content);
+
+    // The line of this sign-in reaches the listener and clears the editor.
+    app.session.editor.clear();
+    try app.session.editor.insert("http://localhost:53694/deadbeef?code=paste-code");
+    try app.handleKey(&.enter);
+    const redirect = try redirect_future.await(io);
+    defer gpa.free(redirect.code);
+    try std.testing.expectEqualStrings("paste-code", redirect.code);
+    try std.testing.expectEqualStrings("", app.session.editor.visible());
+}
+
 test "a sign-in cancel drops the rest of one exit attempt" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -5176,7 +5294,7 @@ test "a sign-in cancel drops the rest of one exit attempt" {
 /// terminal event, as the real worker does.
 fn completeLoginForTest(app: *App, account: ai.llm.Account, generation: u64) LoginWorkerResult {
     var prompt: LoginPrompt = .{ .app = app, .generation = generation };
-    prompt.showAuthorization("https://example.test/authorize") catch {};
+    prompt.showAuthorization("https://example.test/authorize", null) catch {};
     app.queue.putOne(app.io, .{ .login = .{
         .generation = generation,
         .payload = .ended,

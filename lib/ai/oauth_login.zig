@@ -53,11 +53,15 @@ pub const Browser = struct {
     }
 };
 
+/// The redirect wait of the callback flow. The prompt reports the callback path
+/// of `options.callback.listen()`, which is the one path that listener answers
+/// on, or null for a login that binds its redirect with `state`. The caller can
+/// then refuse a pasted line that names another path.
 pub fn receive(comptime Result: type, options: anytype) !Result {
     var listener = try options.callback.listen();
     defer listener.deinit();
 
-    try options.prompt.showAuthorization(options.url);
+    try options.prompt.showAuthorization(options.url, listener.path);
 
     var maybe_browser = try options.browser.launch(options.url);
     defer if (maybe_browser) |*browser| browser.deinit();
@@ -113,6 +117,11 @@ const Fake = struct {
     callback_while_browser_running: bool = false,
     authorization_count: usize = 0,
     authorization_fails: bool = false,
+    /// The one path that the fake listener answers on. Its callback source
+    /// carries the path of its login the same way.
+    callback_path: ?[]const u8 = null,
+    /// The path that the prompt received with the authorization URL.
+    reported_path: ?[]const u8 = null,
     warning_count: usize = 0,
     warning_fails: bool = false,
     browser_launched: bool = false,
@@ -125,8 +134,13 @@ const Fake = struct {
     const Prompt = struct {
         fake: *Fake,
 
-        fn showAuthorization(self: @This(), url: []const u8) !void {
+        fn showAuthorization(
+            self: @This(),
+            url: []const u8,
+            callback_path: ?[]const u8,
+        ) !void {
             _ = url;
+            self.fake.reported_path = callback_path;
             self.fake.authorization_count += 1;
             if (self.fake.authorization_fails) return error.AuthorizationOutputFailed;
         }
@@ -171,12 +185,14 @@ const Fake = struct {
         fn listen(self: @This()) !Fake.Listener {
             if (self.fake.listener_fails) return error.ListenerSetupFailed;
             self.fake.listener_ready = true;
-            return .{ .fake = self.fake };
+            return .{ .fake = self.fake, .path = self.fake.callback_path };
         }
     };
 
     const Listener = struct {
         fake: *Fake,
+        /// The one path this listener answers on.
+        path: ?[]const u8,
 
         fn deinit(self: *@This()) void {
             self.fake.listener_ready = false;
@@ -194,7 +210,7 @@ const Fake = struct {
 };
 
 test "callback progress does not wait for browser lifetime and reaps helper" {
-    var fake: Fake = .{};
+    var fake: Fake = .{ .callback_path = "/deadbeef" };
     try receive(void, &.{
         .url = "https://example.test/authorize",
         .prompt = Fake.Prompt{ .fake = &fake },
@@ -204,6 +220,10 @@ test "callback progress does not wait for browser lifetime and reaps helper" {
     try std.testing.expect(fake.callback_while_browser_running);
     try std.testing.expect(fake.browser_reaped);
     try std.testing.expectEqual(@as(usize, 1), fake.listener_deinit_count);
+    // The prompt reports the path of this listener, so the caller can refuse a
+    // pasted line that names another one. The listener is the only source of
+    // the path, so the two can never disagree.
+    try std.testing.expectEqualStrings("/deadbeef", fake.reported_path.?);
 }
 
 test "listener setup failure does not show or launch browser" {

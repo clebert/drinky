@@ -13,7 +13,7 @@ const request_frame_bytes = "GET ".len + " HTTP/1.1\r\n".len;
 const response_page = "Drinky received authorization. Close this tab.";
 
 /// The longest pasted line that fits the wire byte limit with the request
-/// frame around it. `holdsRedirect` refuses a longer line, so the two limits
+/// frame around it. The paste filter refuses a longer line, so the two limits
 /// cannot disagree.
 pub const paste_bytes_max = request_bytes_max - request_frame_bytes;
 
@@ -30,11 +30,9 @@ pub const Binding = enum {
     /// carries the state of another sign-in reaches the exchange, which names
     /// that mismatch.
     state,
-    /// The listener answers on a random callback path alone, so a grant must
-    /// name a path. A paste that names another path reaches no verdict: the
-    /// listener skips it and waits on, and the paste reports nothing. The
-    /// browser holds the one path of this sign-in, so such a paste is a line
-    /// of an earlier one.
+    /// The listener answers on one random callback path alone, so a grant must
+    /// name the path of its own login. A paste of an earlier sign-in names the
+    /// path of that sign-in, and the paste filter refuses it.
     path,
 };
 
@@ -71,25 +69,53 @@ fn receiveBounded(
     return receiveWith(gpa, &bound, &source, path);
 }
 
-/// Whether a pasted line can serve as the redirect request target: a callback
-/// outcome, no byte that breaks a request line, and room for the request frame
-/// within the wire byte limit.
+/// Whether a pasted line can carry the redirect of a login that binds with
+/// `state`: a callback outcome, no byte that breaks a request line, and room
+/// for the request frame within the wire byte limit.
 ///
 /// RFC 6749 fixes the name of each outcome: `code` for a grant and `error` for
 /// a failure. The filter demands of each outcome exactly what this login
-/// demands. A line that passes therefore reaches the verdict of the listener.
-/// A grant needs its `code` and the `binding` of the login: the `state` that
-/// its exchange compares, or the path that its listener answers on. A failure
-/// needs nothing more, because its own name ends the login.
-pub fn holdsRedirect(line: []const u8, binding: Binding) bool {
+/// demands, so a line that passes reaches the verdict of the listener. A grant
+/// needs its `code` and its `state`, which the exchange compares. A failure
+/// needs nothing more, because its own name ends the login. A state of another
+/// sign-in still reaches the exchange, which names that mismatch.
+pub fn holdsStateRedirect(line: []const u8) bool {
+    if (!fitsRequestLine(line)) return false;
+    if (std.mem.indexOf(u8, line, "error=") != null) return true;
+    return std.mem.indexOf(u8, line, "code=") != null and
+        std.mem.indexOf(u8, line, "state=") != null;
+}
+
+/// The pasted line and the callback path that the listener of the waiting login
+/// answers on. The fields are named, because the two slices can swap at a call
+/// site and a swap still compiles.
+pub const PasteOptions = struct {
+    line: []const u8,
+    path: []const u8,
+};
+
+/// Whether a pasted line can carry the redirect of the login whose listener
+/// answers on `options.path` alone: a callback outcome for that path, no byte
+/// that breaks a request line, and room for the request frame within the wire
+/// byte limit.
+///
+/// `options.path` is the callback path of the waiting login. The listener
+/// answers no other path, and it answers a failure under the `error` name as it
+/// answers a grant. A line that passes therefore reaches the verdict of the
+/// listener. The filter refuses a line that names another path, because the
+/// listener skips that line and waits on.
+pub fn holdsPathRedirect(options: *const PasteOptions) bool {
+    if (!fitsRequestLine(options.line)) return false;
+    if (std.mem.indexOf(u8, options.line, "error=") == null and
+        std.mem.indexOf(u8, options.line, "code=") == null) return false;
+    const found = targetPath(options.line) orelse return false;
+    return std.mem.eql(u8, found, options.path);
+}
+
+fn fitsRequestLine(line: []const u8) bool {
     if (line.len == 0 or line.len > paste_bytes_max) return false;
     for (line) |byte| if (byte <= ' ' or byte == 0x7f) return false;
-    if (std.mem.indexOf(u8, line, "error=") != null) return true;
-    if (std.mem.indexOf(u8, line, "code=") == null) return false;
-    return switch (binding) {
-        .state => std.mem.indexOf(u8, line, "state=") != null,
-        .path => targetPath(line) != null,
-    };
+    return true;
 }
 
 /// Replay a pasted redirect line to the local listener on `port` as one HTTP
@@ -672,48 +698,79 @@ test bindingOf {
     try std.testing.expectEqual(Binding.state, bindingOf(state_flow));
 }
 
-test "a pasted line must hold a callback outcome and fit the request line" {
-    try std.testing.expect(holdsRedirect(
+// A path-bound listener answers on one random path. A line of an earlier
+// sign-in names the path of that sign-in, so the listener skips it and waits
+// on. The filter must refuse such a line, or the paste reports nothing.
+test "a pasted line of another callback path cannot complete a sign-in" {
+    try std.testing.expect(!holdsPathRedirect(&.{
+        .line = "http://localhost:53694/other?code=only",
+        .path = "/deadbeef",
+    }));
+    try std.testing.expect(!holdsPathRedirect(&.{
+        .line = "http://localhost:53694/other?error=access_denied",
+        .path = "/deadbeef",
+    }));
+    try std.testing.expect(holdsPathRedirect(&.{
+        .line = "http://localhost:53694/deadbeef?code=only",
+        .path = "/deadbeef",
+    }));
+    try std.testing.expect(holdsPathRedirect(&.{ .line = "/deadbeef?code=only", .path = "/deadbeef" }));
+    try std.testing.expect(holdsPathRedirect(&.{
+        .line = "/deadbeef?error=access_denied",
+        .path = "/deadbeef",
+    }));
+}
+
+test "a pasted state line must hold a callback outcome and fit the request line" {
+    try std.testing.expect(holdsStateRedirect(
         "https://localhost:1455/auth/callback?code=paste-code&state=paste-state",
-        .state,
     ));
-    try std.testing.expect(holdsRedirect("code=paste-code&state=paste-state", .state));
+    try std.testing.expect(holdsStateRedirect("code=paste-code&state=paste-state"));
     // The listener ends the login on the `error` name alone, so a failure line
-    // passes under either binding.
-    for ([_]Binding{ .state, .path }) |binding| {
-        try std.testing.expect(holdsRedirect(
-            "https://localhost:1455/auth/callback?error=access_denied&state=paste-state",
-            binding,
-        ));
-        try std.testing.expect(holdsRedirect(
-            "https://localhost:1455/auth/callback?error=server_error",
-            binding,
-        ));
-        try std.testing.expect(!holdsRedirect("", binding));
-        try std.testing.expect(!holdsRedirect("https://localhost:1455/auth/callback", binding));
-        try std.testing.expect(!holdsRedirect("code=a&state=b with a space", binding));
-        try std.testing.expect(!holdsRedirect("code=a&state=b\x1b", binding));
-    }
+    // needs nothing more than that name.
+    try std.testing.expect(holdsStateRedirect(
+        "https://localhost:1455/auth/callback?error=access_denied&state=paste-state",
+    ));
+    try std.testing.expect(holdsStateRedirect(
+        "https://localhost:1455/auth/callback?error=server_error",
+    ));
+    try std.testing.expect(!holdsStateRedirect(""));
+    try std.testing.expect(!holdsStateRedirect("https://localhost:1455/auth/callback"));
+    try std.testing.expect(!holdsStateRedirect("code=a&state=b with a space"));
+    try std.testing.expect(!holdsStateRedirect("code=a&state=b\x1b"));
     // A grant of a `state` login reaches no token exchange without its state,
     // so the paste stops here and asks for the complete URL.
-    try std.testing.expect(!holdsRedirect(
+    try std.testing.expect(!holdsStateRedirect(
         "https://localhost:1455/auth/callback?code=only",
-        .state,
     ));
-    try std.testing.expect(!holdsRedirect(
+    try std.testing.expect(!holdsStateRedirect(
         "https://localhost:1455/auth/callback?state=only",
-        .state,
     ));
-    // A grant of a path-bound login needs no state, and the listener answers on
-    // its path alone, so a line that names none reaches no verdict.
-    try std.testing.expect(holdsRedirect("http://localhost:53694/deadbeef?code=only", .path));
-    try std.testing.expect(holdsRedirect("/deadbeef?code=only", .path));
-    try std.testing.expect(!holdsRedirect("code=only", .path));
-    try std.testing.expect(!holdsRedirect("code=a&state=b", .path));
     // One byte past the limit cannot fit the wire byte limit with its frame.
     var oversized: [paste_bytes_max + 1]u8 = @splat('x');
     @memcpy(oversized[0.."code=x&state=".len], "code=x&state=");
-    try std.testing.expect(!holdsRedirect(&oversized, .state));
+    try std.testing.expect(!holdsStateRedirect(&oversized));
+}
+
+test "a pasted path line must name the callback path and an outcome" {
+    // A grant of a path-bound login needs no state, and the listener answers on
+    // its path alone, so a line that names none reaches no verdict.
+    try std.testing.expect(!holdsPathRedirect(&.{ .line = "code=only", .path = "/deadbeef" }));
+    try std.testing.expect(!holdsPathRedirect(&.{ .line = "code=a&state=b", .path = "/deadbeef" }));
+    try std.testing.expect(!holdsPathRedirect(&.{ .line = "", .path = "/deadbeef" }));
+    try std.testing.expect(!holdsPathRedirect(&.{ .line = "/deadbeef", .path = "/deadbeef" }));
+    try std.testing.expect(!holdsPathRedirect(&.{
+        .line = "http://localhost:53694",
+        .path = "/deadbeef",
+    }));
+    try std.testing.expect(!holdsPathRedirect(&.{
+        .line = "/deadbeef?code=a with a space",
+        .path = "/deadbeef",
+    }));
+    try std.testing.expect(!holdsPathRedirect(&.{ .line = "/deadbeef?code=a\x1b", .path = "/deadbeef" }));
+    var oversized: [paste_bytes_max + 1]u8 = @splat('x');
+    @memcpy(oversized[0.."/deadbeef?code=".len], "/deadbeef?code=");
+    try std.testing.expect(!holdsPathRedirect(&.{ .line = &oversized, .path = "/deadbeef" }));
 }
 
 test "a maximal paste frames a request line at the wire byte limit" {
@@ -723,7 +780,7 @@ test "a maximal paste frames a request line at the wire byte limit" {
     var line: [paste_bytes_max]u8 = @splat('x');
     const prefix = "/callback?code=code&state=state&padding=";
     @memcpy(line[0..prefix.len], prefix);
-    try std.testing.expect(holdsRedirect(&line, .state));
+    try std.testing.expect(holdsStateRedirect(&line));
 
     var request: [request_bytes_max]u8 = undefined;
     const framed = try std.fmt.bufPrint(&request, "GET {s} HTTP/1.1\r\n", .{&line});
