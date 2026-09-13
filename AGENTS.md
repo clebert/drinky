@@ -80,7 +80,8 @@ credential that an environment variable holds or names, as in `anthropic-api-key
 without it signs in through an OAuth login. `Account.id()` is the only spelling outside the enum
 tag. A model under an account reads `account/model`.
 
-- **vendor**: The `Provider` tag: `anthropic`, `openai`, `xai`, `openrouter`, or `google`.
+- **vendor**: The `Provider` tag: `anthropic`, `openai`, `xai`, `openrouter`, `deepseek`, or
+  `google`.
 - **plan**: A consumer subscription, as in Claude Pro or Max, ChatGPT, and SuperGrok.
 - **api**: The developer API of the vendor, billed per token.
 - **cloud**: The cloud platform of the vendor, as in a Google Cloud project on the Agent Platform.

@@ -9,6 +9,7 @@ in the working directory. Drinky talks to:
 - OpenAI
 - xAI
 - OpenRouter
+- DeepSeek
 - Gemini Enterprise Agent Platform (Vertex AI)
 
 Drinky is a single Zig program. It needs no Node.js runtime or third-party package tree, so a
@@ -60,13 +61,14 @@ holds or names.
 | `xai-api-key`        | `XAI_API_KEY`                                                |
 | `openrouter-api`     | OpenRouter login, which mints and stores an API key          |
 | `openrouter-api-key` | `OPENROUTER_API_KEY`                                         |
+| `deepseek-api-key`   | `DEEPSEEK_API_KEY`                                           |
 | `google-cloud-key`   | `GOOGLE_APPLICATION_CREDENTIALS` and `GOOGLE_CLOUD_LOCATION` |
 
 Run `/login` to sign in with an account that has no `-key` suffix. Set the variable of a `-key`
 account by hand. For `google-cloud-key`, set `GOOGLE_APPLICATION_CREDENTIALS` to an Agent Platform
 service account key file and `GOOGLE_CLOUD_LOCATION` to `eu`, `us`, or `global`.
 
-Drinky is not affiliated with Anthropic, OpenAI, xAI, OpenRouter, or Google.
+Drinky is not affiliated with Anthropic, OpenAI, xAI, OpenRouter, DeepSeek, or Google.
 
 ## Cost display
 

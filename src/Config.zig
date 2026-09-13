@@ -135,6 +135,7 @@ const File = struct {
         xai_idle_timeout_ms: u64 = timeouts_default.xai.idle_ms,
         google_idle_timeout_ms: u64 = timeouts_default.google.idle_ms,
         openrouter_idle_timeout_ms: u64 = timeouts_default.openrouter.idle_ms,
+        deepseek_idle_timeout_ms: u64 = timeouts_default.deepseek.idle_ms,
         attempts_max: u32 = retry_default.attempts_max,
         backoff_ms_initial: u64 = retry_default.backoff_ms_initial,
         backoff_ms_max: u64 = retry_default.backoff_ms_max,
@@ -265,6 +266,12 @@ const keys = [_]Key{
         .description = "The time that Drinky waits between two streamed OpenRouter events. " ++
             "The stream can stay silent while the model reasons, so the default matches the " ++
             "OpenAI wait.",
+    },
+    .{
+        .path = "request.deepseek_idle_timeout_ms",
+        .description = "The time that Drinky waits between two streamed DeepSeek events. " ++
+            "The first reasoning event can take a long time to arrive, so the default matches " ++
+            "the OpenAI wait.",
     },
     .{
         .path = "request.attempts_max",
@@ -405,6 +412,7 @@ fn defaultText(comptime field: std.builtin.Type.StructField) []const u8 {
 /// it reads the shape off the struct that parses the file, so a new field cannot
 /// reach a release undocumented.
 const leaves: []const Leaf = blk: {
+    @setEvalBranchQuota(20_000);
     var list: []const Leaf = &.{};
     for (@typeInfo(File).@"struct".fields) |field| {
         if (isSection(field.type)) {
@@ -442,7 +450,7 @@ const leaves: []const Leaf = blk: {
 const key_lines = blk: {
     // The walk pairs every leaf with every key, so its work grows with the
     // square of the key count. Each new key needs a little more room here.
-    @setEvalBranchQuota(10_000);
+    @setEvalBranchQuota(20_000);
     var text: []const u8 = "";
     var used = [_]bool{false} ** keys.len;
     for (leaves) |leaf| {
@@ -533,7 +541,8 @@ pub fn document(
         \\brackets show each array entry. Drinky ignores a key that it does not know, so a typo has
         \\no effect. The next start still succeeds and shows a warning that names each ignored key.
         \\The file holds no secret. An API key comes from the ANTHROPIC_API_KEY, the
-        \\OPENAI_API_KEY, the XAI_API_KEY, or the OPENROUTER_API_KEY variable. The
+        \\OPENAI_API_KEY, the XAI_API_KEY, the OPENROUTER_API_KEY, or the
+        \\DEEPSEEK_API_KEY variable. The
         \\google-cloud-key account reads the service account key file that
         \\GOOGLE_APPLICATION_CREDENTIALS names.
         \\GOOGLE_CLOUD_LOCATION is eu, us, or global.
@@ -713,6 +722,10 @@ fn loadFromData(gpa: std.mem.Allocator, io: std.Io, options: *const DataOptions)
             .openrouter = .{
                 .connect_ms = request.connect_timeout_ms,
                 .idle_ms = request.openrouter_idle_timeout_ms,
+            },
+            .deepseek = .{
+                .connect_ms = request.connect_timeout_ms,
+                .idle_ms = request.deepseek_idle_timeout_ms,
             },
         },
         .retry = .{
@@ -941,6 +954,7 @@ test "load reads the request section" {
     try std.testing.expectEqual(@as(u64, 1000), config.timeouts.openai.connect_ms);
     try std.testing.expectEqual(@as(u64, 1000), config.timeouts.xai.connect_ms);
     try std.testing.expectEqual(@as(u64, 1000), config.timeouts.google.connect_ms);
+    try std.testing.expectEqual(@as(u64, 1000), config.timeouts.deepseek.connect_ms);
     try std.testing.expectEqual(@as(u64, 2000), config.timeouts.anthropic.idle_ms);
     try std.testing.expectEqual(@as(u64, 3000), config.timeouts.openai.idle_ms);
     try std.testing.expectEqual(@as(u64, 4500), config.timeouts.xai.idle_ms);
@@ -1165,6 +1179,10 @@ test "load fills missing fields and sections from defaults" {
     try std.testing.expectEqual(
         timeouts_default.openrouter.idle_ms,
         empty.timeouts.openrouter.idle_ms,
+    );
+    try std.testing.expectEqual(
+        timeouts_default.deepseek.idle_ms,
+        empty.timeouts.deepseek.idle_ms,
     );
     try std.testing.expectEqual(retry_default.attempts_max, empty.retry.attempts_max);
     try std.testing.expectEqual(@as(usize, 0), empty.user_instructions.files().len);

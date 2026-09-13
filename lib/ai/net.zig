@@ -23,13 +23,15 @@ pub const Timeouts = struct {
 /// dead connection. The OpenAI backend sends nothing while the model reasons
 /// privately, and its official client tolerates a 300 s gap, so the OpenAI
 /// window matches that. Gemini and Grok can hold a stream silent while they
-/// think, so they take the same window. The connect bound is network-bound, so
+/// think, and DeepSeek can take a long time to send its first reasoning event,
+/// so all three take the same window. The connect bound is network-bound, so
 /// every provider shares its default.
 pub const ProviderTimeouts = struct {
     anthropic: Timeouts = .{},
     openai: Timeouts = .{ .idle_ms = 300_000 },
     xai: Timeouts = .{ .idle_ms = 300_000 },
     openrouter: Timeouts = .{ .idle_ms = 300_000 },
+    deepseek: Timeouts = .{ .idle_ms = 300_000 },
     google: Timeouts = .{ .idle_ms = 300_000 },
 };
 
@@ -249,11 +251,13 @@ fn getInto(gpa: std.mem.Allocator, io: std.Io, get: *const Get, out: *?[]u8) !vo
 }
 
 /// A hard ceiling on the total wire bytes one streamed response body can
-/// deliver. Every model tops out at 128k output tokens (~14 MB of framed SSE
-/// at one token per frame). This ceiling clears any real reply several times
-/// over and still bounds a stream that never ends. A safety limit, not a
-/// tunable, like the OAuth token-response cap.
-pub const stream_response_bytes_max = 64 << 20;
+/// deliver. The budget of one stream is a running total over the whole body,
+/// and every provider shares this ceiling. A DeepSeek reasoning frame carries
+/// about 167 bytes for one token, so a 384k-token reply projects to about
+/// 63 MiB. A slightly denser frame passes 64 MiB, so this ceiling keeps
+/// headroom above the projection, and it still bounds a stream that never
+/// ends. A safety limit, not a tunable, like the OAuth token-response cap.
+pub const stream_response_bytes_max = 256 << 20;
 
 /// The bytes of a failed response body that a transport captures for the error
 /// report. The report reads the message out of the captured JSON, so the whole
@@ -465,6 +469,7 @@ test "the provider timeout defaults differ only in the idle window" {
     try std.testing.expectEqual(timeouts.anthropic.connect_ms, timeouts.google.connect_ms);
     try std.testing.expectEqual(timeouts.anthropic.connect_ms, timeouts.xai.connect_ms);
     try std.testing.expectEqual(timeouts.anthropic.connect_ms, timeouts.openrouter.connect_ms);
+    try std.testing.expectEqual(timeouts.anthropic.connect_ms, timeouts.deepseek.connect_ms);
     // The generic pair serves the short OAuth and token requests, so the
     // Anthropic stream default must stay in step with it.
     try std.testing.expectEqual(@as(Timeouts, .{}), timeouts.anthropic);
@@ -472,4 +477,5 @@ test "the provider timeout defaults differ only in the idle window" {
     try std.testing.expectEqual(timeouts.openai.idle_ms, timeouts.google.idle_ms);
     try std.testing.expectEqual(timeouts.openai.idle_ms, timeouts.xai.idle_ms);
     try std.testing.expectEqual(timeouts.openai.idle_ms, timeouts.openrouter.idle_ms);
+    try std.testing.expectEqual(timeouts.openai.idle_ms, timeouts.deepseek.idle_ms);
 }

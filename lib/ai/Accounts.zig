@@ -1,5 +1,5 @@
 //! The set of configured accounts and their live credentials: the OAuth login
-//! stores, the three environment-sourced API keys, and the Google service
+//! stores, the environment-sourced API keys, and the Google service
 //! account key file. It owns what a `provider.Client` points into: the `Auth`
 //! structs and (by borrow) the key bytes. A client built here stays valid for
 //! the whole session. It reports which accounts are authenticated and builds a
@@ -13,6 +13,7 @@ const std = @import("std");
 const anthropic = @import("anthropic/root.zig");
 const auth = @import("auth.zig");
 const Catalog = @import("Catalog.zig");
+const deepseek = @import("deepseek/root.zig");
 const google = @import("google/root.zig");
 const json_store = @import("json_store.zig");
 const llm = @import("llm.zig");
@@ -98,6 +99,7 @@ pub const Environment = struct {
     openai: ?[]const u8 = null,
     xai: ?[]const u8 = null,
     openrouter: ?[]const u8 = null,
+    deepseek: ?[]const u8 = null,
     /// `GOOGLE_APPLICATION_CREDENTIALS`, the path of the service account key file.
     google_key_path: ?[]const u8 = null,
     /// `GOOGLE_CLOUD_LOCATION`: `eu`, `us`, or `global`.
@@ -212,6 +214,7 @@ pub fn isAuthenticated(self: *const Accounts, account: llm.Account) bool {
         .anthropic_api => self.anthropic_api_ready,
         .openrouter_api_key => self.environment.openrouter != null,
         .openrouter_api => self.openrouter_api_ready,
+        .deepseek_api_key => self.environment.deepseek != null,
         .google_cloud_key => self.google_auth != null,
     };
 }
@@ -365,6 +368,9 @@ pub fn client(self: *Accounts, account: llm.Account) ?provider.Client {
             .{ .openrouter_api = self.openrouter_auth.apiKey() orelse return null }
         else
             return null,
+        .deepseek_api_key => .{
+            .deepseek_api_key = self.environment.deepseek orelse return null,
+        },
         .google_cloud_key => if (self.google_auth) |*cloud_auth|
             .{ .google_cloud_key = cloud_auth }
         else
@@ -534,6 +540,12 @@ fn fetchModels(self: *Accounts, account: llm.Account, deadline: net.Deadline) ![
             },
         ) else error.SignedOut,
         .openrouter_api, .openrouter_api_key => error.OpenRouterHasNoList,
+        .deepseek_api_key => deepseek.models.fetch(
+            self.gpa,
+            self.io,
+            deadline,
+            self.environment.deepseek orelse return error.SignedOut,
+        ),
     };
 }
 
@@ -544,6 +556,7 @@ fn timeoutsOf(self: *const Accounts, account: llm.Account) net.Timeouts {
         .openai => self.timeouts.openai,
         .xai => self.timeouts.xai,
         .openrouter => self.timeouts.openrouter,
+        .deepseek => self.timeouts.deepseek,
         .google => self.timeouts.google,
     };
 }
@@ -563,6 +576,7 @@ pub fn callback(account: llm.Account) ?Callback {
         .openai_api_key,
         .xai_api_key,
         .openrouter_api_key,
+        .deepseek_api_key,
         .google_cloud_key,
         => null,
     };
@@ -608,6 +622,7 @@ pub fn login(self: *Accounts, account: llm.Account, prompt: anytype) !Login {
         .openai_api_key,
         .xai_api_key,
         .openrouter_api_key,
+        .deepseek_api_key,
         .google_cloud_key,
         => return error.ApiAccountHasNoLogin,
     };
@@ -654,6 +669,7 @@ pub fn logout(self: *Accounts, account: llm.Account) !void {
         .openai_api_key,
         .xai_api_key,
         .openrouter_api_key,
+        .deepseek_api_key,
         .google_cloud_key,
         => return error.ApiAccountHasNoLogout,
     }
@@ -700,6 +716,7 @@ pub fn invalidate(self: *Accounts, account: llm.Account) !bool {
         .xai_api_key,
         .openrouter_api,
         .openrouter_api_key,
+        .deepseek_api_key,
         .google_cloud_key,
         => {
             return error.AccountHasNoRefreshCredential;
@@ -794,6 +811,7 @@ test "logout rejects the accounts whose credential is env-sourced" {
         .openai_api_key,
         .xai_api_key,
         .openrouter_api_key,
+        .deepseek_api_key,
         .google_cloud_key,
     }) |account| {
         try std.testing.expectError(error.ApiAccountHasNoLogout, accounts.logout(account));
@@ -809,6 +827,7 @@ test "invalidation rejects accounts without a refresh credential" {
         .xai_api_key,
         .openrouter_api,
         .openrouter_api_key,
+        .deepseek_api_key,
         .google_cloud_key,
     }) |account| {
         try std.testing.expectError(
@@ -849,6 +868,7 @@ test "a client carries the timeout pair of its provider" {
         .openai = .{ .idle_ms = 2 },
         .google = .{ .idle_ms = 3 },
         .xai = .{ .idle_ms = 4 },
+        .deepseek = .{ .idle_ms = 5 },
     };
     try std.testing.expectEqual(
         @as(u64, 1),
@@ -860,6 +880,7 @@ test "a client carries the timeout pair of its provider" {
     );
     try std.testing.expectEqual(@as(u64, 3), accounts.timeoutsOf(.google_cloud_key).idle_ms);
     try std.testing.expectEqual(@as(u64, 4), accounts.timeoutsOf(.xai_plan).idle_ms);
+    try std.testing.expectEqual(@as(u64, 5), accounts.timeoutsOf(.deepseek_api_key).idle_ms);
 }
 
 test "the key file account loads from the key file and records a failed load" {

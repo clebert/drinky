@@ -7,8 +7,8 @@ planned work.
 Drinky is a terminal coding agent. You type a prompt. The model reads, searches, writes, and edits
 files in the working directory, and the conversation streams into your scrollback. Drinky talks to
 Anthropic, OpenAI, and xAI through a subscription login, an Anthropic Console login, or an API key,
-to OpenRouter through a login or an API key, and to Gemini on the Gemini Enterprise Agent Platform
-(Vertex AI) through a service account key file.
+to OpenRouter through a login or an API key, to DeepSeek through an API key, and to Gemini on the
+Gemini Enterprise Agent Platform (Vertex AI) through a service account key file.
 
 ## Talking to it
 
@@ -96,10 +96,12 @@ to OpenRouter through a login or an API key, and to Gemini on the Gemini Enterpr
 - A model that no source describes never reaches the picker. A Codex model that the backend hides
   stays hidden. A model that the public metadata names without tools never reaches the picker. The
   OpenRouter list holds a model only when that metadata states its tools.
-- An OpenAI API key and both xAI accounts state no model fact, so such an account offers no model
-  until the public metadata describes one. The xAI list names a model under its id and its aliases,
-  and the picker shows each spelling that the public metadata describes. A reply under the id behind
-  an alias counts as a reply of that alias.
+- An OpenAI API key, both xAI accounts, and the DeepSeek account state no model fact, so such an
+  account offers no model until the public metadata describes one. The xAI list names a model under
+  its id and its aliases, and the picker shows each spelling that the public metadata describes. A
+  reply under the id behind an alias counts as a reply of that alias. A versionless DeepSeek id,
+  such as `deepseek-flash`, takes the public metadata of the newest versioned spelling of that
+  family. A versioned id matches the public spelling alone. The request still names the platform id.
 - An Anthropic request must name an output cap. A model that states no limit runs at a low default,
   and the model picker marks it, because that default can cut a reply short.
 - The effort levels are `low`, `medium`, `high`, `xhigh`, and `max`. Every level is a wire spelling
@@ -131,14 +133,16 @@ to OpenRouter through a login or an API key, and to Gemini on the Gemini Enterpr
 
 - An account identifier reads `vendor-product`: `anthropic-plan`, `anthropic-api`,
   `anthropic-api-key`, `openai-plan`, `openai-api-key`, `xai-plan`, `xai-api-key`, `openrouter-api`,
-  `openrouter-api-key`, and `google-cloud-key`. The product is `plan` for a subscription, `api` for
-  the developer API, or `cloud` for the cloud platform. A `-key` suffix marks a credential that an
-  environment variable holds or names. An identifier without it signs in through a login.
+  `openrouter-api-key`, `deepseek-api-key`, and `google-cloud-key`. The product is `plan` for a
+  subscription, `api` for the developer API, or `cloud` for the cloud platform. A `-key` suffix
+  marks a credential that an environment variable holds or names. An identifier without it signs in
+  through a login.
 - A model under an account reads `account/model`, as in `openrouter-api/openai/gpt-5.6-sol`. The
   status line, the pickers, the events, and the store files hold the same identifiers.
 - Drinky supports Anthropic, OpenAI, and xAI, each as a subscription account or an API-key account.
   The `anthropic-api` account adds a login that mints and stores a platform key. OpenRouter adds a
   login that mints a key and an API-key account. Both spend the credit of one OpenRouter account.
+  The `deepseek-api-key` account spends a prepaid DeepSeek platform balance.
 - The `google-cloud-key` account reads the service account key file that
   `GOOGLE_APPLICATION_CREDENTIALS` names and sends its requests to the Agent Platform location that
   `GOOGLE_CLOUD_LOCATION` names: `eu`, `us`, or `global`. A multi-region keeps the processing inside
@@ -250,24 +254,26 @@ to OpenRouter through a login or an API key, and to Gemini on the Gemini Enterpr
 
 ## Providers
 
-- Drinky streams from the Anthropic Messages API, the OpenAI Responses API (for OpenAI, xAI, and
-  OpenRouter), and the Gemini `streamGenerateContent` API of the Agent Platform over SSE. A reply
-  enters the conversation only when the provider reports it complete.
+- Drinky streams from the Anthropic Messages API, the OpenAI Responses API (for OpenAI, xAI,
+  OpenRouter, and DeepSeek), and the Gemini `streamGenerateContent` API of the Agent Platform over
+  SSE. A reply enters the conversation only when the provider reports it complete.
 - A Gemini reply carries a thought signature on one part, and Drinky sends it back on the same part,
   so a function call replays with its proof. The Gemini model list comes from the Google publisher
   on the Agent Platform, keeps Gemini 3 and later, and the public metadata describes each model.
 - Prompt caching is always on: explicit breakpoints for Anthropic, the automatic per-session cache
-  for OpenAI, xAI, and OpenRouter, and the implicit cache of the Agent Platform.
+  for OpenAI, xAI, OpenRouter, and DeepSeek, and the implicit cache of the Agent Platform.
 - Drinky requests summarized reasoning at the resolved effort and replays it verbatim on later
-  turns. An OpenRouter request asks for no encrypted reasoning, because that request reaches fewer
-  endpoints, so its reply replays the summary or the raw reasoning text instead.
+  turns. An OpenRouter or DeepSeek request asks for no encrypted reasoning. OpenRouter then replays
+  the summary or the raw reasoning text. DeepSeek generates no summary, and its proof replays the
+  encrypted blob when it holds one and the reasoning text otherwise.
 - An `anthropic-plan` or `anthropic-api` request carries the Claude Code client identity. An
   `anthropic-api-key` request goes straight to the platform API.
 - Every Anthropic request asks for the input of a tool call as the model writes it.
 - A request times out after 30 s to the response head. A streamed event must arrive within 60 s for
   Anthropic and 300 s for OpenAI, xAI, OpenRouter, and the Agent Platform, whose streams are silent
-  while the model reasons. Keepalive filler does not count as progress. All six windows are
-  configurable.
+  while the model reasons. A DeepSeek stream takes the same 300 s window, because its first
+  reasoning event can take a long time to arrive. Keepalive filler does not count as progress. All
+  seven windows are configurable.
 - A failed request runs up to 3 attempts with a backoff from 500 ms to 16 s, and it honors a
   retry-after hint. A wait longer than the backoff cap ends the request. A spent OpenAI plan states
   its reset in the error body, so Drinky reports it after one try.
@@ -395,10 +401,11 @@ to OpenRouter through a login or an API key, and to Gemini on the Gemini Enterpr
   wait shows one unit and rounds down: `53m`, `22h`, `6d`. The shortest window prints first.
   Anthropic and OpenAI state the allowance in the response head of each request. Drinky reads the
   xAI subscription allowance after each model reply. An API-key account reports none.
-- An OpenRouter account spends a prepaid credit pool. Drinky reads the pool after each model reply,
-  and the line states the remaining amount as `Credits: $7.14`. A positive amount under one cent
-  reads `Credits: <$0.01`, so a nearly spent pool never reads as empty. The pool takes no color,
-  because an amount states no share. A key that the endpoint refuses states no pool.
+- An OpenRouter account spends a prepaid credit pool. A DeepSeek account spends a prepaid USD
+  balance. Drinky reads the pool after each model reply, and the line states the remaining amount as
+  `Credits: $7.14`. A positive amount under one cent reads `Credits: <$0.01`, so a nearly spent pool
+  never reads as empty. The pool takes no color, because an amount states no share. A key that the
+  endpoint refuses states no pool. A DeepSeek body that names no USD row states no pool.
 - The quota, the credit pool, and the cache-hit rate show once this turn reports them. They never
   show the last turn. The cache-hit rate measures one request.
 - The context gauge and each quota window take the warning color from 75% used and the error color
@@ -519,8 +526,9 @@ to OpenRouter through a login or an API key, and to Gemini on the Gemini Enterpr
 - `~/.drinky/config.json` is optional. It holds the user instruction paths, the request and bash
   limits, a default effort level, the skills that a path requires, the interface settings, and the
   prompt history switch. Drinky reads it only at startup, so a change applies at the next start. It
-  holds no secrets. API keys come from `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, and `XAI_API_KEY`, and
-  the key file credential from `GOOGLE_APPLICATION_CREDENTIALS` and `GOOGLE_CLOUD_LOCATION`.
+  holds no secrets. API keys come from `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `XAI_API_KEY`,
+  `OPENROUTER_API_KEY`, and `DEEPSEEK_API_KEY`, and the key file credential from
+  `GOOGLE_APPLICATION_CREDENTIALS` and `GOOGLE_CLOUD_LOCATION`.
 - Drinky reports an unknown key, an unknown effort level, and an interface value that it cannot use,
   so a typo never looks like an applied setting.
 - A required skill whose name no discovered skill carries guards nothing in that project. It reports

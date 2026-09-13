@@ -120,7 +120,7 @@ test "the picker lists every account, marking the active and authenticated ones"
                 gpa.free(pick.options);
             }
             try std.testing.expectEqualStrings("Sign in", pick.title);
-            try std.testing.expectEqual(@as(usize, 10), pick.options.len);
+            try std.testing.expectEqual(@as(usize, 11), pick.options.len);
             try std.testing.expectEqualStrings("anthropic-plan", pick.options[0].name);
             try std.testing.expectEqualStrings("Signed in", pick.options[0].tag.?);
             try std.testing.expectEqualStrings("anthropic-api", pick.options[1].name);
@@ -132,7 +132,8 @@ test "the picker lists every account, marking the active and authenticated ones"
             try std.testing.expectEqualStrings("xai-api-key", pick.options[6].name);
             try std.testing.expectEqualStrings("openrouter-api", pick.options[7].name);
             try std.testing.expectEqualStrings("openrouter-api-key", pick.options[8].name);
-            try std.testing.expectEqualStrings("google-cloud-key", pick.options[9].name);
+            try std.testing.expectEqualStrings("deepseek-api-key", pick.options[9].name);
+            try std.testing.expectEqualStrings("google-cloud-key", pick.options[10].name);
         },
         else => return error.ExpectedPick,
     }
@@ -174,7 +175,7 @@ test "the picker marks a loaded key file, a failed one, and an API key apart" {
     try std.testing.expectEqualStrings("Not loaded", failed.tag.?);
     try std.testing.expect(failed.tag_pressure);
     try Context.Outcome.expectNoticeContaining(
-        try select(&context, .{ .payload = 0, .row = 9 }),
+        try select(&context, .{ .payload = 0, .row = 10 }),
         .failure,
         "because of error FileNotFound",
     );
@@ -186,7 +187,7 @@ test "the picker marks a loaded key file, a failed one, and an API key apart" {
     try std.testing.expectEqualStrings("google-cloud-key", absent.name);
     try std.testing.expect(absent.tag == null);
     try Context.Outcome.expectNoticeContaining(
-        try select(&context, .{ .payload = 0, .row = 9 }),
+        try select(&context, .{ .payload = 0, .row = 10 }),
         .information,
         "GOOGLE_CLOUD_LOCATION",
     );
@@ -230,6 +231,16 @@ test "select starts login, instructs an API account, and no-ops the active one" 
         try select(&context, .{ .payload = 0, .row = 8 }),
         .information,
         "OPENROUTER_API_KEY",
+    );
+    try Context.Outcome.expectNoticeContaining(
+        try select(&context, .{ .payload = 0, .row = 9 }),
+        .information,
+        "DEEPSEEK_API_KEY",
+    );
+    try Context.Outcome.expectNoticeContaining(
+        try select(&context, .{ .payload = 0, .row = 10 }),
+        .information,
+        "GOOGLE_CLOUD_LOCATION",
     );
     try Context.Outcome.expectNoticeContaining(
         try select(&context, .{ .payload = 0, .row = 2 }),

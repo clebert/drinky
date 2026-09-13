@@ -2,9 +2,10 @@
 //! endpoint with the correct auth identity. It exposes the response as a pull
 //! stream of decoded SSE `response.*` events on the shared `sse` engine.
 //! Every Responses account shares it: the OpenAI API key, the ChatGPT
-//! subscription, both xAI accounts, and both OpenRouter accounts differ only in
-//! `endpoint`, in whether `account_id` is set, and in whether the account
-//! replays plain reasoning. It knows nothing about conversation state or tools.
+//! subscription, both xAI accounts, both OpenRouter accounts, and the DeepSeek
+//! account differ only in `endpoint`, in whether `account_id` is set, and in
+//! whether the account replays plain reasoning. It knows nothing about
+//! conversation state or tools.
 
 const std = @import("std");
 

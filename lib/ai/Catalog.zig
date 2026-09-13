@@ -795,6 +795,42 @@ test "a merged model without tool support is not offered" {
     try std.testing.expect(catalog.isEmpty(.openai_api_key));
 }
 
+test "a DeepSeek account takes public metadata by the vendor id" {
+    const gpa = std.testing.allocator;
+    var catalog = testCatalog(gpa);
+
+    const vendor_models = [_]Model{
+        vendorModel("deepseek-v4-pro", null, null),
+        vendorModel("deepseek-flash", null, null),
+    };
+    catalog.accounts.set(.deepseek_api_key, try gpa.dupe(Model, &vendor_models));
+    defer gpa.free(catalog.accounts.get(.deepseek_api_key));
+
+    var public_pro = Model.init("deepseek-v4-pro") catch unreachable;
+    public_pro.context_window = 1_048_576;
+    public_pro.thinking = .supported;
+    public_pro.tools = .supported;
+    public_pro.price = .{ .input = 1.6, .output = 3.2, .cache_read = 0.135, .cache_write = 0 };
+    var public_flash = Model.init("deepseek-v4.1-flash") catch unreachable;
+    public_flash.context_window = 1_048_576;
+    public_flash.thinking = .supported;
+    public_flash.tools = .supported;
+    public_flash.price = .{ .input = 0.15, .output = 0.6, .cache_read = 0.003, .cache_write = 0 };
+    const entries = [_]Metadata.Entry{
+        .{ .provider = .deepseek, .model = public_pro },
+        .{ .provider = .deepseek, .model = public_flash },
+    };
+    catalog.metadata = try gpa.dupe(Metadata.Entry, &entries);
+    defer gpa.free(catalog.metadata);
+
+    const merged = catalog.find(.deepseek_api_key, "deepseek-v4-pro").?;
+    try std.testing.expectEqual(@as(f64, 1.6), merged.price.?.input);
+    try std.testing.expectEqual(@as(?u64, 1_048_576), merged.context_window);
+    const flash = catalog.find(.deepseek_api_key, "deepseek-flash").?;
+    try std.testing.expectEqualStrings("deepseek-flash", flash.name());
+    try std.testing.expectEqual(@as(f64, 0.15), flash.price.?.input);
+}
+
 test "an OpenRouter account reads the public list and never the account cache" {
     const gpa = std.testing.allocator;
     var catalog = testCatalog(gpa);

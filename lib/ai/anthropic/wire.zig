@@ -26,6 +26,7 @@ fn sendsSystemHeader(account: llm.Account) bool {
         .xai_api_key,
         .openrouter_api,
         .openrouter_api_key,
+        .deepseek_api_key,
         .google_cloud_key,
         => false,
     };
@@ -201,6 +202,7 @@ fn emitsBlock(item: llm.Item, emit_thinking: bool, account: llm.Account) bool {
             .xai_api_key,
             .openrouter_api,
             .openrouter_api_key,
+            .deepseek_api_key,
             .google_cloud_key,
             => false,
         },
@@ -301,6 +303,7 @@ fn writeThinking(stringify: *std.json.Stringify, reasoning: *const llm.Item.Reas
         .xai_api_key,
         .openrouter_api,
         .openrouter_api_key,
+        .deepseek_api_key,
         .google_cloud_key,
         => unreachable,
     }

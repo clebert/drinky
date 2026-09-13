@@ -8,6 +8,7 @@
 const std = @import("std");
 
 const anthropic = @import("anthropic/root.zig");
+const deepseek = @import("deepseek/root.zig");
 const google = @import("google/root.zig");
 const llm = @import("llm.zig");
 const net = @import("net.zig");
@@ -21,6 +22,7 @@ const codex_url = "https://chatgpt.com/backend-api/codex/responses";
 /// token, so the URL names no account.
 const xai_url = "https://api.x.ai/v1/responses";
 const openrouter_url = "https://openrouter.ai/api/v1/responses";
+const deepseek_url = "https://api.deepseek.com/v1/responses";
 
 /// What a client needs to authenticate, tagged by the account it belongs to. A
 /// subscription account holds an OAuth `Auth` (owned by the caller, refreshed on
@@ -37,6 +39,7 @@ pub const Credentials = union(llm.Account) {
     xai_api_key: []const u8,
     openrouter_api: []const u8,
     openrouter_api_key: []const u8,
+    deepseek_api_key: []const u8,
     google_cloud_key: *google.Auth,
 };
 
@@ -81,6 +84,7 @@ pub const Client = struct {
             .xai_api_key,
             .openrouter_api,
             .openrouter_api_key,
+            .deepseek_api_key,
             => false,
         };
     }
@@ -101,8 +105,9 @@ pub const Client = struct {
 
     /// The credit pool of this account when it spends a prepaid pool, or null
     /// when it does not. Both OpenRouter accounts read the pool of their key.
-    /// The subscription accounts state their allowance in the response head or
-    /// on a billing endpoint instead.
+    /// The DeepSeek account reads the remaining USD balance of its key. The
+    /// subscription accounts state their allowance in the response head or on
+    /// a billing endpoint instead.
     pub fn fetchCredits(self: *Client) !?llm.Credits {
         return switch (self.credentials) {
             .openrouter_api, .openrouter_api_key => |key| openrouter.credits.fetch(
@@ -110,6 +115,7 @@ pub const Client = struct {
                 self.io,
                 key,
             ),
+            .deepseek_api_key => |key| deepseek.balance.fetch(self.gpa, self.io, key),
             else => null,
         };
     }
@@ -137,18 +143,20 @@ pub const Client = struct {
                 };
                 try transport.send(&@field(out.*, @tagName(tag)), body);
             },
-            // The six Responses accounts share one transport and one wire.
-            // Only the Codex backend takes an account header. The two xAI
-            // accounts differ in the credential alone, so both reach the
-            // public xAI endpoint the same way. The two OpenRouter accounts
-            // differ in the credential alone as well, and both replay plain
-            // reasoning.
+            // The Responses accounts share one transport and one wire. Only the
+            // Codex backend takes an account header. The two xAI accounts
+            // differ in the credential alone, so both reach the public xAI
+            // endpoint the same way. The two OpenRouter accounts differ in the
+            // credential alone as well, and both ask for no encrypted
+            // reasoning. The DeepSeek account does too, and still receives a
+            // blob from its vendor.
             inline .openai_plan,
             .openai_api_key,
             .xai_plan,
             .xai_api_key,
             .openrouter_api,
             .openrouter_api_key,
+            .deepseek_api_key,
             => |credential, tag| {
                 const subscription = tag == .openai_plan or tag == .xai_plan;
                 const token = if (subscription) try credential.accessToken() else credential;
@@ -203,6 +211,7 @@ fn responsesUrl(comptime account: llm.Account) []const u8 {
         .openai_api_key => openai_url,
         .xai_plan, .xai_api_key => xai_url,
         .openrouter_api, .openrouter_api_key => openrouter_url,
+        .deepseek_api_key => deepseek_url,
         .anthropic_plan,
         .anthropic_api,
         .anthropic_api_key,
@@ -224,6 +233,7 @@ pub const Stream = union(llm.Account) {
     xai_api_key: openai.Transport.Stream,
     openrouter_api: openai.Transport.Stream,
     openrouter_api_key: openai.Transport.Stream,
+    deepseek_api_key: openai.Transport.Stream,
     google_cloud_key: google.Transport.Stream,
 
     pub fn deinit(self: *Stream) void {
@@ -337,6 +347,13 @@ test "init selects the arm matching the credentials" {
         .{},
     );
     try std.testing.expectEqual(llm.Account.openrouter_api, openrouter_login.account());
+    const deepseek_key = Client.init(
+        gpa,
+        std.testing.io,
+        .{ .deepseek_api_key = "sk-deepseek" },
+        .{},
+    );
+    try std.testing.expectEqual(llm.Account.deepseek_api_key, deepseek_key.account());
     const cloud = Client.init(gpa, std.testing.io, .{ .google_cloud_key = undefined }, .{});
     try std.testing.expectEqual(llm.Account.google_cloud_key, cloud.account());
 }
@@ -354,6 +371,7 @@ test "an OAuth account and the key file account renew, a key account does not" {
         .{ .xai_api_key = "xai-test" },
         .{ .openrouter_api_key = "sk-or" },
         .{ .openrouter_api = "sk-or" },
+        .{ .deepseek_api_key = "sk-deepseek" },
     }) |credentials| {
         var client = Client.init(gpa, io, credentials, .{});
         try std.testing.expect(!try client.renewCredential());
@@ -435,7 +453,7 @@ test "fetchQuota is a billing read of the xAI subscription alone" {
     try std.testing.expectError(error.BadCredentials, grok.fetchQuota());
 }
 
-test "fetchCredits is a pool read of the OpenRouter accounts alone" {
+test "fetchCredits is a pool read of the OpenRouter and DeepSeek accounts" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     for ([_]Credentials{
@@ -452,4 +470,6 @@ test "fetchCredits is a pool read of the OpenRouter accounts alone" {
     try std.testing.expectError(error.BadCredentials, key.fetchCredits());
     var login = Client.init(gpa, io, .{ .openrouter_api = "" }, .{});
     try std.testing.expectError(error.BadCredentials, login.fetchCredits());
+    var deepseek_key = Client.init(gpa, io, .{ .deepseek_api_key = "key\r\nleaked" }, .{});
+    try std.testing.expectError(error.BadCredentials, deepseek_key.fetchCredits());
 }

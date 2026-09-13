@@ -36,6 +36,8 @@ pub const Account = enum {
     openrouter_api,
     /// Per-token OpenRouter API, authorized with a `Bearer` key.
     openrouter_api_key,
+    /// Per-token DeepSeek platform API, authorized with a `Bearer` key.
+    deepseek_api_key,
     /// Gemini models on the Agent Platform of Google Cloud, authorized with an
     /// access token that Drinky mints from a service account key file. It goes
     /// last, so the startup order prefers every other account.
@@ -85,6 +87,7 @@ pub const Account = enum {
             .openai_api_key,
             .xai_api_key,
             .openrouter_api_key,
+            .deepseek_api_key,
             .google_cloud_key,
             => false,
         };
@@ -102,6 +105,7 @@ pub const Account = enum {
             .xai_api_key,
             .openrouter_api,
             .openrouter_api_key,
+            .deepseek_api_key,
             .google_cloud_key,
             => false,
         };
@@ -116,6 +120,7 @@ pub const Account = enum {
             .openai_api_key => "OPENAI_API_KEY",
             .xai_api_key => "XAI_API_KEY",
             .openrouter_api_key => "OPENROUTER_API_KEY",
+            .deepseek_api_key => "DEEPSEEK_API_KEY",
             .google_cloud_key => "GOOGLE_APPLICATION_CREDENTIALS and GOOGLE_CLOUD_LOCATION",
             .anthropic_plan,
             .openai_plan,
@@ -133,17 +138,23 @@ pub const Account = enum {
             .openai_api_key, .openai_plan => .openai,
             .xai_api_key, .xai_plan => .xai,
             .openrouter_api, .openrouter_api_key => .openrouter,
+            .deepseek_api_key => .deepseek,
             .google_cloud_key => .google,
         };
     }
 
-    /// Whether this account replays a reasoning item without encrypted content.
-    /// OpenRouter picks the endpoint of a request from the parameters of that
-    /// request, and a request for encrypted content reaches fewer endpoints, so
-    /// Drinky asks for none and replays the reasoning text instead. Every other
-    /// Responses account must hold the encrypted blob.
+    /// Whether this account asks for no encrypted reasoning. OpenRouter picks
+    /// the endpoint of a request from the parameters of that request, and a
+    /// request for encrypted content reaches fewer endpoints, so Drinky asks
+    /// for none there. DeepSeek ignores that request, and its reply carries a
+    /// blob. Such an account replays the blob when the proof holds one, and
+    /// the reasoning text otherwise. Every other Responses account must hold
+    /// an encrypted blob.
     pub fn replaysPlainReasoning(self: Account) bool {
-        return self.provider() == .openrouter;
+        return switch (self.provider()) {
+            .openrouter, .deepseek => true,
+            .anthropic, .openai, .xai, .google => false,
+        };
     }
 };
 
@@ -160,6 +171,7 @@ pub const Provider = enum {
     openai,
     xai,
     openrouter,
+    deepseek,
     google,
 };
 
@@ -219,6 +231,9 @@ pub const Item = union(enum) {
             /// proof has the OpenAI shape.
             openrouter_api: OpenAi,
             openrouter_api_key: OpenAi,
+            /// The DeepSeek account speaks the Responses protocol, so its proof
+            /// has the OpenAI shape.
+            deepseek_api_key: OpenAi,
             /// The `thoughtSignature` of one part. The text stays empty, because
             /// no wire needs the thought text back.
             google_cloud_key: Signature,
@@ -250,6 +265,7 @@ pub const Item = union(enum) {
                     .xai_api_key,
                     .openrouter_api,
                     .openrouter_api_key,
+                    .deepseek_api_key,
                     => |proof, tag| openai: {
                         const text_copy = try gpa.dupe(u8, proof.text);
                         errdefer gpa.free(text_copy);
@@ -283,6 +299,7 @@ pub const Item = union(enum) {
                     .xai_api_key,
                     .openrouter_api,
                     .openrouter_api_key,
+                    .deepseek_api_key,
                     => |proof| {
                         gpa.free(proof.text);
                         gpa.free(proof.id);
@@ -396,7 +413,7 @@ pub const Request = struct {
         pub fn replaysReasoning(self: Reasoning, vendor: Provider) bool {
             return switch (vendor) {
                 .anthropic => self == .named,
-                .openai, .xai, .openrouter, .google => true,
+                .openai, .xai, .openrouter, .deepseek, .google => true,
             };
         }
 
@@ -460,12 +477,13 @@ pub const Quota = struct {
 /// at it.
 pub const amount_usd_max: f64 = 1_000_000_000;
 
-/// The prepaid credit pool of an account, in USD. The provider states the pool
-/// and the spend it drew from it, and a consumer derives the remaining amount.
-/// No window rolls, so a fresh report states the truth and no consumer ages
-/// the numbers. The pool states an amount and no share: the figures are
-/// lifetime totals, so their ratio measures no pressure. The OpenRouter pool
-/// states none of the window fields of a quota, so it keeps its own type.
+/// The prepaid credit pool of an account, in USD. The remaining amount is
+/// `total - used`. OpenRouter states both figures. DeepSeek states remaining
+/// funds alone, so `used` is zero. No window rolls, so a fresh report states
+/// the truth and no consumer ages the numbers. The pool states an amount and
+/// no share: the figures are lifetime totals, so their ratio measures no
+/// pressure. The pool states none of the window fields of a quota, so it keeps
+/// its own type.
 pub const Credits = struct {
     total: f64,
     used: f64,
@@ -555,6 +573,7 @@ pub const Event = union(enum) {
                 .xai_api_key,
                 .openrouter_api,
                 .openrouter_api_key,
+                .deepseek_api_key,
                 => |tag| switch (self.*) {
                     .encrypted => |encrypted| if (encrypted.replayable(
                         tag.replaysPlainReasoning(),
@@ -681,7 +700,11 @@ test "only an account that replays plain reasoning takes a summary without encry
         .id = "rs_1",
         .encrypted_content = "",
     } };
-    inline for (.{ Account.openrouter_api, Account.openrouter_api_key }) |account| {
+    inline for (.{
+        Account.openrouter_api,
+        Account.openrouter_api_key,
+        Account.deepseek_api_key,
+    }) |account| {
         const maybe_replay = reasoning.replay(account);
         try std.testing.expect(maybe_replay != null);
         try std.testing.expectEqualStrings("think", @field(maybe_replay.?, @tagName(account)).text);
@@ -700,10 +723,10 @@ test "only an account that replays plain reasoning takes a summary without encry
     }
 }
 
-test "an account replays plain reasoning exactly when OpenRouter serves it" {
+test "only the OpenRouter and DeepSeek accounts ask for no encrypted reasoning" {
     for (std.enums.values(Account)) |account| {
         try std.testing.expectEqual(
-            account.provider() == .openrouter,
+            account.provider() == .openrouter or account.provider() == .deepseek,
             account.replaysPlainReasoning(),
         );
     }
@@ -776,6 +799,7 @@ test "an account identifier starts with its provider and parses back" {
     try std.testing.expectEqualStrings("xai-api-key", Account.xai_api_key.id());
     try std.testing.expectEqualStrings("openrouter-api", Account.openrouter_api.id());
     try std.testing.expectEqualStrings("openrouter-api-key", Account.openrouter_api_key.id());
+    try std.testing.expectEqualStrings("deepseek-api-key", Account.deepseek_api_key.id());
     try std.testing.expectEqualStrings("google-cloud-key", Account.google_cloud_key.id());
     // The tag spelling is not the identifier, so a store key never holds it.
     try std.testing.expect(Account.parse("anthropic_plan") == null);
@@ -793,6 +817,7 @@ test "Account.provider maps each account to its vendor" {
     try std.testing.expectEqual(Provider.xai, Account.xai_api_key.provider());
     try std.testing.expectEqual(Provider.openrouter, Account.openrouter_api.provider());
     try std.testing.expectEqual(Provider.openrouter, Account.openrouter_api_key.provider());
+    try std.testing.expectEqual(Provider.deepseek, Account.deepseek_api_key.provider());
     try std.testing.expectEqual(Provider.google, Account.google_cloud_key.provider());
 }
 
@@ -806,6 +831,7 @@ test "account credential flags and environment variables" {
     try std.testing.expect(!Account.openai_api_key.hasLogin());
     try std.testing.expect(!Account.xai_api_key.hasLogin());
     try std.testing.expect(!Account.openrouter_api_key.hasLogin());
+    try std.testing.expect(!Account.deepseek_api_key.hasLogin());
     try std.testing.expect(!Account.google_cloud_key.hasLogin());
     try std.testing.expect(Account.anthropic_plan.hasRefreshCredential());
     try std.testing.expect(Account.openai_plan.hasRefreshCredential());
@@ -816,6 +842,7 @@ test "account credential flags and environment variables" {
     try std.testing.expect(!Account.xai_api_key.hasRefreshCredential());
     try std.testing.expect(!Account.openrouter_api.hasRefreshCredential());
     try std.testing.expect(!Account.openrouter_api_key.hasRefreshCredential());
+    try std.testing.expect(!Account.deepseek_api_key.hasRefreshCredential());
     try std.testing.expect(!Account.google_cloud_key.hasRefreshCredential());
     try std.testing.expectEqualStrings(
         "ANTHROPIC_API_KEY",
@@ -827,6 +854,7 @@ test "account credential flags and environment variables" {
         "OPENROUTER_API_KEY",
         Account.openrouter_api_key.credentialEnv().?,
     );
+    try std.testing.expectEqualStrings("DEEPSEEK_API_KEY", Account.deepseek_api_key.credentialEnv().?);
     try std.testing.expectEqualStrings(
         "GOOGLE_APPLICATION_CREDENTIALS and GOOGLE_CLOUD_LOCATION",
         Account.google_cloud_key.credentialEnv().?,

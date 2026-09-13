@@ -111,9 +111,10 @@ pub const Stats = struct {
     /// must drop it and a restart must read it as unknown.
     quota_seen_ms: i64 = 0,
     /// The credit pool of an account that spends a prepaid pool, in USD.
-    /// Drinky reads the OpenRouter pool after each model reply. A report that
-    /// names none leaves it unchanged. The value is null until a report
-    /// arrives. A new turn drops it. An account switch clears it.
+    /// Drinky reads the OpenRouter pool or the DeepSeek balance after each
+    /// model reply. A report that names none leaves it unchanged. The value is
+    /// null until a report arrives. A new turn drops it. An account switch
+    /// clears it.
     credits: ?llm.Credits = null,
 
     /// Forget the allowance and the pool. Both hold what the last response of
@@ -989,10 +990,10 @@ fn adoptQuota(self: *Agent, quota: llm.Quota, turn: *TurnState, handler: anytype
     try presentation(&turn.presentation_closed, handler.onUsage(self.stats));
 }
 
-/// Read the credit pool after a committed round. The OpenRouter pool is the
-/// balance behind the account, and a report that names none cannot replace a
-/// pool. A timeout or a refused GET leaves the last-known pool. A cancel or an
-/// allocation failure ends the turn and keeps the round.
+/// Read the credit pool after a committed round. The OpenRouter pool and the
+/// DeepSeek balance are the funds behind the account, and a report that names
+/// none cannot replace a pool. A timeout or a refused GET leaves the last-known
+/// pool. A cancel or an allocation failure ends the turn and keeps the round.
 fn refreshCredits(self: *Agent, fetch: anytype, turn: *TurnState, handler: anytype) !void {
     const maybe_credits = fetch.fetchCredits() catch |err| switch (err) {
         error.Canceled, error.OutOfMemory => return err,
@@ -2333,6 +2334,7 @@ fn appendProof(agent: *Agent, account: llm.Account) !void {
         .xai_api_key,
         .openrouter_api,
         .openrouter_api_key,
+        .deepseek_api_key,
         => |tag| replay: {
             const id = try gpa.dupe(u8, "rs_1");
             break :replay @unionInit(
@@ -3053,7 +3055,11 @@ fn expectUnencryptedReply(options: struct {
 }) !void {
     const gpa = std.testing.allocator;
     const openai = @import("openai/root.zig");
-    inline for (.{ llm.Account.openrouter_api, llm.Account.openrouter_api_key }) |account| {
+    inline for (.{
+        llm.Account.openrouter_api,
+        llm.Account.openrouter_api_key,
+        llm.Account.deepseek_api_key,
+    }) |account| {
         const body = try std.fmt.allocPrint(
             gpa,
             "data: {{\"type\":\"response.reasoning_text.delta\",\"delta\":\"think\"}}\n\n" ++
@@ -3070,7 +3076,7 @@ fn expectUnencryptedReply(options: struct {
         var reader: std.Io.Reader = .fixed(body);
         var stream = openaiStream(std.testing.io, &reader);
         // The client sets this from the account, so a stream built by hand sets
-        // it too. Every OpenRouter account replays plain reasoning.
+        // it too. OpenRouter and DeepSeek replay plain reasoning.
         stream.openai_api_key.plain_reasoning = true;
         defer stream.openai_api_key.deinitDecode();
         var agent = openaiScriptedAgent(gpa);

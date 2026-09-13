@@ -131,7 +131,115 @@ pub fn lookup(self: *const Metadata, provider: llm.Provider, name: []const u8) ?
         if (entry.provider != provider) continue;
         if (entry.model.sameName(wanted)) return entry.model;
     }
+    // A versionless DeepSeek id such as `deepseek-flash` has no public row of
+    // that spelling. It takes the newest versioned row of the same family.
+    if (provider == .deepseek) return self.lookupDeepseekFamily(wanted);
     return null;
+}
+
+/// The newest versioned public row of a versionless DeepSeek family, or null.
+/// `deepseek-flash` takes `deepseek-v4.1-flash` when that spelling outranks
+/// `deepseek-v4-flash`. A versioned id does not use this path. A trailing digit
+/// group is a snapshot of the same family, not a new family.
+fn lookupDeepseekFamily(self: *const Metadata, name: []const u8) ?Model {
+    const wanted = deepseekFamily(name) orelse return null;
+    if (wanted.major != null) return null;
+
+    var best: ?Model = null;
+    var best_rank: Rank = undefined;
+    for (self.entries) |entry| {
+        if (entry.provider != .deepseek) continue;
+        const found = deepseekFamily(entry.model.name()) orelse continue;
+        if (found.major == null) continue;
+        if (!std.mem.eql(u8, found.family, wanted.family)) continue;
+        const rank: Rank = .{
+            .major = found.major.?,
+            .minor = found.minor,
+            .snapshot = found.snapshot,
+        };
+        if (best != null and !best_rank.less(rank)) continue;
+        best = entry.model;
+        best_rank = rank;
+    }
+    return best;
+}
+
+const Rank = struct {
+    major: u32,
+    minor: u32,
+    snapshot: u32,
+
+    fn less(self: Rank, other: Rank) bool {
+        if (self.major != other.major) return self.major < other.major;
+        if (self.minor != other.minor) return self.minor < other.minor;
+        return self.snapshot < other.snapshot;
+    }
+};
+
+const DeepseekFamily = struct {
+    family: []const u8,
+    major: ?u32,
+    minor: u32,
+    snapshot: u32,
+};
+
+/// Split a DeepSeek id into its family, version, and optional snapshot.
+/// `deepseek-flash` is versionless. `deepseek-v4.1-flash` is family `flash` at
+/// 4.1. `deepseek-v4-pro-0813` is family `pro` at snapshot 0813.
+fn deepseekFamily(name: []const u8) ?DeepseekFamily {
+    const prefix = "deepseek-";
+    if (!std.mem.startsWith(u8, name, prefix)) return null;
+    const rest = name[prefix.len..];
+    if (rest.len == 0) return null;
+    if (rest.len < 2 or rest[0] != 'v' or !isDigit(rest[1]))
+        return .{ .family = rest, .major = null, .minor = 0, .snapshot = 0 };
+
+    var index: usize = 1;
+    const major = digits(rest, &index) orelse return null;
+    var minor: u32 = 0;
+    if (index < rest.len and rest[index] == '.') {
+        index += 1;
+        minor = digits(rest, &index) orelse return null;
+    }
+    if (index >= rest.len or rest[index] != '-') return null;
+    const remainder = rest[index + 1 ..];
+    if (remainder.len == 0) return null;
+    const split = snapshotOf(remainder);
+    return .{
+        .family = split.family,
+        .major = major,
+        .minor = minor,
+        .snapshot = split.snapshot,
+    };
+}
+
+const Snapshot = struct {
+    family: []const u8,
+    snapshot: u32,
+};
+
+/// A trailing dash of digits is a snapshot of `family`. `pro-0813` is family
+/// `pro` at 813. `flash-vision-exp` has no snapshot.
+fn snapshotOf(family: []const u8) Snapshot {
+    const dash = std.mem.lastIndexOfScalar(u8, family, '-') orelse
+        return .{ .family = family, .snapshot = 0 };
+    const tail = family[dash + 1 ..];
+    if (tail.len == 0 or dash == 0) return .{ .family = family, .snapshot = 0 };
+    for (tail) |byte| {
+        if (!isDigit(byte)) return .{ .family = family, .snapshot = 0 };
+    }
+    const snapshot = std.fmt.parseInt(u32, tail, 10) catch
+        return .{ .family = family, .snapshot = 0 };
+    return .{ .family = family[0..dash], .snapshot = snapshot };
+}
+
+/// The unsigned integer at `index`, and the index past it. Null when no digit
+/// stands there, or when the run does not fit in a `u32`.
+fn digits(text: []const u8, index: *usize) ?u32 {
+    const start = index.*;
+    while (index.* < text.len and isDigit(text[index.*])) index.* += 1;
+    if (index.* == start) return null;
+    return std.fmt.parseInt(u32, text[start..index.*], 10) catch null;
 }
 
 /// The aggregator spelling of a vendor id. The aggregator writes a version with
@@ -243,6 +351,7 @@ fn providerOf(vendor: []const u8) ?llm.Provider {
     if (std.mem.eql(u8, vendor, "openai")) return .openai;
     if (std.mem.eql(u8, vendor, "x-ai")) return .xai;
     if (std.mem.eql(u8, vendor, "google")) return .google;
+    if (std.mem.eql(u8, vendor, "deepseek")) return .deepseek;
     return null;
 }
 
@@ -419,6 +528,59 @@ test slug {
     try std.testing.expectEqualStrings("model-4-56", slug("model-4-56", &buffer));
     // Only eight trailing digits behind a dash read as a date.
     try std.testing.expectEqualStrings("model-2025110", slug("model-2025110", &buffer));
+}
+
+test "a versionless DeepSeek id takes the latest versioned family spelling" {
+    var v4 = Model.init("deepseek-v4-flash") catch unreachable;
+    v4.price = .{ .input = 1, .output = 1, .cache_read = 0, .cache_write = 0 };
+    var v41 = Model.init("deepseek-v4.1-flash") catch unreachable;
+    v41.price = .{ .input = 2, .output = 2, .cache_read = 0, .cache_write = 0 };
+    var snapshot = Model.init("deepseek-v4-flash-0731") catch unreachable;
+    snapshot.price = .{ .input = 9, .output = 9, .cache_read = 0, .cache_write = 0 };
+    var vision = Model.init("deepseek-v4-flash-vision-exp") catch unreachable;
+    vision.price = .{ .input = 3, .output = 3, .cache_read = 0, .cache_write = 0 };
+    var pro = Model.init("deepseek-v4-pro") catch unreachable;
+    pro.price = .{ .input = 4, .output = 4, .cache_read = 0, .cache_write = 0 };
+    var pro_snapshot = Model.init("deepseek-v4-pro-0813") catch unreachable;
+    pro_snapshot.price = .{ .input = 6, .output = 6, .cache_read = 0, .cache_write = 0 };
+    var pro_new = Model.init("deepseek-v4.2-pro") catch unreachable;
+    pro_new.price = .{ .input = 5, .output = 5, .cache_read = 0, .cache_write = 0 };
+    var entries = [_]Entry{
+        .{ .provider = .deepseek, .model = v4 },
+        .{ .provider = .deepseek, .model = snapshot },
+        .{ .provider = .deepseek, .model = v41 },
+        .{ .provider = .deepseek, .model = vision },
+        .{ .provider = .deepseek, .model = pro },
+        .{ .provider = .deepseek, .model = pro_snapshot },
+        .{ .provider = .deepseek, .model = pro_new },
+    };
+    const metadata: Metadata = .{ .gpa = undefined, .entries = &entries };
+
+    try std.testing.expectEqual(@as(f64, 2), metadata.lookup(.deepseek, "deepseek-flash").?.price.?.input);
+    try std.testing.expectEqualStrings(
+        "deepseek-v4.1-flash",
+        metadata.lookup(.deepseek, "deepseek-flash").?.name(),
+    );
+    try std.testing.expectEqual(@as(f64, 5), metadata.lookup(.deepseek, "deepseek-pro").?.price.?.input);
+    try std.testing.expectEqual(
+        @as(f64, 3),
+        metadata.lookup(.deepseek, "deepseek-flash-vision-exp").?.price.?.input,
+    );
+    // A versioned id matches the public spelling alone.
+    try std.testing.expectEqualStrings(
+        "deepseek-v4-flash",
+        metadata.lookup(.deepseek, "deepseek-v4-flash").?.name(),
+    );
+    try std.testing.expectEqualStrings(
+        "deepseek-v4-pro",
+        metadata.lookup(.deepseek, "deepseek-v4-pro").?.name(),
+    );
+    try std.testing.expectEqualStrings(
+        "deepseek-v4-pro-0813",
+        metadata.lookup(.deepseek, "deepseek-v4-pro-0813").?.name(),
+    );
+    try std.testing.expect(metadata.lookup(.deepseek, "deepseek-v5-flash") == null);
+    try std.testing.expect(metadata.lookup(.openrouter, "deepseek-flash") == null);
 }
 
 const sample =

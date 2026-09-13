@@ -235,7 +235,7 @@ pub fn outputLimitUnknown(self: *const Model, account: llm.Account) bool {
         // The Anthropic wire requires `max_tokens` in every request.
         .anthropic => true,
         // None of these wires sends a cap, so the budget of the model governs.
-        .openai, .xai, .openrouter, .google => false,
+        .openai, .xai, .openrouter, .deepseek, .google => false,
     };
 }
 
@@ -506,6 +506,7 @@ test outputLimitUnknown {
     try std.testing.expect(!model.outputLimitUnknown(.xai_api_key));
     try std.testing.expect(!model.outputLimitUnknown(.openrouter_api));
     try std.testing.expect(!model.outputLimitUnknown(.openrouter_api_key));
+    try std.testing.expect(!model.outputLimitUnknown(.deepseek_api_key));
     try std.testing.expect(!model.outputLimitUnknown(.google_cloud_key));
 
     // A stated limit answers the question for every account.

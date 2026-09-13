@@ -1,7 +1,8 @@
 //! Translates a neutral `llm.Request` into an OpenAI Responses API JSON body.
 //! Every Responses account shares this module: the OpenAI accounts, the xAI
-//! accounts, and the OpenRouter accounts differ in transport base, auth, and a
-//! few request options, never in wire shape. It holds no state and does no I/O.
+//! accounts, the OpenRouter accounts, and the DeepSeek account differ in
+//! transport base, auth, and a few request options, never in wire shape. It
+//! holds no state and does no I/O.
 //! `Transport` sends the bytes this module produces.
 
 const std = @import("std");
@@ -65,9 +66,11 @@ pub fn serialize(gpa: std.mem.Allocator, request: *const llm.Request, account: l
     // turn (the model requires the reasoning that preceded a function call).
     //
     // The reasoning rule: an account that replays plain reasoning asks for no
-    // blob and replays the reasoning text instead. The endpoint rule above
-    // motivates it, but the two rules govern different fields, so each names
-    // the account property it belongs to.
+    // blob and accepts a proof that holds none. The wire still sends a blob
+    // when a proof holds one, which happens when the vendor returns it
+    // unasked. The endpoint rule above motivates the request, but the two
+    // rules govern different fields, so each names the account property it
+    // belongs to.
     try stringify.objectField("store");
     try stringify.write(false);
     if (!account.replaysPlainReasoning()) {
@@ -126,6 +129,7 @@ fn writeItem(
             .xai_api_key,
             .openrouter_api,
             .openrouter_api_key,
+            .deepseek_api_key,
             => |proof, tag| {
                 if (tag == account and proof.replayable(account.replaysPlainReasoning()))
                     try writeReasoning(stringify, &proof);
@@ -669,4 +673,38 @@ test "an OpenRouter request requires parameters and replays its own proof" {
         );
         try std.testing.expectEqual(@as(usize, 0), direct_root.get("input").?.array.items.len);
     }
+}
+
+test "a DeepSeek request replays plain reasoning and still names parallel tools" {
+    const items = [_]llm.Item{
+        .{ .reasoning = .{ .replay = .{ .deepseek_api_key = .{
+            .text = "",
+            .id = "rs_ds",
+            .encrypted_content = "",
+            .raw_text = "plain reasoning",
+        } } } },
+    };
+    const tools = [_]llm.Tool{
+        .{ .name = "read", .description = "read", .parameters = &.{} },
+    };
+    const body = try serialize(std.testing.allocator, &.{
+        .model = "deepseek-v4-pro",
+        .tokens_max = 8,
+        .system = "s",
+        .items = &items,
+        .tools = &tools,
+    }, .deepseek_api_key);
+    defer std.testing.allocator.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try std.testing.expect(root.get("include") == null);
+    try std.testing.expect(root.get("provider") == null);
+    try std.testing.expect(root.get("parallel_tool_calls").?.bool);
+    const input = root.get("input").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), input.len);
+    try std.testing.expect(input[0].object.get("encrypted_content") == null);
+    const part = input[0].object.get("content").?.array.items[0].object;
+    try std.testing.expectEqualStrings("reasoning_text", part.get("type").?.string);
+    try std.testing.expectEqualStrings("plain reasoning", part.get("text").?.string);
 }
