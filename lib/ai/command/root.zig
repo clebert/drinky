@@ -45,7 +45,7 @@ const Entry = struct {
 /// summary reaches no row, because the list leaves `/help` out. It states the
 /// command in the table, where every other entry states one.
 const help_name = "help";
-const help_summary = "list every command";
+const help_summary = "List every command";
 /// The name prefix that loads a skill. It is the only command that takes an argument.
 const skill_prefix = skill.name ++ ":";
 /// Editor input can carry interior newlines (Shift+Enter, paste), so a newline
@@ -271,7 +271,7 @@ fn runHelp(context: *Context) !Outcome {
     errdefer options.deinit();
     var rows: [commands.len]Entry = undefined;
     for (listed(context, &rows)) |entry| {
-        try options.print("/{s} — {s}", .{ entry.name, entry.summary });
+        try options.addExtraPrint(false, "/{s}", .{entry.name}, "{s}.", .{entry.summary});
     }
     // The list builds itself again, so Esc in the picker that a row opens
     // returns to the list.
@@ -490,7 +490,7 @@ test "run routes a known command" {
     switch ((try run(&context, "/effort")).?) {
         .pick => |pick| {
             defer {
-                for (pick.options) |option| gpa.free(option);
+                for (pick.options) |*option| option.deinit(gpa);
                 gpa.free(pick.options);
             }
             try std.testing.expect(pick.select == &effort.select);
@@ -643,7 +643,7 @@ test "a line without a name opens its list" {
         switch ((try run(&context, line)).?) {
             .pick => |pick| {
                 defer {
-                    for (pick.options) |option| gpa.free(option);
+                    for (pick.options) |*option| option.deinit(gpa);
                     gpa.free(pick.options);
                 }
                 try std.testing.expectEqualStrings("Command", pick.title);
@@ -652,16 +652,15 @@ test "a line without a name opens its list" {
                 try std.testing.expect(pick.reopen.? == &runHelp);
                 try std.testing.expectEqual(commands.len - 1, pick.options.len);
                 // Alphabetical, the summary after the name, and no `/help` row.
+                try std.testing.expectEqualStrings("/effort", pick.options[0].name);
+                try std.testing.expectEqualStrings("Set the reasoning effort.", pick.options[0].extra.?);
+                try std.testing.expectEqualStrings("/system", pick.options[pick.options.len - 1].name);
                 try std.testing.expectEqualStrings(
-                    "/effort — set the reasoning effort",
-                    pick.options[0],
+                    "Show the complete system prompt.",
+                    pick.options[pick.options.len - 1].extra.?,
                 );
-                try std.testing.expectEqualStrings(
-                    "/system — show the complete system prompt",
-                    pick.options[pick.options.len - 1],
-                );
-                for (pick.options) |option|
-                    try std.testing.expect(!std.mem.startsWith(u8, option, "/help"));
+                for (pick.options) |*option|
+                    try std.testing.expect(!std.mem.startsWith(u8, option.name, "/help"));
             },
             else => return error.ExpectedPick,
         }
@@ -708,7 +707,7 @@ test "a command row runs its command" {
     switch (try selectCommand(&context, .ofRow(effort_index))) {
         .pick => |pick| {
             defer {
-                for (pick.options) |option| gpa.free(option);
+                for (pick.options) |*option| option.deinit(gpa);
                 gpa.free(pick.options);
             }
             try std.testing.expect(pick.select == &effort.select);
@@ -764,15 +763,15 @@ test "a remote host runs the commands that need no terminal" {
     switch ((try run(&context, "/help")).?) {
         .pick => |pick| {
             defer {
-                for (pick.options) |option| gpa.free(option);
+                for (pick.options) |*option| option.deinit(gpa);
                 gpa.free(pick.options);
             }
             try std.testing.expectEqual(@as(usize, 5), pick.options.len);
-            try std.testing.expect(std.mem.startsWith(u8, pick.options[0], "/effort"));
-            try std.testing.expect(std.mem.startsWith(u8, pick.options[1], "/model"));
-            try std.testing.expect(std.mem.startsWith(u8, pick.options[2], "/new"));
-            try std.testing.expect(std.mem.startsWith(u8, pick.options[3], "/skill"));
-            try std.testing.expect(std.mem.startsWith(u8, pick.options[4], "/status"));
+            try std.testing.expectEqualStrings("/effort", pick.options[0].name);
+            try std.testing.expectEqualStrings("/model", pick.options[1].name);
+            try std.testing.expectEqualStrings("/new", pick.options[2].name);
+            try std.testing.expectEqualStrings("/skill", pick.options[3].name);
+            try std.testing.expectEqualStrings("/status", pick.options[4].name);
             try std.testing.expect(
                 (try pick.select(&context, .ofRow(2))) == .new_conversation,
             );

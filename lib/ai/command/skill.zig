@@ -14,7 +14,7 @@ const skills = @import("../skills.zig");
 const Context = @import("Context.zig");
 
 pub const name = "skill";
-pub const summary = "pick a skill";
+pub const summary = "Pick a skill";
 
 const whitespace = " \t\r\n";
 
@@ -27,9 +27,12 @@ pub fn run(context: *Context) !Context.Outcome {
     var options: Context.Outcome.Options = .{ .gpa = gpa };
     errdefer options.deinit();
     // The row shows the line it writes, so the user learns the typed form.
-    for (items) |target| try options.print(
-        "/{s}:{s} — {s}",
-        .{ name, target.name, firstSentence(target.description) },
+    for (items) |target| try options.addExtraPrint(
+        false,
+        "/{s}:{s}",
+        .{ name, target.name },
+        "{s}",
+        .{firstSentence(target.description)},
     );
     return .{ .pick = .{
         .select = select,
@@ -145,21 +148,17 @@ test "the list shows one row per skill, ordered by name" {
     switch (outcome) {
         .pick => |pick| {
             defer {
-                for (pick.options) |option| gpa.free(option);
+                for (pick.options) |*option| option.deinit(gpa);
                 gpa.free(pick.options);
             }
             try std.testing.expectEqualStrings("Skill", pick.title);
             try std.testing.expectEqual(@as(usize, 2), pick.options.len);
             // The row holds the line it writes, and the summary stops at the
             // first sentence of the description.
-            try std.testing.expectEqualStrings(
-                "/skill:alpha — The first skill.",
-                pick.options[0],
-            );
-            try std.testing.expectEqualStrings(
-                "/skill:omega — The last skill.",
-                pick.options[1],
-            );
+            try std.testing.expectEqualStrings("/skill:alpha", pick.options[0].name);
+            try std.testing.expectEqualStrings("The first skill.", pick.options[0].extra.?);
+            try std.testing.expectEqualStrings("/skill:omega", pick.options[1].name);
+            try std.testing.expectEqualStrings("The last skill.", pick.options[1].extra.?);
         },
         else => return error.ExpectedPick,
     }

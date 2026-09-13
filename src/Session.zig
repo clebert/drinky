@@ -1358,15 +1358,19 @@ fn enterPicker(
     trail: Trail,
     position: ?ui.Picker.Position,
 ) !void {
-    errdefer {
-        for (pick.options) |option| self.gpa.free(option);
-        self.gpa.free(pick.options);
-    }
     // A step that both reports and opens a list records its line first. The
     // scrollback holds the report, so a failed picker loses neither the line nor
     // its bytes, and a report of several sentences reads whole.
-    if (pick.report) |message| try self.appendEvent(message);
-    const picker = try ui.Picker.init(self.gpa, pick.title, pick.options, .{
+    if (pick.report) |message| {
+        errdefer freePickOptions(self.gpa, pick.options);
+        try self.appendEvent(message);
+    }
+    const rows = blk: {
+        errdefer freePickOptions(self.gpa, pick.options);
+        break :blk try takePickerOptions(self.gpa, pick.options);
+    };
+    errdefer freePickerOptions(self.gpa, rows);
+    const picker = try ui.Picker.init(self.gpa, pick.title, rows, .{
         .current = pick.current,
         .position = position,
         .can_step_back = trail.len > 0,
@@ -1406,12 +1410,19 @@ pub fn closePicker(self: *Session) void {
 /// entry through `appendPromptHistory`.
 pub fn openPromptHistory(self: *Session, labels: []const []const u8) !void {
     std.debug.assert(self.mode == .prompt);
-    errdefer {
-        for (labels) |label| self.gpa.free(label);
+    const options = blk: {
+        errdefer {
+            for (labels) |label| self.gpa.free(label);
+            self.gpa.free(labels);
+        }
+        const options = try self.gpa.alloc(ui.Picker.Option, labels.len);
+        for (labels, options) |label, *option| option.* = .{ .name = label };
         self.gpa.free(labels);
-    }
+        break :blk options;
+    };
+    errdefer freePickerOptions(self.gpa, options);
     // No row holds a value in use, so the list opens on its first row untagged.
-    const picker = try ui.Picker.init(self.gpa, prompt_history_title, labels, .{});
+    const picker = try ui.Picker.init(self.gpa, prompt_history_title, options, .{});
     self.mode = .{ .picking = .{
         .picker = picker,
         .purpose = .prompt_history,
@@ -2733,8 +2744,8 @@ test "a picker that reports records its line and still opens its list" {
     var session: Session = Session.init(gpa, &out.writer, test_model, .low);
     defer session.deinit();
 
-    const options = try gpa.alloc([]const u8, 1);
-    options[0] = try gpa.dupe(u8, "claude-sonnet-4-6");
+    const options = try gpa.alloc(ai.command.Outcome.Pick.Option, 1);
+    options[0] = .{ .name = try gpa.dupe(u8, "claude-sonnet-4-6") };
     try session.applyOutcome(.{ .pick = .{
         .select = undefined,
         .title = "Model",
@@ -2760,8 +2771,8 @@ test "a picker that reports records its line and still opens its list" {
     try std.testing.expect(!failure_blocks[0].content.event.is_warning);
 
     session.closePicker();
-    const empty_options = try gpa.alloc([]const u8, 1);
-    empty_options[0] = try gpa.dupe(u8, "Fetch the model list");
+    const empty_options = try gpa.alloc(ai.command.Outcome.Pick.Option, 1);
+    empty_options[0] = .{ .name = try gpa.dupe(u8, "Fetch the model list") };
     try session.applyOutcome(.{ .pick = .{
         .select = undefined,
         .title = "Model",
@@ -4083,6 +4094,34 @@ test "a pick that reopens its own step leaves the trail depth unchanged" {
     try std.testing.expect(session.mode.picking.trail.last().?.open == account_step);
 }
 
+fn freePickOptions(gpa: std.mem.Allocator, options: []const ai.command.Outcome.Pick.Option) void {
+    for (options) |*option| option.deinit(gpa);
+    gpa.free(options);
+}
+
+fn freePickerOptions(gpa: std.mem.Allocator, options: []const ui.Picker.Option) void {
+    for (options) |*option| option.deinit(gpa);
+    gpa.free(options);
+}
+
+fn takePickerOptions(
+    gpa: std.mem.Allocator,
+    source: []const ai.command.Outcome.Pick.Option,
+) ![]ui.Picker.Option {
+    const rows = try gpa.alloc(ui.Picker.Option, source.len);
+    for (source, rows) |*item, *target| {
+        target.* = .{
+            .name = item.name,
+            .extra = item.extra,
+            .extra_pressure = item.extra_pressure,
+            .tag = item.tag,
+            .tag_pressure = item.tag_pressure,
+        };
+    }
+    gpa.free(source);
+    return rows;
+}
+
 /// Test helper: a one-row picker that names `open` as the handler that builds it
 /// again. The rows transfer to the session.
 fn pickForTest(
@@ -4090,9 +4129,9 @@ fn pickForTest(
     title: []const u8,
     open: ai.command.Outcome.Opener,
 ) !ai.command.Outcome.Pick {
-    const options = try gpa.alloc([]const u8, 1);
+    const options = try gpa.alloc(ai.command.Outcome.Pick.Option, 1);
     errdefer gpa.free(options);
-    options[0] = try gpa.dupe(u8, "row");
+    options[0] = .{ .name = try gpa.dupe(u8, "row") };
     return .{
         .select = undefined,
         .title = title,
@@ -4192,7 +4231,7 @@ test "the prompt history picker opens over the draft with a purpose of its own" 
     const picking = &session.mode.picking;
     try std.testing.expect(picking.purpose == .prompt_history);
     try std.testing.expectEqualStrings("Prompt history", picking.picker.title);
-    try std.testing.expectEqualStrings("newest", picking.picker.options[0]);
+    try std.testing.expectEqualStrings("newest", picking.picker.options[0].name);
     try std.testing.expectEqual(@as(usize, 0), picking.picker.cursor);
     try std.testing.expect(picking.picker.marked == null);
     try std.testing.expect(!picking.picker.can_step_back);
@@ -4315,8 +4354,8 @@ test "opening a picker over a turn releases its retained prompt" {
 
     var prompt = try ui.Editor.Draft.fromText(gpa, "first");
     session.retainTurnPrompt(&prompt, 0);
-    const options = try gpa.alloc([]const u8, 1);
-    options[0] = try gpa.dupe(u8, "choice");
+    const options = try gpa.alloc(ai.command.Outcome.Pick.Option, 1);
+    options[0] = .{ .name = try gpa.dupe(u8, "choice") };
     try session.applyOutcome(.{ .pick = .{
         .select = undefined,
         .title = "Select an option",

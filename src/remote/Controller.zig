@@ -1161,12 +1161,12 @@ test "a saved bot attaches, its messages and taps reach the owner, and a detach 
     // summary.
     const registered = try server.waitForRequest("/setMyCommands", 0);
     try std.testing.expectEqualStrings(
-        "{\"commands\":[{\"command\":\"effort\",\"description\":\"set the reasoning effort\"}," ++
-            "{\"command\":\"help\",\"description\":\"list every command\"}," ++
-            "{\"command\":\"model\",\"description\":\"switch the model\"}," ++
-            "{\"command\":\"new\",\"description\":\"clear the conversation\"}," ++
-            "{\"command\":\"skill\",\"description\":\"pick a skill\"}," ++
-            "{\"command\":\"status\",\"description\":\"state the session\"}]}",
+        "{\"commands\":[{\"command\":\"effort\",\"description\":\"Set the reasoning effort\"}," ++
+            "{\"command\":\"help\",\"description\":\"List every command\"}," ++
+            "{\"command\":\"model\",\"description\":\"Switch the model\"}," ++
+            "{\"command\":\"new\",\"description\":\"Clear the conversation\"}," ++
+            "{\"command\":\"skill\",\"description\":\"Pick a skill\"}," ++
+            "{\"command\":\"status\",\"description\":\"State the session\"}]}",
         registered,
     );
     try controller.sendEvent(.information, "You attached @drinky_bot.");

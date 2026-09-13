@@ -187,12 +187,14 @@ const Run = struct { start: usize = 0, end: usize = 0 };
 /// A collapsed paste marker is such a run. A row paints the part of the run that
 /// it holds in that role, so a run wider than the row keeps its role on every
 /// row it crosses. A run with a `url` is a terminal hyperlink to it, underlined
-/// like a link in a reply.
+/// like a link in a reply. `underline` without a url marks emphasis, such as the
+/// name of a current picker value.
 pub const Mark = struct {
     start: usize,
     end: usize,
     role: role.Name,
     url: ?[]const u8 = null,
+    underline: bool = false,
 };
 
 /// Where a component composes its rows: the sink to write into, the anchor `id`
@@ -676,8 +678,8 @@ fn framedRowText(sink: *terminal.View.Sink, row: *const FramedRow) !void {
         std.debug.assert(start >= position);
         try sink.text(text[position..start]);
         try role.apply(sink, mark.role);
+        if (mark.underline or mark.url != null) try attribute.apply(sink, .underline);
         if (mark.url) |url| {
-            try attribute.apply(sink, .underline);
             // The link opens and closes inside this row, so it covers exactly
             // the text on this row and never leaks into the row under it.
             try sink.linkSet(url);
@@ -1347,6 +1349,18 @@ test "a mark that wraps keeps its role on every row it crosses" {
 
 // A line role opens the row, and it takes over again behind a mark, so the text
 // behind the mark keeps the color of its line.
+test "a mark can underline without a link" {
+    const gpa = std.testing.allocator;
+    const painted = try paintedFramed(gpa, 40, &.{
+        .body = "ab",
+        .body_rows = 1,
+        .marks = &.{.{ .start = 0, .end = 2, .role = .text, .underline = true }},
+    });
+    defer gpa.free(painted);
+    const row = comptime "\r\n" ++ attribute.sequence(.underline) ++ "ab\x1b[0m\r\n";
+    try std.testing.expect(std.mem.indexOf(u8, painted, row) != null);
+}
+
 test "a line role resumes behind a mark" {
     const gpa = std.testing.allocator;
     const roles = [_]?role.Name{.muted};

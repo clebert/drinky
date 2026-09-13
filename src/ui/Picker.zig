@@ -1,7 +1,8 @@
 //! A single-choice list for the live region: a responsive caption, then the
 //! options. The options sit between the same open separators as the editor, so
-//! the list takes the editor's place. Each option holds one row, the selected
-//! one is highlighted, and a pre-existing choice is tagged "(Current)".
+//! the list takes the editor's place. Each option holds one row. The selected
+//! row is highlighted. A pre-existing choice is tagged "(Current)" and its name
+//! is underlined.
 //!
 //! The caption carries an accent title and a muted key hint above the frame. It
 //! is chrome, not content. It stays outside the scrolled window, so the picker
@@ -9,10 +10,11 @@
 //! alone. The shared caption component owns every responsive split, and three
 //! rows bound it, so chrome cannot crowd the options out of a narrow window.
 //!
-//! The picker owns its option strings and the composed `content` buffer (freed on
+//! The picker owns its option rows and the composed `content` buffer (freed on
 //! `deinit`) and borrows the title. Navigation moves the selection and rolls over
 //! at both ends. `reflow` windows a tall list to keep it in view. The caller
-//! reads `cursor` and acts on the selected row.
+//! reads `cursor` and acts on the selected row. An option carries its extra and
+//! occupancy tag as fields. The picker never reads chrome out of the name.
 //!
 //! Every option holds exactly one row: `compose` cuts a row that the window
 //! cannot hold and marks the cut with one `…`. One row per option keeps the
@@ -21,6 +23,7 @@
 const std = @import("std");
 
 const Caption = @import("Caption.zig");
+const attribute = @import("attribute.zig");
 const block = @import("block.zig");
 const paint = @import("paint.zig");
 const role = @import("role.zig");
@@ -38,6 +41,9 @@ const hint_back = "↑/↓: Move · Enter: Select · Esc: Back";
 const hint_wait = "Esc: Cancel";
 /// The tag of the option that holds the value the picker starts on.
 const tag_current = " (Current)";
+/// The opening of an occupancy tag the command set.
+const tag_open = " (";
+const tag_close = ")";
 /// The pad in front of a row: the marker column of the selection. The wait row
 /// keeps it, so its text lines up with the rows it replaced.
 const pad_selected = " > ";
@@ -48,7 +54,7 @@ const unbounded = std.math.maxInt(usize);
 
 gpa: std.mem.Allocator,
 title: []const u8,
-options: []const []const u8,
+options: []const Option,
 /// The highlighted row. Navigation moves it.
 cursor: usize,
 /// The row to tag "(Current)", if any: a pre-existing choice, distinct from
@@ -80,9 +86,9 @@ wait: ?[]const u8,
 /// The link beside the wait text, or null for a wait without one. Borrowed.
 /// See `beginLinkedWait`.
 wait_link: ?[]const u8,
-/// The one run of the body that takes a role of its own: the link of a wait.
-marks: [1]paint.Mark,
-mark_count: usize,
+/// Runs of the body that take a role of their own: extras, occupancy tags, the
+/// underlined current name, and the link of a wait.
+marks: std.ArrayList(paint.Mark),
 
 /// Where a list sits: the highlighted row, and the first body row the window
 /// shows. A caller that reopens a list hands both back, so the list looks as the
@@ -113,12 +119,49 @@ pub const RenderOptions = struct {
     activity: ?paint.Activity = null,
 };
 
+/// One picker row. The command sets extra and tag. The picker paints them.
+pub const Option = struct {
+    name: []const u8,
+    extra: ?[]const u8 = null,
+    extra_pressure: bool = false,
+    tag: ?[]const u8 = null,
+    tag_pressure: bool = false,
+
+    pub fn deinit(self: *const Option, gpa: std.mem.Allocator) void {
+        gpa.free(self.name);
+        if (self.extra) |extra| gpa.free(extra);
+        if (self.tag) |tag| gpa.free(tag);
+    }
+};
+
+const RowMarks = struct {
+    line_role: role.Name,
+    in_use: bool,
+    name_start: usize,
+    name_end: usize,
+    extra_start: usize,
+    extra_end: usize,
+    extra_pressure: bool,
+    extra_present: bool,
+    tag_start: usize,
+    tag_end: usize,
+    tag_pressure: bool,
+    tag_present: bool,
+};
+
+const Occupancy = struct {
+    start: usize,
+    len: usize,
+    pressure: bool,
+    present: bool,
+};
+
 /// Take ownership of `options` and compose the initial body. On failure the
 /// caller still owns `options`.
 pub fn init(
     gpa: std.mem.Allocator,
     title: []const u8,
-    options: []const []const u8,
+    options: []const Option,
     start: Start,
 ) !Picker {
     // A rebuilt list can be shorter than the one the position came from.
@@ -138,11 +181,11 @@ pub fn init(
         .can_step_back = start.can_step_back,
         .wait = null,
         .wait_link = null,
-        .marks = undefined,
-        .mark_count = 0,
+        .marks = .empty,
     };
     errdefer self.content.deinit(gpa);
     errdefer self.line_roles.deinit(gpa);
+    errdefer self.marks.deinit(gpa);
     try self.compose();
     return self;
 }
@@ -151,6 +194,7 @@ pub fn deinit(self: *Picker) void {
     self.freeOptions();
     self.content.deinit(self.gpa);
     self.line_roles.deinit(self.gpa);
+    self.marks.deinit(self.gpa);
 }
 
 /// Drop every row and state `text` in their place, so no selection can land on
@@ -174,7 +218,7 @@ pub fn beginLinkedWait(self: *Picker, text: []const u8, url: ?[]const u8) !void 
     errdefer {
         self.wait = null;
         self.wait_link = null;
-        self.mark_count = 0;
+        self.marks.clearRetainingCapacity();
         // The half-built row of the failed compose goes with them, because
         // `reflow` rebuilds the content at a width change alone.
         self.content.clearRetainingCapacity();
@@ -184,7 +228,7 @@ pub fn beginLinkedWait(self: *Picker, text: []const u8, url: ?[]const u8) !void 
 }
 
 fn freeOptions(self: *Picker) void {
-    for (self.options) |option| self.gpa.free(option);
+    for (self.options) |*option| option.deinit(self.gpa);
     self.gpa.free(self.options);
 }
 
@@ -262,7 +306,7 @@ pub fn render(
         .hidden_above = self.scroll,
         .hidden_below = total_body - self.scroll - visible_rows,
         .line_roles = self.line_roles.items,
-        .marks = self.marks[0..self.mark_count],
+        .marks = self.marks.items,
         .activity = options.activity,
     });
 }
@@ -297,20 +341,22 @@ fn caption(self: *const Picker) Caption {
 
 /// Rebuild `content`: one row per option, the selected one in the selection role
 /// and any pre-existing choice tagged. Reverse video marks the selection with the
-/// terminal foreground and background. Every row carries text, so the frame holds
-/// no blank row. Rows are `\n`-separated and carry a three-column left pad for
-/// the selection marker. The trusted role lives separately in `line_roles`.
+/// terminal foreground and background. An unselected name stays at normal
+/// intensity. Extra after the separator is muted, or warning when it states
+/// pressure. Every row carries text, so the frame holds no blank row. Rows are
+/// `\n`-separated and carry a three-column left pad for the selection marker.
+/// The trusted role lives separately in `line_roles`.
 ///
 /// A list that waits holds one muted row with its wait text in place of the
 /// options. The row keeps the pad, so it lines up with the rows it replaced.
 fn compose(self: *Picker) !void {
     self.content.clearRetainingCapacity();
     self.line_roles.clearRetainingCapacity();
+    self.marks.clearRetainingCapacity();
     // Reset with the buffers it indexes into: a failure below must not leave the
     // offset past the shorter rebuilt content for `reflow` to slice.
     self.cursor_offset = 0;
 
-    self.mark_count = 0;
     if (self.wait) |text| {
         try self.startLine(.muted);
         try self.content.appendSlice(self.gpa, pad_plain);
@@ -319,33 +365,137 @@ fn compose(self: *Picker) !void {
             try self.content.appendSlice(self.gpa, paint.separator);
             const start = self.content.items.len;
             try self.content.appendSlice(self.gpa, url);
-            self.marks[0] = .{ .start = start, .end = self.content.items.len, .role = .link, .url = url };
-            self.mark_count = 1;
+            try self.marks.append(self.gpa, .{
+                .start = start,
+                .end = self.content.items.len,
+                .role = .link,
+                .url = url,
+            });
         }
         return self.cut(0, self.columns_max);
     }
 
-    for (self.options, 0..) |option, index| {
+    for (self.options, 0..) |*option, index| {
         const chosen = index == self.cursor;
-        const name: role.Name = if (chosen) .selection else .muted;
-        try self.startLine(name);
+        const in_use = self.marked == index;
+        const line_role: role.Name = if (chosen) .selection else .text;
+        try self.startLine(line_role);
         if (chosen) self.cursor_offset = self.content.items.len;
+        const tag_columns = occupancyColumns(in_use, option);
         const start = self.content.items.len;
-        const tag = if (self.marked == index) tag_current else "";
-        const tag_columns = terminal.width.ofText(tag);
         try self.content.appendSlice(self.gpa, if (chosen) pad_selected else pad_plain);
-        try self.content.appendSlice(self.gpa, option);
+        const name_start = self.content.items.len;
+        try self.content.appendSlice(self.gpa, option.name);
+        const name_end = self.content.items.len;
+        var extra_start: usize = 0;
+        var extra_end: usize = 0;
+        if (option.extra) |extra| {
+            extra_start = self.content.items.len;
+            try self.content.appendSlice(self.gpa, paint.separator);
+            try self.content.appendSlice(self.gpa, extra);
+            extra_end = self.content.items.len;
+        }
         if (tag_columns < self.columns_max) {
             // The tag states what the row is, so the cut takes the option text
             // and leaves the tag. The row then holds the width by construction.
             try self.cut(start, self.columns_max - tag_columns);
-            try self.content.appendSlice(self.gpa, tag);
+            try self.addRowMarks(&.{
+                .line_role = line_role,
+                .in_use = in_use,
+                .name_start = name_start,
+                .name_end = name_end,
+                .extra_start = extra_start,
+                .extra_end = extra_end,
+                .extra_pressure = option.extra_pressure,
+                .extra_present = option.extra != null,
+                .tag_start = 0,
+                .tag_end = 0,
+                .tag_pressure = false,
+                .tag_present = false,
+            });
+            const occupancy = try self.appendOccupancy(in_use, option);
+            if (occupancy.present) try self.addMark(
+                occupancy.start,
+                self.content.items.len,
+                if (occupancy.pressure) .warning else .muted,
+                false,
+            );
         } else {
             // The window is narrower than the tag, so one cut takes both.
-            try self.content.appendSlice(self.gpa, tag);
+            const occupancy = try self.appendOccupancy(in_use, option);
             try self.cut(start, self.columns_max);
+            try self.addRowMarks(&.{
+                .line_role = line_role,
+                .in_use = in_use,
+                .name_start = name_start,
+                .name_end = name_end,
+                .extra_start = extra_start,
+                .extra_end = extra_end,
+                .extra_pressure = option.extra_pressure,
+                .extra_present = option.extra != null,
+                .tag_start = occupancy.start,
+                .tag_end = occupancy.start + occupancy.len,
+                .tag_pressure = occupancy.pressure,
+                .tag_present = occupancy.present,
+            });
         }
     }
+}
+
+fn occupancyColumns(in_use: bool, option: *const Option) usize {
+    if (in_use) return terminal.width.ofText(tag_current);
+    const inner = option.tag orelse return 0;
+    return terminal.width.ofText(tag_open) + terminal.width.ofText(inner) +
+        terminal.width.ofText(tag_close);
+}
+
+fn appendOccupancy(self: *Picker, in_use: bool, option: *const Option) !Occupancy {
+    if (in_use) {
+        const start = self.content.items.len;
+        try self.content.appendSlice(self.gpa, tag_current);
+        return .{ .start = start, .len = tag_current.len, .pressure = false, .present = true };
+    }
+    const inner = option.tag orelse
+        return .{ .start = 0, .len = 0, .pressure = false, .present = false };
+    const start = self.content.items.len;
+    try self.content.appendSlice(self.gpa, tag_open);
+    try self.content.appendSlice(self.gpa, inner);
+    try self.content.appendSlice(self.gpa, tag_close);
+    return .{
+        .start = start,
+        .len = self.content.items.len - start,
+        .pressure = option.tag_pressure,
+        .present = true,
+    };
+}
+
+/// Paint extras, occupancy, and the current name on one composed row. A cut can
+/// drop the tail, so each run clamps to the bytes that remain.
+fn addRowMarks(self: *Picker, row: *const RowMarks) !void {
+    if (row.in_use) try self.addMark(row.name_start, row.name_end, row.line_role, true);
+    if (row.extra_present) try self.addMark(
+        row.extra_start,
+        row.extra_end,
+        if (row.extra_pressure) .warning else .muted,
+        false,
+    );
+    if (row.tag_present) try self.addMark(
+        row.tag_start,
+        row.tag_end,
+        if (row.tag_pressure) .warning else .muted,
+        false,
+    );
+}
+
+fn addMark(self: *Picker, start: usize, end: usize, name: role.Name, underline: bool) !void {
+    const to = @min(end, self.content.items.len);
+    if (start >= to) return;
+    try self.marks.append(self.gpa, .{
+        .start = start,
+        .end = to,
+        .role = name,
+        .underline = underline,
+    });
 }
 
 /// Cut the row that starts at `start` to `columns_max`, and mark the cut with
@@ -367,8 +517,8 @@ fn startLine(self: *Picker, name: role.Name) !void {
 }
 
 fn testPicker(gpa: std.mem.Allocator, labels: []const []const u8, cursor: usize) !Picker {
-    const options = try gpa.alloc([]const u8, labels.len);
-    for (labels, 0..) |label, index| options[index] = try gpa.dupe(u8, label);
+    const options = try gpa.alloc(Option, labels.len);
+    for (labels, options) |label, *option| option.* = .{ .name = try gpa.dupe(u8, label) };
     var picker = try Picker.init(gpa, "Pick", options, .{ .current = 0 });
     picker.cursor = cursor;
     try picker.compose();
@@ -410,6 +560,7 @@ test "the frame holds the option rows alone and the caption stays above it" {
     try std.testing.expect(std.mem.indexOf(u8, picker.content.items, "Esc: Cancel") == null);
     try std.testing.expect(std.mem.indexOf(u8, picker.content.items, "alpha (Current)") != null);
     try std.testing.expect(std.mem.indexOfScalar(u8, picker.content.items, 0x1b) == null);
+    try std.testing.expectEqual(role.Name.text, picker.line_roles.items[0].?);
     try std.testing.expectEqual(role.Name.selection, picker.line_roles.items[1].?);
 
     // Painted order: the accent title and muted controls, then the frame.
@@ -426,6 +577,62 @@ test "the frame holds the option rows alone and the caption stays above it" {
         std.mem.indexOf(u8, painted, "Esc: Cancel").? < std.mem.indexOf(u8, painted, "─").?,
     );
     try std.testing.expectEqual(@as(usize, 5), block.paintedRows(painted));
+}
+
+test "a current name is underlined, an extra is muted, and pressure is warning" {
+    const gpa = std.testing.allocator;
+    const options = try gpa.alloc(Option, 4);
+    options[0] = .{ .name = try gpa.dupe(u8, "high") };
+    options[1] = .{
+        .name = try gpa.dupe(u8, "medium"),
+        .extra = try gpa.dupe(u8, "The model folds this level to low."),
+    };
+    options[2] = .{
+        .name = try gpa.dupe(u8, "max"),
+        .extra = try gpa.dupe(u8, "The model drops this level."),
+        .extra_pressure = true,
+    };
+    options[3] = .{
+        .name = try gpa.dupe(u8, "google-cloud-key"),
+        .tag = try gpa.dupe(u8, "Not loaded"),
+        .tag_pressure = true,
+    };
+    var picker = try Picker.init(gpa, "Pick", options, .{ .current = 0 });
+    picker.cursor = 1;
+    try picker.compose();
+    defer picker.deinit();
+    const size: terminal.View.Size = .{ .columns = 80, .rows = 24 };
+    const painted = try renderForTest(gpa, &picker, size);
+    defer gpa.free(painted);
+
+    try std.testing.expectEqual(role.Name.text, picker.line_roles.items[0].?);
+    try std.testing.expectEqual(role.Name.selection, picker.line_roles.items[1].?);
+    const current_name = comptime attribute.sequence(.underline) ++ "high";
+    const extra = comptime role.sequence(.muted) ++ " · The model folds this level to low.";
+    const pressure = comptime role.sequence(.warning) ++ " · The model drops this level.";
+    const occupancy = comptime role.sequence(.warning) ++ " (Not loaded)";
+    try std.testing.expect(std.mem.indexOf(u8, painted, current_name) != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, extra) != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, pressure) != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, occupancy) != null);
+}
+
+test "option text is not extra or occupancy chrome" {
+    const gpa = std.testing.allocator;
+    const labels = [_][]const u8{
+        "Fix the bug (Current)",
+        "Notes · The output limit is unknown.",
+        "google-cloud-key (Not loaded)",
+    };
+    const options = try gpa.alloc(Option, labels.len);
+    for (labels, options) |label, *option| option.* = .{ .name = try gpa.dupe(u8, label) };
+    var picker = try Picker.init(gpa, "Prompt history", options, .{});
+    defer picker.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), picker.marks.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, picker.content.items, labels[0]) != null);
+    try std.testing.expect(std.mem.indexOf(u8, picker.content.items, labels[1]) != null);
+    try std.testing.expect(std.mem.indexOf(u8, picker.content.items, labels[2]) != null);
 }
 
 fn renderForTest(
@@ -469,8 +676,8 @@ test "a linked wait paints its link as a terminal hyperlink" {
         "   Send the code x7kq4m2p to @bot · https://t.me/bot?start=x7kq4m2p",
         picker.content.items,
     );
-    try std.testing.expectEqual(@as(usize, 1), picker.mark_count);
-    try std.testing.expectEqual(role.Name.link, picker.marks[0].role);
+    try std.testing.expectEqual(@as(usize, 1), picker.marks.items.len);
+    try std.testing.expectEqual(role.Name.link, picker.marks.items[0].role);
     const painted = try renderForTest(gpa, &picker, size);
     defer gpa.free(painted);
     try std.testing.expect(std.mem.indexOf(
@@ -481,7 +688,7 @@ test "a linked wait paints its link as a terminal hyperlink" {
 
     // A plain wait carries no link and no mark.
     try picker.beginWait("Drinky checks the bot token.");
-    try std.testing.expectEqual(@as(usize, 0), picker.mark_count);
+    try std.testing.expectEqual(@as(usize, 0), picker.marks.items.len);
     try std.testing.expect(std.mem.indexOf(u8, picker.content.items, "·") == null);
 }
 
@@ -503,7 +710,7 @@ test "a wait that cannot compose keeps no borrowed text" {
 
     try std.testing.expect(picker.wait == null);
     try std.testing.expect(picker.wait_link == null);
-    try std.testing.expectEqual(@as(usize, 0), picker.mark_count);
+    try std.testing.expectEqual(@as(usize, 0), picker.marks.items.len);
     try std.testing.expectEqual(@as(usize, 0), picker.content.items.len);
     // The empty list still paints, so the failure costs the rows alone.
     const painted = try renderForTest(gpa, &picker, .{ .columns = 80, .rows = 24 });
@@ -593,8 +800,8 @@ test "the opening row takes the cursor over the current value, inside the list" 
             .marked = null,
         },
     }) |case| {
-        const options = try gpa.alloc([]const u8, labels.len);
-        for (labels, 0..) |label, index| options[index] = try gpa.dupe(u8, label);
+        const options = try gpa.alloc(Option, labels.len);
+        for (labels, options) |label, *option| option.* = .{ .name = try gpa.dupe(u8, label) };
         var picker = try Picker.init(gpa, "Pick", options, case.start);
         defer picker.deinit();
         try std.testing.expectEqual(case.cursor, picker.cursor);
@@ -605,7 +812,7 @@ test "the opening row takes the cursor over the current value, inside the list" 
     }
 
     // An empty list holds no row at all.
-    const no_rows = try gpa.alloc([]const u8, 0);
+    const no_rows = try gpa.alloc(Option, 0);
     var empty = try Picker.init(gpa, "Pick", no_rows, .{ .position = .{ .cursor = 4 } });
     defer empty.deinit();
     try std.testing.expectEqual(@as(usize, 0), empty.cursor);
@@ -660,8 +867,11 @@ test "a row too wide for the window is cut and marked" {
     const painted = try renderForTest(gpa, &picker, size);
     defer gpa.free(painted);
     // The tag states what the row is, so the cut takes the text it marks and
-    // never the tag itself.
-    try std.testing.expect(std.mem.indexOf(u8, painted, " > anthropic-… (Current)") != null);
+    // never the tag itself. Paint splits the name and the tag, so the bytes in
+    // `content` hold the whole row.
+    try std.testing.expect(std.mem.indexOf(u8, picker.content.items, " > anthropic-… (Current)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "anthropic-…") != null);
+    try std.testing.expect(std.mem.indexOf(u8, painted, "(Current)") != null);
     try std.testing.expectEqual(@as(usize, 7), block.paintedRows(painted));
     // The kept control rows hold whole segments, and the segment past the row
     // bound drops whole. Esc still cancels, so the drop costs no capability.

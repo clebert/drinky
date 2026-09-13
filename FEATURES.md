@@ -415,8 +415,8 @@ to OpenRouter through a login or an API key, and to Gemini on the Gemini Enterpr
 
 ### Pickers
 
-- A picker is a single-choice list that tags the current value. Enter confirms. Ctrl+C or Ctrl+D
-  cancels from any step. The selection rolls over at both ends.
+- A picker is a single-choice list that underlines and tags the current value. Enter confirms.
+  Ctrl+C or Ctrl+D cancels from any step. The selection rolls over at both ends.
 - A selection can open a second list, which replaces the first one. Esc returns to the list that the
   selection came from, and Esc at the first list cancels. The key hint states which one the Esc
   does. Drinky skips a list on the way back that it skipped on the way down, and it reopens each

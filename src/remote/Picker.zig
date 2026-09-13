@@ -57,7 +57,7 @@ const Open = struct {
     /// the tapped row.
     payload: usize,
     /// The rows. Owned.
-    options: []const []const u8,
+    options: []const ai.command.Outcome.Pick.Option,
     /// Borrowed from the command, which names it in a literal.
     title: []const u8,
     cancellation_message: []const u8,
@@ -67,7 +67,7 @@ const Open = struct {
     trail_len: usize,
 
     fn deinit(self: *const Open, gpa: std.mem.Allocator) void {
-        for (self.options) |option| gpa.free(option);
+        for (self.options) |*option| option.deinit(gpa);
         gpa.free(self.options);
     }
 };
@@ -277,12 +277,8 @@ fn buildMarkup(self: *Picker, open: *const Open, current: ?usize) ![]u8 {
     }
     const shown = @min(open.options.len, rows_max);
     try buttons.ensureTotalCapacity(self.gpa, shown + 2);
-    for (open.options[0..shown], 0..) |option, index| {
-        const text = try std.fmt.allocPrint(
-            self.gpa,
-            "{s}{s}",
-            .{ if (current == index) current_mark else "", option },
-        );
+    for (open.options[0..shown], 0..) |*option, index| {
+        const text = try rowLabel(self.gpa, option, current == index);
         errdefer self.gpa.free(text);
         const data = try dataOf(self.gpa, .{ .row = .{ .serial = open.serial, .index = index } });
         buttons.appendAssumeCapacity(.{ .text = text, .data = data });
@@ -300,6 +296,23 @@ fn buildMarkup(self: *Picker, open: *const Open, current: ?usize) ![]u8 {
         buttons.appendAssumeCapacity(.{ .text = text, .data = data });
     }
     return keyboard.markup(self.gpa, buttons.items);
+}
+
+fn rowLabel(
+    gpa: std.mem.Allocator,
+    option: *const ai.command.Outcome.Pick.Option,
+    current: bool,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    errdefer out.deinit();
+    if (current) try out.writer.writeAll(current_mark);
+    try out.writer.writeAll(option.name);
+    if (option.extra) |extra| {
+        try out.writer.writeAll(" \u{00B7} ");
+        try out.writer.writeAll(extra);
+    }
+    if (option.tag) |tag| try out.writer.print(" ({s})", .{tag});
+    return out.toOwnedSlice();
 }
 
 /// The callback data of `tap`, owned.

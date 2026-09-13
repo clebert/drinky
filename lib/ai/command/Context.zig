@@ -143,12 +143,13 @@ pub const Outcome = union(enum) {
     /// `options` (each row and the slice) transfers to the app. The app frees
     /// them when the picker closes. The request borrows the title and the
     /// cancellation message. `current`, if set, is the row to mark and
-    /// preselect.
+    /// preselect. A row carries its extra and occupancy tag as fields, so the
+    /// picker never reads chrome out of the name.
     pub const Pick = struct {
         select: *const fn (*Context, Selection) anyerror!Outcome,
         title: []const u8,
         cancellation_message: []const u8,
-        options: []const []const u8,
+        options: []const Option,
         current: ?usize,
         /// A value the command sets on this picker and reads back from the
         /// selection, beside the tapped row. It names the earlier choice that
@@ -165,6 +166,22 @@ pub const Outcome = union(enum) {
         /// returns here. The app owns that trail, so a step names itself alone
         /// and knows nothing of the step above it.
         reopen: ?Opener = null,
+
+        /// One picker row. The name is the value. Extra and tag are chrome the
+        /// command sets. The picker paints them. It does not parse the name.
+        pub const Option = struct {
+            name: []const u8,
+            extra: ?[]const u8 = null,
+            extra_pressure: bool = false,
+            tag: ?[]const u8 = null,
+            tag_pressure: bool = false,
+
+            pub fn deinit(self: *const Option, gpa: std.mem.Allocator) void {
+                gpa.free(self.name);
+                if (self.extra) |extra| gpa.free(extra);
+                if (self.tag) |tag| gpa.free(tag);
+            }
+        };
 
         /// The tapped row and the payload the command set on this picker.
         pub const Selection = struct {
@@ -186,20 +203,66 @@ pub const Outcome = union(enum) {
     /// Builds a picker's owned rows. When the build fails, it frees the rows already built.
     pub const Options = struct {
         gpa: std.mem.Allocator,
-        rows: std.ArrayList([]const u8) = .empty,
+        rows: std.ArrayList(Pick.Option) = .empty,
 
         pub fn deinit(self: *Options) void {
-            for (self.rows.items) |row| self.gpa.free(row);
+            for (self.rows.items) |*row| row.deinit(self.gpa);
             self.rows.deinit(self.gpa);
         }
 
-        pub fn print(self: *Options, comptime format: []const u8, args: anytype) !void {
-            const row = try std.fmt.allocPrint(self.gpa, format, args);
-            errdefer self.gpa.free(row);
-            try self.rows.append(self.gpa, row);
+        pub fn add(self: *Options, option: Pick.Option) !void {
+            try self.rows.append(self.gpa, option);
         }
 
-        pub fn toOwnedSlice(self: *Options) ![]const []const u8 {
+        pub fn print(self: *Options, comptime format: []const u8, args: anytype) !void {
+            const name = try std.fmt.allocPrint(self.gpa, format, args);
+            errdefer self.gpa.free(name);
+            try self.add(.{ .name = name });
+        }
+
+        pub fn addExtra(
+            self: *Options,
+            extra_pressure: bool,
+            name: []const u8,
+            comptime extra_format: []const u8,
+            extra_args: anytype,
+        ) !void {
+            const name_copy = try self.gpa.dupe(u8, name);
+            errdefer self.gpa.free(name_copy);
+            const extra = try std.fmt.allocPrint(self.gpa, extra_format, extra_args);
+            errdefer self.gpa.free(extra);
+            try self.add(.{ .name = name_copy, .extra = extra, .extra_pressure = extra_pressure });
+        }
+
+        pub fn addExtraPrint(
+            self: *Options,
+            extra_pressure: bool,
+            comptime name_format: []const u8,
+            name_args: anytype,
+            comptime extra_format: []const u8,
+            extra_args: anytype,
+        ) !void {
+            const name = try std.fmt.allocPrint(self.gpa, name_format, name_args);
+            errdefer self.gpa.free(name);
+            const extra = try std.fmt.allocPrint(self.gpa, extra_format, extra_args);
+            errdefer self.gpa.free(extra);
+            try self.add(.{ .name = name, .extra = extra, .extra_pressure = extra_pressure });
+        }
+
+        pub fn addTag(
+            self: *Options,
+            tag_pressure: bool,
+            name: []const u8,
+            tag: []const u8,
+        ) !void {
+            const name_copy = try self.gpa.dupe(u8, name);
+            errdefer self.gpa.free(name_copy);
+            const tag_copy = try self.gpa.dupe(u8, tag);
+            errdefer self.gpa.free(tag_copy);
+            try self.add(.{ .name = name_copy, .tag = tag_copy, .tag_pressure = tag_pressure });
+        }
+
+        pub fn toOwnedSlice(self: *Options) ![]const Pick.Option {
             return self.rows.toOwnedSlice(self.gpa);
         }
     };

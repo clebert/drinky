@@ -3773,7 +3773,7 @@ fn applyChatOutcome(self: *App, outcome: ai.command.Outcome, origin: ChatOrigin)
             // A step that both reports and opens a list records its line first.
             // The picker takes the rows below, so a failure before it frees them.
             if (pick.report) |message| self.session.applyOutcome(.{ .event = message }) catch |err| {
-                for (pick.options) |option| self.gpa.free(option);
+                for (pick.options) |*option| option.deinit(self.gpa);
                 self.gpa.free(pick.options);
                 return err;
             };
@@ -4426,8 +4426,8 @@ test "Tab opens the prompt history over the idle prompt alone" {
     const picker = &app.session.mode.picking.picker;
     try std.testing.expectEqualStrings("Prompt history", picker.title);
     try std.testing.expectEqual(@as(usize, 2), picker.options.len);
-    try std.testing.expectEqualStrings("newer", picker.options[0]);
-    try std.testing.expectEqualStrings("older", picker.options[1]);
+    try std.testing.expectEqualStrings("newer", picker.options[0].name);
+    try std.testing.expectEqualStrings("older", picker.options[1].name);
     try std.testing.expectEqual(@as(usize, 0), picker.cursor);
     try std.testing.expect(picker.marked == null);
     try std.testing.expect(app.session.mode.picking.purpose == .prompt_history);
@@ -4629,8 +4629,8 @@ test "a history label folds its line breaks and cuts like every picker row" {
 
     try app.handleKeys("\t");
     const picker = &app.session.mode.picking.picker;
-    try std.testing.expectEqualStrings(long, picker.options[0]);
-    try std.testing.expectEqualStrings("one two three four", picker.options[1]);
+    try std.testing.expectEqualStrings(long, picker.options[0].name);
+    try std.testing.expectEqualStrings("one two three four", picker.options[1].name);
     try std.testing.expectEqualStrings(long, app.prompt_history.entries.items[0]);
     try std.testing.expectEqualStrings(
         "one\r\ntwo\rthree\nfour",
@@ -4678,8 +4678,8 @@ test "a failed prompt history open frees its labels once" {
         // found a step that never fails.
         if (step == 64) return error.TestSweepTooLong;
     }
-    try std.testing.expectEqualStrings("three", app.session.mode.picking.picker.options[0]);
-    try std.testing.expectEqualStrings("one two", app.session.mode.picking.picker.options[1]);
+    try std.testing.expectEqualStrings("three", app.session.mode.picking.picker.options[0].name);
+    try std.testing.expectEqualStrings("one two", app.session.mode.picking.picker.options[1].name);
 }
 
 // Enter appends the exact entry to the draft and writes nothing: a selection is
@@ -7338,8 +7338,8 @@ test "a picker confirmation keeps the characters typed behind it" {
     app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
 
-    const options = try gpa.alloc([]const u8, 1);
-    options[0] = try gpa.dupe(u8, "alpha");
+    const options = try gpa.alloc(ai.command.Outcome.Pick.Option, 1);
+    options[0] = .{ .name = try gpa.dupe(u8, "alpha") };
     try app.session.applyOutcome(.{ .pick = .{
         .select = struct {
             fn select(
@@ -8247,7 +8247,7 @@ test "the logout of the last account signs out and opens the login picker" {
     const picker = app.session.mode.picking.picker;
     try std.testing.expectEqualStrings("Sign in", picker.title);
     try std.testing.expectEqual(std.enums.values(ai.llm.Account).len, picker.options.len);
-    try std.testing.expectEqualStrings("anthropic-plan", picker.options[0]);
+    try std.testing.expectEqualStrings("anthropic-plan", picker.options[0].name);
 }
 
 // The next account can offer no model, because no fetch ran for it. The logout
@@ -8611,8 +8611,8 @@ test "the login picker rereads the store and keeps the active Console key live" 
     try std.testing.expect(app.session.mode == .picking);
     try std.testing.expectEqualStrings("Sign in", app.session.mode.picking.picker.title);
     try std.testing.expectEqualStrings(
-        "anthropic-api (Active)",
-        app.session.mode.picking.picker.options[1],
+        "anthropic-api",
+        app.session.mode.picking.picker.options[1].name,
     );
     try std.testing.expectEqual(borrowed.ptr, app.agent.client.?.credentials.anthropic_api.ptr);
     try std.testing.expectEqual(
@@ -8711,8 +8711,8 @@ test "the login picker hands the session off an account another instance signed 
     // The picker shows the store as it stands.
     try std.testing.expect(app.session.mode == .picking);
     const picker = app.session.mode.picking.picker;
-    try std.testing.expectEqualStrings("anthropic-plan", picker.options[0]);
-    try std.testing.expectEqualStrings("anthropic-api-key (Active)", picker.options[2]);
+    try std.testing.expectEqualStrings("anthropic-plan", picker.options[0].name);
+    try std.testing.expectEqualStrings("anthropic-api-key", picker.options[2].name);
 }
 
 // The last account can leave this way too. The session signs out, and the
@@ -8764,7 +8764,7 @@ test "the login picker signs out when another instance signed out the last accou
     );
     try std.testing.expect(app.session.mode == .picking);
     try std.testing.expectEqual(@as(usize, 0), app.session.mode.picking.trail.len);
-    try std.testing.expectEqualStrings("openai-plan", app.session.mode.picking.picker.options[3]);
+    try std.testing.expectEqualStrings("openai-plan", app.session.mode.picking.picker.options[3].name);
 }
 
 // A sign-in and a rotation in another instance move nothing here. The picker
@@ -8825,8 +8825,9 @@ test "the login picker shows a sign-in from another instance and keeps a rotated
     try std.testing.expectEqual(@as(usize, 1), app.session.transcript.blocks().len);
     try std.testing.expect(app.session.transcript.blocks()[0].content == .thinking);
     const picker = app.session.mode.picking.picker;
-    try std.testing.expectEqualStrings("anthropic-plan (Active)", picker.options[0]);
-    try std.testing.expectEqualStrings("xai-plan (Signed in)", picker.options[5]);
+    try std.testing.expectEqualStrings("anthropic-plan", picker.options[0].name);
+    try std.testing.expectEqualStrings("xai-plan", picker.options[5].name);
+    try std.testing.expectEqualStrings("Signed in", picker.options[5].tag.?);
 }
 
 // The hand-off adopts the first authenticated account. That account can have
@@ -9012,8 +9013,9 @@ test "the login picker reports one entry it cannot read and settles the rest" {
     try std.testing.expectEqual(ai.llm.Account.anthropic_plan, app.activeAccount().?);
     try std.testing.expectEqualStrings("r", app.accounts.anthropic_auth.tokens.?.refresh);
     const picker = app.session.mode.picking.picker;
-    try std.testing.expectEqualStrings("anthropic-plan (Active)", picker.options[0]);
-    try std.testing.expectEqualStrings("xai-plan (Signed in)", picker.options[5]);
+    try std.testing.expectEqualStrings("anthropic-plan", picker.options[0].name);
+    try std.testing.expectEqualStrings("xai-plan", picker.options[5].name);
+    try std.testing.expectEqualStrings("Signed in", picker.options[5].tag.?);
     const blocks = app.session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 1), blocks.len);
     try std.testing.expect(blocks[0].content.event.is_error);
@@ -9073,8 +9075,8 @@ test "the login picker opens over an unreadable credential file and reports it" 
     try std.testing.expect(app.accounts.isAuthenticated(.anthropic_plan));
     try std.testing.expect(app.session.mode == .picking);
     try std.testing.expectEqualStrings(
-        "anthropic-plan (Active)",
-        app.session.mode.picking.picker.options[0],
+        "anthropic-plan",
+        app.session.mode.picking.picker.options[0].name,
     );
     const blocks = app.session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 1), blocks.len);
@@ -9199,7 +9201,7 @@ test "token request failures keep the credential before a grant rejection remove
     try std.testing.expect(app.session.mode == .picking);
     try std.testing.expectEqualStrings(
         "anthropic-plan",
-        app.session.mode.picking.picker.options[0],
+        app.session.mode.picking.picker.options[0].name,
     );
 }
 
@@ -11761,8 +11763,8 @@ test "Esc, Ctrl+C, and Ctrl+D each cancel the picker with context" {
 
     const keys = [_]terminal.Input.Key{ .escape, .{ .ctrl = 'c' }, .{ .ctrl = 'd' } };
     for (keys) |key| {
-        const options = try gpa.alloc([]const u8, 1);
-        options[0] = try gpa.dupe(u8, "alpha");
+        const options = try gpa.alloc(ai.command.Outcome.Pick.Option, 1);
+        options[0] = .{ .name = try gpa.dupe(u8, "alpha") };
         try app.session.applyOutcome(.{
             .pick = .{
                 // Never called: every key under test cancels.
@@ -11958,8 +11960,8 @@ test "a fetch wakeup rebuilds the model step over the fetched list" {
     const rebuilt = &app.session.mode.picking.picker;
     try std.testing.expectEqualStrings("Model: anthropic-api-key", rebuilt.title);
     try std.testing.expectEqual(@as(usize, 2), rebuilt.options.len);
-    try std.testing.expectEqualStrings("Refresh the model list", rebuilt.options[0]);
-    try std.testing.expectEqualStrings("claude-opus-5", rebuilt.options[1]);
+    try std.testing.expectEqualStrings("Refresh the model list", rebuilt.options[0].name);
+    try std.testing.expectEqualStrings("claude-opus-5", rebuilt.options[1].name);
     try std.testing.expect(rebuilt.can_step_back);
     // The missed metadata states itself in the scrollback beside the list.
     const blocks = app.session.transcript.blocks();
@@ -12046,7 +12048,7 @@ test "Esc cancels a fetch and returns the rows of its step" {
     try std.testing.expect(!app.session.pickerWaits());
     const reopened = &app.session.mode.picking.picker;
     try std.testing.expectEqualStrings("Model: anthropic-api-key", reopened.title);
-    try std.testing.expectEqualStrings("Fetch the model list", reopened.options[0]);
+    try std.testing.expectEqualStrings("Fetch the model list", reopened.options[0].name);
     try std.testing.expect(reopened.can_step_back);
     try std.testing.expectEqualStrings(
         "You canceled the model fetch.",
@@ -12135,8 +12137,8 @@ test "Esc walks back through the command list that opened the command" {
     try app.submit();
     const commands = &app.session.mode.picking.picker;
     try std.testing.expect(!commands.can_step_back);
-    const model_row = for (commands.options, 0..) |option, index| {
-        if (std.mem.startsWith(u8, option, "/model —")) break index;
+    const model_row = for (commands.options, 0..) |*option, index| {
+        if (std.mem.eql(u8, option.name, "/model")) break index;
     } else return error.MissingModelRow;
 
     // Down to the last row and back up to the model row, in a window too short
@@ -12179,7 +12181,7 @@ test "Esc walks back through the command list that opened the command" {
     // The list opens where it was left, so the next Enter runs the same command
     // and the window does not jump. The list marks no row, so nothing but the
     // trail holds either value.
-    try std.testing.expectEqualStrings("/model", reopened.options[reopened.cursor][0..6]);
+    try std.testing.expectEqualStrings("/model", reopened.options[reopened.cursor].name);
     try std.testing.expectEqual(left_cursor, reopened.cursor);
     try std.testing.expectEqual(left_scroll, reopened.scroll);
     try std.testing.expect(reopened.marked == null);
@@ -12243,15 +12245,16 @@ test "the command list opens the skill list and writes the picked line" {
 
     // The `/skill` row opens the skill list over the command list.
     const commands = &app.session.mode.picking.picker;
-    commands.cursor = for (commands.options, 0..) |option, index| {
-        if (std.mem.startsWith(u8, option, "/skill —")) break index;
+    commands.cursor = for (commands.options, 0..) |*option, index| {
+        if (std.mem.eql(u8, option.name, "/skill")) break index;
     } else return error.MissingSkillRow;
     const enter: terminal.Input.Key = .enter;
     try app.handleKey(&enter);
     try std.testing.expect(app.session.mode == .picking);
     const listed_skills = &app.session.mode.picking.picker;
     try std.testing.expectEqualStrings("Skill", listed_skills.title);
-    try std.testing.expectEqualStrings("/skill:demo — Shape a demo.", listed_skills.options[0]);
+    try std.testing.expectEqualStrings("/skill:demo", listed_skills.options[0].name);
+    try std.testing.expectEqualStrings("Shape a demo.", listed_skills.options[0].extra.?);
 
     // The skill row closes the picker and writes its line, with the trailing
     // blank that marks where the task goes.
@@ -13095,8 +13098,8 @@ test "/remote lists the saved bots, and the remove row drops one with an event" 
     try std.testing.expect(app.session.mode == .picking);
     const picker = &app.session.mode.picking.picker;
     try std.testing.expectEqual(@as(usize, 4), picker.options.len);
-    try std.testing.expectEqualStrings("@first_bot", picker.options[0]);
-    try std.testing.expectEqualStrings("Remove a bot", picker.options[3]);
+    try std.testing.expectEqualStrings("@first_bot", picker.options[0].name);
+    try std.testing.expectEqualStrings("Remove a bot", picker.options[3].name);
 
     // The remove row opens the second list, and one pick is the decision.
     try app.handleKeys("\x1b[B\x1b[B\x1b[B\r");

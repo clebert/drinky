@@ -23,7 +23,7 @@ const Context = @import("Context.zig");
 const testing = @import("testing.zig");
 
 pub const name = "model";
-pub const summary = "switch the model";
+pub const summary = "Switch the model";
 
 /// Every step belongs to one `/model` run, so every step reports one cancellation.
 const cancellation_message = "You canceled the model selection.";
@@ -38,7 +38,7 @@ const refresh_row = "Refresh the model list";
 /// The mark of a model whose output limit no source states. Drinky then sends a
 /// low default, which can cut a long reply short, so the row states that Drinky
 /// does not know the output support of the model.
-const output_limit_mark = " · Output limit unknown";
+const extra_output_limit = "The output limit is unknown.";
 
 /// A picker selector. It takes the tapped row and the payload the command set.
 const Selector = *const fn (*Context, Context.Outcome.Pick.Selection) anyerror!Context.Outcome;
@@ -199,8 +199,7 @@ fn authorStep(context: *Context, account: llm.Account) !Context.Outcome {
     const lead = leadRows(context);
     if (lead > 0) try options.print("{s}", .{firstRow(list.items.len)});
     for (grouped, 0..) |author, index| {
-        try options.print("{s} · {d} model{s}", .{
-            author.name,
+        try options.addExtra(false, author.name, "{d} model{s}", .{
             author.count,
             format.pluralSuffix(author.count),
         });
@@ -449,7 +448,7 @@ fn row(
     model: *const Model,
 ) !void {
     if (model.outputLimitUnknown(account))
-        return options.print("{s}" ++ output_limit_mark, .{model.name()});
+        return options.addExtra(true, model.name(), extra_output_limit, .{});
     return options.print("{s}", .{model.name()});
 }
 
@@ -714,7 +713,7 @@ fn fetchReport(
 
 /// Free the rows of a picker that reaches no caller.
 fn freePick(gpa: std.mem.Allocator, pick: *const Context.Outcome.Pick) void {
-    for (pick.options) |option| gpa.free(option);
+    for (pick.options) |*option| option.deinit(gpa);
     gpa.free(pick.options);
 }
 
@@ -774,7 +773,7 @@ test "a fetch opens the list that arrived and states what it missed" {
     defer freePick(gpa, &metadata_gone);
     defer gpa.free(metadata_gone.report.?.content);
     try std.testing.expectEqual(@as(usize, 3), metadata_gone.options.len);
-    try std.testing.expectEqualStrings("claude-fable-5", metadata_gone.options[1]);
+    try std.testing.expectEqualStrings("claude-fable-5", metadata_gone.options[1].name);
     try std.testing.expectEqual(
         Context.Outcome.Severity.failure,
         metadata_gone.report.?.severity,
@@ -887,8 +886,8 @@ test "the first step lists the providers with an authenticated account" {
     defer freePick(gpa, &pick);
     try std.testing.expectEqualStrings("Provider", pick.title);
     try std.testing.expectEqual(@as(usize, 2), pick.options.len);
-    try std.testing.expectEqualStrings("anthropic", pick.options[0]);
-    try std.testing.expectEqualStrings("openai", pick.options[1]);
+    try std.testing.expectEqualStrings("anthropic", pick.options[0].name);
+    try std.testing.expectEqualStrings("openai", pick.options[1].name);
     // The active account marks its provider.
     try std.testing.expectEqual(@as(usize, 0), pick.current.?);
 }
@@ -905,8 +904,8 @@ test "one provider alone opens the account step at once" {
     defer freePick(gpa, &pick);
     try std.testing.expectEqualStrings("Account", pick.title);
     try std.testing.expectEqual(@as(usize, 2), pick.options.len);
-    try std.testing.expectEqualStrings("anthropic-plan", pick.options[0]);
-    try std.testing.expectEqualStrings("anthropic-api-key", pick.options[1]);
+    try std.testing.expectEqualStrings("anthropic-plan", pick.options[0].name);
+    try std.testing.expectEqualStrings("anthropic-api-key", pick.options[1].name);
     try std.testing.expectEqual(@as(usize, 1), pick.current.?);
 }
 
@@ -925,9 +924,9 @@ test "one account alone opens the model step at once" {
     try std.testing.expectEqualStrings("Model: anthropic-api-key", pick.title);
     // The fetch row leads the list, so the user can replace a stale one.
     try std.testing.expectEqual(@as(usize, 3), pick.options.len);
-    try std.testing.expectEqualStrings("Refresh the model list", pick.options[0]);
-    try std.testing.expectEqualStrings("claude-fable-5", pick.options[1]);
-    try std.testing.expectEqualStrings("claude-sonnet-4-6", pick.options[pick.current.?]);
+    try std.testing.expectEqualStrings("Refresh the model list", pick.options[0].name);
+    try std.testing.expectEqualStrings("claude-fable-5", pick.options[1].name);
+    try std.testing.expectEqualStrings("claude-sonnet-4-6", pick.options[pick.current.?].name);
 }
 
 // Anthropic takes the output limit from every request, so a model that states
@@ -951,15 +950,14 @@ test "a model row marks an output limit that no source states" {
     const anthropic_models = try expectPick(try modelStep(&context, .anthropic_api_key));
     defer freePick(gpa, &anthropic_models);
     // The vendor stated the limit of this model, so its row stands as it is.
-    try std.testing.expectEqualStrings("claude-fable-5", anthropic_models.options[1]);
-    try std.testing.expectEqualStrings(
-        "claude-sonnet-4-6 · Output limit unknown",
-        anthropic_models.options[2],
-    );
+    try std.testing.expectEqualStrings("claude-fable-5", anthropic_models.options[1].name);
+    try std.testing.expectEqualStrings("claude-sonnet-4-6", anthropic_models.options[2].name);
+    try std.testing.expectEqualStrings(extra_output_limit, anthropic_models.options[2].extra.?);
+    try std.testing.expect(anthropic_models.options[2].extra_pressure);
 
     const openai_models = try expectPick(try modelStep(&context, .openai_api_key));
     defer freePick(gpa, &openai_models);
-    try std.testing.expectEqualStrings("gpt-5.6-sol", openai_models.options[1]);
+    try std.testing.expectEqualStrings("gpt-5.6-sol", openai_models.options[1].name);
 }
 
 // Drinky compiles no model in, so an account the user never fetched offers the
@@ -975,7 +973,7 @@ test "an account with no model offers the fetch row alone" {
     const pick = try expectPick(try run(&context));
     defer freePick(gpa, &pick);
     try std.testing.expectEqual(@as(usize, 1), pick.options.len);
-    try std.testing.expectEqualStrings("Fetch the model list", pick.options[0]);
+    try std.testing.expectEqualStrings("Fetch the model list", pick.options[0].name);
     try std.testing.expect(pick.current == null);
 }
 
@@ -1008,9 +1006,11 @@ test "an OpenRouter account opens the author step then the models of that author
     defer freePick(gpa, &authors);
     try std.testing.expectEqualStrings("Author: openrouter-api-key", authors.title);
     try std.testing.expectEqual(@as(usize, 3), authors.options.len);
-    try std.testing.expectEqualStrings("Refresh the model list", authors.options[0]);
-    try std.testing.expectEqualStrings("openai · 2 models", authors.options[1]);
-    try std.testing.expectEqualStrings("qwen · 1 model", authors.options[2]);
+    try std.testing.expectEqualStrings("Refresh the model list", authors.options[0].name);
+    try std.testing.expectEqualStrings("openai", authors.options[1].name);
+    try std.testing.expectEqualStrings("2 models", authors.options[1].extra.?);
+    try std.testing.expectEqualStrings("qwen", authors.options[2].name);
+    try std.testing.expectEqualStrings("1 model", authors.options[2].extra.?);
     try std.testing.expectEqual(
         llm.Account.openrouter_api_key,
         (try selectRow(&authors, &context, 0)).fetch,
@@ -1020,15 +1020,15 @@ test "an OpenRouter account opens the author step then the models of that author
     defer freePick(gpa, &openai_models);
     try std.testing.expectEqualStrings("Model: openrouter-api-key", openai_models.title);
     try std.testing.expectEqual(@as(usize, 2), openai_models.options.len);
-    try std.testing.expectEqualStrings("openai/gpt-new", openai_models.options[0]);
-    try std.testing.expectEqualStrings("openai/gpt-old", openai_models.options[1]);
+    try std.testing.expectEqualStrings("openai/gpt-new", openai_models.options[0].name);
+    try std.testing.expectEqualStrings("openai/gpt-old", openai_models.options[1].name);
     try std.testing.expectEqual(authorKey("openai"), openai_models.payload);
     try Context.Outcome.expectEvent(try selectRow(&openai_models, &context, 1), .information);
     try std.testing.expectEqualStrings("openai/gpt-old", agent.model.?.name());
 
     const qwen_models = try expectPick(try selectRow(&authors, &context, 2));
     defer freePick(gpa, &qwen_models);
-    try std.testing.expectEqualStrings("qwen/qwen-new", qwen_models.options[0]);
+    try std.testing.expectEqualStrings("qwen/qwen-new", qwen_models.options[0].name);
     try std.testing.expectEqual(authorKey("qwen"), qwen_models.payload);
 
     // A row past the models of the author must not reach the next author.
@@ -1112,8 +1112,10 @@ test "a remote host lists the authors with no fetch row" {
     const authors = try expectPick(try run(&context));
     defer freePick(gpa, &authors);
     try std.testing.expectEqual(@as(usize, 2), authors.options.len);
-    try std.testing.expectEqualStrings("openai · 1 model", authors.options[0]);
-    try std.testing.expectEqualStrings("qwen · 1 model", authors.options[1]);
+    try std.testing.expectEqualStrings("openai", authors.options[0].name);
+    try std.testing.expectEqualStrings("1 model", authors.options[0].extra.?);
+    try std.testing.expectEqualStrings("qwen", authors.options[1].name);
+    try std.testing.expectEqualStrings("1 model", authors.options[1].extra.?);
 
     const qwen_models = try expectPick(try selectRow(&authors, &context, 1));
     defer freePick(gpa, &qwen_models);
@@ -1173,10 +1175,10 @@ test "a remote host lists the cached models with no fetch row" {
     const anthropic_models = try expectPick(try modelStep(&context, .anthropic_api_key));
     defer freePick(gpa, &anthropic_models);
     try std.testing.expectEqual(@as(usize, 2), anthropic_models.options.len);
-    try std.testing.expectEqualStrings("claude-fable-5", anthropic_models.options[0]);
+    try std.testing.expectEqualStrings("claude-fable-5", anthropic_models.options[0].name);
     try std.testing.expectEqualStrings(
         "claude-sonnet-4-6",
-        anthropic_models.options[anthropic_models.current.?],
+        anthropic_models.options[anthropic_models.current.?].name,
     );
     try Context.Outcome.expectEvent(try selectRow(&anthropic_models, &context, 0), .information);
     try std.testing.expectEqualStrings("claude-fable-5", agent.model.?.name());
@@ -1210,7 +1212,7 @@ test "the fetch row hands its account to the app" {
     defer freePick(gpa, &vendors);
     const anthropic_models = try expectPick(try selectRow(&vendors, &context, 0));
     defer freePick(gpa, &anthropic_models);
-    try std.testing.expectEqualStrings("Fetch the model list", anthropic_models.options[0]);
+    try std.testing.expectEqualStrings("Fetch the model list", anthropic_models.options[0].name);
     try std.testing.expectEqual(
         llm.Account.anthropic_api_key,
         (try selectRow(&anthropic_models, &context, 0)).fetch,
@@ -1218,7 +1220,7 @@ test "the fetch row hands its account to the app" {
 
     const openai_models = try expectPick(try selectRow(&vendors, &context, 1));
     defer freePick(gpa, &openai_models);
-    try std.testing.expectEqualStrings("Refresh the model list", openai_models.options[0]);
+    try std.testing.expectEqualStrings("Refresh the model list", openai_models.options[0].name);
     try std.testing.expectEqual(
         llm.Account.openai_api_key,
         (try selectRow(&openai_models, &context, 0)).fetch,
@@ -1260,7 +1262,7 @@ test "a provider row opens its accounts, and an account row opens its models" {
     defer freePick(gpa, &openai_models);
     try std.testing.expectEqualStrings("Model: openai-api-key", openai_models.title);
     try std.testing.expectEqual(@as(usize, 3), openai_models.options.len);
-    try std.testing.expectEqualStrings("gpt-5.6-sol", openai_models.options[1]);
+    try std.testing.expectEqualStrings("gpt-5.6-sol", openai_models.options[1].name);
 }
 
 // Esc returns to the picker that a row opened, so every step names the opener
@@ -1295,7 +1297,7 @@ test "each step names the opener that builds it again" {
     const reopened = try expectPick(try anthropic_accounts.reopen.?(&context));
     defer freePick(gpa, &reopened);
     try std.testing.expectEqualStrings("Account", reopened.title);
-    try std.testing.expectEqualStrings("anthropic-plan", reopened.options[0]);
+    try std.testing.expectEqualStrings("anthropic-plan", reopened.options[0].name);
     try std.testing.expect(reopened.reopen.? == accountStepOf(.anthropic));
 
     // A step that the flow skipped opens no picker, so it enters no trail and
@@ -1350,7 +1352,7 @@ test "a pick of the active model adopts the fetched description" {
 
     const pick = try expectPick(try run(&context));
     defer freePick(gpa, &pick);
-    try std.testing.expectEqualStrings("claude-opus-5", pick.options[pick.current.?]);
+    try std.testing.expectEqualStrings("claude-opus-5", pick.options[pick.current.?].name);
 
     const outcome = try selectRow(&pick, &context, 1);
     switch (outcome) {
@@ -1571,14 +1573,14 @@ test "the active mark matches the account, not just the model name" {
     defer freePick(gpa, &anthropic_accounts);
     try std.testing.expectEqualStrings(
         "anthropic-plan",
-        anthropic_accounts.options[anthropic_accounts.current.?],
+        anthropic_accounts.options[anthropic_accounts.current.?].name,
     );
 
     const subscription_models = try expectPick(try selectRow(&anthropic_accounts, &context, 0));
     defer freePick(gpa, &subscription_models);
     try std.testing.expectEqualStrings(
         "claude-sonnet-4-6",
-        subscription_models.options[subscription_models.current.?],
+        subscription_models.options[subscription_models.current.?].name,
     );
 
     // The same model name under the API account marks no row.

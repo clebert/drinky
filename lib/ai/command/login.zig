@@ -12,7 +12,7 @@ const Context = @import("Context.zig");
 const testing = @import("testing.zig");
 
 pub const name = "login";
-pub const summary = "sign in or switch the account";
+pub const summary = "Sign in or switch the account";
 
 /// Hand the open to the app. The registry table fixes the signature, and the
 /// rows come from `picker` once the app settled the session on the store.
@@ -25,13 +25,17 @@ pub fn run(context: *Context) !Context.Outcome {
 pub fn picker(context: *Context) !Context.Outcome {
     var options: Context.Outcome.Options = .{ .gpa = context.gpa };
     errdefer options.deinit();
-    for (std.enums.values(llm.Account)) |account| try writeRow(&options, context, account);
+    var current: ?usize = null;
+    for (std.enums.values(llm.Account), 0..) |account, index| {
+        try writeRow(&options, context, account);
+        if (isActive(context, account)) current = index;
+    }
     return .{ .pick = .{
         .select = select,
         .title = "Sign in",
         .cancellation_message = "You canceled the sign-in selection.",
         .options = try options.toOwnedSlice(),
-        .current = null,
+        .current = current,
     } };
 }
 
@@ -73,13 +77,13 @@ pub fn select(context: *Context, selection: Context.Outcome.Pick.Selection) !Con
 /// that source delivered.
 fn writeRow(options: *Context.Outcome.Options, context: *const Context, account: llm.Account) !void {
     const id = account.id();
-    if (isActive(context, account)) return options.print("{s} (Active)", .{id});
+    if (isActive(context, account)) return options.print("{s}", .{id});
     if (context.accounts.isAuthenticated(account)) {
-        if (account.hasLogin()) return options.print("{s} (Signed in)", .{id});
-        return options.print("{s} (Set)", .{id});
+        if (account.hasLogin()) return options.addTag(false, id, "Signed in");
+        return options.addTag(false, id, "Set");
     }
     if (context.accounts.loadError(account) != null)
-        return options.print("{s} (Not loaded)", .{id});
+        return options.addTag(true, id, "Not loaded");
     return options.print("{s}", .{id});
 }
 
@@ -112,29 +116,30 @@ test "the picker lists every account, marking the active and authenticated ones"
     switch (try picker(&context)) {
         .pick => |pick| {
             defer {
-                for (pick.options) |option| gpa.free(option);
+                for (pick.options) |*option| option.deinit(gpa);
                 gpa.free(pick.options);
             }
             try std.testing.expectEqualStrings("Sign in", pick.title);
             try std.testing.expectEqual(@as(usize, 10), pick.options.len);
-            try std.testing.expectEqualStrings("anthropic-plan (Signed in)", pick.options[0]);
-            try std.testing.expectEqualStrings("anthropic-api", pick.options[1]);
-            try std.testing.expectEqualStrings("anthropic-api-key (Active)", pick.options[2]);
-            try std.testing.expectEqualStrings("openai-plan", pick.options[3]);
-            try std.testing.expectEqualStrings("openai-api-key", pick.options[4]);
-            try std.testing.expectEqualStrings("xai-plan", pick.options[5]);
-            try std.testing.expectEqualStrings("xai-api-key", pick.options[6]);
-            try std.testing.expectEqualStrings("openrouter-api", pick.options[7]);
-            try std.testing.expectEqualStrings("openrouter-api-key", pick.options[8]);
-            try std.testing.expectEqualStrings("google-cloud-key", pick.options[9]);
-            try std.testing.expect(pick.current == null);
+            try std.testing.expectEqualStrings("anthropic-plan", pick.options[0].name);
+            try std.testing.expectEqualStrings("Signed in", pick.options[0].tag.?);
+            try std.testing.expectEqualStrings("anthropic-api", pick.options[1].name);
+            try std.testing.expectEqualStrings("anthropic-api-key", pick.options[2].name);
+            try std.testing.expectEqual(@as(usize, 2), pick.current.?);
+            try std.testing.expectEqualStrings("openai-plan", pick.options[3].name);
+            try std.testing.expectEqualStrings("openai-api-key", pick.options[4].name);
+            try std.testing.expectEqualStrings("xai-plan", pick.options[5].name);
+            try std.testing.expectEqualStrings("xai-api-key", pick.options[6].name);
+            try std.testing.expectEqualStrings("openrouter-api", pick.options[7].name);
+            try std.testing.expectEqualStrings("openrouter-api-key", pick.options[8].name);
+            try std.testing.expectEqualStrings("google-cloud-key", pick.options[9].name);
         },
         else => return error.ExpectedPick,
     }
 }
 
 /// The row of `account` as the picker prints it. The caller frees it.
-fn row(context: *const Context, account: llm.Account) ![]const u8 {
+fn row(context: *const Context, account: llm.Account) !Context.Outcome.Pick.Option {
     var options: Context.Outcome.Options = .{ .gpa = context.gpa };
     errdefer options.deinit();
     try writeRow(&options, context, account);
@@ -152,18 +157,22 @@ test "the picker marks a loaded key file, a failed one, and an API key apart" {
     var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
 
     const loaded = try row(&context, .google_cloud_key);
-    defer gpa.free(loaded);
-    try std.testing.expectEqualStrings("google-cloud-key (Set)", loaded);
+    defer loaded.deinit(gpa);
+    try std.testing.expectEqualStrings("google-cloud-key", loaded.name);
+    try std.testing.expectEqualStrings("Set", loaded.tag.?);
     const active = try row(&context, .openai_api_key);
-    defer gpa.free(active);
-    try std.testing.expectEqualStrings("openai-api-key (Active)", active);
+    defer active.deinit(gpa);
+    try std.testing.expectEqualStrings("openai-api-key", active.name);
+    try std.testing.expect(active.tag == null);
 
     // A key file that did not load shows as such, and a pick names the error.
     accounts.google_auth = null;
     accounts.google_error = error.FileNotFound;
     const failed = try row(&context, .google_cloud_key);
-    defer gpa.free(failed);
-    try std.testing.expectEqualStrings("google-cloud-key (Not loaded)", failed);
+    defer failed.deinit(gpa);
+    try std.testing.expectEqualStrings("google-cloud-key", failed.name);
+    try std.testing.expectEqualStrings("Not loaded", failed.tag.?);
+    try std.testing.expect(failed.tag_pressure);
     try Context.Outcome.expectNoticeContaining(
         try select(&context, .{ .payload = 0, .row = 9 }),
         .failure,
@@ -173,8 +182,9 @@ test "the picker marks a loaded key file, a failed one, and an API key apart" {
     // Without a load failure, the account is simply not set up.
     accounts.google_error = null;
     const absent = try row(&context, .google_cloud_key);
-    defer gpa.free(absent);
-    try std.testing.expectEqualStrings("google-cloud-key", absent);
+    defer absent.deinit(gpa);
+    try std.testing.expectEqualStrings("google-cloud-key", absent.name);
+    try std.testing.expect(absent.tag == null);
     try Context.Outcome.expectNoticeContaining(
         try select(&context, .{ .payload = 0, .row = 9 }),
         .information,

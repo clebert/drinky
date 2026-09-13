@@ -8,7 +8,7 @@ const std = @import("std");
 const Context = @import("Context.zig");
 
 pub const name = "remote";
-pub const summary = "attach a Telegram bot";
+pub const summary = "Attach a Telegram bot";
 
 const add_row = "Add a bot";
 const remove_row = "Remove a bot";
@@ -61,7 +61,7 @@ fn selectRemoval(context: *Context, selection: Context.Outcome.Pick.Selection) !
 }
 
 fn freePick(gpa: std.mem.Allocator, pick: *const Context.Outcome.Pick) void {
-    for (pick.options) |option| gpa.free(option);
+    for (pick.options) |*option| option.deinit(gpa);
     gpa.free(pick.options);
 }
 
@@ -74,7 +74,7 @@ test "a picker with no saved bot holds the add row alone" {
             defer freePick(gpa, &pick);
             try std.testing.expectEqualStrings("Remote", pick.title);
             try std.testing.expectEqual(@as(usize, 1), pick.options.len);
-            try std.testing.expectEqualStrings(add_row, pick.options[0]);
+            try std.testing.expectEqualStrings(add_row, pick.options[0].name);
             try std.testing.expect(pick.reopen.? == &run);
         },
         else => return error.ExpectedPick,
@@ -98,10 +98,10 @@ test "the rows name each bot, then the add row and the remove row" {
         .pick => |pick| {
             defer freePick(gpa, &pick);
             try std.testing.expectEqual(@as(usize, 4), pick.options.len);
-            try std.testing.expectEqualStrings("@drinky_bot", pick.options[0]);
-            try std.testing.expectEqualStrings("@other_bot", pick.options[1]);
-            try std.testing.expectEqualStrings(add_row, pick.options[2]);
-            try std.testing.expectEqualStrings(remove_row, pick.options[3]);
+            try std.testing.expectEqualStrings("@drinky_bot", pick.options[0].name);
+            try std.testing.expectEqualStrings("@other_bot", pick.options[1].name);
+            try std.testing.expectEqualStrings(add_row, pick.options[2].name);
+            try std.testing.expectEqualStrings(remove_row, pick.options[3].name);
         },
         else => return error.ExpectedPick,
     }
@@ -128,7 +128,7 @@ test "the remove row opens the second list, and one pick removes" {
             defer freePick(gpa, &pick);
             try std.testing.expectEqualStrings("Remove a bot", pick.title);
             try std.testing.expectEqual(@as(usize, 2), pick.options.len);
-            try std.testing.expectEqualStrings("@other_bot", pick.options[1]);
+            try std.testing.expectEqualStrings("@other_bot", pick.options[1].name);
             // The list builds itself again, so Esc returns to the first step.
             try std.testing.expect(pick.reopen.? == &openRemoval);
             switch (try pick.select(&context, .ofRow(1))) {

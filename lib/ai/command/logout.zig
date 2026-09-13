@@ -10,7 +10,7 @@ const Context = @import("Context.zig");
 const testing = @import("testing.zig");
 
 pub const name = "logout";
-pub const summary = "drop the credentials of an account";
+pub const summary = "Drop the credentials of an account";
 
 pub fn run(context: *Context) !Context.Outcome {
     var buffer: [account_count]llm.Account = undefined;
@@ -69,12 +69,12 @@ test "the picker lists only signed-in accounts, and none reports an error" {
     switch (try run(&context)) {
         .pick => |pick| {
             defer {
-                for (pick.options) |option| gpa.free(option);
+                for (pick.options) |*option| option.deinit(gpa);
                 gpa.free(pick.options);
             }
             try std.testing.expectEqualStrings("Sign out", pick.title);
             try std.testing.expectEqual(@as(usize, 1), pick.options.len);
-            try std.testing.expectEqualStrings("openai-plan", pick.options[0]);
+            try std.testing.expectEqualStrings("openai-plan", pick.options[0].name);
         },
         else => return error.ExpectedPick,
     }

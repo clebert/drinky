@@ -20,18 +20,18 @@ const Context = @import("Context.zig");
 const testing = @import("testing.zig");
 
 pub const name = "effort";
-pub const summary = "set the reasoning effort";
+pub const summary = "Set the reasoning effort";
 
 /// The whole ladder, in order.
 const ladder = std.enums.values(llm.Effort);
 
 /// The mark of a level that the model does not name. The request then carries
 /// the nearest level the model names, and the mark states that level.
-const fold_mark = " · Folds to ";
+const extra_fold = "The model folds this level to {s}.";
 
-/// The mark of a level that the model drops. The request then carries no
+/// The extra of a level that the model drops. The request then carries no
 /// reasoning control.
-const drop_mark = " · Dropped";
+const extra_drop = "The model drops this level.";
 
 pub fn run(context: *Context) !Context.Outcome {
     var options: Context.Outcome.Options = .{ .gpa = context.gpa };
@@ -66,8 +66,8 @@ fn printRow(
         .named => |found| if (found == level)
             options.print("{s}", .{tag})
         else
-            options.print("{s}" ++ fold_mark ++ "{s}", .{ tag, @tagName(found) }),
-        .omitted => options.print("{s}" ++ drop_mark, .{tag}),
+            options.addExtra(false, tag, extra_fold, .{@tagName(found)}),
+        .omitted => options.addExtra(true, tag, extra_drop, .{}),
     };
 }
 
@@ -98,16 +98,16 @@ fn contextForTest(agent: anytype) Context {
 }
 
 /// Test helper: the rows of `outcome`, which the caller must free.
-fn expectRows(outcome: Context.Outcome) ![]const []const u8 {
+fn expectRows(outcome: Context.Outcome) ![]const Context.Outcome.Pick.Option {
     return switch (outcome) {
         .pick => |pick| pick.options,
         else => error.ExpectedPick,
     };
 }
 
-fn freeRows(rows: []const []const u8) void {
+fn freeRows(rows: []const Context.Outcome.Pick.Option) void {
     const gpa = std.testing.allocator;
-    for (rows) |row| gpa.free(row);
+    for (rows) |*row| row.deinit(gpa);
     gpa.free(rows);
 }
 
@@ -124,9 +124,9 @@ test "the picker lists every level, preselecting the current one" {
             try std.testing.expect(pick.select == &select);
             try std.testing.expectEqualStrings("Effort", pick.title);
             try std.testing.expectEqual(ladder.len, pick.options.len);
-            try std.testing.expectEqualStrings("low", pick.options[0]);
-            try std.testing.expectEqualStrings("max", pick.options[ladder.len - 1]);
-            try std.testing.expectEqualStrings("high", pick.options[pick.current.?]);
+            try std.testing.expectEqualStrings("low", pick.options[0].name);
+            try std.testing.expectEqualStrings("max", pick.options[ladder.len - 1].name);
+            try std.testing.expectEqualStrings("high", pick.options[pick.current.?].name);
         },
         else => return error.ExpectedPick,
     }
@@ -147,15 +147,18 @@ test "the picker marks a level that the model folds" {
 
     const rows = try expectRows(try run(&context));
     defer freeRows(rows);
-    const expected = [_][]const u8{
-        "low",
-        "medium · Folds to low",
-        "high · Folds to low",
-        "xhigh · Folds to max",
-        "max",
-    };
-    try std.testing.expectEqual(expected.len, rows.len);
-    for (expected, rows) |want, row| try std.testing.expectEqualStrings(want, row);
+    try std.testing.expectEqual(@as(usize, 5), rows.len);
+    try std.testing.expectEqualStrings("low", rows[0].name);
+    try std.testing.expect(rows[0].extra == null);
+    try std.testing.expectEqualStrings("medium", rows[1].name);
+    try std.testing.expectEqualStrings("The model folds this level to low.", rows[1].extra.?);
+    try std.testing.expect(!rows[1].extra_pressure);
+    try std.testing.expectEqualStrings("high", rows[2].name);
+    try std.testing.expectEqualStrings("The model folds this level to low.", rows[2].extra.?);
+    try std.testing.expectEqualStrings("xhigh", rows[3].name);
+    try std.testing.expectEqualStrings("The model folds this level to max.", rows[3].extra.?);
+    try std.testing.expectEqualStrings("max", rows[4].name);
+    try std.testing.expect(rows[4].extra == null);
 }
 
 // The level is a wish of the user, so a model that names fewer levels narrows
@@ -193,8 +196,9 @@ test "a model that names no level keeps every row" {
     try std.testing.expectEqual(ladder.len, rows.len);
     // The model takes no level, so every row states that the request drops it.
     for (ladder, rows) |level, row| {
-        try std.testing.expect(std.mem.startsWith(u8, row, @tagName(level)));
-        try std.testing.expect(std.mem.endsWith(u8, row, " · Dropped"));
+        try std.testing.expectEqualStrings(@tagName(level), row.name);
+        try std.testing.expectEqualStrings(extra_drop, row.extra.?);
+        try std.testing.expect(row.extra_pressure);
     }
 
     try Context.Outcome.expectEvent(try select(&context, .ofRow(4)), .information);
@@ -234,7 +238,10 @@ test "the picker stands while the account offers no model" {
     defer freeRows(rows);
     try std.testing.expectEqual(ladder.len, rows.len);
     // No model resolves the level, so no row carries a mark.
-    for (ladder, rows) |level, row| try std.testing.expectEqualStrings(@tagName(level), row);
+    for (ladder, rows) |level, row| {
+        try std.testing.expectEqualStrings(@tagName(level), row.name);
+        try std.testing.expect(row.extra == null);
+    }
 
     try Context.Outcome.expectEvent(try select(&context, .ofRow(1)), .information);
     try std.testing.expectEqual(llm.Effort.medium, agent.effort);

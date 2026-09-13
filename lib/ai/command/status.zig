@@ -7,7 +7,7 @@ const std = @import("std");
 const Context = @import("Context.zig");
 
 pub const name = "status";
-pub const summary = "state the session";
+pub const summary = "State the session";
 
 pub fn run(context: *Context) !Context.Outcome {
     _ = context;
