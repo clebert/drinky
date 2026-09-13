@@ -65,6 +65,8 @@ const fetch_wait_text = "Drinky fetches the model list.";
 /// The notices of Tab where no prompt-history picker can open.
 const prompt_history_turn_notice = "Prompt history cannot open while a turn runs.";
 const prompt_history_empty_notice = "Prompt history is empty.";
+/// The warning of the first Esc over a draft during a turn.
+const turn_cancel_notice = "Press Esc again to cancel the turn. The draft stays.";
 /// The warning of a submitted prompt that the history cannot take. The turn runs
 /// anyway.
 const prompt_history_oversized_notice = std.fmt.comptimePrint(
@@ -1666,6 +1668,14 @@ fn handleKey(self: *App, event: *const terminal.Input.Key) !void {
     // keeps the offer.
     const confirms_revision = editor_live and at_prompt and event.* == .ctrl and event.ctrl == 'n';
     if (!confirms_revision) self.session.cancelConfirmation(.revision);
+    // During a turn the terminal owns, Esc dismisses a notice and nothing else.
+    // The cancel warning still takes the second Esc.
+    if (event.* == .escape and self.session.mode == .turn and editor_live) {
+        if (self.session.notice != null and !self.session.confirmations.contains(.turn_cancel)) {
+            self.session.clearNotice();
+            return;
+        }
+    }
     // Clear before the key routes, so a notice produced by this action survives it.
     self.session.clearNotice();
     // A sign-in keeps the raw terminal and editor. It owns every key until its
@@ -1683,9 +1693,9 @@ fn handleKey(self: *App, event: *const terminal.Input.Key) !void {
     // states the reason, and no other key reaches the editor.
     if (!editor_live) return self.handleExternalKey(event);
     // The token prompt outranks the mode, because a bot token must never reach
-    // a model. Only the prompt mode opens it, so this takes no key from another
-    // mode today, and it keeps that true if one ever runs beside it.
+    // a model. The check holds the same token, so it uses the same rule.
     if (self.controller.state() == .token_prompt) return self.handleTokenKey(event);
+    if (self.controller.pairs()) return self.handlePairingKey(event);
     if (self.session.mode == .turn) return self.handleTurnKey(event);
     if (try self.editKey(event)) return;
     switch (event.*) {
@@ -1817,11 +1827,12 @@ fn submitLoginLine(self: *App) !void {
 }
 
 /// Keys during a streaming turn. The editor stays live: Enter queues steering,
-/// and Ctrl+P recalls the queue. Esc and Ctrl+D cancel the turn and keep the
-/// draft. Esc warns first over a draft, because a reflex Esc while the user
-/// types can mean a dismiss or a clear. Ctrl+D cancels at once, so the legacy
-/// exit attempt Esc+Ctrl+D still works. Ctrl+C clears a draft first. A turn
-/// cannot host a picker, so Tab states that and changes nothing.
+/// and Ctrl+P recalls the queue. Esc first restores the status line. Esc and
+/// Ctrl+D cancel the turn and keep the draft. Esc warns first over a draft,
+/// because a reflex Esc while the user types can mean a dismiss or a clear.
+/// Ctrl+D cancels at once, so the legacy exit attempt Esc+Ctrl+D still works.
+/// Ctrl+C clears a draft first. A turn cannot host a picker, so Tab states that
+/// and changes nothing.
 fn handleTurnKey(self: *App, event: *const terminal.Input.Key) !void {
     if (try self.editKey(event)) return;
     switch (event.*) {
@@ -1847,7 +1858,7 @@ fn warnOrCancel(self: *App) !void {
     if (self.session.editor.visible().len == 0 or self.session.takeConfirmation(.turn_cancel))
         return self.cancelTurn();
     self.session.armConfirmation(.turn_cancel);
-    try self.reportNotice(.warning, "Press Esc again to cancel the turn. The draft stays.", .{});
+    try self.reportNotice(.warning, turn_cancel_notice, .{});
 }
 
 /// Ctrl+C during a turn: clear a draft, or cancel the turn when the editor is
@@ -5821,6 +5832,64 @@ test "a key between two esc presses drops the turn-cancel confirmation" {
     try std.testing.expectEqualStrings("draftx", app.session.editor.visible());
 }
 
+test "Esc dismisses a notice and leaves the turn running" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    defer app.drainQueue();
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = test_anthropic_model,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
+    defer app.session.deinit();
+
+    // Tab during a turn states its restriction. Esc restores the status line.
+    app.session.beginTurn(1);
+    try spawnCanceledTurn(&app);
+    try app.handleKey(&.tab);
+    try std.testing.expectEqualStrings(prompt_history_turn_notice, app.session.notice.?.content);
+    try app.handleKey(&.escape);
+    try std.testing.expect(app.session.mode == .turn);
+    try std.testing.expect(app.session.notice == null);
+    try std.testing.expect(app.turn_future != null);
+    try std.testing.expect(!app.session.confirmations.contains(.turn_cancel));
+
+    // The next Esc cancels, because the notice is gone and the editor is empty.
+    try app.handleKey(&.escape);
+    try std.testing.expect(app.session.mode == .prompt);
+    try std.testing.expect(app.turn_future == null);
+
+    // A draft warns on Esc. A notice takes that press too.
+    app.session.beginTurn(1);
+    try spawnCanceledTurn(&app);
+    try app.session.editor.insert("draft");
+    try app.handleKey(&.tab);
+    try app.handleKey(&.escape);
+    try std.testing.expect(app.session.mode == .turn);
+    try std.testing.expect(app.session.notice == null);
+    try std.testing.expect(app.turn_future != null);
+    try std.testing.expect(!app.session.confirmations.contains(.turn_cancel));
+    try std.testing.expectEqualStrings("draft", app.session.editor.visible());
+
+    // The next Esc warns. One more Esc cancels and keeps the draft.
+    try app.handleKey(&.escape);
+    try std.testing.expect(app.session.mode == .turn);
+    try std.testing.expectEqualStrings(turn_cancel_notice, app.session.notice.?.content);
+    try std.testing.expect(app.session.confirmations.contains(.turn_cancel));
+    try app.handleKey(&.escape);
+    try std.testing.expect(app.session.mode == .prompt);
+    try std.testing.expect(app.turn_future == null);
+    try std.testing.expectEqualStrings("draft", app.session.editor.visible());
+}
+
 test "a key between two ctrl+d presses drops the quit confirmation" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -9610,6 +9679,49 @@ test "a committed failure arms a retry that Esc dismisses" {
     try std.testing.expect(app.turn_future == null);
 }
 
+test "Esc at the prompt dismisses a notice and a recovery offer together" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    var app: App = undefined;
+    app.initForTest(gpa);
+    app.agent = ai.Agent.init(gpa, io, null, .{
+        .model = test_anthropic_model,
+        .system = "",
+        .retry = .{},
+        .environ = .empty,
+    });
+    defer app.agent.deinit();
+    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
+    defer app.session.deinit();
+    defer app.dropRetry();
+    app.session.beginTurn(1);
+
+    var result: WorkerResult = .{
+        .outcome = .{
+            .receipt = .{
+                .history_base = 0,
+                .history_end = 2,
+                .steering_committed_count = 0,
+            },
+            .disposition = .{ .failed = error.ApiError },
+        },
+        .error_text = try gpa.dupe(u8, "The provider is overloaded."),
+    };
+    defer app.freeWorkerResult(&result);
+    try app.finishWorkerResult(&result);
+
+    try app.session.applyOutcome(
+        try ai.command.Outcome.reportNotice(gpa, .information, "temporary", .{}),
+    );
+    try app.handleKey(&.escape);
+    try std.testing.expect(app.retry == null);
+    try std.testing.expectEqual(Session.PromptOffer.none, app.session.prompt_offer);
+    try std.testing.expect(app.session.notice == null);
+}
+
 // A human request that committed nothing needs no retry: it returns to the editor,
 // and the next Enter sends it as a normal turn.
 test "an uncommitted human failure returns to the editor and arms no retry" {
@@ -13176,6 +13288,35 @@ test "the add row opens the token prompt, and every exit key or a bad token keep
     try app.handleKeys("\x04");
     try std.testing.expectEqual(remote.Controller.State.idle, app.controller.state());
     try std.testing.expect(app.running);
+}
+
+test "Enter on the token-check wait starts no turn" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    // No script answers, so the check waits until shutdown.
+    var server = try remote_testing.Server.init(gpa, io, &.{});
+    defer server.deinit();
+    try server.start();
+    var url_buffer: [64]u8 = undefined;
+
+    var app: App = undefined;
+    app.initRemoteTest(gpa, io, &out, &server, &url_buffer);
+    defer app.deinitRemoteTest();
+
+    try app.runCommand("/remote");
+    try app.handleKeys("\r");
+    try app.handleKeys("42:secret\r");
+    try std.testing.expectEqual(remote.Controller.State.checking_token, app.controller.state());
+    try std.testing.expect(app.session.mode == .picking);
+
+    try app.handleKey(&.enter);
+    try std.testing.expect(app.session.mode == .picking);
+    try std.testing.expect(app.turn_future == null);
+    try std.testing.expectEqualStrings("42:secret", app.session.editor.visible());
 }
 
 test "a pairing shows its wait and its code in the picker, and the bind takes the input" {

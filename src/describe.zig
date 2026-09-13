@@ -156,7 +156,8 @@ fn writeKeys(writer: *std.Io.Writer, options: *const Options) !void {
         \\  a turn runs.` instead.
         \\- Ctrl+P moves the queued steering messages back into the editor, above the draft and
         \\  in the order the user sent them.
-        \\- Esc cancels the turn. Esc with a draft warns first and cancels on the second press.
+        \\- Esc cancels the turn. Esc first restores the status line. Esc with a draft warns first
+        \\  and cancels on the second press.
         \\- Ctrl+D cancels the turn at once.
         \\- Ctrl+C clears a draft, and it cancels the turn at an empty editor.
         \\
@@ -290,6 +291,11 @@ test "the document states every command, key, and discovery rule" {
     try std.testing.expect(std.mem.indexOf(u8, text[login..turn], "replays a callback URL") != null);
     try std.testing.expect(std.mem.indexOf(u8, text[login..turn], "cancels the sign-in") != null);
     try std.testing.expect(std.mem.indexOf(u8, text[turn..], "Ctrl+P moves") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        text[turn..],
+        "Esc first restores the status line.",
+    ) != null);
     try std.testing.expect(std.mem.indexOf(
         u8,
         text[turn..],

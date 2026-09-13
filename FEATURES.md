@@ -22,8 +22,9 @@ server through `DS4_BASE_URL`.
 - Enter during a turn queues a steering message. The turn takes it at the next tool round.
 - Ctrl+P moves the queued messages back into the editor, above the draft and in the order you sent
   them. A message that the turn did not take returns the same way when the turn ends.
-- Esc or Ctrl+D cancels the turn and keeps the draft. Esc with a draft warns first and cancels on
-  the second press. Ctrl+C clears the draft first and cancels only at an empty editor.
+- Esc or Ctrl+D cancels the turn and keeps the draft. Esc first restores the status line. Esc with a
+  draft warns first and cancels on the second press. Ctrl+C clears the draft first and cancels only
+  at an empty editor.
 - A canceled or failed turn keeps the finished rounds, drops the unfinished tail, and returns
   uncommitted text to the editor.
 - A refused send starts no turn, and the editor keeps the line for the next Enter.
@@ -562,7 +563,8 @@ server through `DS4_BASE_URL`.
   `Bot token · Enter: Save · Esc: Cancel`. A rejected token returns to the prompt with the token.
 - A new bot pairs: the picker states `Send the code x7kq4m2p to @bot` beside a clickable link, and
   the private chat that sends the code within five minutes binds. Drinky saves the bot as soon as
-  the token check passes, so a failed pairing keeps it in the picker.
+  the token check passes, so a failed pairing keeps it in the picker. Enter during the token check
+  sends nothing.
 - Three wrong codes end a pairing, and so does a five-minute wait. A group message counts as
   nothing, and an exit key cancels the pairing alone.
 - While a bot is attached, the bot holds the input. The editor shows `Remote: @bot · Esc: Detach`
