@@ -17,6 +17,9 @@ const million = 1_000_000.0;
 /// instead of truncating it into a name that no request can use.
 pub const name_bytes_max = 64;
 
+/// The longest engine label Drinky keeps for a picker row.
+pub const engine_bytes_max = 128;
+
 /// The output limit a request carries for a model whose sources state none.
 /// Anthropic requires the field, so a request must carry a number. A model that
 /// states its own limit stands far above this floor, and a reply that reaches
@@ -30,6 +33,9 @@ name_length: u8,
 /// name is the id itself.
 served_buffer: [name_bytes_max]u8,
 served_length: u8,
+/// The engine behind this request id. Empty when the provider states no label.
+engine_buffer: [engine_bytes_max]u8,
+engine_length: u8,
 /// The levels the provider named for this model.
 efforts: std.EnumSet(llm.Effort),
 /// Whether the vendor stated that this model takes no effort level at all. An
@@ -98,6 +104,8 @@ pub fn init(id: []const u8) error{BadModelName}!Model {
         .name_length = @intCast(id.len),
         .served_buffer = undefined,
         .served_length = 0,
+        .engine_buffer = undefined,
+        .engine_length = 0,
         .efforts = .initEmpty(),
         .efforts_denied = false,
         .thinking = .unknown,
@@ -143,6 +151,22 @@ pub fn servedName(self: *const Model) []const u8 {
     return self.served_buffer[0..self.served_length];
 }
 
+/// Record the engine label that describes the weights behind this request id.
+pub fn setEngine(self: *Model, engine_name: []const u8) error{BadEngineName}!void {
+    if (engine_name.len == 0 or engine_name.len > engine_bytes_max) return error.BadEngineName;
+    if (!std.unicode.utf8ValidateSlice(engine_name)) return error.BadEngineName;
+    for (engine_name) |byte| {
+        if (byte < ' ' or byte == 0x7f) return error.BadEngineName;
+    }
+    @memcpy(self.engine_buffer[0..engine_name.len], engine_name);
+    self.engine_length = @intCast(engine_name.len);
+}
+
+/// The engine behind this request id, or empty when no source states one.
+pub fn engineName(self: *const Model) []const u8 {
+    return self.engine_buffer[0..self.engine_length];
+}
+
 /// Whether a reply that a provider names as `served` came from this model: the
 /// name itself, or the id behind an alias. A reply from any other name came from
 /// a provider-side fallback.
@@ -168,6 +192,7 @@ pub fn sameName(self: *const Model, other: []const u8) bool {
 pub fn eql(self: *const Model, other: *const Model) bool {
     return self.sameName(other.name()) and
         std.mem.eql(u8, self.servedName(), other.servedName()) and
+        std.mem.eql(u8, self.engineName(), other.engineName()) and
         self.efforts.eql(other.efforts) and
         self.efforts_denied == other.efforts_denied and
         self.thinking == other.thinking and
@@ -235,7 +260,7 @@ pub fn outputLimitUnknown(self: *const Model, account: llm.Account) bool {
         // The Anthropic wire requires `max_tokens` in every request.
         .anthropic => true,
         // None of these wires sends a cap, so the budget of the model governs.
-        .openai, .xai, .openrouter, .deepseek, .google => false,
+        .openai, .xai, .openrouter, .deepseek, .google, .ds4 => false,
     };
 }
 
@@ -271,6 +296,7 @@ test init {
     // A fresh model states nothing beyond its name.
     try std.testing.expectEqual(@as(?u64, null), model.context_window);
     try std.testing.expectEqual(@as(?u32, null), model.tokens_max);
+    try std.testing.expectEqualStrings("", model.engineName());
     try std.testing.expectEqual(Thinking.unknown, model.thinking);
     try std.testing.expectEqual(Tools.unknown, model.tools);
     try std.testing.expect(!model.efforts_denied);
@@ -315,10 +341,24 @@ test "a name that a request line cannot carry names no model" {
 // back into the store the model came from.
 test "a copy owns its name" {
     var original = try init("gpt-5.6-sol");
+    try original.setEngine("Engine one");
     const copy = original;
     original = try init("gpt-5.6-luna");
     try std.testing.expectEqualStrings("gpt-5.6-sol", copy.name());
+    try std.testing.expectEqualStrings("Engine one", copy.engineName());
     try std.testing.expectEqualStrings("gpt-5.6-luna", original.name());
+}
+
+test "an engine label is bounded and safe for one picker row" {
+    var model = try init("model");
+    try model.setEngine("DeepSeek V4 Flash");
+    try std.testing.expectEqualStrings("DeepSeek V4 Flash", model.engineName());
+    try std.testing.expectError(error.BadEngineName, model.setEngine(""));
+    try std.testing.expectError(error.BadEngineName, model.setEngine("bad\nlabel"));
+    try std.testing.expectError(
+        error.BadEngineName,
+        model.setEngine("x" ** (engine_bytes_max + 1)),
+    );
 }
 
 // A fetch replaces the description of a model and keeps its name, so the
@@ -374,6 +414,10 @@ test eql {
     var aliased = init("claude-opus-5") catch unreachable;
     aliased.serveAs("claude-opus-5-20260101") catch unreachable;
     try std.testing.expect(!fetched.eql(&aliased));
+
+    var labeled = init("claude-opus-5") catch unreachable;
+    labeled.setEngine("Other weights") catch unreachable;
+    try std.testing.expect(!fetched.eql(&labeled));
 }
 
 // A provider names the id behind an alias as the model that served a reply, so

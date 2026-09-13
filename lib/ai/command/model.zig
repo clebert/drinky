@@ -40,6 +40,10 @@ const refresh_row = "Refresh the model list";
 /// does not know the output support of the model.
 const extra_output_limit = "The output limit is unknown.";
 
+/// The mark of a request id that names the engine behind it. Several ids can
+/// reach one loaded set of weights.
+const extra_engine = "Weights: {s}";
+
 /// A picker selector. It takes the tapped row and the payload the command set.
 const Selector = *const fn (*Context, Context.Outcome.Pick.Selection) anyerror!Context.Outcome;
 
@@ -441,7 +445,8 @@ fn leadRows(context: *const Context) usize {
 
 /// Write the picker row of `model` under `account`. A model whose output limit
 /// no source states carries the mark, because a request for it then sends the
-/// low default of `Model.tokens_max_fallback`.
+/// low default of `Model.tokens_max_fallback`. A DwarfStar id names the engine
+/// behind it.
 fn row(
     options: *Context.Outcome.Options,
     account: llm.Account,
@@ -449,6 +454,8 @@ fn row(
 ) !void {
     if (model.outputLimitUnknown(account))
         return options.addExtra(true, model.name(), extra_output_limit, .{});
+    if (model.engineName().len != 0)
+        return options.addExtra(false, model.name(), extra_engine, .{model.engineName()});
     return options.print("{s}", .{model.name()});
 }
 
@@ -958,6 +965,27 @@ test "a model row marks an output limit that no source states" {
     const openai_models = try expectPick(try modelStep(&context, .openai_api_key));
     defer freePick(gpa, &openai_models);
     try std.testing.expectEqualStrings("gpt-5.6-sol", openai_models.options[1].name);
+}
+
+test "a DwarfStar model row names the engine behind the request id" {
+    const gpa = std.testing.allocator;
+    var accounts = testing.accounts(.{ .ds4_base_url = "http://127.0.0.1:8000/v1" }, .{});
+    defer testing.deinitAccounts(&accounts);
+    try testing.seed(&accounts, .ds4, &.{ "deepseek-v4-flash", "deepseek-v4-pro" });
+    try accounts.catalog.accounts.get(.ds4)[0].setEngine("DeepSeek V4 Flash");
+    try accounts.catalog.accounts.get(.ds4)[1].setEngine("DeepSeek V4 Flash");
+    var agent = testing.agent(gpa, .{ .ds4 = "http://127.0.0.1:8000/v1" });
+    defer agent.deinit();
+    var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
+
+    const pick = try expectPick(try modelStep(&context, .ds4));
+    defer freePick(gpa, &pick);
+    try std.testing.expectEqualStrings("Refresh the model list", pick.options[0].name);
+    try std.testing.expectEqualStrings("deepseek-v4-flash", pick.options[1].name);
+    try std.testing.expectEqualStrings("Weights: DeepSeek V4 Flash", pick.options[1].extra.?);
+    try std.testing.expect(!pick.options[1].extra_pressure);
+    try std.testing.expectEqualStrings("deepseek-v4-pro", pick.options[2].name);
+    try std.testing.expectEqualStrings("Weights: DeepSeek V4 Flash", pick.options[2].extra.?);
 }
 
 // Drinky compiles no model in, so an account the user never fetched offers the

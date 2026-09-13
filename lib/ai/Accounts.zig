@@ -1,12 +1,12 @@
 //! The set of configured accounts and their live credentials: the OAuth login
-//! stores, the environment-sourced API keys, and the Google service
-//! account key file. It owns what a `provider.Client` points into: the `Auth`
-//! structs and (by borrow) the key bytes. A client built here stays valid for
-//! the whole session. It reports which accounts are authenticated and builds a
-//! client for one on demand. The selection is always an explicit account, never
-//! inferred from a precedence. It also owns the model catalog, because a fetch
-//! needs the credential of the account it fetches for. No fetch runs at startup:
-//! the user asks for one.
+//! stores, the environment-sourced API keys, the Google service account key
+//! file, and the local DwarfStar base URL. It owns what a `provider.Client`
+//! points into: the `Auth` structs and (by borrow) the key bytes. A client built
+//! here stays valid for the whole session. It reports which accounts are
+//! authenticated and builds a client for one on demand. The selection is always
+//! an explicit account, never inferred from a precedence. It also owns the
+//! model catalog, because a fetch needs the credential of the account it fetches
+//! for. No fetch runs at startup: the user asks for one.
 
 const std = @import("std");
 
@@ -14,6 +14,7 @@ const anthropic = @import("anthropic/root.zig");
 const auth = @import("auth.zig");
 const Catalog = @import("Catalog.zig");
 const deepseek = @import("deepseek/root.zig");
+const ds4 = @import("ds4/root.zig");
 const google = @import("google/root.zig");
 const json_store = @import("json_store.zig");
 const llm = @import("llm.zig");
@@ -47,6 +48,11 @@ google_auth: ?google.Auth,
 /// Google client. The login picker names the cause when the user picks the
 /// account.
 google_error: ?anyerror,
+/// The validated DwarfStar base URL without a trailing slash. It borrows the
+/// process environment.
+ds4_base_url: ?[]const u8,
+/// Why a set `DS4_BASE_URL` did not load, or null.
+ds4_error: ?anyerror,
 environment: Environment,
 /// Whether each subscription store loaded a credential from `auth.json`.
 anthropic_plan_ready: bool,
@@ -104,6 +110,8 @@ pub const Environment = struct {
     google_key_path: ?[]const u8 = null,
     /// `GOOGLE_CLOUD_LOCATION`: `eu`, `us`, or `global`.
     google_location: ?[]const u8 = null,
+    /// `DS4_BASE_URL`, which enables the credential-free local account.
+    ds4_base_url: ?[]const u8 = null,
 };
 
 /// A committed subscription login's persistence outcome. Both variants mean
@@ -166,8 +174,18 @@ pub fn init(
     }
     errdefer if (google_auth) |*cloud_auth| cloud_auth.deinit();
 
+    var ds4_base_url: ?[]const u8 = null;
+    var ds4_error: ?anyerror = null;
+    if (environment.ds4_base_url) |configured| {
+        ds4_base_url = normalizeDs4BaseUrl(configured) catch |err| failed: {
+            ds4_error = err;
+            break :failed null;
+        };
+    }
+
     var catalog = try Catalog.init(gpa, io, home);
     errdefer catalog.deinit();
+    if (ds4_base_url) |base_url| catalog.dropAccountFromAnotherUrl(.ds4, base_url);
 
     return .{
         .gpa = gpa,
@@ -180,6 +198,8 @@ pub fn init(
         .openrouter_auth = openrouter_auth,
         .google_auth = google_auth,
         .google_error = google_error,
+        .ds4_base_url = ds4_base_url,
+        .ds4_error = ds4_error,
         .environment = environment,
         .anthropic_plan_ready = anthropic_ready,
         .openai_plan_ready = openai_ready,
@@ -188,6 +208,19 @@ pub fn init(
         .openrouter_api_ready = openrouter_ready,
         .catalog = catalog,
     };
+}
+
+/// Validate and normalize one DwarfStar base URL. The result borrows `configured`.
+fn normalizeDs4BaseUrl(configured: []const u8) error{BadBaseUrl}![]const u8 {
+    const base_url = std.mem.trimEnd(u8, configured, "/");
+    const uri = std.Uri.parse(base_url) catch return error.BadBaseUrl;
+    if (!std.ascii.eqlIgnoreCase(uri.scheme, "http") and
+        !std.ascii.eqlIgnoreCase(uri.scheme, "https")) return error.BadBaseUrl;
+    const host = uri.host orelse return error.BadBaseUrl;
+    if (host.isEmpty()) return error.BadBaseUrl;
+    if (uri.query != null or uri.fragment != null) return error.BadBaseUrl;
+    if (!std.mem.endsWith(u8, base_url, "/v1")) return error.BadBaseUrl;
+    return base_url;
 }
 
 pub fn deinit(self: *Accounts) void {
@@ -216,14 +249,16 @@ pub fn isAuthenticated(self: *const Accounts, account: llm.Account) bool {
         .openrouter_api => self.openrouter_api_ready,
         .deepseek_api_key => self.environment.deepseek != null,
         .google_cloud_key => self.google_auth != null,
+        .ds4 => self.ds4_base_url != null,
     };
 }
 
 /// Why the environment names `account` and the account still did not load, or
-/// null. Only the key file account loads a file at startup, so only it can fail.
+/// null. A key file or a malformed local base URL can fail at startup.
 pub fn loadError(self: *const Accounts, account: llm.Account) ?anyerror {
     return switch (account) {
         .google_cloud_key => self.google_error,
+        .ds4 => self.ds4_error,
         else => null,
     };
 }
@@ -375,6 +410,7 @@ pub fn client(self: *Accounts, account: llm.Account) ?provider.Client {
             .{ .google_cloud_key = cloud_auth }
         else
             return null,
+        .ds4 => .{ .ds4 = self.ds4_base_url orelse return null },
     };
     return provider.Client.init(self.gpa, self.io, credentials, self.timeoutsOf(account));
 }
@@ -400,9 +436,9 @@ pub fn listModels(
     try self.catalog.list(account, out, gpa);
 }
 
-/// Fetch the model list of `account` and the public metadata, and store both.
-/// The two requests are independent, so a failure of one keeps the result of
-/// the other. Only the user starts this.
+/// Fetch the model list of `account` and store it. A remote account also
+/// fetches public metadata. Those two requests are independent. DwarfStar
+/// skips the metadata request. Only the user starts this.
 ///
 /// One window bounds the whole fetch: the token refresh, every page of the
 /// list, and the metadata request behind it. A list runs up to eight pages, so a
@@ -437,7 +473,7 @@ fn refreshWithin(
     } else {
         if (listFn(self, account, deadline)) |discovered| {
             defer self.gpa.free(discovered);
-            recordSave(&result.models_save_error, self.catalog.setAccount(account, discovered));
+            recordSave(&result.models_save_error, self.storeModels(account, discovered));
         } else |err| {
             result.models_error = err;
         }
@@ -447,12 +483,14 @@ fn refreshWithin(
         // caller discards the result of a canceled fetch.
         if (isCanceled(result.models_error) or isCanceled(result.models_save_error)) return result;
 
-        if (metadataFn(self.gpa, self.io, deadline)) |fetched| {
-            var metadata = fetched;
-            defer metadata.deinit();
-            recordSave(&result.metadata_save_error, self.catalog.setMetadata(metadata.entries));
-        } else |err| {
-            result.metadata_error = err;
+        if (account != .ds4) {
+            if (metadataFn(self.gpa, self.io, deadline)) |fetched| {
+                var metadata = fetched;
+                defer metadata.deinit();
+                recordSave(&result.metadata_save_error, self.catalog.setMetadata(metadata.entries));
+            } else |err| {
+                result.metadata_error = err;
+            }
         }
     }
 
@@ -462,6 +500,15 @@ fn refreshWithin(
         result.count = listed.items.len;
     } else |_| {}
     return result;
+}
+
+/// Store one fetched list with the source facts that its account needs.
+fn storeModels(self: *Accounts, account: llm.Account, discovered: []const Model) !void {
+    if (account != .ds4) return self.catalog.setAccount(account, discovered);
+    try self.catalog.setAccountAt(.ds4, .{
+        .models = discovered,
+        .base_url = self.ds4_base_url orelse return error.SignedOut,
+    });
 }
 
 /// Fold the outcome of one cache write into `slot`. The catalog holds what
@@ -546,6 +593,12 @@ fn fetchModels(self: *Accounts, account: llm.Account, deadline: net.Deadline) ![
             deadline,
             self.environment.deepseek orelse return error.SignedOut,
         ),
+        .ds4 => ds4.models.fetch(
+            self.gpa,
+            self.io,
+            deadline,
+            self.ds4_base_url orelse return error.SignedOut,
+        ),
     };
 }
 
@@ -558,6 +611,7 @@ fn timeoutsOf(self: *const Accounts, account: llm.Account) net.Timeouts {
         .openrouter => self.timeouts.openrouter,
         .deepseek => self.timeouts.deepseek,
         .google => self.timeouts.google,
+        .ds4 => self.timeouts.ds4,
     };
 }
 
@@ -578,6 +632,7 @@ pub fn callback(account: llm.Account) ?Callback {
         .openrouter_api_key,
         .deepseek_api_key,
         .google_cloud_key,
+        .ds4,
         => null,
     };
 }
@@ -624,6 +679,7 @@ pub fn login(self: *Accounts, account: llm.Account, prompt: anytype) !Login {
         .openrouter_api_key,
         .deepseek_api_key,
         .google_cloud_key,
+        .ds4,
         => return error.ApiAccountHasNoLogin,
     };
     return switch (provider_login) {
@@ -671,6 +727,7 @@ pub fn logout(self: *Accounts, account: llm.Account) !void {
         .openrouter_api_key,
         .deepseek_api_key,
         .google_cloud_key,
+        .ds4,
         => return error.ApiAccountHasNoLogout,
     }
 }
@@ -718,6 +775,7 @@ pub fn invalidate(self: *Accounts, account: llm.Account) !bool {
         .openrouter_api_key,
         .deepseek_api_key,
         .google_cloud_key,
+        .ds4,
         => {
             return error.AccountHasNoRefreshCredential;
         },
@@ -813,6 +871,7 @@ test "logout rejects the accounts whose credential is env-sourced" {
         .openrouter_api_key,
         .deepseek_api_key,
         .google_cloud_key,
+        .ds4,
     }) |account| {
         try std.testing.expectError(error.ApiAccountHasNoLogout, accounts.logout(account));
     }
@@ -829,6 +888,7 @@ test "invalidation rejects accounts without a refresh credential" {
         .openrouter_api_key,
         .deepseek_api_key,
         .google_cloud_key,
+        .ds4,
     }) |account| {
         try std.testing.expectError(
             error.AccountHasNoRefreshCredential,
@@ -869,6 +929,7 @@ test "a client carries the timeout pair of its provider" {
         .google = .{ .idle_ms = 3 },
         .xai = .{ .idle_ms = 4 },
         .deepseek = .{ .idle_ms = 5 },
+        .ds4 = .{ .idle_ms = 6 },
     };
     try std.testing.expectEqual(
         @as(u64, 1),
@@ -881,6 +942,7 @@ test "a client carries the timeout pair of its provider" {
     try std.testing.expectEqual(@as(u64, 3), accounts.timeoutsOf(.google_cloud_key).idle_ms);
     try std.testing.expectEqual(@as(u64, 4), accounts.timeoutsOf(.xai_plan).idle_ms);
     try std.testing.expectEqual(@as(u64, 5), accounts.timeoutsOf(.deepseek_api_key).idle_ms);
+    try std.testing.expectEqual(@as(u64, 6), accounts.timeoutsOf(.ds4).idle_ms);
 }
 
 test "the key file account loads from the key file and records a failed load" {
@@ -945,6 +1007,77 @@ test "the key file account loads from the key file and records a failed load" {
     defer bad_location.deinit();
     try std.testing.expectEqual(@as(?anyerror, error.BadLocation), bad_location.google_error);
     try std.testing.expectEqual(llm.Account.anthropic_api_key, bad_location.firstAuthenticated().?);
+}
+
+test "the DwarfStar account loads from DS4_BASE_URL and records a malformed URL" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var home_buffer: [128]u8 = undefined;
+    const home = try std.fmt.bufPrint(&home_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+
+    var absent = try Accounts.init(gpa, io, home, .{}, .{});
+    defer absent.deinit();
+    try std.testing.expect(!absent.isAuthenticated(.ds4));
+    try std.testing.expect(absent.loadError(.ds4) == null);
+
+    var ready = try Accounts.init(gpa, io, home, .{}, .{
+        .ds4_base_url = "http://127.0.0.1:8000/v1/",
+    });
+    defer ready.deinit();
+    try std.testing.expect(ready.isAuthenticated(.ds4));
+    try std.testing.expectEqualStrings("http://127.0.0.1:8000/v1", ready.ds4_base_url.?);
+    try std.testing.expect(ready.loadError(.ds4) == null);
+    try std.testing.expectEqual(llm.Account.ds4, ready.client(.ds4).?.account());
+
+    for ([_][]const u8{
+        "http://127.0.0.1:8000",
+        "http://127.0.0.1:8000/v1?x=1",
+        "http://127.0.0.1:8000/v1#frag",
+        "ftp://127.0.0.1:8000/v1",
+        "http:///v1",
+    }) |configured| {
+        var bad = try Accounts.init(gpa, io, home, .{}, .{ .ds4_base_url = configured });
+        defer bad.deinit();
+        try std.testing.expect(!bad.isAuthenticated(.ds4));
+        try std.testing.expectEqual(@as(?anyerror, error.BadBaseUrl), bad.loadError(.ds4));
+    }
+}
+
+test "startup drops a DwarfStar list that another URL stored" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var home_buffer: [128]u8 = undefined;
+    const home = try std.fmt.bufPrint(&home_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+
+    var model = Model.init("deepseek-v4-pro") catch unreachable;
+    model.thinking = .supported;
+    model.tools = .supported;
+    try model.setEngine("DeepSeek V4 Flash");
+
+    var written = try Accounts.init(gpa, io, home, .{}, .{
+        .ds4_base_url = "http://127.0.0.1:8000/v1",
+    });
+    try written.catalog.setAccountAt(.ds4, .{
+        .models = &.{model},
+        .base_url = written.ds4_base_url.?,
+    });
+    written.deinit();
+
+    var same = try Accounts.init(gpa, io, home, .{}, .{
+        .ds4_base_url = "http://127.0.0.1:8000/v1",
+    });
+    defer same.deinit();
+    try std.testing.expect(!same.catalog.isEmpty(.ds4));
+
+    var other = try Accounts.init(gpa, io, home, .{}, .{
+        .ds4_base_url = "http://127.0.0.1:9000/v1",
+    });
+    defer other.deinit();
+    try std.testing.expect(other.catalog.isEmpty(.ds4));
 }
 
 test "invalidation forgets a rejected credential when store removal fails" {
@@ -1374,6 +1507,34 @@ test "an OpenRouter fetch runs no list request and reports a failed body as the 
     );
     try std.testing.expect(arrived.models_error == null);
     try std.testing.expectEqual(@as(usize, 1), arrived.count);
+}
+
+test "a DwarfStar fetch skips public metadata" {
+    const gpa = std.testing.allocator;
+    var accounts = testAccounts(.{ .ds4_base_url = "http://127.0.0.1:8000/v1" }, false, false);
+    defer {
+        gpa.free(accounts.catalog.accounts.get(.ds4));
+        if (accounts.catalog.base_urls.get(.ds4)) |base_url| gpa.free(base_url);
+    }
+    const unbounded: net.Deadline = .{ .at = null };
+
+    const refused = accounts.refreshWithin(.ds4, unbounded, refuseList, refuseMetadata);
+    try std.testing.expectEqual(@as(?anyerror, error.ConnectionRefused), refused.models_error);
+    try std.testing.expect(refused.metadata_error == null);
+
+    const arrived = accounts.refreshWithin(.ds4, unbounded, ds4List, refuseMetadata);
+    try std.testing.expect(arrived.models_error == null);
+    try std.testing.expect(arrived.metadata_error == null);
+    try std.testing.expectEqual(@as(usize, 1), arrived.count);
+}
+
+fn ds4List(self: *Accounts, account: llm.Account, _: net.Deadline) ![]Model {
+    std.debug.assert(account == .ds4);
+    var model = try Model.init("deepseek-v4-pro");
+    model.thinking = .supported;
+    model.tools = .supported;
+    try model.setEngine("DeepSeek V4 Flash");
+    return try self.gpa.dupe(Model, &.{model});
 }
 
 fn openrouterMetadata(gpa: std.mem.Allocator, _: std.Io, _: net.Deadline) anyerror!Metadata {

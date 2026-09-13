@@ -28,6 +28,7 @@ fn sendsSystemHeader(account: llm.Account) bool {
         .openrouter_api_key,
         .deepseek_api_key,
         .google_cloud_key,
+        .ds4,
         => false,
     };
 }
@@ -204,6 +205,7 @@ fn emitsBlock(item: llm.Item, emit_thinking: bool, account: llm.Account) bool {
             .openrouter_api_key,
             .deepseek_api_key,
             .google_cloud_key,
+            .ds4,
             => false,
         },
         else => true,
@@ -305,6 +307,7 @@ fn writeThinking(stringify: *std.json.Stringify, reasoning: *const llm.Item.Reas
         .openrouter_api_key,
         .deepseek_api_key,
         .google_cloud_key,
+        .ds4,
         => unreachable,
     }
 }

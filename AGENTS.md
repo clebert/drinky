@@ -68,6 +68,8 @@ message from the user, because a bot message reads as a message that the bot wro
 
 - **author**: The slug before the slash in an OpenRouter model id, as in `openai` of
   `openai/gpt-5.6-sol`. OpenRouter keeps `provider` for the company that serves a request.
+- **engine**: The label of the weights behind a request id. A DwarfStar picker row shows it as
+  `Weights:`. Empty when no source states one.
 - **public metadata**: The price, window, effort, thinking, and tool facts of a model. Drinky stores
   them in `metadata.json`. Never write **OpenRouter** for that source.
 
@@ -77,11 +79,12 @@ message from the user, because a bot message reads as a message that the bot wro
 
 An account identifier reads `vendor-product`, as in `anthropic-plan`. A `-key` suffix marks a
 credential that an environment variable holds or names, as in `anthropic-api-key`. An identifier
-without it signs in through an OAuth login. `Account.id()` is the only spelling outside the enum
-tag. A model under an account reads `account/model`.
+without it signs in through an OAuth login. The local `ds4` account is the exception: it has no
+product tier and no `-key` suffix. `Account.id()` is the only spelling outside the enum tag. A model
+under an account reads `account/model`.
 
-- **vendor**: The `Provider` tag: `anthropic`, `openai`, `xai`, `openrouter`, `deepseek`, or
-  `google`.
+- **vendor**: The `Provider` tag: `anthropic`, `openai`, `xai`, `openrouter`, `deepseek`, `google`,
+  or `ds4`.
 - **plan**: A consumer subscription, as in Claude Pro or Max, ChatGPT, and SuperGrok.
 - **api**: The developer API of the vendor, billed per token.
 - **cloud**: The cloud platform of the vendor, as in a Google Cloud project on the Agent Platform.

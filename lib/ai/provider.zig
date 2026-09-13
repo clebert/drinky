@@ -41,6 +41,8 @@ pub const Credentials = union(llm.Account) {
     openrouter_api_key: []const u8,
     deepseek_api_key: []const u8,
     google_cloud_key: *google.Auth,
+    /// The validated base URL of the credential-free local server.
+    ds4: []const u8,
 };
 
 pub const Client = struct {
@@ -85,6 +87,7 @@ pub const Client = struct {
             .openrouter_api,
             .openrouter_api_key,
             .deepseek_api_key,
+            .ds4,
             => false,
         };
     }
@@ -148,8 +151,8 @@ pub const Client = struct {
             // differ in the credential alone, so both reach the public xAI
             // endpoint the same way. The two OpenRouter accounts differ in the
             // credential alone as well, and both ask for no encrypted
-            // reasoning. The DeepSeek account does too, and still receives a
-            // blob from its vendor.
+            // reasoning. DeepSeek does too. DwarfStar adds a dynamic endpoint
+            // and sends no authorization.
             inline .openai_plan,
             .openai_api_key,
             .xai_plan,
@@ -157,9 +160,20 @@ pub const Client = struct {
             .openrouter_api,
             .openrouter_api_key,
             .deepseek_api_key,
+            .ds4,
             => |credential, tag| {
                 const subscription = tag == .openai_plan or tag == .xai_plan;
-                const token = if (subscription) try credential.accessToken() else credential;
+                const token: ?[]const u8 = if (comptime tag == .ds4)
+                    null
+                else if (subscription)
+                    try credential.accessToken()
+                else
+                    credential;
+                const endpoint = if (comptime tag == .ds4)
+                    try std.fmt.allocPrint(self.gpa, "{s}/responses", .{credential})
+                else
+                    responsesUrl(tag);
+                defer if (comptime tag == .ds4) self.gpa.free(endpoint);
                 const body = try openai.wire.serialize(self.gpa, request, tag);
                 defer self.gpa.free(body);
                 out.* = @unionInit(Stream, @tagName(tag), undefined);
@@ -167,9 +181,10 @@ pub const Client = struct {
                     .gpa = self.gpa,
                     .io = self.io,
                     .timeouts = self.timeouts,
-                    .endpoint = responsesUrl(tag),
+                    .endpoint = endpoint,
                     .account_id = if (tag == .openai_plan) credential.accountId() else "",
                     .plain_reasoning = tag.replaysPlainReasoning(),
+                    .empty_reasoning = tag.acceptsEmptyReasoning(),
                 };
                 try transport.send(&@field(out.*, @tagName(tag)), .{
                     .body = body,
@@ -216,7 +231,8 @@ fn responsesUrl(comptime account: llm.Account) []const u8 {
         .anthropic_api,
         .anthropic_api_key,
         .google_cloud_key,
-        => @compileError("the account speaks no Responses protocol"),
+        .ds4,
+        => @compileError("the account has no static Responses endpoint"),
     };
 }
 
@@ -235,6 +251,7 @@ pub const Stream = union(llm.Account) {
     openrouter_api_key: openai.Transport.Stream,
     deepseek_api_key: openai.Transport.Stream,
     google_cloud_key: google.Transport.Stream,
+    ds4: openai.Transport.Stream,
 
     pub fn deinit(self: *Stream) void {
         switch (self.*) {
@@ -356,6 +373,8 @@ test "init selects the arm matching the credentials" {
     try std.testing.expectEqual(llm.Account.deepseek_api_key, deepseek_key.account());
     const cloud = Client.init(gpa, std.testing.io, .{ .google_cloud_key = undefined }, .{});
     try std.testing.expectEqual(llm.Account.google_cloud_key, cloud.account());
+    const local = Client.init(gpa, std.testing.io, .{ .ds4 = "http://127.0.0.1:8000/v1" }, .{});
+    try std.testing.expectEqual(llm.Account.ds4, local.account());
 }
 
 // A key account holds one fixed secret, so a rejected request stands. An OAuth
@@ -372,6 +391,7 @@ test "an OAuth account and the key file account renew, a key account does not" {
         .{ .openrouter_api_key = "sk-or" },
         .{ .openrouter_api = "sk-or" },
         .{ .deepseek_api_key = "sk-deepseek" },
+        .{ .ds4 = "http://127.0.0.1:8000/v1" },
     }) |credentials| {
         var client = Client.init(gpa, io, credentials, .{});
         try std.testing.expect(!try client.renewCredential());
@@ -472,4 +492,94 @@ test "fetchCredits is a pool read of the OpenRouter and DeepSeek accounts" {
     try std.testing.expectError(error.BadCredentials, login.fetchCredits());
     var deepseek_key = Client.init(gpa, io, .{ .deepseek_api_key = "key\r\nleaked" }, .{});
     try std.testing.expectError(error.BadCredentials, deepseek_key.fetchCredits());
+}
+
+test "a DwarfStar request posts to the local responses path" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try address.listen(io, .{});
+    defer server.deinit(io);
+    const base_url = try std.fmt.allocPrint(
+        gpa,
+        "http://127.0.0.1:{d}/v1",
+        .{server.socket.address.getPort()},
+    );
+    defer gpa.free(base_url);
+
+    var path: [128]u8 = undefined;
+    var path_len: usize = 0;
+    var serve = try io.concurrent(serveDs4Response, .{ io, &server, &path, &path_len });
+    var reaped = false;
+    defer if (!reaped) {
+        _ = serve.cancel(io) catch {};
+    };
+
+    var client = Client.init(gpa, io, .{ .ds4 = base_url }, .{});
+    var stream: Stream = undefined;
+    try client.send(&stream, &.{
+        .model = "deepseek-v4-pro",
+        .tokens_max = 8,
+        .system = "s",
+        .items = &.{},
+        .tools = &.{},
+    });
+    defer stream.deinit();
+    reaped = true;
+    try serve.await(io);
+    try std.testing.expectEqualStrings("/v1/responses", path[0..path_len]);
+}
+
+fn serveDs4Response(
+    io: std.Io,
+    server: *std.Io.net.Server,
+    path: *[128]u8,
+    path_len: *usize,
+) !void {
+    const body = "data: [DONE]\n\n";
+    var connection = try server.accept(io);
+    defer connection.close(io);
+
+    var read_buffer: [4096]u8 = undefined;
+    var reader = connection.reader(io, &read_buffer);
+    var content_length: usize = 0;
+    var first = true;
+    var lines_left: usize = 64;
+    while (lines_left > 0) : (lines_left -= 1) {
+        const raw = try reader.interface.takeDelimiterInclusive('\n');
+        const line = std.mem.trimEnd(u8, raw, "\r\n");
+        if (first) {
+            first = false;
+            const rest = if (std.mem.indexOfScalar(u8, line, ' ')) |space|
+                line[space + 1 ..]
+            else
+                line;
+            const captured = if (std.mem.indexOfScalar(u8, rest, ' ')) |space|
+                rest[0..space]
+            else
+                rest;
+            const length = @min(captured.len, path.len);
+            @memcpy(path[0..length], captured[0..length]);
+            path_len.* = length;
+        }
+        if (line.len == 0) break;
+        const label = "content-length:";
+        if (std.ascii.startsWithIgnoreCase(line, label)) {
+            const value = std.mem.trim(u8, line[label.len..], " \t");
+            content_length = try std.fmt.parseInt(usize, value, 10);
+        }
+    }
+    try reader.interface.discardAll(content_length);
+
+    var write_buffer: [512]u8 = undefined;
+    var writer = connection.writer(io, &write_buffer);
+    try writer.interface.print(
+        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n" ++
+            "content-length: {d}\r\nconnection: close\r\n\r\n{s}",
+        .{ body.len, body },
+    );
+    try writer.interface.flush();
 }

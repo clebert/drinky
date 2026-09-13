@@ -103,11 +103,12 @@ fn validSubscriptionCredentials(access_token: []const u8, account_id: []const u8
     return account_id.len == 0 or net.validHeaderValue(account_id);
 }
 
-/// One `GET /v1/models` request of a vendor that answers in the OpenAI list
-/// format: the list endpoint and the bearer credential that authorizes it.
+/// One `GET /v1/models` request: its endpoint, optional bearer credential, and
+/// decoder. A credential-free local server leaves `token` null.
 pub const List = struct {
     endpoint: []const u8,
-    token: []const u8,
+    token: ?[]const u8,
+    decoder: *const fn (std.mem.Allocator, []const u8) anyerror![]Model = parseApi,
 };
 
 /// Every model the API key `key` can name. The caller owns the result. The
@@ -121,8 +122,8 @@ pub fn fetchApi(
     return fetchList(gpa, io, deadline, &.{ .endpoint = api_endpoint, .token = key });
 }
 
-/// Every model that `list.token` can name at `list.endpoint`. The caller owns
-/// the result. The `deadline` bounds the request.
+/// Every model that `list.endpoint` offers. The caller owns the result. The
+/// request omits authorization when `list.token` is null. The deadline bounds it.
 pub fn fetchList(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -138,19 +139,25 @@ pub fn fetchList(
 }
 
 fn requestList(gpa: std.mem.Allocator, io: std.Io, list: *const List, out: *?[]Model) !void {
-    if (!net.validHeaderValue(list.token)) return error.BadModelListCredentials;
-    const authorization = try std.fmt.allocPrint(gpa, "Bearer {s}", .{list.token});
-    defer gpa.free(authorization);
+    var maybe_authorization: ?[]u8 = null;
+    if (list.token) |token| {
+        if (!net.validHeaderValue(token)) return error.BadModelListCredentials;
+        maybe_authorization = try std.fmt.allocPrint(gpa, "Bearer {s}", .{token});
+    }
+    defer if (maybe_authorization) |authorization| gpa.free(authorization);
 
     const extra = [_]std.http.Header{.{ .name = "accept", .value = "application/json" }};
     const body = try get(gpa, io, list.endpoint, .{
-        .headers = .{ .authorization = .{ .override = authorization } },
+        .headers = .{ .authorization = if (maybe_authorization) |authorization|
+            .{ .override = authorization }
+        else
+            .omit },
         .extra_headers = &extra,
         .redirect_behavior = .not_allowed,
     });
     defer gpa.free(body);
 
-    out.* = try parseApi(gpa, body);
+    out.* = try list.decoder(gpa, body);
 }
 
 /// The body of one successful GET. The caller owns it.
@@ -439,4 +446,63 @@ test "both parsers bound the entry count" {
     gpa.free(try parseApi(gpa, api_at_max));
     const api_over = "{\"data\":[{}" ++ (",{}" ** entry_count_max) ++ "]}";
     try std.testing.expectError(error.BadModelList, parseApi(gpa, api_over));
+}
+
+test "a list without a credential omits the Authorization header" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try address.listen(io, .{});
+    defer server.deinit(io);
+    const endpoint = try std.fmt.allocPrint(
+        gpa,
+        "http://127.0.0.1:{d}/v1/models",
+        .{server.socket.address.getPort()},
+    );
+    defer gpa.free(endpoint);
+
+    var has_authorization = false;
+    var serve = try io.concurrent(serveModelList, .{ io, &server, &has_authorization });
+    var reaped = false;
+    defer if (!reaped) {
+        _ = serve.cancel(io) catch {};
+    };
+
+    const models = try fetchList(gpa, io, .{ .at = null }, &.{
+        .endpoint = endpoint,
+        .token = null,
+    });
+    defer gpa.free(models);
+    reaped = true;
+    try serve.await(io);
+    try std.testing.expect(!has_authorization);
+    try std.testing.expectEqual(@as(usize, 0), models.len);
+}
+
+fn serveModelList(io: std.Io, server: *std.Io.net.Server, has_authorization: *bool) !void {
+    const body = "{\"object\":\"list\",\"data\":[]}";
+    var connection = try server.accept(io);
+    defer connection.close(io);
+
+    var read_buffer: [4096]u8 = undefined;
+    var reader = connection.reader(io, &read_buffer);
+    var lines_left: usize = 64;
+    while (lines_left > 0) : (lines_left -= 1) {
+        const raw = try reader.interface.takeDelimiterInclusive('\n');
+        const line = std.mem.trimEnd(u8, raw, "\r\n");
+        if (line.len == 0) break;
+        if (std.ascii.startsWithIgnoreCase(line, "authorization:")) has_authorization.* = true;
+    }
+
+    var write_buffer: [512]u8 = undefined;
+    var writer = connection.writer(io, &write_buffer);
+    try writer.interface.print(
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n" ++
+            "content-length: {d}\r\nconnection: close\r\n\r\n{s}",
+        .{ body.len, body },
+    );
+    try writer.interface.flush();
 }

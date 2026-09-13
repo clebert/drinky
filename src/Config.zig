@@ -127,15 +127,17 @@ const File = struct {
     };
 
     const Request = struct {
-        // The connect timeout depends on the network, not on the provider, so
-        // both providers share it and either default serves.
+        // Remote providers share the network connect timeout. DwarfStar uses a
+        // separate window because a local server can load weights for minutes.
         connect_timeout_ms: u64 = timeouts_default.anthropic.connect_ms,
+        ds4_connect_timeout_ms: u64 = timeouts_default.ds4.connect_ms,
         anthropic_idle_timeout_ms: u64 = timeouts_default.anthropic.idle_ms,
         openai_idle_timeout_ms: u64 = timeouts_default.openai.idle_ms,
         xai_idle_timeout_ms: u64 = timeouts_default.xai.idle_ms,
         google_idle_timeout_ms: u64 = timeouts_default.google.idle_ms,
         openrouter_idle_timeout_ms: u64 = timeouts_default.openrouter.idle_ms,
         deepseek_idle_timeout_ms: u64 = timeouts_default.deepseek.idle_ms,
+        ds4_idle_timeout_ms: u64 = timeouts_default.ds4.idle_ms,
         attempts_max: u32 = retry_default.attempts_max,
         backoff_ms_initial: u64 = retry_default.backoff_ms_initial,
         backoff_ms_max: u64 = retry_default.backoff_ms_max,
@@ -235,8 +237,13 @@ const keys = [_]Key{
     },
     .{
         .path = "request.connect_timeout_ms",
-        .description = "The time that Drinky waits for the head of a provider response. One " ++
-            "window of this size also bounds a whole model fetch.",
+        .description = "The time that Drinky waits for the head of a remote provider response. " ++
+            "One window of this size also bounds a remote model fetch.",
+    },
+    .{
+        .path = "request.ds4_connect_timeout_ms",
+        .description = "The time that Drinky waits for a DwarfStar response head. One window " ++
+            "of this size also bounds its model fetch.",
     },
     .{
         .path = "request.anthropic_idle_timeout_ms",
@@ -272,6 +279,11 @@ const keys = [_]Key{
         .description = "The time that Drinky waits between two streamed DeepSeek events. " ++
             "The first reasoning event can take a long time to arrive, so the default matches " ++
             "the OpenAI wait.",
+    },
+    .{
+        .path = "request.ds4_idle_timeout_ms",
+        .description = "The time that Drinky waits between two streamed DwarfStar events. A " ++
+            "local prefill can take many minutes.",
     },
     .{
         .path = "request.attempts_max",
@@ -545,7 +557,8 @@ pub fn document(
         \\DEEPSEEK_API_KEY variable. The
         \\google-cloud-key account reads the service account key file that
         \\GOOGLE_APPLICATION_CREDENTIALS names.
-        \\GOOGLE_CLOUD_LOCATION is eu, us, or global.
+        \\GOOGLE_CLOUD_LOCATION is eu, us, or global. DS4_BASE_URL enables the
+        \\credential-free ds4 account and ends at /v1.
         \\{s}
         \\### Models and effort
         \\
@@ -726,6 +739,10 @@ fn loadFromData(gpa: std.mem.Allocator, io: std.Io, options: *const DataOptions)
             .deepseek = .{
                 .connect_ms = request.connect_timeout_ms,
                 .idle_ms = request.deepseek_idle_timeout_ms,
+            },
+            .ds4 = .{
+                .connect_ms = request.ds4_connect_timeout_ms,
+                .idle_ms = request.ds4_idle_timeout_ms,
             },
         },
         .retry = .{
@@ -943,22 +960,25 @@ fn tmpPath(
 
 test "load reads the request section" {
     var config = try loadDataForTest(
-        \\{ "request": { "connect_timeout_ms": 1000, "anthropic_idle_timeout_ms": 2000,
-        \\  "openai_idle_timeout_ms": 3000, "google_idle_timeout_ms": 4000,
-        \\  "xai_idle_timeout_ms": 4500,
-        \\  "attempts_max": 5, "backoff_ms_initial": 100, "backoff_ms_max": 900 } }
+        \\{ "request": { "connect_timeout_ms": 1000, "ds4_connect_timeout_ms": 1500,
+        \\  "anthropic_idle_timeout_ms": 2000, "openai_idle_timeout_ms": 3000,
+        \\  "google_idle_timeout_ms": 4000, "xai_idle_timeout_ms": 4500,
+        \\  "ds4_idle_timeout_ms": 5000, "attempts_max": 5,
+        \\  "backoff_ms_initial": 100, "backoff_ms_max": 900 } }
     );
     defer config.deinit(std.testing.allocator);
-    // The shared connect bound reaches every provider.
+    // Remote providers share the connect bound. DwarfStar uses its own.
     try std.testing.expectEqual(@as(u64, 1000), config.timeouts.anthropic.connect_ms);
     try std.testing.expectEqual(@as(u64, 1000), config.timeouts.openai.connect_ms);
     try std.testing.expectEqual(@as(u64, 1000), config.timeouts.xai.connect_ms);
     try std.testing.expectEqual(@as(u64, 1000), config.timeouts.google.connect_ms);
     try std.testing.expectEqual(@as(u64, 1000), config.timeouts.deepseek.connect_ms);
+    try std.testing.expectEqual(@as(u64, 1500), config.timeouts.ds4.connect_ms);
     try std.testing.expectEqual(@as(u64, 2000), config.timeouts.anthropic.idle_ms);
     try std.testing.expectEqual(@as(u64, 3000), config.timeouts.openai.idle_ms);
     try std.testing.expectEqual(@as(u64, 4500), config.timeouts.xai.idle_ms);
     try std.testing.expectEqual(@as(u64, 4000), config.timeouts.google.idle_ms);
+    try std.testing.expectEqual(@as(u64, 5000), config.timeouts.ds4.idle_ms);
     try std.testing.expectEqual(@as(u32, 5), config.retry.attempts_max);
     try std.testing.expectEqual(@as(u64, 100), config.retry.backoff_ms_initial);
     try std.testing.expectEqual(@as(u64, 900), config.retry.backoff_ms_max);
@@ -1184,6 +1204,8 @@ test "load fills missing fields and sections from defaults" {
         timeouts_default.deepseek.idle_ms,
         empty.timeouts.deepseek.idle_ms,
     );
+    try std.testing.expectEqual(timeouts_default.ds4.connect_ms, empty.timeouts.ds4.connect_ms);
+    try std.testing.expectEqual(timeouts_default.ds4.idle_ms, empty.timeouts.ds4.idle_ms);
     try std.testing.expectEqual(retry_default.attempts_max, empty.retry.attempts_max);
     try std.testing.expectEqual(@as(usize, 0), empty.user_instructions.files().len);
 }

@@ -8,10 +8,11 @@
 //! credential replacement drop that list from memory, and a removal that fails
 //! leaves it in the file, so the next start loads it again. An account that
 //! reads its key from the environment has no such event, so its list stands
-//! until the next fetch. `metadata.json` holds the public facts of a vendor
-//! model, which belong to nobody and survive every logout. It also holds the
-//! OpenRouter list, which is public, so an OpenRouter account reads that list
-//! and never writes `models.json`.
+//! until the next fetch. A DwarfStar list also drops when the base URL changes
+//! at startup. `metadata.json` holds the public facts of a vendor model, which
+//! belong to nobody and survive every logout. It also holds the OpenRouter list,
+//! which is public, so an OpenRouter account reads that list and never writes
+//! `models.json`.
 //!
 //! A merge joins them, and the vendor wins every field it states. Only the
 //! aggregator prices a model.
@@ -29,6 +30,7 @@ const Catalog = @This();
 /// The longest effort list one model can encode: every rung and its separator.
 const efforts_bytes_max = 64;
 const models_key = "models";
+const base_url_key = "base_url";
 
 gpa: std.mem.Allocator,
 io: std.Io,
@@ -41,6 +43,9 @@ metadata_path: []const u8,
 /// vendor stated it. An empty list means the user has not fetched that account
 /// yet. An OpenRouter account holds no such list.
 accounts: std.EnumArray(llm.Account, []Model),
+/// The base URL stored with each account list. Only DwarfStar sets one.
+/// Each non-null value is owned.
+base_urls: std.EnumArray(llm.Account, ?[]const u8),
 /// The public metadata of every vendor model Drinky reaches, and the OpenRouter
 /// list under that provider.
 metadata: []Metadata.Entry,
@@ -50,6 +55,8 @@ metadata: []Metadata.Entry,
 /// fact. A decoder takes that null as the absent value it is.
 const Encoded = struct {
     name: []const u8,
+    /// The engine behind this request id, or null when no source states one.
+    engine: ?[]const u8,
     /// The id behind an alias, or null when the name is the id itself.
     served_as: ?[]const u8,
     context_window: ?u64,
@@ -80,6 +87,7 @@ pub fn init(gpa: std.mem.Allocator, io: std.Io, home: []const u8) !Catalog {
         .models_path = models_path,
         .metadata_path = metadata_path,
         .accounts = .initFill(&.{}),
+        .base_urls = .initFill(null),
         .metadata = &.{},
     };
     catalog.loadAccounts();
@@ -88,7 +96,10 @@ pub fn init(gpa: std.mem.Allocator, io: std.Io, home: []const u8) !Catalog {
 }
 
 pub fn deinit(self: *Catalog) void {
-    for (std.enums.values(llm.Account)) |account| self.gpa.free(self.accounts.get(account));
+    for (std.enums.values(llm.Account)) |account| {
+        self.gpa.free(self.accounts.get(account));
+        if (self.base_urls.get(account)) |base_url| self.gpa.free(base_url);
+    }
     self.gpa.free(self.metadata);
     self.gpa.free(self.models_path);
     self.gpa.free(self.metadata_path);
@@ -152,7 +163,8 @@ pub fn find(self: *const Catalog, account: llm.Account, name: []const u8) ?Model
 /// keeps the window of its own backend even where the public API contradicts it.
 fn merge(self: *const Catalog, account: llm.Account, vendor: Model) ?Model {
     var merged = vendor;
-    const public = self.lookup(account.provider(), vendor.name());
+    // DwarfStar states local facts. Public metadata cannot describe that server.
+    const public = if (account == .ds4) null else self.lookup(account.provider(), vendor.name());
     if (public) |extra| {
         merged.price = extra.price;
         if (merged.context_window == null) merged.context_window = extra.context_window;
@@ -186,11 +198,57 @@ fn lookup(self: *const Catalog, provider: llm.Provider, name: []const u8) ?Model
 /// path skips its `models.json` entry, so a write here would leave a list that
 /// nothing reads.
 pub fn setAccount(self: *Catalog, account: llm.Account, discovered: []const Model) !void {
+    std.debug.assert(account != .ds4);
+    try self.replaceAccount(account, .{ .models = discovered });
+}
+
+/// Replace an account list and store the base URL that supplied it.
+pub fn setAccountAt(
+    self: *Catalog,
+    account: llm.Account,
+    options: struct { models: []const Model, base_url: []const u8 },
+) !void {
+    std.debug.assert(account == .ds4);
+    try self.replaceAccount(account, .{
+        .models = options.models,
+        .base_url = options.base_url,
+    });
+}
+
+fn replaceAccount(
+    self: *Catalog,
+    account: llm.Account,
+    options: struct { models: []const Model, base_url: ?[]const u8 = null },
+) !void {
     std.debug.assert(account.provider() != .openrouter);
-    const copy = try self.gpa.dupe(Model, discovered);
+    const models = try self.gpa.dupe(Model, options.models);
+    var installed = false;
+    errdefer if (!installed) self.gpa.free(models);
+    const base_url = if (options.base_url) |source| try self.gpa.dupe(u8, source) else null;
+    errdefer if (!installed) if (base_url) |url| self.gpa.free(url);
+
     self.gpa.free(self.accounts.get(account));
-    self.accounts.set(account, copy);
+    if (self.base_urls.get(account)) |old| self.gpa.free(old);
+    self.accounts.set(account, models);
+    self.base_urls.set(account, base_url);
+    // A failed write leaves the list in memory for this session.
+    installed = true;
     try self.saveAccount(account);
+}
+
+/// Drop a stored list when `base_url` differs from its source. A legacy list
+/// has no source and therefore differs. An absent list needs no file change.
+pub fn dropAccountFromAnotherUrl(
+    self: *Catalog,
+    account: llm.Account,
+    base_url: []const u8,
+) void {
+    std.debug.assert(account == .ds4);
+    const maybe_stored = self.base_urls.get(account);
+    if (maybe_stored) |stored| {
+        if (std.mem.eql(u8, stored, base_url)) return;
+    } else if (self.accounts.get(account).len == 0) return;
+    self.dropAccount(account);
 }
 
 /// Drop the list of `account` from memory, and remove it from the file. The
@@ -199,7 +257,9 @@ pub fn setAccount(self: *Catalog, account: llm.Account, discovered: []const Mode
 /// the file as it stands, so the next start loads that list again.
 pub fn dropAccount(self: *Catalog, account: llm.Account) void {
     self.gpa.free(self.accounts.get(account));
+    if (self.base_urls.get(account)) |base_url| self.gpa.free(base_url);
     self.accounts.set(account, &.{});
+    self.base_urls.set(account, null);
     if (self.models_path.len == 0) return;
     json_store.remove(self.gpa, self.io, self.models_path, account.id()) catch {};
 }
@@ -220,8 +280,18 @@ fn loadAccounts(self: *Catalog) void {
         const entry = file.entry(account.id()) orelse continue;
         const listed = json.array(entry.get(models_key)) orelse continue;
         const models = self.decodeList(listed) catch continue;
+        const maybe_source = if (account == .ds4) json.string(entry.get(base_url_key)) else null;
+        const base_url = if (maybe_source) |source|
+            self.gpa.dupe(u8, source) catch {
+                self.gpa.free(models);
+                continue;
+            }
+        else
+            null;
         self.gpa.free(self.accounts.get(account));
+        if (self.base_urls.get(account)) |old| self.gpa.free(old);
         self.accounts.set(account, models);
+        self.base_urls.set(account, base_url);
     }
 }
 
@@ -233,6 +303,7 @@ fn loadMetadata(self: *Catalog) void {
     var entries: std.ArrayList(Metadata.Entry) = .empty;
     defer entries.deinit(self.gpa);
     for (std.enums.values(llm.Provider)) |provider| {
+        if (provider == .ds4) continue;
         const entry = file.entry(@tagName(provider)) orelse continue;
         const listed = json.array(entry.get(models_key)) orelse continue;
         for (listed.items) |value| {
@@ -260,6 +331,13 @@ fn saveAccount(self: *Catalog, account: llm.Account) !void {
     var arena: std.heap.ArenaAllocator = .init(self.gpa);
     defer arena.deinit();
     const encoded = try encodeList(arena.allocator(), self.accounts.get(account));
+    if (account == .ds4) {
+        try json_store.save(self.gpa, self.io, self.models_path, account.id(), .{
+            .base_url = self.base_urls.get(account) orelse return error.MissingBaseUrl,
+            .models = encoded,
+        }, .{});
+        return;
+    }
     try json_store.save(self.gpa, self.io, self.models_path, account.id(), .{
         .models = encoded,
     }, .{});
@@ -268,6 +346,7 @@ fn saveAccount(self: *Catalog, account: llm.Account) !void {
 fn saveMetadata(self: *Catalog) !void {
     if (self.metadata_path.len == 0) return;
     for (std.enums.values(llm.Provider)) |provider| {
+        if (provider == .ds4) continue;
         var arena: std.heap.ArenaAllocator = .init(self.gpa);
         defer arena.deinit();
         const gpa = arena.allocator();
@@ -305,6 +384,10 @@ fn encode(gpa: std.mem.Allocator, model: *const Model) !Encoded {
     }
     return .{
         .name = try gpa.dupe(u8, model.name()),
+        .engine = if (model.engineName().len != 0)
+            try gpa.dupe(u8, model.engineName())
+        else
+            null,
         .served_as = if (model.servedName().len != 0)
             try gpa.dupe(u8, model.servedName())
         else
@@ -323,6 +406,7 @@ fn decodeModel(value: std.json.Value) ?Model {
     const object = json.object(value) orelse return null;
     const name = json.string(object.get("name")) orelse return null;
     var model = Model.init(name) catch return null;
+    if (json.string(object.get("engine"))) |engine| model.setEngine(engine) catch return null;
     if (json.string(object.get("served_as"))) |served_as|
         model.serveAs(served_as) catch return null;
     model.context_window = positive(object.get("context_window"));
@@ -394,6 +478,7 @@ fn testCatalog(gpa: std.mem.Allocator) Catalog {
         .models_path = "",
         .metadata_path = "",
         .accounts = .initFill(&.{}),
+        .base_urls = .initFill(null),
         .metadata = &.{},
     };
 }
@@ -590,6 +675,7 @@ test "a stored model survives a round trip through both files" {
     var model = Model.init("claude-opus-4-8") catch unreachable;
     model.context_window = 1_000_000;
     model.tokens_max = 128_000;
+    try model.setEngine("Claude weights");
     model.thinking = .supported;
     model.tools = .supported;
     model.addEffort(.low);
@@ -623,6 +709,7 @@ test "a stored model survives a round trip through both files" {
     const restored = read.find(.anthropic_plan, "claude-opus-4-8").?;
     try std.testing.expectEqual(@as(?u64, 1_000_000), restored.context_window);
     try std.testing.expectEqual(@as(?u32, 128_000), restored.tokens_max);
+    try std.testing.expectEqualStrings("Claude weights", restored.engineName());
     try std.testing.expectEqual(Model.Thinking.supported, restored.thinking);
     try std.testing.expectEqual(Model.Tools.supported, restored.tools);
     try std.testing.expect(restored.offers(.low));
@@ -660,6 +747,60 @@ test "a stored model survives a round trip through both files" {
     defer reopened.deinit();
     try std.testing.expect(reopened.isEmpty(.anthropic_plan));
     try std.testing.expectEqual(@as(usize, 1), reopened.metadata.len);
+}
+
+test "a DwarfStar list keeps its base URL and drops after an address change" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var home_buffer: [128]u8 = undefined;
+    const home = try std.fmt.bufPrint(&home_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+
+    var written = try init(gpa, io, home);
+    defer written.deinit();
+    var model = vendorModel("deepseek-v4-pro", 1_048_576, .high);
+    try model.setEngine("DeepSeek V4 Flash");
+    model.tools = .supported;
+    try written.setAccountAt(.ds4, .{
+        .models = &.{model},
+        .base_url = "http://127.0.0.1:8000/v1",
+    });
+
+    var file = (try json_store.open(gpa, io, written.models_path)).?;
+    defer file.deinit();
+    try std.testing.expectEqualStrings(
+        "http://127.0.0.1:8000/v1",
+        file.entry("ds4").?.get(base_url_key).?.string,
+    );
+
+    var read = try init(gpa, io, home);
+    defer read.deinit();
+    try std.testing.expectEqualStrings(
+        "http://127.0.0.1:8000/v1",
+        read.base_urls.get(.ds4).?,
+    );
+    try std.testing.expectEqualStrings(
+        "DeepSeek V4 Flash",
+        read.find(.ds4, "deepseek-v4-pro").?.engineName(),
+    );
+
+    read.dropAccountFromAnotherUrl(.ds4, "http://127.0.0.1:8000/v1");
+    try std.testing.expect(!read.isEmpty(.ds4));
+    read.dropAccountFromAnotherUrl(.ds4, "http://127.0.0.1:9000/v1");
+    try std.testing.expect(read.isEmpty(.ds4));
+    var dropped = (try json_store.open(gpa, io, read.models_path)).?;
+    defer dropped.deinit();
+    try std.testing.expect(dropped.entry("ds4") == null);
+}
+
+test "a DwarfStar list with no stored URL is foreign" {
+    const gpa = std.testing.allocator;
+    var catalog = testCatalog(gpa);
+    const models = [_]Model{vendorModel("deepseek-v4-pro", 1_048_576, .high)};
+    catalog.accounts.set(.ds4, try gpa.dupe(Model, &models));
+    catalog.dropAccountFromAnotherUrl(.ds4, "http://127.0.0.1:8000/v1");
+    try std.testing.expect(catalog.isEmpty(.ds4));
 }
 
 // A cache write that failed leaves the fetched list in memory, so the account

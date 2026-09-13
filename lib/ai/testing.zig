@@ -59,6 +59,8 @@ pub fn accounts(environment: Accounts.Environment) Accounts {
         .openrouter_auth = memoryStore(openrouter.Auth),
         .google_auth = null,
         .google_error = null,
+        .ds4_base_url = environment.ds4_base_url,
+        .ds4_error = null,
         .environment = environment,
         .anthropic_plan_ready = false,
         .openai_plan_ready = false,
@@ -71,6 +73,7 @@ pub fn accounts(environment: Accounts.Environment) Accounts {
             .models_path = "",
             .metadata_path = "",
             .accounts = .initFill(&.{}),
+            .base_urls = .initFill(null),
             .metadata = &.{},
         },
     };

@@ -8,7 +8,8 @@ const std = @import("std");
 /// the product the user buys. `plan` is a consumer subscription, `api` is the
 /// developer API, and `cloud` is the cloud platform of the vendor. A `key`
 /// suffix marks a credential that an environment variable holds or names, and
-/// a tag without it signs in through an interactive OAuth login. This is the
+/// a tag without it signs in through an interactive OAuth login. The local
+/// `ds4` account is the exception: it has no product and no login. This is the
 /// tag `provider.Client`/`Stream` key on. It is also the origin stamped on
 /// stored reasoning, so only the exact account that produced a blob replays
 /// it. At startup any account with a login is preferred over an environment
@@ -39,9 +40,11 @@ pub const Account = enum {
     /// Per-token DeepSeek platform API, authorized with a `Bearer` key.
     deepseek_api_key,
     /// Gemini models on the Agent Platform of Google Cloud, authorized with an
-    /// access token that Drinky mints from a service account key file. It goes
-    /// last, so the startup order prefers every other account.
+    /// access token that Drinky mints from a service account key file.
     google_cloud_key,
+    /// A local DwarfStar server, enabled by its base URL and authorized by no
+    /// credential. It goes last, so startup prefers every remote account.
+    ds4,
 
     /// The identifier of each account: its tag with `-` in place of `_`.
     const ids: std.EnumArray(Account, []const u8) = table: {
@@ -89,6 +92,7 @@ pub const Account = enum {
             .openrouter_api_key,
             .deepseek_api_key,
             .google_cloud_key,
+            .ds4,
             => false,
         };
     }
@@ -107,13 +111,13 @@ pub const Account = enum {
             .openrouter_api_key,
             .deepseek_api_key,
             .google_cloud_key,
+            .ds4,
             => false,
         };
     }
 
-    /// The environment variables that supply the credential of an account
-    /// without a login, or null for an account whose credential comes from an
-    /// interactive login.
+    /// The environment variables that set up an account without a login, or
+    /// null for an account that has an interactive login.
     pub fn credentialEnv(self: Account) ?[]const u8 {
         return switch (self) {
             .anthropic_api_key => "ANTHROPIC_API_KEY",
@@ -122,6 +126,7 @@ pub const Account = enum {
             .openrouter_api_key => "OPENROUTER_API_KEY",
             .deepseek_api_key => "DEEPSEEK_API_KEY",
             .google_cloud_key => "GOOGLE_APPLICATION_CREDENTIALS and GOOGLE_CLOUD_LOCATION",
+            .ds4 => "DS4_BASE_URL",
             .anthropic_plan,
             .openai_plan,
             .anthropic_api,
@@ -140,6 +145,7 @@ pub const Account = enum {
             .openrouter_api, .openrouter_api_key => .openrouter,
             .deepseek_api_key => .deepseek,
             .google_cloud_key => .google,
+            .ds4 => .ds4,
         };
     }
 
@@ -152,9 +158,15 @@ pub const Account = enum {
     /// an encrypted blob.
     pub fn replaysPlainReasoning(self: Account) bool {
         return switch (self.provider()) {
-            .openrouter, .deepseek => true,
+            .openrouter, .deepseek, .ds4 => true,
             .anthropic, .openai, .xai, .google => false,
         };
+    }
+
+    /// Whether a reasoning item with only its id can replay. DwarfStar can
+    /// continue from the visible transcript without hidden reasoning state.
+    pub fn acceptsEmptyReasoning(self: Account) bool {
+        return self == .ds4;
     }
 };
 
@@ -173,6 +185,7 @@ pub const Provider = enum {
     openrouter,
     deepseek,
     google,
+    ds4,
 };
 
 pub const Role = enum { user, assistant };
@@ -237,6 +250,9 @@ pub const Item = union(enum) {
             /// The `thoughtSignature` of one part. The text stays empty, because
             /// no wire needs the thought text back.
             google_cloud_key: Signature,
+            /// The DwarfStar account speaks the Responses protocol, so its proof
+            /// has the OpenAI shape.
+            ds4: OpenAi,
 
             pub fn dupe(
                 self: *const Replay,
@@ -266,6 +282,7 @@ pub const Item = union(enum) {
                     .openrouter_api,
                     .openrouter_api_key,
                     .deepseek_api_key,
+                    .ds4,
                     => |proof, tag| openai: {
                         const text_copy = try gpa.dupe(u8, proof.text);
                         errdefer gpa.free(text_copy);
@@ -300,6 +317,7 @@ pub const Item = union(enum) {
                     .openrouter_api,
                     .openrouter_api_key,
                     .deepseek_api_key,
+                    .ds4,
                     => |proof| {
                         gpa.free(proof.text);
                         gpa.free(proof.id);
@@ -339,13 +357,23 @@ pub const Item = union(enum) {
             raw_text: []const u8 = "",
 
             /// Whether this proof can go back on the wire. Every account needs
-            /// the id and the encrypted blob. An account that replays plain
-            /// reasoning (see `Account.replaysPlainReasoning`) takes the summary
-            /// or the raw reasoning text instead.
-            pub fn replayable(self: *const OpenAi, plain: bool) bool {
+            /// an id. Most accounts also need encrypted or plain reasoning state.
+            pub fn replayable(self: *const OpenAi, account: Account) bool {
+                return self.replayableWith(.{
+                    .plain = account.replaysPlainReasoning(),
+                    .empty = account.acceptsEmptyReasoning(),
+                });
+            }
+
+            /// Whether the transport rules can replay this proof.
+            pub fn replayableWith(
+                self: *const OpenAi,
+                options: struct { plain: bool, empty: bool },
+            ) bool {
                 if (self.id.len == 0) return false;
                 if (self.encrypted_content.len != 0) return true;
-                return plain and (self.text.len != 0 or self.raw_text.len != 0);
+                if (self.text.len != 0 or self.raw_text.len != 0) return options.plain;
+                return options.empty;
             }
         };
     };
@@ -413,7 +441,7 @@ pub const Request = struct {
         pub fn replaysReasoning(self: Reasoning, vendor: Provider) bool {
             return switch (vendor) {
                 .anthropic => self == .named,
-                .openai, .xai, .openrouter, .deepseek, .google => true,
+                .openai, .xai, .openrouter, .deepseek, .google, .ds4 => true,
             };
         }
 
@@ -574,10 +602,9 @@ pub const Event = union(enum) {
                 .openrouter_api,
                 .openrouter_api_key,
                 .deepseek_api_key,
+                .ds4,
                 => |tag| switch (self.*) {
-                    .encrypted => |encrypted| if (encrypted.replayable(
-                        tag.replaysPlainReasoning(),
-                    ))
+                    .encrypted => |encrypted| if (encrypted.replayable(tag))
                         @unionInit(Item.Reasoning.Replay, @tagName(tag), encrypted)
                     else
                         null,
@@ -704,6 +731,7 @@ test "only an account that replays plain reasoning takes a summary without encry
         Account.openrouter_api,
         Account.openrouter_api_key,
         Account.deepseek_api_key,
+        Account.ds4,
     }) |account| {
         const maybe_replay = reasoning.replay(account);
         try std.testing.expect(maybe_replay != null);
@@ -723,13 +751,27 @@ test "only an account that replays plain reasoning takes a summary without encry
     }
 }
 
-test "only the OpenRouter and DeepSeek accounts ask for no encrypted reasoning" {
+test "OpenRouter, DeepSeek, and DwarfStar ask for no encrypted reasoning" {
     for (std.enums.values(Account)) |account| {
         try std.testing.expectEqual(
-            account.provider() == .openrouter or account.provider() == .deepseek,
+            account.provider() == .openrouter or
+                account.provider() == .deepseek or
+                account.provider() == .ds4,
             account.replaysPlainReasoning(),
         );
     }
+}
+
+test "only the DwarfStar account replays a reasoning id with no state" {
+    const reasoning: Event.Reasoning = .{ .encrypted = .{
+        .text = "",
+        .id = "rs_1",
+        .encrypted_content = "",
+    } };
+    try std.testing.expect(reasoning.replay(.ds4) != null);
+    try std.testing.expectEqualStrings("rs_1", reasoning.replay(.ds4).?.ds4.id);
+    try std.testing.expect(reasoning.replay(.deepseek_api_key) == null);
+    try std.testing.expect(reasoning.replay(.openai_api_key) == null);
 }
 
 fn dupeRawReasoning(gpa: std.mem.Allocator) !void {
@@ -779,10 +821,16 @@ test "an account identifier starts with its provider and parses back" {
     for (std.enums.values(Account)) |account| {
         const prefix = @tagName(account.provider());
         try std.testing.expect(std.mem.startsWith(u8, account.id(), prefix));
-        try std.testing.expectEqual(account.id()[prefix.len], '-');
         try std.testing.expect(std.mem.indexOfScalar(u8, account.id(), '_') == null);
         try std.testing.expect(std.mem.indexOfScalar(u8, account.id(), '/') == null);
         try std.testing.expectEqual(account, Account.parse(account.id()).?);
+        // The local server has no product tier and no credential suffix.
+        if (account == .ds4) {
+            try std.testing.expectEqualStrings(prefix, account.id());
+            try std.testing.expect(!std.mem.endsWith(u8, account.id(), "-key"));
+            continue;
+        }
+        try std.testing.expectEqual(account.id()[prefix.len], '-');
         // A `-key` suffix marks a credential that an environment variable holds
         // or names.
         try std.testing.expectEqual(
@@ -801,6 +849,7 @@ test "an account identifier starts with its provider and parses back" {
     try std.testing.expectEqualStrings("openrouter-api-key", Account.openrouter_api_key.id());
     try std.testing.expectEqualStrings("deepseek-api-key", Account.deepseek_api_key.id());
     try std.testing.expectEqualStrings("google-cloud-key", Account.google_cloud_key.id());
+    try std.testing.expectEqualStrings("ds4", Account.ds4.id());
     // The tag spelling is not the identifier, so a store key never holds it.
     try std.testing.expect(Account.parse("anthropic_plan") == null);
     try std.testing.expect(Account.parse("anthropic-plan/claude-fable-5-1") == null);
@@ -819,6 +868,7 @@ test "Account.provider maps each account to its vendor" {
     try std.testing.expectEqual(Provider.openrouter, Account.openrouter_api_key.provider());
     try std.testing.expectEqual(Provider.deepseek, Account.deepseek_api_key.provider());
     try std.testing.expectEqual(Provider.google, Account.google_cloud_key.provider());
+    try std.testing.expectEqual(Provider.ds4, Account.ds4.provider());
 }
 
 test "account credential flags and environment variables" {
@@ -833,6 +883,7 @@ test "account credential flags and environment variables" {
     try std.testing.expect(!Account.openrouter_api_key.hasLogin());
     try std.testing.expect(!Account.deepseek_api_key.hasLogin());
     try std.testing.expect(!Account.google_cloud_key.hasLogin());
+    try std.testing.expect(!Account.ds4.hasLogin());
     try std.testing.expect(Account.anthropic_plan.hasRefreshCredential());
     try std.testing.expect(Account.openai_plan.hasRefreshCredential());
     try std.testing.expect(Account.xai_plan.hasRefreshCredential());
@@ -844,6 +895,7 @@ test "account credential flags and environment variables" {
     try std.testing.expect(!Account.openrouter_api_key.hasRefreshCredential());
     try std.testing.expect(!Account.deepseek_api_key.hasRefreshCredential());
     try std.testing.expect(!Account.google_cloud_key.hasRefreshCredential());
+    try std.testing.expect(!Account.ds4.hasRefreshCredential());
     try std.testing.expectEqualStrings(
         "ANTHROPIC_API_KEY",
         Account.anthropic_api_key.credentialEnv().?,
@@ -859,13 +911,14 @@ test "account credential flags and environment variables" {
         "GOOGLE_APPLICATION_CREDENTIALS and GOOGLE_CLOUD_LOCATION",
         Account.google_cloud_key.credentialEnv().?,
     );
+    try std.testing.expectEqualStrings("DS4_BASE_URL", Account.ds4.credentialEnv().?);
     try std.testing.expect(Account.anthropic_api.credentialEnv() == null);
     // An account names a variable exactly when it has no login.
     for (std.enums.values(Account)) |account|
         try std.testing.expectEqual(account.hasLogin(), account.credentialEnv() == null);
-    // The key file account goes last, so the startup order prefers every other one.
+    // The local account goes last, so the startup order prefers every remote one.
     const accounts = std.enums.values(Account);
-    try std.testing.expectEqual(Account.google_cloud_key, accounts[accounts.len - 1]);
+    try std.testing.expectEqual(Account.ds4, accounts[accounts.len - 1]);
 }
 
 test "a rejection a retry cannot clear outranks one it can" {

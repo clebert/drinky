@@ -23,9 +23,10 @@ pub const Timeouts = struct {
 /// dead connection. The OpenAI backend sends nothing while the model reasons
 /// privately, and its official client tolerates a 300 s gap, so the OpenAI
 /// window matches that. Gemini and Grok can hold a stream silent while they
-/// think, and DeepSeek can take a long time to send its first reasoning event,
-/// so all three take the same window. The connect bound is network-bound, so
-/// every provider shares its default.
+/// think. DeepSeek can take a long time before its first reasoning event.
+/// These providers take the same idle window. A local DwarfStar server can
+/// queue a request or prefill for many minutes, so both of its windows are
+/// one hour.
 pub const ProviderTimeouts = struct {
     anthropic: Timeouts = .{},
     openai: Timeouts = .{ .idle_ms = 300_000 },
@@ -33,6 +34,7 @@ pub const ProviderTimeouts = struct {
     openrouter: Timeouts = .{ .idle_ms = 300_000 },
     deepseek: Timeouts = .{ .idle_ms = 300_000 },
     google: Timeouts = .{ .idle_ms = 300_000 },
+    ds4: Timeouts = .{ .connect_ms = 3_600_000, .idle_ms = 3_600_000 },
 };
 
 /// Whole-request retry policy, applied above the transport.
@@ -463,19 +465,20 @@ test "Deadline draws its window down instead of resetting per read" {
     try std.testing.expectError(error.Timeout, deadline.call(io, fastWork, .{io}));
 }
 
-test "the provider timeout defaults differ only in the idle window" {
+test "the DwarfStar timeout defaults are one hour and independent" {
     const timeouts: ProviderTimeouts = .{};
     try std.testing.expectEqual(timeouts.anthropic.connect_ms, timeouts.openai.connect_ms);
     try std.testing.expectEqual(timeouts.anthropic.connect_ms, timeouts.google.connect_ms);
     try std.testing.expectEqual(timeouts.anthropic.connect_ms, timeouts.xai.connect_ms);
     try std.testing.expectEqual(timeouts.anthropic.connect_ms, timeouts.openrouter.connect_ms);
     try std.testing.expectEqual(timeouts.anthropic.connect_ms, timeouts.deepseek.connect_ms);
-    // The generic pair serves the short OAuth and token requests, so the
-    // Anthropic stream default must stay in step with it.
+    // The generic pair serves the short OAuth and token requests.
     try std.testing.expectEqual(@as(Timeouts, .{}), timeouts.anthropic);
     try std.testing.expect(timeouts.openai.idle_ms > timeouts.anthropic.idle_ms);
     try std.testing.expectEqual(timeouts.openai.idle_ms, timeouts.google.idle_ms);
     try std.testing.expectEqual(timeouts.openai.idle_ms, timeouts.xai.idle_ms);
     try std.testing.expectEqual(timeouts.openai.idle_ms, timeouts.openrouter.idle_ms);
     try std.testing.expectEqual(timeouts.openai.idle_ms, timeouts.deepseek.idle_ms);
+    try std.testing.expectEqual(@as(u64, 3_600_000), timeouts.ds4.connect_ms);
+    try std.testing.expectEqual(@as(u64, 3_600_000), timeouts.ds4.idle_ms);
 }

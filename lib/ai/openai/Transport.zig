@@ -2,10 +2,9 @@
 //! endpoint with the correct auth identity. It exposes the response as a pull
 //! stream of decoded SSE `response.*` events on the shared `sse` engine.
 //! Every Responses account shares it: the OpenAI API key, the ChatGPT
-//! subscription, both xAI accounts, both OpenRouter accounts, and the DeepSeek
-//! account differ only in `endpoint`, in whether `account_id` is set, and in
-//! whether the account replays plain reasoning. It knows nothing about
-//! conversation state or tools.
+//! subscription, both xAI accounts, both OpenRouter accounts, DeepSeek, and
+//! DwarfStar differ only in their endpoint, headers, and reasoning replay.
+//! It knows nothing about conversation state or tools.
 
 const std = @import("std");
 
@@ -34,6 +33,8 @@ account_id: []const u8,
 /// for no encrypted content, so its completed reasoning items carry none. The
 /// default is the strict rule, which rejects such an item and retries.
 plain_reasoning: bool = false,
+/// Whether an id without encrypted or plain state still forms a reasoning item.
+empty_reasoning: bool = false,
 
 /// A single Responses request in flight on the shared SSE engine. The engine
 /// supplies the reading half. This struct keeps the Responses frame vocabulary
@@ -98,6 +99,8 @@ pub const Stream = struct {
     /// encrypted content. `connect` copies it from the transport, and the blank
     /// start keeps the strict rule of every other account.
     plain_reasoning: bool,
+    /// Whether an id without reasoning state still forms a retained item.
+    empty_reasoning: bool,
     /// The subscription allowance from the response head, or null when the
     /// backend sent no quota headers (API-key mode, or none present).
     quota: ?llm.Quota,
@@ -107,8 +110,8 @@ pub const Stream = struct {
     /// points at it until `deinit`, so it is a stream field, not a `connect`
     /// local.
     header_buffer: [3]std.http.Header,
-    /// The composed Authorization value. The retained request points at it for
-    /// the stream's whole lifetime, so the stream owns the bytes.
+    /// The composed Authorization value. Empty means that the request sends no
+    /// authorization. The stream owns nonempty bytes for the request lifetime.
     authorization: []u8,
     /// The account id behind the `chatgpt-account-id` header, owned like
     /// `authorization`. Empty on a stream that sends no such header.
@@ -151,6 +154,7 @@ pub const Stream = struct {
         self.call_named = false;
         self.served_model = .empty;
         self.plain_reasoning = false;
+        self.empty_reasoning = false;
         self.quota = null;
         self.authorization = &.{};
         self.account_id = &.{};
@@ -379,8 +383,10 @@ pub const Stream = struct {
             // preceded a function call, so the whole request retries. An
             // account that replays plain reasoning asked for no blob, so an
             // item with no text at all holds nothing a retry could recover.
-            if (!reasoning.replayable(self.plain_reasoning))
-                return if (self.plain_reasoning) .progress else .invalid;
+            if (!reasoning.replayableWith(.{
+                .plain = self.plain_reasoning,
+                .empty = self.empty_reasoning,
+            })) return if (self.plain_reasoning) .progress else .invalid;
             return .{ .event = .{ .item = .{ .reasoning = .{ .encrypted = reasoning } } } };
         }
         if (std.mem.eql(u8, item_kind, "function_call")) {
@@ -630,8 +636,9 @@ pub const Stream = struct {
     }
 };
 
-/// One request's confusable string pair, named so body and token cannot swap.
-pub const Payload = struct { body: []const u8, access_token: []const u8 };
+/// One request's body and optional bearer token. Null sends no Authorization
+/// header, which a credential-free local server requires.
+pub const Payload = struct { body: []const u8, access_token: ?[]const u8 };
 
 /// Open a streaming Responses request bounded by the connect timeout. On any
 /// failure this call tears down `out`, so a caller that sees an error owns
@@ -642,22 +649,23 @@ pub fn send(self: *Transport, out: *Stream, payload: Payload) !void {
 
 fn connect(self: *Transport, out: *Stream, payload: Payload) anyerror!void {
     // Credentials become header values. Reject values that can split the head.
-    if (!net.validHeaderValue(payload.access_token) or
-        (self.account_id.len != 0 and !net.validHeaderValue(self.account_id)))
-    {
-        return error.BadCredentials;
+    if (payload.access_token) |token| {
+        if (!net.validHeaderValue(token)) return error.BadCredentials;
     }
+    if (self.account_id.len != 0 and !net.validHeaderValue(self.account_id))
+        return error.BadCredentials;
     const engine = sse.Engine(Stream);
     engine.begin(out, self.gpa, self.io);
-    // `begin` blanks the decode state, so the account rule lands after it.
+    // `begin` blanks the decode state, so the account rules land after it.
     out.plain_reasoning = self.plain_reasoning;
+    out.empty_reasoning = self.empty_reasoning;
     errdefer out.client.deinit();
     errdefer out.frame_arena.deinit();
 
     // The retained request points at every header value until `deinit`, so the
-    // stream owns the composed Authorization bytes (std.http: a header value
-    // must outlive its request).
-    out.authorization = try std.fmt.allocPrint(self.gpa, "Bearer {s}", .{payload.access_token});
+    // stream owns the composed Authorization bytes. Null sends no such header.
+    if (payload.access_token) |token|
+        out.authorization = try std.fmt.allocPrint(self.gpa, "Bearer {s}", .{token});
     errdefer self.gpa.free(out.authorization);
 
     // Owned by the stream for the same reason. The copy also detaches the
@@ -682,7 +690,10 @@ fn connect(self: *Transport, out: *Stream, payload: Payload) anyerror!void {
     out.request = try out.client.request(.POST, uri, .{
         .headers = .{
             .content_type = .{ .override = "application/json" },
-            .authorization = .{ .override = out.authorization },
+            .authorization = if (out.authorization.len == 0)
+                .omit
+            else
+                .{ .override = out.authorization },
             .user_agent = .{ .override = originator },
             // Read the event stream uncompressed so event delivery stays
             // independent of any decompressor's own buffering.
@@ -1399,6 +1410,20 @@ test "empty reasoning without encryption keeps the answer of a plain account" {
         );
         try std.testing.expect(stop.event.stop.rejection == null);
     }
+}
+
+test "DwarfStar keeps a reasoning item that holds only an id" {
+    var stream = testStream(undefined, undefined, 0, 0);
+    stream.plain_reasoning = true;
+    stream.empty_reasoning = true;
+    defer stream.deinitDecode();
+    const item = (try stream.decode(
+        \\{"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_1","summary":[]}}
+    )).event.item.reasoning.encrypted;
+    try std.testing.expectEqualStrings("rs_1", item.id);
+    try std.testing.expectEqualStrings("", item.text);
+    try std.testing.expectEqualStrings("", item.raw_text);
+    try std.testing.expectEqualStrings("", item.encrypted_content);
 }
 
 test "a plain account keeps the reasoning text of an item without encryption" {
@@ -2302,6 +2327,46 @@ fn serveOneResponse(io: std.Io, server: *std.Io.net.Server) !void {
 // for the stream's whole lifetime. std.http requires a header value to outlive
 // its request, so the stream owns the bytes now, and both values must read
 // back intact after the send.
+test "a request without a credential omits the Authorization header" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try address.listen(io, .{});
+    defer server.deinit(io);
+    const endpoint = try std.fmt.allocPrint(
+        gpa,
+        "http://127.0.0.1:{d}/v1/responses",
+        .{server.socket.address.getPort()},
+    );
+    defer gpa.free(endpoint);
+
+    var serve = try io.concurrent(serveOneResponse, .{ io, &server });
+    var reaped = false;
+    defer if (!reaped) {
+        _ = serve.cancel(io) catch {};
+    };
+
+    var transport: Transport = .{
+        .gpa = gpa,
+        .io = io,
+        .timeouts = .{},
+        .endpoint = endpoint,
+        .account_id = "",
+    };
+    var stream: Stream = undefined;
+    try transport.send(&stream, .{ .body = "{}", .access_token = null });
+    defer stream.deinit();
+    reaped = true;
+    try serve.await(io);
+
+    try std.testing.expectEqual(std.http.Client.Request.Headers.Value.omit, stream.request.headers.authorization);
+    try std.testing.expectEqualStrings("", stream.authorization);
+    try std.testing.expect((try stream.next()) == null);
+}
+
 test "the stream owns the request header values for its whole lifetime" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});

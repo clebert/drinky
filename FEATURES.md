@@ -7,8 +7,9 @@ planned work.
 Drinky is a terminal coding agent. You type a prompt. The model reads, searches, writes, and edits
 files in the working directory, and the conversation streams into your scrollback. Drinky talks to
 Anthropic, OpenAI, and xAI through a subscription login, an Anthropic Console login, or an API key,
-to OpenRouter through a login or an API key, to DeepSeek through an API key, and to Gemini on the
-Gemini Enterprise Agent Platform (Vertex AI) through a service account key file.
+to OpenRouter through a login or an API key, to DeepSeek through an API key, to Gemini on the Gemini
+Enterprise Agent Platform (Vertex AI) through a service account key file, and to a local DwarfStar
+server through `DS4_BASE_URL`.
 
 ## Talking to it
 
@@ -90,9 +91,13 @@ Gemini Enterprise Agent Platform (Vertex AI) through a service account key file.
 - A fetch runs beside the interface. The picker clears its rows, states the wait, and moves its
   separators. Esc cancels the fetch and returns the rows. A fetch with something to report records a
   transcript event.
-- One window of `request.connect_timeout_ms` bounds a whole fetch: the token refresh, every page of
-  the list, and the metadata request.
-- The provider wins every field that it states. Only the public metadata prices a model.
+- One window of `request.connect_timeout_ms` bounds a whole remote fetch: the token refresh, every
+  page of the list, and the metadata request. A DwarfStar fetch uses
+  `request.ds4_connect_timeout_ms` and skips public metadata.
+- The provider wins every field that it states. Only the public metadata prices a model. A DwarfStar
+  server states its own window, output limit, and engine, and it states no price. Drinky assumes
+  tools, thinking, and the `high` and `max` effort levels for every listed id. A picker row names a
+  nonempty engine as `Weights:`.
 - A model that no source describes never reaches the picker. A Codex model that the backend hides
   stays hidden. A model that the public metadata names without tools never reaches the picker. The
   OpenRouter list holds a model only when that metadata states its tools.
@@ -136,7 +141,8 @@ Gemini Enterprise Agent Platform (Vertex AI) through a service account key file.
   `openrouter-api-key`, `deepseek-api-key`, and `google-cloud-key`. The product is `plan` for a
   subscription, `api` for the developer API, or `cloud` for the cloud platform. A `-key` suffix
   marks a credential that an environment variable holds or names. An identifier without it signs in
-  through a login.
+  through a login. The local `ds4` account is the exception: it has no product tier and no `-key`
+  suffix.
 - A model under an account reads `account/model`, as in `openrouter-api/openai/gpt-5.6-sol`. The
   status line, the pickers, the events, and the store files hold the same identifiers.
 - Drinky supports Anthropic, OpenAI, and xAI, each as a subscription account or an API-key account.
@@ -150,8 +156,12 @@ Gemini Enterprise Agent Platform (Vertex AI) through a service account key file.
 - A location outside the three, or a key file that Drinky cannot read, leaves the account absent.
   Startup says nothing, because the key path is also the variable of every other Google client. The
   login picker marks the account and names the cause when you pick it.
+- The `ds4` account talks to a local DwarfStar server. `DS4_BASE_URL` enables it and must end at
+  `/v1`. The account sends no credential and has no login. A malformed URL leaves the account
+  absent. Startup says nothing. The login picker marks it and names the cause when you pick it.
 - Startup resumes on the account that this project used last. Otherwise it takes the first
-  authenticated account and prefers a login over an API key or a key file.
+  authenticated account and prefers a login over an API key or a key file. A local `ds4` account
+  comes last.
 - With no account at all, the login picker opens by itself. While signed out, Drinky refuses a
   message and points to `/login`.
 - Reasoning replays only to the account that produced it. A login, a logout, or a credential

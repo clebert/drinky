@@ -15,6 +15,7 @@ pub fn main(init: std.process.Init) !void {
             .openrouter = init.environ_map.get("OPENROUTER_API_KEY"),
             .deepseek = init.environ_map.get("DEEPSEEK_API_KEY"),
             .google_key_path = init.environ_map.get("GOOGLE_APPLICATION_CREDENTIALS"),
+            .ds4_base_url = init.environ_map.get("DS4_BASE_URL"),
             .google_location = init.environ_map.get("GOOGLE_CLOUD_LOCATION"),
         },
         .herdr = Herdr.fromEnviron(init.environ_map),

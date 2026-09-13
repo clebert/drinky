@@ -2335,6 +2335,7 @@ fn appendProof(agent: *Agent, account: llm.Account) !void {
         .openrouter_api,
         .openrouter_api_key,
         .deepseek_api_key,
+        .ds4,
         => |tag| replay: {
             const id = try gpa.dupe(u8, "rs_1");
             break :replay @unionInit(

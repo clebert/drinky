@@ -47,8 +47,10 @@ pub fn accounts(
 /// Free every model list a `seed` call added. A registry from `accounts` owns
 /// nothing else, so this is its whole teardown.
 pub fn deinitAccounts(registry: *Accounts) void {
-    for (std.enums.values(llm.Account)) |account|
+    for (std.enums.values(llm.Account)) |account| {
         registry.gpa.free(registry.catalog.accounts.get(account));
+        if (registry.catalog.base_urls.get(account)) |base_url| registry.gpa.free(base_url);
+    }
 }
 
 /// Offer `names` under `account`, as a fetch does.

@@ -120,7 +120,7 @@ test "the picker lists every account, marking the active and authenticated ones"
                 gpa.free(pick.options);
             }
             try std.testing.expectEqualStrings("Sign in", pick.title);
-            try std.testing.expectEqual(@as(usize, 11), pick.options.len);
+            try std.testing.expectEqual(@as(usize, 12), pick.options.len);
             try std.testing.expectEqualStrings("anthropic-plan", pick.options[0].name);
             try std.testing.expectEqualStrings("Signed in", pick.options[0].tag.?);
             try std.testing.expectEqualStrings("anthropic-api", pick.options[1].name);
@@ -134,6 +134,7 @@ test "the picker lists every account, marking the active and authenticated ones"
             try std.testing.expectEqualStrings("openrouter-api-key", pick.options[8].name);
             try std.testing.expectEqualStrings("deepseek-api-key", pick.options[9].name);
             try std.testing.expectEqualStrings("google-cloud-key", pick.options[10].name);
+            try std.testing.expectEqualStrings("ds4", pick.options[11].name);
         },
         else => return error.ExpectedPick,
     }
@@ -243,6 +244,11 @@ test "select starts login, instructs an API account, and no-ops the active one" 
         "GOOGLE_CLOUD_LOCATION",
     );
     try Context.Outcome.expectNoticeContaining(
+        try select(&context, .{ .payload = 0, .row = 11 }),
+        .information,
+        "DS4_BASE_URL",
+    );
+    try Context.Outcome.expectNoticeContaining(
         try select(&context, .{ .payload = 0, .row = 2 }),
         .information,
         "active account",
@@ -264,6 +270,33 @@ test "select never re-runs the login for the active subscription" {
         "active account",
     );
     try std.testing.expectEqual(llm.Account.anthropic_plan, agent.client.?.account());
+}
+
+test "the picker marks a loaded DwarfStar URL and a malformed one apart" {
+    const gpa = std.testing.allocator;
+    var accounts = testing.accounts(.{ .ds4_base_url = "http://127.0.0.1:8000/v1" }, .{});
+    defer testing.deinitAccounts(&accounts);
+    var agent = testing.agent(gpa, .{ .anthropic_api_key = "sk-ant" });
+    defer agent.deinit();
+    var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
+
+    const loaded = try row(&context, .ds4);
+    defer loaded.deinit(gpa);
+    try std.testing.expectEqualStrings("ds4", loaded.name);
+    try std.testing.expectEqualStrings("Set", loaded.tag.?);
+
+    accounts.ds4_base_url = null;
+    accounts.ds4_error = error.BadBaseUrl;
+    const failed = try row(&context, .ds4);
+    defer failed.deinit(gpa);
+    try std.testing.expectEqualStrings("ds4", failed.name);
+    try std.testing.expectEqualStrings("Not loaded", failed.tag.?);
+    try std.testing.expect(failed.tag_pressure);
+    try Context.Outcome.expectNoticeContaining(
+        try select(&context, .{ .payload = 0, .row = 11 }),
+        .failure,
+        "because of error BadBaseUrl",
+    );
 }
 
 test "select hands an authenticated but inactive account to the app to switch" {
