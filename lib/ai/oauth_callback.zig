@@ -1,13 +1,18 @@
-//! The loopback OAuth redirect receiver: one bounded HTTP request line under a
-//! shared five-minute deadline, with stray connections ignored. A pasted
-//! redirect line replays into the same listener, so a browser policy that
-//! blocks the plain-HTTP callback cannot strand the login.
+//! The loopback OAuth redirect receiver: one bounded request line per
+//! connection under a shared five-minute deadline, with stray connections
+//! ignored. A pasted redirect line replays into the same listener, so a browser
+//! policy that blocks the plain-HTTP callback cannot strand the login.
 
 const std = @import("std");
 
 const net = @import("net.zig");
 
 const callback_timeout_ms = 5 * std.time.ms_per_min;
+/// The longest wait for the request line of one connection. A local browser and
+/// a paste replay send their request line at once, so a peer that stays silent
+/// this long is stray. The loop drops its connection and listens on, because a
+/// silent peer holds the only accept unread and strands every request behind it.
+const request_line_timeout_ms = std.time.ms_per_s;
 const request_bytes_max = 8 * 1024;
 const request_frame_bytes = "GET ".len + " HTTP/1.1\r\n".len;
 const response_page = "Drinky received authorization. Close this tab.";
@@ -50,22 +55,38 @@ pub fn receive(
     server: *std.Io.net.Server,
     path: ?[]const u8,
 ) !Redirect {
-    return receiveBounded(gpa, io, server, callback_timeout_ms, path);
+    return receiveBounded(gpa, io, server, .{
+        .timeout_ms = callback_timeout_ms,
+        .request_line_timeout_ms = request_line_timeout_ms,
+    }, path);
 }
 
-/// The redirect wait under an explicit deadline. `receive` holds the deadline of
-/// the product, and a socket test holds a short one, so a stalled accept reads
-/// as a failed test and not as a five-minute hang. Both callers share this one
+/// The two deadlines of one redirect wait. The fields are named, because two
+/// durations can swap at a call site and a swap still compiles.
+const Wait = struct {
+    /// The deadline of the whole wait, accept included.
+    timeout_ms: u64,
+    /// The deadline of the request line of one connection.
+    request_line_timeout_ms: u64,
+};
+
+/// The redirect wait under explicit deadlines. `receive` holds the deadlines of
+/// the product, and a socket test holds short ones, so a stalled peer reads as
+/// a failed test and not as a five-minute hang. Both callers share this one
 /// wire path.
 fn receiveBounded(
     gpa: std.mem.Allocator,
     io: std.Io,
     server: *std.Io.net.Server,
-    timeout_ms: u64,
+    wait: Wait,
     path: ?[]const u8,
 ) !Redirect {
     var source: ServerSource = .{ .io = io, .server = server };
-    var bound: TimeoutBound = .{ .io = io, .timeout_ms = timeout_ms };
+    var bound: TimeoutBound = .{
+        .io = io,
+        .timeout_ms = wait.timeout_ms,
+        .request_line_timeout_ms = wait.request_line_timeout_ms,
+    };
     return receiveWith(gpa, &bound, &source, path);
 }
 
@@ -144,8 +165,8 @@ fn receiveWith(
     errdefer output.deinit(gpa);
 
     bound.call(
-        Wire(@TypeOf(source)).receive,
-        .{ gpa, source, path, &request_buffer, &output },
+        Wire(@TypeOf(source), @TypeOf(bound)).receive,
+        .{ gpa, source, bound, path, &request_buffer, &output },
     ) catch |err| switch (err) {
         error.Timeout => return error.CallbackTimeout,
         error.ConcurrencyUnavailable => return error.CallbackTimeoutUnavailable,
@@ -165,18 +186,20 @@ const Output = struct {
     }
 };
 
-fn Wire(comptime Source: type) type {
+fn Wire(comptime Source: type, comptime Bound: type) type {
     return struct {
         fn receive(
             gpa: std.mem.Allocator,
             source: Source,
+            bound: Bound,
             path: ?[]const u8,
             request_buffer: *[request_bytes_max]u8,
             output: *Output,
         ) !void {
             // A stray connection must not consume the only accept. A probe, a
-            // prefetch, a favicon fetch, and a TLS handshake are all stray.
-            // Ignore one and listen on until the deadline.
+            // prefetch, a favicon fetch, a TLS handshake, and a peer that sends
+            // nothing are all stray. Ignore one and listen on until the
+            // deadline.
             //
             // A request that carries `code=` or `error=` is the provider
             // redirect. It still fails fast when malformed or denied.
@@ -184,11 +207,17 @@ fn Wire(comptime Source: type) type {
                 var connection = try source.accept();
                 defer connection.close();
 
-                const request_line = connection.readRequestLine(request_buffer) catch |err|
-                    switch (err) {
-                        error.EndOfStream, error.ReadFailed, error.StrayProtocol => continue,
-                        else => return err,
-                    };
+                const request_line = bound.readRequestLine(
+                    @TypeOf(connection).readRequestLine,
+                    .{ &connection, request_buffer },
+                ) catch |err| switch (err) {
+                    error.EndOfStream,
+                    error.ReadFailed,
+                    error.StrayProtocol,
+                    error.RequestLineTimeout,
+                    => continue,
+                    else => return err,
+                };
                 if (path) |wanted| {
                     const found = requestPath(request_line) orelse continue;
                     if (!std.mem.eql(u8, found, wanted)) continue;
@@ -308,6 +337,7 @@ fn queryParameter(
 const TimeoutBound = struct {
     io: std.Io,
     timeout_ms: u64,
+    request_line_timeout_ms: u64,
 
     fn call(
         self: *const TimeoutBound,
@@ -317,6 +347,30 @@ const TimeoutBound = struct {
         // `net.race` reserves the timer before the work, and its outer error
         // propagates: the callback refuses to run unbounded.
         return try net.race(self.io, self.timeout_ms, function, args);
+    }
+
+    /// Read the request line of one connection under its own bound. A peer that
+    /// sends no line inside the bound is stray: the read is canceled, and the
+    /// loop drops the connection and listens on. The timeout of this bound is
+    /// `error.RequestLineTimeout` alone, so a dropped connection cannot read as
+    /// an elapsed whole wait.
+    fn readRequestLine(
+        self: *const TimeoutBound,
+        comptime function: anytype,
+        args: std.meta.ArgsTuple(@TypeOf(function)),
+    ) anyerror![]const u8 {
+        const bounded: anyerror![]const u8 = net.race(
+            self.io,
+            self.request_line_timeout_ms,
+            function,
+            args,
+        ) catch |err| switch (err) {
+            error.ConcurrencyUnavailable => return error.ConcurrencyUnavailable,
+        };
+        return bounded catch |err| switch (err) {
+            error.Timeout => error.RequestLineTimeout,
+            else => err,
+        };
     }
 };
 
@@ -355,6 +409,18 @@ const Fake = struct {
             defer self.fake.deadline_ms = null;
             try @call(.auto, function, args);
             if (self.fake.behavior == .deadline_wins_after_success) return error.Timeout;
+        }
+
+        /// The doubles hold no real socket, so they answer their script at
+        /// once. The bound of one connection's request line stays a socket
+        /// test: a silent peer needs a stream that stays open.
+        fn readRequestLine(
+            self: Bound,
+            comptime function: anytype,
+            args: std.meta.ArgsTuple(@TypeOf(function)),
+        ) anyerror![]const u8 {
+            _ = self;
+            return @call(.auto, function, args);
         }
     };
 
@@ -450,7 +516,11 @@ fn stalledWork(io: std.Io) anyerror!void {
 test "callback refuses to run without deadline concurrency" {
     var threaded: std.Io.Threaded = .init_single_threaded;
     const io = threaded.io();
-    var bound: TimeoutBound = .{ .io = io, .timeout_ms = 1 };
+    var bound: TimeoutBound = .{
+        .io = io,
+        .timeout_ms = 1,
+        .request_line_timeout_ms = request_line_timeout_ms,
+    };
     var fake: Fake = .{
         .request = "GET /callback?code=code&state=state HTTP/1.1\r\n",
     };
@@ -474,7 +544,11 @@ test "callback work does not start unless its deadline timer is reserved" {
     );
     defer threaded.deinit();
     const io = threaded.io();
-    var bound: TimeoutBound = .{ .io = io, .timeout_ms = callback_timeout_ms };
+    var bound: TimeoutBound = .{
+        .io = io,
+        .timeout_ms = callback_timeout_ms,
+        .request_line_timeout_ms = request_line_timeout_ms,
+    };
     var fake: Fake = .{
         .request = "GET /callback?code=code&state=state HTTP/1.1\r\n",
     };
@@ -498,7 +572,11 @@ test "callback deadline cancels and reaps work when its timer wins" {
     );
     defer threaded.deinit();
     const io = threaded.io();
-    var bound: TimeoutBound = .{ .io = io, .timeout_ms = 1 };
+    var bound: TimeoutBound = .{
+        .io = io,
+        .timeout_ms = 1,
+        .request_line_timeout_ms = request_line_timeout_ms,
+    };
     try std.testing.expectError(error.Timeout, bound.call(stalledWork, .{io}));
 }
 
@@ -797,9 +875,15 @@ test "a maximal paste frames a request line at the wire byte limit" {
     try std.testing.expectEqual(request.len, fake.request_byte_count);
 }
 
-/// The deadline of a socket test below. It bounds a stalled accept, and every
-/// loopback accept of a test lands far inside it.
+/// The aggregate deadline of a socket test below. It bounds a stalled accept,
+/// and every loopback accept of a test lands far inside it.
 const socket_test_timeout_ms = 5 * std.time.ms_per_s;
+
+/// The deadlines of a socket test whose peer sends its request line at once.
+const socket_test_wait: Wait = .{
+    .timeout_ms = socket_test_timeout_ms,
+    .request_line_timeout_ms = request_line_timeout_ms,
+};
 
 test "a replayed paste line completes the redirect wait" {
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
@@ -810,7 +894,7 @@ test "a replayed paste line completes the redirect wait" {
     defer server.deinit(io);
     var future = try io.concurrent(
         receiveBounded,
-        .{ std.testing.allocator, io, &server, socket_test_timeout_ms, null },
+        .{ std.testing.allocator, io, &server, socket_test_wait, null },
     );
     errdefer if (future.cancel(io)) |canceled| {
         std.testing.allocator.free(canceled.code);
@@ -839,7 +923,7 @@ test "a replayed denial line ends the redirect wait with the listener's verdict"
     defer server.deinit(io);
     var future = try io.concurrent(
         receiveBounded,
-        .{ std.testing.allocator, io, &server, socket_test_timeout_ms, null },
+        .{ std.testing.allocator, io, &server, socket_test_wait, null },
     );
     errdefer if (future.cancel(io)) |canceled| {
         std.testing.allocator.free(canceled.code);
@@ -853,6 +937,50 @@ test "a replayed denial line ends the redirect wait with the listener's verdict"
         "https://localhost:1455/auth/callback?error=access_denied",
     );
     try std.testing.expectError(error.AuthorizationFailed, future.await(io));
+}
+
+// A peer can open a connection and send no byte: an HTTPS upgrade that stops
+// before its handshake, a preconnect, or a probe. The listener reads one
+// connection at a time, so a silent peer holds the accept loop, and the paste
+// that follows waits unread. The login then ends with no redirect and no
+// verdict, which is the silence this test refuses.
+test "a silent connection cannot blind the listener to a replayed paste" {
+    // The silent peer must leave the listener inside its own bound, so the test
+    // holds a short one.
+    const wait: Wait = .{
+        .timeout_ms = socket_test_timeout_ms,
+        .request_line_timeout_ms = 50,
+    };
+
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try address.listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    var future = try io.concurrent(
+        receiveBounded,
+        .{ std.testing.allocator, io, &server, wait, null },
+    );
+    errdefer if (future.cancel(io)) |canceled| {
+        std.testing.allocator.free(canceled.code);
+        if (canceled.state) |state| std.testing.allocator.free(state);
+    } else |_| {};
+
+    var silent_address: std.Io.net.IpAddress = .{
+        .ip4 = .loopback(server.socket.address.getPort()),
+    };
+    const silent = try silent_address.connect(io, .{ .mode = .stream, .protocol = .tcp });
+    defer silent.close(io);
+
+    try replay(
+        io,
+        server.socket.address.getPort(),
+        "http://localhost:53694/deadbeef?code=paste-code",
+    );
+    const redirect = try future.await(io);
+    defer std.testing.allocator.free(redirect.code);
+    try std.testing.expectEqualStrings("paste-code", redirect.code);
 }
 
 test "callback cancellation closes acquired connections" {

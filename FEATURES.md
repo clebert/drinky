@@ -190,7 +190,9 @@ server through `DS4_BASE_URL`.
   browser cannot reach the callback, Enter on the callback URL from its address bar replays it to
   the listener. Enter on any other line is refused with a notice that names the sign-in. An
   OpenRouter login waits on one random callback path. A callback URL of an earlier sign-in names
-  another path, so Drinky refuses it and the editor keeps the line.
+  another path, so Drinky refuses it and the editor keeps the line. A connection that sends no
+  request line is dropped at its own deadline, so a stalled browser attempt cannot block the
+  callback.
 - The browser lands on a plain page: "Drinky received authorization. Close this tab."
 - The xAI subscription login (SuperGrok or X Premium) uses the device-code grant. The event holds
   the verification URL and the user code, Drinky opens the browser, and polls until the grant
