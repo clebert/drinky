@@ -1,9 +1,3 @@
-//! Model fixtures for tests. Drinky compiles no model in, so a test that needs
-//! one builds it here rather than reading a table that no longer exists. The
-//! fixtures carry no vendor data: a caller passes the name it wants to see, and
-//! the limits and rates below are round numbers chosen for arithmetic that is
-//! easy to check.
-
 const std = @import("std");
 
 const Accounts = @import("Accounts.zig");
@@ -14,9 +8,6 @@ const openai = @import("openai/root.zig");
 const openrouter = @import("openrouter/root.zig");
 const xai = @import("xai/root.zig");
 
-/// A fully described model: a window, an output limit, every effort level, a
-/// reasoning, and a price. A test that needs another shape starts
-/// here and overwrites the one field it cares about.
 pub fn model(name: []const u8) Model {
     var built = Model.init(name) catch unreachable;
     built.context_window = 1_000_000;
@@ -27,14 +18,10 @@ pub fn model(name: []const u8) Model {
     return built;
 }
 
-/// A model that states its name alone, as an OpenAI key states one. It has no
-/// window, no level, and no price.
 pub fn bareModel(name: []const u8) Model {
     return Model.init(name) catch unreachable;
 }
 
-/// A credential store with no file behind it, so a test keeps its credential in
-/// memory alone, exactly as a catalog with no path keeps its models.
 fn memoryStore(comptime Store: type) Store {
     return .{
         .gpa = std.testing.allocator,
@@ -45,8 +32,6 @@ fn memoryStore(comptime Store: type) Store {
     };
 }
 
-/// A registry stubbed to the given environment, which offers no model until a
-/// `seedAccount` call. It owns no store, so a caller frees only what it seeds.
 pub fn accounts(environment: Accounts.Environment) Accounts {
     return .{
         .gpa = std.testing.allocator,
@@ -79,9 +64,6 @@ pub fn accounts(environment: Accounts.Environment) Accounts {
     };
 }
 
-/// Offer `names` under `account`, as a fetch does. Every model is fully
-/// described, so it survives the merge and reaches a picker. The registry frees
-/// the list, so a caller that owns the registry needs no teardown of its own.
 pub fn seedAccount(
     registry: *Accounts,
     account: llm.Account,

@@ -1,76 +1,40 @@
-//! The Telegram Bot API client: one HTTPS POST with a JSON body per call, and
-//! the reply classified by its status. The client knows the nine methods that
-//! the transport, the mirror, and the keyboards need and nothing of the session.
-//!
-//! The URL of every call carries the token, so no error, event, or log names a
-//! URL. A failure reads as one of the `Error` names, and the description that
-//! Telegram sent stays in `description` for the event that reports it.
-
 const std = @import("std");
 
 const ai = @import("ai");
 
 const Client = @This();
 
-/// The public API host. A test points `base_url` at a loopback server instead.
 pub const api_url = "https://api.telegram.org";
 
-/// The hard cap on one reply body. A `getUpdates` reply holds at most 100
-/// updates, each under a few kilobytes, so the cap clears any real reply and
-/// still bounds a body that never ends.
 const response_bytes_max = 4 << 20;
 
-/// The margin between the poll timeout and the head window, so the reply head
-/// of an empty poll arrives inside the window.
 const poll_margin_ms = 5_000;
 
-/// The least head window of a long poll. The configured window bounds the head
-/// of one provider request, and a long poll holds the connection open on
-/// purpose, so a short configured window must not shorten the poll. A poll under
-/// this floor returns at once and asks again every second, and Telegram answers
-/// that with a 429. A zero configured window disables the bound, and the poll
-/// still needs a finite wait, so it takes this window too.
 pub const poll_connect_ms_min = 30_000;
 
 gpa: std.mem.Allocator,
 io: std.Io,
-/// The API origin, without a trailing slash. Borrowed.
 base_url: []const u8,
-/// The bot token. Borrowed, and never part of any text this client produces.
 token: []const u8,
-/// The head window of one call, in milliseconds. It bounds the whole call, body
-/// included, because every reply is small. Zero disables the bound.
 connect_ms: u64,
-/// The wait that the last `error.RateLimited` named, in seconds.
 retry_after_s: u64 = 0,
-/// The description of the last failure that Telegram described, cut to the
-/// buffer. Empty after a failure without a description.
 description_buffer: [200]u8 = undefined,
 description_length: usize = 0,
 
 pub const Error = error{
-    /// 401: Telegram no longer knows the token.
     Unauthorized,
-    /// 403: the user blocked the bot.
     Forbidden,
-    /// 409: another client polls the same bot, or a webhook is active.
     Conflict,
-    /// 429: `retry_after_s` names the wait.
     RateLimited,
-    /// Any other 4xx: a repeat of the same request cannot succeed.
     Rejected,
-    /// A 5xx, a network fault, or a timeout: a repeat can succeed.
     Unavailable,
-    /// A 200 whose body is not the reply of the method.
     MalformedReply,
     OutOfMemory,
     Canceled,
 };
 
-/// The bot that a token names.
 pub const Me = struct {
     id: i64,
-    /// Owned by the caller.
     username: []u8,
 
     pub fn deinit(self: *const Me, gpa: std.mem.Allocator) void {
@@ -78,9 +42,6 @@ pub const Me = struct {
     }
 };
 
-/// One update of a poll: a message, a tap on an inline keyboard, or neither,
-/// because the poll asks for those two kinds alone and an edit arrives as
-/// neither.
 pub const Update = struct {
     update_id: i64,
     message: ?Message,
@@ -89,28 +50,18 @@ pub const Update = struct {
     pub const Message = struct {
         message_id: i64,
         chat_id: i64,
-        /// Whether the chat is a private chat with one user.
         chat_private: bool,
-        /// The text, or null for a photo, a sticker, a voice note, or any other
-        /// content. Owned by the list.
         text: ?[]u8,
     };
 
-    /// One tap on a button of an inline keyboard. Every tap needs an answer
-    /// through `answerCallbackQuery` with its `id`.
     pub const Callback = struct {
-        /// The id of the query. Owned by the list.
         id: []u8,
-        /// The message that holds the keyboard.
         message_id: i64,
         chat_id: i64,
-        /// The `callback_data` of the button. Owned by the list.
         data: []u8,
     };
 };
 
-/// The updates of one poll, in the order Telegram sent them. The list owns
-/// every text.
 pub const Updates = struct {
     items: []Update,
 
@@ -131,43 +82,27 @@ fn freeUpdate(gpa: std.mem.Allocator, update: *const Update) void {
 }
 
 pub const SendOptions = struct {
-    /// The message that the new one answers, or null for a plain message.
     reply_to: ?i64 = null,
-    /// Whether the chat stays silent for this message.
     disable_notification: bool = false,
-    /// `HTML` for a formatted text, or null for plain text.
     parse_mode: ?[]const u8 = null,
-    /// The `reply_markup` object of an inline keyboard as JSON, or null for a
-    /// message without one. Borrowed for the call.
     markup: ?[]const u8 = null,
 };
 
-/// What an edit states beside its text.
 pub const EditOptions = struct {
-    /// `HTML` for a formatted text, or null for plain text.
     parse_mode: ?[]const u8 = null,
-    /// The `reply_markup` object of an inline keyboard as JSON, or null for a
-    /// message without one. An edit without a keyboard removes the one the
-    /// message holds. Borrowed for the call.
     markup: ?[]const u8 = null,
 };
 
-/// The message of a chat that an edit, a deletion, or a reaction acts on.
 pub const Target = struct {
     chat_id: i64,
     message_id: i64,
 };
 
-/// One command that `setMyCommands` registers, so the chat completes it.
 pub const Command = struct {
-    /// The name without the slash: `[a-z0-9_]`, 1 to 32 characters.
     command: []const u8,
-    /// The line the chat shows beside the name.
     description: []const u8,
 };
 
-/// A JSON value that stands complete in its bytes, so a serialized keyboard
-/// embeds into a body without a second parse.
 const Raw = struct {
     bytes: []const u8,
 
@@ -180,7 +115,6 @@ fn raw(maybe_bytes: ?[]const u8) ?Raw {
     return .{ .bytes = maybe_bytes orelse return null };
 }
 
-/// One reply body under its own arena.
 const Reply = struct {
     parsed: std.json.Parsed(std.json.Value),
 
@@ -188,7 +122,6 @@ const Reply = struct {
         self.parsed.deinit();
     }
 
-    /// The `result` field of the reply.
     fn result(self: *const Reply) Error!std.json.Value {
         const object = switch (self.parsed.value) {
             .object => |object| object,
@@ -198,24 +131,14 @@ const Reply = struct {
     }
 };
 
-/// The head window a long poll runs under, for a configured window of
-/// `connect_ms`. A client that polls takes this window, and one that sends
-/// keeps the configured one.
 pub fn pollConnectMs(connect_ms: u64) u64 {
     return @max(connect_ms, poll_connect_ms_min);
 }
 
-/// The Telegram `timeout` parameter of a long poll for a head window of
-/// `connect_ms`: five seconds under the window, with a floor of one second.
-/// The caller passes a `pollConnectMs` window, so the floor only guards a
-/// window that no poller uses.
 pub fn pollTimeoutSeconds(connect_ms: u64) u64 {
     return @max(1, @divFloor(connect_ms -| poll_margin_ms, std.time.ms_per_s));
 }
 
-/// Whether `token` has the shape of a bot token: digits, a colon, and the
-/// letters, digits, `_`, and `-` of the secret. Every byte outside that set
-/// breaks the URL path that carries the token, so the check refuses it first.
 pub fn validToken(token: []const u8) bool {
     const colon = std.mem.indexOfScalar(u8, token, ':') orelse return false;
     if (colon == 0 or colon + 1 == token.len) return false;
@@ -226,12 +149,10 @@ pub fn validToken(token: []const u8) bool {
     return true;
 }
 
-/// The description of the last failure, or empty when Telegram sent none.
 pub fn description(self: *const Client) []const u8 {
     return self.description_buffer[0..self.description_length];
 }
 
-/// Prove the token and name the bot. The caller frees the result.
 pub fn getMe(self: *Client) Error!Me {
     const reply = try self.call("getMe", "{}");
     defer reply.deinit();
@@ -241,16 +162,12 @@ pub fn getMe(self: *Client) Error!Me {
     return .{ .id = id, .username = try self.gpa.dupe(u8, username) };
 }
 
-/// Remove an active webhook, because one blocks every poll.
 pub fn deleteWebhook(self: *Client) Error!void {
     const reply = try self.call("deleteWebhook", "{}");
     defer reply.deinit();
     _ = try reply.result();
 }
 
-/// Poll for message and tap updates from `offset` on, and wait at most
-/// `timeout_s` for one. An `offset` of -1 confirms every waiting update and
-/// returns the newest one alone. The caller frees the result.
 pub fn getUpdates(self: *Client, offset: ?i64, timeout_s: u64) Error!Updates {
     const body = try std.json.Stringify.valueAlloc(self.gpa, .{
         .offset = offset,
@@ -300,8 +217,6 @@ pub fn getUpdates(self: *Client, offset: ?i64, timeout_s: u64) Error!Updates {
     return .{ .items = try updates.toOwnedSlice(self.gpa) };
 }
 
-/// The tap of one `callback_query`, or null for a query without a message or
-/// without data, which no keyboard of Drinky produces.
 fn parseCallback(self: *Client, object: std.json.ObjectMap) Error!?Update.Callback {
     const id = stringOf(object.get("id")) orelse return error.MalformedReply;
     const message = objectOf(object.get("message")) orelse return null;
@@ -317,7 +232,6 @@ fn parseCallback(self: *Client, object: std.json.ObjectMap) Error!?Update.Callba
     };
 }
 
-/// Register the commands that the chat completes after a slash.
 pub fn setMyCommands(self: *Client, commands: []const Command) Error!void {
     const body = try std.json.Stringify.valueAlloc(self.gpa, .{ .commands = commands }, .{});
     defer self.gpa.free(body);
@@ -326,7 +240,6 @@ pub fn setMyCommands(self: *Client, commands: []const Command) Error!void {
     _ = try reply.result();
 }
 
-/// Send `text` to `chat_id` and return the id of the new message.
 pub fn sendMessage(
     self: *Client,
     chat_id: i64,
@@ -352,11 +265,6 @@ pub fn sendMessage(
     return integerOf(result.get("message_id")) orelse error.MalformedReply;
 }
 
-/// Replace the text of the message `target`, and its inline keyboard with the
-/// one of `options`. An edit without a keyboard removes the one the message
-/// holds. An edit to the state the message already holds changes nothing, and
-/// that is the state the caller asked for, so Telegram's refusal of it reads as
-/// success.
 pub fn editMessageText(
     self: *Client,
     target: Target,
@@ -382,8 +290,6 @@ pub fn editMessageText(
     _ = try reply.result();
 }
 
-/// Take the message `target` out of its chat. Telegram lets a bot delete its
-/// own message for 48 hours, which every message of a picker stays inside.
 pub fn deleteMessage(self: *Client, target: Target) Error!void {
     const body = try std.json.Stringify.valueAlloc(
         self.gpa,
@@ -396,9 +302,6 @@ pub fn deleteMessage(self: *Client, target: Target) Error!void {
     _ = try reply.result();
 }
 
-/// Answer the tap `query_id`, with `text` as a toast or with nothing, so the
-/// button stops its wait. A query expires after a few seconds, and an answer
-/// after that fails as rejected.
 pub fn answerCallbackQuery(self: *Client, query_id: []const u8, text: ?[]const u8) Error!void {
     const body = try std.json.Stringify.valueAlloc(self.gpa, .{
         .callback_query_id = query_id,
@@ -410,8 +313,6 @@ pub fn answerCallbackQuery(self: *Client, query_id: []const u8, text: ?[]const u
     _ = try reply.result();
 }
 
-/// Set the one reaction of the bot on the message `target`. Telegram allows a
-/// fixed emoji list for a bot.
 pub fn setMessageReaction(self: *Client, target: Target, emoji: []const u8) Error!void {
     const ReactionType = struct { type: []const u8 = "emoji", emoji: []const u8 };
     const body = try std.json.Stringify.valueAlloc(self.gpa, .{
@@ -425,8 +326,6 @@ pub fn setMessageReaction(self: *Client, target: Target, emoji: []const u8) Erro
     _ = try reply.result();
 }
 
-/// One POST of `body` to `method`, bounded by the head window. The reply parses
-/// under its own arena, and the caller frees it.
 fn call(self: *Client, method: []const u8, body: []const u8) Error!Reply {
     const url = try std.fmt.allocPrint(
         self.gpa,
@@ -441,7 +340,6 @@ fn call(self: *Client, method: []const u8, body: []const u8) Error!Reply {
         post,
         .{ self.gpa, self.io, url, body, &out },
     ) catch |err| {
-        // The race can discard a response that arrived at the deadline.
         if (out) |response| self.gpa.free(response.body);
         return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
@@ -454,7 +352,6 @@ fn call(self: *Client, method: []const u8, body: []const u8) Error!Reply {
     return self.classify(&response);
 }
 
-/// The status and the body of one reply.
 const Response = struct {
     status: std.http.Status,
     body: []u8,
@@ -495,8 +392,6 @@ fn post(
     out.* = .{ .status = response.head.status, .body = bytes };
 }
 
-/// Read the status and the body of one reply. A failure keeps its description,
-/// and a 429 keeps its wait.
 fn classify(self: *Client, response: *const Response) Error!Reply {
     const parsed = std.json.parseFromSlice(std.json.Value, self.gpa, response.body, .{}) catch |err|
         switch (err) {
@@ -531,22 +426,17 @@ fn classify(self: *Client, response: *const Response) Error!Reply {
     };
 }
 
-/// Keep the `description` of a failed reply, or clear it for a reply without one.
-/// The cut to the buffer falls before a UTF-8 sequence, never inside one, so the
-/// event that reports the description stays valid text.
 fn keepDescription(self: *Client, parsed: ?std.json.Parsed(std.json.Value)) void {
     self.description_length = 0;
     const reply = parsed orelse return;
     const object = objectOf(reply.value) orelse return;
     const text = stringOf(object.get("description")) orelse return;
     var length = @min(text.len, self.description_buffer.len);
-    // A continuation byte reads `10xxxxxx`, and a sequence holds at most three.
     while (length > 0 and length < text.len and (text[length] & 0xC0) == 0x80) length -= 1;
     @memcpy(self.description_buffer[0..length], text[0..length]);
     self.description_length = length;
 }
 
-/// The `parameters.retry_after` of a 429 reply, in seconds.
 fn retryAfter(parsed: ?std.json.Parsed(std.json.Value)) ?u64 {
     const reply = parsed orelse return null;
     const object = objectOf(reply.value) orelse return null;
@@ -595,14 +485,10 @@ test validToken {
 test pollTimeoutSeconds {
     try std.testing.expectEqual(@as(u64, 25), pollTimeoutSeconds(30_000));
     try std.testing.expectEqual(@as(u64, 55), pollTimeoutSeconds(60_500));
-    // No poller passes a window under the floor. The timeout stays positive
-    // there too, so a direct caller gets a wait and never a zero.
     try std.testing.expectEqual(@as(u64, 1), pollTimeoutSeconds(5_000));
     try std.testing.expectEqual(@as(u64, 1), pollTimeoutSeconds(0));
 }
 
-// A short configured window must not turn the long poll into a busy poll, so
-// the poll takes the floor and the timeout stays a real wait.
 test pollConnectMs {
     try std.testing.expectEqual(@as(u64, 30_000), pollConnectMs(5_000));
     try std.testing.expectEqual(@as(u64, 30_000), pollConnectMs(0));
@@ -676,17 +562,14 @@ test "getUpdates reads a text message, a non-text message, a tap, and the chat t
     try std.testing.expect(updates.items[0].callback == null);
     try std.testing.expect(updates.items[1].message.?.text == null);
     try std.testing.expect(!updates.items[2].message.?.chat_private);
-    // An edit is no message, so the update carries no payload.
     try std.testing.expect(updates.items[3].message == null);
     try std.testing.expect(updates.items[3].callback == null);
-    // A tap names its query, the message under the keyboard, and the button.
     const tap = updates.items[4].callback.?;
     try std.testing.expectEqualStrings("4407", tap.id);
     try std.testing.expectEqual(@as(i64, 50), tap.message_id);
     try std.testing.expectEqual(@as(i64, 99), tap.chat_id);
     try std.testing.expectEqualStrings("cancel:3", tap.data);
     try std.testing.expect(updates.items[4].message == null);
-    // A tap without a message comes from no keyboard of Drinky.
     try std.testing.expect(updates.items[5].callback == null);
     try server.finish();
     try std.testing.expectEqualStrings(
@@ -695,9 +578,6 @@ test "getUpdates reads a text message, a non-text message, a tap, and the chat t
     );
 }
 
-// A later update that lacks its id fails the whole poll. The texts of the updates
-// before it are owned by then, and the leak check of the test allocator proves
-// that the failure frees each one and the list.
 test "a malformed later update fails the poll without a leak" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -759,7 +639,6 @@ test "sendMessage returns the message id and states its options" {
         "{\"chat_id\":99,\"text\":\"Event: hi\",\"disable_notification\":false}",
         server.requests.items[0].body,
     );
-    // The keyboard embeds as the object it already is.
     try std.testing.expectEqualStrings(
         "{\"chat_id\":99,\"text\":\"<b>x</b>\",\"disable_notification\":true," ++
             "\"parse_mode\":\"HTML\",\"reply_parameters\":{\"message_id\":12}," ++
@@ -802,12 +681,10 @@ test "editMessageText states its target and keyboard, and an unchanged text coun
         client.editMessageText(.{ .chat_id = 99, .message_id = 315 }, "Writing", &.{}),
     );
     try server.finish();
-    // An edit without a keyboard names none, so the message loses the one it holds.
     try std.testing.expectEqualStrings(
         "{\"chat_id\":99,\"message_id\":314,\"text\":\"Writing\"}",
         server.requests.items[0].body,
     );
-    // A formatted edit names its parse mode like a formatted send.
     try std.testing.expectEqualStrings(
         "{\"chat_id\":99,\"message_id\":314,\"text\":\"<b>Writing</b>\",\"parse_mode\":\"HTML\"," ++
             "\"reply_markup\":{\"inline_keyboard\":[]}}",
@@ -971,21 +848,17 @@ test "every status classifies, and a failure keeps its description and its wait"
     try std.testing.expectError(error.Rejected, client.deleteWebhook());
     try std.testing.expectEqualStrings("Bad Request: can't parse entities", client.description());
     try std.testing.expectError(error.Unavailable, client.deleteWebhook());
-    // A body without a description clears the last one.
     try std.testing.expectEqualStrings("", client.description());
     try std.testing.expectError(error.MalformedReply, client.deleteWebhook());
     try std.testing.expectError(error.MalformedReply, client.deleteWebhook());
     try server.finish();
 }
 
-// The description buffer is smaller than a description can be. The cut must not
-// leave half a UTF-8 sequence behind, because the text reaches an event.
 test "a long description cuts before a UTF-8 sequence" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    // 198 ASCII bytes, then a three-byte symbol that straddles the 200-byte cut.
     const body = "{\"ok\":false,\"error_code\":400,\"description\":\"" ++ "x" ** 198 ++ "€€\"}";
     var server = try testing.Server.init(gpa, io, &.{.{ .method = "deleteWebhook", .replies = &.{
         .{ .status = 400, .body = body },
@@ -1023,7 +896,6 @@ test "a server that does not answer is unavailable, not a hang" {
         .token = "t",
         .connect_ms = 50,
     };
-    // No script answers, so the call waits for its head until the window closes.
     try std.testing.expectError(error.Unavailable, client.getMe());
     try server.finish();
 }

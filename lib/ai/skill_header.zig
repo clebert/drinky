@@ -1,12 +1,7 @@
-//! Parses the YAML front matter subset used by `SKILL.md` metadata. This is
-//! intentionally not a general-purpose YAML parser.
-
 const std = @import("std");
 
 pub const Parsed = struct {
-    /// Borrows the source passed to `parse`.
     name: ?[]const u8,
-    /// Owned. `deinit` releases it.
     description: ?[]u8,
     model_invocation_disabled: bool,
 
@@ -34,8 +29,6 @@ pub fn parse(gpa: std.mem.Allocator, data: []const u8) !Parsed {
             closed = true;
             break;
         }
-        // A description consumes its own continuation lines. Any blank or
-        // indented line that reaches the mapping loop belongs to nothing.
         if (line.len == 0 or line[0] == ' ' or line[0] == '\t') continue;
 
         const separator = std.mem.indexOfScalar(u8, line, ':') orelse continue;
@@ -115,11 +108,6 @@ const BlockHeader = struct {
     const Mode = enum { literal, folded };
 };
 
-/// Parse a block scalar header. The header is `|`/`>` with an optional 1-9
-/// indentation indicator and -/+ chomping indicator, each once, in either
-/// order. Returns null when the value is a plain scalar that merely starts
-/// with `>` or `|`. Only unquoted values reach this function, so a quoted
-/// `"|"` is never a block header.
 fn blockHeader(value: []const u8) ?BlockHeader {
     if (value.len == 0) return null;
     const mode: BlockHeader.Mode = switch (value[0]) {
@@ -154,11 +142,6 @@ fn appendDescription(writer: *std.Io.Writer, raw: []const u8) !void {
     }
 }
 
-/// Read a single front matter scalar into `out` and apply YAML line folding.
-/// Leave `lines` positioned on the first line that is not part of the scalar.
-/// Handles the scalar styles skill descriptions use: plain, single/double
-/// quoted (each can be multi-line), and literal/folded block. This is not a
-/// general YAML parser.
 fn collectDescription(
     lines: *std.mem.SplitIterator(u8, .scalar),
     first_value: []const u8,
@@ -167,8 +150,6 @@ fn collectDescription(
     if (first_value.len > 0 and (first_value[0] == '"' or first_value[0] == '\'')) {
         return collectQuoted(lines, first_value, out);
     }
-    // Detect the block header on the comment-stripped value. A legal trailing
-    // `# comment` on `|`/`>` then does not demote the value to a plain scalar.
     if (blockHeader(scalarValue(first_value))) |header| return collectBlock(lines, header, out);
     return collectPlain(lines, first_value, out);
 }
@@ -218,8 +199,6 @@ fn collectQuoted(
             continue;
         }
         if (line[0] != ' ' and line[0] != '\t') {
-            // Unterminated quote: hand the mapping loop its key or closing
-            // fence back. Keep the partial value rather than reject the skill.
             lines.index = resume_index;
             break;
         }
@@ -279,9 +258,6 @@ fn collectBlock(
     }
 }
 
-/// The index of the closing `quote` in a quoted scalar's content, or null when
-/// the quote stays open past this line. Honors `\` escapes in double quotes
-/// and `''` in single quotes.
 fn flowClose(content: []const u8, quote: u8) ?usize {
     var index: usize = 0;
     while (index < content.len) {
@@ -302,9 +278,6 @@ fn flowClose(content: []const u8, quote: u8) ?usize {
     return null;
 }
 
-/// Emit the fold between two flow-scalar lines: nothing before the first
-/// content line, a space across a single line break, and one newline per blank
-/// line otherwise.
 fn foldSeparator(out: *std.Io.Writer, started: *bool, breaks: *usize) !void {
     if (!started.*) {
         started.* = true;
@@ -366,7 +339,6 @@ fn writeDoubleQuoted(writer: *std.Io.Writer, value: []const u8) !void {
                 if (writeHexEscape(writer, value[index..], width)) |consumed| {
                     index += consumed;
                 } else |_| {
-                    // Malformed hex escape: keep the source bytes verbatim.
                     try writer.writeByte('\\');
                     try writer.writeByte(escaped);
                 }

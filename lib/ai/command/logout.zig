@@ -1,7 +1,3 @@
-//! `/logout`: a picker over the signed-in accounts. API-key accounts are
-//! environment-sourced and have no logout. A selection hands the
-//! app a `logout` outcome. The command takes no argument.
-
 const std = @import("std");
 
 const Accounts = @import("../Accounts.zig");
@@ -50,7 +46,6 @@ pub fn select(context: *Context, selection: Context.Outcome.Pick.Selection) !Con
 
 const account_count = std.enums.values(llm.Account).len;
 
-/// The picker's rows in enum order. `run` and `select` re-derive them identically.
 fn loggedIn(accounts: *const Accounts, buffer: []llm.Account) []llm.Account {
     var count: usize = 0;
     for (std.enums.values(llm.Account)) |account| {

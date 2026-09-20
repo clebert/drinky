@@ -1,16 +1,3 @@
-//! The public model metadata. It needs no credential. It is the only source
-//! that states a price, so Drinky reads it for every account and merges it
-//! under whatever the vendor itself stated. The same body also holds the
-//! OpenRouter list, which Drinky stores under that provider.
-//!
-//! `GET https://openrouter.ai/api/v1/models` answers with every model of every
-//! vendor. Drinky keeps a normalized subset: the vendors it reaches, and per
-//! model the context window, the effort levels, the thinking state, the tool
-//! state, the four rates, and the long-context tier. The endpoints of a model
-//! are deliberately ignored. They price service tiers, regions, and resellers
-//! that Drinky never calls, while the top-level `pricing` object states the
-//! standard rate of the vendor itself.
-
 const std = @import("std");
 
 const json = @import("json.zig");
@@ -24,16 +11,11 @@ const endpoint = "https://openrouter.ai/api/v1/models";
 const user_agent = "drinky";
 const body_bytes_max = 8 * 1024 * 1024;
 const entry_count_max = 4096;
-/// Rates arrive in dollars per token, and Drinky states them per million
-/// tokens, so every rate scales by this many tokens.
 const tokens_per_million = 1_000_000.0;
 
 gpa: std.mem.Allocator,
 entries: []Entry,
 
-/// One model of one vendor, as the aggregator states it. The name is the
-/// aggregator spelling, which is not always the id the vendor answers to, so a
-/// lookup normalizes before it compares. An OpenRouter entry holds the full id.
 pub const Entry = struct {
     provider: llm.Provider,
     model: Model,
@@ -48,9 +30,6 @@ pub fn deinit(self: *Metadata) void {
     self.gpa.free(self.entries);
 }
 
-/// Fetch and decode the public list. The request carries no credential. The
-/// `deadline` bounds it. A fetch of a vendor account lists that account first,
-/// and both requests share the one window.
 pub fn fetch(gpa: std.mem.Allocator, io: std.Io, deadline: net.Deadline) !Metadata {
     var maybe_metadata: ?Metadata = null;
     deadline.call(io, request, .{ gpa, io, &maybe_metadata }) catch |err| {
@@ -89,10 +68,6 @@ fn request(gpa: std.mem.Allocator, io: std.Io, out: *?Metadata) !void {
     out.* = try parse(gpa, body);
 }
 
-/// Decode a complete response into the normalized subset. A malformed envelope
-/// rejects the whole body. A malformed entry is skipped, because one bad model
-/// must not cost the user every other price. One body fills the vendor metadata
-/// and the grouped OpenRouter list.
 pub fn parse(gpa: std.mem.Allocator, body: []const u8) !Metadata {
     var parsed = try std.json.parseFromSlice(std.json.Value, gpa, body, .{});
     defer parsed.deinit();
@@ -120,10 +95,6 @@ pub fn parse(gpa: std.mem.Allocator, body: []const u8) !Metadata {
     return .{ .gpa = gpa, .entries = try vendor_entries.toOwnedSlice(gpa) };
 }
 
-/// The metadata of `name` under `provider`, or null when the list holds no such
-/// model. The vendor id normalizes to the aggregator spelling first. An
-/// OpenRouter account does not look up here, because a slug would rewrite a
-/// full id.
 pub fn lookup(self: *const Metadata, provider: llm.Provider, name: []const u8) ?Model {
     var buffer: [Model.name_bytes_max]u8 = undefined;
     const wanted = slug(name, &buffer);
@@ -131,16 +102,10 @@ pub fn lookup(self: *const Metadata, provider: llm.Provider, name: []const u8) ?
         if (entry.provider != provider) continue;
         if (entry.model.sameName(wanted)) return entry.model;
     }
-    // A versionless DeepSeek id such as `deepseek-flash` has no public row of
-    // that spelling. It takes the newest versioned row of the same family.
     if (provider == .deepseek) return self.lookupDeepseekFamily(wanted);
     return null;
 }
 
-/// The newest versioned public row of a versionless DeepSeek family, or null.
-/// `deepseek-flash` takes `deepseek-v4.1-flash` when that spelling outranks
-/// `deepseek-v4-flash`. A versioned id does not use this path. A trailing digit
-/// group is a snapshot of the same family, not a new family.
 fn lookupDeepseekFamily(self: *const Metadata, name: []const u8) ?Model {
     const wanted = deepseekFamily(name) orelse return null;
     if (wanted.major != null) return null;
@@ -183,9 +148,6 @@ const DeepseekFamily = struct {
     snapshot: u32,
 };
 
-/// Split a DeepSeek id into its family, version, and optional snapshot.
-/// `deepseek-flash` is versionless. `deepseek-v4.1-flash` is family `flash` at
-/// 4.1. `deepseek-v4-pro-0813` is family `pro` at snapshot 0813.
 fn deepseekFamily(name: []const u8) ?DeepseekFamily {
     const prefix = "deepseek-";
     if (!std.mem.startsWith(u8, name, prefix)) return null;
@@ -218,8 +180,6 @@ const Snapshot = struct {
     snapshot: u32,
 };
 
-/// A trailing dash of digits is a snapshot of `family`. `pro-0813` is family
-/// `pro` at 813. `flash-vision-exp` has no snapshot.
 fn snapshotOf(family: []const u8) Snapshot {
     const dash = std.mem.lastIndexOfScalar(u8, family, '-') orelse
         return .{ .family = family, .snapshot = 0 };
@@ -233,8 +193,6 @@ fn snapshotOf(family: []const u8) Snapshot {
     return .{ .family = family[0..dash], .snapshot = snapshot };
 }
 
-/// The unsigned integer at `index`, and the index past it. Null when no digit
-/// stands there, or when the run does not fit in a `u32`.
 fn digits(text: []const u8, index: *usize) ?u32 {
     const start = index.*;
     while (index.* < text.len and isDigit(text[index.*])) index.* += 1;
@@ -242,17 +200,11 @@ fn digits(text: []const u8, index: *usize) ?u32 {
     return std.fmt.parseInt(u32, text[start..index.*], 10) catch null;
 }
 
-/// The aggregator spelling of a vendor id. The aggregator writes a version with
-/// a dot where the vendor writes a dash, and it names no dated snapshot, so
-/// `claude-opus-4-8` becomes `claude-opus-4.8` and a trailing date goes. An id
-/// that needs no change comes back unchanged.
 fn slug(name: []const u8, buffer: []u8) []const u8 {
     const trimmed = withoutDate(name);
     if (trimmed.len > buffer.len) return trimmed;
     @memcpy(buffer[0..trimmed.len], trimmed);
     const result = buffer[0..trimmed.len];
-    // A version reads as `-<digit>-<digit>`. One pass covers every version in
-    // one id, because the scan never revisits a byte it rewrote.
     if (result.len < 4) return result;
     for (1..result.len - 1) |index| {
         if (result[index] != '-') continue;
@@ -264,7 +216,6 @@ fn slug(name: []const u8, buffer: []u8) []const u8 {
     return result;
 }
 
-/// `name` without a trailing snapshot date, which is eight digits behind a dash.
 fn withoutDate(name: []const u8) []const u8 {
     const date_length = 8;
     if (name.len < date_length + 2) return name;
@@ -280,24 +231,16 @@ fn isDigit(byte: u8) bool {
     return byte >= '0' and byte <= '9';
 }
 
-/// A count that states a limit, or null when it is absent or not one. Zero
-/// states no limit, so it reads as absent.
 fn positive(value: ?std.json.Value) ?u64 {
     const found = json.integer(value) orelse return null;
     return if (found > 0) @intCast(found) else null;
 }
 
-/// The author slug of a full OpenRouter id, or the whole name when it holds no
-/// slash.
 pub fn authorOf(name: []const u8) []const u8 {
     const separator = std.mem.indexOfScalar(u8, name, '/') orelse return name;
     return name[0..separator];
 }
 
-/// One listed vendor model, or null when it names no vendor Drinky reaches,
-/// when its id is unusable, or when it is a variant that no vendor answers to.
-/// A `:` marks such a variant, as in `:batch` and `:free`. Silence about tools
-/// keeps the model, so a merge can drop it later.
 fn decodeVendor(value: std.json.Value) ?Entry {
     const object = json.object(value) orelse return null;
     const id = json.string(object.get("id")) orelse return null;
@@ -311,11 +254,6 @@ fn decodeVendor(value: std.json.Value) ?Entry {
     return .{ .provider = provider, .model = model };
 }
 
-/// One OpenRouter model, or null when the id is not a plain `vendor/model`,
-/// when it is a router or an alias, or when the entry does not state that the
-/// model takes tools. Silence about tools drops the model here, because every
-/// Drinky request names tools and the endpoint filter of OpenRouter then serves
-/// no endpoint for it.
 fn decodeOpenRouter(value: std.json.Value) ?Model {
     const object = json.object(value) orelse return null;
     const id = json.string(object.get("id")) orelse return null;
@@ -355,8 +293,6 @@ fn providerOf(vendor: []const u8) ?llm.Provider {
     return null;
 }
 
-/// Group OpenRouter models by author: authors by tool-model count, then by the
-/// position of the first model, and inside one author the models newest first.
 fn groupOpenRouter(gpa: std.mem.Allocator, models: []const Model) ![]Model {
     var authors: std.ArrayList(Author) = .empty;
     defer authors.deinit(gpa);
@@ -387,8 +323,6 @@ fn groupOpenRouter(gpa: std.mem.Allocator, models: []const Model) ![]Model {
                 if (more or earlier) best = index;
             } else best = index;
         }
-        // Each pass takes one unused author, and the loop runs once per author,
-        // so an unused author always remains.
         const chosen = best.?;
         used[chosen] = true;
         const author = authors.items[chosen];
@@ -399,17 +333,10 @@ fn groupOpenRouter(gpa: std.mem.Allocator, models: []const Model) ![]Model {
             out += 1;
         }
     }
-    // Every model belongs to exactly one author, so the passes above copy the
-    // whole list.
     std.debug.assert(out == models.len);
     return grouped;
 }
 
-/// The four rates Drinky charges against and the long-context tier, converted
-/// from dollars per token. A model priced at zero is a free endpoint rather
-/// than a rate, so it states no price. A missing input or output rate rejects
-/// the whole price, because a half-priced model reports a cost that is wrong
-/// rather than absent.
 fn price(value: ?std.json.Value) ?Model.Price {
     const object = json.object(value orelse return null) orelse return null;
     const input = rate(object.get("prompt")) orelse return null;
@@ -419,17 +346,12 @@ fn price(value: ?std.json.Value) ?Model.Price {
         .input = input,
         .output = output,
         .cache_read = rate(object.get("input_cache_read")) orelse 0,
-        // The 1-hour variant is deliberately ignored: Drinky writes 5-minute
-        // ephemeral entries alone.
         .cache_write = rate(object.get("input_cache_write")) orelse 0,
     };
     priced.long_context = longContext(&priced, object.get("overrides"));
     return priced;
 }
 
-/// The long-context tier of `standard`: the first override that names a prompt
-/// threshold. Another override names a time window instead, and Drinky reads no
-/// clock for a rate. A kind the tier omits keeps the rate of the entry.
 fn longContext(standard: *const Model.Price, value: ?std.json.Value) ?Model.Price.LongContext {
     const listed = json.array(value orelse return null) orelse return null;
     for (listed.items) |item| {
@@ -446,9 +368,6 @@ fn longContext(standard: *const Model.Price, value: ?std.json.Value) ?Model.Pric
     return null;
 }
 
-/// One rate, which arrives as a decimal string of dollars per token. The guard
-/// tests the scaled number, because a finite rate can reach infinity at that
-/// scale, and such a value prints as a cost and writes as invalid JSON.
 fn rate(value: ?std.json.Value) ?f64 {
     const text = json.string(value orelse return null) orelse return null;
     const parsed = std.fmt.parseFloat(f64, text) catch return null;
@@ -457,8 +376,6 @@ fn rate(value: ?std.json.Value) ?f64 {
     return if (std.math.isFinite(scaled)) scaled else null;
 }
 
-/// The effort levels and the thinking state. A model with a reasoning object
-/// reasons, and a model with none never reasons.
 fn reasoning(model: *Model, value: ?std.json.Value) void {
     const object = json.object(value orelse {
         model.thinking = .unsupported;
@@ -469,13 +386,10 @@ fn reasoning(model: *Model, value: ?std.json.Value) void {
     const levels = json.array(object.get("supported_efforts")) orelse return;
     for (levels.items) |level| {
         const name = json.string(level) orelse continue;
-        // A name the ladder does not hold drops. `none` is one such name.
         model.addEffort(std.meta.stringToEnum(llm.Effort, name) orelse continue);
     }
 }
 
-/// The tool state. A named parameter list without `tools` denies tools. Silence
-/// keeps the model unknown.
 fn tools(model: *Model, value: ?std.json.Value) void {
     const listed = json.array(value orelse return) orelse return;
     for (listed.items) |item| {
@@ -496,8 +410,6 @@ fn countProvider(self: *const Metadata, provider: llm.Provider) usize {
     return count;
 }
 
-// The metadata request follows the account list inside one window. A window
-// that the list spent refuses the request before it opens a socket.
 test "an expired deadline refuses the metadata without a request" {
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
@@ -508,10 +420,8 @@ test "an expired deadline refuses the metadata without a request" {
 
 test slug {
     var buffer: [Model.name_bytes_max]u8 = undefined;
-    // A dashed version takes the dot of the aggregator.
     try std.testing.expectEqualStrings("claude-opus-4.8", slug("claude-opus-4-8", &buffer));
     try std.testing.expectEqualStrings("claude-sonnet-4.6", slug("claude-sonnet-4-6", &buffer));
-    // A dated id drops its snapshot and then takes the dot.
     try std.testing.expectEqualStrings(
         "claude-opus-4.5",
         slug("claude-opus-4-5-20251101", &buffer),
@@ -520,13 +430,10 @@ test slug {
         "claude-haiku-4.5",
         slug("claude-haiku-4-5-20251001", &buffer),
     );
-    // An id that already reads like the aggregator stays as it is.
     try std.testing.expectEqualStrings("claude-opus-5", slug("claude-opus-5", &buffer));
     try std.testing.expectEqualStrings("gpt-5.6-sol", slug("gpt-5.6-sol", &buffer));
     try std.testing.expectEqualStrings("gpt-5.6-luna", slug("gpt-5.6-luna", &buffer));
-    // A multi-digit group is a date-like number rather than a version.
     try std.testing.expectEqualStrings("model-4-56", slug("model-4-56", &buffer));
-    // Only eight trailing digits behind a dash read as a date.
     try std.testing.expectEqualStrings("model-2025110", slug("model-2025110", &buffer));
 }
 
@@ -566,7 +473,6 @@ test "a versionless DeepSeek id takes the latest versioned family spelling" {
         @as(f64, 3),
         metadata.lookup(.deepseek, "deepseek-flash-vision-exp").?.price.?.input,
     );
-    // A versioned id matches the public spelling alone.
     try std.testing.expectEqualStrings(
         "deepseek-v4-flash",
         metadata.lookup(.deepseek, "deepseek-v4-flash").?.name(),
@@ -633,9 +539,6 @@ test parse {
     var metadata = try parse(std.testing.allocator, sample);
     defer metadata.deinit();
 
-    // A vendor Drinky does not reach, and a variant that no vendor answers to,
-    // both stay out of the vendor subset. Silence about tools keeps those
-    // vendor models, and drops them from the OpenRouter list.
     try std.testing.expectEqual(@as(usize, 7), countProvider(&metadata, .anthropic) +
         countProvider(&metadata, .openai) +
         countProvider(&metadata, .xai) +
@@ -643,14 +546,10 @@ test parse {
     try std.testing.expectEqual(@as(usize, 0), countProvider(&metadata, .openrouter));
     try std.testing.expect(metadata.lookup(.openai, "gpt-5.6-sol:batch") == null);
 
-    // The aggregator spells the xAI vendor `x-ai`, and the id of a Grok model
-    // already reads like the aggregator spelling. Grok names no `max` rung, so
-    // that level folds onto `xhigh`.
     const grok = metadata.lookup(.xai, "grok-4.6").?;
     try std.testing.expectEqual(@as(?u64, 500_000), grok.context_window);
     try std.testing.expectEqual(@as(f64, 2), grok.price.?.input);
     try std.testing.expectEqual(@as(f64, 0.5), grok.price.?.cache_read);
-    // The override that names a threshold states the long-context tier.
     const grok_tier = grok.price.?.long_context.?;
     try std.testing.expectEqual(@as(u64, 200_000), grok_tier.prompt_tokens_min);
     try std.testing.expectEqual(@as(f64, 4), grok_tier.input);
@@ -661,13 +560,9 @@ test parse {
     try std.testing.expectEqual(llm.Effort.xhigh, grok.reasoning(.max).named);
     try std.testing.expect(metadata.lookup(.openai, "grok-4.6") == null);
 
-    // A Gemini id already reads like the aggregator spelling, so it needs no
-    // normalization, and the vendor is a third one Drinky reaches.
     const gemini = metadata.lookup(.google, "gemini-3.7-flash").?;
     try std.testing.expectEqual(@as(?u64, 1_048_576), gemini.context_window);
     try std.testing.expectApproxEqAbs(@as(f64, 0.4), gemini.price.?.input, 1e-9);
-    // A time-window override is not a tier, so the threshold override behind it
-    // states the tier. A kind the tier omits keeps the rate of the entry.
     const gemini_tier = gemini.price.?.long_context.?;
     try std.testing.expectEqual(@as(u64, 200_000), gemini_tier.prompt_tokens_min);
     try std.testing.expectApproxEqAbs(@as(f64, 0.8), gemini_tier.input, 1e-9);
@@ -678,39 +573,29 @@ test parse {
     try std.testing.expect(!gemini.offers(.max));
     try std.testing.expect(metadata.lookup(.anthropic, "gemini-3.7-flash") == null);
 
-    // The vendor id normalizes onto the aggregator spelling.
     const opus = metadata.lookup(.anthropic, "claude-opus-4-8").?;
     try std.testing.expectEqual(@as(?u64, 1_000_000), opus.context_window);
     try std.testing.expectEqual(@as(f64, 5), opus.price.?.input);
     try std.testing.expectEqual(@as(f64, 25), opus.price.?.output);
     try std.testing.expectEqual(@as(f64, 0.5), opus.price.?.cache_read);
-    // The 5-minute write rate wins, because Drinky writes no 1-hour entry.
     try std.testing.expectEqual(@as(f64, 6.25), opus.price.?.cache_write);
-    // An entry without a threshold override bills every prompt at one rate.
     try std.testing.expect(opus.price.?.long_context == null);
     try std.testing.expectEqual(Model.Thinking.supported, opus.thinking);
     try std.testing.expect(opus.offers(.max));
-    // A model with a price but no cache rates charges nothing for a cache hit.
     const fable = metadata.lookup(.anthropic, "claude-fable-5").?;
     try std.testing.expectEqual(@as(f64, 0), fable.price.?.cache_read);
-    // Whether the reasoning is mandatory changes nothing, because Drinky never
-    // stops it.
     try std.testing.expectEqual(Model.Thinking.supported, fable.thinking);
 
-    // A name outside the ladder, such as `ultra`, `minimal`, or `none`, drops,
-    // so the model names the five rungs alone.
     const sol = metadata.lookup(.openai, "gpt-5.6-sol").?;
     try std.testing.expectEqual(Model.Thinking.supported, sol.thinking);
     try std.testing.expectEqual(@as(usize, 5), sol.efforts.count());
     try std.testing.expect(sol.offers(.low));
     try std.testing.expect(sol.offers(.max));
 
-    // A model with no reasoning object never reasons, so it offers no level.
     const legacy = metadata.lookup(.openai, "gpt-4o").?;
     try std.testing.expectEqual(Model.Thinking.unsupported, legacy.thinking);
     try std.testing.expect(legacy.reasoning(.high) == .omitted);
 
-    // A free endpoint states no rate, so it reports no price at all.
     try std.testing.expect(metadata.lookup(.openai, "free-one").?.price == null);
     try std.testing.expect(metadata.lookup(.openai, "does-not-exist") == null);
 }
@@ -760,11 +645,7 @@ test "a bad number states no value rather than a wrong one" {
     try std.testing.expect(zero.price == null);
     try std.testing.expect(metadata.lookup(.anthropic, "negative").?.price == null);
     try std.testing.expect(metadata.lookup(.anthropic, "unpriced").?.price == null);
-    // A rate that the scale takes past the range of the type states no value,
-    // because an infinite number prints as a cost and writes as invalid JSON.
     try std.testing.expect(metadata.lookup(.anthropic, "huge").?.price == null);
-    // A threshold that is not a positive count names no tier, and the standard
-    // price stands.
     const bad_tier = metadata.lookup(.anthropic, "bad-tier").?;
     try std.testing.expectEqual(@as(f64, 1), bad_tier.price.?.input);
     try std.testing.expect(bad_tier.price.?.long_context == null);
@@ -826,8 +707,6 @@ test "the OpenRouter list keeps tool models, groups authors, and drops variants"
         names[index] = entry.model.name();
         index += 1;
     }
-    // openai has three tool models, qwen has two, so openai leads. Inside one
-    // author the models keep the newest-first order of the body.
     try std.testing.expectEqualStrings("openai/gpt-new", names[0]);
     try std.testing.expectEqualStrings("openai/gpt-mid", names[1]);
     try std.testing.expectEqualStrings("openai/gpt-old", names[2]);

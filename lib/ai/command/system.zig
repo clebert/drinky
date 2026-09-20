@@ -1,6 +1,3 @@
-//! `/system`: ask the app to show its complete provider-neutral system prompt.
-//! The command takes no argument.
-
 const std = @import("std");
 
 const Context = @import("Context.zig");

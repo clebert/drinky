@@ -1,13 +1,7 @@
-//! Shared display formatting for the values that Drinky shows to the user. A value
-//! that two callers report must read the same in both places.
-
 const std = @import("std");
 
 const project = @import("project.zig");
 
-/// A compact byte size: bytes under 1 KB, else KB or MB to one decimal. Integer
-/// math throughout. `buffer` needs only a dozen bytes, because the scale ends at
-/// MB and the tenths scaling of a bounded file cannot overflow.
 pub fn bytes(buffer: []u8, count: usize) []const u8 {
     if (count < 1024) return std.fmt.bufPrint(buffer, "{d} B", .{count}) catch unreachable;
     const tenths_kb = @divFloor(count * 10, 1024);
@@ -22,9 +16,6 @@ pub fn bytes(buffer: []u8, count: usize) []const u8 {
     }) catch unreachable;
 }
 
-/// The `s` that a plural needs, and an empty string for a count of one. Every
-/// sentence that counts a thing reads it from here, so no line states a count
-/// of one in the plural.
 pub fn pluralSuffix(count: u64) []const u8 {
     return if (count == 1) "" else "s";
 }
@@ -35,20 +26,11 @@ test pluralSuffix {
     try std.testing.expectEqualStrings("s", pluralSuffix(2));
 }
 
-/// The two roots a shown path is measured against. Either can be empty when the
-/// host does not know it, which leaves every path as it is.
 pub const Roots = struct {
     working_directory: []const u8 = "",
     home_directory: []const u8 = "",
 };
 
-/// `path` as the interface shows it: relative to the working directory when it
-/// sits below it, else with the home directory as `~`, else the path itself. The
-/// result is owned.
-///
-/// A path under neither root keeps its whole absolute form. That is the path
-/// worth a second look, so the short form never hides the reach the user wants
-/// to see.
 pub fn path(gpa: std.mem.Allocator, target: []const u8, roots: *const Roots) ![]u8 {
     if (relativeTo(&.{ .boundary = roots.working_directory, .target = target })) |relative|
         return gpa.dupe(u8, relative);
@@ -57,13 +39,6 @@ pub fn path(gpa: std.mem.Allocator, target: []const u8, roots: *const Roots) ![]
     return gpa.dupe(u8, target);
 }
 
-/// The target without its boundary prefix, or null when the boundary is empty,
-/// does not contain the target, or is the target itself. A caller that must know
-/// which root matched asks here rather than reading the result of `path`, whose
-/// output cannot say whether a leading `~/` came from home or from the target.
-///
-/// The two paths take the same options struct `project.contains` takes, because
-/// they are the same pair and a swap of them compiles.
 pub fn relativeTo(options: *const project.ContainsOptions) ?[]const u8 {
     const boundary = options.boundary;
     if (boundary.len == 0) return null;
@@ -78,14 +53,9 @@ test path {
     const gpa = std.testing.allocator;
     const roots: Roots = .{ .working_directory = "/home/you/work", .home_directory = "/home/you" };
     const cases = [_]struct { target: []const u8, expected: []const u8 }{
-        // Below the working directory: the part that names the file is enough.
         .{ .target = "/home/you/work/src/App.zig", .expected = "src/App.zig" },
-        // Below home but outside the work tree: `~` stands in for home.
         .{ .target = "/home/you/.drinky/config.json", .expected = "~/.drinky/config.json" },
-        // Below neither root: the whole path stays, because that is the reach
-        // the user must be able to see.
         .{ .target = "/etc/hosts", .expected = "/etc/hosts" },
-        // A relative path names no root to measure against, so it stands as it is.
         .{ .target = "src/App.zig", .expected = "src/App.zig" },
     };
     for (cases) |case| {
@@ -93,16 +63,11 @@ test path {
         defer gpa.free(shown);
         try std.testing.expectEqualStrings(case.expected, shown);
     }
-    // With no roots known, every path stands as it is.
     const bare = try path(gpa, "/home/you/work/src/App.zig", &.{});
     defer gpa.free(bare);
     try std.testing.expectEqualStrings("/home/you/work/src/App.zig", bare);
 }
 
-/// The lines `text` holds. A final line break closes the last line rather than
-/// opening an empty one, so a file of three lines counts three whether or not it
-/// ends with a break. Every tool that reports a line count uses this rule, so two
-/// tools cannot report a different count for the same bytes.
 pub fn lines(text: []const u8) usize {
     if (text.len == 0) return 0;
     const breaks = std.mem.count(u8, text, "\n");
@@ -115,20 +80,9 @@ test lines {
     try std.testing.expectEqual(@as(usize, 1), lines("a\n"));
     try std.testing.expectEqual(@as(usize, 3), lines("a\nb\nc"));
     try std.testing.expectEqual(@as(usize, 3), lines("a\nb\nc\n"));
-    // A blank line is a line: the break before it closed the line above.
     try std.testing.expectEqual(@as(usize, 2), lines("a\n\n"));
 }
 
-/// A compact wall-clock span: whole milliseconds below a second, seconds to one
-/// decimal below a minute, else whole minutes and seconds. Integer math
-/// throughout. `buffer` needs two dozen bytes, because a span of many minutes
-/// prints every digit of its minute count. A negative span reads as zero, so a
-/// clock that steps backward cannot print a span that runs the wrong way.
-///
-/// Every finished span in the interface takes this one shape, so no two spans
-/// read in two vocabularies. Each tier measures in a unit that its spans fill: a
-/// search that ends in 42 milliseconds states that span, rather than the `0.0s`
-/// that tenths alone can offer it.
 pub fn duration(buffer: []u8, milliseconds: i64) []const u8 {
     const total: u64 = @intCast(@max(milliseconds, 0));
     if (total < std.time.ms_per_s)
@@ -143,21 +97,11 @@ pub fn duration(buffer: []u8, milliseconds: i64) []const u8 {
     return durationSeconds(buffer, milliseconds, .down);
 }
 
-/// How a whole-second span reads a fraction of a second.
 pub const Rounding = enum {
-    /// Down, so the whole seconds never pass the span.
     down,
-    /// Up, so the span never passes the whole seconds.
     up,
 };
 
-/// The `milliseconds` span in whole seconds: whole seconds below a minute, else
-/// whole minutes and seconds. It counts in whole seconds where `duration`
-/// counts in milliseconds and tenths, and it keeps the coarse tier of
-/// `duration`, so the two read in one vocabulary.
-///
-/// A row that a running clock rewrites takes this shape. Such a row changes at
-/// most once per second, and a repaint of it can cost a whole frame.
 pub fn durationSeconds(buffer: []u8, milliseconds: i64, rounding: Rounding) []const u8 {
     const total: u64 = @intCast(@max(milliseconds, 0));
     const seconds = switch (rounding) {
@@ -177,41 +121,31 @@ test duration {
     try std.testing.expectEqualStrings("0ms", duration(&buffer, 0));
     try std.testing.expectEqualStrings("42ms", duration(&buffer, 42));
     try std.testing.expectEqualStrings("450ms", duration(&buffer, 450));
-    // Each tier ends where the next one carries the same digits, so no span
-    // reads in two shapes and no shape loses a digit at its edge.
     try std.testing.expectEqualStrings("999ms", duration(&buffer, 999));
     try std.testing.expectEqualStrings("1.0s", duration(&buffer, 1_000));
     try std.testing.expectEqualStrings("41.6s", duration(&buffer, 41_600));
     try std.testing.expectEqualStrings("59.9s", duration(&buffer, 59_999));
     try std.testing.expectEqualStrings("1m 0s", duration(&buffer, 60_000));
     try std.testing.expectEqualStrings("2m 5s", duration(&buffer, 125_400));
-    // A backward clock step reads as no time at all, never as a negative span.
     try std.testing.expectEqualStrings("0ms", duration(&buffer, -1));
 }
 
 test durationSeconds {
     var buffer: [24]u8 = undefined;
     try std.testing.expectEqualStrings("0s", durationSeconds(&buffer, 0, .down));
-    // Every span below a second reads as no whole second, so a row holds one
-    // text for that whole second.
     try std.testing.expectEqualStrings("0s", durationSeconds(&buffer, 999, .down));
     try std.testing.expectEqualStrings("1s", durationSeconds(&buffer, 1_000, .down));
     try std.testing.expectEqualStrings("30s", durationSeconds(&buffer, 30_400, .down));
     try std.testing.expectEqualStrings("59s", durationSeconds(&buffer, 59_999, .down));
-    // The coarse tier keeps the shape of `duration`, so the two agree there.
     try std.testing.expectEqualStrings("1m 0s", durationSeconds(&buffer, 60_000, .down));
     try std.testing.expectEqualStrings("2m 5s", durationSeconds(&buffer, 125_400, .down));
     try std.testing.expectEqualStrings("60m 0s", durationSeconds(&buffer, 3_600_000, .down));
     try std.testing.expectEqualStrings("0s", durationSeconds(&buffer, -1, .down));
 
-    // A limit keeps the fraction it holds, so it rounds the other way. A whole
-    // second reads the same under both roundings.
     try std.testing.expectEqualStrings("0s", durationSeconds(&buffer, 0, .up));
     try std.testing.expectEqualStrings("1s", durationSeconds(&buffer, 1, .up));
     try std.testing.expectEqualStrings("2s", durationSeconds(&buffer, 1_500, .up));
     try std.testing.expectEqualStrings("30s", durationSeconds(&buffer, 30_000, .up));
-    // The ceiling carries the span into the coarse tier, so this span reads as
-    // `1m 0s` and never as `60s`.
     try std.testing.expectEqualStrings("1m 0s", durationSeconds(&buffer, 59_001, .up));
     try std.testing.expectEqualStrings("1m 31s", durationSeconds(&buffer, 90_500, .up));
     try std.testing.expectEqualStrings("0s", durationSeconds(&buffer, -1, .up));

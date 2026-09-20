@@ -1,9 +1,3 @@
-//! Bounded loading of the instruction files that go into the system prompt.
-//! `discover` finds the repository-controlled `AGENTS.md` files, and `load`
-//! reads the user files that `config.json` names. Both sources run one policy,
-//! so they accept the same bytes, hold the same totals, and report the same
-//! reasons through one `Result`.
-
 const std = @import("std");
 const builtin = @import("builtin");
 
@@ -14,18 +8,11 @@ const source_bytes_max = 64 << 10;
 const notices_max = 1024;
 const directory_entries_max = 100_000;
 const display_bytes_max = 4 * std.fs.max_path_bytes + 1024;
-// The same caps in the unit a message uses, so one constant drives both the
-// limit and the sentence that reports it. A host that documents its own
-// configuration reads them too, so its document cannot state a stale cap.
 pub const file_kibibytes_max = @divExact(file_bytes_max, 1024);
 pub const source_kibibytes_max = @divExact(source_bytes_max, 1024);
 
-/// How many files one source can put into the prompt. A caller that builds the
-/// path list can size its own buffer against this cap.
 pub const files_max = 32;
 
-/// Where a set of instruction files comes from. The value gives the noun that
-/// every message about that set uses.
 pub const Source = enum {
     user,
     project,
@@ -38,14 +25,9 @@ pub const Source = enum {
     }
 };
 
-/// One loaded instruction file. The `Result` that holds it owns every slice.
 pub const File = struct {
-    /// The path Drinky read the file through. Messages and the prompt show it.
     path: []const u8,
     content: []const u8,
-    /// The canonical path of the file, with every symbolic link resolved. It is
-    /// the identity of the file: Drinky compares it to recognize one file that two
-    /// paths reach, so the same content cannot enter the prompt twice.
     identity: []const u8,
 
     fn deinit(self: *const File, gpa: std.mem.Allocator) void {
@@ -55,9 +37,6 @@ pub const File = struct {
     }
 };
 
-/// One startup message about an instruction file. An empty file is normal
-/// housekeeping and carries `.information`. Every other message reports
-/// something the user must fix, so it carries `.failure`.
 pub const Notice = struct {
     severity: Severity,
     text: []const u8,
@@ -65,8 +44,6 @@ pub const Notice = struct {
     pub const Severity = enum { information, failure };
 };
 
-/// Why Drinky rejects the content of an instruction file. Each value gives the
-/// clause that completes the sentence `Drinky skipped ... because {s}.`
 const Problem = enum {
     empty,
     too_large,
@@ -93,20 +70,12 @@ const Problem = enum {
     }
 };
 
-/// The outcome of one read. A read error travels as a value, because the caller
-/// reports it and continues with the remaining files.
 const Content = union(enum) {
-    /// The content passed every check. The caller owns the bytes.
     loaded: []u8,
-    /// The content broke the shared policy.
     rejected: Problem,
-    /// The read failed. The caller reports the name of this error.
     failed: anyerror,
 };
 
-/// Read at most `file_bytes_max` bytes from an open instruction file and apply
-/// the shared content policy. Only cancellation and an allocation failure stop
-/// the caller.
 fn readContent(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -132,7 +101,6 @@ fn readContent(
     return .{ .loaded = content };
 }
 
-/// Apply the shared content policy. Null means Drinky accepts the content.
 fn checkContent(content: []const u8) ?Problem {
     if (content.len == 0) return .empty;
     if (content.len > file_bytes_max) return .too_large;
@@ -141,8 +109,6 @@ fn checkContent(content: []const u8) ?Problem {
     return null;
 }
 
-/// The instruction files of one source, with the messages the load produced.
-/// The result owns every path, every byte of content, and every message.
 pub const Result = struct {
     gpa: std.mem.Allocator,
     source: Source,
@@ -150,14 +116,10 @@ pub const Result = struct {
     file_items: std.ArrayList(File) = .empty,
     notice_items: std.ArrayList(Notice) = .empty,
     notices_capped: bool = false,
-    /// The running byte total, so one source can never push more than
-    /// `source_bytes_max` into the prompt.
     bytes_total: usize = 0,
 
     const TakeOptions = struct {
-        /// The path Drinky read the file through.
         path: []const u8,
-        /// The canonical path of `file`.
         identity: []const u8,
         file: std.Io.File,
     };
@@ -187,8 +149,6 @@ pub const Result = struct {
         return self.notice_items.items;
     }
 
-    /// True when a loaded file already has this canonical path. The loop is
-    /// bounded by `files_max`.
     fn holds(self: *const Result, identity: []const u8) bool {
         for (self.file_items.items) |file| {
             if (std.mem.eql(u8, file.identity, identity)) return true;
@@ -196,10 +156,6 @@ pub const Result = struct {
         return false;
     }
 
-    /// Read one open instruction file, apply the caps, and keep the content.
-    /// The caller has checked that the path names a regular file it can use, and
-    /// resolved the canonical path of that file. Both sources end here, so both
-    /// apply one policy and report one shape.
     fn take(self: *Result, io: std.Io, options: *const TakeOptions) !void {
         const noun = self.source.noun();
         if (self.holds(options.identity)) {
@@ -232,7 +188,6 @@ pub const Result = struct {
             self.gpa.free(content);
             return;
         }
-        // The subtraction cannot underflow, because the total never passes the cap.
         if (content.len > source_bytes_max - self.bytes_total) {
             try self.report(
                 .failure,
@@ -277,48 +232,28 @@ pub const Result = struct {
     }
 };
 
-/// The walk from the working directory up to the project boundary. It only ever
-/// runs for the project source, so its messages name that source directly.
-///
-/// `project.findBoundary` gives the top of the walk. Two boundaries then guard the
-/// walk, and they differ on purpose. The `source_boundary` is that top: the Git
-/// root, or the working directory when Drinky found no Git root. A plain instruction
-/// file must resolve inside it, so a mount trick cannot pull content in from
-/// outside the repository. The `link_boundary` is the Git root, or the working
-/// directory alone when there is no Git root. A symbolic-link target must resolve
-/// inside it. The two differ when Drinky cannot read a repository marker: the walk
-/// then stops at that ancestor and still scans it, but only the working directory
-/// stays trusted for a link target.
 const Discovery = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     working_directory: []const u8,
     result: *Result,
 
-    /// The noun of the only source this walk serves, spliced into every message
-    /// at compile time.
     const noun = Source.noun(.project);
 
     const ScanOptions = struct {
         directory: []const u8,
-        /// The top of the walk. A plain instruction file must resolve inside it.
         source_boundary: []const u8,
-        /// The boundary a symbolic-link target must resolve inside.
         link_boundary: []const u8,
     };
 
     const CandidateOptions = struct {
         source_path: []const u8,
-        /// See `ScanOptions.source_boundary`.
         source_boundary: []const u8,
-        /// See `ScanOptions.link_boundary`.
         link_boundary: []const u8,
     };
 
     const OpenOptions = struct {
         source_path: []const u8,
-        /// The boundary that applies to this candidate: the source boundary for
-        /// a plain file, the link boundary for a symbolic link.
         content_boundary: []const u8,
         follow_symlinks: bool,
         was_symlink: bool,
@@ -597,8 +532,6 @@ const Discovery = struct {
             );
             return;
         }
-        // The canonical path is already resolved, so it also serves as the
-        // identity that keeps one file out of the prompt twice.
         try self.result.take(self.io, &.{
             .path = options.source_path,
             .identity = target,
@@ -607,8 +540,6 @@ const Discovery = struct {
     }
 };
 
-/// Discover the project instructions for an absolute, canonical working
-/// directory. The returned result owns all files, paths, and messages.
 pub fn discover(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -630,18 +561,10 @@ pub fn discover(
 }
 
 pub const LoadOptions = struct {
-    /// The absolute directory that a relative configured path resolves against.
     directory: []const u8,
-    /// The configured paths, in the order the prompt keeps them. Drinky inspects
-    /// at most `files_max` of them. One entry past that cap is enough to make
-    /// Drinky report the rest, so a caller can cut the list at `files_max + 1`
-    /// and still lose no message.
     paths: []const []const u8,
 };
 
-/// Load the configured user instruction files. Drinky inspects at most `files_max`
-/// entries and reports the rest. A path Drinky cannot use becomes a message, so a
-/// bad entry never stops the load. The returned result owns everything it holds.
 pub fn load(gpa: std.mem.Allocator, io: std.Io, options: *const LoadOptions) !Result {
     if (!std.fs.path.isAbsolute(options.directory)) return error.DirectoryNotAbsolute;
 
@@ -657,8 +580,6 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, options: *const LoadOptions) !Re
             );
             break;
         }
-        // A relative path resolves against the configured directory, so
-        // `~/.drinky/` holds the common case.
         const path = try std.fs.path.resolve(gpa, &.{ options.directory, configured });
         defer gpa.free(path);
         try loadPath(&result, io, path);
@@ -666,12 +587,9 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, options: *const LoadOptions) !Re
     return result;
 }
 
-/// Inspect and read one resolved configured path.
 fn loadPath(result: *Result, io: std.Io, path: []const u8) !void {
     const noun = result.source.noun();
     const cwd = std.Io.Dir.cwd();
-    // The stat before the open reports a directory the same way on every
-    // platform, because an open of a directory fails on Linux but works on macOS.
     const stat = cwd.statFile(io, path, .{}) catch |err| {
         if (err == error.Canceled or err == error.OutOfMemory) return err;
         if (err == error.FileNotFound) {
@@ -703,8 +621,6 @@ fn loadPath(result: *Result, io: std.Io, path: []const u8) !void {
         );
     };
     defer file.close(io);
-    // The canonical path is the identity of the file, so two configured paths
-    // that reach one file through a symbolic link load it once.
     var target_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const target_length = file.realPath(io, &target_buffer) catch |err| {
         if (err == error.Canceled or err == error.OutOfMemory) return err;
@@ -721,12 +637,10 @@ fn loadPath(result: *Result, io: std.Io, path: []const u8) !void {
     });
 }
 
-/// A bounded terminal-safe rendering of path bytes for startup diagnostics.
 pub fn diagnosticAlloc(gpa: std.mem.Allocator, text: []const u8) ![]u8 {
     return escapedAlloc(gpa, text, 96);
 }
 
-/// Escape control and format characters. Truncate oversized startup messages safely.
 pub fn displayAlloc(gpa: std.mem.Allocator, text: []const u8) ![]u8 {
     return escapedAlloc(gpa, text, display_bytes_max);
 }
@@ -758,7 +672,6 @@ fn escapedAlloc(gpa: std.mem.Allocator, text: []const u8, input_bytes_max: usize
 
 fn codepointPrintable(codepoint: u21) bool {
     if (codepoint < 0x20 or (codepoint >= 0x7f and codepoint <= 0x9f)) return false;
-    // Unicode format controls can hide or reorder path diagnostics.
     return switch (codepoint) {
         0x00ad,
         0x0600...0x0605,
@@ -929,7 +842,6 @@ test "invalid, oversized, and empty files are skipped and reported" {
     try std.testing.expectEqual(@as(usize, 1), result.files().len);
     try std.testing.expectEqual(@as(usize, file_bytes_max), result.files()[0].content.len);
     try std.testing.expectEqual(@as(usize, 4), result.notices().len);
-    // An empty file is housekeeping, not a failure, so it reads as information.
     var empty_found = false;
     var oversized_found = false;
     var null_byte_found = false;
@@ -1063,9 +975,6 @@ test "instruction symlinks stay inside the project and load one file once" {
 
     var result = try discover(gpa, io, working_directory);
     defer result.deinit();
-    // Both `a/b` and `a/b/c` link to one shared file. The scan runs from the
-    // working directory upwards, so the nearest path keeps it and the broader
-    // one reports the repeat.
     try std.testing.expectEqual(@as(usize, 1), result.files().len);
     try std.testing.expectEqualStrings("linked", result.files()[0].content);
     try std.testing.expect(std.mem.endsWith(u8, result.files()[0].path, "a/b/c/AGENTS.md"));
@@ -1192,9 +1101,6 @@ test "configured files load in order and one file loads once" {
     defer gpa.free(directory);
     const absolute_first = try tmpPath(gpa, io, &tmp, "first.md");
     defer gpa.free(absolute_first);
-    // A relative repeat, an absolute repeat, and a symbolic link all name the
-    // file that `first.md` already loaded. The identity is the canonical path,
-    // so none of the three reaches the prompt a second time.
     tmp.dir.symLink(io, absolute_first, "link.md", .{}) catch |err| switch (err) {
         error.AccessDenied,
         error.PermissionDenied,
@@ -1212,7 +1118,6 @@ test "configured files load in order and one file loads once" {
     try std.testing.expectEqual(@as(usize, 2), result.files().len);
     try std.testing.expectEqualStrings("Second.\n", result.files()[0].content);
     try std.testing.expectEqualStrings("First.\n", result.files()[1].content);
-    // A relative configured path resolves against the configured directory.
     try std.testing.expectEqualStrings(absolute_first, result.files()[1].path);
     try std.testing.expectEqual(@as(usize, 3), result.notices().len);
     for (result.notices()) |notice| {
@@ -1266,8 +1171,6 @@ test "configured files stop at the shared byte budget" {
     const directory = try tmpPath(gpa, io, &tmp, "");
     defer gpa.free(directory);
 
-    // Two 24 KiB files fit. The third goes past 64 KiB, so Drinky keeps the
-    // earlier files and reports the one it dropped.
     var result = try load(gpa, io, &.{
         .directory = directory,
         .paths = &.{ "a.md", "b.md", "c.md" },

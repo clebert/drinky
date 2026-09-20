@@ -1,38 +1,20 @@
-//! The inline keyboards of the chat and the taps on their buttons. A keyboard
-//! is one button per row, and every button carries a `Tap` as its callback
-//! data: an id alone, never text. The owner of a keyboard stamps it with a
-//! serial, so a tap on a keyboard that the chat history still shows names a
-//! serial the owner no longer holds, and the owner answers it as stale.
-
 const std = @import("std");
 
-/// The bytes Telegram allows in one `callback_data`.
 pub const data_bytes_max = 64;
 
-/// One button of a keyboard. The texts are borrowed for the build.
 pub const Button = struct {
     text: []const u8,
     data: []const u8,
 };
 
-/// One tap, as the callback data of its button names it. The serial names the
-/// keyboard, and the row names the button of a picker.
 pub const Tap = union(enum) {
-    /// The `Cancel turn` button of the activity message.
     cancel_turn: u64,
-    /// The `Withdraw` button of the activity message.
     withdraw: u64,
-    /// The `Try again` button of the failed turn message.
     retry: u64,
-    /// The `Dismiss` button of the failed turn message.
     dismiss: u64,
-    /// The `Shorten` button of the last answer of a completed turn.
     shorten: u64,
-    /// One row of a picker.
     row: Row,
-    /// The `‹ Back` button of a stepped picker.
     back: u64,
-    /// The `Cancel` button of a picker.
     close: u64,
 
     pub const Row = struct {
@@ -40,10 +22,8 @@ pub const Tap = union(enum) {
         index: usize,
     };
 
-    /// The keyword of each tap in its callback data.
     const Word = enum { cancel, withdraw, retry, dismiss, shorten, row, back, close };
 
-    /// The callback data of this tap, in `buffer`.
     pub fn write(self: Tap, buffer: *[data_bytes_max]u8) []const u8 {
         return switch (self) {
             .cancel_turn => |serial| std.fmt.bufPrint(buffer, "cancel:{d}", .{serial}),
@@ -57,8 +37,6 @@ pub const Tap = union(enum) {
         } catch unreachable;
     }
 
-    /// The tap that `data` names, or null for data that no keyboard of Drinky
-    /// wrote.
     pub fn parse(data: []const u8) ?Tap {
         var parts = std.mem.splitScalar(u8, data, ':');
         const word = std.meta.stringToEnum(Word, parts.first()) orelse return null;
@@ -82,8 +60,6 @@ pub const Tap = union(enum) {
     }
 };
 
-/// The `reply_markup` object of `buttons` as JSON, one button per row. The
-/// result is owned.
 pub fn markup(gpa: std.mem.Allocator, buttons: []const Button) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(gpa);
     errdefer out.deinit();

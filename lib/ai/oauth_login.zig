@@ -1,26 +1,12 @@
-//! The interactive login choreography of both browser flows. In the callback
-//! flow the listener is ready before the best-effort browser launch, whose
-//! lifetime never blocks the callback. In the device-code flow (RFC 8628) the
-//! prompt shows the user code, the browser opens the verification page, and a
-//! bounded poll waits for the grant.
-
 const std = @import("std");
 
-/// RFC 8628 section 3.5: a `slow_down` answer adds five seconds to the interval.
 const slow_down_increment_ms = 5_000;
-/// The floor under a poll interval, so a grant that names a zero interval still
-/// spends the window and the loop ends.
 const interval_ms_min = 1_000;
-/// The ceiling on a grant lifetime. The callback flow waits this long too, so
-/// no server can hold its worker open for longer.
 const lifetime_ms_max = 5 * std.time.ms_per_min;
 
-/// The answer of one poll of a device-code grant.
 pub fn Poll(comptime Result: type) type {
     return union(enum) {
-        /// The user has not authorized yet.
         pending,
-        /// The server asks for a longer interval.
         slow_down,
         granted: Result,
     };
@@ -53,10 +39,6 @@ pub const Browser = struct {
     }
 };
 
-/// The redirect wait of the callback flow. The prompt reports the callback path
-/// of `options.callback.listen()`, which is the one path that listener answers
-/// on, or null for a login that binds its redirect with `state`. The caller can
-/// then refuse a pasted line that names another path.
 pub fn receive(comptime Result: type, options: anytype) !Result {
     var listener = try options.callback.listen();
     defer listener.deinit();
@@ -70,11 +52,6 @@ pub fn receive(comptime Result: type, options: anytype) !Result {
     return listener.receive();
 }
 
-/// Wait for a device-code grant. The prompt shows the verification URL and the
-/// user code, the browser opens that URL, and `options.poller.poll()` asks the
-/// token endpoint once per interval until the grant arrives or its lifetime of
-/// `options.lifetime_ms` ends, capped at `lifetime_ms_max`. An ended lifetime is
-/// `error.DeviceCodeExpired`.
 pub fn poll(comptime Result: type, options: anytype) !Result {
     try options.prompt.showDeviceCode(options.url, options.code);
 
@@ -84,8 +61,6 @@ pub fn poll(comptime Result: type, options: anytype) !Result {
 
     var interval_ms: u64 = @max(options.interval_ms, interval_ms_min);
     var remaining_ms: u64 = @min(options.lifetime_ms, lifetime_ms_max);
-    // Every pass spends at least the floor of the window, so the loop ends
-    // inside the lifetime of the grant.
     while (remaining_ms > 0) {
         const wait_ms = @min(interval_ms, remaining_ms);
         try options.clock.sleep(wait_ms);
@@ -117,10 +92,7 @@ const Fake = struct {
     callback_while_browser_running: bool = false,
     authorization_count: usize = 0,
     authorization_fails: bool = false,
-    /// The one path that the fake listener answers on. Its callback source
-    /// carries the path of its login the same way.
     callback_path: ?[]const u8 = null,
-    /// The path that the prompt received with the authorization URL.
     reported_path: ?[]const u8 = null,
     warning_count: usize = 0,
     warning_fails: bool = false,
@@ -191,7 +163,6 @@ const Fake = struct {
 
     const Listener = struct {
         fake: *Fake,
-        /// The one path this listener answers on.
         path: ?[]const u8,
 
         fn deinit(self: *@This()) void {
@@ -220,9 +191,6 @@ test "callback progress does not wait for browser lifetime and reaps helper" {
     try std.testing.expect(fake.callback_while_browser_running);
     try std.testing.expect(fake.browser_reaped);
     try std.testing.expectEqual(@as(usize, 1), fake.listener_deinit_count);
-    // The prompt reports the path of this listener, so the caller can refuse a
-    // pasted line that names another one. The listener is the only source of
-    // the path, so the two can never disagree.
     try std.testing.expectEqualStrings("/deadbeef", fake.reported_path.?);
 }
 
@@ -311,8 +279,6 @@ test "manual fallback warning error closes listener" {
     try std.testing.expectEqual(@as(usize, 1), fake.listener_deinit_count);
 }
 
-/// The doubles of the device-code flow. The poller answers from a script, and
-/// the clock records every wait in place of a sleep.
 const DeviceFake = struct {
     answers: []const Poll(void) = &.{},
     polled: usize = 0,
@@ -417,8 +383,6 @@ test "a device grant waits one interval between polls and returns the grant" {
     try std.testing.expectEqual(@as(usize, 0), fake.warning_count);
 }
 
-// RFC 8628 section 3.5: a `slow_down` answer lengthens every later wait by
-// five seconds.
 test "a slow_down answer lengthens the poll interval" {
     var fake: DeviceFake = .{ .answers = &.{ .slow_down, .pending, .{ .granted = {} } } };
     try poll(void, &fake.options(5_000, 60_000));
@@ -427,8 +391,6 @@ test "a slow_down answer lengthens the poll interval" {
     try std.testing.expectEqual(@as(u64, 10_000), fake.waits[2]);
 }
 
-// The window of the grant bounds the loop. The last wait takes what is left of
-// the window, and a grant that never arrives ends as expired.
 test "a device grant that never arrives expires with its window" {
     var fake: DeviceFake = .{ .answers = &.{ .pending, .pending, .pending } };
     try std.testing.expectError(error.DeviceCodeExpired, poll(void, &fake.options(5_000, 12_000)));
@@ -439,8 +401,6 @@ test "a device grant that never arrives expires with its window" {
     try std.testing.expect(fake.browser_reaped);
 }
 
-// A server cannot hold the wait open past the ceiling, whatever lifetime its
-// grant names.
 test "a long grant lifetime ends at the ceiling" {
     var fake: DeviceFake = .{ .answers = &.{ .pending, .pending, .pending } };
     try std.testing.expectError(
@@ -452,8 +412,6 @@ test "a long grant lifetime ends at the ceiling" {
     try std.testing.expectEqual(@as(u64, std.time.ms_per_min), fake.waits[2]);
 }
 
-// A grant that names no interval takes the floor, so the loop still spends the
-// window and ends.
 test "a zero interval takes the floor" {
     var fake: DeviceFake = .{ .answers = &.{ .pending, .pending } };
     try std.testing.expectError(error.DeviceCodeExpired, poll(void, &fake.options(0, 2_000)));

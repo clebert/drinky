@@ -1,17 +1,9 @@
-//! Owns the controlling terminal for the session. It enters raw mode on `init`
-//! and restores it on `deinit`. It exposes the window size, reads stdin with a
-//! timeout, and hands out a buffered stdout stream. Pin the value (it is
-//! self-referential through the output buffer) and call `init` on the pointer.
-
 const std = @import("std");
 
 const escape = @import("escape.zig");
 
 const Tty = @This();
 
-// The read path (`in_handle`) and the write path (`out_*` plus `raw_state`)
-// share no mutable field. A blocked reader and the consumer's renderer can run
-// concurrently without a lock. Preserve that split.
 io: std.Io,
 in_handle: std.posix.fd_t,
 out_handle: std.posix.fd_t,
@@ -39,10 +31,6 @@ const PosixSetup = struct {
     raw: *const std.posix.termios,
     original: *const std.posix.termios,
 
-    // Entry flushes pending input (`.FLUSH`) for a clean raw-mode slate. Restore
-    // uses `.NOW` so it applies immediately. `.FLUSH` and `.DRAIN` block until
-    // the terminal's output queue transmits. A wedged or flow-controlled
-    // terminal never transmits, and that block strands the terminal in raw mode.
     fn setRaw(self: *const PosixSetup) !void {
         try std.posix.tcsetattr(self.in_handle, .FLUSH, self.raw.*);
     }
@@ -68,8 +56,6 @@ pub fn deinit(self: *Tty) void {
     self.leaveRaw();
 }
 
-/// Enter raw mode and enable the input/render escape modes. Used at startup.
-/// `leaveRaw` reverses it.
 pub fn enterRaw(self: *Tty) !void {
     var raw = self.original;
     raw.lflag.ECHO = false;
@@ -92,11 +78,7 @@ pub fn enterRaw(self: *Tty) !void {
     try enterWith(&self.raw_state, &self.out_stream.interface, &control);
 }
 
-/// Restore the original cooked state first, because an escape write that blocks
-/// or fails must not strand raw mode. Then reverse the escape modes. Used at
-/// shutdown.
 pub fn leaveRaw(self: *Tty) void {
-    // `raw` is unused on the restore path.
     var control: PosixSetup = .{
         .in_handle = self.in_handle,
         .raw = &self.original,
@@ -109,14 +91,10 @@ pub fn writer(self: *Tty) *std.Io.Writer {
     return &self.out_stream.interface;
 }
 
-/// Enter or leave the alternate screen. Repeated requests are no-ops.
 pub fn setAlternateScreen(self: *Tty, enabled: bool) !void {
     try setAlternateScreenWith(&self.raw_state, &self.out_stream.interface, enabled);
 }
 
-/// Read available input into `buffer`, and block until some arrives or
-/// `timeout` elapses. A timeout returns null, so an idle caller can react to a
-/// resize between keystrokes. A closed input surfaces as `error.EndOfStream`.
 pub fn read(self: *Tty, buffer: []u8, timeout: std.Io.Timeout) !?usize {
     var chunk: [1][]u8 = .{buffer};
     const result = self.io.operateTimeout(.{ .file_read_streaming = .{
@@ -129,11 +107,6 @@ pub fn read(self: *Tty, buffer: []u8, timeout: std.Io.Timeout) !?usize {
     return try result.file_read_streaming;
 }
 
-/// The window size, or null when the terminal cannot report one. `TIOCGWINSZ`
-/// is an instantaneous kernel query with nothing to block or cancel on, so it
-/// bypasses `io`. The bypass also sidesteps a `std.Io.Threaded` device-control
-/// path that returns spurious `ENOTTY` on a valid tty under ReleaseSafe on
-/// aarch64-macOS (codeberg.org/ziglang/zig/issues/36218).
 pub fn size(self: *Tty) ?Size {
     var window: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
     const rc = std.posix.system.ioctl(self.out_handle, std.posix.T.IOCGWINSZ, @intFromPtr(&window));
@@ -158,9 +131,6 @@ fn enterWith(state: *RawState, output: *std.Io.Writer, control: anytype) !void {
     state.setup_complete = true;
 }
 
-// The alternate screen carries its own keyboard mode stack and cursor visibility, so this
-// re-sends both, and it asks for the alternate-scroll mode that turns a wheel notch into an arrow
-// key.
 fn setAlternateScreenWith(state: *RawState, output: *std.Io.Writer, enabled: bool) !void {
     if (enabled) {
         if (state.screen_alternate_reset_pending) return;
@@ -195,11 +165,6 @@ fn cleanupWith(
     control: anytype,
     write_newline: bool,
 ) void {
-    // Restore the OS terminal mode before any presentation output. A write or
-    // flush that blocks on a wedged or flow-controlled terminal then cannot
-    // postpone it. On restore failure, keep raw ownership and every pending
-    // reset flag. A later cleanup retries the restore, then writes the resets,
-    // exactly once.
     if (state.raw_owned) {
         control.restore() catch return;
         state.raw_owned = false;
@@ -452,7 +417,6 @@ test "each alternate screen transition pairs its own keyboard and scroll modes" 
             .keyboard_reset_pending = true,
             .cursor_show_pending = true,
         };
-        // A shutdown with the page still open reverses the page modes too.
         try setAlternateScreenWith(&state, &output.interface, true);
         cleanupWith(&state, &output.interface, &control, false);
         cleanupWith(&state, &output.interface, &control, false);
@@ -482,8 +446,6 @@ test "each alternate screen transition pairs its own keyboard and scroll modes" 
             .keyboard_reset_pending = true,
             .cursor_show_pending = true,
         };
-        // A write that fails mid-entry leaves every attempted mode pending, so the cleanup
-        // reverses exactly those.
         try std.testing.expectError(
             error.WriteFailed,
             setAlternateScreenWith(&state, &output.interface, true),
@@ -656,7 +618,6 @@ test "shutdown restores cooked mode before the potentially blocking presentation
 }
 
 test "shutdown restores cooked mode even when presentation output fails" {
-    // The first cleanup write fails: the four setup writes precede it.
     var output: TestWriter = .{ .drain_fail_at = 5, .flush_fail_at = 2 };
     var control: TestControl = .{ .log = &output };
     var state: RawState = .{};
@@ -667,7 +628,6 @@ test "shutdown restores cooked mode even when presentation output fails" {
     try std.testing.expect(!control.raw);
     try std.testing.expectEqual(@as(usize, 1), control.restore_count);
     try std.testing.expectEqual(RawState{}, state);
-    // The restore precedes every cleanup write, whatever the mode count is.
     const recorded = output.operations[0..output.operations_len];
     const restore_at = std.mem.indexOfScalar(TestWriter.Operation, recorded, .restore).?;
     const cursor_at = std.mem.indexOfScalar(TestWriter.Operation, recorded, .cursor_show).?;

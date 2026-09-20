@@ -1,11 +1,3 @@
-//! The model list of the Anthropic API, which every Anthropic account of Drinky
-//! reads. `GET /v1/models` answers an OAuth subscription token and an API key
-//! alike, so no account needs a private endpoint of its own.
-//!
-//! An entry states the id, the context window (`max_input_tokens`), the output
-//! limit (`max_tokens`), and a capability object. The capability object names
-//! the effort levels the model offers and whether it reasons at all.
-
 const std = @import("std");
 
 const json = @import("../json.zig");
@@ -20,13 +12,9 @@ const user_agent = "claude-cli/2.1.75";
 const beta = "claude-code-20250219,oauth-2025-04-20";
 const body_bytes_max = 2 * 1024 * 1024;
 const entry_count_max = 1024;
-/// The page size the request asks for, which is the maximum the API serves.
 const page_size = 100;
-/// The page cap. The list holds a few dozen models, so a request that keeps
-/// reporting more pages is a server Drinky stops following.
 const pages_max = 8;
 
-/// One decoded page of the list.
 pub const Page = struct {
     models: []Model,
     has_more: bool,
@@ -36,9 +24,6 @@ pub const Page = struct {
     }
 };
 
-/// Every model the credential behind `identity` can reach, in the order the API
-/// lists it. The caller owns the result. One `deadline` bounds every page, so a
-/// list that keeps reporting pages cannot hold the fetch open past it.
 pub fn fetch(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -98,7 +83,6 @@ fn request(
 
     const authorization: []const u8 = switch (identity) {
         .subscription => |token| try std.fmt.allocPrint(gpa, "Bearer {s}", .{token}),
-        // The key identity sends no `authorization` header at all.
         .api_key => &.{},
     };
     defer gpa.free(authorization);
@@ -128,10 +112,6 @@ fn request(
     out.* = try parse(gpa, body);
 }
 
-/// The request identity of the list, which mirrors the one the messages
-/// endpoint uses. The subscription sends its Claude Code identity, and a key
-/// sends itself. `extra` and `authorization` back the result, so both must
-/// outlive the request.
 fn options(
     identity: Transport.Identity,
     authorization: []const u8,
@@ -162,10 +142,6 @@ fn options(
     }
 }
 
-/// Whether the credential of `identity` can travel as a header value. The
-/// subscription sends its token in `authorization` and the key sends itself in
-/// `x-api-key`, so the guard reads the credential rather than one composed
-/// header.
 fn validCredential(identity: Transport.Identity) bool {
     return net.validHeaderValue(switch (identity) {
         .subscription => |token| token,
@@ -173,8 +149,6 @@ fn validCredential(identity: Transport.Identity) bool {
     });
 }
 
-/// Decode one page. A malformed envelope rejects the page, while a malformed
-/// entry is skipped so one bad model costs no other.
 pub fn parse(gpa: std.mem.Allocator, body: []const u8) !Page {
     var parsed = try std.json.parseFromSlice(std.json.Value, gpa, body, .{});
     defer parsed.deinit();
@@ -205,10 +179,6 @@ fn decode(value: std.json.Value) ?Model {
     return model;
 }
 
-/// The effort levels and the thinking state of one entry. A model that states no
-/// capability object states nothing, so its levels stay empty and a request
-/// carries no reasoning control. A model that states an unsupported effort
-/// control denies the whole ladder, which no other source can reopen.
 fn capabilities(model: *Model, value: ?std.json.Value) void {
     const object = json.object(value orelse return) orelse return;
     if (json.object(object.get("thinking"))) |thinking|
@@ -241,8 +211,6 @@ fn outputLimit(value: ?std.json.Value) ?u32 {
     return std.math.cast(u32, found);
 }
 
-// One entry of each shape the live list holds: an adaptive model with every
-// level, a model without `xhigh`, and a model that names no level at all.
 const sample =
     \\{ "data": [
     \\  { "type": "model", "id": "claude-opus-4-8", "display_name": "Claude Opus 4.8",
@@ -268,9 +236,6 @@ const sample =
     \\], "has_more": false, "first_id": "claude-opus-4-8", "last_id": "claude-haiku-4-5-20251001" }
 ;
 
-// Both identities reach the same endpoint, so both must pass the guard. The key
-// travels as `x-api-key` and the token as `authorization`, and a credential that
-// holds CR or LF can split either head.
 test "the credential guard reads the credential that each identity sends" {
     try std.testing.expect(validCredential(.{ .api_key = "sk-ant-key" }));
     try std.testing.expect(validCredential(.{ .subscription = "oauth-token" }));
@@ -281,9 +246,6 @@ test "the credential guard reads the credential that each identity sends" {
     try std.testing.expect(!validCredential(.{ .subscription = "token\nx-injected: 1" }));
 }
 
-// The deadline of a fetch is shared with the requests around it, so a page must
-// take what is left of the window and not a window of its own. A window that has
-// closed refuses the page before it opens a socket.
 test "an expired deadline refuses the list without a request" {
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
@@ -311,22 +273,17 @@ test parse {
         try std.testing.expect(opus.offers(level));
     try std.testing.expectEqual(Model.Thinking.supported, opus.thinking);
 
-    // A level the vendor marks unsupported folds onto the nearest one it names.
     const sonnet = page.models[1];
     try std.testing.expect(!sonnet.offers(.xhigh));
     try std.testing.expectEqual(llm.Effort.high, sonnet.reasoning(.xhigh).named);
     try std.testing.expectEqual(llm.Effort.max, sonnet.reasoning(.max).named);
 
-    // A model that never reasons names no level and carries no control.
     const haiku = page.models[2];
     try std.testing.expectEqualStrings("claude-haiku-4-5-20251001", haiku.name());
     try std.testing.expectEqual(Model.Thinking.unsupported, haiku.thinking);
     try std.testing.expect(haiku.reasoning(.high) == .omitted);
-    // The denial of the effort control is a fact of its own, so no other source
-    // can name a level for this model later.
     try std.testing.expect(haiku.efforts_denied);
     try std.testing.expectEqual(@as(?u32, 64_000), haiku.tokens_max);
-    // The vendor prices nothing, so every model of the list arrives unpriced.
     try std.testing.expect(haiku.price == null);
 }
 
@@ -348,13 +305,9 @@ test "a malformed envelope is rejected and a malformed entry is skipped" {
     try std.testing.expectEqual(@as(usize, 1), page.models.len);
     try std.testing.expectEqualStrings("kept", page.models[0].name());
     try std.testing.expect(page.has_more);
-    // A stated limit that is not a count leaves the field unstated.
     try std.testing.expectEqual(@as(?u32, null), page.models[0].tokens_max);
 }
 
-// The cursor of the next page is the name of the last model of this page, and
-// that name lands in the query of the next request line. A name that splits the
-// head or corrupts the query therefore never survives the decode.
 test "an id that a request line cannot carry never becomes a cursor" {
     const gpa = std.testing.allocator;
     var page = try parse(gpa,
@@ -368,7 +321,6 @@ test "an id that a request line cannot carry never becomes a cursor" {
     defer page.deinit(gpa);
 
     try std.testing.expectEqual(@as(usize, 1), page.models.len);
-    // The last model of the page is the cursor, so it holds the safe id alone.
     const cursor = page.models[page.models.len - 1].name();
     try std.testing.expectEqualStrings("claude-opus-4-8", cursor);
     try std.testing.expect(std.mem.indexOfAny(u8, cursor, "\r\n&?# ") == null);

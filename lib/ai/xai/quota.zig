@@ -1,24 +1,11 @@
-//! The weekly plan allowance of the xAI subscription. The public Responses
-//! endpoint states only burst TPM and RPM, so Drinky reads the CLI billing
-//! surface. That surface is the same off-label client as the device login.
-
 const std = @import("std");
 
 const json = @import("../json.zig");
 const llm = @import("../llm.zig");
 const net = @import("../net.zig");
 
-/// The Grok Build credits shape. The same URL without `format=credits` is the
-/// legacy monthly API-credit body, which is empty for this plan.
 const endpoint = "https://cli-chat-proxy.grok.com/v1/billing?format=credits";
 
-/// The plan allowance behind `token`, or null when the endpoint refuses the
-/// request or the body names no used share. The caller owns nothing. Bearer
-/// alone authorizes the proxy: `X-XAI-Token-Auth` is omitted, because any
-/// value other than `xai-grok-cli` returns 401. A non-OK status, including
-/// 401, returns null. `accessToken` already refreshed a locally expired
-/// credential, so a 401 here is a token another instance rotated, and the
-/// model request handles that renewal.
 pub fn fetch(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -31,10 +18,6 @@ pub fn fetch(
     return parse(gpa, body, now_ms);
 }
 
-/// Decode the credits body into one primary window. `prepaidBalance` and
-/// `productUsage` are extra credits after the weekly pool, not a second
-/// rolling window, so they stay out of the gauge. Null when the used share is
-/// missing or not a percentage.
 fn parse(gpa: std.mem.Allocator, body: []const u8, now_ms: i64) error{OutOfMemory}!?llm.Quota {
     const parsed = std.json.parseFromSlice(std.json.Value, gpa, body, .{}) catch |err|
         return switch (err) {
@@ -87,8 +70,6 @@ fn resetSeconds(end_seconds: ?i64, now_ms: i64) ?u64 {
     return @intCast(@divFloor(remaining_ms, std.time.ms_per_s));
 }
 
-/// Seconds since the Unix epoch. Fractional seconds truncate. Null when the
-/// text is not an RFC 3339 timestamp with a time zone.
 fn parseRfc3339(text: []const u8) ?i64 {
     var index: usize = 0;
     const year = takeDigits(text, &index, 4) orelse return null;
@@ -157,7 +138,6 @@ fn takeByte(text: []const u8, index: *usize, byte: u8) bool {
     return true;
 }
 
-/// Days since 1970-01-01 (Howard Hinnant).
 fn daysFromCivil(year: i64, month: i64, day: i64) i64 {
     var civil_year = year;
     if (month <= 2) civil_year -= 1;
@@ -213,8 +193,6 @@ test parseRfc3339 {
 
 test parse {
     const gpa = std.testing.allocator;
-    // One hour before the end of a seven-day window that starts at the std
-    // epoch-decoding sample instant.
     const now_ms: i64 = 1_623_526_106_000;
     const weekly =
         \\{"config":{"creditUsagePercent":1.0,"isUnifiedBillingUser":true,"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","start":"2021-06-05T20:28:26Z","end":"2021-06-12T20:28:26Z"},"prepaidBalance":{"val":0},"productUsage":[{"product":"GrokBuild","usagePercent":50.0}]}}
@@ -245,8 +223,6 @@ test parse {
         \\{"config":{"creditUsagePercent":12,"currentPeriod":{"type":"USAGE_PERIOD_TYPE_MONTHLY","start":"2021-06-05T20:28:26Z","end":"2021-07-05T20:28:26Z"}}}
     ;
     const monthly_quota = (try parse(gpa, monthly, now_ms)).?;
-    // The status line labels 5h and weekly windows only, so a monthly length
-    // stays hidden. This plan is weekly. Other plans can send this type.
     try std.testing.expectEqual(@as(?u32, 43200), monthly_quota.primary.?.window_minutes);
 
     const no_period = "{\"config\":{\"creditUsagePercent\":4}}";

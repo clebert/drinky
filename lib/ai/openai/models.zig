@@ -1,19 +1,3 @@
-//! The model lists of the two OpenAI accounts, which have nothing in common but
-//! their vendor.
-//!
-//! The ChatGPT subscription reads the Codex catalog. It states a slug, a context
-//! window that the public API contradicts, and the reasoning levels of that
-//! backend, which include one the API never offers. It hides a model from its
-//! own clients through `visibility`, and Drinky hides those too.
-//!
-//! The API key reads `GET /v1/models`, which states an id and nothing else. No
-//! window, no level, and no price. Every other field of such a model comes from
-//! an aggregator, so the caller merges before it offers the model to the user.
-//! Another vendor that answers in this list format reads its own endpoint
-//! through `fetchList`. Such a vendor can list a model under an id and under
-//! aliases, and the decoder keeps every spelling, because a request can name
-//! any of them and the aggregator describes one.
-
 const std = @import("std");
 
 const Auth = @import("Auth.zig");
@@ -22,7 +6,6 @@ const llm = @import("../llm.zig");
 const Model = @import("../Model.zig");
 const net = @import("../net.zig");
 
-/// The numeric semantic version the Codex catalog uses for client filtering.
 const client_version = "0.0.0";
 const codex_endpoint = "https://chatgpt.com/backend-api/codex/models?client_version=" ++
     client_version;
@@ -31,8 +14,6 @@ const originator = "drinky";
 const body_bytes_max = 4 * 1024 * 1024;
 const entry_count_max = 1024;
 
-/// Every model the ChatGPT subscription behind `auth` can run. The caller owns
-/// the result. The `deadline` bounds the request and the token refresh inside it.
 pub fn fetchSubscription(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -80,10 +61,6 @@ fn requestSubscription(
     out.* = try parseSubscription(gpa, body);
 }
 
-/// The extra headers of the Codex list request. A stored credential can carry
-/// no account id, and the transport sends neither the account nor the
-/// originator header there, so this request omits both too. `extra` backs the
-/// result, so it must outlive the request.
 fn subscriptionHeaders(
     account_id: []const u8,
     extra: *[3]std.http.Header,
@@ -95,24 +72,17 @@ fn subscriptionHeaders(
     return extra[0..3];
 }
 
-/// Whether the credentials of the subscription can travel as header values. An
-/// empty account id names no header at all, so it cannot split the request
-/// head and the guard passes it.
 fn validSubscriptionCredentials(access_token: []const u8, account_id: []const u8) bool {
     if (!net.validHeaderValue(access_token)) return false;
     return account_id.len == 0 or net.validHeaderValue(account_id);
 }
 
-/// One `GET /v1/models` request: its endpoint, optional bearer credential, and
-/// decoder. A credential-free local server leaves `token` null.
 pub const List = struct {
     endpoint: []const u8,
     token: ?[]const u8,
     decoder: *const fn (std.mem.Allocator, []const u8) anyerror![]Model = parseApi,
 };
 
-/// Every model the API key `key` can name. The caller owns the result. The
-/// `deadline` bounds the request.
 pub fn fetchApi(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -122,8 +92,6 @@ pub fn fetchApi(
     return fetchList(gpa, io, deadline, &.{ .endpoint = api_endpoint, .token = key });
 }
 
-/// Every model that `list.endpoint` offers. The caller owns the result. The
-/// request omits authorization when `list.token` is null. The deadline bounds it.
 pub fn fetchList(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -160,7 +128,6 @@ fn requestList(gpa: std.mem.Allocator, io: std.Io, list: *const List, out: *?[]M
     out.* = try list.decoder(gpa, body);
 }
 
-/// The body of one successful GET. The caller owns it.
 fn get(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -188,8 +155,6 @@ fn get(
     return reader.allocRemaining(gpa, .limited(body_bytes_max));
 }
 
-/// Decode the Codex catalog. A model the backend hides from its own clients
-/// stays out, because the picker must offer what the user can run.
 fn parseSubscription(gpa: std.mem.Allocator, body: []const u8) ![]Model {
     var parsed = try std.json.parseFromSlice(std.json.Value, gpa, body, .{});
     defer parsed.deinit();
@@ -213,8 +178,6 @@ fn decodeSubscription(value: std.json.Value) ?Model {
     const slug = json.string(object.get("slug")) orelse return null;
     var model = Model.init(slug) catch return null;
 
-    // The stated window wins. The maximum stands in only when the entry states
-    // no window of its own.
     const maximum = positive(object.get("max_context_window"));
     model.context_window = switch (object.get("context_window") orelse std.json.Value.null) {
         .null => maximum,
@@ -225,23 +188,16 @@ fn decodeSubscription(value: std.json.Value) ?Model {
     for (levels.items) |entry| {
         const level = json.object(entry) orelse continue;
         const name = json.string(level.get("effort")) orelse continue;
-        // A name the ladder does not hold drops, so no picker offers a level
-        // that Drinky cannot send. `none` and `ultra` are such names.
         model.addEffort(std.meta.stringToEnum(llm.Effort, name) orelse continue);
     }
     return model;
 }
 
-/// Whether the backend hides this model from its own clients.
 fn hidden(value: ?std.json.Value) bool {
     const visibility = json.string(value orelse return false) orelse return false;
     return std.mem.eql(u8, visibility, "hide");
 }
 
-/// Decode `GET /v1/models`, which states an id, its aliases, and nothing more
-/// that Drinky reads. A vendor that states more in this list also lists models
-/// that no chat request can run, so the aggregator decides which name describes
-/// a model.
 fn parseApi(gpa: std.mem.Allocator, body: []const u8) ![]Model {
     var parsed = try std.json.parseFromSlice(std.json.Value, gpa, body, .{});
     defer parsed.deinit();
@@ -257,7 +213,6 @@ fn parseApi(gpa: std.mem.Allocator, body: []const u8) ![]Model {
         const id = json.string(entry.get("id")) orelse continue;
         const model = Model.init(id) catch continue;
         try models.append(gpa, model);
-        // The provider names the id in every reply, so an alias records it.
         const aliases = json.array(entry.get("aliases")) orelse continue;
         for (aliases.items) |alias_value| {
             const alias = json.string(alias_value) orelse continue;
@@ -275,7 +230,6 @@ fn positive(value: ?std.json.Value) ?u64 {
     return if (found > 0) @intCast(found) else null;
 }
 
-// The live catalog shape, cut to the fields Drinky reads.
 const codex_sample =
     \\{ "models": [
     \\  { "slug": "gpt-5.6-sol", "display_name": "GPT-5.6-Sol", "visibility": "list",
@@ -297,9 +251,6 @@ const codex_sample =
     \\] }
 ;
 
-// A stored credential can carry no account id, and the transport treats that
-// state as valid: it omits the account headers there. The list request of the
-// same account must follow that contract.
 test "the Codex list omits the account headers when the credential names none" {
     var extra: [3]std.http.Header = undefined;
 
@@ -316,8 +267,6 @@ test "the Codex list omits the account headers when the credential names none" {
     try std.testing.expectEqualStrings("accept", anonymous[0].name);
 }
 
-// Both lists share the deadline of the fetch around them, so a window that has
-// closed refuses each request before it opens a socket.
 test "an expired deadline refuses both lists without a request" {
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
@@ -327,9 +276,6 @@ test "an expired deadline refuses both lists without a request" {
         error.Timeout,
         fetchApi(std.testing.allocator, io, expired, "sk-openai"),
     );
-    // The subscription reads its token inside the request, so a refused request
-    // never reaches this store. A signed-out store would answer with
-    // `NotAuthenticated` if it did.
     var signed_out: Auth = .{
         .gpa = std.testing.allocator,
         .io = io,
@@ -347,7 +293,6 @@ test "the Codex guard accepts a credential that names no account" {
     try std.testing.expect(validSubscriptionCredentials("token", "account"));
     try std.testing.expect(validSubscriptionCredentials("token", ""));
 
-    // A credential that can split the request head is refused in both fields.
     try std.testing.expect(!validSubscriptionCredentials("", "account"));
     try std.testing.expect(!validSubscriptionCredentials("token\r\nx-injected: 1", "account"));
     try std.testing.expect(!validSubscriptionCredentials("token", "account\nx-injected: 1"));
@@ -358,28 +303,21 @@ test parseSubscription {
     const models = try parseSubscription(gpa, codex_sample);
     defer gpa.free(models);
 
-    // The hidden model never reaches the picker.
     try std.testing.expectEqual(@as(usize, 2), models.len);
     try std.testing.expectEqualStrings("gpt-5.6-sol", models[0].name());
     try std.testing.expectEqualStrings("gpt-5.4", models[1].name());
 
     const sol = models[0];
-    // The stated window wins over the maximum, and it contradicts the public API.
     try std.testing.expectEqual(@as(?u64, 272_000), sol.context_window);
-    // The catalog lists `ultra`, which no rung of the ladder holds, so it drops.
     try std.testing.expectEqual(@as(usize, 5), sol.efforts.count());
     try std.testing.expect(sol.offers(.low));
     try std.testing.expect(sol.offers(.max));
-    // The catalog states no thinking state.
     try std.testing.expectEqual(Model.Thinking.unknown, sol.thinking);
-    // The backend prices nothing and states no output limit.
     try std.testing.expect(sol.price == null);
     try std.testing.expectEqual(@as(?u32, null), sol.tokens_max);
 
-    // A null window falls back to the maximum.
     try std.testing.expectEqual(@as(?u64, 1_000_000), models[1].context_window);
     try std.testing.expectEqual(llm.Effort.high, models[1].reasoning(.max).named);
-    // `none` is no rung, so it drops like any name outside the ladder.
     try std.testing.expectEqual(@as(usize, 2), models[1].efforts.count());
 }
 
@@ -399,20 +337,13 @@ test parseApi {
     );
     defer gpa.free(models);
 
-    // The list states an id and nothing else, so every other field stays unset
-    // and the caller must merge before it offers the model.
     try std.testing.expectEqual(@as(usize, 5), models.len);
     try std.testing.expectEqualStrings("gpt-5.6-sol", models[0].name());
     try std.testing.expectEqual(@as(?u64, null), models[0].context_window);
     try std.testing.expect(models[0].price == null);
     try std.testing.expectEqual(Model.Thinking.unknown, models[0].thinking);
     try std.testing.expect(models[0].reasoning(.high) == .omitted);
-    // The xAI list states a window for an image model too, so the decoder reads
-    // no window: such a model must stay out of the picker.
     try std.testing.expectEqual(@as(?u64, null), models[2].context_window);
-    // An alias is a name too, and it records the id that a reply names. One that
-    // repeats the id, one that is no string, and one that no request line can
-    // carry all drop.
     try std.testing.expectEqualStrings("grok-4.20-0309-reasoning", models[3].name());
     try std.testing.expectEqualStrings("", models[3].servedName());
     try std.testing.expectEqualStrings("grok-4.20", models[4].name());

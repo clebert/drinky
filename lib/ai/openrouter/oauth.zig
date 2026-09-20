@@ -1,11 +1,3 @@
-//! The OpenRouter OAuth protocol. It uses PKCE with no client registration.
-//! The exchange trades the code for a user-owned key. The account needs no
-//! token refresh. A random callback path binds the redirect.
-//!
-//! OpenRouter documents this flow and the endpoints below for any client, so
-//! this is a supported surface, unlike the subscription logins of the other
-//! providers.
-
 const std = @import("std");
 
 const json = @import("../json.zig");
@@ -17,8 +9,6 @@ const keys_url = "https://openrouter.ai/api/v1/auth/keys";
 pub const callback_port = 53694;
 pub const callback_path_len = 1 + 32;
 
-/// The minted API key. It never expires in session and needs no refresh, so it
-/// is the only stored field.
 pub const Tokens = struct {
     api_key: []const u8,
 
@@ -27,7 +17,6 @@ pub const Tokens = struct {
     }
 };
 
-/// A random callback path that binds the redirect the way `state` does.
 pub fn callbackPath(buffer: *[callback_path_len]u8, io: std.Io) []const u8 {
     var seed: [16]u8 = undefined;
     io.random(&seed);
@@ -40,8 +29,6 @@ pub fn callbackPath(buffer: *[callback_path_len]u8, io: std.Io) []const u8 {
     return buffer;
 }
 
-/// The browser authorize URL for `code` and `callback_path`. The caller frees
-/// the result.
 pub fn authorizeUrl(
     gpa: std.mem.Allocator,
     code: *const oauth_wire.Pkce,
@@ -70,15 +57,11 @@ fn isUnreserved(byte: u8) bool {
     return std.ascii.isAlphanumeric(byte) or std.mem.indexOfScalar(u8, "-._~", byte) != null;
 }
 
-/// The authorization grant traded for a key: the callback `code` and the local
-/// PKCE `verifier`.
 pub const Grant = struct {
     code: []const u8,
     verifier: []const u8,
 };
 
-/// Trade an authorization grant for a minted API key. The caller frees the
-/// result.
 pub fn exchange(
     gpa: std.mem.Allocator,
     io: std.Io,

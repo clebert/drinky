@@ -1,17 +1,3 @@
-//! The transcript-block model. `Entry.Content` is a tagged union that carries
-//! exactly each block's data: the plain blocks a byte buffer, the flagged ones a
-//! buffer plus error and warning flags, the reasoning one a buffer plus the
-//! account that produced it. A block owns its bytes (`init`/`deinit`), measures itself
-//! (`rows`), and paints itself (`render`) with the shared `paint` primitives. The
-//! model block grows in place as its reply streams, and its markdown renders as
-//! it goes.
-//!
-//! Each block also retains the rows of its last paint. A frame replays those
-//! rows and runs the markdown of the blocks that changed alone. A streamed block
-//! grows by `appendText`, which drops the rows of the streaming tail while every
-//! block above it retains its own. An event is the one block that a rewrite can
-//! replace in place, through `replaceEvent`.
-
 const std = @import("std");
 
 const ai = @import("ai");
@@ -22,16 +8,8 @@ const markdown = @import("markdown.zig");
 const paint = @import("paint.zig");
 const role = @import("role.zig");
 
-/// The bytes that paint as blank rows alone. A block trims the rows of them off
-/// its ends, and the transcript holds a run of them until another byte follows,
-/// because a block of them alone shows as a blank row.
 const blank_bytes = " \t\r\n";
 
-/// `text` without the blank rows it starts on and ends on. A model can start
-/// its answer on blank lines after its reasoning, and a provider can end a
-/// reply or a run of reasoning on them. The markdown walk counts a row for each
-/// one, so the block would hold empty rows around its text. The first line
-/// keeps its indent, because markdown reads it.
 fn trimBlank(text: []const u8) []const u8 {
     const first = std.mem.indexOfNone(u8, text, blank_bytes) orelse return text[0..0];
     const line_start = if (std.mem.lastIndexOfScalar(u8, text[0..first], '\n')) |newline|
@@ -41,22 +19,17 @@ fn trimBlank(text: []const u8) []const u8 {
     return std.mem.trimEnd(u8, text[line_start..], blank_bytes);
 }
 
-/// Whether `text` paints as blank rows alone.
 pub fn isBlank(text: []const u8) bool {
     return std.mem.indexOfNone(u8, text, blank_bytes) == null;
 }
 
 pub const Entry = struct {
     content: Content,
-    /// The rows this block painted last, so the frames that follow replay them.
     cache: Cache = .{},
 
     pub const Content = union(enum) {
         intro: std.ArrayList(u8),
         user: std.ArrayList(u8),
-        /// A line that reports a message that Drinky wrote for the user. The
-        /// head of a loaded skill and the line of a retry attempt read this way.
-        /// It is not a box, so a typed message cannot forge it.
         user_note: std.ArrayList(u8),
         thinking: Reasoning,
         model: std.ArrayList(u8),
@@ -67,35 +40,14 @@ pub const Entry = struct {
     pub const Flagged = struct {
         text: std.ArrayList(u8),
         is_error: bool,
-        /// Whether an event reports a warning the user can pass. A failure
-        /// outranks it. Other flagged blocks ignore this field.
         is_warning: bool,
-        /// How a line wider than the window fits. Only a tool box reads it. An
-        /// event renders as a notice, which always wraps.
         fit: paint.Fit,
-        /// Whether an event stays when an abnormal turn rewinds its model tail.
-        /// Other flagged blocks ignore this field.
         survives_rewind: bool,
-        /// Whether an event belongs to the turn that recorded it, so a deliberate
-        /// removal of that whole turn takes the event with it. A provider retry
-        /// event sets both flags: it happened during the turn, so it survives a
-        /// rewind of the tail, and it goes with a removal of the turn. A session
-        /// event and a command event set neither. Other flagged blocks ignore
-        /// this field, because the removal takes every one of them.
         turn_owned: bool,
-        /// Whether a remote mirror of the transcript sends this event. An event
-        /// that stands in the chat already, or that a send to the chat caused,
-        /// stays in the terminal. Other flagged blocks ignore this field.
         mirrored: bool,
-        /// How many times this event occurred back to back. The text states the
-        /// count from two on. Other flagged blocks ignore this field.
         repeats: usize = 1,
-        /// The bytes of the text before the suffix of its repeat count. Other
-        /// flagged blocks ignore this field.
         base_len: usize,
 
-        /// How an event paints. A failure outranks a warning, and every other
-        /// event takes the accent role of a session report.
         fn eventNotice(self: *const Flagged) paint.Notice {
             if (self.is_error) return .{
                 .role = .@"error",
@@ -112,81 +64,37 @@ pub const Entry = struct {
         }
     };
 
-    /// One run of model reasoning and the account slot that produced it. Only
-    /// that slot replays the stored proof of that reasoning, so only that slot
-    /// shows the block. Null marks a block that no account claims, and every
-    /// projection shows such a block.
     pub const Reasoning = struct {
         text: std.ArrayList(u8),
         account: ?ai.llm.Account,
     };
     pub const Kind = std.meta.Tag(Content);
 
-    /// What a block carries beyond its text. A variant that ignores a field
-    /// takes its default, so a plain block states nothing.
     pub const Options = struct {
-        /// Whether the block reports a failure. It selects the error role, and
-        /// it gives an event the warning symbol in place of the information
-        /// symbol. The plain variants ignore it.
         is_error: bool = false,
-        /// Whether an event reports a warning the user can pass. It selects the
-        /// warning role and the warning symbol. A failure outranks it. Every
-        /// other variant ignores it.
         is_warning: bool = false,
-        /// How a tool box fits a line that is wider than the window. A call row
-        /// and a measures line cut, because the start of each identifies it. The
-        /// sentence of a failure wraps, because its instruction sits at the end,
-        /// and a cut there takes the half the user needs.
         fit: paint.Fit = .head,
-        /// The account slot that produced a reasoning block. Every other variant
-        /// ignores it.
         account: ?ai.llm.Account = null,
-        /// Whether an event survives an abnormal turn rewind. Every other
-        /// variant ignores it.
         survives_rewind: bool = false,
-        /// Whether an event goes with a deliberate removal of the turn that
-        /// recorded it. Every other variant ignores it.
         turn_owned: bool = false,
-        /// Whether a remote mirror of the transcript sends an event. Every
-        /// other variant ignores it.
         mirrored: bool = true,
     };
 
-    /// The composed rows of one block at one width. A frame that painted the
-    /// block whole retained them, and their count is the measure of the block.
-    /// A clipped block retains nothing, so the rows stay inside the window.
-    /// Every block paints at least one row, so an empty store means that no
-    /// frame retained one.
     pub const Cache = struct {
-        /// The width the retained rows fit.
         columns: usize = 0,
-        /// Every row the block paints at `columns`.
         lines: terminal.View.Lines = .empty,
-        /// The reset epoch of the last frame that composed this block, or null
-        /// before the first one. The terminal holds rows of the block while the
-        /// epoch is the current one, because a reset clears every row above the
-        /// window and the block then reaches the terminal only through a frame
-        /// that composes it again.
         epoch: ?u64 = null,
-        /// Whether a rewrite changed the text after a frame composed it, and no
-        /// frame composed it since. An append never sets it, because an append
-        /// changes no row above the block. A frame that composes the block
-        /// again clears it.
         rewritten: bool = false,
 
         fn deinit(self: *Cache, gpa: std.mem.Allocator) void {
             self.lines.deinit(gpa);
         }
 
-        /// The rows retained for `columns`, or null when the cache holds none.
         fn retained(self: *const Cache, columns: usize) ?*const terminal.View.Lines {
             if (self.columns != columns or self.lines.count() == 0) return null;
             return &self.lines;
         }
 
-        /// Retain the rows that `sink` composed from `options.first_row` on.
-        /// They fit `options.columns`, so a frame at another width composes the
-        /// block again.
         fn retain(
             self: *Cache,
             gpa: std.mem.Allocator,
@@ -198,20 +106,16 @@ pub const Entry = struct {
             try sink.capture(gpa, options.first_row, &self.lines);
         }
 
-        /// Drop the retained rows and hold their buffers for the next paint.
         fn forget(self: *Cache) void {
             self.lines.clearRetainingCapacity();
         }
 
-        /// A rewrite changed rows that an earlier paint composed: drop the
-        /// retained rows and mark the rewrite.
         fn invalidate(self: *Cache) void {
             self.forget();
             self.rewritten = true;
         }
     };
 
-    /// A new block that owns a copy of `text`.
     pub fn init(
         gpa: std.mem.Allocator,
         kind: Kind,
@@ -248,13 +152,6 @@ pub const Entry = struct {
         self.cache.deinit(gpa);
     }
 
-    /// Append `delta` to the text of a streamed block, and drop the rows that
-    /// held the text before it. Only a block that a run streams accepts text.
-    /// An append grows the block at its bottom, so it marks no rewrite: the rows
-    /// above its last row stand, and the last row can rewrap alone. That row sits
-    /// above the window only once the whole block does, which takes a tail
-    /// taller than the window under a block that still streams, and it costs one
-    /// stale row there.
     pub fn appendText(self: *Entry, gpa: std.mem.Allocator, delta: []const u8) !void {
         switch (self.content) {
             .model => |*list| try list.appendSlice(gpa, delta),
@@ -264,9 +161,6 @@ pub const Entry = struct {
         self.cache.forget();
     }
 
-    /// Replace the text and the flags of an event, as the end of a wait rewrites
-    /// the line that announced it. The block keeps its place, and the rows of
-    /// its earlier paint no longer match it. Only an event accepts a replacement.
     pub fn replaceEvent(
         self: *Entry,
         gpa: std.mem.Allocator,
@@ -291,33 +185,19 @@ pub const Entry = struct {
         self.cache.invalidate();
     }
 
-    /// Free the rows this block retains. A block that a frame does not paint
-    /// retains none, so the retained rows stay inside the window.
     pub fn release(self: *Entry, gpa: std.mem.Allocator) void {
         self.cache.lines.clear(gpa);
     }
 
-    /// Whether the terminal holds rows of this block that a rewrite left behind,
-    /// and clear the mark. The rows are there while `epoch` is the current reset
-    /// epoch, because a reset clears every row above the window. The layout asks
-    /// this of a block that no frame composes, because only a reset can remove
-    /// such rows.
     pub fn takeRewritten(self: *Entry, epoch: u64) bool {
         defer self.cache.rewritten = false;
         return self.cache.rewritten and self.cache.epoch == epoch;
     }
 
-    /// Record that the frame of `epoch` composed this block, so the terminal
-    /// holds its rows from here on. The layout stamps it after the frame paints,
-    /// because a reset in that same frame starts the epoch that the rows belong
-    /// to.
     pub fn stampEpoch(self: *Entry, epoch: u64) void {
         self.cache.epoch = epoch;
     }
 
-    /// The account slot whose model context holds this block, or null for a
-    /// local block that every account shows. Only stored reasoning binds to one
-    /// account, because only that account replays its proof.
     pub fn account(self: *const Entry) ?ai.llm.Account {
         return switch (self.content) {
             .thinking => |reasoning| reasoning.account,
@@ -325,8 +205,6 @@ pub const Entry = struct {
         };
     }
 
-    /// Whether this event states `text` under `options`, its repeat count
-    /// aside. A block of another kind states nothing.
     pub fn statesEvent(self: *const Entry, options: Options, text: []const u8) bool {
         const flagged = switch (self.content) {
             .event => |*flagged| flagged,
@@ -340,10 +218,6 @@ pub const Entry = struct {
         return std.mem.eql(u8, eventText(flagged), text);
     }
 
-    /// Count one more occurrence of this event, and state the count in its
-    /// text. The new count replaces the one before it, so the text carries one.
-    /// The whole text is built beside the old one, so a failure leaves the
-    /// block as it stands.
     pub fn repeatEvent(self: *Entry, gpa: std.mem.Allocator) !void {
         const flagged = &self.content.event;
         const repeats = flagged.repeats + 1;
@@ -357,13 +231,10 @@ pub const Entry = struct {
         self.cache.invalidate();
     }
 
-    /// The text of `flagged` without the suffix of its repeat count.
     fn eventText(flagged: *const Flagged) []const u8 {
         return flagged.text.items[0..flagged.base_len];
     }
 
-    /// Whether this event remains visible when an abnormal turn rewinds its
-    /// model tail. Every other block follows the rewind checkpoint.
     pub fn survivesRewind(self: *const Entry) bool {
         return switch (self.content) {
             .event => |event| event.survives_rewind,
@@ -371,11 +242,6 @@ pub const Entry = struct {
         };
     }
 
-    /// Whether a deliberate removal of the turn that recorded this block takes
-    /// it. Every message, note, reasoning, answer, and tool box of a turn goes
-    /// with it. An event goes only when it belongs to the turn, so a session
-    /// event and a command event inside the range stay. An intro stands outside
-    /// every turn.
     pub fn turnOwned(self: *const Entry) bool {
         return switch (self.content) {
             .event => |event| event.turn_owned,
@@ -384,7 +250,6 @@ pub const Entry = struct {
         };
     }
 
-    /// The bytes this block holds.
     fn bytes(self: *const Entry) []const u8 {
         return switch (self.content) {
             .intro, .user, .user_note, .model => |list| list.items,
@@ -393,29 +258,18 @@ pub const Entry = struct {
         };
     }
 
-    /// How this block paints as a notice, or null for a block that paints a box
-    /// or markdown. The measure and the paint share it, so the rows a block
-    /// counts cannot diverge from the rows it paints. Each notice opens on the
-    /// symbol of its kind, so copied text keeps the kind where the color is gone.
     fn notice(self: *const Entry) ?paint.Notice {
         return switch (self.content) {
             .user_note => .{ .role = .user_note, .prefix = paint.note_prefix },
-            // An event wraps, so the transcript keeps the complete sentence.
             .event => |*flagged| flagged.eventNotice(),
             .intro, .user, .tool_result, .thinking, .model => null,
         };
     }
 
-    /// The intro line as the caption of the interface: the `Drinky` title, then
-    /// the legend this block carries. It keeps the default row bound, because a
-    /// transcript block scrolls away and moves no input around.
     fn introCaption(legend: []const u8) Caption {
         return .{ .title = "Drinky", .controls = legend };
     }
 
-    /// The role of the box this block paints, or null for a block that paints a
-    /// notice or markdown. A failed call takes the error color, so the state of
-    /// a call decides the color of its box.
     fn boxRole(self: *const Entry) ?role.Name {
         return switch (self.content) {
             .user => .user,
@@ -424,10 +278,6 @@ pub const Entry = struct {
         };
     }
 
-    /// The physical rows this block wraps to at `columns`, its leading separator
-    /// excluded. Must equal exactly what `render` emits: the parity the diff
-    /// and window math rely on. The rows of the last paint state that count, so
-    /// a block that painted whole at this width measures itself again for free.
     pub fn rows(self: *const Entry, columns: usize) usize {
         if (self.cache.retained(columns)) |lines| return lines.count();
         return self.measure(columns);
@@ -448,15 +298,6 @@ pub const Entry = struct {
         };
     }
 
-    /// Compose this block's rows through `placement` and drop its top `skip`
-    /// rows (nonzero only for the clip). The rows of the last paint at this
-    /// width replay as they are, so an unchanged block runs no markdown.
-    ///
-    /// A paint that composed the block whole retains its rows for the frames
-    /// that follow. A clipped block composes its visible rows alone and retains
-    /// none, so its hidden top never materializes and the retained rows stay
-    /// inside the window. Rows that Drinky cannot hold cost the frame nothing,
-    /// because the paint below already wrote every one of them.
     pub fn render(
         self: *Entry,
         gpa: std.mem.Allocator,
@@ -465,7 +306,6 @@ pub const Entry = struct {
         if (self.cache.retained(placement.columns)) |lines| return replay(placement, lines);
         const first_row = placement.sink.composed();
         try self.compose(placement);
-        // The frame holds the rows of the current text, so no rewrite waits.
         self.cache.rewritten = false;
         if (placement.skip > 0) return;
         self.cache.retain(gpa, placement.sink, .{
@@ -474,9 +314,6 @@ pub const Entry = struct {
         }) catch self.cache.forget();
     }
 
-    /// Compose the retained rows through `placement`, its clipped top dropped.
-    /// The rows carry the anchors of a fresh paint, so the diff of the frame
-    /// cannot tell the two apart.
     fn replay(placement: *const paint.Placement, lines: *const terminal.View.Lines) !void {
         for (0..lines.count()) |index| {
             const line = placement.base + index;
@@ -497,8 +334,6 @@ pub const Entry = struct {
             .tool_result => |flagged| try paint.box(
                 placement,
                 box.?,
-                // The head row names the tool, so the box emphasizes that
-                // name. A finished box then reads like the running one.
                 &.{
                     .text = flagged.text.items,
                     .fit = flagged.fit,
@@ -515,14 +350,10 @@ pub const Entry = struct {
     }
 };
 
-/// Physical rows in a fresh paint: the view joins its inert rows with `\r\n`,
-/// and row text cannot emit those separators, so they count physical rows.
 pub fn paintedRows(bytes: []const u8) usize {
     return std.mem.count(u8, bytes, "\r\n") + 1;
 }
 
-/// A `\n`-joined `L0`..`L<count-1>` test fixture, tall enough to overflow a
-/// window so clipping tests can pin which numbered rows survive.
 pub fn numberedLines(gpa: std.mem.Allocator, count: usize) !std.ArrayList(u8) {
     var text: std.ArrayList(u8) = .empty;
     errdefer text.deinit(gpa);
@@ -534,8 +365,6 @@ pub fn numberedLines(gpa: std.mem.Allocator, count: usize) !std.ArrayList(u8) {
     return text;
 }
 
-// A reply that carries the markdown shapes that reflow: a heading, a fenced
-// block, a nested list, a quote, and inline emphasis.
 const markdown_reply =
     \\## Findings
     \\- one bullet with words enough to wrap
@@ -550,9 +379,6 @@ const markdown_reply =
     \\That is **it**.
 ;
 
-// The bytes `entry` paints into a fresh view. The paint drops its top `skip`.
-// Fresh so the paint is a full reprint whose rows `paintedRows` can count. The
-// window is tall enough that only `skip` clips. Caller-owned.
 fn rendered(gpa: std.mem.Allocator, entry: *Entry, columns: usize, skip: usize) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
@@ -571,15 +397,12 @@ fn rendered(gpa: std.mem.Allocator, entry: *Entry, columns: usize, skip: usize) 
     return gpa.dupe(u8, out.written());
 }
 
-// Rows `entry` paints into a fresh view, through `rendered`.
 fn renderedRows(gpa: std.mem.Allocator, entry: *Entry, columns: usize, skip: usize) !usize {
     const painted = try rendered(gpa, entry, columns, skip);
     defer gpa.free(painted);
     return paintedRows(painted);
 }
 
-// The parity contract: what `rows` counts is exactly what `render` emits. Here
-// per entry variant, with content that wraps and carries blank lines.
 test "each entry variant renders exactly the rows it counts" {
     const gpa = std.testing.allocator;
     const cases = [_]struct { kind: Entry.Kind, options: Entry.Options, text: []const u8 }{
@@ -588,14 +411,12 @@ test "each entry variant renders exactly the rows it counts" {
         .{ .kind = .event, .options = .{ .is_error = true }, .text = "boom" },
         .{ .kind = .user, .options = .{}, .text = "a user message long enough to wrap " ++
             "across the narrow test width more than once" },
-        // The head of a skill invocation: one line that no box holds.
         .{ .kind = .user_note, .options = .{}, .text = "Skill: zig-style · File: " ++
             ".agents/skills/zig-style/SKILL.md" },
         .{ .kind = .model, .options = .{}, .text = "model reply\nwith a blank\n\n" ++
             "then a long paragraph that must wrap several rows" },
         .{ .kind = .thinking, .options = .{}, .text = "reasoning that runs on\n\n" ++
             "long enough to wrap across the narrow test width more than once" },
-        // Markdown, whose prefixes and indents can outgrow the narrow widths.
         .{ .kind = .model, .options = .{}, .text = markdown_reply },
         .{ .kind = .thinking, .options = .{}, .text = markdown_reply },
         .{
@@ -603,35 +424,25 @@ test "each entry variant renders exactly the rows it counts" {
             .options = .{ .is_error = true, .fit = .wrap },
             .text = "read foo.zig\n→ no such file",
         },
-        // A failure that states measures cuts its lines like a success does.
         .{
             .kind = .tool_result,
             .options = .{ .is_error = true },
             .text = "Tool: bash · Command: ls\nTime: 400ms · Exit code: 1",
         },
-        // A call whose tool decided no box line is the call row alone.
         .{ .kind = .tool_result, .options = .{}, .text = "Tool: describe_drinky" },
-        // A wide-glyph box, to exercise the narrow-width row cap.
         .{ .kind = .user, .options = .{}, .text = "你好世界" },
     };
-    // Includes widths narrower than a box's borders and the error prefix, where
-    // `Sink.end`'s one-row assertion pins the renderers' clamps.
     const widths = [_]usize{ 16, 3, 2 };
     for (cases) |case| {
         var entry = try Entry.init(gpa, case.kind, case.options, case.text);
         defer entry.deinit(gpa);
         for (widths) |columns| {
-            // The measure runs ahead of the paint, so it walks the content of
-            // the block and never reads the rows of the paint before it.
             const counted = entry.rows(columns);
             try std.testing.expectEqual(counted, try renderedRows(gpa, &entry, columns, 0));
         }
     }
 }
 
-// Regression: a provider can end a reply or a run of reasoning on blank lines.
-// The markdown walk counted a row for each one, so empty rows opened under the
-// block.
 test "a streamed block drops the blank rows it ends on" {
     const gpa = std.testing.allocator;
     const columns = 20;
@@ -649,16 +460,12 @@ test "a streamed block drops the blank rows it ends on" {
         try std.testing.expectEqualStrings(tight_paint, trailing_paint);
     }
 
-    // Blank lines alone still hold the one row that every block paints.
     var blanks_only = try Entry.init(gpa, .model, .{}, "\n\n");
     defer blanks_only.deinit(gpa);
     try std.testing.expectEqual(@as(usize, 1), blanks_only.rows(columns));
     try std.testing.expectEqual(@as(usize, 1), try renderedRows(gpa, &blanks_only, columns, 0));
 }
 
-// Regression: a model can start its answer on blank lines after its reasoning.
-// The run keeps that whitespace in front of its text, so the block painted two
-// empty rows above the answer.
 test "a streamed block drops the blank rows it starts on" {
     const gpa = std.testing.allocator;
     const columns = 20;
@@ -679,15 +486,12 @@ test "a streamed block drops the blank rows it starts on" {
 
 test trimBlank {
     try std.testing.expectEqualStrings("the answer", trimBlank("\n\n  \nthe answer\n\n  \n"));
-    // The first line keeps its indent, because markdown reads it.
     try std.testing.expectEqualStrings("    code", trimBlank("\n \n    code"));
     try std.testing.expectEqualStrings("  a\n  b", trimBlank("  a\n  b  "));
     try std.testing.expectEqualStrings("", trimBlank("\n\n  \n"));
     try std.testing.expectEqualStrings("", trimBlank(""));
 }
 
-// The same padding everywhere: a copy of a reasoning row starts at the column a
-// copy of a message box row starts at.
 test "no box carries a pad, so a copy of the rows lines up" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -716,16 +520,11 @@ test "no box carries a pad, so a copy of the rows lines up" {
     try thinking.render(gpa, &second);
     try view.render();
 
-    // Every row opens on its own first character.
     const painted = out.written();
     try expectRowOpensOnText(painted, "a user message that");
     try expectRowOpensOnText(painted, "reasoning that wraps");
 }
 
-// A sentence names what went wrong and what to do about it, and the instruction
-// sits at its end. A cut there takes the half the user needs, so a box that
-// holds a sentence wraps while every other box keeps one row a line. The failure
-// flag decides the color alone, never the fit.
 test "a tool box wraps a sentence and cuts a line of measures" {
     const gpa = std.testing.allocator;
     const columns = 20;
@@ -738,7 +537,6 @@ test "a tool box wraps a sentence and cuts a line of measures" {
     var cut = try Entry.init(gpa, .tool_result, .{ .is_error = true }, text);
     defer cut.deinit(gpa);
 
-    // Two padding rows plus one row a line for the cut box.
     try std.testing.expectEqual(@as(usize, 4), cut.rows(columns));
     try std.testing.expect(wrapped.rows(columns) > cut.rows(columns));
 
@@ -755,15 +553,10 @@ test "a tool box wraps a sentence and cuts a line of measures" {
         .skip = 0,
     });
     try view.render();
-    // The tail of the sentence reaches the interface, and no row cut it.
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "around it.") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "\u{2026}") == null);
 }
 
-// A row that starts with a blank puts that blank in every copy of it. The style
-// of the row is the only thing in front of its first character, so no space at
-// all separates the start of the row from its text. Both blocks meeting this
-// start at the same column.
 fn expectRowOpensOnText(painted: []const u8, row: []const u8) !void {
     const start = std.mem.indexOf(u8, painted, row) orelse return error.TestExpectedRow;
     const break_end = if (std.mem.lastIndexOf(u8, painted[0..start], "\r\n")) |cut|
@@ -774,7 +567,6 @@ fn expectRowOpensOnText(painted: []const u8, row: []const u8) !void {
     try std.testing.expect(std.mem.indexOfScalar(u8, painted[break_end..start], ' ') == null);
 }
 
-// The clip drops its top `skip` rows and shows the rest.
 test "a clipped block shows its bottom rows" {
     const gpa = std.testing.allocator;
     var text = try numberedLines(gpa, 40);
@@ -786,9 +578,6 @@ test "a clipped block shows its bottom rows" {
     try std.testing.expectEqual(@as(usize, 15), try renderedRows(gpa, &entry, columns, 25));
 }
 
-// A block that painted whole retains its rows, so every frame that follows runs
-// no markdown for it. The replay must paint exactly the bytes of that first
-// paint, and a change of the text or of the width must reach the screen.
 test "a block replays its rows until its text or its width changes" {
     const gpa = std.testing.allocator;
     var entry = try Entry.init(gpa, .model, .{}, markdown_reply);
@@ -804,13 +593,11 @@ test "a block replays its rows until its text or its width changes" {
     defer gpa.free(replayed);
     try std.testing.expectEqualStrings(first, replayed);
 
-    // Another width composes the block again, and its rows replace the old ones.
     const narrow = try rendered(gpa, &entry, 16, 0);
     defer gpa.free(narrow);
     try std.testing.expect(!std.mem.eql(u8, first, narrow));
     try std.testing.expectEqual(@as(usize, 16), entry.cache.columns);
 
-    // Streamed text drops the retained rows, so the next paint carries it.
     try entry.appendText(gpa, "\n\nEpilogue\n");
     try std.testing.expectEqual(@as(usize, 0), entry.cache.lines.count());
     const grown = try rendered(gpa, &entry, 16, 0);
@@ -819,9 +606,6 @@ test "a block replays its rows until its text or its width changes" {
     try std.testing.expectEqual(entry.cache.lines.count(), entry.rows(16));
 }
 
-// A clip reads the retained rows the way the paint does: it drops the same top
-// rows and shows the same tail. A clipped paint retains no rows, because the
-// window holds no whole block then.
 test "a replayed block drops the rows that the clip hides" {
     const gpa = std.testing.allocator;
     var text = try numberedLines(gpa, 40);
@@ -842,9 +626,6 @@ test "a replayed block drops the rows that the clip hides" {
     try std.testing.expectEqualStrings(composed, clipped);
 }
 
-/// One pinned block, and each role it paints as a notice or as a box. A caption
-/// block owns the accent title and the muted legend of the shared caption. A
-/// block that paints markdown carries no name at all.
 const Pinned = struct {
     kind: Entry.Kind,
     options: Entry.Options = .{},
@@ -853,14 +634,10 @@ const Pinned = struct {
     caption: bool = false,
 };
 
-// The roles of a block state its semantic source. A message that Drinky wrote
-// for the user takes the user color. It never reads as a session report. A kind
-// that the list leaves out fails, so no new kind reaches a release unclassified.
 test "each block kind pins the role that it paints" {
     const gpa = std.testing.allocator;
     const pinned = [_]Pinned{
         .{ .kind = .intro, .caption = true },
-        // Every message that Drinky wrote for the user reports in this color.
         .{ .kind = .user_note, .notice = .user_note },
         .{ .kind = .event, .notice = .accent },
         .{ .kind = .event, .options = .{ .is_warning = true }, .notice = .warning },
@@ -868,7 +645,6 @@ test "each block kind pins the role that it paints" {
         .{ .kind = .user, .box = .user },
         .{ .kind = .tool_result, .box = .tool_success },
         .{ .kind = .tool_result, .options = .{ .is_error = true }, .box = .tool_error },
-        // Reasoning and a reply paint markdown, which owns its own colors.
         .{ .kind = .thinking },
         .{ .kind = .model },
     };
@@ -889,9 +665,6 @@ test "each block kind pins the role that it paints" {
     try std.testing.expectEqual(std.enums.values(Entry.Kind).len, seen.count());
 }
 
-// The intro block paints the shared caption: the accent title, then the muted
-// legend. A narrow window splits the legend under the title, and the block still
-// counts exactly the rows it paints.
 test "the intro block paints the Drinky caption" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -921,14 +694,9 @@ test "the intro block paints the Drinky caption" {
     try std.testing.expect(std.mem.indexOf(u8, painted, "\x1b[1m") == null);
     try std.testing.expect(std.mem.indexOf(u8, painted, legend) != null);
 
-    // A window narrower than the joined row splits the legend under the title.
     try std.testing.expectEqual(@as(usize, 3), intro.rows(14));
 }
 
-// A symbol identifies a notice when its color is unavailable in copied text: an
-// event opens on the information symbol, a warning or a failed event on the
-// warning symbol, and a line that Drinky wrote for the user on the arrow. Each
-// symbol paints in the role of its notice, so the row reads as one.
 test "each notice paints the symbol of its kind in its role" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -978,26 +746,18 @@ test "each notice paints the symbol of its kind in its role" {
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, painted, "→ "));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, painted, error_sequence));
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, painted, warning_sequence));
-    // The label of an event went with the color, so no row names one.
     try std.testing.expect(std.mem.indexOf(u8, painted, "Event: ") == null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "Error: ") == null);
 }
 
-// One event that repeats states its count in its own text, so the count of the
-// block and the text of the block cannot come apart. The suffix of a count
-// takes the place of the one before it, and a count that takes one digit more
-// leaves no remainder of the shorter one.
 test "a repeated event states one count and matches its own text" {
     const gpa = std.testing.allocator;
     var entry = try Entry.init(gpa, .event, .{ .is_error = true }, "no route to host");
     defer entry.deinit(gpa);
 
     try std.testing.expect(entry.statesEvent(.{ .is_error = true }, "no route to host"));
-    // Every flag of the event takes part, so a mirrored event and a terminal
-    // event never share a block.
     try std.testing.expect(!entry.statesEvent(.{ .is_error = true, .mirrored = false }, "no route to host"));
     try std.testing.expect(!entry.statesEvent(.{ .is_error = true, .is_warning = true }, "no route to host"));
-    // Two events with another ownership cannot collapse into one block either.
     try std.testing.expect(!entry.statesEvent(.{ .is_error = true, .turn_owned = true }, "no route to host"));
     try std.testing.expect(!entry.statesEvent(.{}, "no route to host"));
     try std.testing.expect(!entry.statesEvent(.{ .is_error = true }, "other"));
@@ -1011,10 +771,6 @@ test "a repeated event states one count and matches its own text" {
     try std.testing.expect(entry.statesEvent(.{ .is_error = true }, "no route to host"));
 }
 
-// Bounded memory: a clipped block composes only its visible rows into a frame
-// warmed to the block's full size. The smaller clip reuses the warmed buffers
-// with no allocation and never materializes its hidden top. The visible rows
-// carry markdown, so the renderer's own paths run under the armed allocator too.
 test "a clipped block streams into a warmed frame without allocating" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     const gpa = failing.allocator();
@@ -1032,7 +788,6 @@ test "a clipped block streams into a warmed frame without allocating" {
     defer entry.cache.deinit(gpa);
     const columns = 20;
 
-    // Warm both frames and the output at the block's full size.
     for (0..2) |_| {
         const sink = try view.beginFrame(.{ .columns = columns, .rows = 100 }, 8);
         const placement: paint.Placement = .{
@@ -1045,14 +800,9 @@ test "a clipped block streams into a warmed frame without allocating" {
         try entry.render(gpa, &placement);
         try view.render();
     }
-    // The window holds no whole block here, so the block retains no rows. The
-    // clipped paint below then runs the renderer, not a replay.
     entry.release(gpa);
-    // Drop the accumulated output so the arm measures only the clipped render.
-    // Its bytes fit the buffer the full-size warm already grew.
     out.clearRetainingCapacity();
 
-    // Arm: any further allocation or growth now fails.
     failing.fail_index = failing.alloc_index;
     failing.resize_fail_index = failing.resize_index;
 
@@ -1067,7 +817,6 @@ test "a clipped block streams into a warmed frame without allocating" {
     try entry.render(gpa, &placement);
     try view.render();
 
-    // The paint emits only the visible rows. The clipped top never materializes.
     const painted = out.written();
     try std.testing.expect(std.mem.indexOf(u8, painted, "L30") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "L59") != null);

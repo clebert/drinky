@@ -1,17 +1,8 @@
-//! Walks a directory tree and collects the regular files whose base-relative
-//! path matches a glob. Skips noise directories: version-control stores,
-//! dependency directories, and build caches. A base whose final non-dot
-//! component names a noise directory turns the filter off. An explicit search
-//! then sees every file. Shared by the `find` and `grep` tools, which give the
-//! walk the timer of their search, so a walk that runs too long stops itself
-//! and keeps the matches it found.
-
 const std = @import("std");
 
 const glob = @import("glob.zig");
 const search = @import("search.zig");
 
-/// Version-control stores are noise, but an empty search never suggests them.
 const version_control_directories = [_][]const u8{
     ".bzr",
     ".git",
@@ -24,11 +15,7 @@ const version_control_directories = [_][]const u8{
     "_darcs",
 };
 
-/// The directory names that a walk skips. They hold generated or vendored
-/// files in bulk, so a walk inside them burns time and rarely serves a search.
-/// The list favors a missed optimization over hidden source files.
 const noise_directories = version_control_directories ++ [_][]const u8{
-    // Dependency directories and virtual environments.
     ".dart_tool",
     ".direnv",
     ".pnpm-store",
@@ -39,7 +26,6 @@ const noise_directories = version_control_directories ++ [_][]const u8{
     "node_modules",
     "venv",
     "web_modules",
-    // Build outputs and tool caches.
     ".aws-sam",
     ".build",
     ".cache",
@@ -77,47 +63,28 @@ const noise_directories = version_control_directories ++ [_][]const u8{
     "zig-out",
 };
 
-/// The hard cap on entries examined per walk, so a huge tree cannot make
-/// traversal run unbounded. Real repositories never reach it.
 const entries_visited_max = 1_000_000;
 const skipped_noise_names_max = 3;
 
-/// The bounds and match query for one directory walk.
 pub const Options = struct {
     base: []const u8,
     pattern: []const u8,
     retain: usize,
     entries_max: usize = entries_visited_max,
-    /// The wall-clock timer of the search, or null when `entries_max` alone
-    /// bounds the walk. The walk checks this timeout after filesystem steps. A
-    /// stopped walk reports the bound and keeps the matches that it found.
     timer: ?search.Timer = null,
 };
 
 const NoisePruning = enum { disabled, enabled };
 
-/// The matches a walk retained. The caller's `gpa` owns them.
 pub const Match = struct {
-    /// The lexicographically-smallest matches, sorted ascending, at most
-    /// `retain` of them.
     paths: [][]const u8,
-    /// The total matches seen. This is a lower bound when a bound stopped the
-    /// walk, since the walk ended early. `matched > paths.len` means the walk
-    /// found matches that it did not retain.
     matched: usize,
-    /// What ended the walk. A walk that a bound stopped leaves `paths` dependent
-    /// on filesystem enumeration order, so its result is incomplete.
     stop: Stop,
-    /// The reportable noise directory names that this walk skipped.
     skipped_noise: SkippedNoise,
 
-    /// What ended one walk.
     pub const Stop = enum {
-        /// The walk exhausted the tree, so it retained every match it could.
         none,
-        /// The walk reached its entry-visit cap (`entries_max`).
         entries,
-        /// The search ran out of time.
         time,
     };
 
@@ -176,18 +143,7 @@ pub const Match = struct {
     }
 };
 
-/// The lexicographically-smallest matches under `options.base` whose
-/// base-relative path matches `options.pattern`, sorted, each relative to the
-/// working directory. `options.retain` bounds memory, and
-/// `options.entries_max` bounds the entries processed. `options.timer` adds a
-/// timeout. A walk that reaches either bound returns the matches it retained
-/// and names the bound. The walk skips unreadable directories.
-/// Cancellation stops the walk at once. Every exit releases every directory
-/// handle and retained path.
 pub fn collect(io: std.Io, gpa: std.mem.Allocator, options: *const Options) !Match {
-    // A base that ends in a noise name aims the walk inside that directory.
-    // Disable pruning because package managers can nest one noise directory
-    // inside another.
     const noise_pruning: NoisePruning = if (baseNamesNoise(options.base)) .disabled else .enabled;
     return collectWithNoisePruning(io, gpa, options, noise_pruning);
 }
@@ -203,9 +159,6 @@ fn collectWithNoisePruning(
 
     var walker = try dir.walkSelectively(gpa);
     defer walker.deinit();
-    // Release directory handles still open on the walker stack on every exit.
-    // `deinit` frees its memory but not its handles. `leave` never closes the
-    // base directory, which `dir` closes on return.
     defer while (walker.stack.items.len > 0) walker.leave(io);
 
     var keeper: Keeper = .{ .retain = options.retain };
@@ -220,24 +173,13 @@ fn collectWithNoisePruning(
     var stop: Match.Stop = .none;
     while (true) {
         const entry = (walker.next(io) catch |err| switch (err) {
-            // Cancellation aborts the turn, so stop the walk at once. An
-            // allocation failure can happen after the iterator consumed an
-            // entry without closing its directory, so it must also propagate
-            // instead of bypassing every bound through repeated failures. Any
-            // other iteration error skips the bad directory (the walker has
-            // already closed it) and keeps the walk resilient.
             error.Canceled, error.OutOfMemory => return err,
             else => continue,
         }) orelse break;
-        // Stop only once a further entry proves the tree is not exhausted. The
-        // walk then does not falsely flag a tree with exactly `entries_max`
-        // entries.
         if (visited >= options.entries_max) {
             stop = .entries;
             break;
         }
-        // Preserve the first entry even when the clock is already spent, so a
-        // stopped search still retains evidence.
         const out_of_time = visited > 0 and if (options.timer) |timer| timer.spent() else false;
         if (out_of_time) {
             stop = .time;
@@ -249,7 +191,6 @@ fn collectWithNoisePruning(
                 if (noise_pruning == .enabled) {
                     const maybe_noise_index = noiseIndex(entry.basename);
                     if (maybe_noise_index) |noise_index| {
-                        // Version-control entries form a silent prefix in noise_directories.
                         if (noise_index >= version_control_directories.len) {
                             noise_skipped[noise_index] = true;
                         }
@@ -257,8 +198,6 @@ fn collectWithNoisePruning(
                     }
                 }
                 walker.enter(io, entry) catch |err| switch (err) {
-                    // The walker can allocate while it adds this directory to
-                    // its stack. Never turn that failure into a skipped tree.
                     error.Canceled, error.OutOfMemory => return err,
                     else => {},
                 };
@@ -286,17 +225,11 @@ fn collectWithNoisePruning(
     };
 }
 
-/// Retains the lexicographically-smallest `retain` paths offered to it and
-/// counts every path offered. Frees larger paths as it evicts them. Grows
-/// lazily to at most `retain` entries, so the caller's result size, not the
-/// tree size, bounds memory.
 const Keeper = struct {
     heap: Heap = .empty,
     retain: usize,
     matched: usize = 0,
 
-    // A max-heap keyed on the path, so the root is the largest retained path.
-    // The root is the eviction candidate when a smaller match arrives.
     const Heap = std.PriorityQueue([]const u8, void, greater);
 
     fn greater(_: void, a: []const u8, b: []const u8) std.math.Order {
@@ -319,13 +252,10 @@ const Keeper = struct {
             const owned = try gpa.dupe(u8, path);
             errdefer gpa.free(owned);
             gpa.free(self.heap.pop().?);
-            // The pop kept capacity, so this push cannot allocate or fail.
             try self.heap.push(gpa, owned);
         }
     }
 
-    // Transfers the retained paths into a fresh, exactly-sized, sorted slice and
-    // frees the heap's backing array (not the paths, whose ownership moves).
     fn toOwnedSorted(self: *Keeper, gpa: std.mem.Allocator) ![][]const u8 {
         const result = try gpa.alloc([]const u8, self.heap.count());
         @memcpy(result, self.heap.items);
@@ -346,8 +276,6 @@ fn isNoise(basename: []const u8) bool {
     return noiseIndex(basename) != null;
 }
 
-/// Whether the final nonempty, non-dot segment of `base` is a noise name.
-/// Such a base explicitly selects the noise directory.
 fn baseNamesNoise(base: []const u8) bool {
     var basename: []const u8 = "";
     var segments = std.mem.splitScalar(u8, base, '/');
@@ -361,13 +289,6 @@ fn lessThan(_: void, a: []const u8, b: []const u8) bool {
     return std.mem.lessThan(u8, a, b);
 }
 
-// Wraps a real io. It fails one directory syscall once (cancellation is
-// one-shot), then counts the traversal opens and reads that follow. The
-// open/close balance proves the walk released every opened handle.
-//
-// `io` replaces the backend userdata with this double, so only the vtable
-// functions overridden below are safe to call. A test that needs another one
-// adds a delegating proxy for it.
 const FaultyIo = struct {
     backend: std.Io,
     vtable: std.Io.VTable,
@@ -378,14 +299,8 @@ const FaultyIo = struct {
     traversal_after_inject: usize = 0,
     open_handles: usize = 0,
 
-    // Which syscall to fail. This exercises each production cancellation site:
-    // the `enter` open and the `next` read.
     const Trigger = union(enum) {
-        // Fail the Nth `dirOpenDir` (1-based). The base opens first, so 2 is
-        // the first entered subdirectory.
         open_call: usize,
-        // Fail the first `dirRead` taken once at least this many directories
-        // are open, that is, a read inside an entered subdirectory.
         subdir_read: usize,
     };
 
@@ -465,8 +380,6 @@ test "collect stops walking when an entered directory is canceled" {
         .inject = error.Canceled,
     });
 
-    // The leak-detecting allocator also proves the cancel path frees every
-    // retained path and the walker's memory.
     try std.testing.expectError(error.Canceled, collect(
         faulty.io(),
         std.testing.allocator,
@@ -512,8 +425,6 @@ test "collect skips an unreadable directory and keeps walking" {
     try std.testing.expectEqual(@as(usize, 0), faulty.open_handles);
 }
 
-// The walker allocates after it consumes a directory entry. An allocation
-// failure must propagate, or repeated failures can bypass both walk bounds.
 test "collect propagates an allocation failure from the walker" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -522,8 +433,6 @@ test "collect propagates an allocation failure from the walker" {
     var base_buf: [128]u8 = undefined;
     const base = try std.fmt.bufPrint(&base_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
 
-    // The walker's stack takes the first allocation. Its path buffer takes the
-    // second allocation, after the iterator consumed `one.txt`.
     var failing: std.testing.FailingAllocator =
         .init(std.testing.allocator, .{ .fail_index = 1 });
     try std.testing.expectError(error.OutOfMemory, collect(
@@ -547,8 +456,6 @@ fn collectUnderAllocationFailure(
     defer matches.deinit(gpa);
 }
 
-// A deep tree forces the walker to grow its directory stack in `enter`. Every
-// allocation failure must propagate and release all open directories.
 test "collect propagates every allocation failure from a deep walk" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -628,8 +535,6 @@ test "collect stops at the entry-visit work cap" {
     try std.testing.expect(matches.paths.len <= 10);
 }
 
-// The walk polls the search timer after each step. It keeps the matches found
-// before the clock stops a further step.
 test "collect stops when the search runs out of time" {
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
@@ -640,8 +545,6 @@ test "collect stops when the search runs out of time" {
     var base_buf: [128]u8 = undefined;
     const base = try std.fmt.bufPrint(&base_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
 
-    // A search that started a whole timeout ago is out of time at its first
-    // check. The walk still takes one step, so it stops on the second entry.
     var matches = try collect(io, std.testing.allocator, &.{
         .base = base,
         .pattern = "**",
@@ -654,8 +557,6 @@ test "collect stops when the search runs out of time" {
     try std.testing.expect(matches.matched < 200);
 }
 
-// A walk of one entry alone read the whole tree, so no bound stopped it. A stop
-// states that a further entry waited, and a spent clock cannot invent one.
 test "collect reports no stop for a tree it read whole" {
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
@@ -767,7 +668,6 @@ test "collect keeps nested noise visible when the base names noise" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // A pnpm-style layout nests node_modules inside the named base.
     var pkg = try tmp.dir.createDirPathOpen(io, "node_modules/node_modules/pkg", .{});
     defer pkg.close(io);
     try pkg.writeFile(io, .{ .sub_path = "index.js", .data = "hit\n" });

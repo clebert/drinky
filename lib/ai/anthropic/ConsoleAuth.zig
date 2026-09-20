@@ -1,9 +1,3 @@
-//! The credential lifecycle for the Anthropic Console account: the shared
-//! `auth` login and store instantiated over `console`'s protocol for the
-//! `"anthropic-api"` entry in `<home>/.drinky/auth.json`. The login mints an
-//! API key and stores it. The key needs no refresh, so there is no
-//! `accessToken`: `apiKey` returns the stored key for the `x-api-key` header.
-
 const std = @import("std");
 
 const auth = @import("../auth.zig");
@@ -16,7 +10,6 @@ const console = @import("console.zig");
 
 const ConsoleAuth = @This();
 
-/// The top-level key this account's credential lives under in `auth.json`.
 const account_key = llm.Account.anthropic_api.id();
 
 gpa: std.mem.Allocator,
@@ -24,8 +17,6 @@ io: std.Io,
 timeouts: net.Timeouts,
 path: []const u8,
 tokens: ?console.Tokens,
-/// Where the key in memory stands against the store. A minted key never
-/// refreshes, so only a reread of the store retries a pending save here.
 persistence: auth.Persistence = .saved,
 
 pub fn init(
@@ -43,33 +34,23 @@ pub fn deinit(self: *ConsoleAuth) void {
     self.gpa.free(self.path);
 }
 
-/// Load the stored key. The call returns false when the file is absent or holds
-/// no Anthropic Console credential.
 pub fn load(self: *ConsoleAuth) !bool {
     return auth.load(self, account_key);
 }
 
-/// Settle the key on the open store `maybe_file`, or on an absent store
-/// when null, so a change in another instance shows here. The call reports
-/// what changed.
 pub fn reread(self: *ConsoleAuth, maybe_file: ?*const json_store.File) !auth.Change {
     return auth.reread(self, account_key, maybe_file);
 }
 
-/// The stored API key for the `x-api-key` header, or null when signed out.
 pub fn apiKey(self: *const ConsoleAuth) ?[]const u8 {
     const tokens = self.tokens orelse return null;
     return tokens.api_key;
 }
 
-/// Run the interactive OAuth login, mint the API key, and return the committed
-/// credential's persistence outcome for the caller to present.
 pub fn login(self: *ConsoleAuth, prompt: anytype) !auth.Login {
     return auth.login(self, account_key, console, prompt, exchangeRedirect);
 }
 
-/// `console.exchange` over the received redirect. The verifier doubles as
-/// `state`. A mismatch means the redirect is not ours.
 fn exchangeRedirect(
     self: *ConsoleAuth,
     redirect: *const oauth_callback.Redirect,
@@ -84,8 +65,6 @@ fn exchangeRedirect(
     });
 }
 
-/// Drop this account's credential: clear the in-memory key and remove its entry
-/// from `auth.json`. The removal preserves every other account's entry.
 pub fn logout(self: *ConsoleAuth) !void {
     return auth.logout(self, account_key);
 }

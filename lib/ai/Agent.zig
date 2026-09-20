@@ -1,9 +1,3 @@
-//! Drives one user turn to completion. It appends the message, streams the
-//! reply, runs the requested tools, and feeds the results back. It repeats
-//! until the model asks for no more tools. Owns the conversation history.
-//! Talks to the model through a neutral `provider.Client` and delegates
-//! presentation to a handler.
-
 const std = @import("std");
 
 const llm = @import("llm.zig");
@@ -16,119 +10,45 @@ const tool = @import("tool/root.zig");
 
 const Agent = @This();
 
-/// The placeholder shown for a redacted reasoning block (its content is encrypted).
 const redacted_notice = "[redacted thinking]";
-/// The per-reply bound on complete tool calls. A call past this bound aborts the stream.
 pub const tool_calls_max: usize = 64;
-/// The bound on read-only calls of one reply that run at a time. Each running
-/// call holds one thread, so a burst runs in batches of this size and never
-/// spawns one thread per call. The process executor sets no limit of its own,
-/// and a limit there fails a call past it instead of holding it back.
 const read_only_calls_max: usize = 32;
 
-/// The conservative content for a reserved tool-result slot whose real result
-/// never arrived. It does not claim the call never started. One wording covers a
-/// call that was not started, was interrupted, raised without a result, or
-/// changed the world and then recorded no result. Stored without an `Error:`
-/// prefix, which the OpenAI serializer adds for error results. The consumer
-/// shows the same wording for the call it fails, so the transcript and the
-/// history cannot drift.
 pub const unfinished_tool_result =
     "The tool stopped before Drinky recorded a result. " ++
     "Drinky does not know if the tool changed the system.";
 
 gpa: std.mem.Allocator,
 io: std.Io,
-/// Each bash command inherits this process environment. The host owns it for the session.
 environ: std.process.Environ,
-/// The active account's transport, or null while signed out. The app refuses to
-/// start a turn while signed out, so the internal uses assume one.
 client: ?provider.Client,
 model: ?Model,
 system: []const u8,
 effort: llm.Effort,
 retry: net.Retry,
-/// The per-turn bound on tool rounds. It is a guard against a runaway loop, not
-/// a budget. A long task must never reach it. The user cancels a turn with Esc,
-/// and a real loop grows the prompt until it hits the context limit first.
 rounds_max: usize = 1000,
-/// Bounds the bash tool's output window and runtime, handed to every tool call.
 bash: tool.Context.Bash,
-/// What the `describe_drinky` tool returns. The host owns the text and keeps it
-/// alive for the session. An empty document means the host describes nothing.
 document: []const u8,
-/// The path-triggered skill rules, handed to every tool call. The host owns the
-/// guard and keeps it alive for the session. Null means the host applies no
-/// rule. The loaded skills belong to the conversation, so a reset forgets them.
 skill_guard: ?*tool.SkillGuard,
 items: std.ArrayList(llm.Item),
 stats: Stats,
-/// The context that the last committed reply measured, with the setup that
-/// produced it. Null means no measurement describes the current history.
 measured_context: ?MeasuredContext,
-/// Steering messages the user submitted mid-turn, drained into the running turn
-/// at each round boundary. Thread-safe: the UI thread pushes, and the worker takes.
 steering: Steering,
-/// The stable per-conversation prompt-cache routing key (used by OpenAI). Every
-/// turn shares it until a deliberate reset rotates it.
 cache_key: [32]u8,
 
-/// The cumulative session cost, the two gauge measurements, the latest
-/// subscription allowance, and the latest credit pool. Each message is priced
-/// against the model that produced it, so the total stays correct across a
-/// mid-session `/model` switch. A plain value type: it copies whole across the
-/// UI channel.
 pub const Stats = struct {
-    /// The session cost of every reply Drinky could price: the charge a reply
-    /// reports, or else an estimate at public rates. The total stops at
-    /// `llm.amount_usd_max`, so a consumer can print it into a fixed buffer.
     cost: f64 = 0,
-    /// The conversation context that the last committed reply measured. Null
-    /// means no measurement describes the current history, or the way the next
-    /// request renders it. Empty history is 0.
     context_tokens: ?u64 = 0,
-    /// The prompt usage of the last request of this turn under the active cache
-    /// key. An all-zero prompt hides the cache rate, so a cleared value reads as
-    /// absent. A canceled attempt counts: its prompt was processed and billed.
-    /// A new turn drops it until this turn reports usage.
     cache_usage: llm.Usage = .{},
-    /// The active subscription account's remaining allowance. A response head
-    /// that carries one replaces it, and so does an xAI billing report after
-    /// each model reply. This includes a head whose stream then errors or is
-    /// canceled, so an exhausted 429 still updates it. A report that omits one
-    /// leaves it unchanged. The value is null until a report arrives. A new turn
-    /// drops it. An account switch clears it. API-key accounts report none.
     quota: ?llm.Quota = null,
-    /// The monotonic milliseconds at which a report last stated `quota`, counted
-    /// on the clock that includes a suspended system, because a window runs on
-    /// the server while the machine sleeps. A window states its reset relative
-    /// to its own report, so a consumer subtracts this from its own reading of
-    /// that clock to show the wait that is left. A report that omits the
-    /// allowance leaves this alone, so a kept countdown keeps running down
-    /// instead of starting again. A new turn drops it with the allowance. It
-    /// travels with the stats, so a failed turn and a canceled turn both carry
-    /// the right age. The value is relative to this process alone, so a save
-    /// must drop it and a restart must read it as unknown.
     quota_seen_ms: i64 = 0,
-    /// The credit pool of an account that spends a prepaid pool, in USD.
-    /// Drinky reads the OpenRouter pool or the DeepSeek balance after each
-    /// model reply. A report that names none leaves it unchanged. The value is
-    /// null until a report arrives. A new turn drops it. An account switch
-    /// clears it.
     credits: ?llm.Credits = null,
 
-    /// Forget the allowance and the pool. Both hold what the last response of
-    /// one account reported, so an account event drops the pair and nothing
-    /// else. A live account states one of the two, never both.
     fn forgetBilling(self: *Stats) void {
         self.quota = null;
         self.credits = null;
     }
 
-    /// Forget the cache rate, the allowance, and the pool. A new turn must not
-    /// show the last turn, so it drops the three until this turn reports them.
-    /// The session cost and the context gauge stay, because they describe the
-    /// conversation.
     pub fn forgetTurnEvidence(self: *Stats) void {
         self.cache_usage = .{};
         self.quota_seen_ms = 0;
@@ -136,46 +56,28 @@ pub const Stats = struct {
     }
 };
 
-/// A reply that another model served than the request named. A provider can
-/// switch a flagged request to a fallback model, so the handler reports the
-/// switch instead of passing the reply off as the requested model's. The named
-/// fields keep the two confusable names apart at the call site. Both slices
-/// stay valid only for the duration of the callback.
 pub const ModelMismatch = struct {
     requested: []const u8,
     served: []const u8,
 };
 
-/// One retry that is about to start, with the cause that ended the prior
-/// attempt. The attempt number includes the initial request, so the first retry
-/// is attempt two. A response slice stays valid only for the callback.
 pub const RetryAttempt = struct {
     attempt: u32,
     cause: Cause,
 
     pub const Cause = union(enum) {
-        /// A local request or stream failure. The error name identifies it.
         failure: anyerror,
-        /// The error text from a provider response head or stream.
         response: []const u8,
     };
 };
 
-/// The receipt of one turn: the history span it produced, how far steering
-/// commitment advanced, and whether a committed reply was cut short. Owns no
-/// memory and stays valid only until another turn mutates the agent history.
 pub const Receipt = struct {
     history_base: usize,
     history_end: usize,
     steering_committed_count: usize,
-    /// A reply this turn committed stopped at the provider's output or context
-    /// limit. The answer stands as authoritative but is incomplete. The
-    /// presentation layer says so and does not pass it off as a full reply.
     truncated: bool = false,
 };
 
-/// A turn's outcome: its receipt plus how the turn ended. The receipt is always
-/// present, so a receipt is never lost through an error union.
 pub const Outcome = struct {
     receipt: Receipt,
     disposition: Disposition,
@@ -183,60 +85,36 @@ pub const Outcome = struct {
     pub const Disposition = union(enum) {
         completed,
         canceled,
-        /// The presentation callback's event channel closed during the turn.
         closed,
-        /// A store reload selected a credential for a different principal.
         credential_replaced,
-        /// The provider rejected the selected client's refresh credential.
         credential_rejected,
         failed: anyerror,
     };
 };
 
-/// One measurement of the conversation context, with the request setup that
-/// produced it. A later request renders the same history to the same tokens
-/// only while the setup holds, so the gauge judges the measurement against it.
 const MeasuredContext = struct {
-    /// The whole prompt of the measuring request plus the output it produced.
     tokens: u64,
-    /// The model the request named. A tokenizer belongs to its model. The name
-    /// is copied, because a model outlives no catalog refresh.
     model: Model,
-    /// The account that rendered the request. It selects account-specific system
-    /// blocks and stored reasoning proofs.
     account: llm.Account,
-    /// The control the request rendered. It decides the replay for Anthropic.
     reasoning: llm.Request.Reasoning,
 };
 
-/// The turn transaction's private bookkeeping. It holds the pre-turn history
-/// length, the latest replay-valid checkpoint an abnormal exit rolls back to,
-/// and the counts and flags surfaced in the receipt. It also retains (and owns)
-/// a consumed-but-uncommitted steering batch until its following reply commits.
 const TurnState = struct {
     base: usize,
     checkpoint: usize,
     steering_committed_count: usize = 0,
     truncated: bool = false,
     pending_steering: ?[][]u8 = null,
-    /// The measurement of the latest reply, held until that reply commits. A
-    /// reply that never commits is rolled back, so its measurement must not
-    /// reach the gauge.
     pending_context: ?MeasuredContext = null,
     presentation_closed: bool = false,
 };
 
-/// One scheduled tool call. The concurrent runner writes `result`. The collector
-/// moves it into the reserved history slot once the task has finished.
 const Call = struct {
     id: []const u8,
     name: []const u8,
     input_json: []const u8,
-    /// The index in `Agent.items` of this call's reserved `tool_result` slot.
     result_index: usize = 0,
     result: State = .pending,
-    /// Whether the real result has replaced the reserved slot's unfinished-call
-    /// content, so a later harvest or collection does not move it twice.
     moved: bool = false,
 
     const State = union(enum) {
@@ -254,8 +132,6 @@ const Call = struct {
     }
 };
 
-/// The production fetch: `provider.Client.send` on the active account. A seam
-/// like `runToolsWith`'s `Dispatch`, so tests can script whole turns.
 const ClientFetch = struct {
     client: *provider.Client,
 
@@ -278,9 +154,6 @@ const ClientFetch = struct {
     }
 };
 
-/// Duplicate one complete borrowed assistant output into the history shape and
-/// bind a reasoning proof to the exact producing account. This is the sole
-/// ownership boundary for provider output strings.
 fn dupeOutput(
     gpa: std.mem.Allocator,
     account: llm.Account,
@@ -318,8 +191,6 @@ fn dupeOutput(
     };
 }
 
-/// Whether `bytes` is a valid top-level JSON object. A parse failure is not
-/// valid. Only an allocation failure propagates.
 fn objectJsonValid(gpa: std.mem.Allocator, bytes: []const u8) !bool {
     var parsed = std.json.parseFromSlice(std.json.Value, gpa, bytes, .{}) catch |err|
         switch (err) {
@@ -371,8 +242,6 @@ pub fn deinit(self: *Agent) void {
     self.steering.deinit();
 }
 
-/// Start a fresh conversation and keep its account, model, and configuration.
-/// Call this only between turns, when no worker can own history or steering.
 pub fn resetConversation(self: *Agent) void {
     self.rollback(0);
     self.stats = .{};
@@ -381,11 +250,6 @@ pub fn resetConversation(self: *Agent) void {
     self.cache_key = generateCacheKey(self.io);
 }
 
-/// Switch the account and the model together, effective on the next turn. The
-/// client carries both the transport and the reasoning-replay account, so the
-/// pair is one atomic step. A model is never paired with a foreign vendor's
-/// client. History is untouched. The new account drops reasoning it did not
-/// produce.
 pub fn switchTo(self: *Agent, client: provider.Client, model: ?Model) void {
     const account_changed = if (self.client) |active|
         active.account() != client.account()
@@ -397,23 +261,11 @@ pub fn switchTo(self: *Agent, client: provider.Client, model: ?Model) void {
         model != null;
     self.client = client;
     self.model = model;
-    // Session totals span account switches, but a point-in-time billing report
-    // must not.
     if (account_changed) self.stats.forgetBilling();
-    // The provider isolates a cache per principal, and it keys the entry on the
-    // rendered model too, so either change makes the measured rate foreign. A
-    // replaced description keeps the name and can still render another
-    // reasoning control, so the comparison reads every described part.
     if (account_changed or model_changed) self.stats.cache_usage = .{};
-    // The context gauge judges its own measurement against the new setup, so a
-    // switch back to the measured setup shows the count again.
     self.refreshContext();
 }
 
-/// Drop the active account and leave the agent signed out. `model` is kept as
-/// the last-shown value. The account-specific allowance, pool, and cache rate
-/// are forgotten. The context gauge stands, because a signed-out Drinky sends
-/// no request that renders the history in another way.
 pub fn signOut(self: *Agent) void {
     self.client = null;
     self.stats.forgetBilling();
@@ -421,20 +273,8 @@ pub fn signOut(self: *Agent) void {
     self.refreshContext();
 }
 
-/// Forget everything bound to the provider principal behind `account`: its
-/// replay proofs, its cache rate, and its allowance gauge. A credential
-/// replacement can put another principal in the same account slot, and none of
-/// this state crosses that boundary. The account itself stays authenticated,
-/// so a caller that drops the account calls `signOut` or `switchTo` as well.
-///
-/// The context gauge keys on the account slot, which is not the principal. The
-/// next principal renders the same prompt bytes today, so a dropped proof is
-/// the only thing that voids the measurement here. Metadata of a principal that
-/// ever reaches the prompt must void it here too.
 pub fn dropAccountEvidence(self: *Agent, account: llm.Account) void {
     self.dropReasoning(account);
-    // The billing reports and the cache rate hold what the last response of
-    // the active account reported, so only that account can own them.
     const client = self.client orelse return;
     if (client.account() == account) {
         self.stats.forgetBilling();
@@ -442,9 +282,6 @@ pub fn dropAccountEvidence(self: *Agent, account: llm.Account) void {
     }
 }
 
-/// How many items before `index` hold a replay proof of `account`.
-/// `dropAccountEvidence` removes them, so a position at `index` moves up by this
-/// count. The caller keeps `index` within the history.
 pub fn producedBefore(self: *const Agent, account: llm.Account, index: usize) usize {
     std.debug.assert(index <= self.items.items.len);
     var count: usize = 0;
@@ -458,23 +295,11 @@ pub fn producedBefore(self: *const Agent, account: llm.Account, index: usize) us
     return count;
 }
 
-/// The bounds of one turn in the history. The named fields keep the two
-/// confusable positions apart at the call site.
 pub const HistorySpan = struct {
-    /// The history length before the turn appended its first message.
     base: usize,
-    /// The history length after the turn, which must still be the whole history.
     end: usize,
 };
 
-/// Remove one canceled turn from the history: every item from `span.base` on.
-/// The history must end at `span.end` still. The caller keeps the span true
-/// through every change of the history, so a span that moved is a programming
-/// error. Call this only between turns, when no worker can own the history. The
-/// removed replies measured the context, so the measurement goes with them, and
-/// the guard searches the shortened history again for its skill proofs. The
-/// session cost, the billing reports, and the cache key stay, because a provider
-/// billed the removed work.
 pub fn rewindHistory(self: *Agent, span: HistorySpan) void {
     std.debug.assert(span.base <= span.end);
     std.debug.assert(span.end == self.items.items.len);
@@ -483,10 +308,6 @@ pub fn rewindHistory(self: *Agent, span: HistorySpan) void {
     self.refreshContext();
 }
 
-/// Remove replay proofs produced by one account slot. A successful credential
-/// replacement calls this before that slot can represent another principal. A
-/// dropped proof shortens the history, so the measured context no longer
-/// describes it.
 fn dropReasoning(self: *Agent, account: llm.Account) void {
     const previous_count = self.items.items.len;
     var retained_count: usize = 0;
@@ -509,61 +330,28 @@ fn dropReasoning(self: *Agent, account: llm.Account) void {
     }
 }
 
-/// Switch the reasoning-effort level. It takes effect on the next turn.
 pub fn setEffort(self: *Agent, effort: llm.Effort) void {
-    // Anthropic renders `output_config.effort` into the prompt and states that
-    // a change always invalidates the cached message blocks. Two levels that
-    // fold onto one wire form render the same bytes, so they share one cache
-    // and the rate survives.
     if (self.model) |model| {
         const rendered_before = model.reasoning(self.effort);
         const rendered_after = model.reasoning(effort);
         if (!rendered_before.eql(rendered_after)) self.stats.cache_usage = .{};
     }
     self.effort = effort;
-    // The same history renders to the same tokens, unless the new effort takes
-    // the stored reasoning out of the prompt or puts it back.
     self.refreshContext();
 }
 
-/// Publish the measurement to the context gauge, or hide it while the next
-/// request renders the measured history in another way.
-///
-/// The gauge is a cache of `contextShown`, because `Stats` copies whole across
-/// the UI channel. Every change of the history, the measurement, or the request
-/// setup calls this, so the two never disagree. A new mutation point must call
-/// it too.
 fn refreshContext(self: *Agent) void {
     self.stats.context_tokens = self.contextShown();
 }
 
-/// The context the gauge shows. Empty history holds exactly zero tokens,
-/// measured or not. A measurement holds while the next request renders the same
-/// prompt around the same history. Anything else returns null, because Drinky
-/// counts no token itself.
 fn contextShown(self: *const Agent) ?u64 {
     if (self.items.items.len == 0) return 0;
     const measured = self.measured_context orelse return null;
-    // A tokenizer belongs to its model. Anthropic states that its models from
-    // 4.7 on count the same text about 30 percent higher.
-    // Without a model no request goes out, so nothing states how this history
-    // renders.
     const model = self.model orelse return null;
     if (!measured.model.sameName(model.name())) return null;
-    // A signed-out Drinky sends nothing, so no request renders this history
-    // differently. The next account decides that.
     const client = self.client orelse return measured.tokens;
     const account = client.account();
-    // The count covers the whole prompt: the system blocks, the tools, the
-    // history, and the output. The account renders all of that around the
-    // history. It decides which stored proofs replay, and an Anthropic
-    // subscription or Console request also leads with the Claude Code identity
-    // that an API key omits. So another account states another number.
     if (account != measured.account) return null;
-    // One account is left, and only the rendered reasoning control can still
-    // move a proof. Anthropic drops every thinking block unless the request
-    // names an effort, so a model change that flips the replay takes each proof
-    // of this account out of the prompt, or puts it back.
     const reasoning = model.reasoning(self.effort);
     const vendor = account.provider();
     if (reasoning.replaysReasoning(vendor) == measured.reasoning.replaysReasoning(vendor))
@@ -571,12 +359,6 @@ fn contextShown(self: *const Agent) ?u64 {
     return if (self.holdsProofOf(account)) null else measured.tokens;
 }
 
-/// Whether the history holds one stored reasoning proof of `account`. Only such
-/// a proof can enter or leave the prompt of that account.
-///
-/// A serializer also drops an incomplete proof. This scan does not repeat that
-/// test, because `dupeOutput` refuses a reply whose proof is empty, so every
-/// stored proof is complete.
 fn holdsProofOf(self: *const Agent, account: llm.Account) bool {
     for (self.items.items) |item| {
         const reasoning = switch (item) {
@@ -588,10 +370,6 @@ fn holdsProofOf(self: *const Agent, account: llm.Account) bool {
     return false;
 }
 
-/// Run one user turn as a checkpointed transaction, stream output through
-/// `handler`, and return its outcome. Never returns an error: every exit yields
-/// a receipt, so a receipt is never lost through an error union. Signed out (a
-/// state the app refuses to start a turn in) yields a failed disposition.
 pub fn run(self: *Agent, user_text: []const u8, handler: anytype) Outcome {
     const base = self.items.items.len;
     if (self.client == null) return .{
@@ -606,7 +384,6 @@ pub fn run(self: *Agent, user_text: []const u8, handler: anytype) Outcome {
     return self.runTurn(&fetch, user_text, handler);
 }
 
-/// The error-returning seam for the reply/round-loop tests.
 fn runWith(self: *Agent, fetch: anytype, user_text: []const u8, handler: anytype) !void {
     return dispositionError(self.runTurn(fetch, user_text, handler).disposition);
 }
@@ -622,18 +399,10 @@ fn dispositionError(disposition: Outcome.Disposition) !void {
     };
 }
 
-/// Run one user turn as a checkpointed transaction and return its outcome. Every
-/// exit — completion, cancellation, channel close, or failure — yields a
-/// receipt. An abnormal exit does not unwind the whole turn. It rolls history
-/// back to the latest valid checkpoint and returns any consumed-but-uncommitted
-/// steering to the queue. The checkpoint retains every completed round and its
-/// tool results.
 fn runTurn(self: *Agent, fetch: anytype, user_text: []const u8, handler: anytype) Outcome {
     return self.runTurnWith(fetch, tool, user_text, handler);
 }
 
-/// `runTurn` with an injectable tool dispatch, so a test can drive the whole
-/// round loop against controllable fake tools rather than the real registry.
 fn runTurnWith(
     self: *Agent,
     fetch: anytype,
@@ -673,9 +442,6 @@ fn classifyDisposition(turn: *const TurnState, err: anyerror) Outcome.Dispositio
     };
 }
 
-/// Preserve callback error provenance in turn state. Only a presentation
-/// callback's channel closure is teardown. The same error from a tool or
-/// transport remains an ordinary failure.
 fn presentation(closed: *bool, result: anyerror!void) !void {
     result catch |err| {
         if (err == error.Closed) closed.* = true;
@@ -696,34 +462,16 @@ fn runRounds(
     while (round < self.rounds_max) : (round += 1) {
         const reply = try self.fetchReply(fetch, turn, handler);
         const ran_tools = try self.runToolsWith(Dispatch, reply, turn, handler);
-        // A no-tool reply commits here. A tool-calling reply committed itself
-        // together with its reserved results before dispatch.
         if (!ran_tools) try self.commitRound(turn, handler);
-        // Billing is a status-line number. It runs after the round commits, so
-        // a cancel cannot drop a finished reply, and tools never wait on the
-        // proxy. It runs before the skill drain, so a cancel has no uncommitted
-        // skill message to roll back. The next model request and the end of the
-        // turn still wait.
         try self.refreshQuota(fetch, turn, handler);
         try self.refreshCredits(fetch, turn, handler);
-        // Send every skill file that this round asked for, before the steering
-        // of the user. A tool met a file that a rule guards, so the model needs
-        // the rules of that file for whatever it does next.
         const loaded = try self.drainSkills(turn, handler);
-        // A reply that asks for no tool ends the turn, and a queued steering
-        // message stays for review. The user wrote it against a reply that was
-        // still streaming, so the finished reply can change what they want to
-        // send. A skill file keeps the turn alive, because it is guidance that
-        // Drinky owes the model before whatever the model does next.
         if (!ran_tools and !loaded) return;
-        // Fold mid-turn steering in before the next round.
         try self.drainSteering(turn, handler);
     }
     return error.TooManyToolRounds;
 }
 
-/// Roll an abnormally-ended turn back to its latest valid checkpoint and return
-/// the consumed-but-uncommitted steering batch to the queue. Allocation-free.
 fn rollbackTurn(self: *Agent, turn: *TurnState) void {
     self.rollback(turn.checkpoint);
     if (turn.pending_steering) |steering| {
@@ -733,21 +481,12 @@ fn rollbackTurn(self: *Agent, turn: *TurnState) void {
     }
 }
 
-/// Commit the latest round: advance the checkpoint, tell the handler, and
-/// publish the gauges when this commit adopted a new context measurement. The
-/// usage frame of a round arrives before its commit, so a gauge that waits for
-/// the next frame trails one committed reply for a whole round.
 fn commitRound(self: *Agent, turn: *TurnState, handler: anytype) !void {
     const measured = self.advanceCheckpoint(turn);
     notifyCheckpoint(handler);
     if (measured) try presentation(&turn.presentation_closed, handler.onUsage(self.stats));
 }
 
-/// Advance the checkpoint to commit the latest reply (and any reserved
-/// tool-result slots). The same advance commits the steering batch that preceded
-/// it, and the context that the reply measured. Returns whether it adopted a new
-/// measurement. The advance itself never fails, because a commit and the release
-/// of its steering batch must not come apart.
 fn advanceCheckpoint(self: *Agent, turn: *TurnState) bool {
     turn.checkpoint = self.items.items.len;
     const measured = turn.pending_context != null;
@@ -764,9 +503,6 @@ fn advanceCheckpoint(self: *Agent, turn: *TurnState) bool {
     return measured;
 }
 
-/// Tell presentation handlers that every event they accepted so far now belongs
-/// to committed history. Most agent tests use partial handlers and do not need
-/// this UI-specific frontier.
 fn notifyCheckpoint(handler: anytype) void {
     if (comptime @hasDecl(@TypeOf(handler.*), "onCheckpoint")) handler.onCheckpoint();
 }
@@ -776,18 +512,10 @@ fn freeSteeringBatch(gpa: std.mem.Allocator, batch: [][]u8) void {
     gpa.free(batch);
 }
 
-/// Deliver every skill file that the guard queued during this round, each as
-/// one user message. The message carries the whole skill file, so the guard
-/// proves it from the history alone on the next check. A rolled-back turn drops
-/// the message, and the next call that needs the skill queues it again.
-/// Returns whether anything was delivered.
 fn drainSkills(self: *Agent, turn: *TurnState, handler: anytype) !bool {
     const guard = self.skill_guard orelse return false;
     var delivered = false;
-    // One pass per rule at most, because a delivery leaves the queue.
     for (0..tool.SkillGuard.rules_max) |_| {
-        // The current history settles a queued rule whose proof arrived by
-        // another route, an earlier delivery of this pass included.
         const delivery = (try guard.takeQueued(self.gpa, self.io, self.items.items)) orelse break;
         defer self.gpa.free(delivery.text);
         try self.appendUser(delivery.text);
@@ -800,29 +528,17 @@ fn drainSkills(self: *Agent, turn: *TurnState, handler: anytype) !bool {
     return delivered;
 }
 
-/// Tell a presentation handler that one skill file entered the conversation.
-/// Most agent tests use partial handlers, so a handler without this callback
-/// still drives a turn.
 fn notifySkill(handler: anytype, skill: []const u8, source: []const u8) !void {
     if (comptime @hasDecl(@TypeOf(handler.*), "onSkillLoaded"))
         try handler.onSkillLoaded(skill, source);
 }
 
-/// Deliver every queued steering message as one combined user message, appended
-/// to history and reported. On success the taken batch is retained in turn state
-/// until its following reply commits. This lets an abnormal exit before then
-/// return it to the queue. A failed delivery returns it at once. The caller
-/// decides that the turn continues, so an empty queue is not an outcome it reads.
 fn drainSteering(self: *Agent, turn: *TurnState, handler: anytype) !void {
     var pending = try self.steering.take();
     if (pending.len == 0) {
         self.gpa.free(pending);
         return;
     }
-    // A failed delivery restores the whole batch ahead of messages submitted
-    // since the take. It does not allocate or expose a partial batch. The move
-    // below guards this: once turn state owns the batch, `rollbackTurn` restores
-    // it. A second restore hands the queue one batch under two owners.
     errdefer if (turn.pending_steering == null) self.steering.restoreTaken(&pending);
     const combined = try Steering.join(self.gpa, pending);
     defer self.gpa.free(combined);
@@ -832,18 +548,6 @@ fn drainSteering(self: *Agent, turn: *TurnState, handler: anytype) !void {
     turn.pending_steering = pending;
 }
 
-/// Stream one assistant reply and retry transient failures. Only whole
-/// requests are safe to retry, so a failed attempt's partial reply is discarded
-/// (history untouched). `handler.onStreamReset` clears partial output and reports
-/// the next attempt with its cause. Returns the reply's items, already appended
-/// to history. An API error is retried when its head or streamed event marks it
-/// transient and the retry policy allows another try (see `net.Retry.allows`). An
-/// exhausted or permanent error is reported through `handler.onError`. It surfaces
-/// as `error.ApiError`, which rolls the turn back to its latest checkpoint.
-///
-/// A head that rejects the credential takes one renewal and one repeat outside
-/// that policy, because another Drinky instance can have rotated the token this
-/// one holds. A renewal that changes nothing reports the failure as it stands.
 fn fetchReply(
     self: *Agent,
     fetch: anytype,
@@ -853,10 +557,6 @@ fn fetchReply(
     const model = self.model orelse return error.NoModel;
     const request: llm.Request = .{
         .model = model.name(),
-        // A provider that requires an output limit gets the one its own list
-        // stated. A model that states none takes the floor, which truncates a
-        // long reply, and `Model.outputLimitUnknown` marks such a model in a
-        // picker.
         .tokens_max = model.tokens_max orelse Model.tokens_max_fallback,
         .system = self.system,
         .items = self.items.items,
@@ -878,22 +578,10 @@ fn fetchReply(
             return err;
         };
         defer stream.deinit();
-        // The response head carries the subscription allowance before any events,
-        // so adopt it as soon as the stream is established. adoptQuota publishes
-        // the snapshot, so a 429 head shows a spent account before the failure.
-        // A stream that then errors, is canceled, or never reaches its terminal
-        // `.stop` still updates the gauge. A head that reports none leaves the
-        // last-known allowance. The stamp uses the clock the interface ages it
-        // against, so the countdown measures from this head and not from the
-        // terminal event of a long stream.
         const maybe_head = stream.quotaSoFar();
         if (maybe_head) |quota| try self.adoptQuota(quota, turn, handler);
 
         if (!stream.ok()) {
-            // The provider rejected the credential. Another instance can have
-            // rotated the token this one still holds, so renew it once and
-            // repeat the request. Nothing streamed yet, so the repeat loses no
-            // output.
             if (!renewed and stream.unauthorized()) {
                 renewed = true;
                 if (try fetch.renewCredential()) {
@@ -951,8 +639,6 @@ fn fetchReply(
                 return error.ApiError;
             },
             error.Canceled => {
-                // A cancel that interrupts the read before its terminal `.stop`
-                // still records whatever usage the provider delivered so far.
                 self.recordUsageSoFar(&model, &stream, &usage_recorded);
                 return err;
             },
@@ -971,11 +657,6 @@ fn fetchReply(
     }
 }
 
-/// Read the billing allowance after a committed round. Anthropic and OpenAI
-/// already stated theirs in the response head, and a live account never states
-/// both, so a null billing body cannot replace a head snapshot. A timeout or a
-/// refused GET leaves the last-known gauge. A cancel or an allocation failure
-/// ends the turn and keeps the round.
 fn refreshQuota(self: *Agent, fetch: anytype, turn: *TurnState, handler: anytype) !void {
     const maybe_quota = fetch.fetchQuota() catch |err| switch (err) {
         error.Canceled, error.OutOfMemory => return err,
@@ -990,10 +671,6 @@ fn adoptQuota(self: *Agent, quota: llm.Quota, turn: *TurnState, handler: anytype
     try presentation(&turn.presentation_closed, handler.onUsage(self.stats));
 }
 
-/// Read the credit pool after a committed round. The OpenRouter pool and the
-/// DeepSeek balance are the funds behind the account, and a report that names
-/// none cannot replace a pool. A timeout or a refused GET leaves the last-known
-/// pool. A cancel or an allocation failure ends the turn and keeps the round.
 fn refreshCredits(self: *Agent, fetch: anytype, turn: *TurnState, handler: anytype) !void {
     const maybe_credits = fetch.fetchCredits() catch |err| switch (err) {
         error.Canceled, error.OutOfMemory => return err,
@@ -1007,7 +684,6 @@ fn adoptCredits(self: *Agent, credits: llm.Credits, turn: *TurnState, handler: a
     try presentation(&turn.presentation_closed, handler.onUsage(self.stats));
 }
 
-/// Report the retry that is about to start, so the handler clears the rejected stream.
 fn notifyRetry(
     turn: *TurnState,
     attempt: u32,
@@ -1018,17 +694,12 @@ fn notifyRetry(
     try presentation(&turn.presentation_closed, handler.onStreamReset(&retry));
 }
 
-/// Wait before the retry after a failed attempt: the server's `retry-after`
-/// (capped) or exponential backoff. A cancel during the wait aborts the turn.
 fn backoff(self: *Agent, failure: net.Retry.Failure) !void {
     const delay_ms = self.retry.backoffMs(failure);
     const bounded: u64 = @min(delay_ms, std.math.maxInt(i64));
     try self.io.sleep(.fromMilliseconds(@intCast(bounded)), .awake);
 }
 
-/// Transient request failures worth a retry. A user cancel or channel close
-/// never is. The agent does not retry a token endpoint response because the
-/// token is single-use.
 fn retryableError(err: anyerror) bool {
     return switch (err) {
         error.Timeout,
@@ -1055,20 +726,13 @@ fn generateCacheKey(io: std.Io) [32]u8 {
     return std.fmt.bytesToHex(seed, .lower);
 }
 
-/// Free and drop every history item from `base` on. Capacity is retained so a
-/// rolled-back turn does not thrash the list backing.
 fn rollback(self: *Agent, base: usize) void {
     for (self.items.items[base..]) |item| freeItem(self.gpa, item);
     self.items.shrinkRetainingCapacity(base);
-    // A dropped item can carry the proof that a skill is loaded, so the guard
-    // searches the shortened history again.
     if (self.skill_guard) |guard| guard.forget();
-    // The rollback keeps every committed reply, so the measurement survives. An
-    // emptied history reads as zero again.
     self.refreshContext();
 }
 
-/// Free one history item's owned strings. An empty string frees as a no-op.
 fn freeItem(gpa: std.mem.Allocator, item: llm.Item) void {
     switch (item) {
         .message => |message| gpa.free(message.text),
@@ -1089,23 +753,13 @@ fn appendUser(self: *Agent, text: []const u8) !void {
     const owned = try self.gpa.dupe(u8, text);
     errdefer self.gpa.free(owned);
     try self.items.append(self.gpa, .{ .message = .{ .role = .user, .text = owned } });
-    // The first message of a conversation ends the zero that empty history
-    // states, and no reply has measured this text. A message that follows a
-    // measured reply leaves that measurement alone, like every other item the
-    // turn appends.
     self.refreshContext();
 }
 
-/// The conversation context one request reports: its whole prompt plus the
-/// output it produced. Saturating, because the counts arrive from the provider
-/// stream unchecked.
 fn contextTokens(usage: *const llm.Usage) u64 {
     return usage.input +| usage.cache_read +| usage.cache_write +| usage.output;
 }
 
-/// Fold one message's usage into the totals, priced with `model`. The model is
-/// threaded from the request so billing cannot drift when `/model` changes
-/// `self.model`.
 fn recordUsage(self: *Agent, model: *const Model, usage: *const llm.Usage) void {
     self.recordCharge(model, usage, null);
 }
@@ -1114,9 +768,6 @@ fn recordStop(self: *Agent, model: *const Model, stop: *const llm.Event.Stop) vo
     self.recordCharge(model, &stop.usage, stop.cost);
 }
 
-/// Add one reply to the totals: the charge it reports, or else its usage at the
-/// rates of `model`. The total stops at the money bound, because a rate from
-/// the metadata is no more bounded than a charge from the wire.
 fn recordCharge(
     self: *Agent,
     model: *const Model,
@@ -1126,19 +777,9 @@ fn recordCharge(
     if (reported_cost orelse model.cost(usage)) |cost| {
         self.stats.cost = @min(self.stats.cost + cost, llm.amount_usd_max);
     }
-    // The prompt of an accepted request is processed and billed whole, even
-    // when the stream is canceled before its reply ends, so its hit rate is
-    // final as soon as the counts arrive.
     self.stats.cache_usage = usage.*;
 }
 
-/// The model that prices one reply: the requested one, or the one the response
-/// names as the model that served it. A provider names the id behind an alias,
-/// and the requested model knows that id, so such a reply keeps its rates.
-/// Drinky knows no rate for a model it did not request, so a served reply
-/// carries no price. A served name that no model can hold keeps the requested
-/// name and drops the price, because the rates of one model never price
-/// another. The session total then counts nothing for that reply.
 fn pricingModel(requested: *const Model, served_name: []const u8) Model {
     if (served_name.len == 0 or requested.serves(served_name)) return requested.*;
     return Model.init(served_name) catch {
@@ -1148,7 +789,6 @@ fn pricingModel(requested: *const Model, served_name: []const u8) Model {
     };
 }
 
-/// Record a stream's nonzero running usage unless its terminal event already did.
 fn recordUsageSoFar(
     self: *Agent,
     model: *const Model,
@@ -1162,12 +802,6 @@ fn recordUsageSoFar(
     usage_recorded.* = true;
 }
 
-/// Read one streamed assistant message to completion, record usage, and append
-/// its items to history. The reply is built locally and committed only once
-/// complete, so a stream or API error leaves history untouched. The whole
-/// request can then be retried without a duplicated or partial message. The
-/// returned slice views the committed tail of `self.items`. It stays valid until
-/// the next append (which `runTools` performs only after the reply is read).
 fn readReply(
     self: *Agent,
     model: *const Model,
@@ -1219,11 +853,7 @@ fn readReplyWith(
         };
     }
     const stop = maybe_stop orelse return error.IncompleteReply;
-    // The model that really served the reply prices it, so a provider-side
-    // fallback bills under its own name.
     const priced_model = pricingModel(model, stop.model);
-    // Terminal usage is billable even when replay validation rejects the reply
-    // and the request is retried.
     self.recordStop(&priced_model, &stop);
     usage_recorded.* = true;
     try presentation(presentation_closed, handler.onUsage(self.stats));
@@ -1236,16 +866,7 @@ fn readReplyWith(
     if (reply_invalid) return error.IncompleteReply;
     if (stop.status == .truncated and replyHasToolCall(reply_items.items))
         return error.IncompleteReply;
-    // A terminal reply that produced no assistant item at all is distinct from a
-    // cut-short one. A resample is still worth a retry, but the exhausted-retry
-    // report must say the model returned nothing rather than blame the stream.
     if (reply_items.items.len == 0) return error.EmptyReply;
-    // A switch reports only for a committed reply, like the truncation flag: a
-    // durable event block ends the open streamed message, so a report on a
-    // rejected attempt leaves partial text that the retry's stream reset
-    // cannot discard. The attempt that lands reports the switch. It reports
-    // before the commit below, so a closed presentation channel cannot fail
-    // the reply after history already owns its items.
     if (stop.model.len != 0 and !model.serves(stop.model))
         try presentation(presentation_closed, handler.onModelMismatch(.{
             .requested = model.name(),
@@ -1254,20 +875,12 @@ fn readReplyWith(
 
     const start = self.items.items.len;
     try self.items.appendSlice(gpa, reply_items.items);
-    // The reply now belongs to the history, so its own report of the whole
-    // prompt plus the output measures that history exactly. Every rejection
-    // path returned above, so a discarded attempt never measures anything. The
-    // checkpoint adopts the measurement, because a round that fails before that
-    // point rolls this reply back out of the history again. The requested model
-    // names it, because the next request goes out under that model.
     if (self.client) |client| turn.pending_context = .{
         .tokens = contextTokens(&stop.usage),
         .model = model.*,
         .account = client.account(),
         .reasoning = model.reasoning(self.effort),
     };
-    // Only a committed reply's cutoff is worth a report: a rejected truncation
-    // is retried, and a resampled attempt can finish.
     if (stop.status == .truncated) turn.truncated = true;
     return self.items.items[start..];
 }
@@ -1283,8 +896,6 @@ fn appendReplyEvent(
     switch (event.*) {
         .text => |delta| try presentation(presentation_closed, handler.onText(delta)),
         .thinking => |delta| try presentation(presentation_closed, handler.onThinking(delta)),
-        // Display only: the call runs from the committed reply, so a half
-        // received argument list never reaches a tool.
         .tool_name => |name| try presentation(presentation_closed, handler.onToolName(name)),
         .tool_arguments => |delta| try presentation(
             presentation_closed,
@@ -1301,8 +912,6 @@ fn appendReplyEvent(
     }
 }
 
-/// The concurrent read-only task body, monomorphized per `Dispatch` so the real
-/// turn loop keeps a direct call.
 fn Runner(comptime Dispatch: type) type {
     return struct {
         fn run(call: *Call, context: *const tool.Context) void {
@@ -1311,25 +920,10 @@ fn Runner(comptime Dispatch: type) type {
     };
 }
 
-/// Run the assistant's tool calls through the real tool registry.
 fn runTools(self: *Agent, reply: []const llm.Item, turn: *TurnState, handler: anytype) !bool {
     return self.runToolsWith(tool, reply, turn, handler);
 }
 
-/// Run every tool the assistant asked for. Each result is committed in call
-/// order so each `tool_result` maps back to its `tool_call`. `Dispatch` names
-/// the tool source (`mutates` and `run`). Tests inject controllable tools into
-/// this path.
-///
-/// A conservative error result is reserved in history for every call. The
-/// round is committed (checkpoint advanced) before anything is announced or
-/// dispatched. So no mutation can change the world with no result recorded.
-/// Contiguous read-only calls run concurrently, at most `read_only_calls_max`
-/// of them at a time. A mutating call is a barrier. It awaits, transfers, and
-/// presents every earlier read before it announces itself, and then runs alone.
-/// Any failure (a mid-turn cancel included) reaps in-flight tasks and harvests
-/// their finished results into the reserved slots. This leaves the committed
-/// round replay-valid. Returns false when no tools were asked.
 fn runToolsWith(
     self: *Agent,
     comptime Dispatch: type,
@@ -1339,9 +933,6 @@ fn runToolsWith(
 ) !bool {
     var call_list: std.ArrayList(Call) = .empty;
     defer call_list.deinit(self.gpa);
-    // Collect the calls before the results are reserved. The reservation append
-    // can move the items backing array and invalidate `reply`. But the borrowed
-    // id, name, and argument strings are separate heap allocations that stay valid.
     for (reply) |item| switch (item) {
         .tool_call => |call| try call_list.append(
             self.gpa,
@@ -1351,16 +942,8 @@ fn runToolsWith(
     };
     const calls = call_list.items;
     if (calls.len == 0) return false;
-    // The conversation below this reply, by index: the reservation below can
-    // move the items backing array, but never these items. The subtraction is
-    // only correct because the reply is always the tail of the history, on
-    // every path that reaches this function. The saturation alone bounds the
-    // index and proves nothing more.
     const history_end = self.items.items.len -| reply.len;
 
-    // Reserve one unfinished-call error result per call and commit the whole round
-    // (reply + results) before any side effect can occur. A preparation failure
-    // announces and dispatches nothing. The turn rolls back the reply.
     try self.reserveResults(calls);
     try self.commitRound(turn, handler);
 
@@ -1371,14 +954,9 @@ fn runToolsWith(
         .bash = self.bash,
         .document = self.document,
         .skill_guard = self.skill_guard,
-        // The reply that asked for these calls stays out, so a skill that this
-        // reply reads cannot license a write that the same reply asked for.
         .history = self.items.items[0..history_end],
     };
     var group: std.Io.Group = .init;
-    // On any early exit, reap in-flight tasks, then move every successful,
-    // not-yet-moved result into its reserved slot. Errored or never-run calls
-    // keep the conservative unfinished-call result. This allocates nothing.
     errdefer {
         group.cancel(self.io);
         self.harvestResults(calls);
@@ -1388,14 +966,6 @@ fn runToolsWith(
     for (calls) |*call| {
         const mutates = Dispatch.mutates(call.name);
         if (mutates or reads_launched == read_only_calls_max) {
-            // Drain earlier reads so the mutation cannot race one, and transfer
-            // and present them in call order. The emptied group is reused. Both
-            // happen before the announce, so presentation never shows a later
-            // call start above an earlier call's result. A cancel at the barrier
-            // never announces a mutation that did not run.
-            //
-            // A full batch drains for the same reason: the group awaits as a
-            // whole, and the drain keeps the presentation in call order.
             try group.await(self.io);
             group = .init;
             reads_launched = 0;
@@ -1418,10 +988,6 @@ fn runToolsWith(
     return true;
 }
 
-/// Append one unfinished-call error `tool_result` per call and record each slot's
-/// index on its `Call`. Capacity is reserved up front so the appends cannot fail
-/// after the first. On a mid-run failure this frees the current call's partial
-/// dupes while the turn rollback frees the slots already committed.
 fn reserveResults(self: *Agent, calls: []Call) !void {
     try self.items.ensureUnusedCapacity(self.gpa, calls.len);
     const base = self.items.items.len;
@@ -1439,9 +1005,6 @@ fn reserveResults(self: *Agent, calls: []Call) !void {
     }
 }
 
-/// Present every completed, not-yet-moved call in call order and move each result
-/// into its slot before its callback. Stops at the first call whose result is
-/// not yet available (a barrier awaits only the reads dispatched before it).
 fn presentReady(
     self: *Agent,
     calls: []Call,
@@ -1457,11 +1020,6 @@ fn presentReady(
     }
 }
 
-/// Move a completed call's owned result content into its reserved slot and then
-/// present it. The move frees the unfinished-call content it replaces. It is
-/// allocation-free and precedes the fallible callback, so a callback failure
-/// leaves provider-visible history honest. A call that raised and returned no
-/// result propagates its error and leaves the unfinished-call result intact.
 fn presentResult(self: *Agent, call: *Call, turn: *TurnState, handler: anytype) !void {
     var result = try call.takeFinished();
     defer result.deinit(self.gpa);
@@ -1473,8 +1031,6 @@ fn presentResult(self: *Agent, call: *Call, turn: *TurnState, handler: anytype) 
     );
 }
 
-/// After tasks are reaped, move every successful, not-yet-moved result into its
-/// slot. An errored or never-run call keeps its unfinished-call result. No allocation.
 fn harvestResults(self: *Agent, calls: []Call) void {
     for (calls) |*call| {
         if (call.moved) continue;
@@ -1485,9 +1041,6 @@ fn harvestResults(self: *Agent, calls: []Call) void {
     }
 }
 
-/// Move a completed result's owned content into its reserved slot. This replaces
-/// and frees the unfinished-call content the slot held. The result retains every other
-/// owned field for its deferred `deinit`.
 fn transferResult(self: *Agent, call: *Call, result: *tool.Result) void {
     const slot = &self.items.items[call.result_index].tool_result;
     self.gpa.free(slot.content);
@@ -1501,13 +1054,6 @@ fn replyHasToolCall(items: []const llm.Item) bool {
     return false;
 }
 
-/// Whether a call already committed in *this reply* carries `id`, so a repeated
-/// identifier is rejected before it enters history. Uniqueness is deliberately
-/// scoped to one reply. That is what the wire format requires: a second call
-/// that shares an id inside one response is unanswerable (one result cannot
-/// address both). An id that reappears in a later round is already paired with
-/// its own result and replays unambiguously. A rejection there fails a turn over
-/// a harmless provider quirk.
 fn duplicateCallId(items: []const llm.Item, id: []const u8) bool {
     for (items) |item| switch (item) {
         .tool_call => |call| if (std.mem.eql(u8, call.call_id, id)) return true,
@@ -1544,13 +1090,8 @@ test retryableError {
     try std.testing.expect(!retryableError(error.Canceled));
     try std.testing.expect(!retryableError(error.Closed));
     try std.testing.expect(!retryableError(error.OutOfMemory));
-    // An oversize stream reproduces on the same request, so it is not retried.
     try std.testing.expect(!retryableError(error.StreamResponseTooLarge));
-    // A retry meets the same wire order, so a correlation failure fails the turn
-    // at once instead of spending the budget on the same outcome.
     try std.testing.expect(!retryableError(error.UncorrelatedReply));
-    // The provider's fallback holds for the conversation, so a retry meets the
-    // same unknown model and only spends the budget.
     try std.testing.expect(!retryableError(error.UnknownServedModel));
 }
 
@@ -1572,8 +1113,6 @@ test "resetConversation clears conversation state and preserves configuration" {
     agent.resetConversation();
 
     try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
-    // Compares the whole struct, so the per-model buckets and their count must
-    // also be back to default, not just the cumulative totals.
     try std.testing.expect(std.meta.eql(Stats{}, agent.stats));
     const steering = try agent.steering.take();
     defer gpa.free(steering);
@@ -1597,14 +1136,10 @@ test "an account change or sign-out clears the previous account's quota and pool
     agent.stats.quota = .{ .primary = .{ .used_percent = 25, .window_minutes = 300 } };
     agent.stats.credits = .{ .total = 10, .used = 2 };
 
-    // A model change within one account keeps that account's latest allowance
-    // and pool.
     agent.switchTo(same_account, sonnet);
     try std.testing.expect(agent.stats.quota != null);
     try std.testing.expect(agent.stats.credits != null);
 
-    // A switch across accounts must not present the old account's allowance
-    // and pool as current.
     const openai_client = provider.Client.init(
         gpa,
         std.testing.io,
@@ -1623,10 +1158,6 @@ test "an account change or sign-out clears the previous account's quota and pool
     try std.testing.expect(agent.stats.credits == null);
 }
 
-// The provider keys its cache on the principal, the model, and the rendered
-// effort, so a change to any of the three makes the measured rate foreign. Two
-// effort levels that fold onto one wire form write the same bytes and share
-// one cache, so the rate survives that change.
 test "the cache rate expires with the principal, the model, and the wire effort" {
     const gpa = std.testing.allocator;
     var agent = scriptedAgent(gpa);
@@ -1642,15 +1173,12 @@ test "the cache rate expires with the principal, the model, and the wire effort"
     agent.setEffort(.high);
     try std.testing.expectEqual(llm.Usage{}, agent.stats.cache_usage);
 
-    // This model names no xhigh, so that level folds onto high and the change
-    // writes the same bytes.
     agent.switchTo(same_account, sonnet);
     agent.setEffort(.high);
     agent.stats.cache_usage = usage;
     agent.setEffort(.xhigh);
     try std.testing.expectEqual(usage, agent.stats.cache_usage);
 
-    // Another principal owns another cache.
     const other_account = provider.Client.init(
         gpa,
         std.testing.io,
@@ -1660,33 +1188,21 @@ test "the cache rate expires with the principal, the model, and the wire effort"
     agent.switchTo(other_account, agent.model.?);
     try std.testing.expectEqual(llm.Usage{}, agent.stats.cache_usage);
 
-    // The provider keys its entry on the rendered model too.
     agent.stats.cache_usage = usage;
     agent.switchTo(other_account, testing.model("claude-opus-4-8"));
     try std.testing.expectEqual(llm.Usage{}, agent.stats.cache_usage);
 
-    // A fetch replaces the description of a model and keeps its name. A
-    // narrowed ladder renders another effort control, so the rate goes with it.
     agent.stats.cache_usage = usage;
     var narrowed = testing.model("claude-opus-4-8");
     narrowed.efforts.remove(.max);
     agent.switchTo(other_account, narrowed);
     try std.testing.expectEqual(llm.Usage{}, agent.stats.cache_usage);
 
-    // A sign-out has no account left to attribute a rate to.
     agent.stats.cache_usage = usage;
     agent.signOut();
     try std.testing.expectEqual(llm.Usage{}, agent.stats.cache_usage);
 }
 
-// The context gauge shows a measurement, and Drinky counts no token itself. So
-// the measurement holds exactly while the next request renders the same prompt
-// around the same history. A tokenizer belongs to its model: Anthropic counts
-// the same text about 30 percent higher from Claude 4.7 on. The account renders
-// everything around the history. Under one account, only the rendered effort
-// still moves a proof, because Anthropic replays a thinking block only under a
-// named effort. The measurement carries the setup it describes, so a switch back
-// to that setup shows the count again.
 test "the context gauge holds while the tokenizer and the replayed reasoning hold" {
     const gpa = std.testing.allocator;
     var agent = scriptedAgent(gpa);
@@ -1699,58 +1215,41 @@ test "the context gauge holds while the tokenizer and the replayed reasoning hol
     agent.setEffort(.high);
     seedContext(&agent, 1020);
 
-    // Another named effort keeps every thinking block in the prompt.
     agent.setEffort(.max);
     try std.testing.expectEqual(@as(?u64, 1020), agent.stats.context_tokens);
 
-    // A fetch can replace the description of opus with one that takes no level.
-    // Such a model omits the effort control, which takes every thinking block
-    // out of the prompt. The count no longer describes what goes out.
     var closed = opus;
     closed.efforts_denied = true;
     agent.switchTo(subscription, closed);
     try std.testing.expect(agent.stats.context_tokens == null);
 
-    // Back under a named effort the proof replays again, so the count returns.
     agent.switchTo(subscription, opus);
     try std.testing.expectEqual(@as(?u64, 1020), agent.stats.context_tokens);
 
-    // Another account renders another prompt, and it cannot replay this proof.
     const console = provider.Client.init(gpa, std.testing.io, .{ .anthropic_api = "k" }, .{});
     agent.switchTo(console, opus);
     try std.testing.expect(agent.stats.context_tokens == null);
     agent.switchTo(subscription, opus);
     try std.testing.expectEqual(@as(?u64, 1020), agent.stats.context_tokens);
 
-    // A signed-out Drinky sends nothing, so the count stands until an account
-    // that renders the history in another way replaces it.
     agent.signOut();
     try std.testing.expectEqual(@as(?u64, 1020), agent.stats.context_tokens);
     agent.switchTo(console, opus);
     try std.testing.expect(agent.stats.context_tokens == null);
 
-    // The rule holds whatever account went before, so the gauge never depends
-    // on the order of the switches.
     agent.signOut();
     try std.testing.expectEqual(@as(?u64, 1020), agent.stats.context_tokens);
     agent.switchTo(subscription, opus);
 
-    // Another model counts the same history with another tokenizer.
     agent.switchTo(subscription, testing.model("claude-sonnet-4-6"));
     try std.testing.expect(agent.stats.context_tokens == null);
     agent.switchTo(subscription, opus);
     try std.testing.expectEqual(@as(?u64, 1020), agent.stats.context_tokens);
 
-    // Empty history holds exactly zero tokens, so a reset needs no measurement.
     agent.resetConversation();
     try std.testing.expectEqual(@as(?u64, 0), agent.stats.context_tokens);
 }
 
-// The measured count covers the whole prompt, not the history alone, and the
-// account renders everything around that history. An Anthropic subscription or
-// Console request leads with the Claude Code identity that an API key omits, so
-// the count of one account states nothing about another. A history with no
-// stored proof changes nothing about that.
 test "an account switch hides the count, and a switch back restores it" {
     const gpa = std.testing.allocator;
     var agent = scriptedAgent(gpa);
@@ -1766,13 +1265,10 @@ test "an account switch hides the count, and a switch back restores it" {
     agent.switchTo(console, opus);
     try std.testing.expect(agent.stats.context_tokens == null);
 
-    // The measurement waits for its own setup, so the switch back shows it.
     agent.switchTo(subscription, opus);
     try std.testing.expectEqual(@as(?u64, 1020), agent.stats.context_tokens);
 }
 
-// A setup change moves a token only when it takes a stored proof out of the
-// prompt of the active account, or puts one back.
 test "the context gauge survives every effort change that replays the same reasoning" {
     const gpa = std.testing.allocator;
     var anthropic_agent = scriptedAgent(gpa);
@@ -1783,15 +1279,11 @@ test "the context gauge survives every effort change that replays the same reaso
     anthropic_agent.setEffort(.high);
     seedContext(&anthropic_agent, 1020);
 
-    // A description that takes no level omits the effort control, but this
-    // history holds no proof that the omission can take out of the prompt.
     var closed = anthropic_agent.model.?;
     closed.efforts_denied = true;
     anthropic_agent.switchTo(subscription, closed);
     try std.testing.expectEqual(@as(?u64, 1020), anthropic_agent.stats.context_tokens);
 
-    // Sonnet 4.6 folds xhigh onto high. Both name an effort, so the proof of
-    // this account replays either way and the count stands.
     const sonnet = testing.model("claude-sonnet-4-6");
     anthropic_agent.switchTo(subscription, sonnet);
     try appendProof(&anthropic_agent, .anthropic_plan);
@@ -1807,7 +1299,6 @@ test "the context gauge survives every effort change that replays the same reaso
     openai_agent.setEffort(.high);
     seedContext(&openai_agent, 1020);
 
-    // OpenAI names an effort at every level and keeps the encrypted item.
     openai_agent.setEffort(.low);
     try std.testing.expectEqual(@as(?u64, 1020), openai_agent.stats.context_tokens);
 }
@@ -1833,13 +1324,10 @@ test "usage is priced with the model that produced it, not the active one" {
 
     const one_million: llm.Usage = .{ .input = 1_000_000 };
 
-    // Produced by sonnet while `self.model` is opus: pricing must follow the
-    // passed model ($3, sonnet), not `self.model` ($5, opus).
     agent.switchTo(client, opus);
     agent.recordUsage(&sonnet, &one_million);
     try std.testing.expectApproxEqAbs(@as(f64, 3), agent.stats.cost, 1e-9);
 
-    // An opus turn blends both rates: sonnet $3 + opus $5.
     agent.recordUsage(&opus, &one_million);
     try std.testing.expectApproxEqAbs(@as(f64, 8), agent.stats.cost, 1e-9);
     try std.testing.expectEqual(@as(u64, 1_000_000), agent.stats.cache_usage.input);
@@ -1856,14 +1344,10 @@ test "a reported charge outranks the rate estimate" {
     agent.recordStop(&model, &.{ .usage = usage, .cost = 0.42 });
     try std.testing.expectApproxEqAbs(@as(f64, 0.42), agent.stats.cost, 1e-9);
 
-    // A stop with no charge falls back to the rates.
     agent.recordStop(&model, &.{ .usage = usage });
     try std.testing.expectApproxEqAbs(0.42 + estimate, agent.stats.cost, 1e-9);
 }
 
-// The status line prints the total into a fixed buffer, so the total must stay
-// short whatever a reply reports or a rate implies. A total past the bound is
-// nonsense anyway, so the ceiling costs no true figure.
 test "the session total stops at the money bound" {
     var agent = scriptedAgent(std.testing.allocator);
     defer agent.deinit();
@@ -1873,15 +1357,12 @@ test "the session total stops at the money bound" {
     agent.recordStop(&model, &.{ .usage = .{ .input = 1 }, .cost = 5 });
     try std.testing.expectEqual(llm.amount_usd_max, agent.stats.cost);
 
-    // A rate estimate over a huge count stops at the same bound.
     agent.stats.cost = 0;
     const priced = testing.model("priced");
     agent.recordUsage(&priced, &.{ .input = std.math.maxInt(u64) });
     try std.testing.expectEqual(llm.amount_usd_max, agent.stats.cost);
 }
 
-// A model that no source priced adds no cost at all. Drinky states no rate it
-// does not know, so such a reply leaves the total where it stood.
 test "an unpriced model adds no cost to the session total" {
     var agent = scriptedAgent(std.testing.allocator);
     defer agent.deinit();
@@ -1893,7 +1374,6 @@ test "an unpriced model adds no cost to the session total" {
     const unpriced = testing.bareModel("unpriced");
     agent.recordUsage(&unpriced, &.{ .input = 2_000_000 });
     try std.testing.expectApproxEqAbs(@as(f64, 3), agent.stats.cost, 1e-9);
-    // The cache gauge reads the last prompt whatever its price.
     try std.testing.expectEqual(@as(u64, 2_000_000), agent.stats.cache_usage.input);
 }
 
@@ -1956,23 +1436,15 @@ const ScriptedStream = struct {
     }
 };
 
-// A scripted fetch for `runWith`. Each send consumes the next attempt (the last
-// repeats) and either fails outright or hands out a fresh copy of its stream.
 const ScriptedFetch = struct {
     attempts: []const Attempt,
     sends: usize = 0,
     renewals: usize = 0,
-    /// What a renewal reports: a subscription that takes a newer token reports
-    /// true, and an API key reports false.
     renewal_changes: bool = false,
     renewal_error: ?anyerror = null,
-    /// The billing allowance of one scripted round, or null when this fetch
-    /// reports none. The agent reads it after the round commits.
     quota_to_fetch: ?llm.Quota = null,
     quota_fetches: usize = 0,
     quota_error: ?anyerror = null,
-    /// The credit pool of one scripted round, or null when this fetch reports
-    /// none. The agent reads it after the round commits.
     credits_to_fetch: ?llm.Credits = null,
     credits_fetches: usize = 0,
     credits_error: ?anyerror = null,
@@ -2008,8 +1480,6 @@ const ScriptedFetch = struct {
     }
 };
 
-// An io seam that records each requested sleep in milliseconds and returns at
-// once, so retry backoffs are observable with no real wait.
 const SleepLog = struct {
     vtable: std.Io.VTable,
     slept_ms: [8]u64 = undefined,
@@ -2065,11 +1535,9 @@ test "steering is delivered as one combined user message" {
     try std.testing.expectEqualStrings("a\n\nb", agent.items.items[0].message.text);
     try std.testing.expectEqualStrings("a\n\nb", handler.text.items);
     try std.testing.expectEqual(@as(usize, 2), handler.count);
-    // The delivered batch is consumed but retained until its following reply.
     try std.testing.expect(turn.pending_steering != null);
     try std.testing.expectEqual(@as(usize, 0), turn.steering_committed_count);
 
-    // An empty queue delivers nothing, so history and the report stand.
     try agent.drainSteering(&turn, &handler);
     try std.testing.expectEqual(@as(usize, 1), agent.items.items.len);
     try std.testing.expectEqual(@as(usize, 2), handler.count);
@@ -2082,8 +1550,6 @@ test "steering appends a separate user item, leaving grouping to the serializer"
     var handler: SteerHandler = .{ .gpa = gpa };
     defer handler.deinit();
 
-    // A trailing user item, as a round's tool results leave it: the Agent
-    // appends a separate item, and the Anthropic serializer merges the run.
     var turn: TurnState = .{ .base = 0, .checkpoint = 0 };
     defer if (turn.pending_steering) |batch| freeSteeringBatch(gpa, batch);
     try agent.appendUser("tool results");
@@ -2102,8 +1568,6 @@ test "a cancel during steering delivery returns the taken batch to the queue" {
     var agent = scriptedAgent(gpa);
     defer agent.deinit();
 
-    // A handler canceled while it reports the batch: a mid-turn Esc that races
-    // the round-boundary drain.
     const CancelHandler = struct {
         fn onSteering(self: *@This(), text: []const u8, count: usize) !void {
             _ = self;
@@ -2120,7 +1584,6 @@ test "a cancel during steering delivery returns the taken batch to the queue" {
     try std.testing.expectError(error.Canceled, agent.drainSteering(&turn, &handler));
     try std.testing.expect(turn.pending_steering == null);
 
-    // The batch is back in the queue, in order, for cancel to return to the editor.
     const taken = try agent.steering.take();
     defer {
         for (taken) |message| gpa.free(message);
@@ -2175,14 +1638,10 @@ const CaptureHandler = struct {
     gpa: std.mem.Allocator,
     thinking: std.ArrayList(u8) = .empty,
     text: std.ArrayList(u8) = .empty,
-    /// Every streamed tool call as `name arguments`, one per line.
     streamed_tools: std.ArrayList(u8) = .empty,
-    /// Every reported model switch as `requested served`, one per line.
     model_mismatches: std.ArrayList(u8) = .empty,
-    /// Every retry as `attempt cause-kind cause`, one per line.
     retries: std.ArrayList(u8) = .empty,
     errors: std.ArrayList(u8) = .empty,
-    /// Every context measurement the agent published, in order.
     published_context: std.ArrayList(?u64) = .empty,
     usage_count: usize = 0,
     tool_start_count: usize = 0,
@@ -2300,7 +1759,6 @@ fn scriptedAgent(gpa: std.mem.Allocator) Agent {
     });
 }
 
-/// Seed the measurement that a committed reply under the current setup leaves.
 fn seedContext(agent: *Agent, tokens: u64) void {
     agent.measured_context = .{
         .tokens = tokens,
@@ -2311,8 +1769,6 @@ fn seedContext(agent: *Agent, tokens: u64) void {
     agent.refreshContext();
 }
 
-/// Append one stored reasoning proof of `account` to the history. Every string
-/// is owned, because `deinit` frees the whole item.
 fn appendProof(agent: *Agent, account: llm.Account) !void {
     const gpa = agent.gpa;
     const text = try gpa.dupe(u8, "think");
@@ -2425,10 +1881,6 @@ test "readReply stops before a post-completion timeout" {
     try std.testing.expectEqual(@as(usize, 1), handler.usage_count);
 }
 
-// A provider can switch a flagged request to a fallback model. The stop names
-// the model that served the reply, so the switch reports instead of passing as
-// the requested model. A stop that names the requested model, or none, reports
-// nothing.
 test "readReply reports a reply that another model served" {
     const gpa = std.testing.allocator;
     var agent = scriptedAgent(gpa);
@@ -2464,9 +1916,6 @@ test "readReply reports a reply that another model served" {
         handler.model_mismatches.items,
     );
 
-    // A rejected attempt reports no switch: a durable event block ends the
-    // open streamed message, the retry's stream reset then cannot discard the
-    // partial text, and the retried reply duplicates it.
     const served_and_rejected = [_]llm.Event{
         .{ .text = "partial" },
         .{ .item = .{ .message = "partial" } },
@@ -2487,10 +1936,6 @@ test "readReply reports a reply that another model served" {
     );
 }
 
-// The provider bills a switched request at the fallback's rates, so the ledger
-// must price the reply at the model that served it and attribute the usage to
-// that model's bucket. The cache rate takes the same reply, because the
-// fallback keeps serving the conversation.
 test "readReply prices a reply that the requested model served" {
     const gpa = std.testing.allocator;
     var agent = scriptedAgent(gpa);
@@ -2506,14 +1951,10 @@ test "readReply prices a reply that the requested model served" {
     var stream: ScriptedStream = .{ .events = &events };
     _ = try agent.readReply(&agent.model.?, &stream, &handler);
 
-    // The requested model served the reply, so its own rates price it.
     try std.testing.expectEqual(agent.model.?.cost(&usage), agent.stats.cost);
     try std.testing.expectEqual(usage, agent.stats.cache_usage);
 }
 
-// A provider names the id behind an alias as the model that served the reply.
-// The alias knows that id, so the reply is its own: no switch reports, and its
-// rates price the reply.
 test "readReply reads the id behind an alias as the requested model" {
     const gpa = std.testing.allocator;
     var agent = scriptedAgent(gpa);
@@ -2534,9 +1975,6 @@ test "readReply reads the id behind an alias as the requested model" {
     try std.testing.expectEqual(agent.model.?.cost(&usage), agent.stats.cost);
 }
 
-// Drinky knows no rate for a model it did not request, so the reply carries no
-// price and adds nothing to the total. A provider-side fallback must not fail
-// the turn.
 test "readReply keeps a reply that an unknown model served, unpriced" {
     const gpa = std.testing.allocator;
     var agent = scriptedAgent(gpa);
@@ -2554,16 +1992,12 @@ test "readReply keeps a reply that an unknown model served, unpriced" {
     try std.testing.expectEqual(@as(usize, 1), reply.len);
     try std.testing.expectEqual(@as(usize, 0), handler.errors.items.len);
     try std.testing.expectEqual(@as(f64, 0), agent.stats.cost);
-    // The reply reports the switch, so the user sees which model answered.
     try std.testing.expectEqualStrings(
         "claude-opus-4-8 claude-mythos-5\n",
         handler.model_mismatches.items,
     );
 }
 
-// A served name arrives from the provider stream unchecked, so it can be longer
-// than a model name Drinky holds. Such a name states no rate either, so the
-// rates of the requested model must never price its reply.
 test "readReply keeps a reply that a model with an over-long name served" {
     const gpa = std.testing.allocator;
     var agent = scriptedAgent(gpa);
@@ -2572,7 +2006,6 @@ test "readReply keeps a reply that a model with an over-long name served" {
     defer handler.deinit();
 
     const served = "c" ** (Model.name_bytes_max + 1);
-    // The requested model prices this usage, so a fallback to it is visible.
     try std.testing.expect(agent.model.?.price != null);
     try std.testing.expect(pricingModel(&agent.model.?, served).price == null);
 
@@ -2590,9 +2023,6 @@ test "readReply keeps a reply that a model with an over-long name served" {
     );
 }
 
-// The name and the argument fragments of a tool call are display only. They
-// reach the handler as they stream, and only the completed item enters history,
-// so no tool ever runs on half-received arguments.
 test "readReply streams a tool call's name and arguments for display alone" {
     const gpa = std.testing.allocator;
     var agent = scriptedAgent(gpa);
@@ -2617,13 +2047,11 @@ test "readReply streams a tool call's name and arguments for display alone" {
     try std.testing.expectEqualStrings("read {\"path\":\"x\"}", handler.streamed_tools.items);
     try std.testing.expectEqual(@as(usize, 1), reply.len);
     try std.testing.expectEqualStrings("t1", reply[0].tool_call.call_id);
-    // The display events retain nothing of their own.
     try std.testing.expectEqual(@as(usize, 1), agent.items.items.len);
 }
 
 test "readReply records terminal usage before rejecting an invalid reply" {
     const gpa = std.testing.allocator;
-    // A terminal truncated tool reply is rejected, but its billed usage remains.
     {
         var agent = scriptedAgent(gpa);
         defer agent.deinit();
@@ -2646,7 +2074,6 @@ test "readReply records terminal usage before rejecting an invalid reply" {
         try std.testing.expectEqual(@as(usize, 1), handler.usage_count);
         try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
     }
-    // An empty completed reply preserves the same accounting behavior.
     {
         var agent = scriptedAgent(gpa);
         defer agent.deinit();
@@ -2664,8 +2091,6 @@ test "readReply records terminal usage before rejecting an invalid reply" {
         try std.testing.expectEqual(@as(u64, 23), agent.stats.cache_usage.output);
         try std.testing.expectEqual(@as(usize, 1), handler.usage_count);
     }
-    // Invalid completed item data is latched. Remaining display content is
-    // ignored while the stream drains through terminal usage.
     {
         var agent = scriptedAgent(gpa);
         defer agent.deinit();
@@ -2720,8 +2145,6 @@ test "a failed reply attempt reclaims its transient allocations" {
     var handler: CaptureHandler = .{ .gpa = gpa };
     defer handler.deinit();
 
-    // A large message then a tool call, and no stop event: each attempt
-    // allocates item memory and then fails.
     const big = "x" ** 4096;
     const events = [_]llm.Event{
         .{ .text = big },
@@ -2733,8 +2156,6 @@ test "a failed reply attempt reclaims its transient allocations" {
         } } },
     };
 
-    // One warm-up attempt settles the reusable capacities (the item list, the
-    // handler buffers) so the measured window isolates per-attempt retention.
     handler.text.clearRetainingCapacity();
     var warmup: ScriptedStream = .{ .events = &events, .terminal_error = error.Timeout };
     try std.testing.expectError(error.Timeout, agent.readReply(&agent.model.?, &warmup, &handler));
@@ -2752,8 +2173,6 @@ test "a failed reply attempt reclaims its transient allocations" {
         try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
     }
 
-    // Retained bytes must not scale with attempts. A session-lifetime arena
-    // keeps each attempt's items and adds at least `big` per attempt.
     const grew = (failing.allocated_bytes - failing.freed_bytes) - settled;
     try std.testing.expect(grew < big.len);
 }
@@ -2768,7 +2187,6 @@ test "rollback frees every item appended since the base" {
     try agent.appendUser("keep me");
     const base = agent.items.items.len;
 
-    // A multi-string reply past the base: reasoning run, answer, and tool call.
     const events = [_]llm.Event{
         .{ .thinking = "weigh it" },
         .{ .item = .{ .reasoning = .{
@@ -2788,16 +2206,11 @@ test "rollback frees every item appended since the base" {
     try std.testing.expectEqual(@as(usize, 3), reply.len);
     try std.testing.expect(agent.items.items.len > base);
 
-    // Each appended item is freed exactly once (the leak-checking allocator
-    // proves it). The user message stays.
     agent.rollback(base);
     try std.testing.expectEqual(base, agent.items.items.len);
     try std.testing.expectEqualStrings("keep me", agent.items.items[base - 1].message.text);
 }
 
-// A revision removes one canceled turn from the history. The removed replies
-// measured the context, so the gauge goes blank with them, and the cost, the
-// billing reports, and the cache key stay, because the provider billed the work.
 test "rewindHistory removes a turn and keeps the billing evidence" {
     const gpa = std.testing.allocator;
     var agent = scriptedAgent(gpa);
@@ -2824,13 +2237,10 @@ test "rewindHistory removes a turn and keeps the billing evidence" {
     try std.testing.expect(agent.stats.quota != null);
     try std.testing.expectEqualSlices(u8, &cache_key, &agent.cache_key);
 
-    // An emptied history states zero again.
     agent.rewindHistory(.{ .base = 0, .end = base });
     try std.testing.expectEqual(@as(?u64, 0), agent.stats.context_tokens);
 }
 
-// A revision anchors positions in the history. An evidence removal takes proofs
-// out below them, and each position moves up by the proofs below it alone.
 test "producedBefore counts the proofs of one account below an index" {
     const gpa = std.testing.allocator;
     var agent = scriptedAgent(gpa);
@@ -2856,7 +2266,6 @@ fn readReplyUnderOom(allocator: std.mem.Allocator) !void {
     var handler: CaptureHandler = .{ .gpa = allocator };
     defer handler.deinit();
 
-    // One reply that exercises every multi-string item builder.
     const events = [_]llm.Event{
         .{ .thinking = "weigh it" },
         .{ .item = .{ .reasoning = .{
@@ -2972,7 +2381,6 @@ test "provider rejections retain terminal usage before failing the reply" {
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
 
-    // Anthropic reports usage before message_stop resolves refusal as unsupported.
     {
         const body =
             "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":11}}}\n\n" ++
@@ -2995,7 +2403,6 @@ test "provider rejections retain terminal usage before failing the reply" {
         try std.testing.expectEqual(@as(u64, 7), agent.stats.cache_usage.output);
         try std.testing.expectEqual(@as(usize, 1), handler.usage_count);
     }
-    // OpenAI refusal frames drain through response.completed and its usage.
     {
         const body =
             "data: {\"type\":\"response.refusal.delta\",\"delta\":\"no\"}\n\n" ++
@@ -3018,8 +2425,6 @@ test "provider rejections retain terminal usage before failing the reply" {
         try std.testing.expectEqual(@as(u64, 5), agent.stats.cache_usage.output);
         try std.testing.expectEqual(@as(usize, 1), handler.usage_count);
     }
-    // An incomplete function item is retryable, but the rejected attempt is
-    // still included in accounting.
     {
         const body =
             "data: {\"type\":\"response.output_item.added\",\"item\":" ++
@@ -3076,8 +2481,6 @@ fn expectUnencryptedReply(options: struct {
         defer gpa.free(body);
         var reader: std.Io.Reader = .fixed(body);
         var stream = openaiStream(std.testing.io, &reader);
-        // The client sets this from the account, so a stream built by hand sets
-        // it too. OpenRouter and DeepSeek replay plain reasoning.
         stream.openai_api_key.plain_reasoning = true;
         defer stream.openai_api_key.deinitDecode();
         var agent = openaiScriptedAgent(gpa);
@@ -3159,9 +2562,6 @@ test "a zero charge after a rejected reply keeps the earlier charge" {
 }
 
 test "readReply separates OpenAI reasoning summary parts with a blank line" {
-    // Two summary parts share one reasoning item and arrive with no text between
-    // them. The rising summary_index on the second part.added is the only seam,
-    // so both the committed reply and the streamed handler must read "a\n\nb".
     const body =
         "data: {\"type\":\"response.reasoning_summary_part.added\"," ++
         "\"item_id\":\"rs_1\",\"summary_index\":0,\"part\":{\"type\":\"summary_text\",\"text\":\"\"}}\n\n" ++
@@ -3204,9 +2604,6 @@ test "readReply separates OpenAI reasoning summary parts with a blank line" {
 }
 
 test "readReply separates a redacted Anthropic block from the reasoning before it" {
-    // This module displays the placeholder for a redacted block, and it cannot
-    // put a blank line in front of that text. The frame that opens the block
-    // carries the seam instead, so the handler must read the two apart.
     const body =
         "data: {\"type\":\"content_block_start\",\"index\":0," ++
         "\"content_block\":{\"type\":\"thinking\"}}\n\n" ++
@@ -3441,8 +2838,6 @@ test "readReply keeps adjacent reasoning runs as separate items in stream order"
     var handler: CaptureHandler = .{ .gpa = gpa };
     defer handler.deinit();
 
-    // Each run keeps its own proof. Text stays between the runs it streamed
-    // between and does not sink below them.
     const events = [_]llm.Event{
         .{ .thinking = "A" },
         .{ .item = .{ .reasoning = .{ .encrypted = .{
@@ -3574,11 +2969,9 @@ test "dropReasoning invalidates only the replaced account slot" {
         llm.Account.openai_api_key,
         std.meta.activeTag(agent.items.items[0].reasoning.replay),
     );
-    // A shorter history leaves no valid measurement of it.
     try std.testing.expect(agent.stats.context_tokens == null);
     agent.dropReasoning(.openai_api_key);
     try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
-    // Empty history holds exactly zero tokens, measured or not.
     try std.testing.expectEqual(@as(?u64, 0), agent.stats.context_tokens);
 }
 
@@ -3588,8 +2981,6 @@ test "dropped account evidence takes the allowance of the active account only" {
     defer agent.deinit();
     const quota: llm.Quota = .{ .primary = .{ .used_percent = 25, .window_minutes = 300 } };
 
-    // Both gauges belong to the account whose response reported them, so
-    // another account's replaced credential leaves them alone.
     const usage: llm.Usage = .{ .input = 100, .cache_read = 900 };
     agent.stats.quota = quota;
     agent.stats.cache_usage = usage;
@@ -3597,13 +2988,10 @@ test "dropped account evidence takes the allowance of the active account only" {
     try std.testing.expect(agent.stats.quota != null);
     try std.testing.expectEqual(usage, agent.stats.cache_usage);
 
-    // A replaced credential of the active account takes them, because the next
-    // principal has its own allowance and its own isolated cache.
     agent.dropAccountEvidence(.anthropic_plan);
     try std.testing.expect(agent.stats.quota == null);
     try std.testing.expectEqual(llm.Usage{}, agent.stats.cache_usage);
 
-    // A signed-out agent has no account to compare, and drops nothing.
     agent.signOut();
     agent.stats.quota = quota;
     agent.dropAccountEvidence(.anthropic_plan);
@@ -3612,7 +3000,6 @@ test "dropped account evidence takes the allowance of the active account only" {
 
 test "readReply retains a truncated tool-free reply but rejects a truncated tool call" {
     const gpa = std.testing.allocator;
-    // A truncated answer with no tool call is an authoritative reply and commits.
     {
         var agent = scriptedAgent(gpa);
         defer agent.deinit();
@@ -3628,7 +3015,6 @@ test "readReply retains a truncated tool-free reply but rejects a truncated tool
         try std.testing.expectEqual(@as(usize, 1), reply.len);
         try std.testing.expectEqualStrings("half", reply[0].message.text);
     }
-    // A truncated reply that still holds a tool call cannot be answered. Reject it.
     {
         var agent = scriptedAgent(gpa);
         defer agent.deinit();
@@ -3653,7 +3039,6 @@ test "readReply retains a truncated tool-free reply but rejects a truncated tool
 
 test "readReply validates tool arguments: empty is an object, non-object rejects" {
     const gpa = std.testing.allocator;
-    // Empty closed arguments commit as an empty object.
     {
         var agent = scriptedAgent(gpa);
         defer agent.deinit();
@@ -3672,7 +3057,6 @@ test "readReply validates tool arguments: empty is an object, non-object rejects
         try std.testing.expectEqual(@as(usize, 1), reply.len);
         try std.testing.expectEqualStrings("{}", reply[0].tool_call.arguments_json);
     }
-    // A non-object final argument is not replayable verbatim. Reject it.
     {
         var agent = scriptedAgent(gpa);
         defer agent.deinit();
@@ -3739,8 +3123,6 @@ test "readReply rejects empty and duplicate call identifiers" {
 
 test "readReply rejects incomplete or invalid reasoning proof" {
     const gpa = std.testing.allocator;
-    // A presented run with no complete reasoning event retains nothing, so the
-    // reply is empty rather than invalid.
     {
         var agent = scriptedAgent(gpa);
         defer agent.deinit();
@@ -3757,7 +3139,6 @@ test "readReply rejects incomplete or invalid reasoning proof" {
         );
         try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
     }
-    // A structurally incomplete identified proof cannot bind to the account.
     {
         var agent = openaiScriptedAgent(gpa);
         defer agent.deinit();
@@ -3779,7 +3160,6 @@ test "readReply rejects incomplete or invalid reasoning proof" {
         );
         try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
     }
-    // Anthropic redacted: an empty encrypted payload is not replayable either.
     {
         var agent = scriptedAgent(gpa);
         defer agent.deinit();
@@ -3798,11 +3178,6 @@ test "readReply rejects incomplete or invalid reasoning proof" {
     }
 }
 
-// A scheduling seam that wraps a real threaded executor. It counts read-only
-// tasks dispatched into the current group generation and records their peak.
-// Via an atomic that each read body holds while it runs, it flags a mutation
-// that ran while a read was still active. The launch counter is main-thread
-// only. The executing count is atomic because read bodies run on worker threads.
 const ScheduleLog = struct {
     backend: std.Io,
     vtable: std.Io.VTable,
@@ -3810,8 +3185,6 @@ const ScheduleLog = struct {
     launched_peak: usize = 0,
     reads_running: std.atomic.Value(usize) = .init(0),
     mutation_overlap: bool = false,
-    // When set, the next group await reports cancellation and does not drain, so
-    // the caller's errdefer must reap the launched reads through `cancelGroup`.
     cancel_at_await: bool = false,
 
     fn init(backend: std.Io) ScheduleLog {
@@ -3828,8 +3201,6 @@ const ScheduleLog = struct {
 
     fn recordMutation(self: *ScheduleLog) void {
         if (self.reads_running.load(.acquire) != 0) self.mutation_overlap = true;
-        // The barrier already drained earlier reads, so the mutation closes the
-        // launch generation: a later read starts a fresh one, not a peak of three.
         self.launched = 0;
     }
 
@@ -3873,8 +3244,6 @@ const ScheduleLog = struct {
     }
 };
 
-// A controllable tool source for `runToolsWith`: "write" mutates, and everything
-// else is read-only. A mutation notes any scheduling overlap.
 const probe = struct {
     fn mutates(name: []const u8) bool {
         return std.mem.eql(u8, name, "write");
@@ -3887,16 +3256,12 @@ const probe = struct {
             log.recordMutation();
             return .{ .content = try context.gpa.dupe(u8, "ok"), .is_error = false };
         }
-        // A read holds the executing count for its whole body, so a mutation that
-        // sees a nonzero count caught a read the barrier failed to drain.
         _ = log.reads_running.fetchAdd(1, .acq_rel);
         defer _ = log.reads_running.fetchSub(1, .acq_rel);
         return .{ .content = try context.gpa.dupe(u8, "ok"), .is_error = false };
     }
 };
 
-// A tool that meets a guarded file asks Drinky for the skill. The round boundary
-// sends it as one user message, so the model holds the rules for its next act.
 test "a queued skill file joins the conversation at the round boundary" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -3918,8 +3283,6 @@ test "a queued skill file joins the conversation at the round boundary" {
     agent.skill_guard = &guard;
     defer agent.deinit();
 
-    // Records what the handler was told, so the report and the message can be
-    // compared against one delivery.
     const Handler = struct {
         skill: []const u8 = "",
         count: usize = 0,
@@ -3932,7 +3295,6 @@ test "a queued skill file joins the conversation at the round boundary" {
     var handler: Handler = .{};
     var turn: TurnState = .{ .base = 0, .checkpoint = 0 };
 
-    // Nothing waits, so the boundary sends nothing and the turn can end.
     try std.testing.expect(!try agent.drainSkills(&turn, &handler));
 
     try guard.require(&.{ .gpa = gpa, .io = io, .path = "src/App.zig", .history = &.{} });
@@ -3944,20 +3306,15 @@ test "a queued skill file joins the conversation at the round boundary" {
     try std.testing.expectEqual(llm.Role.user, message.role);
     try std.testing.expect(std.mem.endsWith(u8, message.text, body));
 
-    // The message is the proof, so a write of the same file goes ahead now.
     try std.testing.expect((try guard.refusal(&.{
         .gpa = gpa,
         .io = io,
         .path = "src/App.zig",
         .history = agent.items.items,
     })) == null);
-    // One delivery per queued rule: the queue is empty again.
     try std.testing.expect(!try agent.drainSkills(&turn, &handler));
 }
 
-// The skill guard proves a loaded skill against the conversation the tools
-// receive. That conversation must stop below the reply, or a skill that this
-// reply reads licenses a write that the same reply already asked for.
 test "the tool context carries the history below the reply" {
     const gpa = std.testing.allocator;
     var agent = scriptedAgent(gpa);
@@ -3965,8 +3322,6 @@ test "the tool context carries the history below the reply" {
     var handler: CaptureHandler = .{ .gpa = gpa };
     defer handler.deinit();
 
-    // Records what one call saw. A tool reads the context, so only a tool can
-    // report it.
     const Dispatch = struct {
         var seen_count: usize = 0;
         var seen_text: []const u8 = "";
@@ -3984,8 +3339,6 @@ test "the tool context carries the history below the reply" {
         }
     };
 
-    // The history holds one older message and then the reply, the way a real
-    // turn leaves it.
     try agent.appendUser("the older message");
     try agent.items.append(gpa, .{ .tool_call = .{
         .call_id = try gpa.dupe(u8, "w1"),
@@ -4012,8 +3365,6 @@ test "a mutating call is a barrier between the reads around it" {
     var handler: CaptureHandler = .{ .gpa = gpa };
     defer handler.deinit();
 
-    // Two reads, a mutation, a read: the leading reads run concurrently, the
-    // mutation drains them first, and the trailing read starts only after it.
     const reply = [_]llm.Item{
         .{ .tool_call = .{ .call_id = "r1", .name = "read", .arguments_json = "{}" } },
         .{ .tool_call = .{ .call_id = "r2", .name = "read", .arguments_json = "{}" } },
@@ -4023,12 +3374,9 @@ test "a mutating call is a barrier between the reads around it" {
     var turn: TurnState = .{ .base = 0, .checkpoint = 0 };
     try std.testing.expect(try agent.runToolsWith(probe, &reply, &turn, &handler));
 
-    // The mutation never ran while a read was still active...
     try std.testing.expect(!log.mutation_overlap);
-    // ...yet the two leading reads were dispatched concurrently.
     try std.testing.expectEqual(@as(usize, 2), log.launched_peak);
 
-    // Results stay in call order, one per call.
     try std.testing.expectEqual(@as(usize, 4), agent.items.items.len);
     try std.testing.expectEqualStrings("r1", agent.items.items[0].tool_result.call_id);
     try std.testing.expectEqualStrings("r2", agent.items.items[1].tool_result.call_id);
@@ -4038,9 +3386,6 @@ test "a mutating call is a barrier between the reads around it" {
     try std.testing.expectEqual(@as(usize, 4), handler.tool_result_count);
 }
 
-// Each running read holds one thread, so one reply must never spawn a thread
-// per call. A burst runs in batches of the cap, and every call still gets its
-// result in call order.
 test "a burst of read-only calls runs at most the cap at a time" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -4086,8 +3431,6 @@ test "a barrier presents the reads before it before announcing its mutation" {
     agent.io = threaded.io();
     defer agent.deinit();
 
-    // Records the presentation sequence itself, since call totals alone cannot
-    // tell a start that precedes an earlier call's result from one that follows.
     const Handler = struct {
         gpa: std.mem.Allocator,
         log: std.ArrayList(u8) = .empty,
@@ -4108,8 +3451,6 @@ test "a barrier presents the reads before it before announcing its mutation" {
         ) !void {
             try self.note("-", name);
         }
-        // The commit of the round publishes the gauges. This test drives that
-        // path directly, so it takes the callback and logs nothing.
         fn onUsage(_: *@This(), _: Stats) !void {}
     };
     var handler: Handler = .{ .gpa = gpa };
@@ -4123,8 +3464,6 @@ test "a barrier presents the reads before it before announcing its mutation" {
     var turn: TurnState = .{ .base = 0, .checkpoint = 0 };
     try std.testing.expect(try agent.runToolsWith(fake_tools, &reply, &turn, &handler));
 
-    // The read's result lands before the mutation is announced, and the trailing
-    // read's after it, so the presentation never runs backwards in call order.
     try std.testing.expectEqualStrings("+read-read+write-write+read-read", handler.log.items);
 }
 
@@ -4146,22 +3485,14 @@ test "a cancel at the barrier reaps launched reads and starts nothing after it" 
         .{ .tool_call = .{ .call_id = "w1", .name = "write", .arguments_json = "{}" } },
         .{ .tool_call = .{ .call_id = "r3", .name = "read", .arguments_json = "{}" } },
     };
-    // Cancel at the barrier await with no drain. This forces the errdefer's
-    // live-task reap. The launched read's finished result is harvested into its
-    // reserved slot, the mutation never runs, and the trailing read never starts.
     var turn: TurnState = .{ .base = 0, .checkpoint = 0 };
     try std.testing.expectError(
         error.Canceled,
         agent.runToolsWith(probe, &reply, &turn, &handler),
     );
     try std.testing.expect(!log.mutation_overlap);
-    // Only r1 was announced. The barrier drains ahead of its own announce, so a
-    // mutation canceled there is never presented as started, and r3 past it
-    // never begins.
     try std.testing.expectEqual(@as(usize, 1), handler.tool_start_count);
     try std.testing.expectEqual(@as(usize, 0), handler.tool_result_count);
-    // The whole round's result slots stay committed and replay-valid: one slot
-    // per call, in call order, and unresolved ones keep their unfinished-call result.
     try std.testing.expectEqual(@as(usize, 3), agent.items.items.len);
     try std.testing.expectEqualStrings("r1", agent.items.items[0].tool_result.call_id);
     try std.testing.expectEqualStrings("w1", agent.items.items[1].tool_result.call_id);
@@ -4181,8 +3512,6 @@ fn runToolsUnderOom(allocator: std.mem.Allocator) !void {
     var handler: CaptureHandler = .{ .gpa = allocator };
     defer handler.deinit();
 
-    // All-mutation calls run inline (no task spawn), so the sweep of the
-    // tool-result builder is deterministic under every injected failure.
     const reply = [_]llm.Item{
         .{ .tool_call = .{ .call_id = "w1", .name = "write", .arguments_json = "{}" } },
         .{ .tool_call = .{ .call_id = "w2", .name = "write", .arguments_json = "{}" } },
@@ -4219,9 +3548,6 @@ test "the round cap retains the completed rounds and fails the turn" {
     const rounds_max = 3;
     agent.rounds_max = rounds_max;
 
-    // A model that asks for a tool every round overruns the bound after exactly
-    // `rounds_max` rounds. Each round's side effects are real, so every
-    // completed round is retained at the latest checkpoint and the turn fails.
     var fetch: ScriptedFetch = .{
         .attempts = &.{.{ .stream = .{ .events = &tool_round_events } }},
     };
@@ -4229,7 +3555,6 @@ test "the round cap retains the completed rounds and fails the turn" {
     try std.testing.expectEqual(@as(usize, rounds_max), fetch.sends);
     try std.testing.expectEqual(@as(usize, rounds_max), handler.tool_result_count);
     try std.testing.expectEqual(@as(usize, rounds_max), handler.checkpoint_count);
-    // Prompt plus one tool_call/tool_result pair per completed round.
     try std.testing.expectEqual(@as(usize, 1 + 2 * rounds_max), agent.items.items.len);
 }
 
@@ -4254,8 +3579,6 @@ test "a reply past the tool call cap aborts and fails the turn" {
         .stop = .{ .usage = .{ .input = 71, .output = 9 } },
     };
 
-    // Round one commits before the next reply exceeds the call cap. The running
-    // usage belongs to the failed reply, but its terminal usage is never read.
     var overflow_events_read: usize = 0;
     var fetch: ScriptedFetch = .{ .attempts = &.{
         .{ .stream = .{ .events = &tool_round_events } },
@@ -4298,18 +3621,9 @@ test "run commits a no-tool reply and ends the turn" {
     try std.testing.expectEqual(@as(usize, 1), handler.checkpoint_count);
 }
 
-// Only a reply that stays in the history measures that history. A rejected
-// reply is retried and never reaches the append, a round that breaks before its
-// checkpoint rolls the reply back out, and a canceled attempt rolls its prompt
-// back, so all three leave the count on the last committed reply. The prompt of
-// an accepted request is processed and billed whole either way, so its hit rate
-// is final as soon as the counts arrive.
 test "only a committed reply measures the context, while any prompt rates the cache" {
     const gpa = std.testing.allocator;
 
-    // Empty history holds exactly zero tokens. The first prompt ends that
-    // certainty, because no reply has measured that text. A rollback to an
-    // empty history states the zero again.
     {
         var agent = scriptedAgent(gpa);
         defer agent.deinit();
@@ -4320,7 +3634,6 @@ test "only a committed reply measures the context, while any prompt rates the ca
         try std.testing.expectEqual(@as(?u64, 0), agent.stats.context_tokens);
     }
 
-    // A committed reply measures the whole prompt plus its own output.
     {
         var agent = scriptedAgent(gpa);
         defer agent.deinit();
@@ -4337,8 +3650,6 @@ test "only a committed reply measures the context, while any prompt rates the ca
         try std.testing.expectEqual(usage, agent.stats.cache_usage);
     }
 
-    // A rejected reply returns before the append, so it rates the cache and
-    // measures nothing. Its retry then commits and measures.
     {
         var agent = scriptedAgent(gpa);
         defer agent.deinit();
@@ -4357,8 +3668,6 @@ test "only a committed reply measures the context, while any prompt rates the ca
         try std.testing.expectEqual(rejected, agent.stats.cache_usage);
     }
 
-    // A reply that reaches no checkpoint leaves the history with its round, so
-    // the count waits for the checkpoint and stands where it was.
     {
         var agent = scriptedAgent(gpa);
         defer agent.deinit();
@@ -4377,8 +3686,6 @@ test "only a committed reply measures the context, while any prompt rates the ca
         try std.testing.expectEqual(uncommitted, agent.stats.cache_usage);
     }
 
-    // A cancel rolls the prompt back to the checkpoint that the last count
-    // already describes, so that count stands and the rate still moves.
     {
         var agent = scriptedAgent(gpa);
         defer agent.deinit();
@@ -4399,9 +3706,6 @@ test "only a committed reply measures the context, while any prompt rates the ca
     }
 }
 
-// The usage frame of a round arrives before the commit of that round, so the
-// commit publishes the gauges itself. Otherwise a tool round leaves the whole
-// next round with the measurement of the reply before it.
 test "each commit publishes its measurement before the next round streams" {
     const gpa = std.testing.allocator;
     var agent = scriptedAgent(gpa);
@@ -4409,8 +3713,6 @@ test "each commit publishes its measurement before the next round streams" {
     var handler: CaptureHandler = .{ .gpa = gpa };
     defer handler.deinit();
 
-    // Round one asks for a tool, and round two answers. Every prompt grows, so
-    // each measurement differs from the one before it.
     const call_events = [_]llm.Event{
         .{ .item = .{ .tool_call = .{
             .call_id = "r1",
@@ -4429,9 +3731,6 @@ test "each commit publishes its measurement before the next round streams" {
     } };
     try agent.runWith(&fetch, "go", &handler);
 
-    // The stream of a round reports the measurement of the round before it, and
-    // the commit that follows reports its own. So the second round streams with
-    // 120 already on the gauge, not with the null of a fresh conversation.
     try std.testing.expectEqualSlices(
         ?u64,
         &.{ null, 120, 120, 340 },
@@ -4447,8 +3746,6 @@ test "a committed truncation is reported in the receipt; a resampled one is not"
         .{ .item = .{ .message = "half an ans" } },
         .{ .stop = .{ .usage = .{}, .status = .truncated } },
     };
-    // A truncated tool-free answer commits and the turn completes, so the receipt
-    // is the only place the cutoff can still be reported.
     {
         var agent = scriptedAgent(gpa);
         defer agent.deinit();
@@ -4462,8 +3759,6 @@ test "a committed truncation is reported in the receipt; a resampled one is not"
         try std.testing.expectEqualStrings("half an ans", agent.items.items[1].message.text);
         try std.testing.expect(outcome.receipt.truncated);
     }
-    // A truncation rejected because it holds a tool call resamples. The attempt
-    // that finishes cleanly is the one committed, so nothing is reported as cut short.
     {
         var log: SleepLog = .init(std.testing.io);
         var agent = scriptedAgent(gpa);
@@ -4530,7 +3825,6 @@ test "run retries transient failures, resetting the stream before each reattempt
     var handler: CaptureHandler = .{ .gpa = gpa };
     defer handler.deinit();
 
-    // attempts_max is 3: a connect failure, a mid-stream failure, then success.
     var fetch: ScriptedFetch = .{ .attempts = &.{
         .{ .fail = error.ConnectionRefused },
         .{ .stream = .{ .events = &.{}, .terminal_error = error.Timeout } },
@@ -4607,7 +3901,6 @@ test "a retryable head's retry-after hint reaches backoff" {
     var handler: CaptureHandler = .{ .gpa = gpa };
     defer handler.deinit();
 
-    // Without the hint the first backoff is backoff_ms_initial (500ms).
     var fetch: ScriptedFetch = .{ .attempts = &.{
         .{ .stream = .{
             .events = &.{},
@@ -4635,9 +3928,6 @@ test "a retry-after past the backoff cap fails the turn at once" {
     var handler: CaptureHandler = .{ .gpa = gpa };
     defer handler.deinit();
 
-    // The head is retryable, but it asks for a wait the 16 s cap cannot serve.
-    // No wait inside the cap clears the failure, so the turn spends no further
-    // attempt.
     var fetch: ScriptedFetch = .{ .attempts = &.{
         .{ .stream = .{
             .events = &.{},
@@ -4656,9 +3946,6 @@ test "a retry-after past the backoff cap fails the turn at once" {
     try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
 }
 
-// Another Drinky instance can refresh the credential this one holds, which
-// revokes its access token. The rejected head must renew the credential once
-// and repeat the request, so the turn never sees the failure.
 test "a rejected credential renews once and repeats the request" {
     const gpa = std.testing.allocator;
     var log: SleepLog = .init(std.testing.io);
@@ -4683,7 +3970,6 @@ test "a rejected credential renews once and repeats the request" {
     try agent.runWith(&fetch, "go", &handler);
     try std.testing.expectEqual(@as(usize, 2), fetch.sends);
     try std.testing.expectEqual(@as(usize, 1), fetch.renewals);
-    // The repeat carries the new credential at once, so it waits for nothing.
     try std.testing.expectEqual(@as(usize, 0), log.count);
     try std.testing.expectEqualStrings(
         "2 response 401 Unauthorized: OAuth access token has been revoked.\n",
@@ -4700,7 +3986,6 @@ test "a credential that cannot renew reports the rejection at once" {
     var handler: CaptureHandler = .{ .gpa = gpa };
     defer handler.deinit();
 
-    // An API key comes from the environment, so no renewal can replace it.
     var fetch: ScriptedFetch = .{
         .attempts = &.{
             .{ .stream = .{
@@ -4717,7 +4002,6 @@ test "a credential that cannot renew reports the rejection at once" {
     try std.testing.expectEqual(@as(usize, 1), fetch.renewals);
     try std.testing.expectEqualStrings("401 Unauthorized: invalid x-api-key", handler.errors.items);
 
-    // A renewal that finds another principal stops the turn with its own error.
     var replaced: ScriptedFetch = .{
         .attempts = &.{.{ .stream = .{
             .events = &.{},
@@ -4739,8 +4023,6 @@ test "a rejection that outlives its renewal is reported after one repeat" {
     var handler: CaptureHandler = .{ .gpa = gpa };
     defer handler.deinit();
 
-    // Every attempt is rejected, so the renewed credential fails too. One
-    // renewal per reply bounds the repeats, whatever the provider answers.
     var fetch: ScriptedFetch = .{
         .attempts = &.{.{ .stream = .{
             .events = &.{},
@@ -4777,9 +4059,6 @@ test "a mid-stream cancel propagates without a retry" {
 
 test "an API error retains completed rounds, reports, and fails the turn" {
     const gpa = std.testing.allocator;
-    // A committed tool round, then an API error in the next request: the round
-    // is retained (its result honest about a possible side effect). The error is
-    // reported and surfaced as a failed disposition.
     {
         var agent = scriptedAgent(gpa);
         defer agent.deinit();
@@ -4795,14 +4074,11 @@ test "an API error retains completed rounds, reports, and fails the turn" {
         } };
         try std.testing.expectError(error.ApiError, agent.runWith(&fetch, "go", &handler));
         try std.testing.expectEqualStrings("boom", handler.errors.items);
-        // Prompt plus the completed tool_call/tool_result round survive.
         try std.testing.expectEqual(@as(usize, 3), agent.items.items.len);
         try std.testing.expectEqualStrings("go", agent.items.items[0].message.text);
         try std.testing.expectEqualStrings("t1", agent.items.items[1].tool_call.call_id);
         try std.testing.expectEqualStrings("t1", agent.items.items[2].tool_result.call_id);
     }
-    // A failed head on the first request commits nothing, so the turn rolls back
-    // to its base and drops the prompt.
     {
         var agent = scriptedAgent(gpa);
         defer agent.deinit();
@@ -4824,8 +4100,6 @@ test "a failed or canceled attempt still adopts the head's allowance" {
     const gpa = std.testing.allocator;
     const exhausted: llm.Quota = .{ .primary = .{ .used_percent = 100, .window_minutes = 300 } };
 
-    // An exhausted 429 emits no stop event, but its head reported the spent
-    // account: the gauge must show that, not the previous allowance.
     {
         var agent = scriptedAgent(gpa);
         defer agent.deinit();
@@ -4838,8 +4112,6 @@ test "a failed or canceled attempt still adopts the head's allowance" {
         try std.testing.expectEqual(@as(f64, 100), agent.stats.quota.?.primary.?.used_percent);
     }
 
-    // A cancel interrupts the read before its stop, yet the head's allowance was
-    // already captured.
     {
         var agent = scriptedAgent(gpa);
         defer agent.deinit();
@@ -4860,10 +4132,6 @@ test "the head that states an allowance stamps its own arrival" {
     var handler: CaptureHandler = .{ .gpa = gpa };
     defer handler.deinit();
 
-    // A window states its reset against the response that carried it, so the
-    // stamp must move only when a head states an allowance. A later head in the
-    // same turn that states none keeps both, so the countdown keeps running
-    // down instead of starting again.
     agent.stats.quota_seen_ms = 0;
     var stated: ScriptedFetch = .{ .attempts = &.{
         .{ .stream = .{
@@ -4882,7 +4150,6 @@ test "the head that states an allowance stamps its own arrival" {
     try std.testing.expect(stamped > 0);
     try std.testing.expectEqual(@as(f64, 12), agent.stats.quota.?.primary.?.used_percent);
 
-    // A new turn drops the last turn even when its head states none.
     var silent: ScriptedFetch = .{ .attempts = &.{
         .{ .stream = .{ .events = &end_turn_events } },
     } };
@@ -4936,8 +4203,6 @@ test "a response head adopts the allowance before the reply streams" {
     try agent.runWith(&fetch, "go", &handler);
     try std.testing.expectEqual(@as(f64, 40), agent.stats.quota.?.primary.?.used_percent);
     try std.testing.expectEqual(@as(?u32, 300), agent.stats.quota.?.primary.?.window_minutes);
-    // Head publish, stop usage, and commit: three snapshots. Without the head
-    // publish the count would be two.
     try std.testing.expectEqual(@as(usize, 3), handler.usage_count);
 }
 
@@ -5088,9 +4353,6 @@ test "an out-of-memory credit read fails the turn and keeps the reply" {
     try std.testing.expectEqual(@as(usize, 2), agent.items.items.len);
 }
 
-// The user wrote the message against a reply that was still streaming, so the
-// finished reply can change what they want to send. A reply that asks for no
-// tool ends the turn, and the queue holds the message for review.
 test "steering queued during a final reply stays queued" {
     const gpa = std.testing.allocator;
     var agent = scriptedAgent(gpa);
@@ -5116,8 +4378,6 @@ test "steering queued during a final reply stays queued" {
     try std.testing.expectEqualStrings("steer", queued[0]);
 }
 
-// A round that asks for a tool keeps the turn alive on its own, so the steering
-// of the user reaches the model before the model acts again.
 test "steering folds into a turn that a tool round keeps alive" {
     const gpa = std.testing.allocator;
     var agent = scriptedAgent(gpa);
@@ -5140,15 +4400,11 @@ test "steering folds into a turn that a tool round keeps alive" {
     try std.testing.expectEqualStrings("steer", agent.items.items[3].message.text);
     try std.testing.expectEqualStrings("hi", agent.items.items[4].message.text);
 
-    // The batch left the queue with the reply that committed it.
     const queued = try agent.steering.take();
     defer gpa.free(queued);
     try std.testing.expectEqual(@as(usize, 0), queued.len);
 }
 
-// A minimal tool source for whole-turn tests: "write" mutates, everything else
-// reads, and every call returns a fixed success result. Unlike `probe` it reads
-// no scheduling log, so it runs under any backing io.
 const fake_tools = struct {
     fn mutates(name: []const u8) bool {
         return std.mem.eql(u8, name, "write");
@@ -5167,8 +4423,6 @@ const fake_tools = struct {
     }
 };
 
-// A tool source whose every call is a mutation that raises and returns no
-// result. It exercises the conservative unfinished-call result retention path.
 const raising_tools = struct {
     fn mutates(name: []const u8) bool {
         _ = name;
@@ -5183,7 +4437,6 @@ const raising_tools = struct {
     }
 };
 
-/// A read-only pair that proves tool errors and pending scheduling state remain distinct.
 const not_run_tools = struct {
     fn mutates(name: []const u8) bool {
         _ = name;
@@ -5218,8 +4471,6 @@ const closed_tools = struct {
 };
 
 test "a preparation failure dispatches nothing and commits no result slot" {
-    // A failed allocation before the placeholder run is committed must leave
-    // no tool announced and no slot appended.
     for ([_]usize{ 0, 1, 2 }) |fail_at| {
         var failing: std.testing.FailingAllocator =
             .init(std.testing.allocator, .{ .fail_index = fail_at });
@@ -5250,8 +4501,6 @@ test "a completed mutation's real result survives a callback failure" {
     agent.io = threaded.io();
     defer agent.deinit();
 
-    // The result is moved into history before the presentation callback runs,
-    // so a callback failure cannot leave provider-visible history dishonest.
     const Handler = struct {
         fn onToolStart(_: *@This(), _: []const u8, _: []const u8) !void {}
         fn onToolResult(
@@ -5265,7 +4514,6 @@ test "a completed mutation's real result survives a callback failure" {
             try std.testing.expectEqualStrings("summary", summary.text);
             return error.Boom;
         }
-        // The commit of the round publishes the gauges before any dispatch.
         fn onUsage(_: *@This(), _: Stats) !void {}
     };
     var handler: Handler = .{};
@@ -5327,7 +4575,6 @@ test "a mutation that raises retains the conservative unfinished-call result" {
         error.Boom,
         agent.runToolsWith(raising_tools, &reply, &turn, &handler),
     );
-    // The slot stays committed with its honest unfinished-call result and no callback.
     try std.testing.expectEqual(@as(usize, 1), agent.items.items.len);
     try std.testing.expect(agent.items.items[0].tool_result.is_error);
     try std.testing.expectEqualStrings(
@@ -5364,14 +4611,12 @@ test "cancellation after a completed tool round retains it at the checkpoint" {
     var handler: CaptureHandler = .{ .gpa = gpa };
     defer handler.deinit();
 
-    // Round 1 runs a tool. Round 2's request is canceled mid-stream.
     var fetch: ScriptedFetch = .{ .attempts = &.{
         .{ .stream = .{ .events = &tool_round_events } },
         .{ .stream = .{ .events = &.{}, .terminal_error = error.Canceled } },
     } };
     const outcome = agent.runTurnWith(&fetch, fake_tools, "go", &handler);
     try std.testing.expect(std.meta.activeTag(outcome.disposition) == .canceled);
-    // Prompt + tool_call + its real result survive at the checkpoint.
     try std.testing.expectEqual(@as(usize, 3), agent.items.items.len);
     try std.testing.expectEqual(@as(usize, 0), outcome.receipt.history_base);
     try std.testing.expectEqual(@as(usize, 3), outcome.receipt.history_end);
@@ -5403,8 +4648,6 @@ test "a canceled request's partial usage is folded into the cost stats" {
     var handler: CaptureHandler = .{ .gpa = gpa };
     defer handler.deinit();
 
-    // The read is canceled before any terminal `.stop`, but the stream had
-    // already accumulated the prompt's usage, which the provider bills.
     var fetch: ScriptedFetch = .{ .attempts = &.{.{ .stream = .{
         .events = &.{},
         .terminal_error = error.Canceled,
@@ -5412,7 +4655,6 @@ test "a canceled request's partial usage is folded into the cost stats" {
     } }} };
     const outcome = agent.runTurnWith(&fetch, fake_tools, "go", &handler);
     try std.testing.expect(std.meta.activeTag(outcome.disposition) == .canceled);
-    // The billed prompt is recorded, and the cache-rate gauge reflects it.
     try std.testing.expect(agent.stats.cost > 0);
     try std.testing.expectEqual(@as(u64, 1_000_000), agent.stats.cache_usage.input);
     try std.testing.expectEqual(@as(u64, 200_000), agent.stats.cache_usage.cache_read);
@@ -5425,8 +4667,6 @@ test "a cancel before any usage frame leaves this turn's cache rate intact" {
     var handler: CaptureHandler = .{ .gpa = gpa };
     defer handler.deinit();
 
-    // Round one books the prompt. A cancel of the next round before any usage
-    // must not fold a zero reading in and reset that gauge.
     const call_events = [_]llm.Event{
         .{ .item = .{ .tool_call = .{
             .call_id = "t1",
@@ -5451,9 +4691,6 @@ test "a cancel during the post-stop usage callback books terminal usage only onc
     var handler: CaptureHandler = .{ .gpa = gpa, .fail_usage = true };
     defer handler.deinit();
 
-    // The stream reaches its terminal `.stop` and books usage once, but the
-    // cancel lands during the usage callback that follows it. The partial fold
-    // must not re-book the same usage, even though usage-so-far now equals it.
     const events = [_]llm.Event{
         .{ .item = .{ .message = "hi" } },
         .{ .stop = .{ .usage = .{ .input = 1000 } } },
@@ -5464,8 +4701,6 @@ test "a cancel during the post-stop usage callback books terminal usage only onc
     } }} };
     const outcome = agent.runTurnWith(&fetch, fake_tools, "go", &handler);
     try std.testing.expect(std.meta.activeTag(outcome.disposition) == .canceled);
-    // Recorded exactly once: the model prices 1M input at $3, so 1000 input
-    // is $0.003.
     try std.testing.expectApproxEqAbs(@as(f64, 0.003), agent.stats.cost, 1e-9);
     try std.testing.expectEqual(@as(u64, 1000), agent.stats.cache_usage.input);
 }
@@ -5477,8 +4712,6 @@ test "a completed round is retained when a later steered reply is canceled" {
     var handler: CaptureHandler = .{ .gpa = gpa };
     defer handler.deinit();
 
-    // Round 1 asks for a tool, which keeps the turn alive and folds the steering
-    // in. Round 2 is canceled before it commits.
     try agent.steering.push("steer");
     var fetch: ScriptedFetch = .{ .attempts = &.{
         .{ .stream = .{ .events = &tool_round_events } },
@@ -5486,12 +4719,10 @@ test "a completed round is retained when a later steered reply is canceled" {
     } };
     const outcome = agent.runTurnWith(&fetch, fake_tools, "go", &handler);
     try std.testing.expect(std.meta.activeTag(outcome.disposition) == .canceled);
-    // The completed tool round survives. The canceled steer round is dropped.
     try std.testing.expectEqual(@as(usize, 3), agent.items.items.len);
     try std.testing.expectEqualStrings("go", agent.items.items[0].message.text);
     try std.testing.expectEqualStrings("t1", agent.items.items[1].tool_call.call_id);
     try std.testing.expectEqualStrings("t1", agent.items.items[2].tool_result.call_id);
-    // The steer was consumed but not committed, so it returns to the queue.
     try std.testing.expectEqual(@as(usize, 0), outcome.receipt.steering_committed_count);
     const restored = try agent.steering.take();
     defer {
@@ -5516,7 +4747,6 @@ test "the receipt reports the committed steering count and history span" {
     } };
     const outcome = agent.runTurnWith(&fetch, fake_tools, "go", &handler);
     try std.testing.expect(std.meta.activeTag(outcome.disposition) == .completed);
-    // The steer batch is consumed in round 1 and committed by round 2's reply.
     try std.testing.expectEqual(@as(usize, 1), outcome.receipt.steering_committed_count);
     try std.testing.expectEqual(@as(usize, 5), outcome.receipt.history_end);
     try std.testing.expect(!outcome.receipt.truncated);

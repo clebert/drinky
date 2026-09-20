@@ -1,30 +1,14 @@
-//! A keyed JSON object file: one top-level object that maps each key to that
-//! key's entry. The credential store uses the account as the key. The app state
-//! store uses the project. The prompt history uses a normalized prompt key.
-//! This module owns the file shape only. The caller owns its entry fields
-//! (passed as `anytype`), so nothing here knows an entry shape.
-//!
-//! Every write holds the owner-only `{path}.lock` sibling across its load,
-//! merge, and atomic rename. Lock contention ends with `error.StoreBusy` after
-//! a bounded wait. A corrupt file is never replaced.
-
 const std = @import("std");
 
 const json = @import("json.zig");
 
 pub const LockPolicy = struct {
-    /// The maximum number of nonblocking lock attempts.
     attempts_max: usize = 50,
-    /// The wait between attempts. The default total wait is about 490 ms.
     wait_ms: u64 = 10,
 };
 
-/// The policy of every lock. A test that provokes contention in a caller lowers
-/// it, because the bounded retry itself is proven here.
 pub var lock_policy: LockPolicy = .{};
 
-/// A parsed store file that owns its backing memory and answers entry lookups.
-/// Open with `open`. Free with `deinit`.
 pub const File = struct {
     parsed: std.json.Parsed(std.json.Value),
 
@@ -32,39 +16,25 @@ pub const File = struct {
         self.parsed.deinit();
     }
 
-    /// The entry object stored under `key`, or null when it is absent or not an
-    /// object.
     pub fn entry(self: *const File, key: []const u8) ?std.json.ObjectMap {
         return json.object(self.parsed.value.object.get(key));
     }
 
-    /// Every top-level key in file order, which is the write order. The keys
-    /// borrow the file.
     pub fn keys(self: *const File) []const []const u8 {
         return self.parsed.value.object.keys();
     }
 };
 
-/// How many keys a save can leave in the file.
 pub const SaveOptions = struct {
-    /// The number of top-level keys the file can hold after the save. The
-    /// rewrite drops the oldest keys first, in the order the file holds them. A
-    /// save appends its own key last, so the file order is the write order.
-    /// Null keeps every key.
     keys_max: ?usize = null,
 };
 
-/// One string field that must still match before its complete entry is removed.
 pub const RemoveCondition = struct {
     key: []const u8,
     field: []const u8,
     expected: []const u8,
 };
 
-/// Open the store file at `path`, or null when it does not exist. A present
-/// file that Drinky cannot parse as a JSON object is `error.CorruptStore`, the
-/// same failure a rewrite reports. Caller frees a non-null result with
-/// `File.deinit`.
 pub fn open(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !?File {
     const data = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited) catch |err|
         switch (err) {
@@ -83,9 +53,6 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !?File {
     return .{ .parsed = parsed };
 }
 
-/// Persist `entry` under `key` in the store file at `path`. The save creates
-/// the parent directory and preserves every other top-level key already
-/// present, up to `options.keys_max`. The write uses owner-only permissions.
 pub fn save(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -97,8 +64,6 @@ pub fn save(
     try rewrite(gpa, io, path, key, entry, options);
 }
 
-/// Remove `key` and rewrite every other entry verbatim. A missing store leaves
-/// no data file, but the operation creates its parent directory and lock file.
 pub fn remove(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -108,9 +73,6 @@ pub fn remove(
     try rewrite(gpa, io, path, key, null, .{});
 }
 
-/// Remove one entry only when its string field still has the expected value.
-/// Return true only when the matching entry was removed. Every Drinky writer
-/// holds the same lock across the comparison and rewrite.
 pub fn removeMatchingString(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -131,7 +93,6 @@ pub fn removeMatchingString(
     return true;
 }
 
-/// Load, merge, and replace while every Drinky writer holds one stable lock file.
 fn rewrite(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -162,7 +123,6 @@ fn ensureParent(io: std.Io, path: []const u8) !void {
     }
 }
 
-/// Open the stable sibling lock file and take its exclusive advisory lock.
 fn lockFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !std.Io.File {
     return lockFileWithPolicy(gpa, io, path, lock_policy);
 }
@@ -219,10 +179,6 @@ fn stringMatches(
     return std.mem.eql(u8, value, condition.expected);
 }
 
-/// Atomically replace the file at `path` with `body` at owner-only
-/// permissions: rename a temp file in the same directory over the destination.
-/// A crash or cancellation mid-save leaves the old file intact rather than
-/// truncated.
 fn replaceFile(io: std.Io, path: []const u8, body: []const u8) !void {
     var atomic = try std.Io.Dir.cwd().createFileAtomic(io, path, .{
         .permissions = @enumFromInt(0o600),
@@ -233,13 +189,6 @@ fn replaceFile(io: std.Io, path: []const u8, body: []const u8) !void {
     try atomic.replace(io);
 }
 
-/// The whole store file with `key` set to `entry` — or dropped, for a null
-/// `entry` — and every other top-level key verbatim. An absent `existing`
-/// starts from a fresh object. An unparseable or non-object one is
-/// `error.CorruptStore` rather than a fresh start: no rewrite can wipe a
-/// sibling key with a fresh start on a file it could not read. A `keys_max`
-/// drops the oldest keys, which are the ones the file holds first. The saved
-/// key always survives. The caller frees the result.
 fn serialize(
     gpa: std.mem.Allocator,
     existing: ?[]const u8,
@@ -247,8 +196,6 @@ fn serialize(
     entry: anytype,
     options: SaveOptions,
 ) ![]u8 {
-    // True for a save, false for a removal. Comptime, because a null `entry` is
-    // the null type rather than a runtime value.
     const writes_key = @TypeOf(entry) != @TypeOf(null);
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
@@ -266,9 +213,7 @@ fn serialize(
         var dropped = dropCount(&parsed.value.object, key, writes_key, options);
         var entries = parsed.value.object.iterator();
         while (entries.next()) |field| {
-            // Skip our own entry (rewritten fresh below, or dropped).
             if (std.mem.eql(u8, field.key_ptr.*, key)) continue;
-            // Skip the oldest entries the cap has no room for.
             if (dropped > 0) {
                 dropped -= 1;
                 continue;
@@ -286,10 +231,6 @@ fn serialize(
     return out.toOwnedSlice();
 }
 
-/// How many of the keys already in `object` the cap leaves no room for. Set
-/// `writes_key` for a save and clear it for a removal, because a written key
-/// takes one of the slots. The two saturating subtractions accept an over-full
-/// file and a cap below one slot, which are both normal.
 fn dropCount(
     object: *const std.json.ObjectMap,
     key: []const u8,
@@ -297,7 +238,6 @@ fn dropCount(
     options: SaveOptions,
 ) usize {
     const keys_max = options.keys_max orelse return 0;
-    // A contained key counts toward `count`, so this cannot underflow.
     const kept = object.count() - @intFromBool(object.contains(key));
     const room = keys_max -| @intFromBool(writes_key);
     return kept -| room;
@@ -328,9 +268,6 @@ test "File reads keyed entries" {
     );
 }
 
-// A save appends its key last, so the file order is the write order. A caller
-// that reads the order back needs the keys as the file holds them, and a key
-// whose value is no object still counts as a key.
 test "File lists its keys in file order" {
     const gpa = std.testing.allocator;
 
@@ -388,7 +325,6 @@ test "serialize from nothing writes just the entry, and replaces its own" {
         parsed.value.object.get("openai-plan").?.object.get("access").?.string,
     );
 
-    // `serialize` replaces an existing entry under the same key and keeps a sibling.
     const replaced = try serialize(
         gpa,
         "{\"anthropic-plan\":{\"access\":\"keep\"}," ++
@@ -444,7 +380,6 @@ test "serialize drops a key, preserving other keys" {
         root.get("anthropic-plan").?.object.get("access").?.string,
     );
 
-    // The removal of the last key leaves a valid empty object, not a wipe error.
     const emptied = try serialize(gpa, merged, "anthropic-plan", null, .{});
     defer gpa.free(emptied);
     var parsed_empty = try std.json.parseFromSlice(std.json.Value, gpa, emptied, .{});
@@ -455,7 +390,6 @@ test "serialize drops a key, preserving other keys" {
 test "a key cap drops the oldest keys and keeps the saved one" {
     const gpa = std.testing.allocator;
 
-    // Three keys, a cap of two: the oldest key goes and the saved key lands last.
     const capped = try serialize(
         gpa,
         "{\"first\":1,\"second\":2,\"third\":3}",
@@ -470,7 +404,6 @@ test "a key cap drops the oldest keys and keeps the saved one" {
     try std.testing.expectEqualStrings("third", parsed.value.object.keys()[0]);
     try std.testing.expectEqualStrings("fourth", parsed.value.object.keys()[1]);
 
-    // A rewrite of a key already present frees its own slot, so nothing drops.
     const rewritten = try serialize(
         gpa,
         "{\"first\":1,\"second\":2}",
@@ -484,7 +417,6 @@ test "a key cap drops the oldest keys and keeps the saved one" {
     try std.testing.expectEqual(@as(usize, 2), parsed_rewritten.value.object.count());
     try std.testing.expectEqual(@as(i64, 9), parsed_rewritten.value.object.get("first").?.integer);
 
-    // The saved key survives a cap with no room at all.
     const only = try serialize(gpa, "{\"first\":1}", "second", 2, .{ .keys_max = 0 });
     defer gpa.free(only);
     var parsed_only = try std.json.parseFromSlice(std.json.Value, gpa, only, .{});
@@ -532,7 +464,6 @@ test "save replaces the file atomically at owner-only permissions" {
         @as(u32, @intCast(@intFromEnum(before.permissions))) & 0o777,
     );
 
-    // A rewrite lands on a fresh inode — renamed over, never truncated in place.
     try save(gpa, io, path, "anthropic-plan", entry, .{});
     const after = try tmp.dir.statFile(io, "auth.json", .{});
     try std.testing.expect(before.inode != after.inode);
@@ -630,7 +561,6 @@ test "open, save, and remove refuse a corrupt file, leaving it intact on disk" {
     const entry: TestEntry = .{ .access = "at", .refresh = "rt", .expires_ms = 1 };
 
     try tmp.dir.writeFile(io, .{ .sub_path = "auth.json", .data = "{ not json" });
-    // Every entry point reports the same failure, so a caller translates one name.
     try std.testing.expectError(error.CorruptStore, open(gpa, io, path));
     try std.testing.expectError(
         error.CorruptStore,

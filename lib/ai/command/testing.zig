@@ -1,7 +1,3 @@
-//! Shared factories for the command tests: an `Accounts` registry stubbed to
-//! the given authentication state, the model lists that registry offers, and an
-//! `Agent` on the given credentials.
-
 const std = @import("std");
 
 const Accounts = @import("../Accounts.zig");
@@ -10,9 +6,6 @@ const llm = @import("../llm.zig");
 const model_testing = @import("../testing.zig");
 const provider = @import("../provider.zig");
 
-/// A registry that offers no model. A test that needs one calls `seed`. A ready
-/// key file account takes a credential stub that owns nothing, because the
-/// commands read the authenticated state alone.
 pub fn accounts(
     environment: Accounts.Environment,
     ready: struct {
@@ -44,8 +37,6 @@ pub fn accounts(
     return registry;
 }
 
-/// Free every model list a `seed` call added. A registry from `accounts` owns
-/// nothing else, so this is its whole teardown.
 pub fn deinitAccounts(registry: *Accounts) void {
     for (std.enums.values(llm.Account)) |account| {
         registry.gpa.free(registry.catalog.accounts.get(account));
@@ -53,7 +44,6 @@ pub fn deinitAccounts(registry: *Accounts) void {
     }
 }
 
-/// Offer `names` under `account`, as a fetch does.
 pub fn seed(registry: *Accounts, account: llm.Account, names: []const []const u8) !void {
     try model_testing.seedAccount(registry, account, names);
 }

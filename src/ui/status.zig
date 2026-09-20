@@ -1,20 +1,3 @@
-//! The bottom status line. It shows the working directory with its branch, then
-//! the session numbers, on the left. It shows `Model: account/model` and the
-//! effort on the right. A notice temporarily replaces the line. The renderer
-//! uses a caller-built `Info` snapshot.
-//!
-//! A narrow window first shortens fields in one fixed order. It then removes
-//! complete parts in another fixed order. The context gauge never goes.
-//!
-//! The line paints muted. Every field but the place writes one label and one
-//! value. The label keeps the muted role, and the value alone can leave it. The
-//! run covers the whole value, its bracketed detail included. A cut that takes
-//! the value away takes its run too. A gauge value takes a color when it fills
-//! past a threshold, and an identity value takes the normal intensity.
-//! Color means pressure. Intensity means identity. A model value that can run no
-//! turn takes the warning color, because it blocks the next send. A notice takes
-//! the role of its severity, and an information notice takes the accent role.
-
 const std = @import("std");
 
 const ai = @import("ai");
@@ -25,60 +8,20 @@ const paint = @import("paint.zig");
 const role = @import("role.zig");
 
 pub const Info = struct {
-    /// The working directory, with the home directory written as `~`. The caller
-    /// keeps it short, at most `directory_bytes_max`, because the line shows an
-    /// identity and not a whole path. Empty hides the directory and its branch.
     directory: []const u8,
-    /// The branch of the repository, or null outside one and for a head that
-    /// Drinky could not read. The caller bounds it at `ai.project.head_name_bytes_max`.
     branch: ?[]const u8,
-    /// The conversation context the last committed reply measured. Null shows
-    /// the unknown form, which happens before the first reply and after a
-    /// change that renders the same history in another way.
     context_tokens: ?u64,
-    /// The prompt usage of the last request under the active cache key. An
-    /// all-zero prompt hides the cache rate.
     cache_usage: ai.llm.Usage,
-    /// The session cost at public rates. It is an estimate, and a subscription
-    /// pays none of it.
     cost: f64,
-    /// The context limit of the active model, or null when no source stated one.
-    /// The gauge then shows the tokens alone.
     context_window: ?u64,
-    /// The active model, or null when the account offers none yet.
     model: ?[]const u8,
     effort: []const u8,
-    /// The active account. Null writes `signed out` as the model value, and the
-    /// effort stays, because `/effort` sets a level while signed out.
     account: ?ai.llm.Account,
-    /// A subscription's allowance, or null when the active provider reports
-    /// none (an API key, or a non-subscription turn). Each window whose duration
-    /// identifies it shows on the left as `<label>: N% (<wait>)`.
     quota: ?ai.llm.Quota,
-    /// The time since the report that carried the quota. The reset of a window
-    /// ages with that report, so the line subtracts this to show the wait that
-    /// is left now.
     quota_age_ms: i64,
-    /// The credit pool of an account that spends a prepaid pool, or null when
-    /// the active provider reports none. An OpenRouter turn reads the pool
-    /// after each model reply, so the line shows it while a turn runs, like
-    /// the quota. The pool prints an amount and takes no color, because an
-    /// amount states no share.
     credits: ?ai.llm.Credits,
-    /// Whether a turn runs. The quota is a live subscription allowance, the
-    /// pool is a live balance, and the cache rate measures one request, so all
-    /// three show while a turn runs and go when it ends. They show only after
-    /// this turn reports them, never from the last turn. An idle Drinky paints
-    /// no frame, which freezes a countdown on the screen. The numbers are no
-    /// safer: another agent on the same account spends the same allowance and
-    /// the same pool, so an idle number can read too low, and it reads too
-    /// high once the window starts again. Only a fresh report from the provider
-    /// states the truth.
     turn_active: bool,
-    /// The shares at which a gauge takes a color. The default is the compiled
-    /// pair, so a caller that configures none keeps it.
     gauge: Gauge = .{},
-    /// A temporary notice replaces this footer until the next user action.
     notice: ?Notice = null,
 
     pub const Notice = struct {
@@ -87,44 +30,27 @@ pub const Info = struct {
     };
 };
 
-/// The two shares at which a gauge leaves the muted role of the line. A gauge
-/// that fills to `percent_warning` takes the warning color, and one that fills
-/// to `percent_error` takes the error color. A gauge below the warning share
-/// keeps the muted role, so a color on this line always means pressure. The
-/// configuration sets the pair, and the two defaults are the compiled pair.
 pub const Gauge = struct {
     percent_warning: f64 = 75,
     percent_error: f64 = 90,
 
-    /// The window that a configured share must fall in. A gauge measures a share
-    /// of its own limit, so no threshold sits outside it.
     pub const percent_min: f64 = 0;
     pub const percent_max: f64 = 100;
 };
 
-/// The longest directory the caller passes. It bounds the left scratch buffer,
-/// so the whole line always fits and the writer can never fail.
 pub const directory_bytes_max = 96;
 
-/// The label of the context gauge. Every form of the gauge carries it.
 const context_label = "Context: ";
 
-/// The model value while no account is active.
 const signed_out_value = "signed out";
-/// The model value of an account that offers no model yet.
 const no_model_value = "none";
 
-/// Joins the account identifier and the model name into one identifier.
 const account_model_separator = "/";
 
-/// Separates one part of the line from the next.
 const separator = " · ";
 
-/// The compact branch keeps at most this many display columns before its mark.
 const branch_prefix_columns_max = 16;
 
-/// The parts the line shows. `all` is what a wide window gets. Each reduction
-/// selects a shorter form or removes one complete part.
 const Parts = struct {
     place: Place,
     branch: Branch,
@@ -138,17 +64,10 @@ const Parts = struct {
     account: bool,
     effort: bool,
 
-    /// The directory: whole, its last component alone, or gone with its branch.
     const Place = enum { full, short, hidden };
 
-    /// The branch: whole, its first bounded prefix with an ellipsis, or gone. A
-    /// bracketed detail goes before the head that carries it, so the branch goes
-    /// while the directory stays.
     const Branch = enum { full, short, hidden };
 
-    /// The context gauge: with its token counts, or the percentage alone. An
-    /// unknown measurement has one form. The gauge has no hidden form, because
-    /// the fill of the window drives what the user does next.
     const Context = enum { full, short };
 
     const all: Parts = .{
@@ -166,13 +85,6 @@ const Parts = struct {
     };
 };
 
-/// Shorten each field before any complete part goes. The measurements of one
-/// request go next, longest window first, and the credit pool with them,
-/// because they leave the line when the turn ends anyway. The session cost
-/// outlives them, so a narrow line holds the same numbers whether a turn runs
-/// or not. Each side then gives up its detail before the head that carries it:
-/// the account prefix of the model, then the branch, then the place. The effort
-/// goes last.
 const reductions = [_]Reduction{
     .shorten_directory,
     .shorten_branch,
@@ -223,21 +135,10 @@ fn reduce(parts: *Parts, reduction: Reduction) void {
     }
 }
 
-/// One painted run of a line: the bytes from `start` to `end`, and the role that
-/// paints them. A line is muted outside every run.
 const Run = struct { start: usize, end: usize, name: role.Name };
 
-/// The runs one side can hold: the context gauge and the two quota windows on
-/// the left, the model value and the effort level on the right.
 const runs_max = 3;
 
-/// One side of the line under construction: its bytes, and the runs that leave
-/// the muted role. A field marks its own run after it writes, so a field that
-/// shortens or goes away needs no separate accounting.
-///
-/// A function that writes a whole field takes the line. A function that formats
-/// one fragment, such as a token count, takes the writer alone and can mark
-/// nothing.
 const Line = struct {
     out: std.Io.Writer,
     runs: [runs_max]Run,
@@ -255,10 +156,6 @@ const Line = struct {
         return self.out.buffered().len;
     }
 
-    /// Paint the bytes from `start` to the end of the line with `name`. A muted
-    /// field records nothing, because the whole line already paints muted. A
-    /// line with no run left keeps the field muted, so one field more than
-    /// `runs_max` loses a color and never writes past the array.
     fn mark(self: *Line, start: usize, name: role.Name) void {
         if (name == .muted or self.count == self.runs.len) return;
         self.runs[self.count] = .{ .start = start, .end = self.offset(), .name = name };
@@ -270,22 +167,12 @@ const Line = struct {
     }
 };
 
-/// The role a gauge takes at `used_percent`. A gauge below the warning share of
-/// `gauge` keeps the muted role of the line, so a color always means pressure.
-///
-/// The caller passes the used share that the printed number implies, not the
-/// measured share. Two rows that print one number then always take one color,
-/// and the color never contradicts the number beside it.
 fn pressureRole(gauge: Gauge, used_percent: f64) role.Name {
     if (used_percent >= gauge.percent_error) return .@"error";
     if (used_percent >= gauge.percent_warning) return .warning;
     return .muted;
 }
 
-/// Paint `kept` of `line`: each run in its own role, and the muted role around
-/// them. A run opens with the reset, because the muted role holds the faint
-/// intensity that an identity field must drop. The runs come in write order, so
-/// they never overlap, and a cut drops a whole run or its tail alone.
 fn paintRuns(sink: *terminal.View.Sink, line: *const Line, kept: []const u8) !void {
     var cursor: usize = 0;
     for (line.marked()) |run| {
@@ -301,18 +188,9 @@ fn paintRuns(sink: *terminal.View.Sink, line: *const Line, kept: []const u8) !vo
     try sink.text(kept[cursor..]);
 }
 
-/// Stream the status line through `placement`. Put the place and the session
-/// numbers on the left, and the agent on the right. Reduce the parts until both
-/// sides fit. When even the reduced line is too wide, show the truncated left,
-/// because the context gauge outranks every other part.
 pub fn render(placement: *const paint.Placement, info: *const Info) !void {
     if (placement.base < placement.skip) return;
     if (info.notice) |notice| {
-        // An information notice takes the accent role, like an information
-        // event in the transcript. The row must read as a new message and not
-        // as the status it replaces. A warning and a failure carry their own
-        // color already, and they share the warning symbol, so the text states
-        // either one without its color.
         const name: role.Name = switch (notice.severity) {
             .information => .accent,
             .warning => .warning,
@@ -322,8 +200,6 @@ pub fn render(placement: *const paint.Placement, info: *const Info) !void {
             .information => paint.information_prefix,
             .warning, .failure => paint.warning_prefix,
         };
-        // The footer keeps one row, because a footer that grows moves the editor,
-        // and a moving interface is worse than a cut sentence.
         return paint.notice(
             placement,
             &.{ .role = name, .prefix = prefix, .fit = .head },
@@ -331,17 +207,9 @@ pub fn render(placement: *const paint.Placement, info: *const Info) !void {
         );
     }
 
-    // Sized so `catch unreachable` is sound. The branch can fill one bounded
-    // `HEAD` file. The remaining space holds the directory and every number: a
-    // token count and the context share derive from a `u64`, a quota share
-    // stops at 100 at the wire, and `ai.llm.amount_usd_max` bounds the cost
-    // and the pool figure. `ai.Model.name_bytes_max` bounds the model name, and
-    // the account identifier, the effort level, and every separator are compiled
-    // strings.
     var left_scratch: [ai.project.head_name_bytes_max + 512]u8 = undefined;
     var right_scratch: [192]u8 = undefined;
     var parts: Parts = .all;
-    // The loop always runs, so it writes both sides before any read.
     var left: Line = undefined;
     var right: Line = undefined;
     var left_columns: usize = 0;
@@ -373,14 +241,7 @@ pub fn render(placement: *const paint.Placement, info: *const Info) !void {
     placement.sink.end(.{ .id = placement.id, .line = placement.base });
 }
 
-/// Write the state of the session as one line for a reader with no column
-/// budget: every part of the line in its full form and in its order, so the
-/// answer of `/status` reads like the status line. An empty directory leaves the
-/// place out, and the quota, the credit pool, and the cache rate come once this
-/// turn reports them, as on the line.
 pub fn writeSummary(out: *std.Io.Writer, info: *const Info) !void {
-    // Both sides of the line, with the room that `render` gives each of them,
-    // and the separator between them.
     var scratch: [ai.project.head_name_bytes_max + 512 + separator.len + 192]u8 = undefined;
     var line: Line = .init(&scratch);
     try writeLeft(&line, info, &Parts.all);
@@ -389,9 +250,6 @@ pub fn writeSummary(out: *std.Io.Writer, info: *const Info) !void {
     try out.writeAll(line.text());
 }
 
-/// Write the two session numbers as one fragment for a reader with no column
-/// budget: the context share in its short form, then the cost. The summary of
-/// a turn in a remote chat takes them, so it reads like the status line.
 pub fn writeNumbers(out: *std.Io.Writer, info: *const Info) !void {
     var scratch: [128]u8 = undefined;
     var line: Line = .init(&scratch);
@@ -400,13 +258,6 @@ pub fn writeNumbers(out: *std.Io.Writer, info: *const Info) !void {
     try out.writeAll(line.text());
 }
 
-/// The agent: `Model: account/model · Effort: level`. Every state of the
-/// account writes one label and one value, so the three read alike. The value
-/// takes one run. That run holds the normal intensity, and the warning color
-/// for a value that can run no turn, because it blocks the next send. A narrow
-/// line drops the account and keeps the value, which still names the state.
-/// Each part carries its own label, so a part that goes away never leaves a
-/// bare value behind.
 fn writeRight(line: *Line, info: *const Info, parts: *const Parts) !void {
     try line.out.writeAll("Model: ");
     const value_start = line.offset();
@@ -419,8 +270,6 @@ fn writeRight(line: *Line, info: *const Info, parts: *const Parts) !void {
         try line.out.writeAll(account.id());
         try line.out.writeAll(account_model_separator);
     }
-    // An account with no model can run nothing, and the user passes that state
-    // by fetching a list, so it warns rather than fails.
     const model = info.model orelse {
         try line.out.writeAll(no_model_value);
         line.mark(value_start, .warning);
@@ -431,8 +280,6 @@ fn writeRight(line: *Line, info: *const Info, parts: *const Parts) !void {
     try writeEffort(line, info, parts);
 }
 
-/// The effort level, which follows the model value in every state of the
-/// account.
 fn writeEffort(line: *Line, info: *const Info, parts: *const Parts) !void {
     if (parts.effort) {
         try line.out.writeAll(separator);
@@ -443,8 +290,6 @@ fn writeEffort(line: *Line, info: *const Info, parts: *const Parts) !void {
     }
 }
 
-/// The place and the session numbers. The context gauge always comes, so every
-/// later part can carry its own leading separator.
 fn writeLeft(line: *Line, info: *const Info, parts: *const Parts) !void {
     if (parts.place != .hidden and info.directory.len > 0) {
         try writePlace(line, info, parts);
@@ -452,11 +297,6 @@ fn writeLeft(line: *Line, info: *const Info, parts: *const Parts) !void {
     }
     try writeContext(line, info, parts.context);
     if (parts.cost) try writeCost(line, info);
-    // The quota is a live subscription allowance, the pool is a live balance,
-    // and the cache rate measures one request, so all three belong to a
-    // running turn alone. A value from the last turn stays out until this turn
-    // reports a new one. A spent OpenAI subscription still names its plan and
-    // its wait in the failure message of the turn.
     if (!info.turn_active) return;
     if (info.quota) |quota| {
         const windows = orderedWindows(&quota);
@@ -467,18 +307,12 @@ fn writeLeft(line: *Line, info: *const Info, parts: *const Parts) !void {
     if (parts.cache) try writeCache(line, info);
 }
 
-/// Append the credit pool as ` · Credits: $7.14`, or nothing for an absent
-/// pool. The figure is the amount still available. It takes no color, because
-/// a color on this line means pressure and an amount states no share.
 fn writeCredits(line: *Line, info: *const Info) !void {
     const credits = info.credits orelse return;
     try line.out.print("{s}Credits: ", .{separator});
     try writeUsd(&line.out, credits.remaining());
 }
 
-/// The windows of `quota`, shortest first, and null for a window the line
-/// cannot label. The slots of the head carry no fixed window, so the length
-/// orders the line and one account never reads in another order than the next.
 fn orderedWindows(quota: *const ai.llm.Quota) [2]?ai.llm.Quota.Window {
     const maybe_first = labeledWindow(&quota.primary);
     const maybe_second = labeledWindow(&quota.secondary);
@@ -488,23 +322,16 @@ fn orderedWindows(quota: *const ai.llm.Quota) [2]?ai.llm.Quota.Window {
     return .{ first, second };
 }
 
-/// The length of a labeled window. `labeledWindow` passes a window whose length
-/// identifies it, so the fallback never orders a line.
 fn windowMinutes(window: *const ai.llm.Quota.Window) u32 {
     return window.window_minutes orelse 0;
 }
 
-/// `maybe_window` when its duration identifies it, and null otherwise. A window
-/// that Drinky cannot name states an allowance that the user cannot act on.
 fn labeledWindow(maybe_window: *const ?ai.llm.Quota.Window) ?ai.llm.Quota.Window {
     const window = maybe_window.* orelse return null;
     if (quotaLabel(window.window_minutes) == null) return null;
     return window;
 }
 
-/// Write one window of the ordered pair, with the wait that the parts allow.
-/// An absent window writes nothing, so a provider that states one window alone
-/// leaves no gap behind.
 fn writeQuotaPart(
     line: *Line,
     maybe_window: *const ?ai.llm.Quota.Window,
@@ -519,9 +346,6 @@ fn writeQuotaPart(
     try writeQuotaWindow(line, &window, info.gauge, wait_seconds);
 }
 
-/// The working directory, and the branch that a command here acts on. A
-/// path names itself, so it takes no label. The branch follows it in brackets,
-/// the same shape the agent takes on the right.
 fn writePlace(line: *Line, info: *const Info, parts: *const Parts) !void {
     try writeDirectory(&line.out, info.directory, parts.place);
     if (parts.branch == .hidden) return;
@@ -532,9 +356,6 @@ fn writePlace(line: *Line, info: *const Info, parts: *const Parts) !void {
     }
 }
 
-/// The short form keeps the last component alone, behind a `…/` mark and the home
-/// `~` that the path carries. A path that the mark does not shorten stays whole,
-/// so shortening never costs columns.
 fn writeDirectory(out: *std.Io.Writer, directory: []const u8, place: Parts.Place) !void {
     const home_prefix = if (std.mem.startsWith(u8, directory, "~/")) "~/" else "";
     const mark = "…/";
@@ -549,9 +370,6 @@ fn writeDirectory(out: *std.Io.Writer, directory: []const u8, place: Parts.Place
     try out.writeAll(base);
 }
 
-/// The short form keeps a bounded prefix and adds an ellipsis. A branch stays
-/// whole when the marked form does not save columns. The prefix ends at a
-/// grapheme boundary.
 fn writeBranch(out: *std.Io.Writer, branch: []const u8, form: Parts.Branch) !void {
     if (form != .short) return out.writeAll(branch);
     const prefix = terminal.width.truncate(branch, branch_prefix_columns_max);
@@ -564,15 +382,9 @@ fn writeBranch(out: *std.Io.Writer, branch: []const u8, form: Parts.Branch) !voi
     try out.writeAll(mark);
 }
 
-/// Context now: what the last committed reply measured, against the model's
-/// window. The one "now" number. The rest is session-cumulative. A model switch
-/// leaves no valid measurement, because a tokenizer belongs to its model.
 fn writeContext(line: *Line, info: *const Info, form: Parts.Context) !void {
     const context = info.context_tokens orelse
         return line.out.writeAll(context_label ++ "Unknown");
-    // A model whose limit no source states shows the tokens alone. The share
-    // and its pressure color need a limit, and Drinky states no figure it
-    // cannot know.
     const window = info.context_window orelse {
         try line.out.writeAll(context_label);
         return writeTokens(&line.out, context);
@@ -581,8 +393,6 @@ fn writeContext(line: *Line, info: *const Info, form: Parts.Context) !void {
         asFloat(context) / asFloat(window) * 100.0
     else
         0.0;
-    // The line prints the rounded share and colors that same number, so a row
-    // never shows one figure and the color of another.
     const shown = @round(percent);
     try line.out.writeAll(context_label);
     const value_start = line.offset();
@@ -597,27 +407,16 @@ fn writeContext(line: *Line, info: *const Info, form: Parts.Context) !void {
     line.mark(value_start, pressureRole(info.gauge, shown));
 }
 
-/// The session cost behind its separator. The cost is an estimate at public
-/// rates, so the tilde marks it: the login type does not reveal the billing, a
-/// subscription pays none of it, and a reply that Drinky could not price counts
-/// nothing. Every cost figure of Drinky takes this one mark. A positive cost
-/// under one cent reads `~$0.01`, so a cheap session never reads as free. The
-/// tilde already marks the estimate, so the figure takes no `<`.
 fn writeCost(line: *Line, info: *const Info) !void {
     const cost = if (info.cost > 0) @max(info.cost, 0.01) else info.cost;
     try line.out.print("{s}Cost: ~${d:.2}", .{ separator, cost });
 }
 
-/// One USD amount to the cent. A positive amount under one cent reads `<$0.01`,
-/// so a nearly spent pool never reads as empty.
 fn writeUsd(out: *std.Io.Writer, amount: f64) !void {
     if (amount > 0 and amount < 0.01) return out.writeAll("<$0.01");
     try out.print("${d:.2}", .{amount});
 }
 
-/// The last request's cache hit rate over the whole prompt. An all-zero prompt
-/// means no measurement describes the active account, model, and effort, so the
-/// part goes rather than show a 0/0 rate.
 fn writeCache(line: *Line, info: *const Info) !void {
     const usage = &info.cache_usage;
     const prompt = usage.prompt();
@@ -626,11 +425,6 @@ fn writeCache(line: *Line, info: *const Info) !void {
     try line.out.print("{s}Cache: {d:.0}%", .{ separator, hit });
 }
 
-/// Append one identified quota window as ` · <label>: N% (<wait>)`, or nothing
-/// for an absent one. The used share drives the number and the color of the
-/// value, so the allowance and the context window read the same way. The
-/// bracket holds the wait until the window starts again, the one figure the
-/// user cannot derive.
 fn writeQuotaWindow(
     line: *Line,
     window: *const ai.llm.Quota.Window,
@@ -650,9 +444,6 @@ fn writeQuotaWindow(
     line.mark(value_start, pressureRole(gauge, used));
 }
 
-/// The seconds left on a window that stated `reset_seconds` when its response
-/// arrived `age_ms` ago. Null when the head stated no reset, and null once the
-/// wait has run out, because the next response states the window that follows.
 fn waitSeconds(reset_seconds: ?u64, age_ms: i64) ?u64 {
     const reset = reset_seconds orelse return null;
     const age = @max(0, age_ms);
@@ -660,9 +451,6 @@ fn waitSeconds(reset_seconds: ?u64, age_ms: i64) ?u64 {
     return if (left == 0) null else left;
 }
 
-/// A wait in one unit: minutes below an hour, hours below a day, then days. It
-/// rounds down, so the user checks a little early. A value that rounds down to
-/// nothing still reads as `1m`, because the window is still closed.
 fn writeWait(out: *std.Io.Writer, seconds: u64) !void {
     const minute = 60;
     const hour = 60 * minute;
@@ -672,10 +460,6 @@ fn writeWait(out: *std.Io.Writer, seconds: u64) !void {
     return out.print("{d}d", .{@divFloor(seconds, day)});
 }
 
-/// A compact label for a rolling window, keyed off its length in minutes.
-/// Anthropic and OpenAI use a 5h window and a weekly window. An xAI
-/// subscription uses a weekly window. Unrecognized or absent lengths stay
-/// hidden rather than show as an allowance we cannot identify.
 fn quotaLabel(maybe_minutes: ?u32) ?[]const u8 {
     const minutes = maybe_minutes orelse return null;
     if (approxWindow(minutes, 300)) return "5h";
@@ -683,14 +467,11 @@ fn quotaLabel(maybe_minutes: ?u32) ?[]const u8 {
     return null;
 }
 
-/// Whether `minutes` falls within 5% of `target`. This matches how the
-/// backend's window lengths drift slightly around their nominal values.
 fn approxWindow(minutes: u32, target: u32) bool {
     const tolerance = @divFloor(target, 20);
     return minutes >= target - tolerance and minutes <= target + tolerance;
 }
 
-/// `count` in `k`/`M` shorthand. The thresholds match pi's footer.
 fn writeTokens(out: *std.Io.Writer, count: u64) !void {
     const thousand = 1000;
     const million = 1000 * thousand;
@@ -719,7 +500,6 @@ test writeTokens {
     try expectTokens("1.0M", 1_000_000);
 }
 
-/// The full set of parts, so a test can watch the line give them up.
 const test_info: Info = .{
     .directory = "~/github/clebert/drinky",
     .branch = "main",
@@ -751,9 +531,6 @@ fn expectSummary(expected: []const u8, info: *const Info) !void {
     try std.testing.expectEqualStrings(expected, out.buffered());
 }
 
-// The summary is the status line for a reader with no column budget, so it takes
-// the words and the order of the line, with every part in its full form. The
-// numbers of one request come while a turn runs alone, as on the line.
 test "the summary states every part of the line in full, in the order of the line" {
     try expectSummary(
         "~/github/clebert/drinky (main) · Context: 21% (206k/1.0M) · Cost: ~$0.39 · " ++
@@ -770,7 +547,6 @@ test "the summary states every part of the line in full, in the order of the lin
         &idle,
     );
 
-    // The three states of the account read as one field with one value.
     var signed_out = idle;
     signed_out.account = null;
     signed_out.context_tokens = null;
@@ -799,8 +575,6 @@ test "the summary states every part of the line in full, in the order of the lin
     );
 }
 
-// The numbers of a turn summary take the text of the line, so a reader of the
-// chat and a reader of the terminal see one gauge.
 test "the numbers state the gauge in its short form and the cost" {
     var buffer: [128]u8 = undefined;
     var out: std.Io.Writer = .fixed(&buffer);
@@ -872,12 +646,6 @@ fn expectHides(painted: []const u8, texts: []const []const u8) !void {
     }
 }
 
-/// Fail when `painted` holds a run of any colored role. A role that the line
-/// takes up later needs no entry here. The search skips the plain text role,
-/// because its empty sequence matches every row. It skips the muted role,
-/// because the line itself paints muted. No other role writes a part of the
-/// muted bytes, so a muted row trips nothing, wherever a run starts. Two roles
-/// can share one sequence, and the message then names the first of them.
 fn expectNoColor(painted: []const u8) !void {
     inline for (comptime std.enums.values(role.Name)) |name| {
         if (comptime !role.paints(name) or name == .muted) continue;
@@ -895,34 +663,23 @@ test render {
     try renderForTest(gpa, &test_info, 200, &out);
 
     const painted = out.written();
-    // The place and the agent read as the same shape: a thing, and the context
-    // it belongs to.
     try expectShows(painted, &.{
         "~/github/clebert/drinky (main)",
         "Context: 21% (206k/1.0M)",
         "Cost: ~$0.39",
-        // The shortest window prints first, each with the share it used and the
-        // wait until it starts again.
         "5h: 12% (53m) · Week: 74% (6d)",
         "Cache: 87%",
-        // The model value and the effort level carry their own intensity, so a
-        // style sequence sits between them and the muted text around them.
         "Model: ",
         "anthropic-plan/claude-opus-4-8",
         " · Effort: ",
         "xhigh",
     });
-    // The place anchors the left, and the agent anchors the right.
     const place = std.mem.indexOf(u8, painted, "~/github").?;
     const context = std.mem.indexOf(u8, painted, "Context:").?;
     try std.testing.expect(place < context);
     try std.testing.expect(context < std.mem.indexOf(u8, painted, "claude-opus-4-8").?);
 }
 
-// The two gauges answer different questions, so an absent measurement reads
-// differently. The fill of the window drives what the user does next, so the
-// gauge names the gap instead of showing a number it does not have. The rate is
-// a secondary number that a narrow window drops first, so it just goes.
 test "an unmeasured context reads as unknown, and an unmeasured rate hides" {
     const gpa = std.testing.allocator;
 
@@ -935,7 +692,6 @@ test "an unmeasured context reads as unknown, and an unmeasured rate hides" {
     try expectShows(unknown_out.written(), &.{"Context: Unknown"});
     try expectHides(unknown_out.written(), &.{ "Context: 21%", "(206k/1.0M)", "Cache:" });
 
-    // Empty history is a measurement, not a gap: it holds exactly zero tokens.
     var empty = test_info;
     empty.context_tokens = 0;
     var empty_out: std.Io.Writer.Allocating = .init(gpa);
@@ -943,7 +699,6 @@ test "an unmeasured context reads as unknown, and an unmeasured rate hides" {
     try renderForTest(gpa, &empty, 200, &empty_out);
     try expectShows(empty_out.written(), &.{"Context: 0% (0/1.0M)"});
 
-    // The gauge outranks every other part, so it survives the narrowest window.
     var narrow_out: std.Io.Writer.Allocating = .init(gpa);
     defer narrow_out.deinit();
     try renderForTest(gpa, &unknown, 20, &narrow_out);
@@ -956,26 +711,20 @@ test "a narrow window shortens fields before it gives up parts" {
         columns: usize,
         shows: []const []const u8,
         hides: []const []const u8,
-        /// The model of this row, so a row can pin the tail of the ladder for
-        /// an account that offers none.
         model: ?[]const u8 = test_info.model,
-        /// The account of this row. Null pins the tail while signed out.
         account: ?ai.llm.Account = test_info.account,
     }{
         .{
-            // The directory shortens before any complete part goes.
             .columns = 167,
             .shows = &.{ "~/…/drinky (main)", "Context: 21% (206k/1.0M)", "Cache: 87%" },
             .hides = &.{"~/github"},
         },
         .{
-            // The context gauge shortens before any complete part goes.
             .columns = 152,
             .shows = &.{ "Context: 21%", "5h: 12% (53m)", "Week: 74% (6d)", "Cache: 87%" },
             .hides = &.{"(206k/1.0M)"},
         },
         .{
-            // Both countdowns go together, so the two windows always read alike.
             .columns = 142,
             .shows = &.{ "Cost: ~$0.39", "5h: 12%", "Week: 74%", "Cache: 87%" },
             .hides = &.{ "(53m)", "(6d)" },
@@ -986,26 +735,21 @@ test "a narrow window shortens fields before it gives up parts" {
             .hides = &.{"Cache:"},
         },
         .{
-            // The longest window goes first.
             .columns = 117,
             .shows = &.{ "Cost: ~$0.39", "5h: 12%" },
             .hides = &.{ "Week:", "Cache:" },
         },
         .{
-            // The session cost outlives every measurement of one request.
             .columns = 107,
             .shows = &.{ "~/…/drinky (main)", "Cost: ~$0.39", "anthropic-plan/" },
             .hides = &.{ "5h:", "Week:", "Cache:" },
         },
         .{
-            // The account prefix goes, and the model name stays whole.
             .columns = 82,
             .shows = &.{ "~/…/drinky (main)", "claude-opus-4-8", "Effort: " },
             .hides = &.{ "anthropic-plan", "Cost:" },
         },
         .{
-            // The branch is a detail of the place, so it goes while the
-            // directory stays.
             .columns = 67,
             .shows = &.{ "~/…/drinky · Context: 21%", "claude-opus-4-8", "Effort: " },
             .hides = &.{"(main)"},
@@ -1016,8 +760,6 @@ test "a narrow window shortens fields before it gives up parts" {
             .hides = &.{ "drinky", "Effort:" },
         },
         .{
-            // The tail of the ladder still names the state of the account, so
-            // an account with no model and no account at all stay distinct.
             .columns = 32,
             .model = null,
             .shows = &.{ "Context: 21%", "Model: ", "none" },
@@ -1041,7 +783,6 @@ test "a narrow window shortens fields before it gives up parts" {
         const painted = out.written();
         try expectShows(painted, step.shows);
         try expectHides(painted, step.hides);
-        // A part goes away whole. Its label and value always go together.
         try std.testing.expectEqual(
             std.mem.indexOf(u8, painted, "Effort:") != null,
             std.mem.indexOf(u8, painted, "xhigh") != null,
@@ -1056,9 +797,6 @@ test "the context gauge survives every width" {
         var out: std.Io.Writer.Allocating = .init(gpa);
         defer out.deinit();
         try renderForTest(gpa, &test_info, columns, &out);
-        // Below the width of the gauge itself only the cut is left, and the
-        // percentage is what it cuts toward. The mark states that cut, and it
-        // takes the last column of the row.
         if (columns >= 12) {
             try expectShows(out.written(), &.{"Context: 21%"});
             continue;
@@ -1070,8 +808,6 @@ test "the context gauge survives every width" {
 test "a gauge takes a color when it fills past its threshold" {
     const gpa = std.testing.allocator;
     var info = test_info;
-    // Each gauge sits on its own edge: 75% used takes the warning color, 90%
-    // used takes the error color, and 74% used takes neither.
     info.context_tokens = 750_000;
     info.quota = .{
         .primary = .{ .used_percent = 90, .window_minutes = 300 },
@@ -1081,9 +817,6 @@ test "a gauge takes a color when it fills past its threshold" {
     defer out.deinit();
     try renderForTest(gpa, &info, 200, &out);
 
-    // The label keeps the muted role of the line, and the color covers the
-    // value with its bracket. The two gauges use one rule, and each one names
-    // its own fill.
     const painted = out.written();
     try expectShows(painted, &.{
         comptime "Context: " ++ attribute.sequence(.reset) ++ role.sequence(.warning) ++
@@ -1091,8 +824,6 @@ test "a gauge takes a color when it fills past its threshold" {
         comptime "5h: " ++ attribute.sequence(.reset) ++ role.sequence(.@"error") ++
             "90%" ++ role.sequence(.muted),
     });
-    // No run opens on a label, and the weekly window stays under the warning
-    // share, so its value keeps the muted role of the line.
     try expectHides(painted, &.{
         comptime attribute.sequence(.reset) ++ "Context:",
         comptime attribute.sequence(.reset) ++ "5h:",
@@ -1100,14 +831,10 @@ test "a gauge takes a color when it fills past its threshold" {
     });
 }
 
-// The configuration sets the pair, and both gauges read the configured one. The
-// compiled pair reaches no gauge then.
 test "a configured pair moves the shares at which a gauge takes a color" {
     const gpa = std.testing.allocator;
     var info = test_info;
     info.gauge = .{ .percent_warning = 20, .percent_error = 50 };
-    // The context gauge prints 21%, which stays under the compiled warning share
-    // and reaches the configured one.
     info.quota = .{
         .primary = .{ .used_percent = 50, .window_minutes = 300 },
         .secondary = .{ .used_percent = 19, .window_minutes = 10080 },
@@ -1121,16 +848,12 @@ test "a configured pair moves the shares at which a gauge takes a color" {
         comptime "Context: " ++ attribute.sequence(.reset) ++ role.sequence(.warning) ++ "21%",
         comptime "5h: " ++ attribute.sequence(.reset) ++ role.sequence(.@"error") ++ "50%",
     });
-    // The weekly window stays under the configured warning share, so its value
-    // keeps the muted role of the line.
     try expectHides(painted, &.{comptime attribute.sequence(.reset) ++ "19%"});
 }
 
 test "the color follows the share that the line prints" {
     const gpa = std.testing.allocator;
     var info = test_info;
-    // The measured shares stay under both thresholds. The printed shares reach
-    // them, so the row and its color must agree with the printed number.
     info.context_tokens = 746_000;
     info.quota = .{
         .primary = .{ .used_percent = 89.6, .window_minutes = 300 },
@@ -1153,9 +876,6 @@ test "the model value and the effort level leave the faint intensity" {
     defer out.deinit();
     try renderForTest(gpa, &test_info, 200, &out);
 
-    // The reset opens each identity field, because the muted role holds the
-    // faint intensity. The muted role closes it again. The account and the
-    // model are one identifier, so one run covers both.
     const painted = out.written();
     const reset = comptime attribute.sequence(.reset);
     const muted = comptime role.sequence(.muted);
@@ -1163,7 +883,6 @@ test "the model value and the effort level leave the faint intensity" {
         reset ++ "anthropic-plan/claude-opus-4-8" ++ muted,
         reset ++ "xhigh" ++ muted,
     });
-    // Each label keeps the muted role of the line.
     try expectHides(painted, &.{
         reset ++ "Model",
         reset ++ "Effort",
@@ -1178,11 +897,8 @@ test "a cut keeps the color it lands in and drops the color it takes away" {
     const label_columns = terminal.width.ofText(context_label);
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    // The label, one column of the share, and the mark of the cut.
     try renderForTest(gpa, &info, label_columns + 2, &out);
 
-    // The cut lands inside the value, so the tail of the run keeps its color.
-    // The mark belongs to the line, so it paints muted.
     const painted = out.written();
     try expectShows(painted, &.{
         comptime role.sequence(.muted) ++ context_label ++ attribute.sequence(.reset) ++
@@ -1190,8 +906,6 @@ test "a cut keeps the color it lands in and drops the color it takes away" {
         comptime role.sequence(.muted) ++ paint.ellipsis,
     });
 
-    // One column less takes the whole share away. The color follows the share,
-    // so the run goes with it and the label alone stays muted.
     var label_out: std.Io.Writer.Allocating = .init(gpa);
     defer label_out.deinit();
     try renderForTest(gpa, &info, label_columns + 1, &label_out);
@@ -1202,8 +916,6 @@ test "a cut keeps the color it lands in and drops the color it takes away" {
 test "shortening the directory never costs columns" {
     const gpa = std.testing.allocator;
     var info = test_info;
-    // The mark and the home prefix cost more than this path spends on its own
-    // components, so the short form must not replace it.
     info.directory = "~/a";
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
@@ -1213,8 +925,6 @@ test "shortening the directory never costs columns" {
     try expectShows(painted, &.{"~/a (main)"});
     try expectHides(painted, &.{"…"});
 
-    // A path with no home prefix pays for the mark alone, and one component is
-    // still not worth it.
     var plain = test_info;
     plain.directory = "/work";
     var plain_out: std.Io.Writer.Allocating = .init(gpa);
@@ -1227,13 +937,9 @@ test "shortening the directory never costs columns" {
 test "a long branch keeps 16 columns and a whole grapheme" {
     const gpa = std.testing.allocator;
     var info = test_info;
-    // Eight flags put this valid branch above the old 64-byte limit. Four flags
-    // fill the compact prefix after `feature/` without splitting a flag.
     info.branch = "feature/" ++ "🇩🇪" ** 8;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    // The width that the shortened branch needs, and one column less than the
-    // whole branch needs.
     try renderForTest(gpa, &info, 177, &out);
 
     const painted = out.written();
@@ -1271,15 +977,11 @@ test "a notice replaces the status for exactly one row" {
     try renderForTest(gpa, &info, 40, &out);
 
     const painted = out.written();
-    // The row keeps the first line, and the mark states the line it hides. The
-    // failure opens on the warning symbol in the error color.
     try expectShows(painted, &.{comptime role.sequence(.@"error") ++ "⚠ boom" ++ paint.ellipsis});
     try expectHides(painted, &.{ "not another row", "hidden-model", "Error:" });
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, painted, "\r\n"));
 }
 
-// A warning and a failure share the symbol, so the text states either one
-// without its color, and the role keeps the two apart on the row.
 test "a warning notice takes the warning symbol in the warning role" {
     const gpa = std.testing.allocator;
     var info = test_info;
@@ -1306,8 +1008,6 @@ test "an information notice takes the information symbol in the accent role" {
         comptime role.sequence(.accent) ++ "ℹ Drinky loaded every queued message.",
     });
     try expectHides(painted, &.{ "Error:", "⚠" });
-    // The muted role belongs to the line that the notice replaces. The row drops
-    // it, so a notice never reads as the status behind it.
     try std.testing.expect(std.mem.indexOf(
         u8,
         painted,
@@ -1315,8 +1015,6 @@ test "an information notice takes the information symbol in the accent role" {
     ) == null);
 }
 
-// The effort states the intention of the user, and `/effort` sets a level while
-// signed out, so the level stays on the line with no account behind it.
 test "a signed-out status names the state in the model value and keeps the effort" {
     const gpa = std.testing.allocator;
     var info = test_info;
@@ -1326,8 +1024,6 @@ test "a signed-out status names the state in the model value and keeps the effor
     defer out.deinit();
     try renderForTest(gpa, &info, 120, &out);
 
-    // The value takes its own run, so the reset opens it, the muted role closes
-    // it, and the escape bytes of that run sit behind the label.
     const painted = out.written();
     try expectShows(painted, &.{
         "Model: ",
@@ -1336,12 +1032,9 @@ test "a signed-out status names the state in the model value and keeps the effor
         " · Effort: ",
         "xhigh",
     });
-    // No prompt tokens sent yet: the cache figure is absent, never a 0/0 rate.
     try expectHides(painted, &.{ "claude-opus-4-8", "Cache" });
 }
 
-// Drinky compiles no model in, so a signed-in account can offer none. The value
-// names that state and warns, because the user passes it with one fetch.
 test "an account with no model shows the value in the warning role" {
     const gpa = std.testing.allocator;
     var info = test_info;
@@ -1351,7 +1044,6 @@ test "an account with no model shows the value in the warning role" {
     defer out.deinit();
     try renderForTest(gpa, &info, 200, &out);
 
-    // One run covers the account and the empty slot, so the whole value warns.
     const painted = out.written();
     try expectShows(painted, &.{
         "Model: ",
@@ -1363,8 +1055,6 @@ test "an account with no model shows the value in the warning role" {
     try expectHides(painted, &.{ "claude-opus-4-8", "signed out" });
 }
 
-// A share needs a limit. A model whose window no source states shows the tokens
-// alone, because Drinky states no figure it cannot know.
 test "an unknown context window shows the tokens with no share" {
     const gpa = std.testing.allocator;
     var info = test_info;
@@ -1390,7 +1080,6 @@ test "quota windows show the used share, labeled by length" {
 
     const painted = out.written();
     try expectShows(painted, &.{ "5h: 12% (53m)", "Week: 74% (6d)" });
-    // An empty directory hides the whole place, separator and all.
     try expectHides(painted, &.{" · Context:"});
 }
 
@@ -1398,7 +1087,6 @@ test "the shortest window prints first, whatever slot carries it" {
     var buffer: [512]u8 = undefined;
     var line: Line = .init(&buffer);
     var info = test_info;
-    // The head of a real account carried the weekly window in the primary slot.
     info.quota = .{
         .primary = .{ .used_percent = 10, .window_minutes = 10080, .reset_seconds = 580_769 },
         .secondary = .{ .used_percent = 4, .window_minutes = 300, .reset_seconds = 8600 },
@@ -1422,17 +1110,12 @@ test "unidentified quota windows stay hidden beside a known window" {
 
     try writeLeft(&line, &info, &Parts.all);
     const written = line.text();
-    // The weekly window keeps its place, and it shows no bracket because the
-    // head stated no reset.
     try std.testing.expect(std.mem.indexOf(u8, written, "Week: 77% · Cache") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "0%") == null);
     try std.testing.expect(quotaLabel(null) == null);
     try std.testing.expect(quotaLabel(600) == null);
 }
 
-// An OpenRouter account spends a prepaid pool rather than a subscription
-// window. The line states the remaining amount while a turn runs, and it goes
-// when the turn ends, as the quota does.
 test "the credit pool shows the remaining amount while a turn runs" {
     const gpa = std.testing.allocator;
     var info = test_info;
@@ -1480,8 +1163,6 @@ test "a sub-cent credit pool never reads as an empty one" {
     try expectShows(out.written(), &.{"Credits: <$0.01"});
 }
 
-// The pool figures are lifetime totals, so their ratio measures no pressure. A
-// nearly spent pool prints its amount in the muted role of the line.
 test "the credit pool takes no color at any used share" {
     const gpa = std.testing.allocator;
     var info = test_info;
@@ -1498,9 +1179,6 @@ test "the credit pool takes no color at any used share" {
         defer out.deinit();
         try renderForTest(gpa, &info, 200, &out);
         try expectShows(out.written(), &.{"Credits: $"});
-        // The pool is the one field that no share colors. Nothing else on this
-        // row is colored, so the whole row proves it: neither the label nor the
-        // amount can open a colored run.
         try expectNoColor(out.written());
     }
 }
@@ -1527,7 +1205,6 @@ test "a narrow window drops the credit pool before the session cost" {
 
 test writeWait {
     const cases = [_]struct { seconds: u64, shown: []const u8 }{
-        // A window that is still closed never reads as no wait at all.
         .{ .seconds = 0, .shown = "1m" },
         .{ .seconds = 59, .shown = "1m" },
         .{ .seconds = 60, .shown = "1m" },
@@ -1535,7 +1212,6 @@ test writeWait {
         .{ .seconds = 3600, .shown = "1h" },
         .{ .seconds = 86_399, .shown = "23h" },
         .{ .seconds = 86_400, .shown = "1d" },
-        // The reset that a real weekly window stated.
         .{ .seconds = 580_769, .shown = "6d" },
     };
     for (cases) |case| {
@@ -1547,15 +1223,11 @@ test writeWait {
 }
 
 test waitSeconds {
-    // The wait ages with the response that stated it.
     try std.testing.expectEqual(@as(?u64, 3180), waitSeconds(3180, 0));
     try std.testing.expectEqual(@as(?u64, 3120), waitSeconds(3180, 60_000));
-    // A head that stated no reset shows no wait, and neither does a window that
-    // has already started again.
     try std.testing.expect(waitSeconds(null, 0) == null);
     try std.testing.expect(waitSeconds(60, 60_000) == null);
     try std.testing.expect(waitSeconds(60, 600_000) == null);
-    // A clock that steps back never lengthens a wait.
     try std.testing.expectEqual(@as(?u64, 60), waitSeconds(60, -600_000));
 }
 
@@ -1567,8 +1239,6 @@ test "the quota and the cache rate show while a turn runs alone" {
     defer out.deinit();
     try renderForTest(gpa, &idle, 200, &out);
 
-    // Both measure one request. The place, the context gauge, and the session
-    // cost describe a state that outlives the turn, so they stay.
     const painted = out.written();
     try expectShows(painted, &.{ "~/github/clebert/drinky (main)", "Context: 21%", "Cost: ~$0.39" });
     try expectHides(painted, &.{ "5h:", "Week:", "Cache:" });
@@ -1593,8 +1263,6 @@ test "a countdown that runs out drops its bracket and keeps its share" {
         .primary = .{ .used_percent = 12, .window_minutes = 300, .reset_seconds = 3180 },
         .secondary = null,
     };
-    // The response that stated the reset is one hour old, so the 53-minute wait
-    // has run out. The share still describes the last measured request.
     info.quota_age_ms = 3_600_000;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();

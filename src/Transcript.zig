@@ -1,15 +1,3 @@
-//! The permanent blocks above the live tail, oldest first. The "model run"
-//! invariant: a run of streamed reasoning collects into one growing thinking
-//! block. Then a run of streamed answer text collects into one growing model
-//! block. A tool call, a turn boundary, or any other block ends the message.
-//! Owns its blocks' bytes (freed on `deinit`).
-//!
-//! The list is the one canonical record of the conversation. `projection` filters
-//! it for the setup of the next request, because a provider replays stored
-//! reasoning only to the exact account that produced it, and Anthropic replays it
-//! only while the request names an effort. A hidden block stays in the list and
-//! returns as soon as a setup carries it again.
-
 const std = @import("std");
 
 const ai = @import("ai");
@@ -20,32 +8,13 @@ const Transcript = @This();
 
 gpa: std.mem.Allocator,
 entries: std.ArrayList(ui.block.Entry),
-/// The blocks of the last `projection`, in screen order. Each paint rebuilds
-/// them, so the layout gets a `[]const *ui.block.Entry` without a per-repaint
-/// allocation. A projection hides the blocks of another account, and a hidden
-/// block breaks a contiguous slice, so the list holds one pointer per shown
-/// block.
 projected: std.ArrayList(*ui.block.Entry),
-/// The current run of streamed deltas: its kind, so deltas of that kind append
-/// to it, and the index of its block. The index is null while the run holds
-/// whitespace alone (see `appendStream`). Null when no run is open.
 current: ?struct { kind: ui.block.Entry.Kind, index: ?usize },
-/// The whitespace of the current run before its block opened.
 held: std.ArrayList(u8),
-/// The index of the first block streamed for the current assistant message
-/// (reasoning or answer), so a retry can drop the whole partial message. Null
-/// while the message has no block.
 message_start: ?usize,
 
-/// What the next request carries of the stored reasoning, so the projection can
-/// show that and nothing else. `Session` builds it from the account, the model,
-/// and the effort level it shows.
 pub const Setup = struct {
-    /// The account slot that renders the next request. Null while signed out.
     account: ?ai.llm.Account,
-    /// Whether a request of that account replays its stored reasoning. Anthropic
-    /// drops every thinking block unless the request names an effort, so a model
-    /// change or an effort change alone can take a block out of the prompt.
     replays_reasoning: bool,
 };
 
@@ -67,8 +36,6 @@ pub fn deinit(self: *Transcript) void {
     self.held.deinit(self.gpa);
 }
 
-/// Append a discrete block that copies `text`. This ends any open streamed run,
-/// so the next streamed delta opens a fresh block.
 pub fn append(
     self: *Transcript,
     kind: ui.block.Entry.Kind,
@@ -81,9 +48,6 @@ pub fn append(
     try self.entries.append(self.gpa, entry);
 }
 
-/// Replace the event at `index` with one that states `text` under `options`. The
-/// block keeps its place, so the line that announced a wait becomes the line
-/// that states its result.
 pub fn replaceEvent(
     self: *Transcript,
     index: usize,
@@ -94,9 +58,6 @@ pub fn replaceEvent(
     try self.entries.items[index].replaceEvent(self.gpa, options, text);
 }
 
-/// How many blocks before `index` `account` produced. `dropAccount` removes
-/// them, so the block at `index` moves up by this count. The caller keeps
-/// `index` within the list.
 pub fn producedBefore(self: *const Transcript, account: ai.llm.Account, index: usize) usize {
     std.debug.assert(index <= self.entries.items.len);
     var count: usize = 0;
@@ -104,12 +65,6 @@ pub fn producedBefore(self: *const Transcript, account: ai.llm.Account, index: u
     return count;
 }
 
-/// Count one more occurrence of the event at the tail, and report whether that
-/// took the place of an append. An event that states `text` under `options`
-/// again, with no block between the two, states its count instead of a block of
-/// its own, so a task that repeats itself takes one row. A mirrored event never
-/// repeats, because the mirror sends a block once and a change to a block below
-/// its cursor never reaches the chat.
 pub fn repeatEvent(
     self: *Transcript,
     options: ui.block.Entry.Options,
@@ -122,18 +77,6 @@ pub fn repeatEvent(
     return true;
 }
 
-/// Append streamed text of `kind` (`.thinking` reasoning or `.model` answer). A
-/// run of deltas of one kind collects into one block, and a kind change ends the
-/// run. The run opens its block at its first byte that is no whitespace, because
-/// a block of whitespace alone shows as a blank row and its separator. Until
-/// then the run holds its whitespace, and the block takes it in front of its
-/// text, so the split of the deltas changes no row. A run that ends on
-/// whitespace alone opens no block. A delta with no bytes changes nothing, so
-/// the deltas around it still collect into one block.
-///
-/// A new reasoning block records `account` as the slot that produced it, so the
-/// projection of another account hides it. An answer block ignores `account`,
-/// because every account shows a message.
 pub fn appendStream(
     self: *Transcript,
     kind: ui.block.Entry.Kind,
@@ -153,9 +96,6 @@ pub fn appendStream(
     try self.entries.items[run.index.?].appendText(self.gpa, delta);
 }
 
-/// Open a streamed block of `kind` at the tail, with the held whitespace of the
-/// run as its text, and return its index. Record it as the message's first block
-/// when none has opened yet.
 fn openRun(self: *Transcript, kind: ui.block.Entry.Kind, account: ?ai.llm.Account) !usize {
     var entry = try ui.block.Entry.init(self.gpa, kind, .{ .account = account }, self.held.items);
     errdefer entry.deinit(self.gpa);
@@ -166,24 +106,16 @@ fn openRun(self: *Transcript, kind: ui.block.Entry.Kind, account: ?ai.llm.Accoun
     return index;
 }
 
-/// Whether a streamed run is open, so a discrete append now splits the message.
 pub fn streaming(self: *const Transcript) bool {
     return self.current != null;
 }
 
-/// End the current message's streamed runs so the next delta opens a new block.
-/// The whitespace of a run that opened no block goes with the run.
 pub fn endMessage(self: *Transcript) void {
     self.current = null;
     self.held.clearRetainingCapacity();
     self.message_start = null;
 }
 
-/// Drop the open message's streamed blocks (reasoning and answer alike) so a
-/// retried reply leaves nothing partial behind. A no-op when none is
-/// streaming. The blocks are the contiguous tail from `message_start`, because
-/// nothing discrete has ended the message. A message that holds whitespace
-/// alone has no block yet, so its end drops all of it.
 pub fn discardMessage(self: *Transcript) void {
     const maybe_start = self.message_start;
     self.endMessage();
@@ -192,8 +124,6 @@ pub fn discardMessage(self: *Transcript) void {
     self.entries.shrinkRetainingCapacity(start);
 }
 
-/// Drop every block from `entry_count` onward. This rolls back an optimistic
-/// discrete append when the operation it represents fails to start.
 pub fn truncate(self: *Transcript, entry_count: usize) void {
     std.debug.assert(entry_count <= self.entries.items.len);
     self.endMessage();
@@ -201,8 +131,6 @@ pub fn truncate(self: *Transcript, entry_count: usize) void {
     self.entries.shrinkRetainingCapacity(entry_count);
 }
 
-/// Drop every rewindable block from `entry_count` onward. Preserve a retry event
-/// because it records a request that happened, even when no reply committed.
 pub fn rewind(self: *Transcript, entry_count: usize) void {
     std.debug.assert(entry_count <= self.entries.items.len);
     self.endMessage();
@@ -218,31 +146,17 @@ pub fn rewind(self: *Transcript, entry_count: usize) void {
     self.entries.shrinkRetainingCapacity(retained_count);
 }
 
-/// What one deliberate removal of a turn took: the count of removed blocks, and
-/// how many of them stood below a cursor over the list, so that cursor can move
-/// back by exactly the blocks that left below it.
 pub const Removal = struct {
     removed_count: usize,
     removed_before_cursor_count: usize,
 
-    /// The range of one turn and the cursor to account for. The named fields
-    /// keep the three positions apart at the call site.
     pub const Options = struct {
-        /// The block count before the turn appended its first block.
         range_base: usize,
-        /// The block count after the last block of the turn.
         range_end: usize,
-        /// The cursor of a mirror over the list. A cursor above the block count
-        /// clamps, like the cursor of `Mirror.flush`.
         mirror_cursor: usize,
     };
 };
 
-/// Remove the blocks of one canceled turn from `[range_base, range_end)`: every
-/// message, note, reasoning, answer, and tool box, and every event that belongs
-/// to the turn. An event of the session or of a command inside the range stays,
-/// and every block after the range stays. This ends the open message, because a
-/// removal moves the blocks behind it. Allocation-free.
 pub fn removeTurn(self: *Transcript, options: Removal.Options) Removal {
     std.debug.assert(options.range_base <= options.range_end);
     std.debug.assert(options.range_end <= self.entries.items.len);
@@ -261,8 +175,6 @@ pub fn removeTurn(self: *Transcript, options: Removal.Options) Removal {
         self.entries.items[retained_count] = entry.*;
         retained_count += 1;
     }
-    // The blocks after the range move down by the removed count, and they move
-    // toward the front, so the forward copy is safe.
     const tail = self.entries.items[options.range_end..];
     std.mem.copyForwards(
         ui.block.Entry,
@@ -273,26 +185,16 @@ pub fn removeTurn(self: *Transcript, options: Removal.Options) Removal {
     return removal;
 }
 
-/// Every block above the live tail, oldest first: the canonical record, hidden
-/// blocks included.
 pub fn blocks(self: *const Transcript) []const ui.block.Entry {
     return self.entries.items;
 }
 
-/// Whether the projection of `setup` shows a block that `producer` produced.
-/// A local block has no producer, so every projection shows it. A produced block
-/// needs a request that replays it, and only the exact slot that produced it
-/// replays it. A signed-out Drinky sends no request, so it hides nothing.
 pub fn shows(producer: ?ai.llm.Account, setup: Setup) bool {
     const owner = producer orelse return true;
     const account = setup.account orelse return true;
     return owner == account and setup.replays_reasoning;
 }
 
-/// The blocks `setup` shows, oldest first, for projection. Each paint rebuilds
-/// the list. The pointers stay valid until the blocks next change. A paint fills
-/// the cache of each block it shows, so the list reaches the blocks themselves.
-/// A hidden block paints nothing, so it releases the rows it retained.
 pub fn projection(self: *Transcript, setup: Setup) ![]const *ui.block.Entry {
     self.projected.clearRetainingCapacity();
     for (self.entries.items) |*entry| {
@@ -305,11 +207,6 @@ pub fn projection(self: *Transcript, setup: Setup) ![]const *ui.block.Entry {
     return self.projected.items;
 }
 
-/// Whether the projection of `previous` holds other blocks than the projection
-/// of `next`. A change needs a deep repaint, because a block that leaves must
-/// leave the terminal scrollback too, and a block that returns must return above
-/// the window. The two projections differ or they do not, so the order of the two
-/// setups cannot change the answer.
 pub fn projectionChanges(self: *const Transcript, previous: Setup, next: Setup) bool {
     for (self.entries.items) |*entry| {
         const producer = entry.account();
@@ -318,10 +215,6 @@ pub fn projectionChanges(self: *const Transcript, previous: Setup, next: Setup) 
     return false;
 }
 
-/// Remove every block that `account` produced, and return how many left. A
-/// credential replacement drops the replay proofs of that account slot for good,
-/// so the blocks that hold that reasoning go with them. This ends the open
-/// message, because a removal moves the blocks behind it.
 pub fn dropAccount(self: *Transcript, account: ai.llm.Account) usize {
     self.endMessage();
     var retained_count: usize = 0;
@@ -338,18 +231,13 @@ pub fn dropAccount(self: *Transcript, account: ai.llm.Account) usize {
     return removed;
 }
 
-// The account slot the tests stream reasoning under, and the one that projects
-// the same transcript without that reasoning.
 const test_account: ai.llm.Account = .anthropic_plan;
 const other_account: ai.llm.Account = .openai_api_key;
 
-// The setup of a request that `account` sends and that replays its reasoning.
 fn replaying(account: ?ai.llm.Account) Setup {
     return .{ .account = account, .replays_reasoning = true };
 }
 
-// The setup of a request that `account` sends with no reasoning at all, as an
-// Anthropic request that names no effort.
 fn silent(account: ?ai.llm.Account) Setup {
     return .{ .account = account, .replays_reasoning = false };
 }
@@ -370,9 +258,6 @@ test "streamed deltas collect into one block until a discrete block ends the run
     try std.testing.expectEqualStrings("more", transcript.entries.items[2].content.model.items);
 }
 
-// Regression: a provider can stream a delta with no bytes. It used to open a
-// block, which showed as a blank row and its separator between the blocks
-// around it.
 test "an empty delta opens no block and does not break a run" {
     const gpa = std.testing.allocator;
     var transcript = Transcript.init(gpa);
@@ -389,26 +274,20 @@ test "an empty delta opens no block and does not break a run" {
     try std.testing.expectEqualStrings("hello", transcript.entries.items[0].content.model.items);
 }
 
-// Regression: a provider can stream a run of whitespace alone. It used to open a
-// block, which showed as a blank row and its separator like an empty one.
 test "a run holds its whitespace until another byte opens the block" {
     const gpa = std.testing.allocator;
     var transcript = Transcript.init(gpa);
     defer transcript.deinit();
 
-    // The run has begun, so the message has, but no block shows yet.
     try transcript.appendStream(.thinking, test_account, "\n");
     try transcript.appendStream(.thinking, test_account, " \t\r\n");
     try std.testing.expectEqual(@as(usize, 0), transcript.entries.items.len);
     try std.testing.expect(transcript.streaming());
 
-    // The answer ends the run, and the whitespace of the run goes with it.
     try transcript.appendStream(.model, null, "answer");
     try std.testing.expectEqual(@as(usize, 1), transcript.entries.items.len);
     try std.testing.expectEqualStrings("answer", transcript.entries.items[0].content.model.items);
 
-    // The block takes the whitespace of its run in front of its text, so the
-    // split of the deltas changes no row.
     transcript.endMessage();
     try transcript.appendStream(.thinking, test_account, "\n\n");
     try transcript.appendStream(.thinking, test_account, "weigh it");
@@ -416,8 +295,6 @@ test "a run holds its whitespace until another byte opens the block" {
     const reasoning = transcript.entries.items[1].content.thinking;
     try std.testing.expectEqualStrings("\n\nweigh it", reasoning.text.items);
 
-    // A discard and an end of the message both end a run of whitespace and drop
-    // the held whitespace with it, so no bytes wait while no run is open.
     transcript.endMessage();
     try transcript.appendStream(.model, null, " ");
     transcript.discardMessage();
@@ -458,7 +335,6 @@ test "discardMessage drops the open run so a retry starts clean" {
     try std.testing.expectEqual(@as(usize, 2), transcript.entries.items.len);
     try std.testing.expectEqualStrings("fresh", transcript.entries.items[1].content.model.items);
 
-    // A no-op when no run is open.
     transcript.endMessage();
     transcript.discardMessage();
     try std.testing.expectEqual(@as(usize, 2), transcript.entries.items.len);
@@ -497,12 +373,6 @@ test "rewind preserves only marked events after its checkpoint" {
     try std.testing.expectEqualStrings("keep retry", entries[1].content.event.text.items);
 }
 
-// A removal takes the turn alone: its messages, notes, reasoning, answers, tool
-// boxes, and the events that belong to it. A session event inside the range and
-// every block after the range stay in their order. The cursor prefix counts only
-// the removed blocks below the cursor, so a cursor before the range does not
-// move, one inside the range moves over the removed blocks before it, and one
-// after the range moves over every removed block.
 test "removeTurn takes the turn-owned blocks of its range and counts the cursor prefix" {
     const gpa = std.testing.allocator;
     var transcript = Transcript.init(gpa);
@@ -520,9 +390,6 @@ test "removeTurn takes the turn-owned blocks of its range and counts the cursor 
     try transcript.append(.event, .{}, "Drinky changed the model.");
     try std.testing.expectEqual(@as(usize, 10), transcript.blocks().len);
 
-    // Seven of the eight blocks in the range go. The cursor at 6 stands above
-    // four removed blocks: the user box, the reasoning, the answer, and the
-    // retry event. The session event at 5 stays, so it does not count.
     const removal = transcript.removeTurn(.{ .range_base = 1, .range_end = 9, .mirror_cursor = 6 });
     try std.testing.expectEqual(@as(usize, 7), removal.removed_count);
     try std.testing.expectEqual(@as(usize, 4), removal.removed_before_cursor_count);
@@ -537,9 +404,6 @@ test "removeTurn takes the turn-owned blocks of its range and counts the cursor 
         entries[2].content.event.text.items,
     );
 
-    // A cursor before the range moves over no block, a cursor past the whole
-    // list clamps and moves over every removed block, and an empty range takes
-    // nothing.
     try transcript.append(.user, .{}, "again");
     const before = transcript.removeTurn(.{ .range_base = 3, .range_end = 4, .mirror_cursor = 1 });
     try std.testing.expectEqual(@as(usize, 1), before.removed_count);
@@ -586,9 +450,6 @@ test "discard drops a partial message's reasoning and answer together" {
     try std.testing.expectEqualStrings("fresh", reasoning.text.items);
 }
 
-// One canonical record, one projection per account. A provider replays stored
-// reasoning only to the account that produced it, so only that account shows the
-// block. Every local block stays, because it is no model context.
 test "a projection holds the reasoning of its own account alone" {
     const gpa = std.testing.allocator;
     var transcript = Transcript.init(gpa);
@@ -607,20 +468,13 @@ test "a projection holds the reasoning of its own account alone" {
     try std.testing.expect(other[0].content == .event);
     try std.testing.expectEqualStrings("answer", other[1].content.model.items);
 
-    // The hidden block stays in the canonical record and returns with its
-    // account.
     try std.testing.expectEqual(@as(usize, 3), transcript.blocks().len);
     const again = try transcript.projection(replaying(test_account));
     try std.testing.expectEqual(@as(usize, 3), again.len);
-    // A signed-out Drinky sends no request, so no projection contradicts the
-    // screen and nothing hides.
     const signed_out = try transcript.projection(replaying(null));
     try std.testing.expectEqual(@as(usize, 3), signed_out.len);
 }
 
-// The account is not the only dimension. Anthropic drops every thinking block
-// unless the request names an effort, so a request of the producing account can
-// carry no reasoning at all. The screen then holds none either.
 test "a projection hides its own reasoning when the request replays none" {
     const gpa = std.testing.allocator;
     var transcript = Transcript.init(gpa);
@@ -632,7 +486,6 @@ test "a projection hides its own reasoning when the request replays none" {
     const shown_blocks = try transcript.projection(silent(test_account));
     try std.testing.expectEqual(@as(usize, 1), shown_blocks.len);
     try std.testing.expectEqualStrings("answer", shown_blocks[0].content.model.items);
-    // The block waits for a setup that carries it again.
     try std.testing.expectEqual(@as(usize, 2), transcript.blocks().len);
     const replayed = try transcript.projection(replaying(test_account));
     try std.testing.expectEqual(@as(usize, 2), replayed.len);
@@ -648,7 +501,6 @@ test "projectionChanges reports only a switch that hides or restores a block" {
     const signed_out = replaying(null);
 
     try transcript.appendStream(.model, null, "answer");
-    // A transcript with no reasoning projects the same under every setup.
     try std.testing.expect(!transcript.projectionChanges(own, other));
     try std.testing.expect(!transcript.projectionChanges(own, silent(test_account)));
 
@@ -656,11 +508,8 @@ test "projectionChanges reports only a switch that hides or restores a block" {
     try std.testing.expect(transcript.projectionChanges(own, other));
     try std.testing.expect(transcript.projectionChanges(other, own));
     try std.testing.expect(!transcript.projectionChanges(own, own));
-    // A request of the same account that replays no reasoning hides the block
-    // too, so an effort change alone needs the deep repaint.
     try std.testing.expect(transcript.projectionChanges(own, silent(test_account)));
     try std.testing.expect(!transcript.projectionChanges(other, silent(test_account)));
-    // Both a sign-out and a sign-in show every block, so neither hides one.
     try std.testing.expect(!transcript.projectionChanges(signed_out, own));
     try std.testing.expect(transcript.projectionChanges(signed_out, other));
 }
@@ -679,11 +528,8 @@ test "dropAccount removes the reasoning of one account for good" {
     try std.testing.expectEqualStrings("answer", transcript.blocks()[0].content.model.items);
     const reasoning = transcript.blocks()[1].content.thinking;
     try std.testing.expectEqualStrings("another slot", reasoning.text.items);
-    // The removal is permanent, so the projection of that account holds no
-    // reasoning either.
     const own = try transcript.projection(replaying(test_account));
     try std.testing.expectEqual(@as(usize, 1), own.len);
-    // A slot that produced no block leaves the record as it is.
     try std.testing.expectEqual(@as(usize, 0), transcript.dropAccount(.anthropic_api));
     try std.testing.expectEqual(@as(usize, 2), transcript.blocks().len);
 }

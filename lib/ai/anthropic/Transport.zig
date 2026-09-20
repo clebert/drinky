@@ -1,8 +1,3 @@
-//! The Messages API transport. It sends a serialized request and exposes the
-//! response as a pull stream of decoded SSE events on the shared `sse` engine.
-//! It knows nothing about conversation state or tools. It turns bytes into
-//! `Event`s. The request identity forks by `Identity`.
-
 const std = @import("std");
 
 const json = @import("../json.zig");
@@ -14,18 +9,7 @@ const Transport = @This();
 
 const messages_url = "https://api.anthropic.com/v1/messages";
 const anthropic_version = "2023-06-01";
-/// The beta that streams the input of a tool call as the model writes it.
-/// Without it the API buffers that input and validates it before it sends any
-/// of it, so the fragments arrive late and coarse and the row that counts them
-/// reports little of a long call. Every account sends the beta, so a call reads
-/// the same on each one.
-///
-/// The trade is that the API no longer holds back input it rejects. A call whose
-/// arguments never parse therefore reaches the tool, which reports invalid
-/// arguments to the model rather than the provider refusing the call. That costs
-/// one round, and it buys progress on every call that does parse.
 const streaming_beta = "fine-grained-tool-streaming-2025-05-14";
-/// The betas of the Claude Code identity, plus the one above.
 const beta = "claude-code-20250219,oauth-2025-04-20," ++ streaming_beta;
 const user_agent = "claude-cli/2.1.75";
 
@@ -33,27 +17,15 @@ gpa: std.mem.Allocator,
 io: std.Io,
 timeouts: net.Timeouts,
 identity: Identity,
-/// The full request URL. It defaults to the production Messages API. A test
-/// overrides it to reach a loopback server.
 endpoint: []const u8 = messages_url,
 
-/// How a request authenticates and identifies itself. Subscription OAuth sends
-/// a `Bearer` access token plus the Claude Code identity headers
-/// (`anthropic-beta`, the `claude-cli` user agent, `x-app`). The API key sends
-/// only `x-api-key`.
 pub const Identity = union(enum) {
     subscription: []const u8,
     api_key: []const u8,
 };
 
-/// A single Messages request in flight on the shared SSE engine, which supplies
-/// the reading half. This struct keeps the Messages frame vocabulary (`decode`)
-/// and its state. Pin it: the HTTP response borrows the request and the SSE
-/// reader borrows this struct's buffers.
 pub const Stream = struct {
     gpa: std.mem.Allocator,
-    /// A full connect sets this last. `sse.Engine.open`'s timeout path frees
-    /// only an established stream.
     established: bool,
     client: std.http.Client,
     request: std.http.Client.Request,
@@ -66,43 +38,21 @@ pub const Stream = struct {
     error_length: usize,
     error_retryable: bool,
     retry_after_ms: ?u64,
-    /// Scratch for one decoded frame. Events can borrow it until the next read.
     frame_arena: std.heap.ArenaAllocator,
-    /// The terminal outcome latched from the last non-null `message_delta` stop
-    /// reason. `message_stop` applies it. It stays `none` until a stop reason
-    /// arrives, so a `message_stop` without one is an incomplete reply.
     stop_reason: Terminal,
-    /// Malformed content observed after a terminal reason. It stays latched
-    /// while the bounded stream drains so message_stop can carry final usage
-    /// and reject.
     terminal_rejection: ?llm.Event.Stop.Rejection,
-    /// The one native content block currently open. Its retained buffers survive
-    /// frame resets. The stream emits them only when the matching block closes.
     open_block: ?OpenBlock,
-    /// Where the streamed reasoning display stands (see `sse.Reasoning`).
     reasoning: sse.Reasoning,
     block_text: std.ArrayList(u8),
     block_proof: std.ArrayList(u8),
     tool_call_id: std.ArrayList(u8),
     tool_name: std.ArrayList(u8),
-    /// The model that `message_start` names as the one that serves the reply.
-    /// Owned, because the frame arena drops the parsed frame it arrives in.
-    /// Empty until that frame arrives, so the stop of a headless stream states
-    /// no model rather than a stale one.
     served_model: std.ArrayList(u8),
     usage: llm.Usage,
-    /// The allowance the response head stated, or null when the head sent no
-    /// unified rate-limit headers.
     quota: ?llm.Quota,
     decompress: std.http.Decompress,
     decompress_buffer: []u8,
-    /// This buffer backs the request's extra headers. The retained request
-    /// points at it until `deinit`, so it is a stream field, not a `connect`
-    /// local.
     header_buffer: [3]std.http.Header,
-    /// The composed Authorization value of the subscription identity. The
-    /// retained request points at it for the stream's whole lifetime, so the
-    /// stream owns the bytes. Empty for the API-key identity.
     authorization: []u8,
     error_buffer: [net.error_body_bytes_max]u8,
     redirect_buffer: [4096]u8,
@@ -128,42 +78,24 @@ pub const Stream = struct {
     pub const unauthorized = engine.unauthorized;
     pub const retryable = engine.retryable;
     pub const retryAfterMs = engine.retryAfterMs;
-    /// Usage accumulated so far. Anthropic splits it across the stream (prompt
-    /// and cache counts in `message_start`, output in `message_delta`). This
-    /// grows as those frames arrive and is complete by the final `message_stop`.
     pub const usageSoFar = engine.usageSoFar;
     pub const next = engine.next;
 
-    /// Capture the subscription allowance from the response head. Anthropic
-    /// states each reset as an absolute epoch, so the capture reads the wall
-    /// clock once and keeps the wait in seconds. The engine calls this while the
-    /// head is still valid. The wall clock serves this one conversion alone. The
-    /// agent then ages the wait on the monotonic clock that the interface uses,
-    /// so no later drift between the two clocks reaches the countdown.
     pub fn captureHead(self: *Stream, head: *const std.http.Client.Response.Head) void {
         const now_ms = std.Io.Timestamp.now(self.io, .real).toMilliseconds();
         self.quota = parseQuota(head, @divFloor(now_ms, std.time.ms_per_s));
     }
 
-    /// The subscription allowance captured from the response head (see
-    /// `captureHead`), or null on a head that stated none.
     pub fn quotaSoFar(self: *const Stream) ?llm.Quota {
         return self.quota;
     }
 
-    /// The message a failed head's error body carries (see
-    /// `sse.Engine.refineError`). A failed head uses the same
-    /// `{"error":{"message":…}}` shape as a streamed error frame. Null keeps the
-    /// raw body, so a truncated or unexpected shape still reports the sent bytes.
     pub fn describeError(self: *Stream, body: []const u8) !?[]const u8 {
         const object = (try json.parseObject(self.frame_arena.allocator(), body)) orelse
             return null;
         return errorMessage(object);
     }
 
-    /// Set the decode state and the owned header value to a blank start. The
-    /// engine's `begin` calls it, so every construction site shares one list
-    /// and a new owned field cannot miss a site and free garbage.
     pub fn beginDecode(self: *Stream) void {
         self.stop_reason = .none;
         self.terminal_rejection = null;
@@ -187,17 +119,10 @@ pub const Stream = struct {
         self.served_model.deinit(self.gpa);
     }
 
-    /// Free the owned Authorization value. The engine calls it after the
-    /// request dies, so the request never points at freed bytes.
     pub fn deinitHeaders(self: *Stream) void {
         self.gpa.free(self.authorization);
     }
 
-    /// Latch a rejection. `unsupported` and `uncorrelated` both win over
-    /// `invalid` however they interleave, and the first of them to latch stays.
-    /// A resample cannot turn an outcome this design cannot retain into one it
-    /// can, and it cannot reorder a stream, so a retry spends the budget and
-    /// only delays the same failure.
     fn markRejection(self: *Stream, rejection: llm.Event.Stop.Rejection) void {
         const latched = self.terminal_rejection orelse {
             self.terminal_rejection = rejection;
@@ -211,17 +136,6 @@ pub const Stream = struct {
         return .progress;
     }
 
-    /// A block frame that contradicts the open block. The wire streams one
-    /// content block at a time, so a frame that names another index means that
-    /// assumption broke. A retry meets the same order, so it latches apart from
-    /// the resampleable failures above, the way an item id does on the OpenAI
-    /// side. Only the contradicted case matches across the two.
-    ///
-    /// A frame that names no block at all is absent correlation, and it stays
-    /// with `invalid` here while the OpenAI side keeps the reply. The delta of a
-    /// block becomes the committed content, so a delta Drinky cannot place leaves
-    /// the reply short. An OpenAI arguments delta only paints a box, and its
-    /// done frame carries the call.
     fn uncorrelated(self: *Stream) sse.Decoded {
         self.markRejection(.uncorrelated);
         return .progress;
@@ -246,9 +160,6 @@ pub const Stream = struct {
             if (data.len == 0) return self.invalid();
             try self.block_proof.appendSlice(self.gpa, data);
             self.open_block = .{ .redacted = index };
-            // The agent core displays a placeholder for this block when the
-            // block closes. This stream does not write that text, so the frame
-            // that opens the block must carry the seam in front of it.
             if (self.reasoning.takeSeam())
                 return .{ .event = .{ .thinking = sse.blank_line } };
         } else if (std.mem.eql(u8, kind, "tool_use")) {
@@ -258,8 +169,6 @@ pub const Stream = struct {
             try self.tool_call_id.appendSlice(self.gpa, call_id);
             try self.tool_name.appendSlice(self.gpa, name);
             self.open_block = .{ .tool = index };
-            // Display only: the interface shows the call while its arguments
-            // stream. The call itself waits for the block to close.
             return .{ .event = .{ .tool_name = self.tool_name.items } };
         } else {
             self.markRejection(.unsupported);
@@ -269,10 +178,6 @@ pub const Stream = struct {
     }
 
     fn appendBlockDelta(self: *Stream, object: *const std.json.ObjectMap) !sse.Decoded {
-        // A delta outside any block, and one that carries no usable index, both
-        // leave the reply malformed, and a resample can fix that. A delta that
-        // names another block breaks the one-block-at-a-time assumption instead,
-        // which no resample changes.
         const open_block = self.open_block orelse return self.invalid();
         const index = contentBlockIndex(object) orelse return self.invalid();
         if (index != open_block.index()) return self.uncorrelated();
@@ -282,8 +187,6 @@ pub const Stream = struct {
             .text => if (std.mem.eql(u8, kind, "text_delta")) text: {
                 const text = json.string(delta.get("text")) orelse return self.invalid();
                 try self.block_text.appendSlice(self.gpa, text);
-                // The answer ends the reasoning display, and a delta with no
-                // bytes displays nothing (see `sse.Reasoning`).
                 if (!self.reasoning.answer(text)) break :text .progress;
                 break :text .{ .event = .{ .text = text } };
             } else self.invalid(),
@@ -309,17 +212,10 @@ pub const Stream = struct {
     }
 
     fn stopBlock(self: *Stream, object: *const std.json.ObjectMap) sse.Decoded {
-        // A stop that closes nothing, and one that carries no usable index, both
-        // mean the block sequence is malformed, so they latch and do not pass for
-        // harmless filler. A stop that names another block is a wire-order
-        // failure instead, which a retry cannot clear.
         const open_block = self.open_block orelse return self.invalid();
         const index = contentBlockIndex(object) orelse return self.invalid();
         if (index != open_block.index()) return self.uncorrelated();
         self.open_block = null;
-        // A reasoning block ends its display here, whatever the block retains.
-        // The agent core displays the placeholder for a redacted block at this
-        // stop, so that block ends its display here too.
         switch (open_block) {
             .thinking, .redacted => self.reasoning.end(),
             else => {},
@@ -348,10 +244,7 @@ pub const Stream = struct {
         };
     }
 
-    /// Decode one Messages `data:` payload. A keepalive `ping` is filler.
     pub fn decode(self: *Stream, payload: []const u8) !sse.Decoded {
-        // A malformed payload is filler, not progress. A truncated tail then
-        // surfaces as an incomplete reply at end of stream, which is retried.
         const object = (try json.parseObject(self.frame_arena.allocator(), payload)) orelse
             return .ignored;
         const kind = json.string(object.get("type")) orelse return .ignored;
@@ -404,8 +297,6 @@ pub const Stream = struct {
         if (std.mem.eql(u8, kind, "message_start")) {
             if (json.object(object.get("message"))) |message| {
                 if (json.object(message.get("usage"))) |usage| mergeUsage(&self.usage, usage);
-                // The head names the model that serves the reply, so the stop
-                // can report a switched model. The copy outlives the frame.
                 if (json.string(message.get("model"))) |model_name| {
                     self.served_model.clearRetainingCapacity();
                     try self.served_model.appendSlice(self.gpa, model_name);
@@ -423,11 +314,6 @@ pub const Stream = struct {
     }
 };
 
-/// The terminal outcome a `stop_reason` folds to. `end_turn`, `tool_use`, and
-/// `stop_sequence` are complete. Output-token and context-window exhaustion are
-/// truncated. `pause_turn`, `refusal`, and any unrecognized reason are
-/// unsupported terminal outcomes this design cannot retain, so they reject the
-/// reply.
 const Terminal = enum { none, complete, truncated, unsupported };
 
 fn foldStop(reason: []const u8) Terminal {
@@ -439,15 +325,11 @@ fn foldStop(reason: []const u8) Terminal {
     return .unsupported;
 }
 
-/// Open a streaming Messages request bounded by the connect timeout. Any
-/// failure tears down `out`, so a caller that sees an error owns nothing
-/// (see `sse.Engine.open`).
 pub fn send(self: *Transport, out: *Stream, body: []const u8) !void {
     return sse.Engine(Stream).open(out, self.io, self.timeouts, connect, .{ self, out, body });
 }
 
 fn connect(self: *Transport, out: *Stream, body: []const u8) anyerror!void {
-    // Credentials become header values. Reject ones that can split the head.
     const credential = switch (self.identity) {
         .subscription => |token| token,
         .api_key => |key| key,
@@ -458,9 +340,6 @@ fn connect(self: *Transport, out: *Stream, body: []const u8) anyerror!void {
     errdefer out.client.deinit();
     errdefer out.frame_arena.deinit();
 
-    // The retained request points at this header value until `deinit`, so the
-    // stream owns the bytes (std.http: a header value must outlive its
-    // request). The API-key identity sends no such header.
     out.authorization = switch (self.identity) {
         .subscription => |token| try std.fmt.allocPrint(self.gpa, "Bearer {s}", .{token}),
         .api_key => &.{},
@@ -475,15 +354,9 @@ fn connect(self: *Transport, out: *Stream, body: []const u8) anyerror!void {
     );
     errdefer out.request.deinit();
 
-    // A cancel during `finish` lands before Agent.run arms its deinit, so
-    // teardown falls to the errdefers above. This corner is untested.
     try engine.finish(out, body);
 }
 
-/// The built request's `Identity` fork. Both paths request an unencoded
-/// response, which keeps event delivery independent of any decompressor's own
-/// buffering. `extra` and `authorization` back the returned options, and the
-/// retained request points at them until `deinit`, so both must outlive it.
 fn requestOptions(
     identity: Identity,
     authorization: []const u8,
@@ -509,8 +382,6 @@ fn requestOptions(
         .api_key => |key| {
             extra[0] = .{ .name = "x-api-key", .value = key };
             extra[1] = .{ .name = "anthropic-version", .value = anthropic_version };
-            // The only beta this identity opts into. It carries no Claude Code
-            // header, and tool streaming is not part of that identity.
             extra[2] = .{ .name = "anthropic-beta", .value = streaming_beta };
             return .{
                 .headers = .{
@@ -547,8 +418,6 @@ fn errorRetryable(object: *const std.json.ObjectMap) bool {
         std.mem.eql(u8, kind, "api_error");
 }
 
-/// Overwrite each field present in `object`. Anthropic reports usage as
-/// cumulative message totals, so last-writer-per-field is the running total.
 fn mergeUsage(usage: *llm.Usage, object: std.json.ObjectMap) void {
     if (json.unsigned(object.get("input_tokens"))) |value| usage.input = value;
     if (json.unsigned(object.get("output_tokens"))) |value| usage.output = value;
@@ -556,20 +425,11 @@ fn mergeUsage(usage: *llm.Usage, object: std.json.ObjectMap) void {
     if (json.unsigned(object.get("cache_creation_input_tokens"))) |value| usage.cache_write = value;
 }
 
-/// The rolling windows of the unified rate limit, keyed by the name the header
-/// carries. Each one states the plan allowance that Drinky shows. The head also
-/// carries an `overage` window, which counts paid usage above the plan and
-/// answers a billing question, so this table leaves it out.
 const quota_windows = [_]struct { name: []const u8, minutes: u32 }{
     .{ .name = "5h", .minutes = 300 },
     .{ .name = "7d", .minutes = 10080 },
 };
 
-/// Parse the unified subscription allowance from the response head. Anthropic
-/// states a share as a fraction of one and a reset as an absolute epoch, so the
-/// parse scales the share and turns the reset into seconds from `now_seconds`.
-/// A window arrives once its utilization header does. Null when the head names
-/// no plan window at all.
 fn parseQuota(head: *const std.http.Client.Response.Head, now_seconds: i64) ?llm.Quota {
     var used: [quota_windows.len]?f64 = @splat(null);
     var reset_seconds: [quota_windows.len]?u64 = @splat(null);
@@ -600,31 +460,18 @@ fn parseQuota(head: *const std.http.Client.Response.Head, now_seconds: i64) ?llm
     return .{ .primary = parsed[0], .secondary = parsed[1] };
 }
 
-/// Decode a utilization fraction as a percentage: `0.06` is 6% used. A share
-/// above the whole window clamps, because a spent allowance must still read as
-/// spent. A negative or non-finite value is no measurement.
 fn parseUtilization(value: []const u8) ?f64 {
     const fraction = std.fmt.parseFloat(f64, value) catch return null;
     if (!std.math.isFinite(fraction) or fraction < 0) return null;
     return @min(100.0, fraction * 100.0);
 }
 
-/// Turn an absolute epoch reset into the seconds that remain at `now_seconds`.
-/// A reset that has gone, or one the head did not write as a count, is no data.
-///
-/// Every captured head states the reset as a plain count of seconds since the
-/// epoch. The published documentation describes an RFC 3339 time instead, which
-/// this parse does not read: the countdown then goes, the used share stays, and
-/// one dump of a response head states the new wire form.
 fn parseResetSeconds(value: []const u8, now_seconds: i64) ?u64 {
     const epoch = std.fmt.parseInt(i64, value, 10) catch return null;
     if (epoch <= now_seconds) return null;
     return @intCast(epoch - now_seconds);
 }
 
-/// A stream over `body` for the tests: test allocator, fresh decode state, and
-/// the given window and budget. The connection fields stay undefined. Pair with
-/// `defer stream.deinitDecode()` to free whatever decoding retains.
 fn testStream(io: std.Io, body: *std.Io.Reader, idle_ms: u64, budget_max: usize) Stream {
     return testStreamWithAllocator(std.testing.allocator, io, body, idle_ms, budget_max);
 }
@@ -637,8 +484,6 @@ fn testStreamWithAllocator(
     budget_max: usize,
 ) Stream {
     var stream: Stream = undefined;
-    // `begin` owns every engine-shared field and blanks the decode state, so
-    // this helper cannot drift from the reset that a real connect performs.
     sse.Engine(Stream).begin(&stream, gpa, io);
     stream.io = io;
     stream.idle_ms = idle_ms;
@@ -690,8 +535,6 @@ fn decodeBlocksUnderOom(gpa: std.mem.Allocator) !void {
 }
 
 test parseQuota {
-    // The head of a real subscription turn. It states the 5h window and an
-    // overage window, and no 7d window.
     const captured = "HTTP/1.1 200 OK\r\n" ++
         "anthropic-ratelimit-unified-status: allowed\r\n" ++
         "anthropic-ratelimit-unified-5h-status: allowed\r\n" ++
@@ -709,11 +552,8 @@ test parseQuota {
     );
     try std.testing.expectEqual(@as(?u32, 300), quota.primary.?.window_minutes);
     try std.testing.expectEqual(@as(?u64, 8600), quota.primary.?.reset_seconds);
-    // The overage window counts paid usage above the plan, so no window carries
-    // it and the weekly slot stays empty.
     try std.testing.expect(quota.secondary == null);
 
-    // A head that states both plan windows fills both slots, shortest first.
     const both = "HTTP/1.1 200 OK\r\n" ++
         "anthropic-ratelimit-unified-5h-utilization: 0.042\r\n" ++
         "anthropic-ratelimit-unified-5h-reset: 1787598000\r\n" ++
@@ -726,7 +566,6 @@ test parseQuota {
     try std.testing.expectEqual(@as(?u32, 10080), windows.secondary.?.window_minutes);
     try std.testing.expectEqual(@as(?u64, 631_400), windows.secondary.?.reset_seconds);
 
-    // A reset that has gone keeps its window and drops its countdown alone.
     const stale_head = try std.http.Client.Response.Head.parse(
         "HTTP/1.1 200 OK\r\n" ++
             "anthropic-ratelimit-unified-5h-utilization: 0.9\r\n" ++
@@ -737,7 +576,6 @@ test parseQuota {
     try std.testing.expectApproxEqAbs(@as(f64, 90), stale.primary.?.used_percent, 1e-9);
     try std.testing.expect(stale.primary.?.reset_seconds == null);
 
-    // No unified headers: null, so an API-key response shows no allowance.
     const none_head = try std.http.Client.Response.Head.parse(
         "HTTP/1.1 200 OK\r\ncontent-length:0\r\n\r\n",
     );
@@ -747,8 +585,6 @@ test parseQuota {
 test parseResetSeconds {
     const now: i64 = 1_787_589_400;
     try std.testing.expectEqual(@as(?u64, 8600), parseResetSeconds("1787598000", now));
-    // A reset that has gone states nothing, and so does the documented RFC 3339
-    // form, which no captured head sends.
     try std.testing.expect(parseResetSeconds("1787000000", now) == null);
     try std.testing.expect(parseResetSeconds("2026-08-24T19:00:00Z", now) == null);
     try std.testing.expect(parseResetSeconds("soon", now) == null);
@@ -758,7 +594,6 @@ test parseResetSeconds {
 test parseUtilization {
     try std.testing.expectEqual(@as(?f64, 0), parseUtilization("0.0"));
     try std.testing.expectEqual(@as(?f64, 100), parseUtilization("1"));
-    // A share above the whole window clamps, so a spent allowance reads spent.
     try std.testing.expectEqual(@as(?f64, 100), parseUtilization("1.4"));
     try std.testing.expect(parseUtilization("-0.1") == null);
     try std.testing.expect(parseUtilization("nan") == null);
@@ -798,8 +633,6 @@ test "reasoning blocks emit display deltas and one complete proof" {
     try std.testing.expectEqualStrings("hmm", complete.event.item.reasoning.signature.text);
     try std.testing.expectEqualStrings("sig", complete.event.item.reasoning.signature.signature);
 
-    // The block before this one displayed reasoning text, so the start frame
-    // carries the seam for the placeholder that the agent core displays.
     try std.testing.expectEqualStrings("\n\n", (try stream.decode(
         \\{"type":"content_block_start","index":1,"content_block":{"type":"redacted_thinking","data":"enc"}}
     )).event.thinking);
@@ -829,8 +662,6 @@ test "a new thinking block separates its display from the block before it" {
     try decodeTestFrame(&stream,
         \\{"type":"content_block_start","index":1,"content_block":{"type":"thinking"}}
     );
-    // Without the blank line the two blocks join into one line, and the
-    // markdown markers at the seam merge into a literal `****`.
     _ = stream.frame_arena.reset(.retain_capacity);
     try std.testing.expectEqualStrings("\n\n**b**", (try stream.decode(
         \\{"type":"content_block_delta","index":1,"delta":{"type":"thinking_delta","thinking":"**b**"}}
@@ -856,8 +687,6 @@ test "an empty thinking delta displays nothing and holds the pending seam" {
     try decodeTestFrame(&stream,
         \\{"type":"content_block_start","index":1,"content_block":{"type":"thinking"}}
     );
-    // An empty delta displays nothing. A blank line on its own adds empty rows
-    // to the block, so the seam must wait for a delta with bytes.
     _ = stream.frame_arena.reset(.retain_capacity);
     try std.testing.expectEqual(@as(sse.Decoded, .progress), try stream.decode(
         \\{"type":"content_block_delta","index":1,"delta":{"type":"thinking_delta","thinking":""}}
@@ -884,8 +713,6 @@ test "answer text ends the thinking display and an empty delta holds the seam" {
     try decodeTestFrame(&stream,
         \\{"type":"content_block_stop","index":0}
     );
-    // An empty answer delta displays nothing, so the seam of the next thinking
-    // block survives it.
     try decodeTestFrame(&stream,
         \\{"type":"content_block_start","index":1,"content_block":{"type":"text"}}
     );
@@ -909,8 +736,6 @@ test "answer text ends the thinking display and an empty delta holds the seam" {
     try decodeTestFrame(&stream,
         \\{"type":"content_block_stop","index":2}
     );
-    // An answer with bytes ends the display. The thinking that follows it opens
-    // a block of its own, which must not start with a blank line.
     try decodeTestFrame(&stream,
         \\{"type":"content_block_start","index":3,"content_block":{"type":"text"}}
     );
@@ -932,8 +757,6 @@ test "answer text ends the thinking display and an empty delta holds the seam" {
 test "a rejected reasoning block latches through terminal usage" {
     const Case = struct {
         frames: []const []const u8,
-        /// A malformed block resamples. A frame for another index cannot, because
-        /// a retry meets the same order.
         rejection: llm.Event.Stop.Rejection = .invalid,
     };
     const missing_signature = [_][]const u8{
@@ -999,9 +822,6 @@ test "negative block indexes never correlate with block zero" {
     try std.testing.expectEqual(@as(sse.Decoded, .progress), try stream.decode(
         \\{"type":"content_block_delta","index":-1,"delta":{"type":"input_json_delta","partial_json":"{}"}}
     ));
-    // A negative index names no block at all, so the frame is malformed rather
-    // than out of order. It must not read as block zero, and it must not spend
-    // the terminal rejection that a real order failure needs.
     try std.testing.expectEqual(
         llm.Event.Stop.Rejection.invalid,
         stream.terminal_rejection.?,
@@ -1074,9 +894,6 @@ test "decode separates pings from progress and events" {
     try std.testing.expectEqualStrings("hi", delta.event.text);
 }
 
-// A provider can switch a request to another model. The head names the model
-// that serves the reply, so the stop must carry it past every frame-arena
-// reset. A stream whose head names none states none.
 test "message_stop names the model that served the reply" {
     var stream = testStream(undefined, undefined, 0, 0);
     defer stream.deinitDecode();
@@ -1145,11 +962,9 @@ test "stop_reason folds to a terminal status; the last non-null delta wins" {
     var stream = testStream(undefined, undefined, 0, 0);
     defer stream.deinitDecode();
 
-    // max_tokens truncates. The reply so far still stands.
     try std.testing.expectEqual(@as(sse.Decoded, .progress), try stream.decode(
         \\{"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{}}
     ));
-    // A later delta that omits the reason updates usage without erasing it.
     try std.testing.expectEqual(@as(sse.Decoded, .progress), try stream.decode(
         \\{"type":"message_delta","delta":{},"usage":{"output_tokens":1}}
     ));
@@ -1170,7 +985,6 @@ test "stop_reason folds to a terminal status; the last non-null delta wins" {
         )).event.stop.status,
     );
 
-    // end_turn, tool_use, and stop_sequence complete. A later delta overrides.
     try std.testing.expectEqual(@as(sse.Decoded, .progress), try stream.decode(
         \\{"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{}}
     ));
@@ -1245,7 +1059,6 @@ test "a tool block emits one completed item when it closes" {
         \\{"type":"content_block_stop","index":0}
     ));
 
-    // The name shows the call while its arguments still stream.
     const opened = try stream.decode(
         \\{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"t1","name":"read"}}
     );
@@ -1276,7 +1089,6 @@ test "correlation state survives per-frame resets across a multi-delta tool call
     var stream = testStream(threaded.io(), &reader, 60_000, net.stream_response_bytes_max);
     defer stream.deinitDecode();
 
-    // The display events come first: the name, then each argument fragment.
     try std.testing.expectEqualStrings("read", (try stream.next()).?.tool_name);
     try std.testing.expectEqualStrings("{", (try stream.next()).?.tool_arguments);
     try std.testing.expectEqualStrings("}", (try stream.next()).?.tool_arguments);
@@ -1295,7 +1107,6 @@ test "an unrecognized frame after the terminal delta stays ignored" {
     try std.testing.expectEqual(@as(sse.Decoded, .progress), try stream.decode(
         \\{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}
     ));
-    // Filler here must not turn a complete reply into an incomplete one.
     try std.testing.expectEqual(@as(sse.Decoded, .ignored), try stream.decode(
         \\{"type":"surprise_new_event"}
     ));
@@ -1318,7 +1129,6 @@ test "decode ignores unrecognized frames instead of counting them as progress" {
     try std.testing.expectEqual(@as(sse.Decoded, .ignored), try stream.decode(
         \\42
     ));
-    // A recognized block boundary that carries no event is still progress.
     try std.testing.expectEqual(@as(sse.Decoded, .progress), try stream.decode(
         \\{"type":"content_block_start","index":0,"content_block":{"type":"text"}}
     ));
@@ -1329,8 +1139,6 @@ test "a block stop that closes nothing is invalid, not silent filler" {
     var stream = testStream(undefined, undefined, 0, 0);
     defer stream.deinitDecode();
 
-    // No block is open, so this stop cannot be part of a well-formed response.
-    // The latch keeps it from quietly dropping content the peer thought it sent.
     try std.testing.expectEqual(@as(sse.Decoded, .progress), try stream.decode(
         \\{"type":"content_block_stop","index":0}
     ));
@@ -1376,14 +1184,12 @@ test "decode surfaces a streamed error frame" {
     ));
     try std.testing.expect(stream.retryable());
 
-    // A frame without a message falls back to reporting its kind.
     try std.testing.expectError(error.ApiError, stream.decode(
         \\{"type":"error","error":{}}
     ));
     try std.testing.expectEqualStrings("error", stream.errorText());
     try std.testing.expect(!stream.retryable());
 
-    // A message longer than the error buffer is truncated, never out of bounds.
     const long = "x" ** (stream.error_buffer.len + 1);
     try std.testing.expectError(error.ApiError, stream.decode(
         "{\"type\":\"error\",\"error\":{\"message\":\"" ++ long ++ "\"}}",
@@ -1399,7 +1205,6 @@ test "describeError reduces a failed head's error body to its message" {
         \\{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}
     )).?);
 
-    // A truncated capture and a body without a message both keep the raw bytes.
     try std.testing.expectEqual(@as(?[]const u8, null), try stream.describeError(
         \\{"type":"error","error":{"message":"cut off
     ));
@@ -1409,8 +1214,6 @@ test "describeError reduces a failed head's error body to its message" {
 }
 
 test "next times out on buffered filler that makes no progress" {
-    // Only filler: the idle window must trip even though every line is
-    // buffered and no read ever blocks on the deadline.
     const body =
         ": keepalive comment\n" ++
         "data: {\"type\":\"surprise_new_event\"}\n" ++
@@ -1426,15 +1229,10 @@ test "next times out on buffered filler that makes no progress" {
     var stream = testStream(clock.io(), &reader, 100, net.stream_response_bytes_max);
     defer stream.deinitDecode();
 
-    // The 100 ms window loses 40 ms per reading, so it closes after a few
-    // filler lines — before the trailing real event or EOF.
     try std.testing.expectError(error.Timeout, stream.next());
 }
 
 test "next stops a stream once its aggregate byte budget is spent" {
-    // Each frame is real progress that restarts the idle window, so only the
-    // aggregate byte budget ends the flood. It spans two frames and trips on
-    // their sum rather than any single line.
     const frame =
         "data: {\"type\":\"content_block_delta\",\"index\":0," ++
         "\"delta\":{\"type\":\"text_delta\",\"text\":\"chunk\"}}\n";
@@ -1452,9 +1250,6 @@ test "next stops a stream once its aggregate byte budget is spent" {
 }
 
 test "next bounds a flood of eventless progress frames" {
-    // Every frame is `.progress`, so `next` loops without returning an event.
-    // The aggregate budget must still stop the flood. An Agent-level counter,
-    // fed only returned events, could not.
     const frame = "data: {\"type\":\"content_block_stop\",\"index\":0}\n";
     const body = frame ** 100;
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
@@ -1467,9 +1262,6 @@ test "next bounds a flood of eventless progress frames" {
 }
 
 test "next reads a data frame larger than the reader buffer" {
-    // Production reads through a 16 KiB `transfer_buffer`, so a longer line
-    // must stream into the growable line buffer. The chunked reader serves at
-    // most 64 bytes per fill, so one line spans several fills.
     const text = "A" ** 4000;
     const body = "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":" ++
         "{\"type\":\"text_delta\",\"text\":\"" ++ text ++ "\"}}\n";
@@ -1488,8 +1280,6 @@ test "next reads a data frame larger than the reader buffer" {
 }
 
 test "next rejects a single frame larger than the stream budget" {
-    // One frame exceeds the whole budget, so its own read trips the ceiling
-    // before the frame is buffered — the per-frame bound.
     const body = "data: {\"type\":\"content_block_delta\",\"delta\":" ++
         "{\"type\":\"text_delta\",\"text\":\"chunk\"}}\n";
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
@@ -1502,7 +1292,6 @@ test "next rejects a single frame larger than the stream budget" {
 }
 
 test "next surfaces a stream truncated mid data-line as a retryable premature end" {
-    // The stream must never decode a truncated final line as a frame.
     const body = "data: {\"type\":\"content_block";
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
@@ -1534,8 +1323,6 @@ test "a canceled read surfaces as a clean abort, not a network error" {
         .seek = 0,
         .end = 0,
     };
-    // The connection's recorded read error decides. A cancel refines to a clean
-    // abort. Anything else stays on the network-error path.
     var connection: std.http.Client.Connection = undefined;
     connection.protocol = .plain;
     connection.stream_reader.err = error.Canceled;
@@ -1550,9 +1337,6 @@ test "a canceled read surfaces as a clean abort, not a network error" {
 test "send leaves the caller owning nothing when connect fails partway" {
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
-    // Connect's first allocation fails after the client is set up: the error
-    // surfaces with `established` still false, so `send` frees nothing the
-    // connect errdefers already unwound.
     var failing: std.testing.FailingAllocator = .init(std.testing.allocator, .{ .fail_index = 0 });
     var transport: Transport = .{
         .gpa = failing.allocator(),
@@ -1601,10 +1385,6 @@ test "requestOptions forks the identity headers by account" {
     try std.testing.expectEqualStrings(streaming_beta, keyed.extra_headers[2].value);
 }
 
-// Every account asks the API to stream a tool input as the model writes it.
-// Without it the API holds each fragment back until the whole input parses, so
-// the row that counts the argument bytes of a long call stands still and then
-// jumps to the total. The beta is the only thing that makes that row climb.
 test "every identity asks for streamed tool input" {
     var extra: [3]std.http.Header = undefined;
     const subscription = requestOptions(.{ .subscription = "tok" }, "Bearer tok", &extra);
@@ -1622,9 +1402,6 @@ test "every identity asks for streamed tool input" {
     ) != null);
 }
 
-/// One accepted connection for the header-lifetime test: read the whole
-/// request, then answer with a bounded event stream that ends the reply at
-/// once.
 fn serveOneResponse(io: std.Io, server: *std.Io.net.Server) !void {
     const body = "data: {\"type\":\"ping\"}\n\n";
     var connection = try server.accept(io);
@@ -1633,7 +1410,6 @@ fn serveOneResponse(io: std.Io, server: *std.Io.net.Server) !void {
     var read_buffer: [4096]u8 = undefined;
     var reader = connection.reader(io, &read_buffer);
     var content_length: usize = 0;
-    // The head of one request holds few lines, so the cap only stops a runaway.
     var lines_left: usize = 64;
     while (lines_left > 0) : (lines_left -= 1) {
         const raw = try reader.interface.takeDelimiterInclusive('\n');
@@ -1657,11 +1433,6 @@ fn serveOneResponse(io: std.Io, server: *std.Io.net.Server) !void {
     try writer.interface.flush();
 }
 
-// Regression: `connect` used to free the composed Authorization value when it
-// returned, while the retained request pointed at it for the stream's whole
-// lifetime. std.http requires a header value to outlive its request, so the
-// stream owns the bytes now, and the value must read back intact after the
-// send.
 test "the stream owns the request Authorization value for its whole lifetime" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -1679,8 +1450,6 @@ test "the stream owns the request Authorization value for its whole lifetime" {
     defer gpa.free(endpoint);
 
     var serve = try io.concurrent(serveOneResponse, .{ io, &server });
-    // A send that fails leaves the server blocked in accept, so the exit path
-    // that skipped the await below must cancel and reap the task.
     var reaped = false;
     defer if (!reaped) {
         _ = serve.cancel(io) catch {};
@@ -1703,6 +1472,5 @@ test "the stream owns the request Authorization value for its whole lifetime" {
         "Bearer secret-token",
         stream.request.headers.authorization.override,
     );
-    // The ping is the whole reply, so the stream drains cleanly before deinit.
     try std.testing.expect((try stream.next()) == null);
 }

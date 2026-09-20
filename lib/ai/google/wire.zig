@@ -1,17 +1,8 @@
-//! This module translates a neutral `llm.Request` into a Gemini
-//! `generateContent` JSON body. It holds no state and does no I/O. Callers own
-//! the request and its backing memory. `Transport` sends the bytes.
-//!
-//! A `reasoning` item of this account holds the `thoughtSignature` that Gemini
-//! returned on one part, and the serializer puts it back on the next part it
-//! writes for the model. No part travels for the item itself.
-
 const std = @import("std");
 
 const json = @import("../json.zig");
 const llm = @import("../llm.zig");
 
-/// Serialize `request` into an owned JSON body. The caller frees the result.
 pub fn serialize(gpa: std.mem.Allocator, request: *const llm.Request) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
@@ -41,9 +32,6 @@ pub fn serialize(gpa: std.mem.Allocator, request: *const llm.Request) ![]u8 {
         try stringify.endArray();
     }
 
-    // A model that never thinks rejects the field, so an omitted control sends
-    // none. The Agent resolved a named level against the levels the model names,
-    // so the name goes out as it stands.
     switch (request.reasoning) {
         .omitted => {},
         .named => |level| {
@@ -71,7 +59,6 @@ const FunctionCallPart = struct {
 const FunctionResponsePart = struct {
     functionResponse: struct { name: []const u8, response: Response },
 
-    /// The two keys the Gemini documentation names for a result and an error.
     const Response = union(enum) {
         output: []const u8,
         @"error": []const u8,
@@ -94,9 +81,6 @@ fn writeTool(stringify: *std.json.Stringify, tool: *const llm.Tool) !void {
     try stringify.endObject();
 }
 
-/// The entry an item belongs to. A tool call is model output, and a tool result
-/// feeds back on the user side. A user entry never mixes function responses
-/// with text, because the newer models refuse such an entry as no user turn.
 const Entry = enum {
     model,
     user_text,
@@ -111,17 +95,11 @@ const Entry = enum {
     }
 };
 
-/// Write one `contents` entry per run of items that share an `Entry` and write
-/// a part, in list order. A reasoning item writes no part, so it opens no entry.
-/// Runs that such a skip leaves adjacent merge into one entry, because Gemini
-/// rejects an entry with no part.
 fn writeContents(stringify: *std.json.Stringify, items: []const llm.Item) !void {
     var open: ?Entry = null;
     var pending_signature: ?[]const u8 = null;
     for (items, 0..) |*item, index| {
         if (item.* == .reasoning) {
-            // The signature of this account waits for the next part. A foreign
-            // arm belongs to another account and writes nothing.
             switch (item.reasoning.replay) {
                 .google_cloud_key => |signature| if (signature.signature.len != 0) {
                     pending_signature = signature.signature;
@@ -163,7 +141,6 @@ fn writeContents(stringify: *std.json.Stringify, items: []const llm.Item) !void 
             }),
             .reasoning => unreachable,
         }
-        // A model part carried the signature, and a user part drops it.
         pending_signature = null;
     }
     if (open != null) try endContent(stringify);
@@ -174,9 +151,6 @@ fn endContent(stringify: *std.json.Stringify) !void {
     try stringify.endObject();
 }
 
-/// The name of the nearest preceding call with `call_id`. A `functionResponse`
-/// names its function, not the call, so the pairing is positional and the name
-/// comes from the call.
 fn callName(prior: []const llm.Item, call_id: []const u8) ![]const u8 {
     var index = prior.len;
     while (index > 0) {
@@ -195,12 +169,6 @@ const golden_tools = [_]llm.Tool{
     } },
 };
 
-// Every byte-affecting path: merged user runs, a signature on a call and on a
-// text part, a user part that drops a signature, a foreign arm that writes
-// nothing, reasoning items that open no entry while the user runs around them
-// merge, a user text behind a tool result that takes an entry of its own, the
-// response name lookup, both response keys, and a tail signature that writes
-// nothing.
 const golden_items = [_]llm.Item{
     .{ .message = .{ .role = .user, .text = "first" } },
     .{ .message = .{ .role = .user, .text = "second" } },

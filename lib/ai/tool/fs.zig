@@ -1,11 +1,5 @@
-//! Filesystem helpers shared by the mutating tools.
-
 const std = @import("std");
 
-/// Create or replace `sub_path` with `data` atomically. The bytes go to a
-/// temporary file in the same directory, and a rename moves it over the
-/// destination. A canceled or crashed write leaves the existing file untouched
-/// rather than truncated.
 pub fn writeFile(io: std.Io, dir: std.Io.Dir, options: Options) !void {
     var atomic = try dir.createFileAtomic(io, options.sub_path, .{ .replace = true });
     defer atomic.deinit(io);
@@ -18,11 +12,6 @@ pub const Options = struct {
     data: []const u8,
 };
 
-/// A copy of `std.testing.io` whose chosen file operation fails with
-/// `error.Canceled`. Tool tests use it to prove a cancel in the file phase
-/// propagates and does not degrade into an ordinary tool-error result. It
-/// shares the real io's userdata, so every other operation passes through
-/// untouched.
 pub const CancelIo = struct {
     vtable: std.Io.VTable,
 

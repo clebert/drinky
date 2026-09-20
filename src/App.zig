@@ -1,17 +1,3 @@
-//! The composition root and event loop. It wires the tty, the agent, and the
-//! `Session` together, then runs the interface off one `std.Io.Queue` of
-//! `UiEvent`. Concurrent producers feed it: the input reader, turn workers,
-//! model fetch workers, sign-in workers, a frame timer, and a resize watcher.
-//! An attached Telegram bot adds its poller and sender. A bot pairing adds its
-//! worker.
-//!
-//! A command runs on the consumer. A model fetch and a sign-in reach the
-//! network, so each runs on a worker. Their events keep the consumer live.
-//!
-//! `Session` owns the model and the rendering and is io-, tty-, and agent-free,
-//! so a test drives it from a scripted event sequence. `App` keeps the io, the
-//! tasks, the tty, the agent, and the key, command, and turn orchestration.
-
 const std = @import("std");
 
 const ai = @import("ai");
@@ -35,21 +21,13 @@ const App = @This();
 
 const effort_default: ai.llm.Effort = .xhigh;
 
-/// The refusal a send meets while the active account offers no model. Drinky
-/// compiles none in, so the user fetches a list and picks one there.
 const no_model_refusal = "Select a model with /model before you send a message.";
 
-/// The refusals of a Telegram message while the session is signed out or has no
-/// model. Each names the terminal, because the command that repairs the state
-/// runs there alone.
 const telegram_signed_out_refusal =
     "Sign in with /login in the terminal before you send a message.";
 const telegram_no_model_refusal =
     "Select a model with /model in the terminal before you send a message.";
 
-/// What a tap on `Shorten` in the chat sends, and the line that names it in the
-/// transcript. The request stays out of the transcript, so the note carries the
-/// meaning of the tap alone.
 const shorten_note_text = "Drinky asked the model to shorten the last answer.";
 const shorten_request_text =
     \\Shorten your last answer for a phone screen.
@@ -58,30 +36,19 @@ const shorten_request_text =
     \\- Write Simplified Technical English. Use a plain word, never a metaphor.
 ;
 
-/// The row that a model picker shows while its fetch runs. The title of the
-/// picker names the account, so the row names the work alone.
 const fetch_wait_text = "Drinky fetches the model list.";
 
-/// The notices of Tab where no prompt-history picker can open.
 const prompt_history_turn_notice = "Prompt history cannot open while a turn runs.";
 const prompt_history_empty_notice = "Prompt history is empty.";
-/// The warning of the first Esc over a draft during a turn.
 const turn_cancel_notice = "Press Esc again to cancel the turn. The draft stays.";
-/// The warning of a submitted prompt that the history cannot take. The turn runs
-/// anyway.
 const prompt_history_oversized_notice = std.fmt.comptimePrint(
     "Drinky did not add the prompt to history because it exceeds {d} KiB.",
     .{@divExact(PromptHistory.entry_bytes_max, 1024)},
 );
 
-/// Two models for the tests, which build what they need because Drinky compiles
-/// no model in.
 const test_anthropic_model = ai.testing.model("claude-opus-5");
 const test_openai_model = ai.testing.model("gpt-5.6-sol");
 
-/// The key hints of the intro line, in the order the line shows them. The
-/// `describe_drinky` document names the same hints, so the legend of the
-/// interface and the document cannot drift.
 const intro_keys = [_][]const u8{
     "Enter: Send",
     "Shift+Enter: New line",
@@ -91,224 +58,102 @@ const intro_keys = [_][]const u8{
     "Ctrl+D: Quit",
 };
 
-/// The intro line: every key hint, then the pointer at the command list. The
-/// line wraps at its separators, so no hint ever goes away.
 const intro_text = blk: {
     var line: []const u8 = "";
     for (intro_keys) |hint| line = line ++ hint ++ ui.paint.separator;
     break :blk line ++ "/help: Commands";
 };
 
-/// The wait row of the picker while the token check runs.
 const token_check_wait_text = "Drinky checks the bot token.";
 
-/// The controls of the editor caption while a sign-in runs. A callback login
-/// takes a callback URL on Enter, and a device-code login takes no line.
 const login_callback_controls = "Enter: Replay callback URL · Esc: Cancel";
 const login_device_controls = "Esc: Cancel";
 
-/// Two Ctrl+C presses within this window quit. A lone press clears the editor.
 const ctrl_c_window_ms = 500;
 
-/// How long a lone Escape byte waits for the rest of a sequence before it becomes
-/// an Escape key. A terminal without the Kitty protocol reports Escape as that one
-/// byte, and every longer sequence starts with it. The wait must stay under human
-/// reaction time and over the gap between two reads of one sequence.
 const escape_wait_ms = 50;
 
-/// Events the channel buffers before a producer blocks in `putOne`. One batched
-/// `get` drains up to this many at once, so a whole burst collapses into a frame.
 const queue_capacity = 256;
 
 gpa: std.mem.Allocator,
 io: std.Io,
 tty: terminal.Tty,
-/// SIGWINCH watcher: turns terminal resizes into `.resize` events.
 resize: terminal.Resize,
 accounts: ai.Accounts,
-/// The machine-local choices of this project: read once at startup, written
-/// whenever the account, the model, or the effort level changes.
 state: State,
-/// The global prompt history: read when Tab opens its picker, written when a
-/// terminal prompt starts a turn. It owns its enabled state.
 prompt_history: PromptHistory,
-/// The resolved path of `config.json`. The disabled-history notice names it, so
-/// the user edits the file that Drinky reads. It borrows `run` storage.
 config_path: []const u8,
-/// The working directory the status line shows, with the home directory
-/// abbreviated to `~`. Owned, and fixed for the session, because Drinky never
-/// changes its working directory.
 directory_label: []const u8,
-/// The canonical working directory and home directory of this session. Both
-/// borrow `run` storage, and a path that the transcript shows reads against
-/// them. Empty until `run` resolves them, so a path then shows as it is.
 working_directory: []const u8,
 home_directory: []const u8,
-/// Project instructions, skill metadata, and the composed prompt. All outlive
-/// the agent, which borrows `prompt`.
 project_instructions: ai.instructions.Result,
 skills: ai.skills.Registry,
 prompt: []const u8,
-/// What the `describe_drinky` tool returns: the document that describes the
-/// harness itself. It outlives the agent, which borrows it.
 document: []const u8,
-/// The page that `/sources` opens: the instruction files, the skills, and the
-/// required skills of this start. `run` composes it once, because the sources
-/// of a session never change after that.
 sources_page: []const u8,
-/// The path-triggered skill rules of the session. Every rule borrows its glob
-/// from the config and its name and file from the skill registry, so both
-/// outlive the agent, which borrows the guard itself.
 skill_guard: ai.tool.SkillGuard,
 agent: ai.Agent,
-/// The consumer-owned model and rendering, driven by the loop.
 session: Session,
-/// Decodes stdin chunks into key events for the consumer's key handling.
 input: terminal.Input,
 running: bool,
 ctrl_c_ms_last: i64,
-/// When a held Escape byte becomes an Escape key, on the monotonic clock. Null
-/// when the parser holds no lone Escape byte.
 escape_deadline_ms: ?i64,
-/// The one cross-thread channel: producer tasks push `UiEvent`s, and the consumer
-/// drains and applies them. Backed by `queue_buffer`, so pin the `App`.
 queue: std.Io.Queue(UiEvent),
 queue_buffer: [queue_capacity]UiEvent,
-/// Non-turn events temporarily removed while cancellation applies queued worker
-/// progress. The consumer processes this prefix before reading newer queue data.
 deferred_events: [queue_capacity]UiEvent,
 deferred_event_count: usize,
-/// The long-lived stdin reader task, or null before the spawn. Shutdown cancels
-/// and reaps it.
 input_future: ?std.Io.Future(void),
-/// The long-lived SIGWINCH watcher task, or null before the spawn. Shutdown
-/// cancels and reaps it.
 resize_future: ?std.Io.Future(void),
-/// The running turn worker, or null between turns. Its result is the sole
-/// terminal authority. A cancel resolves from the actual worker state and stays
-/// recoverable even when the payload-free wakeup cannot enter the queue.
 turn_future: ?std.Io.Future(WorkerResult),
-/// A joined completion held until its already-queued terminal fence arrives.
-/// The queue still carries no terminal payload or ownership.
 pending_turn_result: ?WorkerResult,
-/// Last generation reserved for a turn worker. The app never reuses a generation.
 turn_generation: u64,
-/// The running model fetch, or null between fetches. The picker that asked for
-/// it waits with no rows while it runs. Its join is the sole result.
 fetch: ?Fetch,
-/// Last generation reserved for a fetch worker. A canceled fetch can leave its
-/// wakeup in the queue, so the wakeup names the fetch it belongs to and cannot
-/// join the fetch that follows.
 fetch_generation: u64,
-/// The running sign-in, or null between sign-ins. Its worker owns the account
-/// registry until the app joins it.
 login: ?Login,
-/// Last generation reserved for a sign-in worker. A canceled sign-in can leave
-/// events in the queue, so each event names its sign-in.
 login_generation: u64,
-/// The retry context of the latest failed turn, or null when none waits. It
-/// lives at the prompt alone, because the start of any turn takes it. It never
-/// coexists with `revision`: `setRetry` and `setRevision` each clear the other.
 retry: ?Retry,
-/// Whether the live turn is a retry attempt. Its failure arms the context again,
-/// because the committed work that it continues from is still in history.
 turn_retry: bool,
-/// The revision context of the latest canceled turn, or null when none waits.
-/// It lives at the prompt alone, because the start of any turn takes it, and it
-/// never coexists with `retry`.
 revision: ?Revision,
-/// The pending frame timer, or null when none is armed (idle or clean).
 tick_future: ?std.Io.Future(void),
-/// A frame timer is armed and its `.tick` has not been drained yet.
 tick_pending: bool,
-/// The frame schedule. Only `armTick` advances it, so no frame can reset it.
 frame_grid: FrameGrid,
-/// The state report to Herdr. Inert outside a Herdr pane. The loop derives the
-/// state after each batch, so no turn end path reports it.
 herdr: Herdr,
-/// The Telegram remote control: the saved bots, a pairing, and the attached bot.
-/// It is the one source of truth for that state, and it reports through
-/// `onRemoteAction`. The app maps its state to the session.
 controller: remote.Controller,
-/// The mirror of the transcript in the chat of the attached bot. The app feeds it
-/// the committed blocks after every event, and it sends through the controller.
 mirror: remote.Mirror,
-/// The open command picker of the chat, or none. A tap on its keyboard runs the
-/// selector of the command, and the app applies the outcome to the chat.
 chat_picker: remote.Picker,
-/// The caption title of the inactive editor while a bot holds the input,
-/// `Remote: @bot`. Owned, and the session borrows it.
 remote_title: []const u8,
-/// The wait row of the pairing picker and the link beside it. Owned, and the
-/// picker borrows them.
 pairing_wait_text: []const u8,
 pairing_wait_link: []const u8,
-/// Whether the Telegram prompt of the running turn holds the committed mark
-/// already. The turn marks it once, at the round that commits it.
 prompt_marked: bool,
-/// How many Telegram messages of the steering queue hold the committed mark.
-/// The turn marks each one at the round that commits it, and the receipt marks
-/// the rest.
 steering_marked_count: usize,
 
-/// The process environment that the app cannot read for itself. `main` owns every
-/// lookup, so a test can run the app with no environment at all.
 pub const Options = struct {
-    /// Each bash command inherits this process environment. `Agent.init` demands one, so the
-    /// default here holds only for a test that runs no command.
     environ: std.process.Environ = .empty,
-    /// The provider credentials that authenticate an account without a login.
     credentials: ai.Accounts.Environment = .{},
-    /// The Herdr pane this process runs in, or null outside Herdr.
     herdr: ?Herdr.Env = null,
 };
 
-/// The frame grid: the deadlines that pace the repaints. Each deadline is one
-/// interval after the previous deadline, not one interval after the previous
-/// frame ended. The work of a frame therefore falls inside its own interval and
-/// does not add to it. A late wake moves the phase of one frame and leaves the
-/// next deadline in place, which matters because macOS has no absolute sleep and
-/// wakes a 16 ms wait about 3 ms late.
 const FrameGrid = struct {
-    /// The deadline of the armed frame timer, on the monotonic clock.
     deadline_ns: i96,
 
-    /// The interval between two deadlines. The loop paints at most once per this
-    /// window, so a keystroke echoes within it and a burst of stream events
-    /// coalesces into it.
     const interval_ns = 16 * std.time.ns_per_ms;
 
-    /// Start the grid at `now_ns`. The next deadline lands one interval later.
     fn reset(now_ns: i96) FrameGrid {
         return .{ .deadline_ns = now_ns };
     }
 
-    /// Move to the next deadline. A slot that has already gone yields `now_ns`,
-    /// so the loop never builds a backlog of missed frames, and the first frame
-    /// after an idle wait paints at once.
     fn advance(self: *FrameGrid, now_ns: i96) void {
         const next_ns = self.deadline_ns + interval_ns;
         self.deadline_ns = if (next_ns <= now_ns) now_ns else next_ns;
     }
 };
 
-/// The turn worker's presentation handler. It does not mutate the transcript and
-/// instead enqueues owned `UiEvent`s for the consumer. It lives on the worker
-/// thread, so it touches only the thread-safe channel and gpa. `agent.run`'s
-/// `anytype` handler makes this a drop-in for the consumer-side handler.
 const TurnHandler = struct {
     app: *App,
     generation: u64,
-    /// Monotonic count of progress events accepted by the UI queue.
     progress_sequence: u64 = 0,
-    /// Latest accepted progress event known to belong to an agent checkpoint.
     progress_sequence_committed: u64 = 0,
-    /// Owned error text captured from `onError`, which the agent calls just before
-    /// a failed turn returns. The worker carries it in its joined result.
     error_text: ?[]u8 = null,
-    /// The served model already reported for this turn, so a fallback that holds
-    /// across the turn's requests reports once rather than once per request. The
-    /// buffer bounds the name, and a longer name dedupes on its head.
     served_model_reported_buffer: [64]u8 = undefined,
     served_model_reported_length: usize = 0,
 
@@ -351,11 +196,9 @@ const TurnHandler = struct {
         maybe_summary: ?ai.tool.Result.Summary,
         is_error: bool,
     ) !void {
-        // The model reads the output, so only the box line reaches the consumer.
         _ = content;
         const name_copy = try self.app.gpa.dupe(u8, name);
         errdefer self.app.gpa.free(name_copy);
-        // The copy keeps the shape beside the text it belongs to.
         const maybe_summary_copy: ?ai.tool.Result.Summary = if (maybe_summary) |summary|
             .{ .text = try self.app.gpa.dupe(u8, summary.text), .kind = summary.kind }
         else
@@ -366,8 +209,6 @@ const TurnHandler = struct {
             .summary = maybe_summary_copy,
             .is_error = is_error,
         } });
-        // Tool-result slots are inside the checkpoint established before tool
-        // dispatch, and the real value replaces its slot before this callback.
         self.progress_sequence_committed = self.progress_sequence;
     }
 
@@ -396,9 +237,6 @@ const TurnHandler = struct {
         try self.enqueue(.{ .stream_reset = owned });
     }
 
-    /// Report the model that really served a reply. The turn's requests share
-    /// one requested model, so a repeat of the same served model adds nothing
-    /// and stays silent. A served model that changes again reports again.
     pub fn onModelMismatch(self: *TurnHandler, mismatch: ai.Agent.ModelMismatch) !void {
         const reported =
             self.served_model_reported_buffer[0..self.served_model_reported_length];
@@ -417,9 +255,6 @@ const TurnHandler = struct {
         self.served_model_reported_length = key_length;
     }
 
-    /// Report that Drinky sent one skill file into the turn. The transcript shows
-    /// the head alone, so the user sees which skill entered the conversation and
-    /// where it comes from.
     pub fn onSkillLoaded(self: *TurnHandler, skill: []const u8, source: []const u8) !void {
         const skill_copy = try self.app.gpa.dupe(u8, skill);
         errdefer self.app.gpa.free(skill_copy);
@@ -443,8 +278,6 @@ const TurnHandler = struct {
         self.error_text = copy;
     }
 
-    /// Agent checkpoint callback: every progress event accepted so far now maps
-    /// to durable history. It performs no I/O and cannot interrupt commitment.
     pub fn onCheckpoint(self: *TurnHandler) void {
         self.progress_sequence_committed = self.progress_sequence;
     }
@@ -463,43 +296,23 @@ const TurnHandler = struct {
     }
 };
 
-/// The turn worker's authoritative joined result. Progress travels through the
-/// queue, but terminal disposition, receipt, and optional owned error text live
-/// only here.
 const WorkerResult = struct {
     outcome: ai.Agent.Outcome,
     error_text: ?[]u8,
     generation: u64 = 0,
-    /// Last progress event accepted by the UI queue.
     progress_sequence: u64 = 0,
-    /// Last queued progress event that the agent committed to history.
     progress_sequence_committed: u64 = 0,
-    /// Whether a payload-free terminal fence entered the queue. After an
-    /// interrupted worker enqueue, the consumer uses this bit to enqueue a
-    /// replacement once it joins the result.
     terminal_queued: bool = false,
 };
 
-/// A message from any producer task to the render consumer. Turn-owned events
-/// carry a generation. Input and presentation-control events do not.
 pub const UiEvent = union(enum) {
     keys: []u8,
     turn: Session.TurnEvent,
     tick,
     resize,
-    /// The wakeup of the fetch worker of this generation: its result is ready
-    /// to join. A canceled fetch can leave one behind, so the consumer joins the
-    /// fetch of this generation alone.
     fetch_ended: u64,
-    /// A report of a bot attachment: a Telegram message, a failure, a recovery, a
-    /// permanent condition, or the end of a drain. The controller drops a report
-    /// of an attachment that ended by its generation.
     remote: remote.Attachment.Event,
-    /// A report of a sign-in: its browser data, a launch warning, or its end.
-    /// A canceled sign-in leaves stale reports that its generation rejects.
     login: LoginEvent,
-    /// A report of a bot pairing: the token check, the bind, or the end. The
-    /// controller drops a report of a canceled pairing by its generation.
     pairing: remote.Pairing.Event,
 
     pub fn deinit(self: *const UiEvent, gpa: std.mem.Allocator) void {
@@ -514,17 +327,12 @@ pub const UiEvent = union(enum) {
     }
 };
 
-/// One model fetch on a worker. The worker owns the account registry until the
-/// join, and the picker mode admits no command meanwhile, so the consumer never
-/// reads the registry under it.
 const Fetch = struct {
     future: std.Io.Future(ai.Accounts.Refresh),
     account: ai.llm.Account,
     generation: u64,
 };
 
-/// One report from a sign-in worker. Authorization data owns its runtime
-/// strings until the consumer records them in the transcript.
 const LoginEvent = struct {
     generation: u64,
     payload: Payload,
@@ -538,8 +346,6 @@ const LoginEvent = struct {
     const Authorization = struct {
         url: []u8,
         code: ?[]u8,
-        /// The one callback path that the listener of this sign-in answers on,
-        /// or null for a login that binds its redirect with `state`.
         callback_path: ?[]u8,
     };
 
@@ -555,14 +361,10 @@ const LoginEvent = struct {
     }
 };
 
-/// The presentation boundary of a sign-in worker. It sends runtime data to the
-/// consumer and never writes the terminal from the worker.
 const LoginPrompt = struct {
     app: *App,
     generation: u64,
 
-    /// The optional strings of an authorization event beside its URL. No login
-    /// reports a user code and a callback path together.
     const Runtime = struct {
         code: ?[]const u8 = null,
         callback_path: ?[]const u8 = null,
@@ -587,8 +389,6 @@ const LoginPrompt = struct {
         } });
     }
 
-    /// Copy the runtime strings of an authorization event for the consumer and
-    /// queue it. No login reports a user code and a callback path together.
     fn show(self: *LoginPrompt, url: []const u8, runtime: *const Runtime) !void {
         const url_copy = try self.app.gpa.dupe(u8, url);
         errdefer self.app.gpa.free(url_copy);
@@ -613,8 +413,6 @@ const LoginPrompt = struct {
     }
 };
 
-/// The sole result of a sign-in worker. A joined result decides whether the
-/// credential changed, even when a cancel races its terminal event.
 const LoginWorkerResult = struct {
     account: ai.llm.Account,
     generation: u64,
@@ -626,30 +424,17 @@ const LoginWorkerResult = struct {
     };
 };
 
-/// One sign-in on a worker. The callback data lets the consumer validate and
-/// replay an entered callback URL without reading the account registry.
 const Login = struct {
     future: std.Io.Future(LoginWorkerResult),
     callback: ?ai.Accounts.Callback,
-    /// The one callback path that the listener of this sign-in answers on,
-    /// reported with its authorization event. Owned. The paste filter refuses
-    /// every line that names another path.
     callback_path: ?[]u8 = null,
     generation: u64,
-    /// The caption title of the editor, `Sign in: {account}`. Owned, and the
-    /// session borrows it.
     title: []const u8,
-    /// The account and the transcript line of this attempt.
     attempt: LoginAttempt,
 };
 
-/// One sign-in attempt as the transcript sees it: the account, and the event
-/// that holds its URL. The result of the attempt replaces that event, so one
-/// attempt costs the transcript one line.
 const LoginAttempt = struct {
     account: ai.llm.Account,
-    /// The transcript index of the URL event, or null while the worker has
-    /// reported none. A result without one lands as a line of its own.
     event_index: ?usize = null,
 };
 
@@ -664,40 +449,25 @@ fn validateWorkingDirectory(gpa: std.mem.Allocator, path: []const u8) !void {
     return error.WorkingDirectoryNotUtf8;
 }
 
-/// `directory` with `home` written as `~`, which is what the status line shows.
-/// A directory outside the home directory keeps its own path. The result is
-/// owned.
 fn directoryLabel(
     gpa: std.mem.Allocator,
     directory: []const u8,
     home: []const u8,
 ) ![]const u8 {
-    // The status line names an identity rather than a file, so it never falls
-    // back to a path relative to the working directory the way `format.path`
-    // does. It asks for the home-relative part directly, because the result of
-    // `format.path` cannot say whether a leading `~/` came from home.
     const label = if (ai.format.relativeTo(&.{ .boundary = home, .target = directory })) |relative|
         try std.fmt.allocPrint(gpa, "~/{s}", .{relative})
     else if (ai.project.contains(&.{ .boundary = home, .target = directory }))
-        // The home directory itself is the whole label.
         try gpa.dupe(u8, "~")
     else
         try gpa.dupe(u8, directory);
     if (label.len <= ui.status.directory_bytes_max) return label;
     defer gpa.free(label);
-    // The status line shows an identity, not a whole path, so a long path keeps
-    // its tail. The start moves onto a display boundary, so the cut never splits
-    // a grapheme cluster.
     const marker = "…";
     const budget = ui.status.directory_bytes_max - marker.len;
     const start = terminal.width.boundaryAtOrAfter(label, label.len - budget);
     return std.fmt.allocPrint(gpa, "{s}{s}", .{ marker, label[start..] });
 }
 
-/// The canonical home directory. The label compares it with the canonical
-/// working directory, so a symbolic link inside `HOME` must resolve first. A home
-/// directory Drinky cannot resolve keeps its lexical path, which then simply does
-/// not match, and the status line shows the whole working directory.
 fn homeDirectory(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -706,8 +476,6 @@ fn homeDirectory(
 ) ![]u8 {
     const resolved = try std.fs.path.resolve(gpa, &.{ working_directory, home });
     errdefer gpa.free(resolved);
-    // The canonical path carries a sentinel, so it becomes a plain copy that the
-    // caller frees like every other path here.
     const canonical = std.Io.Dir.realPathFileAbsoluteAlloc(io, resolved, gpa) catch return resolved;
     defer gpa.free(canonical);
     const owned = try gpa.dupe(u8, canonical);
@@ -715,9 +483,6 @@ fn homeDirectory(
     return owned;
 }
 
-/// Herdr labels its pane with the directory and the branch, so inside a pane the
-/// status line leaves them to Herdr. The null root then also ends every branch
-/// readout, because the status line is the only reader of the branch.
 fn showProject(self: *App, inside_herdr: bool) void {
     if (inside_herdr) return;
     self.session.directory_shown = self.directory_label;
@@ -725,18 +490,12 @@ fn showProject(self: *App, inside_herdr: bool) void {
     self.refreshBranch();
 }
 
-/// Read the branch of the project and show it on the status line. Display only:
-/// a repository whose head Drinky cannot read leaves the directory standing alone.
 fn refreshBranch(self: *App) void {
     const root = self.session.branch_root orelse return self.session.setBranch("");
     var maybe_head = ai.project.head(self.gpa, self.io, root);
     if (maybe_head) |*head| self.session.setBranch(head.name()) else self.session.setBranch("");
 }
 
-/// Wire up the tty, agent, and session, then run the interactive loop until the
-/// user quits or stdin closes. When no account is authenticated the session
-/// starts signed out and the login picker opens so the user signs in. Pin the
-/// value: streams and the channel borrow its buffers.
 pub fn run(
     self: *App,
     gpa: std.mem.Allocator,
@@ -745,8 +504,6 @@ pub fn run(
     options: *const Options,
 ) !void {
     self.initFields(gpa, io);
-    // `initFields` built the key decoder. Only the consumer loop feeds it, so free
-    // its growth once that loop returns.
     defer self.input.deinit();
 
     const cwd_source = try std.process.currentPathAlloc(io, gpa);
@@ -762,11 +519,7 @@ pub fn run(
     defer self.accounts.deinit();
     try self.controller.openStore(home);
     defer self.controller.deinit();
-    // The connect window depends on the network, not on the provider, so every
-    // provider shares it and either one serves the Telegram calls.
     self.controller.connect_ms = config.timeouts.anthropic.connect_ms;
-    // A stale keyboard stays in the chat history, so the serials of this process
-    // must never name a keyboard that an earlier process left there.
     var serial_seed: [8]u8 = undefined;
     io.random(&serial_seed);
     self.mirror.seedSerials(std.mem.readInt(u64, &serial_seed, .little));
@@ -781,15 +534,12 @@ pub fn run(
 
     self.project_instructions = try ai.instructions.discover(gpa, io, cwd);
     defer self.project_instructions.deinit();
-    // One repository keeps one remembered choice, so the key is its root. Outside
-    // a repository the working directory is the project.
     self.state = try State.open(gpa, io, &.{
         .working_directory = cwd,
         .home = home,
         .project = self.project_instructions.projectRoot() orelse cwd,
     });
     defer self.state.deinit();
-    // The history has no project key, so every project shares the one file.
     self.prompt_history = try PromptHistory.open(gpa, io, &.{
         .working_directory = cwd,
         .home = home,
@@ -806,9 +556,6 @@ pub fn run(
         .project_root = self.project_instructions.projectRoot(),
     });
     defer self.skills.deinit();
-    // A configured glob measures against the working directory. The rules must
-    // reach the guard before the prompt below names them, so the messages of a
-    // rule that Drinky drops wait for the transcript.
     self.skill_guard = .{ .working_directory = cwd };
     var skill_notices: std.ArrayList(ai.instructions.Notice) = .empty;
     defer {
@@ -845,11 +592,6 @@ pub fn run(
     });
     defer gpa.free(self.document);
 
-    // Start on the account this project used last, then on the first
-    // authenticated account, or signed out (no client) when none is. The login
-    // picker opens below to sign in. The model resolves from the name that
-    // account ran here. A name the account no longer offers, and an account
-    // that no fetch ran for, resolve to no model, and the status line says so.
     const active = self.startAccount();
     const start_account = active orelse .anthropic_plan;
     const start_client = if (active) |account| self.accounts.client(account) else null;
@@ -866,9 +608,6 @@ pub fn run(
         .skill_guard = &self.skill_guard,
     });
     defer self.agent.deinit();
-    // Startup applies the remembered or the default choices, so it saves nothing.
-    // Only a later change writes the file. A signed-out start has no account to
-    // remember, so the first login records one.
     if (active) |account| try self.state.seed(account, start_model, start_effort);
 
     try self.tty.init(io);
@@ -880,11 +619,7 @@ pub fn run(
     self.session = Session.init(gpa, self.tty.writer(), self.agent.model, self.agent.effort);
     defer self.session.deinit();
     self.session.showSetup(active, self.agent.model, self.agent.effort);
-    // The session reports how long a call has run against this timeout, so it
-    // must read the same one the tool runs under.
     self.session.bash_timeout_ms = config.bash.timeout_ms;
-    // The interface settings reach the frame through the session, because paint
-    // reads no configuration of its own.
     self.session.window_pages = config.window_pages;
     self.session.gauge = config.gauge;
     self.session.display_roots = self.displayRoots();
@@ -921,9 +656,6 @@ pub fn run(
     );
     if (config.dropped_gauge) |dropped| try self.recordEvent(
         .failure,
-        // The file can state one share alone, and the other one is then the
-        // compiled share. The pair is therefore not always a configured pair,
-        // so the sentence names the shares and not the lines of the file.
         "Drinky ignored the gauge shares {d} and {d}. A share must be from {d} to {d}, and " ++
             "the warning share must not pass the error share. Drinky uses the shares {d} " ++
             "and {d}.",
@@ -942,8 +674,6 @@ pub fn run(
         "Drinky could not read the saved bots in {s} because of error {s}.",
         .{ self.controller.storePath(), @errorName(err) },
     );
-    // The parse ignores an unknown key so that an older binary reads a newer
-    // file. Report it, because a typo otherwise looks like an applied setting.
     for (config.unknown_keys) |key| try self.recordEvent(
         .failure,
         "Drinky ignored the unknown configuration key \"{s}\" in {s}.",
@@ -954,13 +684,9 @@ pub fn run(
         "Drinky omitted the remaining unknown configuration keys in {s}.",
         .{config.path},
     );
-    // Only a skipped file gets a line. A normal load reports nothing, and
-    // `/sources` shows what it loaded.
     try self.reportNotices(config.user_instructions.notices());
     try self.reportNotices(self.project_instructions.notices());
     try self.reportNotices(self.skills.notices());
-    // No account signed in: open the login picker (the same one /login opens) so
-    // the user chooses how to sign in.
     if (!self.signedIn()) {
         try self.reportNotice(
             .information,
@@ -971,12 +697,8 @@ pub fn run(
     }
     defer self.prepareTerminalExit();
     try self.refresh();
-    // Start the frame grid at the first painted frame, so the first tick lands
-    // one interval after it rather than at once.
     self.frame_grid = .reset(self.nowNs());
 
-    // The release is the last word of this process to Herdr, so it runs after
-    // every other task is down.
     self.herdr.start(options.herdr);
     defer self.herdr.deinit();
     self.running = true;
@@ -987,23 +709,14 @@ pub fn run(
     try self.runLoop();
 }
 
-/// Give every field its start value. `run` and the test scaffolding both begin
-/// here, and the exhaustive literal fails the build for a field with no start.
-/// No value allocates, so a caller overwrites one without a leak. A field that
-/// stays `undefined` needs a live resource that only `run` or a test can build.
 fn initFields(self: *App, gpa: std.mem.Allocator, io: std.Io) void {
     self.* = .{
         .gpa = gpa,
         .io = io,
-        // A tty needs a terminal, and the watcher needs a signal handler.
         .tty = undefined,
         .resize = undefined,
-        // Pinned: `client` returns a pointer into it, so the owner must build it
-        // in place.
         .accounts = undefined,
-        // It needs the account, model, and effort level of the caller.
         .agent = undefined,
-        // It needs the writer that the caller reads back.
         .session = undefined,
         .state = .inert(gpa, io),
         .prompt_history = .inert(gpa, io),
@@ -1011,28 +724,18 @@ fn initFields(self: *App, gpa: std.mem.Allocator, io: std.Io) void {
         .directory_label = "",
         .working_directory = "",
         .home_directory = "",
-        // The source only names a noun in a report, and nothing reports an empty
-        // result, so either tag serves until discovery replaces this.
         .project_instructions = .init(gpa, .project),
         .skills = .init(gpa),
         .prompt = "",
         .document = "",
         .sources_page = "",
-        // The rules join it in `run`, once the config and the skill scan are
-        // both read.
         .skill_guard = .{},
         .input = .init(gpa),
-        // The loop is not live yet. `run` arms this before it enters the loop.
         .running = false,
-        // The monotonic clock can start near zero. A boot press must never read
-        // as the second of a pair.
         .ctrl_c_ms_last = -ctrl_c_window_ms,
         .escape_deadline_ms = null,
-        // Taken below, after the literal.
         .queue = undefined,
-        // The storage that the queue borrows.
         .queue_buffer = undefined,
-        // Storage that only a cancel drain writes.
         .deferred_events = undefined,
         .deferred_event_count = 0,
         .input_future = null,
@@ -1051,8 +754,6 @@ fn initFields(self: *App, gpa: std.mem.Allocator, io: std.Io) void {
         .tick_pending = false,
         .frame_grid = .reset(0),
         .herdr = .init(io),
-        // The controller reports into this app and routes its tasks into the
-        // queue below, and `run` replaces the inert store.
         .controller = .init(gpa, io, &.{
             .store = .inert(gpa, io),
             .sink = .{ .context = self, .act = onRemoteAction },
@@ -1067,32 +768,19 @@ fn initFields(self: *App, gpa: std.mem.Allocator, io: std.Io) void {
         .prompt_marked = false,
         .steering_marked_count = 0,
     };
-    // The literal above writes `queue_buffer` too. A result location does put that
-    // buffer at its final address, but do not depend on that, so take it here.
     self.queue = std.Io.Queue(UiEvent).init(&self.queue_buffer);
 }
 
-/// Leave the alternate screen and park the primary cursor before terminal teardown.
-/// An output failure does not stop terminal teardown.
 fn prepareTerminalExit(self: *App) void {
     self.tty.setAlternateScreen(false) catch return;
     self.session.parkCursor() catch {};
 }
 
-/// Cancel and reap every producer task, then drain and free any events they left
-/// buffered. Runs before `tty.deinit`, so the reader no longer touches stdin when
-/// the tty restores termios.
 fn shutdownTasks(self: *App) void {
-    // No consumer drains the channel from here on, so it closes first: a producer
-    // that meets a full channel then ends instead of a wait that no one answers.
     self.queue.close(self.io);
-    // The detach goes first, so its event is the last message of the chat, and
-    // its window is bounded, so a dead network cannot hold the exit.
     self.controller.shutdown();
     self.chat_picker.deinit();
     self.freeRemoteStrings();
-    // Shutdown is teardown, not an interactive cancel: free the worker result's
-    // owned terminal text and leave the session untouched.
     self.dropRetry();
     self.dropRevision();
     if (self.cancelTurnFuture()) |result| self.freeWorkerResult(&result);
@@ -1108,9 +796,6 @@ fn shutdownTasks(self: *App) void {
     self.drainQueue();
 }
 
-/// Cancel and reap the turn worker, then return its joined result, or null if
-/// none is running. `Future.cancel` returns the task's actual result, so a worker
-/// that finished before the cancel reads as completed, not interrupted.
 fn cancelTurnFuture(self: *App) ?WorkerResult {
     if (self.turn_future) |*future| {
         const result = future.cancel(self.io);
@@ -1120,7 +805,6 @@ fn cancelTurnFuture(self: *App) ?WorkerResult {
     return null;
 }
 
-/// Reap the finished turn worker, then return its joined result, or null if none.
 fn awaitTurnFuture(self: *App) ?WorkerResult {
     if (self.turn_future) |*future| {
         const result = future.await(self.io);
@@ -1130,8 +814,6 @@ fn awaitTurnFuture(self: *App) ?WorkerResult {
     return null;
 }
 
-/// Take the authoritative result at its terminal fence. A late cancel can join it
-/// first. Otherwise the fence guarantees the worker is ready to join.
 fn takeTurnResult(self: *App) ?WorkerResult {
     if (self.awaitTurnFuture()) |result| return result;
     if (self.pending_turn_result) |result| {
@@ -1141,10 +823,6 @@ fn takeTurnResult(self: *App) ?WorkerResult {
     return null;
 }
 
-/// Nonblocking enqueue of a replacement terminal fence when cancellation joined
-/// a worker with an interrupted enqueue. The fence follows every event already in
-/// the queue. If producers fill the queue first, the consumer retries after its
-/// next drain has opened capacity.
 fn enqueuePendingTurnFence(self: *App) void {
     const result = if (self.pending_turn_result) |*pending| pending else return;
     if (result.terminal_queued) return;
@@ -1159,20 +837,13 @@ fn enqueuePendingTurnFence(self: *App) void {
     if (count == 1) result.terminal_queued = true;
 }
 
-/// Free any terminal error text still owned by a joined result after its caller
-/// has resolved or discarded the outcome.
 fn freeWorkerResult(self: *App, result: *const WorkerResult) void {
     if (result.error_text) |text| self.gpa.free(text);
 }
 
-/// Reconcile a completed or failed joined result, then return late steering to
-/// the editor after a completion. A failure returns uncommitted drafts too.
 fn finishWorkerResult(self: *App, result: *const WorkerResult) !void {
     self.session.stats_shown = self.agent.stats;
-    // A turn can check out another branch, so the status line settles here.
     self.refreshBranch();
-    // The chat learns the state of its messages before the session resolves
-    // them, because their ids live on the session until then.
     try self.settleChatMessages(&result.outcome.receipt);
     switch (result.outcome.disposition) {
         .completed => {
@@ -1194,10 +865,6 @@ fn finishWorkerResult(self: *App, result: *const WorkerResult) !void {
                 return error.UnexpectedTokenGrantRejection;
             if (!account.hasRefreshCredential())
                 return error.UnexpectedTokenGrantRejection;
-            // The repair is a login, and `/login` is terminal-only, so the bot
-            // hands the session back first. The failed turn then returns its
-            // uncommitted Telegram messages to the editor like every message
-            // after a detach, and the picker opens over them.
             try self.controller.detach(.credential_rejected);
             try self.finishFailedWorker(result);
             try self.rejectCredential(account);
@@ -1207,27 +874,15 @@ fn finishWorkerResult(self: *App, result: *const WorkerResult) !void {
     }
 }
 
-/// Apply one failed result and arm its retry. The credential work stays with
-/// the caller, because it can open a picker over the restored prompt.
 fn finishFailedWorker(self: *App, result: *const WorkerResult) !void {
-    // The turn ends here whatever follows, so its attempt flag resolves first.
     const attempt = self.takeTurnRetry();
     try self.session.reserveFailureRestore(&result.outcome.receipt);
     defer self.agent.steering.clear();
-    // The reconciliation runs first, because `reserveFailureRestore` makes only
-    // that step infallible. The arm allocates, so it stays outside that window,
-    // and it comes before the chat learns of the end, so the chat gets the
-    // failed turn message of the retry it armed.
     try self.session.failTurnWithReceipt(&result.outcome.receipt, result.error_text);
     try self.armRetry(result, attempt);
     try self.endMirrorTurn(.failed);
 }
 
-/// Arm one retry context from a failed turn, so Ctrl+N can ask the model to
-/// continue. Only committed work can be continued, so a turn that committed
-/// nothing arms nothing: its request returns to the editor instead. A failed
-/// `attempt` is the exception, because the work that it continues from is already
-/// in history. The latest failure replaces any older context.
 fn armRetry(self: *App, result: *const WorkerResult, attempt: bool) !void {
     const receipt = &result.outcome.receipt;
     const committed = receipt.history_end != receipt.history_base;
@@ -1239,14 +894,6 @@ fn armRetry(self: *App, result: *const WorkerResult, attempt: bool) !void {
     self.setRetry(.{ .failure = failure });
 }
 
-/// Replace the recovery offer with `retry` and mirror its caption into the
-/// session. This is the one place that moves both together, so the caption
-/// cannot outlive it. A revision that waits goes first, because the two offers
-/// cannot coexist.
-///
-/// The call frees the context that it replaces, so a caller builds `retry` and
-/// every byte in it first. `armRetry` duplicates the failure sentence before it
-/// arrives here for exactly that reason.
 fn setRetry(self: *App, retry: Retry) void {
     self.dismissOffer();
     self.retry = retry;
@@ -1254,10 +901,6 @@ fn setRetry(self: *App, retry: Retry) void {
     self.session.dirty = true;
 }
 
-/// Replace the recovery offer with `revision` and mirror its caption into the
-/// session. A retry that waits goes first, because the two offers cannot
-/// coexist. Infallible, so a cancellation publishes the context before a later
-/// error returns.
 fn setRevision(self: *App, revision: Revision) void {
     self.dismissOffer();
     self.revision = revision;
@@ -1265,13 +908,6 @@ fn setRevision(self: *App, revision: Revision) void {
     self.session.dirty = true;
 }
 
-/// Dismiss whichever recovery offer waits at the prompt, and its caption. The
-/// editor keeps its text, because the offer owns none of it. A retry that ends
-/// takes the buttons off its message in the chat too, and a failed edit costs
-/// the buttons alone. A revision has no remote controls, and a warning that its
-/// first Ctrl+N armed goes with it, so no confirmation outlives its offer. Esc,
-/// `/new`, and every turn start come here, and each successful Ctrl+N action
-/// comes here at its commit point.
 fn dismissOffer(self: *App) void {
     std.debug.assert(self.retry == null or self.revision == null);
     if (self.retry != null) self.mirror.dismissRetry(&self.controller) catch {};
@@ -1282,37 +918,28 @@ fn dismissOffer(self: *App) void {
     self.session.dirty = true;
 }
 
-/// Take the attempt flag of the turn that is ending. Only a new attempt sets it
-/// again, so every terminal reads it once.
 fn takeTurnRetry(self: *App) bool {
     defer self.turn_retry = false;
     return self.turn_retry;
 }
 
-/// Free the retry context and forget it. Teardown uses this, because it touches
-/// no session state.
 fn dropRetry(self: *App) void {
     const retry = self.retry orelse return;
     retry.deinit(self.gpa);
     self.retry = null;
 }
 
-/// Free the revision context and forget it. Teardown uses this, because it
-/// touches no session state.
 fn dropRevision(self: *App) void {
     const revision = if (self.revision) |*revision| revision else return;
     revision.deinit(self.gpa);
     self.revision = null;
 }
 
-/// Discard a waiting retry alone. A tap on `Dismiss` in the chat comes here,
-/// because the buttons of the chat name the retry and never a revision.
 fn clearRetry(self: *App) void {
     if (self.retry == null) return;
     self.dismissOffer();
 }
 
-/// Cancel and reap `maybe_future`'s task, then clear the handle. A no-op when null.
 fn cancelFuture(self: *App, maybe_future: *?std.Io.Future(void)) void {
     if (maybe_future.*) |*future| {
         future.cancel(self.io);
@@ -1320,7 +947,6 @@ fn cancelFuture(self: *App, maybe_future: *?std.Io.Future(void)) void {
     }
 }
 
-/// Reap `maybe_future`'s finished task, then clear the handle. A no-op when null.
 fn awaitFuture(self: *App, maybe_future: *?std.Io.Future(void)) void {
     if (maybe_future.*) |*future| {
         future.await(self.io);
@@ -1328,8 +954,6 @@ fn awaitFuture(self: *App, maybe_future: *?std.Io.Future(void)) void {
     }
 }
 
-/// Free every event still buffered on the channel. Only safe once the producers
-/// are reaped, so no new event can arrive mid-drain.
 fn drainQueue(self: *App) void {
     var batch: [queue_capacity]UiEvent = undefined;
     while (true) {
@@ -1341,7 +965,6 @@ fn drainQueue(self: *App) void {
     self.deferred_event_count = 0;
 }
 
-/// Move the consumer-owned prefix into `batch` and transfer event ownership.
 fn takeDeferredEvents(self: *App, batch: *[queue_capacity]UiEvent) usize {
     const count = self.deferred_event_count;
     @memcpy(batch[0..count], self.deferred_events[0..count]);
@@ -1349,11 +972,6 @@ fn takeDeferredEvents(self: *App, batch: *[queue_capacity]UiEvent) usize {
     return count;
 }
 
-/// The consumer: block on the channel, drain a coalesced batch, apply each event
-/// to the session, and paint only on a `.tick`. The loop arms a tick whenever the
-/// session is dirty, a turn animates, or a held Escape byte waits, and none is
-/// pending. A clean idle interface stays inert (no tick, blocked on an empty
-/// channel).
 fn runLoop(self: *App) !void {
     var batch: [queue_capacity]UiEvent = undefined;
     while (self.running) {
@@ -1375,8 +993,6 @@ fn runLoop(self: *App) !void {
                 self.session.dirty = false;
             }
         }
-        // A held Escape byte arms a frame too, because its wait ends on a tick and
-        // an idle loop has no other wake.
         const waiting = self.session.dirty or
             self.session.animating() or
             self.escape_deadline_ms != null;
@@ -1384,10 +1000,6 @@ fn runLoop(self: *App) !void {
     }
 }
 
-/// The state that Herdr shows for this pane, read from the model after a batch.
-/// A turn works. A failed turn or a canceled turn that waits for Ctrl+N blocks,
-/// because the user must decide on it. Everything else, the pickers included,
-/// is idle.
 fn herdrState(self: *const App) Herdr.State {
     std.debug.assert(self.retry == null or self.revision == null);
     if (self.session.mode == .turn) return .working;
@@ -1395,8 +1007,6 @@ fn herdrState(self: *const App) Herdr.State {
     return .idle;
 }
 
-/// Apply one bounded queue batch. Once the queue hands the batch to the consumer,
-/// this function owns every event. An error frees the unprocessed suffix.
 fn applyBatch(self: *App, events: []const UiEvent) !bool {
     std.debug.assert(events.len <= queue_capacity);
     var applied_count: usize = 0;
@@ -1410,8 +1020,6 @@ fn applyBatch(self: *App, events: []const UiEvent) !bool {
             .resize => self.session.dirty = true,
             .keys => |bytes| {
                 defer self.gpa.free(bytes);
-                // A checkout in another terminal shows on the next key. An idle
-                // loop paints no frame, so the label waits for this wake.
                 self.refreshBranch();
                 try self.handleKeys(bytes);
             },
@@ -1434,10 +1042,6 @@ fn applyBatch(self: *App, events: []const UiEvent) !bool {
     return ticked;
 }
 
-/// Arm the next frame: a one-shot timer for the next deadline on the grid. This
-/// is the only place that advances the grid, so the work of a frame stays inside
-/// its own interval. On the impossible failure to spawn the timer, paint inline
-/// and start the grid again at the painted frame.
 fn armTick(self: *App) void {
     self.frame_grid.advance(self.nowNs());
     const deadline_ns = self.frame_grid.deadline_ns;
@@ -1450,10 +1054,6 @@ fn armTick(self: *App) void {
     self.tick_pending = true;
 }
 
-/// Frame timer task: wait for the deadline, then push one `.tick`. It waits on
-/// the deadline, not on a duration, so the arming time cannot drift the frame. A
-/// cancel drops the tick. The deadline arrives by value, so the task reads no
-/// state the consumer can write.
 fn frameTimer(self: *App, deadline_ns: i96) void {
     const deadline: std.Io.Clock.Timestamp = .{
         .raw = .fromNanoseconds(deadline_ns),
@@ -1463,9 +1063,6 @@ fn frameTimer(self: *App, deadline_ns: i96) void {
     self.queue.putOne(self.io, .tick) catch {};
 }
 
-/// Resize watcher task: block on the SIGWINCH self-pipe and push one `.resize`
-/// per wake, so the consumer repaints at the new size (which `refresh` re-reads).
-/// Exits on cancel (shutdown) or a pipe fault.
 fn readResize(self: *App) void {
     while (true) {
         self.resize.wait(self.io) catch return;
@@ -1473,9 +1070,6 @@ fn readResize(self: *App) void {
     }
 }
 
-/// Input reader task: block on stdin and push each chunk as owned `.keys`. Exits
-/// on cancel (shutdown). On stdin close or a read fault it closes the channel so
-/// the consumer's `get` returns `error.Closed` and the program winds down.
 fn readInput(self: *App) void {
     var buffer: [4096]u8 = undefined;
     while (true) {
@@ -1498,10 +1092,6 @@ fn readInput(self: *App) void {
     }
 }
 
-/// Transcript text for a turn the agent failed without a report through `onError`.
-/// Each is the agent's own verdict on a reply, so it reads as a sentence and
-/// never as an internal fault. Anything unmapped returns null, and the caller
-/// wraps its error name.
 fn turnFailureText(err: anyerror) ?[]const u8 {
     return switch (err) {
         error.NoModel => no_model_refusal,
@@ -1516,8 +1106,6 @@ fn turnFailureText(err: anyerror) ?[]const u8 {
             .{ai.Agent.tool_calls_max},
         ),
         error.TooManyToolRounds => "The turn reached the limit for tool rounds.",
-        // The next step depends on the transition that follows this failure, so
-        // the app names it in a later event.
         error.CredentialReplaced => "Drinky found a replacement credential for this account. " ++
             "Drinky removed the prior account evidence.",
         error.TokenGrantRejected => "The provider rejected the refresh credential.",
@@ -1532,10 +1120,6 @@ fn turnFailureText(err: anyerror) ?[]const u8 {
     };
 }
 
-/// Turn worker task: run one turn, queue a payload-free completion wakeup after
-/// all progress, and return the sole terminal result. Cancellation or channel
-/// closure suppresses the wakeup. An interrupted wakeup still leaves the joined
-/// result authoritative.
 fn runTurnWorker(self: *App, text: []const u8, generation: u64) WorkerResult {
     defer self.gpa.free(text);
     var handler: TurnHandler = .{ .app = self, .generation = generation };
@@ -1579,20 +1163,15 @@ fn runTurnWorker(self: *App, text: []const u8, generation: u64) WorkerResult {
     };
 }
 
-/// The active account, or null when the agent is signed out.
 fn activeAccount(self: *const App) ?ai.llm.Account {
     const client = self.agent.client orelse return null;
     return client.account();
 }
 
-/// Whether an account is active. Drinky refuses normal messages until a login.
 fn signedIn(self: *const App) bool {
     return self.activeAccount() != null;
 }
 
-/// The account to start on: the one this project used last, when it is still
-/// authenticated, else the first authenticated account. Null when no account is
-/// authenticated.
 fn startAccount(self: *const App) ?ai.llm.Account {
     if (self.state.start.account) |account| {
         if (self.accounts.isAuthenticated(account)) return account;
@@ -1600,28 +1179,15 @@ fn startAccount(self: *const App) ?ai.llm.Account {
     return self.accounts.firstAuthenticated();
 }
 
-/// The model `account` runs: the one it ran last in this project, else none. A
-/// model belongs to the account that ran it, so another account starts on its
-/// own last model. Startup, a switch, and a login all read this one rule.
-///
-/// `state` remembers a name alone, and the catalog says what that name is. A
-/// name the account no longer offers, and an account that no fetch ran for,
-/// resolve to no model, so the user picks one with `/model`.
 fn accountModel(self: *const App, account: ai.llm.Account) ?ai.Model {
     const remembered = self.state.models.get(account) orelse return null;
     return self.accounts.findModel(account, remembered.name());
 }
 
-/// The effort level to start on: the one this project used last, else the
-/// `configured` default, else the compiled fallback.
 fn startEffort(self: *const App, configured: ?ai.llm.Effort) ai.llm.Effort {
     return self.state.start.effort orelse configured orelse effort_default;
 }
 
-/// Decode a stdin chunk into key events and apply each. An exit key that returns
-/// the session to the prompt ends the chunk and drops the keys behind it. Those
-/// keys are the rest of one exit attempt, such as `\x1b\x04` from a terminal
-/// without the Kitty protocol, and Ctrl+D at the prompt quits Drinky.
 fn handleKeys(self: *App, bytes: []const u8) !void {
     try self.input.feed(bytes);
     while (self.input.next()) |event| {
@@ -1629,8 +1195,6 @@ fn handleKeys(self: *App, bytes: []const u8) !void {
         const owner = self.session.input.owner;
         const login_generation = if (self.login) |login| login.generation else null;
         try self.handleKey(&event);
-        // A detach, a wait end, and a sign-in cancel each return one input layer.
-        // The rest of that exit attempt must not reach the prompt.
         const current_login_generation = if (self.login) |login| login.generation else null;
         const returned = (!at_prompt and self.session.mode == .prompt) or
             owner != self.session.input.owner or
@@ -1640,16 +1204,12 @@ fn handleKeys(self: *App, bytes: []const u8) !void {
             break;
         }
     }
-    // A held Escape byte starts its wait here. Bytes that complete a sequence
-    // arrive in the next chunk at the latest, so this chunk ends the wait too.
     self.escape_deadline_ms = if (self.input.pendingEscape())
         self.nowMs() + escape_wait_ms
     else
         null;
 }
 
-/// Whether `event` is one of the keys a user presses to leave the current layer.
-/// Enter is not one, even where it also returns to the prompt.
 fn isExitKey(event: *const terminal.Input.Key) bool {
     return switch (event.*) {
         .escape => true,
@@ -1658,9 +1218,6 @@ fn isExitKey(event: *const terminal.Input.Key) bool {
     };
 }
 
-/// Turn a held Escape byte into an Escape key once its wait passes. A terminal
-/// without the Kitty protocol reports Escape as that one byte, so this is the only
-/// path that closes a page or cancels a turn there.
 fn flushEscape(self: *App) !void {
     const deadline = self.escape_deadline_ms orelse return;
     if (self.nowMs() < deadline) return;
@@ -1671,56 +1228,30 @@ fn flushEscape(self: *App) !void {
 
 fn handleKey(self: *App, event: *const terminal.Input.Key) !void {
     const at_prompt = self.session.mode == .prompt;
-    // The input owner is a second axis over the mode. While the terminal does not
-    // hold the input, no key confirms anything: the key that returns the input
-    // ends one thing, and the key after it must warn again.
-    // A sign-in holds the editor for a callback URL, so no key confirms anything
-    // there either: Enter replays a line, and an exit key cancels the sign-in.
     const editor_live = self.session.input.owner == .terminal and self.login == null;
-    // A refused command line goes to the model on the next Enter alone. The prompt
-    // sends it, and a turn queues it, so both modes can confirm.
     const confirms_message = editor_live and (at_prompt or self.session.mode == .turn) and
         event.* == .enter;
     if (!confirms_message) self.session.cancelConfirmation(.message);
-    // Only a second Esc during a turn can confirm the turn-cancel warning. Every
-    // other user action clears the warning and its one-shot confirmation.
     const confirms_turn_cancel = editor_live and self.session.mode == .turn and event.* == .escape;
     if (!confirms_turn_cancel) self.session.cancelConfirmation(.turn_cancel);
-    // Only a second Ctrl+D at the prompt can confirm the quit warning. Every
-    // other user action clears the warning and its one-shot confirmation.
     const confirms_quit = editor_live and at_prompt and event.* == .ctrl and event.ctrl == 'd';
     if (!confirms_quit) self.session.cancelConfirmation(.quit);
-    // Only a second Ctrl+N at the prompt can confirm the revision warning. Every
-    // other user action clears the warning and its one-shot confirmation, and
-    // keeps the offer.
     const confirms_revision = editor_live and at_prompt and event.* == .ctrl and event.ctrl == 'n';
     if (!confirms_revision) self.session.cancelConfirmation(.revision);
-    // During a turn the terminal owns, Esc dismisses a notice and nothing else.
-    // The cancel warning still takes the second Esc.
     if (event.* == .escape and self.session.mode == .turn and editor_live) {
         if (self.session.notice != null and !self.session.confirmations.contains(.turn_cancel)) {
             self.session.clearNotice();
             return;
         }
     }
-    // Clear before the key routes, so a notice produced by this action survives it.
     self.session.clearNotice();
-    // A sign-in keeps the raw terminal and editor. It owns every key until its
-    // worker ends or an exit cancels it.
     if (self.login != null) return self.handleLoginKey(event);
-    // A picker or a page takes its keys under any owner. The attached state opens
-    // none, and the detaching state opens the login picker of a credential
-    // rejection, which the user must be able to answer.
     switch (self.session.mode) {
         .picking => return self.handlePickerKey(event),
         .viewing => return self.handlePageKey(event),
         .turn, .prompt => {},
     }
-    // While the terminal does not hold the input, every exit key returns it, Enter
-    // states the reason, and no other key reaches the editor.
     if (!editor_live) return self.handleExternalKey(event);
-    // The token prompt outranks the mode, because a bot token must never reach
-    // a model. The check holds the same token, so it uses the same rule.
     if (self.controller.state() == .token_prompt) return self.handleTokenKey(event);
     if (self.controller.pairs()) return self.handlePairingKey(event);
     if (self.session.mode == .turn) return self.handleTurnKey(event);
@@ -1728,17 +1259,12 @@ fn handleKey(self: *App, event: *const terminal.Input.Key) !void {
     switch (event.*) {
         .enter => try self.submit(),
         .tab => try self.openPromptHistory(),
-        // Esc owns the waiting recovery offer, and it keeps the editor text. A
-        // dismissed revision keeps the canceled turn in both histories.
         .escape => self.dismissOffer(),
         .ctrl => |letter| switch (letter) {
             'c' => {
                 self.clearOrQuit();
                 if (self.running) self.session.dirty = true;
             },
-            // Ctrl+D quits at once on an empty editor. A draft arms a one-shot
-            // confirmation and warns instead, because the quit discards it. The
-            // second Ctrl+D quits anyway.
             'd' => if (self.session.editor.visible().len == 0 or
                 self.session.takeConfirmation(.quit))
             {
@@ -1751,9 +1277,6 @@ fn handleKey(self: *App, event: *const terminal.Input.Key) !void {
                     .{},
                 );
             },
-            // Ctrl+N acts on the one recovery offer that the caption names. A
-            // failed turn continues, and a canceled turn leaves the
-            // conversation. Without an offer the key does nothing.
             'n' => switch (self.session.prompt_offer) {
                 .none => {},
                 .retry => try self.retryTurn(),
@@ -1765,9 +1288,6 @@ fn handleKey(self: *App, event: *const terminal.Input.Key) !void {
     }
 }
 
-/// Apply an editing key to the live editor and mark the session dirty. Returns
-/// whether `event` was an editing key. Shared by the prompt and by a running
-/// turn, where the editor stays live so the user can steer.
 fn editKey(self: *App, event: *const terminal.Input.Key) !bool {
     const editor = &self.session.editor;
     switch (event.*) {
@@ -1791,8 +1311,6 @@ fn editKey(self: *App, event: *const terminal.Input.Key) !bool {
     return true;
 }
 
-/// Keys during a sign-in. The editor accepts a callback URL. Esc and Ctrl+D
-/// cancel the sign-in. Ctrl+C clears a draft first.
 fn handleLoginKey(self: *App, event: *const terminal.Input.Key) !void {
     if (try self.editKey(event)) return;
     switch (event.*) {
@@ -1812,8 +1330,6 @@ fn handleLoginKey(self: *App, event: *const terminal.Input.Key) !void {
     }
 }
 
-/// Replay an entered callback URL to the listener of the active sign-in. A
-/// refused or failed line stays in the editor.
 fn submitLoginLine(self: *App) !void {
     const login = if (self.login) |*login| login else return;
     const text = try self.session.editor.expanded(.whole_prompt);
@@ -1824,9 +1340,6 @@ fn submitLoginLine(self: *App) !void {
         "The sign-in to {s} does not accept a callback URL. Complete the sign-in in the browser.",
         .{account.id()},
     );
-    // A path-bound login answers on one random path, and the listener reports
-    // that path with the authorization event. Until that report arrives, no
-    // line can be its redirect.
     const accepted = switch (callback.binding) {
         .state => ai.oauth_callback.holdsStateRedirect(text),
         .path => if (login.callback_path) |callback_path|
@@ -1841,8 +1354,6 @@ fn submitLoginLine(self: *App) !void {
         .{account.id()},
     );
     ai.oauth_callback.replay(self.io, callback.port, text) catch |err| switch (err) {
-        // The listener closes after its response. A refused connection means
-        // that this sign-in already moved past the callback.
         error.ConnectionRefused => {
             self.session.editor.clear();
             self.session.markEdited();
@@ -1863,13 +1374,6 @@ fn submitLoginLine(self: *App) !void {
     self.session.markEdited();
 }
 
-/// Keys during a streaming turn. The editor stays live: Enter queues steering,
-/// and Ctrl+P recalls the queue. Esc first restores the status line. Esc and
-/// Ctrl+D cancel the turn and keep the draft. Esc warns first over a draft,
-/// because a reflex Esc while the user types can mean a dismiss or a clear.
-/// Ctrl+D cancels at once, so the legacy exit attempt Esc+Ctrl+D still works.
-/// Ctrl+C clears a draft first. A turn cannot host a picker, so Tab states that
-/// and changes nothing.
 fn handleTurnKey(self: *App, event: *const terminal.Input.Key) !void {
     if (try self.editKey(event)) return;
     switch (event.*) {
@@ -1878,7 +1382,6 @@ fn handleTurnKey(self: *App, event: *const terminal.Input.Key) !void {
         .escape => try self.warnOrCancel(),
         .ctrl => |letter| switch (letter) {
             'c' => try self.clearOrCancel(),
-            // Ctrl+D cancels the turn at once.
             'd' => try self.cancelTurn(),
             'p' => try self.pullSteering(),
             else => {},
@@ -1887,10 +1390,6 @@ fn handleTurnKey(self: *App, event: *const terminal.Input.Key) !void {
     }
 }
 
-/// Esc during a turn: cancel at once when the editor is empty, because an Esc
-/// there is a decision. A draft signals that the user types, and a reflex Esc
-/// while typing must not stop the turn, so it arms a one-shot confirmation and
-/// warns instead. The second Esc cancels the turn and keeps the draft.
 fn warnOrCancel(self: *App) !void {
     if (self.session.editor.visible().len == 0 or self.session.takeConfirmation(.turn_cancel))
         return self.cancelTurn();
@@ -1898,9 +1397,6 @@ fn warnOrCancel(self: *App) !void {
     try self.reportNotice(.warning, turn_cancel_notice, .{});
 }
 
-/// Ctrl+C during a turn: clear a draft, or cancel the turn when the editor is
-/// empty. The editor stays live for steering, so the key that stops the turn must
-/// not drop typed text. Esc cancels and keeps the draft instead.
 fn clearOrCancel(self: *App) !void {
     if (self.session.editor.visible().len != 0) {
         self.session.editor.clear();
@@ -1910,11 +1406,6 @@ fn clearOrCancel(self: *App) !void {
     try self.cancelTurn();
 }
 
-/// Enter during a turn: queue the line as steering. No command but `/status`
-/// runs mid-turn, because a command can open a picker that a turn cannot host.
-/// A line the registry cannot run as typed keeps its refusal, which arms one
-/// Enter to queue it as steering. A runnable command has no such arm, because
-/// the next Enter runs it once the turn ends.
 fn submitSteering(self: *App) !void {
     if (self.session.editor.blank()) {
         self.session.cancelConfirmation(.message);
@@ -1933,11 +1424,6 @@ fn submitSteering(self: *App) !void {
             return self.refuseCommand(name, "while a turn runs");
         }
     }
-    // Reserve the mirror slot before the channel push, so the push is the only
-    // fallible step before the draft moves in. If the push fails, the editor is
-    // untouched. Once it succeeds, the literal-edge-trimmed draft moves into the
-    // mirror with no allocation. The channel copy is whole-prompt trimmed. The
-    // recovery draft keeps its atoms and their exact payloads.
     try self.session.reserveSteering();
     try self.agent.steering.push(text);
     var draft = self.session.editor.detachTrimmed();
@@ -1945,77 +1431,36 @@ fn submitSteering(self: *App) !void {
     self.session.dirty = true;
 }
 
-/// Ctrl+P during a turn: pull the pending steering back into the editor as live
-/// placeholder drafts, after any in-progress line. Content comes from the mirror,
-/// so a paste returns as its marker, not expanded text. The channel gives only
-/// the count that selects the mirror's pending suffix. The remaining prefix stays
-/// retained until it is consumed or a failed delivery makes it recallable.
 fn pullSteering(self: *App) !void {
     _ = try self.withdrawSteering();
 }
 
-/// Return steering the worker never took before the turn ended. The user wrote
-/// it against an unfinished reply, so it can depend on work the final reply
-/// changed. The drafts go back above the in-progress line for review instead of
-/// starting a turn on their own.
 fn returnLateSteering(self: *App) !void {
-    // Reserve every possible draft move so no fallible work follows the channel
-    // take.
     try self.session.reserveSteeringRecall();
     const taken = try self.agent.steering.take();
     defer {
         for (taken) |message| self.gpa.free(message);
         self.gpa.free(taken);
     }
-    // The mirror and the channel always move together, and a completed turn
-    // exits with no consumed-but-uncommitted batch, so the counts match here.
     std.debug.assert(taken.len == self.session.steering.items.len);
-    // A Telegram message drops instead, because the chat still holds it, so a
-    // queue of Telegram messages alone reports no return.
     if (self.session.recallLateSteering() == 0) return;
     try self.reportNotice(.information, "Drinky returned every queued message to the editor.", .{});
 }
 
-/// Abort the running turn: cancel and join the worker, then resolve from its
-/// joined disposition rather than event timing. A genuine cancel restores
-/// uncommitted rich drafts. A worker that finished first shows as its own
-/// completion or failure. Queued events retain their generation and cannot affect
-/// a successor.
 fn cancelTurn(self: *App) !void {
-    // Preflight editor capacity to restore every rich draft before the join, and
-    // the storage that a revision capture fills. An OOM then cannot leave an
-    // already-canceled worker's drafts unrecoverable. The mirror is
-    // consumer-owned and stable here.
     try self.session.reserveSteeringRestore();
     try self.session.reserveRevisionCapture();
     const result = self.cancelTurnFuture() orelse return;
     switch (result.outcome.disposition) {
-        // The joined outcome is authoritative. Sync the usage a queued `.usage`
-        // can no longer deliver (it dies at the generation gate). Restore the
-        // uncommitted rich drafts to the editor (the committed ones are in
-        // history). Clear the plain queue the agent returned its rolled-back batch
-        // to, and show the cancellation.
         .canceled => {
             defer self.freeWorkerResult(&result);
-            // The user stopped this turn, so it arms no retry.
             _ = self.takeTurnRetry();
             const receipt = &result.outcome.receipt;
             const committed = receipt.history_end != receipt.history_base;
-            // The worker is joined, so one bounded queue take owns all progress it
-            // successfully published. Preserve non-turn events in a consumer-side
-            // prefix. A put-back into the queue races producers.
             var maybe_progress_error = self.drainCanceledProgress(committed);
-            // A queued usage snapshot can predate usage recorded while cancellation
-            // unwound the provider stream. The joined agent state wins.
             self.session.stats_shown = self.agent.stats;
-            // A canceled turn can leave another branch checked out behind it.
             self.refreshBranch();
             try self.settleChatMessages(receipt);
-            // A committed turn that the terminal canceled can leave the
-            // conversation later, so its messages move out before the receipt
-            // frees their shells. A cancellation from the chat offers no
-            // revision, because the chat holds the input and the text of its
-            // messages.
             var maybe_capture: ?Session.RevisionCapture = null;
             if (committed and self.session.input.owner == .terminal)
                 maybe_capture = self.session.takeCanceledRevision(receipt);
@@ -2023,9 +1468,6 @@ fn cancelTurn(self: *App) !void {
             self.agent.steering.clear();
             if (committed) {
                 const aborted = self.session.abortTurn();
-                // The context stands before the error of a lost event returns,
-                // and it names the transcript end after that event, whether the
-                // event landed or not.
                 if (maybe_capture) |capture| self.setRevision(.{
                     .history = .{ .base = receipt.history_base, .end = receipt.history_end },
                     .transcript_base = capture.transcript_base,
@@ -2044,17 +1486,11 @@ fn cancelTurn(self: *App) !void {
             try self.endMirrorTurn(.canceled);
             if (maybe_progress_error) |progress_error| return progress_error;
         },
-        // The worker won the race. Retain the joined result until FIFO progress
-        // ahead of its terminal fence has applied. After an interrupted worker
-        // enqueue, append a replacement fence and do not block the consumer.
         .completed, .credential_replaced, .credential_rejected, .failed => {
             std.debug.assert(self.pending_turn_result == null);
             self.pending_turn_result = result;
             self.enqueuePendingTurnFence();
         },
-        // The channel closed under the worker. End the turn on its receipt like
-        // any normal terminal, but with no event. A dead channel is teardown,
-        // not a failure worth a report or a cancellation to restore from.
         .closed => {
             defer self.freeWorkerResult(&result);
             _ = self.takeTurnRetry();
@@ -2064,15 +1500,7 @@ fn cancelTurn(self: *App) !void {
     }
 }
 
-/// After the join of a canceled worker, consume its queued progress and preserve
-/// all non-turn events as a prefix for the normal loop. When history committed
-/// nothing, progress needs only deinitialization because the transcript rewinds
-/// to the turn base. Returns the first error after it owns and frees every
-/// event, so the caller can finish cancellation before the error propagates.
 fn drainCanceledProgress(self: *App, apply_progress: bool) ?anyerror {
-    // A second cancellation can occur inside the same buffered key event after a
-    // first drain has created this prefix. Leave newer queue data in place until
-    // the loop consumes the prefix rather than exceed its bounded storage.
     if (self.deferred_event_count > 0) return null;
 
     var batch: [queue_capacity]UiEvent = undefined;
@@ -2099,10 +1527,6 @@ fn drainCanceledProgress(self: *App, apply_progress: bool) ?anyerror {
     return maybe_apply_error;
 }
 
-/// Ctrl+C: clear the editor, or quit when pressed twice inside the window.
-/// The clear takes no warning, because the clear is the purpose of the key and
-/// not a side effect. Measured on the monotonic clock. A wall-clock step must
-/// not fake or break the double press.
 fn clearOrQuit(self: *App) void {
     const now = self.nowMs();
     if (now - self.ctrl_c_ms_last < ctrl_c_window_ms) {
@@ -2113,48 +1537,29 @@ fn clearOrQuit(self: *App) void {
     }
 }
 
-/// Repaint: read the terminal size (keep the last known one if the query fails),
-/// then hand it to the session's projection. The size read here is the source of
-/// truth every frame. A `.resize` event just forces the frame so an idle
-/// interface reflows too.
 fn refresh(self: *App) !void {
     const size: terminal.View.Size = if (self.tty.size()) |window|
         .{ .columns = window.columns, .rows = window.rows }
     else
         .{ .columns = self.session.columns, .rows = self.session.rows };
     try self.tty.setAlternateScreen(self.session.mode == .viewing);
-    // The session does no io, so the driver hands it both clocks every frame.
     self.session.clock_ms = self.nowMs();
     self.session.boot_clock_ms = self.nowBootMs();
     try self.session.paint(size);
 }
 
-/// Milliseconds on the monotonic clock that stops with a suspended system. It
-/// drives every span the interface measures against work of its own: the double
-/// Ctrl+C window, the escape wait, and the frame clock the io-free session
-/// reads. A tool measures its own timeout on this clock, so a running row and
-/// its timeout stay one measure.
 fn nowMs(self: *App) i64 {
     return std.Io.Timestamp.now(self.io, .awake).toMilliseconds();
 }
 
-/// Milliseconds on the monotonic clock that counts a suspended system too. It
-/// ages a span that a server measures, which keeps running while the machine
-/// sleeps. The quota countdown is the one such span.
 fn nowBootMs(self: *App) i64 {
     return std.Io.Timestamp.now(self.io, .boot).toMilliseconds();
 }
 
-/// Nanoseconds on the monotonic clock that stops with a suspended system, for
-/// frame scheduling. A machine that sleeps owes no frame for that sleep.
 fn nowNs(self: *App) i96 {
     return std.Io.Timestamp.now(self.io, .awake).toNanoseconds();
 }
 
-/// Enter while idle: run a command line locally, or start a turn over the prompt.
-/// Every line that starts with a slash is a command line, so Drinky reads it locally
-/// first. A line the registry refuses stays in the editor and arms one Enter, which
-/// sends that line to the model as typed.
 fn submit(self: *App) !void {
     if (self.session.editor.blank()) {
         self.session.cancelConfirmation(.message);
@@ -2164,10 +1569,6 @@ fn submit(self: *App) !void {
     defer self.gpa.free(text);
     self.session.dirty = true;
 
-    // A confirmed line skips the registry and reaches the model as typed. Without
-    // that confirmation, the registry decides first: a line it cannot run keeps its
-    // own refusal and arms the next Enter, so plain text that starts with a slash
-    // still has a way out.
     const message_confirmed = self.session.takeConfirmation(.message);
     if (!message_confirmed) {
         if (try self.checkCommand(text)) |refusal|
@@ -2175,9 +1576,6 @@ fn submit(self: *App) !void {
         if (try self.dispatchCommand(text)) |outcome|
             return self.applySubmittedCommand(outcome);
     }
-    // A refused send starts no turn, so the editor keeps every byte the user
-    // typed. The same Enter sends that line once the account and the model
-    // stand.
     if (!self.signedIn()) return self.reportNotice(
         .failure,
         "Sign in with /login before you send a message.",
@@ -2185,23 +1583,13 @@ fn submit(self: *App) !void {
     );
     if (self.agent.model == null) return self.reportNotice(.failure, no_model_refusal, .{});
     const base = try self.startUserTurn(text);
-    // The turn is live and owns its own copy. Retain the prompt's rich draft
-    // so an abnormal exit that commits nothing can return it. Leave the
-    // editor empty for in-progress text. Both steps are infallible, so the
-    // rollback above stays correct.
     var prompt = self.session.editor.detachTrimmed();
     self.session.retainTurnPrompt(&prompt, base);
-    // The turn and its recovery state stand, so the history takes the prompt
-    // last. Only this path records: a Telegram message, a steering line, a
-    // retry, and a skill line each start their turn elsewhere.
     try self.recordPromptHistory(text);
 }
 
-/// Apply the outcome of a submitted command line.
 fn applySubmittedCommand(self: *App, outcome: ai.command.Outcome) !void {
     switch (outcome) {
-        // A skill line starts its own turn, so it keeps the editor's rich draft.
-        // A refused line starts none, so the editor keeps that draft as typed.
         .prompt => |prompt| {
             defer prompt.deinit(self.gpa);
             if (!self.signedIn()) {
@@ -2214,16 +1602,11 @@ fn applySubmittedCommand(self: *App, outcome: ai.command.Outcome) !void {
                 try self.reportNotice(.failure, no_model_refusal, .{});
             } else {
                 const base = try self.startSkillTurn(&prompt);
-                // The line reproduces this request, so a failure that commits
-                // nothing returns it to the editor like any other human request.
                 var draft = self.session.editor.detachTrimmed();
                 self.session.retainTurnPrompt(&draft, base);
             }
         },
-        // The registry accepted the line, so this refusal is a command that broke.
-        // Another try is the way forward, so the line stays in the editor.
         .refusal => try self.applyOutcome(outcome),
-        // Every other command clears the editor first.
         else => {
             self.session.editor.clear();
             try self.applyOutcome(outcome);
@@ -2231,42 +1614,24 @@ fn applySubmittedCommand(self: *App, outcome: ai.command.Outcome) !void {
     }
 }
 
-/// Report a registry refusal and arm one Enter to send the line to the model as
-/// typed. `action` names what that Enter does, so the row reads as a control hint.
-/// The refusal keeps the line in the editor, which the arm needs, because the
-/// confirmation drops on every other key, at the end of a turn, and under any later
-/// notice that replaces the row.
 fn armMessageSend(
     self: *App,
     refusal: ai.command.Outcome.Message,
     action: []const u8,
 ) !void {
     defer self.gpa.free(refusal.content);
-    // Arm last, so a failed notice leaves no offer that the row never showed.
     try self.reportNotice(refusal.severity, "Enter: {s} · {s}", .{ action, refusal.content });
     self.session.armConfirmation(.message);
 }
 
-/// Record the user message of one skill invocation, then spawn the turn over
-/// the expanded skill content. Returns the rich draft's rewind checkpoint.
 fn startSkillTurn(self: *App, prompt: *const ai.command.Outcome.Prompt) !usize {
     const base = try self.appendSkillPrompt(prompt);
     errdefer self.session.transcript.truncate(base);
-    // The turn sends the whole skill file as one user message, so the guard
-    // finds its own proof in the history. Nothing marks a skill by hand.
     try self.runTurn(prompt.content);
     self.session.dirty = true;
     return base;
 }
 
-/// Record what one skill invocation sends. The request is one user message, and
-/// the transcript splits it into what Drinky sent and what the user typed: the
-/// head that names the skill and its file, then the task in a user box below
-/// it. The expanded file stays out of the transcript, because the head reports
-/// where it comes from.
-///
-/// The head is no box, so a message that the user types cannot look like one.
-/// Only this path writes a head, and the model reads the file that it names.
 fn appendSkillPrompt(self: *App, prompt: *const ai.command.Outcome.Prompt) !usize {
     const base = self.session.transcript.blocks().len;
     errdefer self.session.transcript.truncate(base);
@@ -2278,22 +1643,16 @@ fn appendSkillPrompt(self: *App, prompt: *const ai.command.Outcome.Prompt) !usiz
     return base;
 }
 
-/// The head line of one skill invocation: `Skill: {name} · File: {path}`. It
-/// reads like a tool box head, and it takes one row that a narrow window cuts.
-/// The result is owned.
 fn skillHead(self: *App, prompt: *const ai.command.Outcome.Prompt) ![]u8 {
     const source = try ai.format.path(self.gpa, prompt.source, &self.displayRoots());
     defer self.gpa.free(source);
     return std.fmt.allocPrint(self.gpa, "Skill: {s} · File: {s}", .{ prompt.name, source });
 }
 
-/// The roots every path in the interface is measured against.
 fn displayRoots(self: *const App) ai.format.Roots {
     return .{ .working_directory = self.working_directory, .home_directory = self.home_directory };
 }
 
-/// Record a plain user message and spawn its turn. Returns the rich draft's
-/// rewind checkpoint.
 fn startUserTurn(self: *App, text: []const u8) !usize {
     const base = self.session.transcript.blocks().len;
     try self.session.transcript.append(.user, .{}, text);
@@ -2303,10 +1662,6 @@ fn startUserTurn(self: *App, text: []const u8) !usize {
     return base;
 }
 
-/// Ctrl+N at the prompt: send one retry attempt. The attempt carries the failure
-/// alone, so the editor keeps every byte it holds. A user who wants that text in
-/// the conversation sends it with Enter, before the attempt or as steering during
-/// it. A prompt with no waiting retry has nothing to send.
 fn retryTurn(self: *App) !void {
     if (self.retry == null) return;
     if (!self.signedIn()) return self.reportNotice(
@@ -2318,19 +1673,11 @@ fn retryTurn(self: *App) !void {
     return self.sendRetryTurn();
 }
 
-/// Spawn one attempt, past the gate above. The two statements pair, so they
-/// stay in one place. A test drives this half with a signed-out agent, because
-/// the worker then fails fast instead of reaching the network.
 fn sendRetryTurn(self: *App) !void {
     const base = try self.startRetryTurn();
-    // The editor holds no part of this attempt, so the rewind anchor stands alone.
     self.session.markTurnBase(base);
 }
 
-/// Send one retry attempt: record the line that names it, then spawn its turn
-/// over the generated request. The attempt carries no user text, so its turn
-/// takes the context and the next failure arms a fresh one that names its own
-/// error. Returns the rewind checkpoint of that line.
 fn startRetryTurn(self: *App) !usize {
     std.debug.assert(self.retry != null);
     const retry = &self.retry.?;
@@ -2338,50 +1685,28 @@ fn startRetryTurn(self: *App) !usize {
     defer self.gpa.free(text);
     const base = self.session.transcript.blocks().len;
     errdefer self.session.transcript.truncate(base);
-    // Drinky wrote this user message, so its line takes the user color, like the
-    // head of a loaded skill. The complete request stays out of the transcript,
-    // as a skill head keeps its expanded file out of it.
     try self.session.transcript.append(.user_note, .{}, Retry.note_text);
-    // The spawn drops the context, so the flag marks the attempt after it.
     try self.runTurn(text);
-    // A failure of this attempt arms the context again from its own error.
     self.turn_retry = true;
     return base;
 }
 
-/// The warning of the first Ctrl+N over a canceled turn that changed the system.
-/// The removal takes the turn out of the conversation, and the changes of its
-/// tools stay, so the user decides with that fact in view.
 const revision_warning = "Press Ctrl+N again to remove the canceled turn. Tool changes stay.";
 
-/// Ctrl+N at the prompt with a waiting revision: remove the canceled turn from
-/// the agent history and the transcript, and return its messages to the editor
-/// above the text that the editor holds, in their order. The removal starts no
-/// turn: Enter sends the revised draft. A turn that committed a call of a tool
-/// that changes the system warns first and removes on the next Ctrl+N alone.
-///
-/// Every fallible step runs before the first mutation, so a failure keeps both
-/// histories, every draft, and the offer. The anchors of the offer hold by
-/// contract: every operation that shortens a history between turns dismisses
-/// the offer or moves its anchors, so a stale anchor is a programming error.
 fn reviseTurn(self: *App) !void {
     std.debug.assert(self.session.mode == .prompt);
     const revision = if (self.revision) |*revision| revision else return;
     if (revision.mutated and !self.session.takeConfirmation(.revision)) {
-        // Arm last, so a failed warning leaves no confirmation that no row shows.
         try self.reportNotice(.warning, revision_warning, .{});
         self.session.armConfirmation(.revision);
         return;
     }
     try self.session.editor.reserveComposition(&revision.prompt, revision.steering.items);
-    // The transcript range holds before the agent rewinds, so the two histories
-    // cannot come apart on the way to a failed assertion.
     std.debug.assert(revision.transcript_base <= revision.transcript_end);
     std.debug.assert(revision.transcript_end <= self.session.transcript.blocks().len);
     const cursor = self.mirror.transcriptCursor();
     self.agent.rewindHistory(revision.history);
 
-    // Both histories rewind from here, and nothing below can fail.
     var taken = self.revision.?;
     self.revision = null;
     defer taken.deinit(self.gpa);
@@ -2391,38 +1716,23 @@ fn reviseTurn(self: *App) !void {
         .range_end = taken.transcript_end,
         .mirror_cursor = cursor,
     });
-    // The blocks below the cursor of the mirror left, so the cursor follows
-    // them, and the chat keeps every message it holds as a record. The live
-    // `Shorten` button stays, because only a completed turn arms it, so it
-    // names an answer outside the range or none.
     self.mirror.retreat(removal.removed_before_cursor_count);
     self.session.editor.prependComposition(&taken.prompt, taken.steering.items);
     self.session.markEdited();
     self.dismissOffer();
 }
 
-/// A tap on `Shorten` in the chat: record the line that names the request, then
-/// spawn its turn over the request. Drinky wrote that line, so it takes the note
-/// kind, like the line of a retry attempt, and the request stays out of the
-/// transcript, as a skill head keeps its expanded file out of it.
 fn sendShortenTurn(self: *App) !void {
     const base = self.session.transcript.blocks().len;
     errdefer self.session.transcript.truncate(base);
     try self.session.transcript.append(.user_note, .{}, shorten_note_text);
     try self.runTurn(shorten_request_text);
-    // The editor holds no part of this request, so the rewind anchor stands alone.
     self.session.markTurnBase(base);
 }
 
-/// Spawn a turn worker over `text` and enter turn mode. The worker owns its own
-/// copy of the prompt. Only commit to turn mode once the spawn succeeds.
 fn runTurn(self: *App, text: []const u8) !void {
-    // A turn returns to prompt mode only after its terminal wakeup consumes the
-    // worker result, so a successor can never overwrite terminal ownership.
     std.debug.assert(self.turn_future == null);
     std.debug.assert(self.pending_turn_result == null);
-    // The user can check out another branch between two turns, so the label is
-    // true at the moment the turn starts.
     self.refreshBranch();
     const generation = try reserveGeneration(&self.turn_generation);
     const owned = try self.gpa.dupe(u8, text);
@@ -2431,35 +1741,17 @@ fn runTurn(self: *App, text: []const u8) !void {
     self.session.beginTurn(generation);
     self.prompt_marked = false;
     self.steering_marked_count = 0;
-    // Every turn start takes the waiting recovery offer, not the attempt alone.
-    // A message that the user sends instead of the attempt moves the
-    // conversation on, so the context it named is stale, and a canceled turn
-    // that another turn follows stays in the conversation. The drop runs after
-    // the spawn, because a start that fails must leave the offer for another
-    // try.
     self.dismissOffer();
-    // A turn cannot host a picker, so the start of one makes the open picker of
-    // the chat stale.
     self.chat_picker.close();
-    // The worker runs by now, so a send that fails costs the activity message of
-    // the chat alone and never the turn.
     self.mirror.beginTurn(&self.controller, self.nowMs()) catch {};
 }
 
-/// Permanently reserve the next generation of `counter` before a worker can
-/// observe it. A failed allocation or spawn can leave a gap, but the app never
-/// reuses a generation.
 fn reserveGeneration(counter: *u64) error{GenerationExhausted}!u64 {
     if (counter.* == std.math.maxInt(u64)) return error.GenerationExhausted;
     counter.* += 1;
     return counter.*;
 }
 
-/// Start the model fetch that a picker row asked for, on a worker, so the
-/// interface keeps painting and reading keys. The picker clears its rows
-/// meanwhile, and `finishFetch` rebuilds it from the result. The worker owns the
-/// account registry until the join, and the picker mode admits no command, so
-/// no consumer step reads the registry under it.
 fn startFetch(self: *App, account: ai.llm.Account) !void {
     std.debug.assert(self.fetch == null);
     std.debug.assert(self.session.mode == .picking);
@@ -2470,18 +1762,12 @@ fn startFetch(self: *App, account: ai.llm.Account) !void {
     try self.session.beginPickerWait(fetch_wait_text);
 }
 
-/// Fetch worker task: run one fetch, queue its wakeup, and return the sole
-/// result. A canceled or closed channel drops the wakeup, and the join still
-/// holds the result.
 fn runFetchWorker(self: *App, account: ai.llm.Account, generation: u64) ai.Accounts.Refresh {
     const result = self.accounts.refresh(account);
     self.queue.putOne(self.io, .{ .fetch_ended = generation }) catch {};
     return result;
 }
 
-/// Join the fetch of `generation` at its wakeup and rebuild the picker from the
-/// result, as a confirmed row does. A wakeup of a fetch that a cancel already
-/// joined names a stale generation, so it changes nothing.
 fn finishFetch(self: *App, generation: u64) !void {
     const fetch = if (self.fetch) |*fetch| fetch else return;
     if (fetch.generation != generation) return;
@@ -2495,10 +1781,6 @@ fn finishFetch(self: *App, generation: u64) !void {
     try self.applyOutcome(outcome);
 }
 
-/// Esc during a fetch: stop the worker, then rebuild the step that asked for it,
-/// so the rows return. The fetch is the one thing this exit ends. The notice
-/// states the cancel, because a list that looks unchanged reads as a fetch that
-/// found nothing new.
 fn cancelFetch(self: *App) !void {
     self.dropFetch();
     const opener = self.session.mode.picking.reopen orelse return self.session.cancelPicker();
@@ -2509,16 +1791,12 @@ fn cancelFetch(self: *App) !void {
     try self.reportNotice(.information, "You canceled the model fetch.", .{});
 }
 
-/// Cancel and join the fetch worker, if one runs, and forget it. The result is
-/// discarded: the catalog already holds whatever arrived, and the step that
-/// follows reads the catalog.
 fn dropFetch(self: *App) void {
     const fetch = if (self.fetch) |*fetch| fetch else return;
     _ = fetch.future.cancel(self.io);
     self.fetch = null;
 }
 
-/// The ambient state that every command handler reads.
 fn commandContext(self: *App) ai.command.Context {
     return .{
         .gpa = self.gpa,
@@ -2531,36 +1809,26 @@ fn commandContext(self: *App) ai.command.Context {
     };
 }
 
-/// The ambient state of a command that the chat runs. The registry then refuses
-/// a terminal-only command, lists no fetch row, and loads a picked skill at once.
 fn chatContext(self: *App) ai.command.Context {
     var context = self.commandContext();
     context.remote = true;
     return context;
 }
 
-/// Run `line` as a command. Null reports that the line is a message.
 fn dispatchCommand(self: *App, line: []const u8) !?ai.command.Outcome {
     var context = self.commandContext();
     return ai.command.run(&context, line);
 }
 
-/// The registry refusal for `line`, with no command run. Null reports that the
-/// registry can run the line as typed, so an active state restriction owns the
-/// refusal instead.
 fn checkCommand(self: *App, line: []const u8) !?ai.command.Outcome.Message {
     var context = self.commandContext();
     return ai.command.check(&context, line);
 }
 
-/// Handle a slash command locally and apply its outcome. Every caller passes a
-/// literal command line, so dispatch always returns an outcome.
 fn runCommand(self: *App, line: []const u8) !void {
     if (try self.dispatchCommand(line)) |outcome| try self.applyOutcome(outcome);
 }
 
-/// Apply a command outcome: prompt, account, and conversation actions need the
-/// app or agent. Presentation-only outcomes go to the session.
 fn applyOutcome(self: *App, outcome: ai.command.Outcome) !void {
     switch (outcome) {
         .show_system_prompt => try self.session.openPage(&.{
@@ -2572,47 +1840,23 @@ fn applyOutcome(self: *App, outcome: ai.command.Outcome) !void {
             .content = self.sources_page,
         }),
         .new_conversation => {
-            // The agent drops its history, and the session drops the blocks
-            // that project it, so the worker and the screen empty together.
-            // The agent's rollback forgets the skill proof memo with the
-            // history that proved it.
             self.agent.resetConversation();
             self.session.clearConversation();
             self.mirror.restart();
             self.chat_picker.close();
-            // The intro line is the legend of the interface, so the empty
-            // conversation opens on it again.
             try self.session.transcript.append(.intro, .{}, intro_text);
-            // The cleared conversation holds no work to continue from, and no
-            // canceled turn to remove.
             self.dismissOffer();
-            // The attach event brackets every Telegram message, and the clear
-            // took it, so the new conversation opens on a bracket of its own.
-            // The mirror starts over at it, so the chat gets it first. The
-            // sentence names the model conversation, which the clear emptied,
-            // and not the chat, which keeps every message.
             if (self.controller.listens()) try self.recordEvent(
                 .information,
                 "You cleared the conversation while @{s} is attached.",
                 .{self.controller.botUsername().?},
             );
         },
-        // Only `submit` produces a prompt outcome (from a typed `/skill:` line),
-        // and it starts that turn itself, so a prompt never reaches this shared
-        // path. A prompt routed here skips the editor's rich draft. The command
-        // list runs a registry entry through this path, so no listed command may
-        // return a prompt: the `/skill` row writes an editor line instead.
         .prompt => unreachable,
-        // The picker must show the store as it stands, so the store is read
-        // again first, and the session settles on what changed there. The picker
-        // then opens on the settled registry, and the mirror below follows a
-        // moved account.
         .login_picker => {
             try self.rereadAccounts();
             try self.openLoginPicker();
         },
-        // A sign-in starts and changes nothing yet. Its worker reports through
-        // `applyLoginEvent`, which mirrors the committed outcome.
         .login => |account| return self.startLogin(account),
         .logout => |account| try self.logoutAccount(account),
         .switch_account => |account| {
@@ -2627,55 +1871,32 @@ fn applyOutcome(self: *App, outcome: ai.command.Outcome) !void {
                 try self.reportModelStep(account, "Drinky now uses {s}. ", .{account.id()});
             }
         },
-        // A fetch asks the provider with the credential of its account, so it
-        // meets the same principal boundary as a turn. The transition is
-        // therefore the one a turn takes, and the report is its own, because no
-        // turn ran. It mirrors the agent itself, so the shared mirror below must
-        // not run a second time.
         .credential_replaced => |account| return self.acceptFetchReplacement(account),
-        // The fetch starts and changes nothing yet, so no mirror runs. Its
-        // result arrives through `finishFetch`, which applies its own outcome.
         .fetch => |account| return self.startFetch(account),
-        // The answer reads the snapshot of the session and changes nothing, so
-        // no mirror runs. A turn can run meanwhile, and the mirror below reads
-        // the agent that the worker writes.
         .show_status => return self.recordStatus(),
         .remote_attach => |index| return self.controller.attachSaved(index),
         .remote_add => {
-            // Enter hands the text to the pairing, so the token prompt opens on
-            // an empty editor.
             self.session.editor.clear();
             return self.controller.beginTokenPrompt();
         },
         .remote_remove => |index| return self.controller.removeBot(index),
         else => try self.session.applyOutcome(outcome),
     }
-    // Commands can switch or drop the active account. Mirror the authoritative
-    // agent snapshot so an allowance cleared by that transition disappears at
-    // the same time as the account changes.
     try self.mirrorAgentState();
 }
 
-/// Mirror the agent configuration into the session and the project state.
 fn mirrorAgentState(self: *App) !void {
     self.session.stats_shown = self.agent.stats;
-    // The account, the model, and the effort select the transcript projection
-    // too, so a change repaints the conversation that the next request carries.
     self.session.showSetup(self.activeAccount(), self.agent.model, self.agent.effort);
     try self.recordState();
 }
 
-/// Remember the account, model, and effort level this project now uses. Only a
-/// change writes the file, and a failed write never stops the session. A
-/// signed-out session records nothing, because the entry names an account. A
-/// signed-out effort change stays in the agent until the next sign-in records it.
 fn recordState(self: *App) !void {
     const account = self.activeAccount() orelse return;
     self.state.record(account, self.agent.model, self.agent.effort) catch |err|
         try self.reportStateSaveFailure(err);
 }
 
-/// Report one failed write of the project state file.
 fn reportStateSaveFailure(self: *App, err: anyerror) !void {
     switch (err) {
         error.StoreBusy => try self.recordEvent(
@@ -2698,9 +1919,6 @@ fn reportStateSaveFailure(self: *App, err: anyerror) !void {
     }
 }
 
-/// Start a sign-in worker and keep the raw editor active for a callback URL.
-/// The picker closed before this action arrived. No synchronous fallback can
-/// block the consumer.
 fn startLogin(self: *App, account: ai.llm.Account) !void {
     std.debug.assert(self.login == null);
     std.debug.assert(self.fetch == null);
@@ -2719,8 +1937,6 @@ fn startLogin(self: *App, account: ai.llm.Account) !void {
     self.syncInputState();
 }
 
-/// Run one sign-in and queue its terminal event. The joined result remains the
-/// authority when a cancel interrupts that event.
 fn runLoginWorker(self: *App, account: ai.llm.Account, generation: u64) LoginWorkerResult {
     var prompt: LoginPrompt = .{ .app = self, .generation = generation };
     const outcome: LoginWorkerResult.Outcome = if (self.accounts.login(account, &prompt)) |login|
@@ -2734,10 +1950,6 @@ fn runLoginWorker(self: *App, account: ai.llm.Account, generation: u64) LoginWor
     return .{ .account = account, .generation = generation, .outcome = outcome };
 }
 
-/// Apply one current sign-in report and free its runtime strings. A report from
-/// a canceled sign-in changes nothing. The launch warning takes the footer,
-/// because the URL event already asks the user to open the URL, and the result
-/// of the attempt replaces that event later.
 fn applyLoginEvent(self: *App, event: *const LoginEvent) !void {
     defer event.deinit(self.gpa);
     const login = if (self.login) |*login| login else return;
@@ -2761,7 +1973,6 @@ fn applyLoginEvent(self: *App, event: *const LoginEvent) !void {
     }
 }
 
-/// Record the URL and optional user code that the provider gave this sign-in.
 fn recordLoginAuthorization(
     self: *App,
     account: ai.llm.Account,
@@ -2782,24 +1993,17 @@ fn recordLoginAuthorization(
     );
 }
 
-/// Join the worker at its terminal event and resolve its authoritative result.
 fn finishLogin(self: *App, generation: u64) !void {
     const active = if (self.login) |*login| login else return;
     if (active.generation != generation) return;
     try self.resolveLogin(&active.future.await(self.io));
 }
 
-/// Cancel and join the sign-in worker while the editor keeps its draft. A
-/// worker that committed first resolves as a successful sign-in.
 fn cancelLogin(self: *App) !void {
     const active = if (self.login) |*login| login else return;
     try self.resolveLogin(&active.future.cancel(self.io));
 }
 
-/// Forget the joined sign-in and resolve its result. A pre-commit failure keeps
-/// the current account. A completion switches to the replacement credential.
-/// The result line takes the place of the URL event, so one attempt costs the
-/// transcript one line, and the launch warning of the footer goes with it.
 fn resolveLogin(self: *App, result: *const LoginWorkerResult) !void {
     const active = self.login.?;
     std.debug.assert(result.generation == active.generation);
@@ -2813,9 +2017,6 @@ fn resolveLogin(self: *App, result: *const LoginWorkerResult) !void {
     }
 }
 
-/// Forget the sign-in and move the input state off its caption. The caption
-/// borrows the title, so this runs before the title goes. The reported callback
-/// path belongs to the paste filter, which stops with the sign-in.
 fn endLoginInput(self: *App) void {
     if (self.login) |*login| {
         if (login.callback_path) |callback_path| self.gpa.free(callback_path);
@@ -2824,19 +2025,12 @@ fn endLoginInput(self: *App) void {
     self.syncInputState();
 }
 
-/// Adopt a committed sign-in, report its persistence outcome, and open the
-/// account model flow. The account switch and the evidence drop finish first.
 fn completeLogin(
     self: *App,
     attempt: LoginAttempt,
     login: *const ai.Accounts.Login,
 ) !void {
     const account = attempt.account;
-    // A fresh login can represent another principal in the same account slot.
-    // Nothing that principal produced crosses that boundary. The drop removes
-    // the reasoning blocks of the slot, and each one above the URL event moves
-    // that event up by one. The result line then replaces that event, or lands
-    // as a line of its own when the worker ended before it announced a URL.
     const maybe_index = if (attempt.event_index) |index|
         index - self.session.transcript.producedBefore(account, index)
     else
@@ -2870,7 +2064,6 @@ fn completeLogin(
     try self.session.applyOutcome(try ai.command.model.forAccount(&context, account));
 }
 
-/// Cancel and join a sign-in during shutdown, then discard its result.
 fn dropLogin(self: *App) void {
     const active = if (self.login) |*login| login else return;
     _ = active.future.cancel(self.io);
@@ -2879,15 +2072,10 @@ fn dropLogin(self: *App) void {
     self.gpa.free(title);
 }
 
-/// Start the input reader task.
 fn startInputReader(self: *App) !void {
     self.input_future = try self.io.concurrent(readInput, .{self});
 }
 
-/// Report a sign-in that ended without a credential. Only an exit key cancels a
-/// sign-in, so a cancel reads as the decision of the user and not as a failure.
-/// The line replaces the URL event of the attempt. Without one, a cancel and a
-/// failure are transient, so they take the footer.
 fn reportLoginFailure(self: *App, attempt: LoginAttempt, login_error: anyerror) !void {
     if (login_error == error.Canceled) return self.reportLoginEnd(
         attempt,
@@ -2902,20 +2090,12 @@ fn reportLoginFailure(self: *App, attempt: LoginAttempt, login_error: anyerror) 
             "response was too large.",
         error.CallbackTimeoutUnavailable => "Drinky could not sign in because it could not " ++
             "set a browser time limit.",
-        // The redirect reports a refusal, a scope fault, and a provider fault
-        // under one parameter. The code of the failure reaches no report, so
-        // one sentence covers the whole set. A device-code grant that the user
-        // refused reads the same way.
         error.AuthorizationFailed, error.AuthorizationDenied => "The provider did not " ++
             "authorize Drinky. Start the sign-in again.",
         error.DeviceCodeExpired => "Drinky stopped the sign-in because the authorization did " ++
             "not arrive in time.",
-        // The redirect carries the state of an earlier sign-in. A tab left open
-        // and a paste of its URL both deliver one, so the sentence names no
-        // source.
         error.StateMismatch => "The response belongs to another sign-in. " ++
             "Start the sign-in again.",
-        // The exchange rejects an authorization that expired or was used before.
         error.TokenGrantRejected => "The provider rejected the authorization. " ++
             "Start the sign-in again.",
         error.TokenServiceUnavailable => "The provider credential service is not available. " ++
@@ -2930,8 +2110,6 @@ fn reportLoginFailure(self: *App, attempt: LoginAttempt, login_error: anyerror) 
     return self.reportLoginEnd(attempt, .failure, "{s}", .{message});
 }
 
-/// State how a sign-in ended without a credential: in place of its URL event,
-/// or in the footer when it announced none.
 fn reportLoginEnd(
     self: *App,
     attempt: LoginAttempt,
@@ -2943,29 +2121,15 @@ fn reportLoginEnd(
     try self.recordEventAt(index, severity, format, args);
 }
 
-/// Whether `account` is the account the agent runs, so a change to its
-/// credential moves the active agent.
 fn isActive(self: *const App, account: ai.llm.Account) bool {
     return self.activeAccount() == account;
 }
 
-/// Report the step that follows a credential transition of `account`. A session
-/// with no model runs no turn, so that report names the model step in place of
-/// the retry. The armed retry waits behind Ctrl+N until a model makes it
-/// runnable.
 fn reportCredentialStep(self: *App, account: ai.llm.Account, comptime lead: []const u8) !void {
     if (self.agent.model == null) return self.reportModelStep(account, lead, .{});
     return self.recordEvent(.information, lead ++ "Try the turn again.", .{});
 }
 
-/// Report one transition that leaves the session with no model. `lead` states
-/// what changed, and the step that follows unblocks `account`. The arguments of
-/// `lead` come first, and the identifier of `account` closes the line.
-///
-/// The catalog answers the step alone. An account whose list stands cached
-/// needs a pick, and an account with no list needs a fetch first. The project
-/// memory says nothing here, because one machine caches every list and each
-/// project remembers its own model.
 fn reportModelStep(
     self: *App,
     account: ai.llm.Account,
@@ -2984,46 +2148,21 @@ fn reportModelStep(
     );
 }
 
-/// Settle the session on a credential that the store identifies as another
-/// principal. The worker stopped before its provider request, so the evidence
-/// and the metadata of the replaced principal go first. The metadata holds the
-/// model list of the account, so that account offers no model until the next
-/// fetch.
-///
-/// Each entry reports its own step, because a turn and a fetch leave the user
-/// at a different place.
 fn settleCredentialReplacement(self: *App, account: ai.llm.Account) void {
     self.accounts.dropPrincipalMetadata(account);
     self.settleReplacedPrincipal(account);
 }
 
-/// Forget what the replaced principal of `account` produced, and move the agent
-/// onto the replacement where the session runs that account. A client borrows
-/// into the credential of its account, so the move gives it the new one.
 fn settleReplacedPrincipal(self: *App, account: ai.llm.Account) void {
     self.dropAccountEvidence(account);
     if (self.isActive(account)) self.adopt(account);
 }
 
-/// Read the credential store again and settle the session on what another
-/// Drinky instance changed there. The registry settled itself already, so this
-/// moves the agent and the transcript to match it. A read that failed leaves
-/// the registry as it was, and an event names the failure.
-///
-/// The active account leaves last, so the hand-off adopts an account that
-/// settled already, and the transcript reads every other move before the one
-/// that moves the session. The caller opens the login picker where no account
-/// remains.
 fn rereadAccounts(self: *App) !void {
     const report = self.accounts.reread();
     var maybe_left: ?ai.llm.Account = null;
     for (std.enums.values(ai.llm.Account)) |account| switch (report.changes.get(account)) {
-        // A sign-in reaches an account that the session does not run.
         .unchanged, .signed_in => {},
-        // A rotation keeps the principal and its evidence. A client that
-        // borrows a key points at the bytes the store held before, so the
-        // active client takes the rotated one. A subscription client points at
-        // its `Auth`, so the rebind moves nothing there.
         .rotated => if (self.isActive(account)) self.rebindClient(account),
         .replaced => {
             self.settleReplacedPrincipal(account);
@@ -3034,8 +2173,6 @@ fn rereadAccounts(self: *App) !void {
                 .{account.id()},
             );
         },
-        // The evidence goes as after a logout here. Only the active account
-        // moves the session, and it does so once every other account settled.
         .signed_out => {
             self.dropAccountEvidence(account);
             if (self.isActive(account)) {
@@ -3069,27 +2206,16 @@ fn rereadAccounts(self: *App) !void {
     }
 }
 
-/// Point the client of the active `account` at the credential its store holds
-/// now. The account and the model stay, so nothing else moves. A client
-/// borrows into the credential of its account, so a credential that moved in
-/// memory needs this.
 fn rebindClient(self: *App, account: ai.llm.Account) void {
     self.agent.switchTo(self.accounts.client(account).?, self.agent.model);
 }
 
-/// Accept the replacement that a turn met. That turn failed on the account it
-/// ran, so the report names the retry where a model stands, and the model step
-/// where none does.
 fn acceptCredentialReplacement(self: *App, account: ai.llm.Account) !void {
     self.settleCredentialReplacement(account);
     try self.reportCredentialStep(account, "");
     try self.mirrorAgentState();
 }
 
-/// Accept the replacement that a model fetch met. No turn ran, and `account`
-/// can be one that the session does not run, so the report names no retry. It
-/// states the replacement and the dropped evidence, then the step of the
-/// fetched account alone.
 fn acceptFetchReplacement(self: *App, account: ai.llm.Account) !void {
     self.settleCredentialReplacement(account);
     try self.reportModelStep(
@@ -3101,10 +2227,6 @@ fn acceptFetchReplacement(self: *App, account: ai.llm.Account) !void {
     try self.mirrorAgentState();
 }
 
-/// Resolve a rejected refresh credential: reload a replacement that another
-/// instance saved, else leave the account and select the next one. Either way
-/// the credential changes principal, so the reasoning evidence of the account
-/// goes before the two paths divide.
 fn rejectCredential(self: *App, account: ai.llm.Account) !void {
     const adopts = self.isActive(account);
     var maybe_removal_error: ?anyerror = null;
@@ -3114,10 +2236,6 @@ fn rejectCredential(self: *App, account: ai.llm.Account) !void {
     };
     self.dropAccountEvidence(account);
     if (recovered) {
-        // `invalidate` dropped the model list of the replaced credential, so the
-        // model resolves again before the session shows it. That list belongs to
-        // the principal behind that credential, so the account offers no model
-        // until the next fetch.
         if (adopts) self.adopt(account);
         try self.reportCredentialStep(
             account,
@@ -3126,8 +2244,6 @@ fn rejectCredential(self: *App, account: ai.llm.Account) !void {
         return self.mirrorAgentState();
     }
 
-    // The agent settles before any fallible report. A conversation that keeps
-    // its own account moves nothing, so it needs no next account.
     const maybe_next = if (adopts) self.handOff() else null;
 
     if (maybe_removal_error) |removal_error| try self.recordEvent(
@@ -3143,27 +2259,17 @@ fn rejectCredential(self: *App, account: ai.llm.Account) !void {
     try self.mirrorAgentState();
 }
 
-/// Move the session off its account: adopt the first authenticated account, or
-/// sign out when none remains. Returns the account that took the session.
 fn handOff(self: *App) ?ai.llm.Account {
     const maybe_next = self.accounts.firstAuthenticated();
     if (maybe_next) |next| self.adopt(next) else self.agent.signOut();
     return maybe_next;
 }
 
-/// Report where the session went after a sign-out here took `account` from it.
-/// When no account remains, the login picker opens so the user chooses how to
-/// sign back in.
 fn reportHandOff(self: *App, account: ai.llm.Account, maybe_next: ?ai.llm.Account) !void {
     try self.recordHandOff("Drinky signed out of {s}. ", account, maybe_next);
     if (maybe_next == null) try self.openLoginPicker();
 }
 
-/// Record where the session went after `account` left it. `lead` states how
-/// the account left and takes its identifier. The next account starts on the
-/// model it ran last here, and on no model where it ran none, so that report
-/// names `/model`. Where no account remains, the line names the login picker,
-/// and the caller opens it.
 fn recordHandOff(
     self: *App,
     comptime lead: []const u8,
@@ -3183,18 +2289,11 @@ fn recordHandOff(
     return self.reportModelStep(next, lead ++ "Drinky now uses {s}. ", .{ account.id(), next.id() });
 }
 
-/// Open the login picker on the registry as it stands, through the session
-/// alone. No reread runs here: a reread can hand the session off, and that
-/// hand-off leads back to this picker. A route through `applyOutcome` cycles
-/// the inferred error sets of `logoutAccount` back to itself.
 fn openLoginPicker(self: *App) !void {
     var context = self.commandContext();
     try self.session.applyOutcome(try ai.command.login.picker(&context));
 }
 
-/// Drop `account`'s credentials. A logout of the active account hands the
-/// session to the next authenticated account, or to the login picker when none
-/// remains. Commands cannot run mid-turn, so this never races a turn.
 fn logoutAccount(self: *App, account: ai.llm.Account) !void {
     const was_active = self.isActive(account);
     self.accounts.logout(account) catch |err| {
@@ -3210,22 +2309,12 @@ fn logoutAccount(self: *App, account: ai.llm.Account) !void {
     try self.reportHandOff(account, self.handOff());
 }
 
-/// Switch the agent to `account` on the model that account ran last, and on no
-/// model where it ran none. The client is present because the caller just
-/// authenticated the account or read it from the registry.
 fn adopt(self: *App, account: ai.llm.Account) void {
     self.agent.switchTo(self.accounts.client(account).?, self.accountModel(account));
 }
 
-/// Forget everything the principal behind `account` produced: the replay proofs
-/// in history, and the reasoning blocks that hold them in the transcript. Both
-/// sides drop together, so the interface never shows a block that no request
-/// carries. Every position over the two histories moves up by the items that
-/// left below it alone: the cursor of the mirror, and the anchors of a waiting
-/// revision, which keeps its offer.
 fn dropAccountEvidence(self: *App, account: ai.llm.Account) void {
     const transcript = &self.session.transcript;
-    // The cursor can stand past the list, as the flush clamps it too.
     const cursor = @min(self.mirror.transcriptCursor(), transcript.blocks().len);
     const cursor_removed = transcript.producedBefore(account, cursor);
     if (self.revision) |*revision| {
@@ -3236,21 +2325,14 @@ fn dropAccountEvidence(self: *App, account: ai.llm.Account) void {
     }
     self.agent.dropAccountEvidence(account);
     self.session.dropAccountReasoning(account);
-    // Only a block below the cursor moves a block that the chat holds, so only
-    // that count moves the cursor back, and no block goes out twice.
     self.mirror.retreat(cursor_removed);
 }
 
-/// The shared refusal path for a command that the active state does not allow.
-/// Drinky keeps the command text in the editor, sends nothing to the model, and
-/// opens no picker. The notice names the command and the restriction, and it
-/// warns rather than reports a failure, because a later Enter still runs the line.
 fn refuseCommand(self: *App, name: []const u8, restriction: []const u8) !void {
     const refusal = try ai.command.refuse(self.gpa, name, restriction);
     try self.session.applyOutcome(.{ .refusal = refusal });
 }
 
-/// Replace the bottom footer with one transient notice.
 fn reportNotice(
     self: *App,
     severity: ai.command.Outcome.Severity,
@@ -3262,15 +2344,6 @@ fn reportNotice(
     );
 }
 
-/// Pair every configured path-triggered skill with a discovered skill and hand
-/// the pair to the guard. The global config serves every project, so a name
-/// that no skill here carries is a normal state. Such a pair goes into
-/// `missing` for the sources page, because a typo in a name silently disables a
-/// guard, and the system prompt names only the rules that resolved. An entry
-/// past the cap drops with a failure.
-///
-/// The caller reports the messages once the transcript exists. The rules
-/// themselves cannot wait that long, because the system prompt names them.
 fn resolveRequiredSkills(
     self: *App,
     config: *const Config,
@@ -3300,7 +2373,6 @@ fn resolveRequiredSkills(
     }
 }
 
-/// Retain one startup message that the transcript cannot take yet.
 fn appendNotice(
     self: *App,
     notices: *std.ArrayList(ai.instructions.Notice),
@@ -3313,9 +2385,6 @@ fn appendNotice(
     try notices.append(self.gpa, .{ .severity = severity, .text = text });
 }
 
-/// Report the startup messages of one instruction source. The instruction files
-/// and the skill files both report through here. An empty file is housekeeping,
-/// so its message reads as information rather than as a failure.
 fn reportNotices(self: *App, notices: []const ai.instructions.Notice) !void {
     for (notices) |notice| {
         const safe_text = try ai.instructions.displayAlloc(self.gpa, notice.text);
@@ -3328,8 +2397,6 @@ fn reportNotices(self: *App, notices: []const ai.instructions.Notice) !void {
     }
 }
 
-/// Record one durable event that a task raised at any moment. A reply that
-/// streams defers it to the next message boundary.
 fn recordAsyncEvent(
     self: *App,
     severity: ai.command.Outcome.Severity,
@@ -3343,7 +2410,6 @@ fn recordAsyncEvent(
     );
 }
 
-/// Record one durable event in the transcript.
 fn recordEvent(
     self: *App,
     severity: ai.command.Outcome.Severity,
@@ -3353,9 +2419,6 @@ fn recordEvent(
     try self.recordEventAt(null, severity, format, args);
 }
 
-/// Record one durable event in place of the event at `maybe_index`, or as a new
-/// event when null. A line that announced a wait becomes the line that states
-/// its result this way.
 fn recordEventAt(
     self: *App,
     maybe_index: ?usize,
@@ -3368,20 +2431,16 @@ fn recordEventAt(
     try self.session.applyOutcome(.{ .event = message });
 }
 
-/// The sink of an attachment: wrap each report into the one channel. The
-/// controller reads it back through `applyBatch`.
 fn emitRemoteEvent(context: *anyopaque, event: remote.Attachment.Event) error{Closed}!void {
     const self: *App = @ptrCast(@alignCast(context));
     self.queue.putOne(self.io, .{ .remote = event }) catch return error.Closed;
 }
 
-/// The sink of a pairing: wrap each report into the one channel.
 fn emitPairingEvent(context: *anyopaque, event: remote.Pairing.Event) error{Closed}!void {
     const self: *App = @ptrCast(@alignCast(context));
     self.queue.putOne(self.io, .{ .pairing = event }) catch return error.Closed;
 }
 
-/// Act on one report of the controller. Every text is borrowed for the call.
 fn onRemoteAction(context: *anyopaque, action: remote.Controller.Action) anyerror!void {
     const self: *App = @ptrCast(@alignCast(context));
     switch (action) {
@@ -3402,24 +2461,18 @@ fn onRemoteAction(context: *anyopaque, action: remote.Controller.Action) anyerro
     }
 }
 
-/// Apply a controller state change and then map all input owners. A sign-in
-/// keeps the terminal until its worker ends.
 fn syncRemoteState(self: *App) !void {
     const was_terminal = self.session.input.owner == .terminal;
     switch (self.controller.state()) {
         .attached => {
             const username = self.controller.botUsername().?;
             if (was_terminal) try self.takeRemoteTitle(username);
-            // Move the input before the chat opens. A failed open cannot leave
-            // the editor live under an attached bot.
             self.syncInputState();
             if (was_terminal) try self.openChat(username);
             return;
         },
         .detaching => {
             if (was_terminal) try self.takeRemoteTitle(self.controller.botUsername().?);
-            // The chat stands as it is from here on, so the messages of the
-            // chat that hold a keyboard are gone for the app.
             self.chat_picker.close();
             self.mirror.detached();
         },
@@ -3428,8 +2481,6 @@ fn syncRemoteState(self: *App) !void {
     self.syncInputState();
 }
 
-/// Map the active sign-in and controller state onto the session input. A sign-in
-/// keeps the terminal under its own caption.
 fn syncInputState(self: *App) void {
     if (self.login) |*login| {
         self.session.input = .{ .caption = .{
@@ -3464,19 +2515,12 @@ fn syncInputState(self: *App) void {
     self.session.dirty = true;
 }
 
-/// Name the caption title of the inactive editor after `username`.
 fn takeRemoteTitle(self: *App, username: []const u8) !void {
     const title = try std.fmt.allocPrint(self.gpa, "Remote: @{s}", .{username});
     self.gpa.free(self.remote_title);
     self.remote_title = title;
 }
 
-/// Record the attach event, which is the first message of the chat, and start
-/// the mirror behind it. The event names the bot alone, and `/status` states the
-/// session on request. The editor is empty by then, because the `/remote` line
-/// went with the command. The event goes to the chat at once, also while a
-/// reply streams and the transcript defers it, so the block carries no mirror
-/// flag and the mirror sends it no second time.
 fn openChat(self: *App, username: []const u8) !void {
     self.session.clearNotice();
     const text = try std.fmt.allocPrint(self.gpa, "You attached @{s}.", .{username});
@@ -3486,7 +2530,6 @@ fn openChat(self: *App, username: []const u8) !void {
     try self.mirror.open(&self.controller, &self.mirrorView());
 }
 
-/// What the mirror reads of the session now.
 fn mirrorView(self: *const App) remote.Mirror.View {
     return .{
         .blocks = self.session.transcript.blocks(),
@@ -3500,16 +2543,10 @@ fn mirrorView(self: *const App) remote.Mirror.View {
     };
 }
 
-/// Send the blocks that committed since the last step, and update the activity
-/// message. Runs after every event, so the chat follows the transcript.
 fn syncMirror(self: *App) !void {
     try self.mirror.sync(&self.controller, &self.mirrorView());
 }
 
-/// Send the last blocks of the ending turn, drop the activity message, and send
-/// the summary. The session has ended the turn, so every block is committed,
-/// and a failure armed its retry by now, so the chat gets the failed turn
-/// message with it.
 fn endMirrorTurn(self: *App, outcome: remote.Mirror.End.Outcome) !void {
     const status = self.session.statusInfo();
     try self.mirror.endTurn(&self.controller, &self.mirrorView(), &.{
@@ -3520,10 +2557,6 @@ fn endMirrorTurn(self: *App, outcome: remote.Mirror.End.Outcome) !void {
     });
 }
 
-/// Mark every Telegram message that the running turn committed since the last
-/// step with 👍. A message belongs to history at the round that commits it, so
-/// the chat learns it there and not at the receipt. Runs after every event of
-/// the turn.
 fn markCommittedChatMessages(self: *App) !void {
     if (!self.controller.listens()) return;
     if (!self.prompt_marked and self.session.turnCommitted()) {
@@ -3543,14 +2576,9 @@ fn markCommittedChatMessages(self: *App) !void {
     }
 }
 
-/// Mark every Telegram message of the ending turn that holds no mark yet: 👍 for
-/// one the turn committed and 👎 for one it did not. The receipt names the
-/// committed rounds and the committed steering prefix. Runs before the session
-/// resolves the messages, because it reads their ids from the session.
 fn settleChatMessages(self: *App, receipt: *const ai.Agent.Receipt) !void {
     if (!self.controller.listens()) return;
     const committed = receipt.history_end != receipt.history_base;
-    // A prompt that a round of this turn marked already holds the mark it needs.
     const prompt_settled = self.prompt_marked and committed;
     if (!prompt_settled) {
         if (self.session.turn_prompt) |*prompt| switch (prompt.source) {
@@ -3560,7 +2588,6 @@ fn settleChatMessages(self: *App, receipt: *const ai.Agent.Receipt) !void {
     }
     for (self.session.steering.items, 0..) |*message, index| {
         const message_committed = index < receipt.steering_committed_count;
-        // A message that a round marked already holds the same mark.
         if (message_committed and index < self.steering_marked_count) continue;
         switch (message.source) {
             .external => |id| try self.controller.react(
@@ -3572,16 +2599,9 @@ fn settleChatMessages(self: *App, receipt: *const ai.Agent.Receipt) !void {
     }
 }
 
-/// The answer of `/status`: the state of the session now, in the words and the
-/// order of the status line and in full. The numbers come from the snapshot of
-/// the session, which the worker never writes, so the answer is safe during a
-/// turn. The place takes its whole label and its branch, because the answer has
-/// no column budget and a Herdr pane hides both from the line alone. The result
-/// is owned.
 fn statusText(self: *App) ![]u8 {
     var info = self.session.statusInfo();
     info.directory = self.directory_label;
-    // A pane leaves the branch unread, so the answer reads the head itself.
     var maybe_head: ?ai.project.Head = null;
     if (self.project_instructions.projectRoot()) |root|
         maybe_head = ai.project.head(self.gpa, self.io, root);
@@ -3592,10 +2612,6 @@ fn statusText(self: *App) ![]u8 {
     return out.toOwnedSlice();
 }
 
-/// Answer `/status` in the terminal: one event that states the session now. It
-/// stays in the terminal, because the chat asks with a line of its own. A reply
-/// that streams defers it to the next message boundary, and every request takes
-/// a block of its own, because each one states its own moment.
 fn recordStatus(self: *App) !void {
     const text = try self.statusText();
     try self.session.recordAsyncEvent(
@@ -3604,8 +2620,6 @@ fn recordStatus(self: *App) !void {
     );
 }
 
-/// Show the pairing in the `/remote` picker: a wait row for the token check,
-/// then the code with its link, and the close of the wait at the end.
 fn applyPairingChange(self: *App, change: remote.Controller.Action.PairingChange) !void {
     switch (change) {
         .check_started => try self.session.openWait(&.{
@@ -3630,7 +2644,6 @@ fn applyPairingChange(self: *App, change: remote.Controller.Action.PairingChange
             self.pairing_wait_text = text;
             self.pairing_wait_link = link;
         },
-        // The token stays in the editor, so the prompt returns to it.
         .prompt_restored => {
             self.session.closePicker();
             self.freePairingStrings();
@@ -3643,8 +2656,6 @@ fn applyPairingChange(self: *App, change: remote.Controller.Action.PairingChange
     }
 }
 
-/// The selector of the wait picker of a pairing. The list holds no row, so no
-/// selection reaches it.
 fn selectNothing(
     context: *ai.command.Context,
     selection: ai.command.Outcome.Pick.Selection,
@@ -3653,8 +2664,6 @@ fn selectNothing(
     return ai.command.Outcome.reportNotice(context.gpa, .failure, "Select a valid row.", .{});
 }
 
-/// Free the wait row of the pairing picker. The picker must be closed, or it
-/// must hold other text.
 fn freePairingStrings(self: *App) void {
     self.gpa.free(self.pairing_wait_text);
     self.gpa.free(self.pairing_wait_link);
@@ -3662,17 +2671,12 @@ fn freePairingStrings(self: *App) void {
     self.pairing_wait_link = "";
 }
 
-/// Free every string the remote state borrows from the app.
 fn freeRemoteStrings(self: *App) void {
     self.freePairingStrings();
     self.gpa.free(self.remote_title);
     self.remote_title = "";
 }
 
-/// Keys while the terminal does not hold the input. Every exit key moves the
-/// input one step toward the terminal: a detach of the attached bot, or the end
-/// of the wait for its last message. Enter states the reason, and every other
-/// key does nothing.
 fn handleExternalKey(self: *App, event: *const terminal.Input.Key) !void {
     switch (event.*) {
         .escape => try self.exitRemote(),
@@ -3685,7 +2689,6 @@ fn handleExternalKey(self: *App, event: *const terminal.Input.Key) !void {
     }
 }
 
-/// An exit key under a bot: detach it, or end the wait for its last message.
 fn exitRemote(self: *App) !void {
     switch (self.controller.state()) {
         .attached => try self.controller.detach(.user),
@@ -3694,8 +2697,6 @@ fn exitRemote(self: *App) !void {
     }
 }
 
-/// Enter under a bot: name the bot that holds the input, or the wait for its
-/// last message, and the key that ends it.
 fn reportRemoteNotice(self: *App) !void {
     const username = self.controller.botUsername().?;
     switch (self.controller.state()) {
@@ -3713,9 +2714,6 @@ fn reportRemoteNotice(self: *App) !void {
     }
 }
 
-/// A Telegram message enters through the path of an Enter in the editor, so every
-/// refusal and every steering rule applies once. It never reads or writes the
-/// editor, and a refusal answers the message in the chat.
 fn submitChatMessage(self: *App, text: []const u8, message_id: i64) !void {
     if (self.login != null) return self.controller.reply(
         message_id,
@@ -3726,9 +2724,6 @@ fn submitChatMessage(self: *App, text: []const u8, message_id: i64) !void {
     const origin: ChatOrigin = .{ .message = .{ .id = message_id, .text = text } };
     switch (self.session.mode) {
         .turn => {
-            // No command but the status runs mid-turn, as in the terminal. The
-            // registry decides first there too, so a line it cannot run as
-            // typed keeps its own refusal instead of the one that names the turn.
             if (ai.command.parse(text)) |name| {
                 if (try ai.command.check(&context, text)) |refusal| {
                     defer self.gpa.free(refusal.content);
@@ -3742,11 +2737,6 @@ fn submitChatMessage(self: *App, text: []const u8, message_id: i64) !void {
                 defer self.gpa.free(refusal.content);
                 return self.controller.reply(message_id, refusal.severity, refusal.content);
             }
-            // The draft and the slot come first, so the channel push is the last
-            // fallible step before the session takes the message. The mark of a
-            // queued message follows both, so a failed mark leaves the queue and
-            // the session in agreement. The round that commits the message
-            // replaces that mark.
             var draft = try ui.Editor.Draft.fromText(self.gpa, text);
             errdefer draft.deinit(self.gpa);
             try self.session.reserveSteering();
@@ -3755,18 +2745,12 @@ fn submitChatMessage(self: *App, text: []const u8, message_id: i64) !void {
             return self.controller.react(message_id, .queued);
         },
         .prompt => {},
-        // The terminal takes no input while the bot holds it, so no picker and
-        // no page opens. The reply guards the session against a message that
-        // meets one anyway, because a message must never end the session.
         .picking, .viewing => return self.controller.reply(
             message_id,
             .warning,
             "Drinky cannot take a message now.",
         ),
     }
-    // A command line runs where the registry allows it in the chat. The
-    // registry refuses a terminal-only command and a line it cannot run as
-    // typed, and the refusal answers the message.
     if (ai.command.parse(text) != null) {
         if (try ai.command.check(&context, text)) |refusal| {
             defer self.gpa.free(refusal.content);
@@ -3779,11 +2763,6 @@ fn submitChatMessage(self: *App, text: []const u8, message_id: i64) !void {
         return self.controller.reply(message_id, .failure, telegram_signed_out_refusal);
     if (self.agent.model == null)
         return self.controller.reply(message_id, .failure, telegram_no_model_refusal);
-    // The draft comes first, so no fallible step stands between the turn start
-    // and the retained prompt. The prompt then follows the rule of a queued
-    // Telegram message: it fills no editor while the bot holds the input, and it
-    // returns after a detach. The mark of a queued message follows the retained
-    // prompt, and a refused message gets its reply instead.
     var draft = try ui.Editor.Draft.fromText(self.gpa, text);
     errdefer draft.deinit(self.gpa);
     const base = try self.startUserTurn(text);
@@ -3791,13 +2770,8 @@ fn submitChatMessage(self: *App, text: []const u8, message_id: i64) !void {
     try self.controller.react(message_id, .queued);
 }
 
-/// Where a command of the chat came from, so its result finds its place.
 const ChatOrigin = union(enum) {
-    /// A command line in a message. A notice answers it as a reply, and a turn
-    /// it starts retains it as the prompt.
     message: Line,
-    /// A tap on the open picker, with the query to answer. A notice answers it
-    /// as a toast, and the message of the picker goes.
     tap: []const u8,
 
     const Line = struct {
@@ -3806,15 +2780,9 @@ const ChatOrigin = union(enum) {
     };
 };
 
-/// Apply the outcome of a command that the chat ran. A picker shows as an
-/// inline keyboard, an event reaches the chat through the mirror, and a skill
-/// starts its turn. The registry refuses every terminal-only command on a remote
-/// host, so no outcome that needs the terminal arrives here.
 fn applyChatOutcome(self: *App, outcome: ai.command.Outcome, origin: ChatOrigin) !void {
     switch (outcome) {
         .pick => |*pick| {
-            // A step that both reports and opens a list records its line first.
-            // The picker takes the rows below, so a failure before it frees them.
             if (pick.report) |message| self.session.applyOutcome(.{ .event = message }) catch |err| {
                 for (pick.options) |*option| option.deinit(self.gpa);
                 self.gpa.free(pick.options);
@@ -3833,7 +2801,6 @@ fn applyChatOutcome(self: *App, outcome: ai.command.Outcome, origin: ChatOrigin)
             try self.stateChatNotice(origin, message.severity, message.content);
         },
         .event => |message| {
-            // The session frees the content below, so a failure before it does.
             self.stateChatResult(origin) catch |err| {
                 self.gpa.free(message.content);
                 return err;
@@ -3844,8 +2811,6 @@ fn applyChatOutcome(self: *App, outcome: ai.command.Outcome, origin: ChatOrigin)
             try self.stateChatResult(origin);
             try self.applyOutcome(outcome);
         },
-        // The answer reaches the chat alone, because the chat asked. The
-        // terminal keeps its own line for its own request.
         .show_status => {
             const text = try self.statusText();
             defer self.gpa.free(text);
@@ -3859,25 +2824,16 @@ fn applyChatOutcome(self: *App, outcome: ai.command.Outcome, origin: ChatOrigin)
                 return self.stateChatNotice(origin, .failure, telegram_no_model_refusal);
             try self.startChatSkillTurn(&prompt, origin);
         },
-        // The chat has no editor, and the registry loads a picked skill at once,
-        // so no line arrives here. The arm frees one that does.
         .editor_text => |text| {
             defer self.gpa.free(text);
             try self.stateChatNotice(origin, .warning, terminal_only_action);
         },
-        // The registry refused every command that reaches the terminal, so
-        // this states the one fact that holds for the rest.
         else => try self.stateChatNotice(origin, .warning, terminal_only_action),
     }
 }
 
-/// The notice of a chat outcome that only the terminal can host.
 const terminal_only_action = "This action runs in the terminal alone.";
 
-/// Start the turn of a skill that the chat loaded. A skill line in a message
-/// keeps the message as the retained prompt, like every Telegram prompt. A tap
-/// retains no prompt, like a retry attempt, because its request never sat in an
-/// editor and has no text to return. A new `/skill` loads the skill again.
 fn startChatSkillTurn(
     self: *App,
     prompt: *const ai.command.Outcome.Prompt,
@@ -3891,8 +2847,6 @@ fn startChatSkillTurn(
             self.session.retainExternalTurnPrompt(&draft, base, line.id);
         },
         .tap => |query_id| {
-            // The head line of the skill states the load, so the message of the
-            // picker goes without a word.
             try self.chat_picker.dismiss(&self.controller);
             try self.controller.answer(query_id, null);
             const base = try self.startSkillTurn(prompt);
@@ -3901,10 +2855,6 @@ fn startChatSkillTurn(
     }
 }
 
-/// State a notice of the chat where its origin shows it: as a reply to the
-/// message under the role of `severity`, or as a toast to the tap. A notice is
-/// short-lived, so the toast states it and the message of the picker goes. A
-/// toast carries no symbol, so the severity reaches the reply alone.
 fn stateChatNotice(
     self: *App,
     origin: ChatOrigin,
@@ -3920,9 +2870,6 @@ fn stateChatNotice(
     }
 }
 
-/// Answer a question of the chat with `text`: as a reply to the message, or as a
-/// message of its own after a tap, whose picker goes. An answer is too long for
-/// a toast, and it states the session, so it takes the information role.
 fn stateChatAnswer(self: *App, origin: ChatOrigin, text: []const u8) !void {
     switch (origin) {
         .message => |line| try self.controller.reply(line.id, .information, text),
@@ -3934,9 +2881,6 @@ fn stateChatAnswer(self: *App, origin: ChatOrigin, text: []const u8) !void {
     }
 }
 
-/// End a command of the chat that states its result as an event. The mirror
-/// carries that event to the chat, so a message gets no reply, and a tap gets a
-/// silent answer while the message of its picker goes.
 fn stateChatResult(self: *App, origin: ChatOrigin) !void {
     switch (origin) {
         .message => {},
@@ -3947,14 +2891,11 @@ fn stateChatResult(self: *App, origin: ChatOrigin) !void {
     }
 }
 
-/// The toasts of a tap on a keyboard whose owner is gone.
 const turn_over_toast = "The turn is over.";
 const retry_over_toast = "The retry is over.";
 const list_closed_toast = "This list is closed.";
 const answer_stale_toast = "This answer is not the newest one.";
 
-/// What a tap on `Shorten` meets while the session cannot take it. Each sentence
-/// names the tap, because the user pressed a button and sent no message.
 const turn_runs_toast = "A turn runs. Wait for its end.";
 const session_busy_toast = "Drinky cannot act on a tap now.";
 const login_runs_toast = "A sign-in runs in the terminal. Wait for its end.";
@@ -3963,9 +2904,6 @@ const shorten_signed_out_toast =
 const shorten_no_model_toast =
     "Select a model with /model in the terminal before you shorten an answer.";
 
-/// Act on one tap of the chat and answer it. A tap on a keyboard the chat
-/// history still shows names a serial its owner no longer holds, and the toast
-/// states that.
 fn handleChatTap(self: *App, query_id: []const u8, tap: remote.keyboard.Tap) !void {
     if (self.login != null) return self.controller.answer(query_id, login_runs_toast);
     switch (tap) {
@@ -4014,9 +2952,6 @@ fn handleChatTap(self: *App, query_id: []const u8, tap: remote.keyboard.Tap) !vo
     }
 }
 
-/// A tap on the open picker of the chat: a row runs the selector of the command,
-/// `‹ Back` rebuilds the step above, and `Cancel` ends the command with its
-/// cancellation message. A tap on a closed list gets the toast alone.
 fn handlePickerTap(self: *App, query_id: []const u8, tap: remote.keyboard.Tap) !void {
     const action = self.chat_picker.resolve(tap) orelse
         return self.controller.answer(query_id, list_closed_toast);
@@ -4033,8 +2968,6 @@ fn handlePickerTap(self: *App, query_id: []const u8, tap: remote.keyboard.Tap) !
                     try self.chat_picker.replace(&self.controller, pick, self.chat_picker.openers());
                     try self.controller.answer(query_id, null);
                 },
-                // The step above reports instead of opening, so the command
-                // ends here.
                 else => try self.applyChatOutcome(outcome, .{ .tap = query_id }),
             }
         },
@@ -4046,13 +2979,7 @@ fn handlePickerTap(self: *App, query_id: []const u8, tap: remote.keyboard.Tap) !
     }
 }
 
-/// Take the whole steering queue back, like Ctrl+P, and mark each Telegram
-/// message of it as dropped. A typed draft returns to the editor, and a
-/// Telegram message drops while the bot holds the input, because the chat
-/// still holds it. Returns how many messages the queue held.
 fn withdrawSteering(self: *App) !usize {
-    // Reserve every possible draft move and the room for the ids, so no fallible
-    // work follows the channel take until the session agrees with the queue.
     try self.session.reserveSteeringRecall();
     var dropped: std.ArrayList(i64) = .empty;
     defer dropped.deinit(self.gpa);
@@ -4062,23 +2989,16 @@ fn withdrawSteering(self: *App) !usize {
         for (taken) |message| self.gpa.free(message);
         self.gpa.free(taken);
     }
-    // The count identifies the rich-record suffix currently owned by the queue.
-    // A batch already owned by the worker remains retained.
     const messages = self.session.steering.items;
     for (messages[messages.len - taken.len ..]) |*message| switch (message.source) {
         .external => |id| dropped.appendAssumeCapacity(id),
         .terminal => {},
     };
     self.session.recallSteering(taken.len);
-    // The session and the queue agree by now, so a failed mark costs the mark
-    // alone.
     for (dropped.items) |id| try self.controller.react(id, .dropped);
     return taken.len;
 }
 
-/// Keys in the token prompt state. The editor stays live for the token, Enter
-/// hands it to the check, and every exit key ends the prompt. Ctrl+C clears a
-/// draft first, as it does at the prompt.
 fn handleTokenKey(self: *App, event: *const terminal.Input.Key) !void {
     if (try self.editKey(event)) return;
     switch (event.*) {
@@ -4098,23 +3018,17 @@ fn handleTokenKey(self: *App, event: *const terminal.Input.Key) !void {
     }
 }
 
-/// Enter in the token prompt state: hand the token to the check. The editor
-/// keeps the token meanwhile, so a rejected token returns to it.
 fn submitToken(self: *App) !void {
     const token = try self.session.editor.expanded(.whole_prompt);
     defer self.gpa.free(token);
     try self.controller.submitToken(token);
 }
 
-/// Leave the token prompt state without a bot.
 fn cancelTokenPrompt(self: *App) !void {
     self.session.editor.clear();
     try self.controller.cancelTokenPrompt();
 }
 
-/// Keys while the `/remote` picker waits for a pairing. Esc cancels the step:
-/// a token check returns to the token prompt, and a code wait ends the pairing.
-/// Ctrl+C and Ctrl+D leave the whole command, as they do from any step.
 fn handlePairingKey(self: *App, event: *const terminal.Input.Key) !void {
     switch (event.*) {
         .escape => try self.controller.cancelPairing(.step),
@@ -4126,9 +3040,6 @@ fn handlePairingKey(self: *App, event: *const terminal.Input.Key) !void {
     }
 }
 
-/// Keys on a full-window page. Esc is the documented way out. Ctrl+C and Ctrl+D
-/// close it too, so an exit attempt always works in a terminal that drops the Esc
-/// report. A page is read-only, so no key on it quits Drinky.
 fn handlePageKey(self: *App, event: *const terminal.Input.Key) !void {
     const page = &self.session.mode.viewing;
     const size: terminal.View.Size = .{
@@ -4166,8 +3077,6 @@ fn handlePickerKey(self: *App, event: *const terminal.Input.Key) !void {
         .enter => return self.confirmPicker(),
         .escape => return self.leavePicker(),
         .ctrl => |letter| switch (letter) {
-            // Ctrl+C and Ctrl+D leave the whole command, however deep the step
-            // is, so a stepped picker keeps a one-key way out.
             'c', 'd' => return self.session.cancelPicker(),
             else => return,
         },
@@ -4176,10 +3085,6 @@ fn handlePickerKey(self: *App, event: *const terminal.Input.Key) !void {
     self.session.dirty = true;
 }
 
-/// The keys of a picker that waits for a fetch. Esc cancels the fetch alone, and
-/// the rows return. Ctrl+C and Ctrl+D leave the whole command, as they do from
-/// any step, and take the fetch with it. Every other key does nothing, because
-/// the list holds no row.
 fn handleFetchKey(self: *App, event: *const terminal.Input.Key) !void {
     switch (event.*) {
         .escape => try self.cancelFetch(),
@@ -4194,13 +3099,6 @@ fn handleFetchKey(self: *App, event: *const terminal.Input.Key) !void {
     }
 }
 
-/// Apply the highlighted picker row: the command that opened the picker runs its
-/// own handler over the selected row.
-///
-/// A row that opens another picker keeps this one open, because the replacement
-/// records it on its trail. A row that starts a fetch keeps it too, because the
-/// list waits for the result. Every other outcome ends the picker, so it closes
-/// first.
 fn confirmPicker(self: *App) !void {
     const picking = &self.session.mode.picking;
     const cursor = picking.picker.cursor;
@@ -4215,24 +3113,12 @@ fn confirmPicker(self: *App) !void {
     }
 }
 
-/// Enter on a prompt-history row: append the exact entry behind the row to the
-/// editor as literal text. The picker owns the labels, and the history holds the
-/// entries the labels were built from, so the row indexes the entry. The source
-/// draft lives until the append consumes it, and one deferred free covers the
-/// consumed and the unconsumed case. A failed reserve keeps the picker open over
-/// the unchanged draft. The store stays untouched: the submitted prompt records
-/// its own use.
 fn appendPromptHistory(self: *App, row: usize) !void {
     var source = try ui.Editor.Draft.fromText(self.gpa, self.prompt_history.entries.items[row]);
     defer source.deinit(self.gpa);
     try self.session.appendPromptHistory(&source);
 }
 
-/// Tab at the idle prompt: read the history file and open the picker over its
-/// prompts, newest first. Each open reads the file again, so a prompt from
-/// another instance shows without a watcher. A disabled history names its key,
-/// an empty one says so, and a file Drinky cannot read names the error. None of
-/// the three opens a list, and the draft stays as it is in every case.
 fn openPromptHistory(self: *App) !void {
     std.debug.assert(self.session.mode == .prompt);
     if (!self.prompt_history.enabled) return self.reportNotice(
@@ -4247,12 +3133,9 @@ fn openPromptHistory(self: *App) !void {
     );
     const entries = self.prompt_history.entries.items;
     if (entries.len == 0) return self.reportNotice(.information, prompt_history_empty_notice, .{});
-    // The session takes the labels, and it frees them when the open fails.
     try self.session.openPromptHistory(try promptLabels(self.gpa, entries));
 }
 
-/// One owned label per prompt, in the order of `prompts`. A failed build frees
-/// every label it built. The caller owns the result.
 fn promptLabels(gpa: std.mem.Allocator, prompts: []const []const u8) ![]const []const u8 {
     const labels = try gpa.alloc([]const u8, prompts.len);
     var built: usize = 0;
@@ -4267,12 +3150,7 @@ fn promptLabels(gpa: std.mem.Allocator, prompts: []const []const u8) ![]const []
     return labels;
 }
 
-/// The one-row label of a saved prompt: the prompt with every line break folded
-/// to one space. CRLF, a lone CR, and LF each fold to one space, so the row
-/// holds the whole prompt in order and no break can open a row of its own. The
-/// caller owns the result.
 fn promptLabel(gpa: std.mem.Allocator, prompt: []const u8) ![]u8 {
-    // Every byte takes one byte of the label, except that a CRLF pair takes one.
     const label = try gpa.alloc(u8, prompt.len - std.mem.count(u8, prompt, "\r\n"));
     var written: usize = 0;
     var index: usize = 0;
@@ -4286,11 +3164,6 @@ fn promptLabel(gpa: std.mem.Allocator, prompt: []const u8) ![]u8 {
     return label;
 }
 
-/// Record a submitted terminal prompt as the most recently used one, after its
-/// turn started. A line that starts with a slash after the outer trim is a
-/// command, a skill line, or a refused line sent as typed, so it stays out. No
-/// result here can touch the turn: an oversized prompt and a failed write each
-/// take the footer alone, and a failure stays out of memory.
 fn recordPromptHistory(self: *App, text: []const u8) !void {
     std.debug.assert(text.len > 0);
     if (text[0] == '/') return;
@@ -4300,7 +3173,6 @@ fn recordPromptHistory(self: *App, text: []const u8) !void {
             prompt_history_oversized_notice,
             .{},
         ),
-        // Memory ran out before or inside the write, so the file is not the cause.
         error.OutOfMemory => try self.reportNotice(
             .failure,
             "Drinky could not add the prompt to history because of error {s}.",
@@ -4314,7 +3186,6 @@ fn recordPromptHistory(self: *App, text: []const u8) !void {
     };
 }
 
-/// Whether `outcome` continues inside the open picker.
 fn keepsPicker(outcome: ai.command.Outcome) bool {
     return switch (outcome) {
         .pick, .fetch => true,
@@ -4322,19 +3193,12 @@ fn keepsPicker(outcome: ai.command.Outcome) bool {
     };
 }
 
-/// Open the picker one step above, or cancel the command where the open picker is
-/// its first step. One Esc per step therefore leaves a stepped command.
-///
-/// The mode stays `picking` on a step up, so `handleKeys` drains no key behind
-/// that Esc and a fast repeat walks the whole way out.
 fn leavePicker(self: *App) !void {
     const opener = self.session.stepAbove() orelse return self.session.cancelPicker();
     var context = self.commandContext();
     const outcome = try opener(&context);
     switch (outcome) {
         .pick => |*pick| try self.session.openPickerAbove(pick),
-        // The step above reports instead of opening. That leaves no picker to
-        // return to, so the command ends here.
         else => {
             self.session.closePicker();
             try self.applyOutcome(outcome);
@@ -4342,32 +3206,18 @@ fn leavePicker(self: *App) !void {
     }
 }
 
-/// Test scaffolding: how many 1 ms rounds a test waits for a worker to start.
-/// A passing run leaves the wait at the first round that sees the flag, so the
-/// cap costs time only when the worker never starts. Five seconds keep a loaded
-/// machine from a false failure.
 const worker_start_rounds_max = 5000;
 
-/// Test scaffolding: an `App` on the defaults of `initFields`. A test builds the
-/// `agent`, the `session`, the `accounts`, and the `tty` that it uses, and it
-/// frees what a fed key or a loaded skill grows. `gpa` is a parameter so an OOM
-/// test reaches every allocation through a `FailingAllocator`.
 fn initForTest(self: *App, gpa: std.mem.Allocator) void {
     self.initFields(gpa, std.testing.io);
-    // A test drives an app that already runs, so a key that quits can be seen.
     self.running = true;
 }
 
-/// Test scaffolding: assert that the agent runs the model that `expected` names.
-/// An agent with no model fails the one test rather than aborting the binary.
 fn expectModel(self: *const App, expected: []const u8) !void {
     const model = self.agent.model orelse return error.TestExpectedModel;
     try std.testing.expectEqualStrings(expected, model.name());
 }
 
-// The intro line is the legend of the interface. It holds every key hint in the
-// order of the constant, and the pointer at the command list closes it. The line
-// wraps, so its width costs no hint at a narrow window.
 test "the intro line holds every key hint and closes on the command list" {
     try std.testing.expectEqualStrings(
         "Enter: Send · Shift+Enter: New line · Tab: Prompt history · Esc: Cancel · " ++
@@ -4379,9 +3229,6 @@ test "the intro line holds every key hint and closes on the command list" {
         try std.testing.expect(std.mem.indexOf(u8, intro_text, hint) != null);
 }
 
-/// Test scaffolding: a signed-in app whose turn worker fails before any provider
-/// request, over the prompt history of a temporary home directory. The caller
-/// frees it with `deinitHistoryTest`.
 fn initHistoryTest(
     self: *App,
     gpa: std.mem.Allocator,
@@ -4398,7 +3245,6 @@ fn initHistoryTest(
         .retry = .{},
         .environ = .empty,
     });
-    // No round runs, so the worker fails before it reaches the network.
     self.agent.rounds_max = 0;
     self.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     self.session.account_shown = .anthropic_api_key;
@@ -4419,15 +3265,12 @@ fn deinitHistoryTest(self: *App) void {
     self.agent.deinit();
 }
 
-/// Test scaffolding: join the fast-failing worker of the turn that runs and
-/// apply its result, so the session returns to the prompt.
 fn finishHistoryTurn(self: *App) !void {
     const result = self.awaitTurnFuture() orelse return error.TestExpectedTurn;
     defer self.freeWorkerResult(&result);
     try self.finishWorkerResult(&result);
 }
 
-/// Test scaffolding: the entries the history holds now, newest first.
 fn expectHistory(self: *App, expected: []const []const u8) !void {
     try self.prompt_history.load();
     const entries = self.prompt_history.entries.items;
@@ -4442,10 +3285,6 @@ fn expectNoHistoryFile(self: *const App) !void {
     );
 }
 
-// Tab is the one key of the history, and the idle prompt is the one place it
-// acts. The list opens over the draft, newest prompt first, with no row tagged,
-// and Esc leaves it as any first step. A page, a picker, a sign-in, a bot, and
-// the token prompt each own their keys, so Tab does nothing there.
 test "Tab opens the prompt history over the idle prompt alone" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -4475,7 +3314,6 @@ test "Tab opens the prompt history over the idle prompt alone" {
     try std.testing.expect(picker.marked == null);
     try std.testing.expect(app.session.mode.picking.purpose == .prompt_history);
     try std.testing.expectEqualStrings("typed", app.session.editor.visible());
-    // Tab inside the list is no key of the list.
     try app.handleKeys("\t");
     try std.testing.expect(app.session.mode == .picking);
     try std.testing.expectEqual(@as(usize, 0), app.session.mode.picking.picker.cursor);
@@ -4487,27 +3325,23 @@ test "Tab opens the prompt history over the idle prompt alone" {
     );
     try std.testing.expectEqualStrings("typed", app.session.editor.visible());
 
-    // A page keeps its keys.
     try app.session.openPage(&.{ .title = "Test page", .content = "body" });
     try app.handleKey(&.tab);
     try std.testing.expect(app.session.mode == .viewing);
     app.session.closePage();
 
-    // A command picker keeps its keys.
     try app.runCommand("/help");
     try app.handleKey(&.tab);
     try std.testing.expect(app.session.mode == .picking);
     try std.testing.expectEqualStrings("Command", app.session.mode.picking.picker.title);
     try app.session.cancelPicker();
 
-    // An attached bot holds the input.
     app.session.input.owner = .external;
     try app.handleKey(&.tab);
     try std.testing.expect(app.session.mode == .prompt);
     try std.testing.expect(app.session.notice == null);
     app.session.input.owner = .terminal;
 
-    // A sign-in holds the editor.
     var signals: LoginTestSignals = .{};
     try beginLoginForTest(&app, .xai_plan, null, &signals);
     try app.handleKey(&.tab);
@@ -4516,7 +3350,6 @@ test "Tab opens the prompt history over the idle prompt alone" {
     app.dropLogin();
     app.syncInputState();
 
-    // The token prompt holds the editor.
     try app.runCommand("/remote");
     try app.handleKeys("\r");
     try std.testing.expectEqual(remote.Controller.State.token_prompt, app.controller.state());
@@ -4528,9 +3361,6 @@ test "Tab opens the prompt history over the idle prompt alone" {
     try std.testing.expectEqual(remote.Controller.State.idle, app.controller.state());
 }
 
-// A turn owns the editor for steering, and a picker cannot open over it. Tab
-// then states the restriction and changes nothing: not the draft, not the turn,
-// and not the file.
 test "Tab during a turn shows its notice and changes no draft or turn state" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -4560,8 +3390,6 @@ test "Tab during a turn shows its notice and changes no draft or turn state" {
     try app.expectNoHistoryFile();
 }
 
-// A false setting turns the feature off and leaves the file alone. Tab then
-// names the key and the file, so the user can turn it on again.
 test "a disabled history explains the setting on Tab and records nothing" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -4582,8 +3410,6 @@ test "a disabled history explains the setting on Tab and records nothing" {
     try app.initHistoryTest(gpa, io, &out, home, false);
     defer app.deinitHistoryTest();
 
-    // The intro keeps the hint, because the key still answers: it names the
-    // setting that turns the history on.
     try std.testing.expect(std.mem.indexOf(u8, intro_text, "Tab: Prompt history") != null);
     try app.session.editor.insert("typed");
     try app.handleKeys("\t");
@@ -4606,9 +3432,6 @@ test "a disabled history explains the setting on Tab and records nothing" {
     try std.testing.expectEqualStrings("{\"dmFsaWQ\":{}}", data);
 }
 
-// A list with no row is no list, so Tab states the fact instead. A file Drinky
-// cannot read is a failure that names the file and the error, and it opens no
-// list either, so no selection can land on a half-read file.
 test "an empty or unreadable history opens no picker and keeps the draft" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -4650,9 +3473,6 @@ test "an empty or unreadable history opens no picker and keeps the draft" {
     try std.testing.expectEqualStrings("typed", app.session.editor.visible());
 }
 
-// Every row holds one line, so a line break inside a prompt folds to a space
-// and a long prompt cuts with the ellipsis of every picker. The entry behind the
-// row keeps its bytes.
 test "a history label folds its line breaks and cuts like every picker row" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -4681,16 +3501,12 @@ test "a history label folds its line breaks and cuts like every picker row" {
     );
 
     try app.session.paint(.{ .columns = 40, .rows = 24 });
-    // Two options make two rows, and the long one ends in the ellipsis.
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, picker.content.items, "\n"));
     try std.testing.expect(std.mem.indexOf(u8, picker.content.items, "…") != null);
     try std.testing.expect(std.mem.indexOf(u8, picker.content.items, "\u{FFFD}") == null);
     try std.testing.expect(std.mem.indexOf(u8, picker.content.items, "one two three four") != null);
 }
 
-// The labels transfer to the session at the open, and the session frees them
-// when its open fails. A sweep of every allocation of the open proves that no
-// failure frees a label twice or leaks one, and that no failure opens a list.
 test "a failed prompt history open frees its labels once" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     const gpa = failing.allocator();
@@ -4717,18 +3533,12 @@ test "a failed prompt history open frees its labels once" {
             if (app.session.mode == .picking) break;
         } else |err| try std.testing.expectEqual(error.OutOfMemory, err);
         try std.testing.expect(app.session.mode == .prompt);
-        // The open makes a handful of allocations, so a sweep past this count
-        // found a step that never fails.
         if (step == 64) return error.TestSweepTooLong;
     }
     try std.testing.expectEqualStrings("three", app.session.mode.picking.picker.options[0].name);
     try std.testing.expectEqualStrings("one two", app.session.mode.picking.picker.options[1].name);
 }
 
-// Enter appends the exact entry to the draft and writes nothing: a selection is
-// no use. The complete prompt that the user then submits records its own use, so
-// a combined draft enters the history as one prompt and the selected source
-// keeps its place.
 test "a selection appends without a write, and the submitted draft records itself" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -4747,8 +3557,6 @@ test "a selection appends without a write, and the submitted draft records itsel
     const before = try tmp.dir.readFileAlloc(io, ".drinky/prompt_history.json", gpa, .unlimited);
     defer gpa.free(before);
 
-    // Down to the older row, then Enter. The bytes after Enter in the same chunk
-    // still reach the editor, because Enter ends no layer.
     try app.session.editor.insert("typed");
     app.session.dirty = false;
     try app.handleKeys("\t\x1b[B\r!");
@@ -4761,14 +3569,11 @@ test "a selection appends without a write, and the submitted draft records itsel
     try std.testing.expectEqualStrings(before, after);
     try app.expectHistory(&.{ "gamma", "alpha\nbeta" });
 
-    // The submitted draft is the one new prompt, and the source stays in place.
     try app.submit();
     try std.testing.expect(app.session.mode == .turn);
     try app.expectHistory(&.{ "typed\n\nalpha\nbeta!", "gamma", "alpha\nbeta" });
     try app.finishHistoryTurn();
 
-    // A selection into an empty draft that the user sends unchanged moves that
-    // entry to the top.
     app.session.editor.clear();
     try app.handleKeys("\t\x1b[B\x1b[B\r");
     try std.testing.expectEqualStrings("alpha\nbeta", app.session.editor.visible());
@@ -4777,8 +3582,6 @@ test "a selection appends without a write, and the submitted draft records itsel
     try app.finishHistoryTurn();
 }
 
-// Esc, Ctrl+C, and Ctrl+D each close the list alone. The draft under it stays,
-// because a cancel decides against the list and not against the text.
 test "every cancel key of the history picker keeps the draft" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -4810,9 +3613,6 @@ test "every cancel key of the history picker keeps the draft" {
     try app.expectHistory(&.{"saved"});
 }
 
-// The record follows a successful start and nothing else. A start that fails
-// records nothing, and a turn that fails after its start keeps its entry, because
-// the prompt was used whatever the model did with it.
 test "a plain prompt enters the history at its successful start alone" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -4844,9 +3644,6 @@ test "a plain prompt enters the history at its successful start alone" {
     try app.expectHistory(&.{"hello\nworld"});
 }
 
-// A line that starts with a slash is a command line, a skill line, or a refused
-// line that the user sends as typed. None of them is a reusable prompt, so none
-// enters the history, and the outer trim decides what starts with a slash.
 test "every outer-trimmed slash line stays out of the history" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -4875,13 +3672,11 @@ test "every outer-trimmed slash line stays out of the history" {
     });
     defer app.skills.deinit();
 
-    // A command that runs.
     try app.session.editor.insert("/status");
     try app.submit();
     try std.testing.expect(app.session.mode == .prompt);
     try app.expectNoHistoryFile();
 
-    // A skill line that starts a turn.
     try app.session.editor.insert("  /skill:demo apply it");
     try app.submit();
     try std.testing.expect(app.session.mode == .turn);
@@ -4889,7 +3684,6 @@ test "every outer-trimmed slash line stays out of the history" {
     try app.finishHistoryTurn();
     app.session.editor.clear();
 
-    // A refused line that the second Enter sends to the model as typed.
     try app.session.editor.insert(" /nope tell me about this");
     try app.handleKey(&.enter);
     try std.testing.expect(app.session.confirmations.contains(.message));
@@ -4899,9 +3693,6 @@ test "every outer-trimmed slash line stays out of the history" {
     try app.finishHistoryTurn();
 }
 
-// Only `submit` records, so the paths that a Telegram message, a steering line,
-// a retry, and a shorten request share with the terminal never write. Ctrl+C
-// clears a draft and records nothing, and its double press still quits.
 test "no path but a submitted terminal prompt records history" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -4916,7 +3707,6 @@ test "no path but a submitted terminal prompt records history" {
     try app.initHistoryTest(gpa, io, &out, home, true);
     defer app.deinitHistoryTest();
 
-    // The shared start of a terminal prompt and a Telegram message.
     try app.session.editor.insert("direct");
     {
         const base = try app.startUserTurn("direct");
@@ -4924,7 +3714,6 @@ test "no path but a submitted terminal prompt records history" {
         app.session.retainTurnPrompt(&prompt, base);
     }
     try app.expectNoHistoryFile();
-    // A steering line during that turn.
     try app.session.editor.insert("steer this");
     try app.handleKey(&.enter);
     try std.testing.expect(app.session.hasSteering());
@@ -4932,7 +3721,6 @@ test "no path but a submitted terminal prompt records history" {
     try app.finishHistoryTurn();
     app.session.editor.clear();
 
-    // A retry attempt and a shorten request.
     app.setRetry(.{ .failure = try gpa.dupe(u8, "The provider is overloaded.") });
     try app.sendRetryTurn();
     try app.expectNoHistoryFile();
@@ -4943,7 +3731,6 @@ test "no path but a submitted terminal prompt records history" {
     try app.finishHistoryTurn();
     app.session.editor.clear();
 
-    // Ctrl+C clears and records nothing. The second press quits.
     try app.session.editor.insert("cleared");
     try app.handleKey(&.{ .ctrl = 'c' });
     try std.testing.expectEqualStrings("", app.session.editor.visible());
@@ -4953,10 +3740,6 @@ test "no path but a submitted terminal prompt records history" {
     try std.testing.expect(!app.running);
 }
 
-// The history is a convenience beside the turn. A prompt the file cannot take
-// starts its turn as every prompt does, and the footer states why the history
-// skipped it. A file that refuses the write does the same, with its path and the
-// error, and the turn keeps running.
 test "a history failure warns and never touches the started turn" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -5018,7 +3801,6 @@ const LoginTestSignals = struct {
     stopped: std.atomic.Value(bool) = .init(false),
 };
 
-/// A fake sign-in that waits until its future receives a cancel.
 fn waitForLoginCancel(
     io: std.Io,
     signals: *LoginTestSignals,
@@ -5035,7 +3817,6 @@ fn waitForLoginCancel(
     };
 }
 
-/// Install one fake sign-in and wait until its worker starts.
 fn beginLoginForTest(
     app: *App,
     account: ai.llm.Account,
@@ -5086,12 +3867,10 @@ test "a sign-in prompt records its URL and user code in transcript events" {
     try std.testing.expectEqual(events.len, count);
     _ = try app.applyBatch(events[0..count]);
 
-    // The launch warning takes the footer, so the attempt still costs one line.
     const blocks = app.session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 2), blocks.len);
     const authorization = blocks[0].content.event.text.items;
     const device = blocks[1].content.event.text.items;
-    // A blank row frames the URL on each side, so the reader finds it at once.
     try std.testing.expect(std.mem.indexOf(
         u8,
         authorization,
@@ -5123,7 +3902,6 @@ test "a sign-in caption names the account and Enter refuses a device login line"
     try beginLoginForTest(&app, .xai_plan, null, &signals);
     defer app.dropLogin();
 
-    // A device-code login takes no line, so its caption offers no Enter.
     const caption = app.session.input.caption.?;
     try std.testing.expectEqualStrings("Sign in: xai-plan", caption.title);
     try std.testing.expectEqualStrings(login_device_controls, caption.controls);
@@ -5179,7 +3957,6 @@ test "Enter replays a callback URL from the raw editor" {
     }, &signals);
     defer app.dropLogin();
 
-    // A callback login offers Enter, so the caption names the replay.
     try std.testing.expectEqualStrings(
         login_callback_controls,
         app.session.input.caption.?.controls,
@@ -5198,10 +3975,6 @@ test "Enter replays a callback URL from the raw editor" {
     try std.testing.expectEqualStrings("", app.session.editor.visible());
 }
 
-// A path-bound listener answers on one random path, and the paste filter
-// demands that path. A line of an earlier sign-in names another path, and the
-// listener skips such a line and waits on, so the paste must keep the line and
-// report why.
 test "a pasted line of another callback path keeps the editor and warns" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -5234,8 +4007,6 @@ test "a pasted line of another callback path keeps the editor and warns" {
     const refusal = "The line is not the callback URL for the sign-in to openrouter-api. " ++
         "Paste the complete callback URL from the browser.";
 
-    // Until the worker reports the one path of its listener, no line can be
-    // its redirect, and even the eventual right path stays in the editor.
     const early = "http://localhost:53694/deadbeef?code=early-code";
     try app.session.editor.insert(early);
     try app.handleKey(&.enter);
@@ -5243,7 +4014,6 @@ test "a pasted line of another callback path keeps the editor and warns" {
     try std.testing.expectEqualStrings(refusal, app.session.notice.?.content);
     app.session.editor.clear();
 
-    // The listener reports the one path it answers on with the URL event.
     var prompt: LoginPrompt = .{ .app = &app, .generation = app.login.?.generation };
     try prompt.showAuthorization(
         "https://openrouter.ai/auth?callback_url=http%3A%2F%2Flocalhost%3A53694%2Fdeadbeef",
@@ -5260,7 +4030,6 @@ test "a pasted line of another callback path keeps the editor and warns" {
     try std.testing.expectEqualStrings(stale, app.session.editor.visible());
     try std.testing.expectEqualStrings(refusal, app.session.notice.?.content);
 
-    // The line of this sign-in reaches the listener and clears the editor.
     app.session.editor.clear();
     try app.session.editor.insert("http://localhost:53694/deadbeef?code=paste-code");
     try app.handleKey(&.enter);
@@ -5290,8 +4059,6 @@ test "a sign-in cancel drops the rest of one exit attempt" {
     try std.testing.expect(signals.stopped.load(.acquire));
 }
 
-/// A fake sign-in that announces its URL, commits at once, and queues its
-/// terminal event, as the real worker does.
 fn completeLoginForTest(app: *App, account: ai.llm.Account, generation: u64) LoginWorkerResult {
     var prompt: LoginPrompt = .{ .app = app, .generation = generation };
     prompt.showAuthorization("https://example.test/authorize", null) catch {};
@@ -5306,10 +4073,6 @@ fn completeLoginForTest(app: *App, account: ai.llm.Account, generation: u64) Log
     };
 }
 
-// The terminal event of a sign-in joins its worker, and the joined result moves
-// the session onto the account. The result line takes the place of the URL
-// event, so the attempt costs the transcript one line. The model flow opens at
-// the fetch row, and the caption goes with the sign-in.
 test "a committed sign-in adopts its account and opens its model flow" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -5320,8 +4083,6 @@ test "a committed sign-in adopts its account and opens its model flow" {
     const home = try tmpPath(gpa, io, &tmp, "");
     defer gpa.free(home);
 
-    // The store holds the credential that the worker committed, so the registry
-    // answers the account with a client.
     var store = try tmp.dir.createDirPathOpen(io, ".drinky", .{});
     store.close(io);
     try tmp.dir.writeFile(io, .{
@@ -5346,8 +4107,6 @@ test "a committed sign-in adopts its account and opens its model flow" {
     app.session = Session.init(gpa, &out.writer, null, .low);
     defer app.session.deinit();
     app.session.account_shown = null;
-    // Reasoning of an earlier principal in the same slot stands above the URL
-    // event. The sign-in drops it, and the result line must still find its event.
     try app.session.transcript.appendStream(.thinking, .anthropic_plan, "old reasoning");
     app.session.transcript.endMessage();
 
@@ -5384,7 +4143,6 @@ test "a committed sign-in adopts its account and opens its model flow" {
     try std.testing.expectEqualStrings("Fetch the model list", picker.options[0].name);
     try std.testing.expectEqual(@as(usize, 0), picker.cursor);
     try std.testing.expect(!picker.can_step_back);
-    // The old reasoning went, and the result took the place of the URL event.
     const blocks = app.session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 1), blocks.len);
     try std.testing.expectEqualStrings(
@@ -5393,8 +4151,6 @@ test "a committed sign-in adopts its account and opens its model flow" {
     );
 }
 
-// A cached model makes the first row a refresh. The remembered model is the
-// marked row and the initial selection after a successful sign-in.
 test "a sign-in opens a cached model flow on the remembered model" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -5444,8 +4200,6 @@ test "a sign-in opens a cached model flow on the remembered model" {
     );
 }
 
-// When the exact OpenRouter model is absent, the remembered author gets the
-// cursor. No author is current until a model selection activates one.
 test "an OpenRouter sign-in preselects the remembered author" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -5494,8 +4248,6 @@ test "an OpenRouter sign-in preselects the remembered author" {
     try std.testing.expectEqualStrings("openai", picker.options[picker.cursor].name);
 }
 
-// A cancel closes the attempt in the transcript: the URL event becomes the line
-// that states the cancel, and no footer notice repeats it.
 test "a canceled sign-in rewrites its URL event into the cancel line" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -5515,7 +4267,6 @@ test "a canceled sign-in rewrites its URL event into the cancel line" {
     const count = try app.queue.get(app.io, &events, 1);
     _ = try app.applyBatch(events[0..count]);
     try std.testing.expectEqual(@as(usize, 0), app.login.?.attempt.event_index.?);
-    // The frame paints the URL event, so the rewrite below changes painted rows.
     try app.session.paint(.{ .columns = 120, .rows = 30 });
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "ABCD-EFGH") != null);
 
@@ -5529,8 +4280,6 @@ test "a canceled sign-in rewrites its URL event into the cancel line" {
         "You canceled the sign-in to xai-plan.",
         blocks[0].content.event.text.items,
     );
-    // The block sits at the bottom of the window, so the frame repaints it in
-    // place and asks for no reset.
     try app.session.paint(.{ .columns = 120, .rows = 30 });
     const repainted = out.written()[painted..];
     try std.testing.expect(std.mem.indexOf(u8, repainted, "You canceled the sign-in") != null);
@@ -5538,8 +4287,6 @@ test "a canceled sign-in rewrites its URL event into the cancel line" {
 }
 
 test "a turn failure the agent named itself reads as a sentence, not an error name" {
-    // A refusal or an unrecognized provider outcome is ordinary model behavior:
-    // Drinky must not show the user a bare Zig error name for it.
     for ([_]anyerror{
         error.UnsupportedReply,
         error.EmptyReply,
@@ -5562,7 +4309,6 @@ test "a turn failure the agent named itself reads as a sentence, not an error na
         "Drinky stopped the reply because it asked for more than 64 tool calls.",
         turnFailureText(error.TooManyToolCalls).?,
     );
-    // A credential the turn can still use names the retry, not a sign-in.
     for ([_]anyerror{
         error.TokenServiceUnavailable,
         error.StoreBusy,
@@ -5570,16 +4316,12 @@ test "a turn failure the agent named itself reads as a sentence, not an error na
         const text = turnFailureText(err).?;
         try std.testing.expect(std.mem.indexOf(u8, text, "Try the turn again.") != null);
     }
-    // A replacement runs before the transition that resolves the model, so the
-    // app names the next step and this text names none.
     const replacement = turnFailureText(error.CredentialReplaced).?;
     try std.testing.expect(std.mem.indexOf(u8, replacement, "Try the turn again.") == null);
     try std.testing.expect(std.mem.indexOf(u8, replacement, "/model") == null);
-    // A rejected credential leaves the account resolution to the app.
     const credentials = turnFailureText(error.TokenGrantRejected).?;
     try std.testing.expect(std.mem.indexOf(u8, credentials, "signed out") == null);
     try std.testing.expect(std.mem.indexOf(u8, credentials, "/login") == null);
-    // An unmapped failure returns null, and the caller wraps its error name.
     try std.testing.expectEqual(null, turnFailureText(error.SignedOut));
 }
 
@@ -5649,8 +4391,6 @@ test "a login the provider refused reads as a sentence, not an error name" {
     app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
 
-    // A rejection names the one action that helps. An unavailable service does
-    // not, because the same sign-in works later.
     try app.reportLoginFailure(.{ .account = .anthropic_plan }, error.TokenGrantRejected);
     try std.testing.expectEqualStrings(
         "The provider rejected the authorization. Start the sign-in again.",
@@ -5661,8 +4401,6 @@ test "a login the provider refused reads as a sentence, not an error name" {
         "The provider did not authorize Drinky. Start the sign-in again.",
         app.session.notice.?.content,
     );
-    // A refused device-code grant reads the same way, and a grant that ran out
-    // names the wait.
     try app.reportLoginFailure(.{ .account = .anthropic_plan }, error.AuthorizationDenied);
     try std.testing.expectEqualStrings(
         "The provider did not authorize Drinky. Start the sign-in again.",
@@ -5673,8 +4411,6 @@ test "a login the provider refused reads as a sentence, not an error name" {
         "Drinky stopped the sign-in because the authorization did not arrive in time.",
         app.session.notice.?.content,
     );
-    // A stale tab and a stale paste both deliver a redirect of an earlier
-    // sign-in, so the sentence names neither source.
     try app.reportLoginFailure(.{ .account = .anthropic_plan }, error.StateMismatch);
     try std.testing.expectEqualStrings(
         "The response belongs to another sign-in. Start the sign-in again.",
@@ -5688,7 +4424,6 @@ test "a login the provider refused reads as a sentence, not an error name" {
         "The provider credential service is not available. Try the sign-in again later.",
         app.session.notice.?.content,
     );
-    // A failure with no single cause still wraps its error name in a sentence.
     try app.reportLoginFailure(.{ .account = .anthropic_plan }, error.TokenRequestFailed);
     try std.testing.expectEqualStrings(
         "Drinky could not sign in because of error TokenRequestFailed.",
@@ -5737,24 +4472,15 @@ test "the input reader closes the key queue at the end of stdin" {
     app.initForTest(gpa);
     defer app.drainQueue();
 
-    // A pipe with a closed write end reports the end of its input, which is
-    // what stdin reports once the terminal behind it is gone. `Tty.read` maps
-    // that to an error, never to a zero-byte read, so the reader has one exit.
     const fds = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true });
     defer _ = std.posix.system.close(fds[0]);
     _ = std.posix.system.close(fds[1]);
     app.tty.io = io;
     app.tty.in_handle = fds[0];
 
-    // The race bounds the reader, so a reader that fails to stop reads as a
-    // failed test instead of a spin that never returns.
     const bounded = try ai.net.race(io, 2 * std.time.ms_per_s, readInput, .{&app});
     try bounded;
 
-    // A closed queue winds the main loop down. An open queue leaves the session
-    // waiting on a terminal that can never answer. A zero minimum makes the open
-    // queue return immediately. The `error.Closed` expectation then fails without
-    // a hang.
     var batch: [1]UiEvent = undefined;
     try std.testing.expectError(error.Closed, app.queue.get(io, &batch, 0));
 }
@@ -5793,12 +4519,8 @@ test "turn producers keep their captured generation" {
     try handler.onStreamReset(&retry);
     try handler.onSteering("steer", 1);
     try handler.onModelMismatch(.{ .requested = "claude-fable-5", .served = "claude-opus-5" });
-    // The same served model reports once per turn, so the repeat adds no event.
     try handler.onModelMismatch(.{ .requested = "claude-fable-5", .served = "claude-opus-5" });
-    // A served model that changes again reports again.
     try handler.onModelMismatch(.{ .requested = "claude-fable-5", .served = "claude-opus-4-8" });
-    // Signed out, so the turn fails at once. The wakeup is payload-free and the
-    // joined result owns the error text.
     const result = runTurnWorker(&app, try gpa.dupe(u8, "prompt"), generation);
     defer app.freeWorkerResult(&result);
     try std.testing.expectEqual(generation, result.generation);
@@ -5833,9 +4555,6 @@ test "turn producers keep their captured generation" {
     try std.testing.expect(events[events.len - 1].turn.payload == .turn_ended);
 }
 
-// Queue a plain-text (atom-free) steering draft directly on the mirror, a stand-in
-// for a message the worker already folded (so the channel no longer holds it).
-// Built through the real editor detach path the app uses.
 fn seedSteering(app: *App, text: []const u8) !void {
     try app.session.editor.insert(text);
     try app.session.reserveSteering();
@@ -5849,8 +4568,6 @@ const zero_receipt: ai.Agent.Receipt = .{
     .steering_committed_count = 0,
 };
 
-// A fake turn worker that returns a fixed result immediately, so a cancel test
-// drives the disposition-driven resolution without a real agent run.
 fn fakeWorker(result: *const WorkerResult) WorkerResult {
     return result.*;
 }
@@ -5862,8 +4579,6 @@ fn canceledWorker() WorkerResult {
     };
 }
 
-// A canceled worker whose turn committed a round, so the cancel path keeps the
-// committed transcript, shows the `canceled` line, and drops no returned prompt.
 fn committedCanceledWorker() WorkerResult {
     return .{
         .outcome = .{ .receipt = .{
@@ -5879,14 +4594,10 @@ fn endedPayload() Session.TurnEvent.Payload {
     return .turn_ended;
 }
 
-// Spawn a fake canceled worker (nothing committed) as the active turn, so the
-// cancel path restores every rich steering draft. Reaped by `cancelTurn`.
 fn spawnCanceledTurn(app: *App) !void {
     app.turn_future = try app.io.concurrent(canceledWorker, .{});
 }
 
-// Spawn a canceled worker whose turn committed a round, so the cancel path keeps
-// the committed transcript and shows the `canceled` line. Reaped by `cancelTurn`.
 fn spawnCommittedCanceledTurn(app: *App) !void {
     app.turn_future = try app.io.concurrent(committedCanceledWorker, .{});
 }
@@ -5951,8 +4662,6 @@ test "ctrl+c during a turn clears the draft first and cancels only on an empty e
     app.session.beginTurn(1);
     try spawnCanceledTurn(&app);
 
-    // A draft is steering the user still writes. The first press takes the text
-    // alone, so the turn keeps running.
     try app.session.editor.insert("keep the turn");
     try app.handleKey(&.{ .ctrl = 'c' });
     try std.testing.expectEqualStrings("", app.session.editor.visible());
@@ -5983,9 +4692,6 @@ test "esc and ctrl+d cancel a turn and keep the draft" {
     app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
 
-    // A cancel backs out of the turn alone: the draft stays, and Drinky runs on, so
-    // no press here can discard text. Esc with a draft warns first, so its cancel
-    // takes a second press. Ctrl+D is a decision and cancels at once.
     for ([_]terminal.Input.Key{ .escape, .{ .ctrl = 'd' } }) |key| {
         app.session.beginTurn(1);
         try spawnCanceledTurn(&app);
@@ -5994,7 +4700,6 @@ test "esc and ctrl+d cancel a turn and keep the draft" {
 
         try app.handleKey(&key);
         if (key == .escape) {
-            // The first Esc arms the confirmation and warns. The turn runs on.
             try std.testing.expect(app.session.mode == .turn);
             try std.testing.expect(app.session.notice != null);
             try app.handleKey(&key);
@@ -6031,8 +4736,6 @@ test "a key between two esc presses drops the turn-cancel confirmation" {
     try app.handleKey(&.escape);
     try std.testing.expect(app.session.mode == .turn);
     try std.testing.expect(app.session.confirmations.contains(.turn_cancel));
-    // The edit clears the warning and its one-shot confirmation, so the next Esc
-    // warns again instead of a cancel.
     try app.handleKey(&.{ .char = 'x' });
     try std.testing.expect(app.session.notice == null);
     try std.testing.expect(!app.session.confirmations.contains(.turn_cancel));
@@ -6062,7 +4765,6 @@ test "Esc dismisses a notice and leaves the turn running" {
     app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
 
-    // Tab during a turn states its restriction. Esc restores the status line.
     app.session.beginTurn(1);
     try spawnCanceledTurn(&app);
     try app.handleKey(&.tab);
@@ -6073,12 +4775,10 @@ test "Esc dismisses a notice and leaves the turn running" {
     try std.testing.expect(app.turn_future != null);
     try std.testing.expect(!app.session.confirmations.contains(.turn_cancel));
 
-    // The next Esc cancels, because the notice is gone and the editor is empty.
     try app.handleKey(&.escape);
     try std.testing.expect(app.session.mode == .prompt);
     try std.testing.expect(app.turn_future == null);
 
-    // A draft warns on Esc. A notice takes that press too.
     app.session.beginTurn(1);
     try spawnCanceledTurn(&app);
     try app.session.editor.insert("draft");
@@ -6090,7 +4790,6 @@ test "Esc dismisses a notice and leaves the turn running" {
     try std.testing.expect(!app.session.confirmations.contains(.turn_cancel));
     try std.testing.expectEqualStrings("draft", app.session.editor.visible());
 
-    // The next Esc warns. One more Esc cancels and keeps the draft.
     try app.handleKey(&.escape);
     try std.testing.expect(app.session.mode == .turn);
     try std.testing.expectEqualStrings(turn_cancel_notice, app.session.notice.?.content);
@@ -6115,8 +4814,6 @@ test "a key between two ctrl+d presses drops the quit confirmation" {
     try app.handleKey(&.{ .ctrl = 'd' });
     try std.testing.expect(app.running);
     try std.testing.expect(app.session.confirmations.contains(.quit));
-    // The edit clears the warning and its one-shot confirmation, so the next
-    // Ctrl+D warns again instead of a quit.
     try app.handleKey(&.{ .char = 'x' });
     try std.testing.expect(app.session.notice == null);
     try std.testing.expect(!app.session.confirmations.contains(.quit));
@@ -6184,10 +4881,6 @@ test "canceling a turn joins and clears its active worker" {
     try std.testing.expect(app.session.mode == .prompt);
 }
 
-// The race a cancel must survive: the worker folded a pasted message (channel
-// entry taken, `.steering_consumed` still queued, so only the mirror holds it)
-// while a newer message is pending in both. Everything returns to the editor
-// exactly once, and the queued usage comes again from the joined agent.
 test "canceling a turn restores in-flight steering and reads the usage again" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -6287,8 +4980,6 @@ test "cancel restores steering before event allocation failure" {
     defer app.session.deinit();
     app.session.beginTurn(1);
 
-    // A committed cancel appends the `canceled` event. Force the OOM there
-    // and confirm the steering is already restored, not lost to the failure.
     try app.session.editor.insert("restore me");
     try app.submitSteering();
     try spawnCommittedCanceledTurn(&app);
@@ -6309,10 +5000,6 @@ test "cancel restores steering before event allocation failure" {
     try std.testing.expectEqual(@as(usize, 0), taken.len);
 }
 
-// Regression: Ctrl+P appended the queued messages after the in-progress text,
-// so an older message followed a newer draft. Every automatic restore keeps
-// chronology, and the queue came before the draft, so the recall prepends the
-// queue in submission order and leaves the draft as the last message.
 test "ctrl+p recalls the steering queue before in-progress editor text" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -6338,11 +5025,9 @@ test "ctrl+p recalls the steering queue before in-progress editor text" {
     try app.submitSteering();
     try app.session.editor.insert("draft");
 
-    // Through the key binding, so the turn-mode route to the pull stays covered.
     try app.handleKey(&.{ .ctrl = 'p' });
     try std.testing.expectEqualStrings("fix it\n\nand test\n\ndraft", app.session.editor.visible());
     try std.testing.expectEqual(@as(usize, 0), app.session.steering.items.len);
-    // The caret lands at the end, so the user continues the draft.
     try std.testing.expectEqual(app.session.editor.visible().len, app.session.editor.caret);
 }
 
@@ -6365,7 +5050,7 @@ test "ctrl+p restores a steered paste as a live placeholder atom" {
     defer app.session.deinit();
     app.session.beginTurn(1);
 
-    const payload = "line\n" ** 15; // 16 logical lines: collapses to a marker
+    const payload = "line\n" ** 15;
     try app.session.editor.paste(payload, true);
     try app.submitSteering();
     try std.testing.expectEqual(@as(usize, 1), app.session.steering.items.len);
@@ -6382,9 +5067,6 @@ test "ctrl+p restores a steered paste as a live placeholder atom" {
     try std.testing.expectEqualStrings(payload, expanded);
 }
 
-// Cancel restores a worker-owned paste whose consumed event is still pending.
-// A later stale event cannot remove the restored atom, and payload-edge
-// whitespace survives because the draft is only literal-edge trimmed.
 test "cancel restores an in-flight steered paste as a live placeholder atom" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -6420,8 +5102,6 @@ test "cancel restores an in-flight steered paste as a live placeholder atom" {
     try std.testing.expectEqual(@as(usize, 1), app.session.editor.draft.atoms.items.len);
     try std.testing.expectEqual(@as(usize, 0), app.session.steering.items.len);
     try std.testing.expect(app.session.mode == .prompt);
-    // A stale consumed event after the turn ended dies at the generation
-    // gate and cannot disturb the restored atom.
     _ = try app.session.applyTurnEvent(&.{
         .generation = 1,
         .payload = .{ .steering_consumed = .{
@@ -6435,8 +5115,6 @@ test "cancel restores an in-flight steered paste as a live placeholder atom" {
     try std.testing.expectEqualStrings(payload, expanded);
 }
 
-// A consumed event retains the rich draft, so a rolled-back batch is recoverable
-// even after the event has applied.
 test "cancel restores a steered paste even after its consumed event applied" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -6473,14 +5151,11 @@ test "cancel restores a steered paste even after its consumed event applied" {
         } },
     });
 
-    // The consumed event hides the row but retains the rich draft.
     try std.testing.expectEqual(@as(usize, 1), app.session.steering.items.len);
     try std.testing.expectEqual(@as(usize, 1), app.session.steering_retained_count);
 
     try spawnCanceledTurn(&app);
     try app.cancelTurn();
-    // Nothing committed, so the uncommitted-consumed batch's rich draft returns
-    // to the editor intact and its optimistic transcript block disappears.
     try std.testing.expectEqual(@as(usize, 1), app.session.editor.draft.atoms.items.len);
     try std.testing.expectEqual(@as(usize, 0), app.session.steering.items.len);
     const expanded = try app.session.editor.expanded(.none);
@@ -6489,8 +5164,6 @@ test "cancel restores a steered paste even after its consumed event applied" {
     try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
 }
 
-// Ctrl+P recalls only the pending suffix. The already folded prefix stays rich
-// but hidden until its consumed event applies or failed delivery requeues it.
 test "ctrl+p recalls the pending suffix and retains the in-flight prefix" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -6510,9 +5183,7 @@ test "ctrl+p recalls the pending suffix and retains the in-flight prefix" {
     defer app.session.deinit();
     app.session.beginTurn(1);
 
-    // "folded": the worker took it, so only the mirror holds it (in-flight prefix).
     try seedSteering(&app, "folded");
-    // "pending": still queued in both the channel and the mirror.
     try app.session.editor.insert("pending");
     try app.submitSteering();
     try std.testing.expectEqual(@as(usize, 2), app.session.steering.items.len);
@@ -6555,8 +5226,6 @@ test "cancel restores an in-flight prefix retained by ctrl+p" {
     try std.testing.expect(app.session.mode == .prompt);
 }
 
-// A worker that completed before cancellation shows as its completion,
-// but only after the terminal fence has preserved all earlier queue progress.
 test "a cancel that loses the race waits for the terminal fence" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -6671,9 +5340,6 @@ test "cancel does not commit stale text across a reset held in the current batch
     );
 }
 
-// Cancellation can join a worker before the consumer reaches progress that the
-// worker queued ahead of its terminal fence. The joined result waits at the App
-// boundary so the whole prefix applies once before the turn ends.
 test "cancel preserves progress before a queued terminal fence" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -6733,8 +5399,6 @@ test "cancel preserves progress before a queued terminal fence" {
     try std.testing.expectEqualStrings("folded", blocks[1].content.user.items);
 }
 
-// The same ordering holds when cancellation interrupts the worker's terminal
-// enqueue: the consumer appends a replacement fence behind the queued prefix.
 test "cancel replaces an interrupted terminal fence after queued progress" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -6802,9 +5466,6 @@ test "cancel replaces an interrupted terminal fence after queued progress" {
     try std.testing.expectEqual(@as(usize, 2), app.session.transcript.blocks().len);
 }
 
-// A full queue cannot deadlock the consumer while it inserts a replacement. The
-// pending result remains live until a later drain opens one slot behind the
-// already-buffered prefix.
 test "an interrupted terminal fence retries after a full queue drain" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -6867,8 +5528,6 @@ test "an interrupted terminal fence retries after a full queue drain" {
     );
 }
 
-// A cancel that loses to a failed worker applies the authoritative joined
-// result and frees its error text once.
 test "a cancel that loses the race applies the failed joined result" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -6908,8 +5567,6 @@ test "a cancel that loses the race applies the failed joined result" {
     try std.testing.expectEqual(events.len, count);
     try std.testing.expect(!try app.applyBatch(events[0..count]));
 
-    // The joined failure rewinds the optimistic prompt, restores all authored
-    // text, and clears the agent's plain steering copy before the turn ends.
     try std.testing.expect(app.session.mode == .prompt);
     try std.testing.expectEqualStrings("prompt\n\nsteer", app.session.editor.visible());
     const remaining_steering = try app.agent.steering.take();
@@ -6963,11 +5620,6 @@ test "a joined completion returns late steering to the editor" {
     try std.testing.expectEqual(events.len, count);
     try std.testing.expect(!try app.applyBatch(events[0..count]));
 
-    // The replacement terminal fence returns pending steering to the editor
-    // before the consumer can take a newer queue event. No turn starts, so the
-    // user reviews the reply before the text sends. The recall is automatic, so
-    // the older steering composes above the newer in-progress line, and a
-    // notice announces the return.
     try std.testing.expect(app.session.mode == .prompt);
     try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
     try std.testing.expectEqualStrings("older\n\ndraft", app.session.editor.visible());
@@ -6981,8 +5633,6 @@ test "a joined completion returns late steering to the editor" {
     try std.testing.expectEqual(@as(usize, 0), remaining.len);
 }
 
-// Shutdown is teardown, not an interactive cancel: it frees the worker result and
-// mutates neither the editor nor the transcript.
 test "shutdown frees the worker result without restoring or recording an event" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -7010,7 +5660,6 @@ test "shutdown frees the worker result without restoring or recording an event" 
     app.turn_future = try io.concurrent(fakeWorker, .{&worker_result});
 
     app.shutdownTasks();
-    // No editor restore, no cancellation event. Shutdown freed the owned text once.
     try std.testing.expectEqualStrings("", app.session.editor.visible());
     try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
     try std.testing.expect(app.turn_future == null);
@@ -7041,7 +5690,6 @@ test "a delayed consumed event after ctrl+p cannot remove newer steering" {
     for (folded) |message| gpa.free(message);
     gpa.free(folded);
 
-    // The worker owns "old", but its consumed event has not reached the UI.
     try app.pullSteering();
     try std.testing.expectEqual(@as(usize, 1), app.session.steering.items.len);
     try std.testing.expectEqual(@as(usize, 1), app.session.steering_retained_count);
@@ -7055,8 +5703,6 @@ test "a delayed consumed event after ctrl+p cannot remove newer steering" {
             .count = 1,
         } },
     });
-    // The delayed consume marks "old" (already hidden by ctrl+p) consumed. It does
-    // not hide the newer pending "new", which stays visible behind the hidden prefix.
     try std.testing.expectEqual(@as(usize, 1), app.session.steering_retained_count);
     try std.testing.expectEqual(@as(usize, 2), app.session.steering.items.len);
     try std.testing.expectEqualStrings(
@@ -7097,14 +5743,11 @@ test "a delivery restored after ctrl+p recalls its retained rich drafts" {
         gpa.free(delivery);
     }
 
-    // The first recall sees the batch as in flight and retains its rich drafts.
     try app.pullSteering();
     try std.testing.expectEqual(@as(usize, 2), app.session.steering.items.len);
     try std.testing.expectEqual(@as(usize, 2), app.session.steering_retained_count);
     try std.testing.expectEqualStrings("", app.session.editor.visible());
 
-    // Failed delivery returns the plain batch. A later recall selects the
-    // matching retained suffix and moves it back live.
     app.agent.steering.restoreTaken(&delivery);
     try app.pullSteering();
     try std.testing.expectEqual(@as(usize, 0), app.session.steering.items.len);
@@ -7112,8 +5755,6 @@ test "a delivery restored after ctrl+p recalls its retained rich drafts" {
     try std.testing.expectEqualStrings("a\n\nb", app.session.editor.visible());
 }
 
-// Literal-edge canonicalization: separately submitted " a " and " b " recall and
-// rejoin as "a\n\nb". The trimmed edge spaces never return.
 test "recall of literal-edge-trimmed steering rejoins without edge spaces" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -7141,9 +5782,6 @@ test "recall of literal-edge-trimmed steering rejoins without edge spaces" {
     try std.testing.expectEqualStrings("a\n\nb", app.session.editor.visible());
 }
 
-// A slash command cannot run mid-turn. Enter must leave the whole line in the
-// editor, report the restriction, and never queue the line as prompt text for the
-// model. A line with no leading slash is a message and must queue.
 test "mid-turn Enter queues a message but refuses a slash line or a blank line" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -7166,8 +5804,6 @@ test "mid-turn Enter queues a message but refuses a slash line or a blank line" 
     try app.session.editor.insert("/model");
     try app.submitSteering();
     try std.testing.expectEqualStrings("/model", app.session.editor.visible());
-    // The refusal names the command and the restriction. It warns, because the
-    // line is complete, and the next Enter runs it once the turn ends.
     try std.testing.expectEqualStrings(
         "The command /model cannot run while a turn runs.",
         app.session.notice.?.content,
@@ -7182,9 +5818,6 @@ test "mid-turn Enter queues a message but refuses a slash line or a blank line" 
     try app.submitSteering();
     try std.testing.expectEqualStrings("   ", app.session.editor.visible());
 
-    // A slash line with a tail is a command line too, so it never becomes steering.
-    // The registry reason wins over the turn, because the tail keeps the line
-    // unrunnable after the turn ends. Such a refusal offers the queue instead.
     app.session.editor.clear();
     try app.session.editor.insert("/model names the account too");
     try app.submitSteering();
@@ -7201,8 +5834,6 @@ test "mid-turn Enter queues a message but refuses a slash line or a blank line" 
         app.session.notice.?.severity,
     );
 
-    // An unknown name mid-turn keeps the registry reason too. `handleKey` drops the
-    // arm of the line above on every key that is not an Enter, so drop it here too.
     app.session.cancelConfirmation(.message);
     app.session.editor.clear();
     try app.session.editor.insert("/nope");
@@ -7217,10 +5848,8 @@ test "mid-turn Enter queues a message but refuses a slash line or a blank line" 
     const blocked = try app.agent.steering.take();
     defer gpa.free(blocked);
     try std.testing.expectEqual(@as(usize, 0), blocked.len);
-    // The arm is one-shot and belongs to this line alone, so the next key drops it.
     app.session.cancelConfirmation(.message);
 
-    // A message keeps the steering path.
     app.session.editor.clear();
     try app.session.editor.insert("the account matters too");
     try app.submitSteering();
@@ -7234,15 +5863,9 @@ test "mid-turn Enter queues a message but refuses a slash line or a blank line" 
     try std.testing.expectEqualStrings("the account matters too", taken[0]);
 }
 
-/// The status answer of the test app: no place, because the test names no
-/// directory, then the numbers and the agent of its signed-in session.
 const test_status_line = "Context: 0% (0/1.0M) · Cost: ~$0.00 · " ++
     "Model: anthropic-plan/claude-opus-5 · Effort: low";
 
-// The status answer reads the snapshot of the session and opens no picker, so it
-// is the one command that a turn hosts. Its event stays in the terminal, because
-// a chat asks with a line of its own, and every request takes a line of its own,
-// because each one states its own moment.
 test "/status records one terminal event for each request, also during a turn" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -7262,8 +5885,6 @@ test "/status records one terminal event for each request, also during a turn" {
     app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
 
-    // At the prompt the command runs like every other one: it clears the
-    // editor and records its answer, which no mirror sends.
     try app.handleKeys("/status\r");
     try std.testing.expect(app.session.mode == .prompt);
     try std.testing.expectEqualStrings("", app.session.editor.visible());
@@ -7274,13 +5895,10 @@ test "/status records one terminal event for each request, also during a turn" {
     try std.testing.expect(!first.mirrored);
     try std.testing.expect(first.survives_rewind);
 
-    // A second request appends a line of its own, with no fold into a count.
     try app.handleKeys("/status\r");
     try std.testing.expectEqual(@as(usize, 2), app.session.transcript.blocks().len);
     try std.testing.expectEqualStrings(test_status_line, app.lastEventText());
 
-    // During a turn every other command waits, and the status runs. It leaves
-    // the turn, the queue, and the waiting retry as they stand.
     app.session.beginTurn(1);
     app.retry = .{ .failure = try gpa.dupe(u8, "an older failure") };
     defer app.dropRetry();
@@ -7301,7 +5919,6 @@ test "/status records one terminal event for each request, also during a turn" {
     const queued = try app.agent.steering.take();
     defer gpa.free(queued);
     try std.testing.expectEqual(@as(usize, 0), queued.len);
-    // The registry keeps its own rules: a tail refuses and offers the queue.
     try app.handleKeys("/status now\r");
     try std.testing.expectEqualStrings("/status now", app.session.editor.visible());
     try std.testing.expectEqualStrings(
@@ -7311,10 +5928,6 @@ test "/status records one terminal event for each request, also during a turn" {
     try std.testing.expectEqual(@as(usize, 3), app.session.transcript.blocks().len);
 }
 
-// A request during a streamed reply captures the state at once, and its event
-// waits for the next message boundary, so the reply stays one block. The event
-// reports the session and not the turn, so a failed turn keeps it while the
-// reply rewinds.
 test "a terminal status event neither splits a streamed reply nor disappears after a failed turn" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -7356,8 +5969,6 @@ test "a terminal status event neither splits a streamed reply nor disappears aft
         app.session.transcript.blocks()[0].content.model.items,
     );
 
-    // The turn fails before a commit: the reply rewinds, the failure lands, and
-    // the status event lands behind it.
     var result: WorkerResult = .{
         .outcome = .{ .receipt = zero_receipt, .disposition = .{ .failed = error.ApiError } },
         .error_text = try gpa.dupe(u8, "The provider refused the request."),
@@ -7415,8 +6026,6 @@ test "late placeholder steering returns before a newer key in the same batch" {
     };
     try std.testing.expect(!try app.applyBatch(&events));
 
-    // The fence returns the paste to the editor first, so the newer key lands
-    // behind it in the same draft instead of an already gone steering queue.
     try std.testing.expect(app.session.mode == .prompt);
     try std.testing.expectEqual(@as(usize, 0), app.session.steering.items.len);
     try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
@@ -7426,9 +6035,6 @@ test "late placeholder steering returns before a newer key in the same batch" {
     try std.testing.expectEqualStrings(payload ++ "new", expanded);
 }
 
-// The lifecycle calls model cancellation and resubmission key entries from a
-// batch App already drained. The remaining entries use the real outer queue union
-// and batch dispatcher.
 test "a drained batch routes only the active turn generation" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -7484,8 +6090,6 @@ test "a drained batch routes only the active turn generation" {
     );
 }
 
-// A resize marks the model dirty with no tick, so even an idle interface
-// reflows on the next frame.
 test "a resize event marks an idle interface dirty" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -7546,22 +6150,18 @@ test "a legacy escape byte closes a page after its wait" {
     defer app.session.deinit();
     try app.session.openPage(&.{ .title = "Test page", .content = "body" });
 
-    // A terminal without the Kitty protocol sends this one byte. It can still
-    // start a longer sequence, so the page stays open while the wait runs.
     try app.handleKeys("\x1b");
     try std.testing.expect(app.session.mode == .viewing);
     try std.testing.expect(app.escape_deadline_ms != null);
     try app.flushEscape();
     try std.testing.expect(app.session.mode == .viewing);
 
-    // The wait passes with no more bytes, so the byte is the Escape key.
     app.escape_deadline_ms = app.nowMs() - 1;
     try app.flushEscape();
     try std.testing.expect(app.session.mode == .prompt);
     try std.testing.expect(app.escape_deadline_ms == null);
     try std.testing.expect(app.running);
 
-    // The bytes of a real sequence end the wait instead.
     try app.handleKeys("\x1b");
     try std.testing.expect(app.escape_deadline_ms != null);
     try app.handleKeys("[A");
@@ -7574,9 +6174,6 @@ test "a page close drops the rest of an exit attempt in one chunk" {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
 
-    // A terminal without the Kitty protocol sends Esc as one byte, so an exit
-    // attempt can land as `\x1b\x03` or `\x1b\x04` in one chunk. The Escape
-    // closes the page, and the control key behind it must not reach the prompt.
     for ([_][]const u8{ "\x1b\x03", "\x1b\x04" }) |chunk| {
         var app: App = undefined;
         app.initForTest(gpa);
@@ -7588,8 +6185,6 @@ test "a page close drops the rest of an exit attempt in one chunk" {
 
         try app.handleKeys(chunk);
         try std.testing.expect(app.session.mode == .prompt);
-        // Ctrl+D did not quit, Ctrl+C left the draft the page hid, and neither
-        // armed the double-press quit window.
         try std.testing.expect(app.running);
         try std.testing.expectEqualStrings("draft", app.session.editor.visible());
         try std.testing.expectEqual(@as(i64, -ctrl_c_window_ms), app.ctrl_c_ms_last);
@@ -7606,8 +6201,6 @@ test "a picker confirmation keeps the characters typed behind it" {
     var app: App = undefined;
     app.initForTest(gpa);
     defer app.input.deinit();
-    // The confirmation mirrors the agent state into the session, so the agent must
-    // be real. A signed-out one records no project state.
     app.agent = ai.Agent.init(gpa, io, null, .{
         .model = test_anthropic_model,
         .system = "",
@@ -7635,9 +6228,6 @@ test "a picker confirmation keeps the characters typed behind it" {
         .current = null,
     } });
 
-    // Enter confirms and returns to the prompt, but it is no exit attempt. The
-    // fast typing behind it must land in the editor, as it does when the terminal
-    // splits the same keystrokes across two reads.
     try app.handleKeys("\rhi");
     try std.testing.expect(app.session.mode == .prompt);
     try std.testing.expectEqualStrings("hi", app.session.editor.visible());
@@ -7665,8 +6255,6 @@ test "a turn cancel drops the rest of an exit attempt in one chunk" {
     app.session.beginTurn(1);
     try spawnCanceledTurn(&app);
 
-    // The Escape cancels the turn. The Ctrl+D behind it must not quit Drinky at the
-    // prompt the cancel returns to.
     try app.handleKeys("\x1b\x04");
     try std.testing.expect(app.session.mode == .prompt);
     try std.testing.expect(app.turn_future == null);
@@ -7683,8 +6271,6 @@ test "ctrl+c clears then quits within the window and a draft makes ctrl+d ask tw
     app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
 
-    // The first Ctrl+D with a draft warns instead of a quit, and the warning
-    // offers the second press. That press quits and keeps nothing waiting.
     try app.session.editor.insert("draft");
     try app.handleKey(&.{ .ctrl = 'd' });
     try std.testing.expect(app.running);
@@ -7694,7 +6280,6 @@ test "ctrl+c clears then quits within the window and a draft makes ctrl+d ask tw
     try app.handleKey(&.{ .ctrl = 'd' });
     try std.testing.expect(!app.running);
 
-    // Arm again, or the window test below proves nothing.
     app.running = true;
     try app.handleKey(&.{ .ctrl = 'c' });
     try std.testing.expectEqualStrings("", app.session.editor.visible());
@@ -7702,15 +6287,11 @@ test "ctrl+c clears then quits within the window and a draft makes ctrl+d ask tw
     try app.handleKey(&.{ .ctrl = 'c' });
     try std.testing.expect(!app.running);
 
-    // Arm again, or the quit below proves nothing.
     app.running = true;
     try app.handleKey(&.{ .ctrl = 'd' });
     try std.testing.expect(!app.running);
 }
 
-// Drinky compiles no model in, so a signed-in account with no fetched list can
-// send nothing. The refusal names the command that fixes it, the line stays out
-// of the transcript, and the editor keeps it.
 test "a send refuses while the account offers no model" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -7740,9 +6321,6 @@ test "a send refuses while the account offers no model" {
     try std.testing.expectEqualStrings(no_model_refusal, app.session.notice.?.content);
 }
 
-// A refusal starts no turn, so the text the user typed must survive it. The
-// user reads the notice, signs in or picks a model, and sends the same line
-// again. A skill line meets the same two gates, so it keeps its text too.
 test "a refused send keeps the typed text" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -7805,14 +6383,11 @@ test "/new clears the conversation and the scrollback without a configuration ch
     try app.session.transcript.append(.user, .{}, "old prompt");
     app.session.stats_shown = seeded;
     try seedSteering(&app, "old steering");
-    // Paint the old conversation first, so its frame holds the screen.
     try app.session.paint(.{ .columns = 80, .rows = 6 });
 
     try app.session.editor.insert("/new");
     try app.submit();
 
-    // The empty conversation must start on a clean screen. The paint clears the
-    // visible rows and drops the scrollback with them.
     const clear_start = out.written().len;
     try app.session.paint(.{ .columns = 80, .rows = 6 });
     const clear_bytes = out.written()[clear_start..];
@@ -7825,7 +6400,6 @@ test "/new clears the conversation and the scrollback without a configuration ch
     const steering = try app.agent.steering.take();
     defer gpa.free(steering);
     try std.testing.expectEqual(@as(usize, 0), steering.len);
-    // The intro line returns, so the empty conversation shows its legend again.
     try std.testing.expectEqual(@as(usize, 1), app.session.transcript.blocks().len);
     try std.testing.expectEqualStrings(
         intro_text,
@@ -7838,9 +6412,6 @@ test "/new clears the conversation and the scrollback without a configuration ch
     try std.testing.expectEqual(ai.llm.Effort.high, app.agent.effort);
 }
 
-// The skill guard proof memo is only true for the history it was proven
-// against, so a `/new` that leaves a stale memo behind could let the empty
-// history skip a proof it never earned.
 test "/new forgets the skill proof of the conversation it clears" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -7866,15 +6437,11 @@ test "/new forgets the skill proof of the conversation it clears" {
         .skill = "demo",
         .source = "/skills/demo/SKILL.md",
     });
-    // The conversation already proved the rule, so a write in it needs no read
-    // of its own.
     app.skill_guard.rule_items[0].loaded.store(true, .monotonic);
     try std.testing.expect(app.skill_guard.rule_items[0].loaded.load(.monotonic));
 
     try app.applyOutcome(.new_conversation);
 
-    // The empty history never proved the rule, so the memo must not survive
-    // into it.
     try std.testing.expect(!app.skill_guard.rule_items[0].loaded.load(.monotonic));
 }
 
@@ -7939,8 +6506,6 @@ test "/system opens the composed prompt alone and escape restores the conversati
     try std.testing.expect(app.session.mode == .prompt);
     try std.testing.expectEqual(@as(usize, 1), app.session.transcript.blocks().len);
 
-    // Reopen before a refresh can leave the old alternate screen. The new page
-    // must still clear and home that screen before the paint.
     try app.session.editor.insert("/system");
     try app.submit();
     const reopen_start = out.written().len;
@@ -7950,7 +6515,6 @@ test "/system opens the composed prompt alone and escape restores the conversati
     try std.testing.expect(std.mem.indexOf(u8, reopen_bytes, "M: Source") != null);
     try std.testing.expect(std.mem.indexOf(u8, reopen_bytes, "Core") != null);
     try std.testing.expect(std.mem.indexOf(u8, reopen_bytes, "# Core") == null);
-    // Ctrl+C closes a page and keeps Drinky running. A page holds no draft to clear.
     try app.handleKey(&.{ .ctrl = 'c' });
     try std.testing.expect(app.session.mode == .prompt);
     try std.testing.expect(app.running);
@@ -7962,8 +6526,6 @@ test "/system opens the composed prompt alone and escape restores the conversati
     try std.testing.expect(std.mem.indexOf(u8, conversation_bytes, "System prompt") == null);
 }
 
-// Ctrl+D closes a page and keeps Drinky running, so a terminal that drops the
-// Esc report still has a way out.
 test "ctrl+d closes a page and restores the conversation" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -8041,7 +6603,6 @@ test "an account-switch command clears the quota snapshot and records the projec
     try std.testing.expectEqualStrings(test_openai_model.name(), app.session.model_shown.?.name());
     try std.testing.expectEqual(ai.llm.Account.openai_api_key, app.session.account_shown.?);
 
-    // The switch also lands in `state.json`, so the next start resumes on it.
     var file = (try ai.json_store.open(gpa, io, app.state.path)).?;
     defer file.deinit();
     const entry = file.entry("/work").?;
@@ -8052,17 +6613,12 @@ test "an account-switch command clears the quota snapshot and records the projec
         test_openai_model.name(),
         listed.get("openai-api-key").?.string,
     );
-    // The account left behind keeps the model it ran, so a switch back returns
-    // to it even after a restart.
     try std.testing.expectEqualStrings(
         test_anthropic_model.name(),
         listed.get("anthropic-plan").?.string,
     );
 }
 
-// The command path that switches the account also projects the conversation for
-// it: the canonical history and transcript keep every item, and the interface
-// shows what the next request carries.
 test "an account switch projects the conversation for the new account" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -8077,8 +6633,6 @@ test "an account switch projects the conversation for the new account" {
     );
     var app: App = undefined;
     app.initForTest(gpa);
-    // The effort names a thinking control, so the request of this account replays
-    // its stored reasoning.
     app.agent = ai.Agent.init(gpa, io, anthropic_client, .{
         .model = test_anthropic_model,
         .system = "",
@@ -8106,8 +6660,6 @@ test "an account switch projects the conversation for the new account" {
         try ai.command.Outcome.reportEvent(gpa, .information, "switched", .{}),
     );
 
-    // The OpenAI request replays no Anthropic proof, so the reasoning block
-    // leaves the screen. Both records keep it for the switch back.
     try std.testing.expectEqual(@as(usize, 1), app.agent.items.items.len);
     try std.testing.expectEqual(@as(usize, 3), app.session.transcript.blocks().len);
     try std.testing.expect(app.session.view.force_reset);
@@ -8119,14 +6671,6 @@ test "an account switch projects the conversation for the new account" {
     try std.testing.expect(std.mem.indexOf(u8, switched, "switched") != null);
 }
 
-// Regression: the evidence removal moved the mirror cursor back by every
-// dropped block, also by a block above the cursor. The blocks below the cursor
-// then went out to the chat a second time. Only a dropped block below the
-// cursor moves a block that the chat holds, so only that count retreats.
-//
-// No ordinary sequence leaves the cursor below a dropped block: `open` starts at
-// the committed frontier, and `flush` advances the cursor before it sends. The
-// test sets the lag itself.
 test "account evidence removal retreats the mirror only over dropped blocks below the cursor" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -8146,8 +6690,6 @@ test "account evidence removal retreats the mirror only over dropped blocks belo
     defer app.session.deinit();
     app.session.showSetup(.anthropic_plan, test_anthropic_model, .high);
 
-    // The chat holds the answer and the event. The reasoning of one account
-    // stands below the answer, and another run of it stands above the cursor.
     try app.session.transcript.appendStream(.thinking, .anthropic_plan, "weigh it");
     try app.session.transcript.appendStream(.model, null, "the answer");
     try app.session.transcript.append(.event, .{}, "You attached @bot.");
@@ -8156,14 +6698,9 @@ test "account evidence removal retreats the mirror only over dropped blocks belo
 
     app.dropAccountEvidence(.anthropic_plan);
 
-    // Only the block below the cursor moves the answer and the event up, so
-    // the cursor follows them by one and no block goes out again.
     try std.testing.expectEqual(@as(usize, 2), app.session.transcript.blocks().len);
     try std.testing.expectEqual(@as(usize, 2), app.mirror.cursor);
 
-    // A cursor above the block count clamps instead of indexing past the list.
-    // The clamped cursor stands above the one dropped block, so the cursor moves
-    // back by one, and the flush clamps it to the list at the next step.
     try app.session.transcript.appendStream(.thinking, .anthropic_plan, "once more");
     app.mirror.cursor = 9;
     app.dropAccountEvidence(.anthropic_plan);
@@ -8199,14 +6736,9 @@ test "startup resumes on the account, model, and effort level this project used 
     });
     defer app.state.deinit();
 
-    // The remembered account wins over the first authenticated one, which is the
-    // Anthropic key here.
     try std.testing.expectEqual(ai.llm.Account.openai_api_key, app.startAccount().?);
     try std.testing.expectEqualStrings("gpt-5.6-luna", app.accountModel(.openai_api_key).?.name());
-    // A remembered model belongs to the account that ran it. An account that
-    // remembered none starts without one.
     try std.testing.expect(app.accountModel(.anthropic_api_key) == null);
-    // The remembered effort level outranks a configured default.
     try std.testing.expectEqual(ai.llm.Effort.low, app.startEffort(.max));
 }
 
@@ -8217,7 +6749,6 @@ test "a signed-out remembered account falls back and the defaults fill the rest"
     defer tmp.cleanup();
     const home = try tmpPath(gpa, io, &tmp, "");
     defer gpa.free(home);
-    // The file names an account with no credentials and no effort level.
     try State.writeForTest(io, &tmp,
         \\{ "/work": { "account": "openai-api-key",
         \\    "models": { "openai-api-key": "gpt-5.6-luna" } } }
@@ -8236,14 +6767,8 @@ test "a signed-out remembered account falls back and the defaults fill the rest"
     defer app.state.deinit();
 
     try std.testing.expectEqual(ai.llm.Account.anthropic_api_key, app.startAccount().?);
-    // The remembered account offers no model here, so the session starts on none
-    // and the user fetches a list.
     try std.testing.expect(app.accountModel(.anthropic_api_key) == null);
-    // The memory holds for the account that ran the model, even while that
-    // account has no credentials. A later login therefore restores the model and
-    // does not reset to the account's default.
     try std.testing.expectEqualStrings("gpt-5.6-luna", app.accountModel(.openai_api_key).?.name());
-    // With nothing remembered, the configured effort wins, else the compiled one.
     try std.testing.expectEqual(ai.llm.Effort.medium, app.startEffort(.medium));
     try std.testing.expectEqual(effort_default, app.startEffort(null));
 }
@@ -8257,7 +6782,6 @@ test "a switch back to an account restores the model that account ran" {
     defer tmp.cleanup();
     const home = try tmpPath(gpa, io, &tmp, "");
     defer gpa.free(home);
-    // The project last ran one model under the `anthropic-api-key` account.
     try State.writeForTest(io, &tmp,
         \\{ "/work": { "account": "anthropic-api-key", "effort": "low",
         \\    "models": { "anthropic-api-key": "claude-sonnet-5" } } }
@@ -8292,30 +6816,21 @@ test "a switch back to an account restores the model that account ran" {
     defer app.session.deinit();
     try app.state.seed(.anthropic_api_key, start_model, .low);
 
-    // Away to another account: that account has run nothing here, so it starts
-    // without a model until the user picks one.
     try app.applyOutcome(.{ .switch_account = .openai_api_key });
     try std.testing.expect(app.agent.model == null);
 
-    // Back again. The model the account ran returns.
     try app.applyOutcome(.{ .switch_account = .anthropic_api_key });
     try app.expectModel("claude-sonnet-5");
 
-    // Both models reach the file, so the next start knows them both.
     var file = (try ai.json_store.open(gpa, io, app.state.path)).?;
     defer file.deinit();
     const entry = file.entry("/work").?;
     try std.testing.expectEqualStrings("anthropic-api-key", entry.get("account").?.string);
     const listed = entry.get("models").?.object;
     try std.testing.expectEqualStrings("claude-sonnet-5", listed.get("anthropic-api-key").?.string);
-    // The account that ran no model here names none in the file.
     try std.testing.expect(listed.get("openai-api-key") == null);
 }
 
-// The model memory of a project and the model cache of the machine live in two
-// files. A project therefore starts with no remembered model while the list of
-// that account stands cached. The step then names the pick, because a fetch
-// returns the same list.
 test "a transition names the pick where the list of the account stands cached" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -8325,8 +6840,6 @@ test "a transition names the pick where the list of the account stands cached" {
     defer tmp.cleanup();
     const home = try tmpPath(gpa, io, &tmp, "");
     defer gpa.free(home);
-    // The project ran one model under the `anthropic-api-key` account, and none under
-    // the `openai-api-key` account.
     try State.writeForTest(io, &tmp,
         \\{ "/work": { "account": "anthropic-api-key", "effort": "low",
         \\    "models": { "anthropic-api-key": "claude-sonnet-5" } } }
@@ -8358,7 +6871,6 @@ test "a transition names the pick where the list of the account stands cached" {
     app.session = Session.init(gpa, &out.writer, start_model, .low);
     defer app.session.deinit();
 
-    // No fetch ran for the `openai-api-key` account, so the step names the fetch.
     try app.applyOutcome(.{ .switch_account = .openai_api_key });
     try std.testing.expect(app.agent.model == null);
     try std.testing.expectEqualStrings(
@@ -8366,8 +6878,6 @@ test "a transition names the pick where the list of the account stands cached" {
         app.session.transcript.blocks()[0].content.event.text.items,
     );
 
-    // The machine caches that list now, and this project still remembers no
-    // model of that account.
     try ai.testing.seedAccount(&app.accounts, .openai_api_key, &.{"gpt-5.6-sol"});
     try app.applyOutcome(.{ .switch_account = .anthropic_api_key });
     try app.expectModel("claude-sonnet-5");
@@ -8381,9 +6891,6 @@ test "a transition names the pick where the list of the account stands cached" {
     );
 }
 
-// A logout, a replaced credential, and a start before the first fetch each leave
-// the catalog without the list of an account. The name that account ran must
-// survive the next save, so a later fetch returns the account to that model.
 test "a model name the catalog cannot resolve stays in the file" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -8406,8 +6913,6 @@ test "a model name the catalog cannot resolve stays in the file" {
         .openai = "sk-openai",
     });
     defer app.accounts.deinit();
-    // The catalog holds no list for the `anthropic-api-key` account, so the stored
-    // name resolves to no model.
     try ai.testing.seedAccount(&app.accounts, .openai_api_key, &.{"gpt-5.6-sol"});
     app.state = try State.open(gpa, io, &.{
         .working_directory = home,
@@ -8428,7 +6933,6 @@ test "a model name the catalog cannot resolve stays in the file" {
     defer app.session.deinit();
     try app.state.seed(.anthropic_api_key, null, .low);
 
-    // The switch writes the whole entry. The unresolved name stays in it.
     try app.applyOutcome(.{ .switch_account = .openai_api_key });
     var file = (try ai.json_store.open(gpa, io, app.state.path)).?;
     defer file.deinit();
@@ -8436,7 +6940,6 @@ test "a model name the catalog cannot resolve stays in the file" {
     try std.testing.expectEqualStrings("claude-sonnet-5", listed.get("anthropic-api-key").?.string);
     try std.testing.expectEqualStrings("gpt-5.6-sol", listed.get("openai-api-key").?.string);
 
-    // A fetch of that list returns the account to the model it ran.
     try ai.testing.seedAccount(&app.accounts, .anthropic_api_key, &.{"claude-sonnet-5"});
     try std.testing.expectEqualStrings(
         "claude-sonnet-5",
@@ -8467,14 +6970,10 @@ test "a remembered account does not resume when no account is authenticated" {
     });
     defer app.state.deinit();
 
-    // Startup then runs signed out and opens the login picker.
     try std.testing.expect(app.state.start.account != null);
     try std.testing.expect(app.startAccount() == null);
 }
 
-// The logout of the last account leaves no one to adopt. Drinky must sign out and
-// open the login picker itself, so the session never rests signed out with no way
-// back in.
 test "the logout of the last account signs out and opens the login picker" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -8485,7 +6984,6 @@ test "the logout of the last account signs out and opens the login picker" {
     const home = try tmpPath(gpa, io, &tmp, "");
     defer gpa.free(home);
 
-    // One signed-in subscription and no environment key: the only account there is.
     var store = try tmp.dir.createDirPathOpen(io, ".drinky", .{});
     store.close(io);
     try tmp.dir.writeFile(io, .{
@@ -8513,12 +7011,10 @@ test "the logout of the last account signs out and opens the login picker" {
 
     try app.applyOutcome(.{ .logout = .anthropic_plan });
 
-    // The credential is gone and no account remains to adopt.
     try std.testing.expect(!app.accounts.isAuthenticated(.anthropic_plan));
     try std.testing.expect(app.agent.client == null);
     try std.testing.expect(app.session.account_shown == null);
 
-    // The event names the way back in, and the picker it names is open.
     try std.testing.expectEqualStrings(
         "Drinky signed out of anthropic-plan. Select an account to sign in.",
         app.session.transcript.blocks()[0].content.event.text.items,
@@ -8530,8 +7026,6 @@ test "the logout of the last account signs out and opens the login picker" {
     try std.testing.expectEqualStrings("anthropic-plan", picker.options[0].name);
 }
 
-// The next account can offer no model, because no fetch ran for it. The logout
-// must report that state instead of unwrapping a model that is not there.
 test "the logout of the active account adopts a next account with no model" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -8542,8 +7036,6 @@ test "the logout of the active account adopts a next account with no model" {
     const home = try tmpPath(gpa, io, &tmp, "");
     defer gpa.free(home);
 
-    // A signed-in subscription plus an environment key, so one account remains
-    // after the logout. No fetch ran, so that account offers no model.
     var store = try tmp.dir.createDirPathOpen(io, ".drinky", .{});
     store.close(io);
     try tmp.dir.writeFile(io, .{
@@ -8570,9 +7062,6 @@ test "the logout of the active account adopts a next account with no model" {
 
     try app.applyOutcome(.{ .logout = .anthropic_plan });
 
-    // The session moved to the remaining account and holds no model. The report
-    // names that account, because the transcript is the durable record of the
-    // move.
     try std.testing.expectEqual(ai.llm.Account.anthropic_api_key, app.session.account_shown.?);
     try std.testing.expect(app.agent.model == null);
     try std.testing.expectEqualStrings(
@@ -8582,9 +7071,6 @@ test "the logout of the active account adopts a next account with no model" {
     );
 }
 
-// The logout reads the same helper, so the step there follows the catalog too.
-// The next account holds a cached list and no remembered model, so the user
-// picks from that list.
 test "the logout of the active account names the pick where the next list stands" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -8609,8 +7095,6 @@ test "the logout of the active account names the pick where the next list stands
     app.initForTest(gpa);
     app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{ .anthropic = "key" });
     defer app.accounts.deinit();
-    // A fetch cached the list of the account that follows, and this project ran
-    // no model on it.
     try ai.testing.seedAccount(&app.accounts, .anthropic_api_key, &.{"claude-sonnet-5"});
     app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_plan), .{
         .model = test_anthropic_model,
@@ -8694,13 +7178,10 @@ test "a principal replacement drops old evidence before the restored turn" {
     try std.testing.expectEqual(ai.llm.Account.anthropic_plan, app.activeAccount().?);
     try std.testing.expectEqual(ai.llm.Account.anthropic_plan, app.session.account_shown.?);
     try std.testing.expect(app.session.mode == .prompt);
-    // The list of the replaced principal went with its metadata, so the account
-    // offers no model.
     try std.testing.expect(app.agent.model == null);
     const blocks = app.session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 2), blocks.len);
     try std.testing.expect(blocks[0].content.event.is_error);
-    // The turn failure runs before the transition, so it names no next step.
     try std.testing.expect(std.mem.indexOf(
         u8,
         blocks[0].content.event.text.items,
@@ -8712,11 +7193,6 @@ test "a principal replacement drops old evidence before the restored turn" {
     );
 }
 
-// A model fetch reaches the same principal boundary as a turn, because it asks
-// the provider with the credential of the account. The transition is therefore
-// the one a turn takes. The evidence of the replaced principal goes, its cached
-// list goes, and the report names the step. The test in
-// `lib/ai/command/model.zig` states that such a fetch produces this outcome.
 test "a fetch that meets a replaced credential drops the evidence of the old principal" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -8763,17 +7239,11 @@ test "a fetch that meets a replaced credential drops the evidence of the old pri
 
     try app.applyOutcome(.{ .credential_replaced = .anthropic_plan });
 
-    // The proofs of the replaced principal leave the history and the interface,
-    // so the next request under the new credential carries none of them.
     try std.testing.expectEqual(@as(usize, 0), app.agent.items.items.len);
-    // The cached list belongs to that principal too, so the account offers no
-    // model until the next fetch.
     try std.testing.expect(app.accounts.catalog.isEmpty(.anthropic_plan));
     try std.testing.expect(app.agent.model == null);
     try std.testing.expectEqual(ai.llm.Account.anthropic_plan, app.activeAccount().?);
 
-    // The report states the replacement and names the step, so the user reads
-    // an action and no error name. No turn ran, so it names no retry.
     const blocks = app.session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 1), blocks.len);
     try std.testing.expectEqualStrings(
@@ -8785,9 +7255,6 @@ test "a fetch that meets a replaced credential drops the evidence of the old pri
     try std.testing.expect(!blocks[0].content.event.is_error);
 }
 
-// A fetch runs on the account of its row, and that account can be one the
-// session does not run. No turn ran either, so the report states the
-// replacement, names the fetched account, and names no retry.
 test "a fetch that meets a replaced credential on an idle account names that account" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -8814,8 +7281,6 @@ test "a fetch that meets a replaced credential on an idle account names that acc
     app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{ .anthropic = "sk-anthropic" });
     defer app.accounts.deinit();
     try ai.testing.seedAccount(&app.accounts, .openai_plan, &.{"gpt-5.6-sol"});
-    // The session runs the `anthropic-api-key` account. The fetch runs on the OpenAI
-    // subscription, which the user stepped to in the picker.
     app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_api_key), .{
         .model = test_anthropic_model,
         .system = "",
@@ -8829,11 +7294,8 @@ test "a fetch that meets a replaced credential on an idle account names that acc
 
     try app.applyOutcome(.{ .credential_replaced = .openai_plan });
 
-    // The replacement reached another account, so the session keeps its own
-    // account and its own model.
     try std.testing.expectEqual(ai.llm.Account.anthropic_api_key, app.activeAccount().?);
     try app.expectModel(test_anthropic_model.name());
-    // The cached list belongs to the replaced principal, so it goes.
     try std.testing.expect(app.accounts.catalog.isEmpty(.openai_plan));
 
     const blocks = app.session.transcript.blocks();
@@ -8847,9 +7309,6 @@ test "a fetch that meets a replaced credential on an idle account names that acc
     try std.testing.expect(!blocks[0].content.event.is_error);
 }
 
-// The client of a minted key borrows the key bytes of its store. The reread that
-// opens the login picker must leave an unchanged key where it is, and it must
-// move the client onto a replaced key, so no request reads freed memory.
 test "the login picker rereads the store and keeps the active Console key live" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -8885,7 +7344,6 @@ test "the login picker rereads the store and keeps the active Console key live" 
     defer app.session.deinit();
     app.session.account_shown = .anthropic_api;
 
-    // The store holds the same key: the client keeps the very bytes it borrowed.
     const borrowed = app.agent.client.?.credentials.anthropic_api;
     try app.applyOutcome(.login_picker);
     try std.testing.expect(app.session.mode == .picking);
@@ -8902,9 +7360,6 @@ test "the login picker rereads the store and keeps the active Console key live" 
     try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
     app.session.closePicker();
 
-    // Another instance signed in again and minted another key. The client moves
-    // onto the key the store now holds, and the evidence and the list of the
-    // prior key go.
     try tmp.dir.writeFile(io, .{
         .sub_path = ".drinky/auth.json",
         .data =
@@ -8931,9 +7386,6 @@ test "the login picker rereads the store and keeps the active Console key live" 
     );
 }
 
-// A sign-out in another instance takes the credential of the active account.
-// The session must leave that account before the picker opens, as it does after
-// a logout here, so the picker never marks a signed-out account as active.
 test "the login picker hands the session off an account another instance signed out" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -8968,14 +7420,11 @@ test "the login picker hands the session off an account another instance signed 
     app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     app.session.account_shown = .anthropic_plan;
-    // The block of that account stands in the transcript, as after a turn.
     try app.session.transcript.appendStream(.thinking, .anthropic_plan, "thought");
 
     try tmp.dir.writeFile(io, .{ .sub_path = ".drinky/auth.json", .data = "{}" });
     try app.applyOutcome(.login_picker);
 
-    // The session moved to the remaining account, and the evidence went with
-    // the credential.
     try std.testing.expect(!app.accounts.isAuthenticated(.anthropic_plan));
     try std.testing.expectEqual(ai.llm.Account.anthropic_api_key, app.activeAccount().?);
     try std.testing.expectEqual(ai.llm.Account.anthropic_api_key, app.session.account_shown.?);
@@ -8988,15 +7437,12 @@ test "the login picker hands the session off an account another instance signed 
             "Fetch the model list of anthropic-api-key with /model.",
         blocks[0].content.event.text.items,
     );
-    // The picker shows the store as it stands.
     try std.testing.expect(app.session.mode == .picking);
     const picker = app.session.mode.picking.picker;
     try std.testing.expectEqualStrings("anthropic-plan", picker.options[0].name);
     try std.testing.expectEqualStrings("anthropic-api-key", picker.options[2].name);
 }
 
-// The last account can leave this way too. The session signs out, and the
-// picker that the user asked for opens once, so Esc leaves it at the prompt.
 test "the login picker signs out when another instance signed out the last account" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -9047,8 +7493,6 @@ test "the login picker signs out when another instance signed out the last accou
     try std.testing.expectEqualStrings("openai-plan", app.session.mode.picking.picker.options[3].name);
 }
 
-// A sign-in and a rotation in another instance move nothing here. The picker
-// shows the sign-in, and the rotated token serves the next request.
 test "the login picker shows a sign-in from another instance and keeps a rotated token" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -9101,7 +7545,6 @@ test "the login picker shows a sign-in from another instance and keeps a rotated
     try std.testing.expectEqual(ai.llm.Account.anthropic_plan, app.activeAccount().?);
     try app.expectModel(test_anthropic_model.name());
     try std.testing.expectEqualStrings("r2", app.accounts.anthropic_auth.tokens.?.refresh);
-    // The evidence of the same principal stays, and no event reports a move.
     try std.testing.expectEqual(@as(usize, 1), app.session.transcript.blocks().len);
     try std.testing.expect(app.session.transcript.blocks()[0].content == .thinking);
     const picker = app.session.mode.picking.picker;
@@ -9110,9 +7553,6 @@ test "the login picker shows a sign-in from another instance and keeps a rotated
     try std.testing.expectEqualStrings("Signed in", picker.options[5].tag.?);
 }
 
-// The hand-off adopts the first authenticated account. That account can have
-// changed in the same reread, so it settles first, and the transcript reads the
-// replacement before the move onto it.
 test "the login picker settles every other account before the active one leaves" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -9152,8 +7592,6 @@ test "the login picker settles every other account before the active one leaves"
     defer app.session.deinit();
     app.session.account_shown = .anthropic_plan;
 
-    // Another instance signed the active subscription out and signed in to
-    // ChatGPT as another account.
     try tmp.dir.writeFile(io, .{
         .sub_path = ".drinky/auth.json",
         .data =
@@ -9183,10 +7621,6 @@ test "the login picker settles every other account before the active one leaves"
     );
 }
 
-// A rotation keeps the principal, but the credential moved in memory, so the
-// active client takes the rotated one. A subscription client reads its store
-// through a pointer, and no store that borrows its key names a principal today,
-// so this pins that the renewal moves nothing the user can see.
 test "the login picker points the active client at a rotated credential" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -9233,7 +7667,6 @@ test "the login picker points the active client at a rotated credential" {
     });
     try app.applyOutcome(.login_picker);
 
-    // The client reads the store it pointed at before, and the model stays.
     try std.testing.expectEqual(
         &app.accounts.openai_auth,
         app.agent.client.?.credentials.openai_plan,
@@ -9243,8 +7676,6 @@ test "the login picker points the active client at a rotated credential" {
     try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
 }
 
-// One entry that does not decode must not hide the other accounts. The event
-// names that account alone, and the rest of the picker shows the store.
 test "the login picker reports one entry it cannot read and settles the rest" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -9311,8 +7742,6 @@ test "the login picker reports one entry it cannot read and settles the rest" {
     ));
 }
 
-// A store that Drinky cannot read must not end the session. The picker opens
-// on the registry as it stands, and the event names the failure.
 test "the login picker opens over an unreadable credential file and reports it" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -9511,8 +7940,6 @@ test "a replacement saved before invalidation keeps the account active" {
     app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
     defer app.accounts.deinit();
     try ai.testing.seedAccount(&app.accounts, .anthropic_plan, &.{"claude-opus-5"});
-    // The model of the replaced principal. Its list goes with the credential, so
-    // the reload leaves the account with no model at all.
     var discovered = test_anthropic_model;
     discovered.context_window = 1;
     app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_plan), .{
@@ -9525,8 +7952,6 @@ test "a replacement saved before invalidation keeps the account active" {
     app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     app.session.account_shown = .anthropic_plan;
-    // The block of that proof stands above the turn, so only the replacement can
-    // take it out again.
     try app.session.transcript.appendStream(.thinking, .anthropic_plan, "thought");
     app.session.beginTurn(1);
 
@@ -9536,8 +7961,6 @@ test "a replacement saved before invalidation keeps the account active" {
         .expires_ms = 4102444800000,
     }, .{});
 
-    // The replacement can belong to another principal, so this proof of the
-    // replaced credential must not survive the reload.
     const replay: ai.llm.Item.Reasoning.Replay = .{ .anthropic_plan = .{
         .signature = .{ .text = "thought", .signature = "proof" },
     } };
@@ -9563,14 +7986,10 @@ test "a replacement saved before invalidation keeps the account active" {
         app.accounts.anthropic_auth.tokens.?.refresh,
     );
     try std.testing.expectEqual(@as(usize, 0), app.agent.items.items.len);
-    // The list of the replaced credential is gone, so the account offers no
-    // model until the user fetches one again.
     try std.testing.expect(app.agent.model == null);
     try std.testing.expect(app.session.model_shown == null);
     try std.testing.expect(app.session.mode == .prompt);
 
-    // The reasoning block of the replaced principal went with its proof, so the
-    // two events are all that stands.
     const blocks = app.session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 2), blocks.len);
     try std.testing.expect(std.mem.indexOf(
@@ -9653,9 +8072,6 @@ test "a rejected refresh credential hands the session to another account" {
     );
 }
 
-// The account that takes the session can offer no model, because no fetch ran
-// for it. The report must state the move beside the step, because the
-// transcript is the durable record of the active account.
 test "a rejected refresh credential names the account with no model it hands the session to" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -9678,8 +8094,6 @@ test "a rejected refresh credential names the account with no model it hands the
 
     var app: App = undefined;
     app.initForTest(gpa);
-    // The OpenAI key authenticates the next account. No fetch ran for it, so it
-    // offers no model.
     app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{ .openai = "sk-openai" });
     defer app.accounts.deinit();
     app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_plan), .{
@@ -9736,9 +8150,6 @@ test "an invoked skill sends a head that no box holds, and its task in a box" {
     };
     try std.testing.expectEqual(@as(usize, 0), try app.appendSkillPrompt(&prompt));
 
-    // One message on the wire, two blocks on the screen: what Drinky sent, and
-    // what the user typed. A user message can hold no head, so the head is the
-    // one part of the pair that the user cannot forge.
     const blocks = app.session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 2), blocks.len);
     switch (blocks[0].content) {
@@ -9753,7 +8164,6 @@ test "an invoked skill sends a head that no box holds, and its task in a box" {
         else => return error.ExpectedUser,
     }
 
-    // The head names the skill and the file that the transcript never shows.
     try app.session.paint(.{ .columns = 80, .rows = 24 });
     try std.testing.expect(std.mem.indexOf(
         u8,
@@ -9764,7 +8174,6 @@ test "an invoked skill sends a head that no box holds, and its task in a box" {
     try std.testing.expect(std.mem.indexOf(u8, out.written(), prompt.content) == null);
 }
 
-// A skill with no task is the head alone, and the head is one row of its own.
 test "an invoked skill with no task sends its head alone" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -9794,7 +8203,6 @@ test "an invoked skill with no task sends its head alone" {
         ),
         else => return error.ExpectedSkill,
     }
-    // The head takes one row, with no padding row around it.
     try std.testing.expectEqual(@as(usize, 1), blocks[0].rows(80));
 }
 
@@ -9805,8 +8213,6 @@ test displayRoots {
     app.working_directory = "/work";
     app.home_directory = "/home/you";
 
-    // A project skill reads relative to the working directory, a user skill takes
-    // the `~` of the home directory, and any other path stays as it is.
     const cases = [_]struct { []const u8, []const u8 }{
         .{ "/work/.agents/skills/demo/SKILL.md", ".agents/skills/demo/SKILL.md" },
         .{ "/home/you/.agents/skills/demo/SKILL.md", "~/.agents/skills/demo/SKILL.md" },
@@ -9819,7 +8225,6 @@ test displayRoots {
         try std.testing.expectEqualStrings(shown, display);
     }
 
-    // Without a resolved session the path stands alone.
     app.working_directory = "";
     app.home_directory = "";
     const bare = try ai.format.path(gpa, "/work/.agents/skills/demo/SKILL.md", &app.displayRoots());
@@ -9827,8 +8232,6 @@ test displayRoots {
     try std.testing.expectEqualStrings("/work/.agents/skills/demo/SKILL.md", bare);
 }
 
-// A failed turn that committed work arms a retry. Its caption appears above the
-// editor, and Esc dismisses that retry alone.
 test "a committed failure arms a retry that Esc dismisses" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -9867,8 +8270,6 @@ test "a committed failure arms a retry that Esc dismisses" {
     try std.testing.expectEqualStrings("The provider is overloaded.", app.retry.?.failure);
     try std.testing.expectEqual(Session.PromptOffer.retry, app.session.prompt_offer);
 
-    // The caption names the failed state and the two keys that own the retry.
-    // Enter belongs to the editor text, so the controls leave it out.
     try app.session.paint(.{ .columns = 80, .rows = 24 });
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "Failed turn") != null);
     try std.testing.expect(std.mem.indexOf(
@@ -9877,14 +8278,12 @@ test "a committed failure arms a retry that Esc dismisses" {
         "Ctrl+N: Try again · Esc: Dismiss",
     ) != null);
 
-    // Esc drops the retry and keeps every byte the editor holds.
     try app.session.editor.insert("keep this text");
     try app.handleKey(&.escape);
     try std.testing.expect(app.retry == null);
     try std.testing.expectEqual(Session.PromptOffer.none, app.session.prompt_offer);
     try std.testing.expectEqualStrings("keep this text", app.session.editor.visible());
 
-    // A prompt with no retry leaves Ctrl+N without an attempt to send.
     try app.handleKey(&.{ .ctrl = 'n' });
     try std.testing.expect(app.session.mode == .prompt);
     try std.testing.expect(app.turn_future == null);
@@ -9933,8 +8332,6 @@ test "Esc at the prompt dismisses a notice and a recovery offer together" {
     try std.testing.expect(app.session.notice == null);
 }
 
-// A human request that committed nothing needs no retry: it returns to the editor,
-// and the next Enter sends it as a normal turn.
 test "an uncommitted human failure returns to the editor and arms no retry" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -9978,9 +8375,6 @@ test "an uncommitted human failure returns to the editor and arms no retry" {
     try std.testing.expect(blocks[0].content.event.is_error);
 }
 
-// A skill line reproduces its own request, so an uncommitted failure returns the
-// whole line and arms no retry. Uncommitted steering joins that line, and one
-// Enter sends everything after the name as the task.
 test "an uncommitted skill failure returns its line and arms no retry" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -10001,7 +8395,6 @@ test "an uncommitted skill failure returns its line and arms no retry" {
     defer app.session.deinit();
     defer app.dropRetry();
 
-    // The line the user typed, and the request that Drinky expanded from it.
     try app.session.editor.insert("/skill:demo apply it");
     const prompt: ai.command.Outcome.Prompt = .{
         .name = "demo",
@@ -10014,7 +8407,6 @@ test "an uncommitted skill failure returns its line and arms no retry" {
     app.session.retainTurnPrompt(&draft, base);
     try seedSteering(&app, "and keep the format");
 
-    // The signed-out worker fails before any provider request, so nothing commits.
     {
         const result = app.awaitTurnFuture().?;
         defer app.freeWorkerResult(&result);
@@ -10027,20 +8419,15 @@ test "an uncommitted skill failure returns its line and arms no retry" {
         "/skill:demo apply it\n\nand keep the format",
         app.session.editor.visible(),
     );
-    // The rewind keeps the failure event alone: the skill box went with the
-    // request that no history holds.
     const blocks = app.session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 1), blocks.len);
     try std.testing.expect(blocks[0].content.event.is_error);
-    // The restored line is still one command line, and its tail is the new task.
     try std.testing.expectEqualStrings(
         "skill:demo",
         ai.command.parse(app.session.editor.visible()).?,
     );
 }
 
-// Ctrl+N sends the attempt alone: no editor text goes with it, the transcript
-// records one line, and the failure of the attempt arms the retry again.
 test "Ctrl+N sends the attempt and keeps the editor text" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -10064,20 +8451,14 @@ test "Ctrl+N sends the attempt and keeps the editor text" {
     app.setRetry(.{ .failure = try gpa.dupe(u8, "The provider is overloaded.") });
     try app.session.editor.insert("a draft that stays");
 
-    // The spawn runs past the sign-in gate, so the worker reaches the agent and
-    // reports the signed-out state as the failure of this attempt.
     try app.sendRetryTurn();
 
     try std.testing.expect(app.session.mode == .turn);
     try std.testing.expect(app.retry == null);
     try std.testing.expectEqual(Session.PromptOffer.none, app.session.prompt_offer);
-    // The attempt sends and clears nothing of the editor, and it retains no draft,
-    // because the editor holds no part of it.
     try std.testing.expectEqualStrings("a draft that stays", app.session.editor.visible());
     try std.testing.expect(app.session.turn_prompt == null);
     {
-        // Drinky wrote the message of the attempt, so its line is a user note.
-        // That kind alone paints the user color, which `ui.block` pins.
         const blocks = app.session.transcript.blocks();
         try std.testing.expectEqual(@as(usize, 1), blocks.len);
         try std.testing.expectEqualStrings(Retry.note_text, blocks[0].content.user_note.items);
@@ -10088,8 +8469,6 @@ test "Ctrl+N sends the attempt and keeps the editor text" {
         defer app.freeWorkerResult(&result);
         try app.finishWorkerResult(&result);
     }
-    // The attempt continues committed work, so its own failure arms the context
-    // again. Its line rewinds, and only the failure event stays.
     try std.testing.expectEqual(Session.PromptOffer.retry, app.session.prompt_offer);
     try std.testing.expect(std.mem.indexOf(u8, app.retry.?.failure, "SignedOut") != null);
     try std.testing.expectEqualStrings("a draft that stays", app.session.editor.visible());
@@ -10098,9 +8477,6 @@ test "Ctrl+N sends the attempt and keeps the editor text" {
     try std.testing.expect(blocks[0].content.event.is_error);
 }
 
-// A tap on `Shorten` sends the request alone: the transcript records the line
-// that names it, the request itself stays out of the transcript, and the editor
-// keeps every byte it holds.
 test "a shorten request records its line and keeps the editor text" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -10122,16 +8498,12 @@ test "a shorten request records its line and keeps the editor text" {
     defer app.dropRetry();
 
     try app.session.editor.insert("a draft that stays");
-    // The spawn runs past the gates of the tap, so the worker reaches the agent
-    // and reports the signed-out state as the failure of this turn.
     try app.sendShortenTurn();
 
     try std.testing.expect(app.session.mode == .turn);
     try std.testing.expectEqualStrings("a draft that stays", app.session.editor.visible());
     try std.testing.expect(app.session.turn_prompt == null);
     {
-        // Drinky wrote the request, so its line is a user note and no user box.
-        // The contract stays out of the transcript.
         const blocks = app.session.transcript.blocks();
         try std.testing.expectEqual(@as(usize, 1), blocks.len);
         try std.testing.expectEqualStrings(shorten_note_text, blocks[0].content.user_note.items);
@@ -10145,8 +8517,6 @@ test "a shorten request records its line and keeps the editor text" {
     try std.testing.expectEqualStrings("a draft that stays", app.session.editor.visible());
 }
 
-// A retry needs an account, so Ctrl+N names the sign-in and sends nothing. Without
-// a retry the key has no action at all.
 test "a signed-out Ctrl+N names the sign-in and keeps the retry" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -10181,9 +8551,6 @@ test "a signed-out Ctrl+N names the sign-in and keeps the retry" {
     );
 }
 
-// A sign-in can land on an account that offers no model, and a waiting retry
-// survives it. Ctrl+N must refuse there like a send. Without the gate the
-// attempt fails inside the worker and reports a raw error name.
 test "Ctrl+N refuses while the account offers no model" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -10214,16 +8581,10 @@ test "Ctrl+N refuses while the account offers no model" {
     try std.testing.expectEqualStrings(no_model_refusal, app.session.notice.?.content);
 }
 
-// The gate above keeps `error.NoModel` out of a turn, so nothing maps it today.
-// The mapping stays, because a residual path must report a sentence and never
-// the internal name.
 test "a turn without a model reports a sentence and not the error name" {
     try std.testing.expectEqualStrings(no_model_refusal, turnFailureText(error.NoModel).?);
 }
 
-// The attempt never takes the editor text: a network or provider failure is
-// nothing a user instruction prevents. Enter sends that text as a plain message,
-// and the start of that turn drops the context, because the conversation moved on.
 test "Enter sends a plain message and drops the waiting retry" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -10248,16 +8609,12 @@ test "Enter sends a plain message and drops the waiting retry" {
     app.session.prompt_offer = .retry;
 
     try app.session.editor.insert("also check the tests");
-    // The two steps that `submit` runs once its sign-in gate passes. A test client
-    // is signed out, so the gate stops the send before any turn.
     {
         const base = try app.startUserTurn("also check the tests");
         var prompt = app.session.editor.detachTrimmed();
         app.session.retainTurnPrompt(&prompt, base);
     }
 
-    // The message is the whole request: no event names an attempt, and no wrapper
-    // carries the failure sentence.
     try std.testing.expect(app.session.mode == .turn);
     try std.testing.expect(app.retry == null);
     try std.testing.expectEqual(Session.PromptOffer.none, app.session.prompt_offer);
@@ -10273,7 +8630,6 @@ test "Enter sends a plain message and drops the waiting retry" {
         defer app.freeWorkerResult(&result);
         try app.finishWorkerResult(&result);
     }
-    // The turn committed nothing, so the human text returns and no context arms.
     try std.testing.expectEqualStrings("also check the tests", app.session.editor.visible());
     try std.testing.expect(app.retry == null);
     try std.testing.expectEqual(Session.PromptOffer.none, app.session.prompt_offer);
@@ -10282,8 +8638,6 @@ test "Enter sends a plain message and drops the waiting retry" {
     try std.testing.expect(blocks[0].content.event.is_error);
 }
 
-// Herdr reads one state per pane. The loop derives it from the model after each
-// batch, so a turn end path of any kind needs no report of its own.
 test "the Herdr state follows the turn and the waiting retry" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -10305,7 +8659,6 @@ test "the Herdr state follows the turn and the waiting retry" {
     defer app.dropRetry();
 
     try std.testing.expectEqual(Herdr.State.idle, app.herdrState());
-    // A page is no turn, so Herdr sees no work in progress.
     try app.session.openPage(&.{ .title = "Test page", .content = "body" });
     try std.testing.expectEqual(Herdr.State.idle, app.herdrState());
     app.session.closePage();
@@ -10314,18 +8667,14 @@ test "the Herdr state follows the turn and the waiting retry" {
     try std.testing.expectEqual(Herdr.State.working, app.herdrState());
     app.session.endTurn();
 
-    // A failed turn with committed work waits for Ctrl+N, and the user must decide.
     app.setRetry(.{ .failure = try gpa.dupe(u8, "The provider is overloaded.") });
     try std.testing.expectEqual(Herdr.State.blocked, app.herdrState());
-    // The attempt is a turn again, and it takes the context.
     app.session.beginTurn(2);
     app.dismissOffer();
     try std.testing.expectEqual(Herdr.State.working, app.herdrState());
     app.session.endTurn();
     try std.testing.expectEqual(Herdr.State.idle, app.herdrState());
 
-    // A canceled turn with committed work waits for Ctrl+N too, and the user
-    // must decide on it the same way. The next turn takes the offer.
     app.setRevision(.{
         .history = .{ .base = 0, .end = 0 },
         .transcript_base = 0,
@@ -10341,15 +8690,10 @@ test "the Herdr state follows the turn and the waiting retry" {
     app.session.endTurn();
     try std.testing.expectEqual(Herdr.State.idle, app.herdrState());
 
-    // Outside Herdr the reporter is inert, so the loop's call costs nothing.
     app.herdr.sync(app.herdrState());
     try std.testing.expect(app.herdr.future == null);
 }
 
-// A cancellation is the user's own stop, so it arms no retry. Esc during an attempt
-// ends the recovery, and the committed work behind it stays in history. An
-// attempt and a shorten request retain no prompt of the user, so their
-// cancellation offers no revision either.
 test "canceling an attempt ends the recovery" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -10369,7 +8713,6 @@ test "canceling an attempt ends the recovery" {
     defer app.session.deinit();
     defer app.dropRetry();
 
-    // The state of a live attempt: the turn owns the request, so no context waits.
     app.session.beginTurn(1);
     app.turn_retry = true;
     try spawnCommittedCanceledTurn(&app);
@@ -10387,7 +8730,6 @@ test "canceling an attempt ends the recovery" {
         blocks[0].content.event.text.items,
     );
 
-    // The state of a live shorten request: a note names it, and no prompt waits.
     try app.session.transcript.append(.user_note, .{}, shorten_note_text);
     app.session.beginTurn(2);
     app.session.markTurnBase(1);
@@ -10398,23 +8740,12 @@ test "canceling an attempt ends the recovery" {
     try std.testing.expect(app.session.mode == .prompt);
 }
 
-/// Test scaffolding: the prompt of one staged turn, where it came from, and
-/// the tool of its committed round.
 const StagedTurn = struct {
-    /// The rich draft of the prompt. The stage takes it.
     prompt: *ui.Editor.Draft,
     source: Session.Message.Source = .terminal,
-    /// The tool of the committed round, or null for a round of the answer alone.
     tool: ?[]const u8 = null,
 };
 
-/// Test scaffolding: the state of turn 1 over `staged.prompt`, as `submit` does
-/// past its gates, after it committed one round: the answer, and the call of
-/// `staged.tool` with its result. The user box and the two agent messages stand
-/// in both histories. `result` then holds the cancellation of that turn, whose
-/// receipt names the history span, and no worker runs yet, so a test adjusts
-/// the result before it spawns the fake worker through `spawnStagedTurn`. The
-/// caller keeps `result` alive until it cancels the turn.
 fn stageCommittedPromptTurn(app: *App, result: *WorkerResult, staged: StagedTurn) !void {
     const gpa = app.gpa;
     const history_base = app.agent.items.items.len;
@@ -10477,14 +8808,10 @@ fn stageCommittedPromptTurn(app: *App, result: *WorkerResult, staged: StagedTurn
     };
 }
 
-/// Test scaffolding: spawn the fake worker of a staged turn. Reaped by
-/// `cancelTurn`.
 fn spawnStagedTurn(app: *App, result: *const WorkerResult) !void {
     app.turn_future = try app.io.concurrent(fakeWorker, .{result});
 }
 
-/// Test scaffolding: stage turn 1 over the typed `prompt` with the committed
-/// call of `maybe_tool`, and spawn its fake worker at once.
 fn beginCommittedPromptTurn(
     app: *App,
     result: *WorkerResult,
@@ -10497,10 +8824,6 @@ fn beginCommittedPromptTurn(
     try spawnStagedTurn(app, result);
 }
 
-/// Test scaffolding: assert that the canceled turn of `beginCommittedPromptTurn`
-/// stands in both histories as it was left: the two agent messages above
-/// `history_base`, and the blocks of the turn above `transcript_base` up to the
-/// cancellation event.
 fn expectCanceledTurnStands(app: *const App, history_base: usize, transcript_base: usize) !void {
     try std.testing.expectEqual(history_base + 2, app.agent.items.items.len);
     const blocks = app.session.transcript.blocks();
@@ -10510,12 +8833,6 @@ fn expectCanceledTurnStands(app: *const App, history_base: usize, transcript_bas
     try std.testing.expectEqualStrings("You canceled the turn.", last.content.event.text.items);
 }
 
-// A cancellation of a turn that committed work keeps that work, because the
-// finished rounds stand in history. The prompt of the user does not return, but
-// the cancellation offers its revision: the caption names the canceled turn and
-// the two keys that own the offer, and the context anchors the turn in both
-// histories. Esc, Ctrl+C at an empty editor, and Ctrl+D each cancel the same
-// way, so each one offers the same revision.
 test "a committed cancellation offers the revision of the turn" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -10550,7 +8867,6 @@ test "a committed cancellation offers the revision of the turn" {
         try std.testing.expectEqual(Session.PromptOffer.revision, app.session.prompt_offer);
         try std.testing.expect(app.retry == null);
         try std.testing.expectEqual(Herdr.State.blocked, app.herdrState());
-        // [intro, user "fix it", model, the read box, the cancellation event]
         try expectCanceledTurnStands(&app, 0, 1);
         try std.testing.expectEqual(@as(usize, 5), app.session.transcript.blocks().len);
         const revision = app.revision.?;
@@ -10564,8 +8880,6 @@ test "a committed cancellation offers the revision of the turn" {
         app.dismissOffer();
     }
 
-    // The caption names the canceled state and the two keys that own the
-    // revision. Enter belongs to the editor text, so the controls leave it out.
     var result: WorkerResult = undefined;
     try beginCommittedPromptTurn(&app, &result, "fix it", "read");
     try app.cancelTurn();
@@ -10579,11 +8893,6 @@ test "a committed cancellation offers the revision of the turn" {
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "Failed turn") == null);
 }
 
-// An uncommitted cancellation has nothing to revise: the rewind takes the
-// optimistic blocks, and the prompt returns to the editor at once with the
-// uncommitted steering above the draft. A cancellation that lost the race
-// against the worker ends as the completion of that worker, so it offers
-// nothing either.
 test "an uncommitted cancellation restores the prompt and offers no revision" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -10604,7 +8913,6 @@ test "an uncommitted cancellation restores the prompt and offers no revision" {
     defer app.session.deinit();
     defer app.dropRevision();
 
-    // The prompt is a paste, so the return must keep its atom.
     const payload = "line\n" ** 15;
     try app.session.transcript.append(.user, .{}, payload);
     app.session.beginTurn(1);
@@ -10625,8 +8933,6 @@ test "an uncommitted cancellation restores the prompt and offers no revision" {
     try std.testing.expectEqualStrings(payload ++ "\n\nand test\n\ndraft", expanded);
     app.session.editor.clear();
 
-    // The worker completed first, so the cancellation resolves as that
-    // completion once the fence arrives, and no revision waits.
     var result: WorkerResult = undefined;
     var draft = try ui.Editor.Draft.fromText(gpa, "fix it");
     try stageCommittedPromptTurn(&app, &result, .{ .prompt = &draft });
@@ -10650,10 +8956,6 @@ test "an uncommitted cancellation restores the prompt and offers no revision" {
     try std.testing.expectEqual(Session.PromptOffer.none, app.session.prompt_offer);
 }
 
-// The chat holds the input and the text of its messages, so a cancellation
-// from the chat offers no revision, and the prompt of the chat drops. Once the
-// terminal took the input back, a cancellation there can revise a turn that a
-// Telegram message started, and the prompt returns into the terminal editor.
 test "a cancellation offers a revision only while the terminal holds the input" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -10674,8 +8976,6 @@ test "a cancellation offers a revision only while the terminal holds the input" 
     defer app.session.deinit();
     defer app.dropRevision();
 
-    // The state of a turn that a Telegram message started while the bot holds
-    // the input.
     var result: WorkerResult = undefined;
     var external = try ui.Editor.Draft.fromText(gpa, "from the chat");
     try stageCommittedPromptTurn(&app, &result, .{
@@ -10690,8 +8990,6 @@ test "a cancellation offers a revision only while the terminal holds the input" 
     try std.testing.expectEqualStrings("", app.session.editor.visible());
     try expectCanceledTurnStands(&app, 0, 0);
 
-    // The terminal detached before the cancellation, so the terminal owns the
-    // input, and the message of the chat returns like a typed one.
     app.agent.resetConversation();
     app.session.transcript.truncate(0);
     app.session.input.owner = .terminal;
@@ -10709,10 +9007,6 @@ test "a cancellation offers a revision only while the terminal holds the input" 
     try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
 }
 
-// Esc keeps the canceled turn in both histories and dismisses the offer alone,
-// so every byte of the editor stays. An ordinary key keeps the offer, and it
-// clears only a warning that a first Ctrl+N raised, so the next Ctrl+N warns
-// again. A safe command keeps the offer too.
 test "Esc keeps the canceled turn while editing and a safe command keep the revision" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -10738,9 +9032,6 @@ test "Esc keeps the canceled turn while editing and a safe command keep the revi
     try app.cancelTurn();
     try std.testing.expect(app.revision.?.mutated);
 
-    // The first Ctrl+N warns and arms. A key between two presses clears the
-    // warning and the confirmation and keeps the offer, so the next Ctrl+N warns
-    // again instead of a removal.
     try app.handleKey(&.{ .ctrl = 'n' });
     try std.testing.expectEqualStrings(revision_warning, app.session.notice.?.content);
     try std.testing.expect(app.session.confirmations.contains(.revision));
@@ -10753,8 +9044,6 @@ test "Esc keeps the canceled turn while editing and a safe command keep the revi
     try std.testing.expectEqualStrings(revision_warning, app.session.notice.?.content);
     try expectCanceledTurnStands(&app, 0, 0);
 
-    // A safe command keeps the offer, and its event lands after the range. The
-    // picker covers the caption, and its Esc closes the picker alone.
     app.session.editor.clear();
     try app.runCommand("/effort");
     try std.testing.expect(app.session.mode == .picking);
@@ -10773,7 +9062,6 @@ test "Esc keeps the canceled turn while editing and a safe command keep the revi
     try std.testing.expect(blocks[4].content == .event);
     try std.testing.expect(!blocks[4].content.event.turn_owned);
 
-    // Esc dismisses the offer, keeps the turn, and keeps the editor text.
     try app.session.editor.insert("keep this text");
     try app.handleKey(&.escape);
     try std.testing.expect(app.revision == null);
@@ -10782,16 +9070,12 @@ test "Esc keeps the canceled turn while editing and a safe command keep the revi
     try std.testing.expectEqualStrings("keep this text", app.session.editor.visible());
     try std.testing.expectEqual(@as(usize, 2), app.agent.items.items.len);
     try std.testing.expectEqual(@as(usize, 5), app.session.transcript.blocks().len);
-    // Ctrl+N has no offer to act on now.
     try app.handleKey(&.{ .ctrl = 'n' });
     try std.testing.expect(app.session.mode == .prompt);
     try std.testing.expect(app.session.notice == null);
     try std.testing.expectEqual(@as(usize, 5), app.session.transcript.blocks().len);
 }
 
-// A dismissal that no key causes, as a Telegram message that starts a turn or a
-// Telegram `/new` does, takes an armed revision confirmation with the offer, so
-// no confirmation outlives its offer.
 test "a dismissal of the revision takes its armed confirmation" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -10824,8 +9108,6 @@ test "a dismissal of the revision takes its armed confirmation" {
     try std.testing.expectEqual(Session.PromptOffer.none, app.session.prompt_offer);
 }
 
-// A prompt-history selection is an explicit insertion after the text the user
-// typed, so it appends, and it keeps the waiting revision.
 test "a prompt-history insertion appends after the draft and keeps the revision" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -10858,10 +9140,6 @@ test "a prompt-history insertion appends after the draft and keeps the revision"
     try std.testing.expect(app.revision != null);
 }
 
-// The start of any turn takes the offer with it: the canceled turn stays in
-// the conversation that the new turn continues. A start that fails leaves the
-// offer for another try. `/new` clears the conversation and the offer together,
-// and it frees every saved draft.
 test "a turn start and /new dismiss the revision and a failed start keeps it" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -10887,8 +9165,6 @@ test "a turn start and /new dismiss the revision and a failed start keeps it" {
     try app.cancelTurn();
     try std.testing.expect(app.revision != null);
 
-    // The exhausted generation stops the start before the spawn, and the
-    // rollback of the optimistic user box leaves the turn as it stands.
     app.turn_generation = std.math.maxInt(u64);
     try std.testing.expectError(error.GenerationExhausted, app.startUserTurn("next"));
     try std.testing.expect(app.revision != null);
@@ -10896,7 +9172,6 @@ test "a turn start and /new dismiss the revision and a failed start keeps it" {
     try std.testing.expectEqual(@as(usize, 3), app.session.transcript.blocks().len);
     app.turn_generation = 1;
 
-    // A start that spawns takes the offer and rewinds nothing.
     const base = try app.startUserTurn("next");
     try std.testing.expect(app.revision == null);
     try std.testing.expectEqual(Session.PromptOffer.none, app.session.prompt_offer);
@@ -10909,7 +9184,6 @@ test "a turn start and /new dismiss the revision and a failed start keeps it" {
     }
     try std.testing.expect(app.session.mode == .prompt);
 
-    // `/new` clears the conversation and the offer together.
     try beginCommittedPromptTurn(&app, &result, "fix it", null);
     try app.cancelTurn();
     try std.testing.expect(app.revision != null);
@@ -10920,10 +9194,6 @@ test "a turn start and /new dismiss the revision and a failed start keeps it" {
     try std.testing.expectEqual(@as(usize, 1), app.session.transcript.blocks().len);
 }
 
-// A credential change removes the reasoning of one account from both histories,
-// and the blocks of a canceled turn move up with them. The anchors of the
-// revision move by the removed items below each one alone, so the offer stays
-// and Ctrl+N still removes exactly the turn.
 test "account evidence removal rebases the revision anchors and keeps the offer" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -10946,8 +9216,6 @@ test "account evidence removal rebases the revision anchors and keeps the offer"
     defer app.dropRevision();
     app.session.showSetup(.anthropic_plan, test_anthropic_model, .high);
 
-    // Reasoning of the account before the turn and inside the turn, in both
-    // histories, and a block of another account that stays.
     const replay: ai.llm.Item.Reasoning.Replay = .{ .anthropic_plan = .{
         .signature = .{ .text = "earlier", .signature = "proof" },
     } };
@@ -10971,8 +9239,6 @@ test "account evidence removal rebases the revision anchors and keeps the offer"
     try app.cancelTurn();
     {
         const revision = app.revision.?;
-        // Agent: [proof, user, assistant, proof]. Transcript: [thinking, model,
-        // user, model, thinking, canceled].
         try std.testing.expectEqual(@as(usize, 1), revision.history.base);
         try std.testing.expectEqual(@as(usize, 4), revision.history.end);
         try std.testing.expectEqual(@as(usize, 2), revision.transcript_base);
@@ -10983,7 +9249,6 @@ test "account evidence removal rebases the revision anchors and keeps the offer"
     try std.testing.expectEqual(Session.PromptOffer.revision, app.session.prompt_offer);
     {
         const revision = app.revision.?;
-        // Agent: [user, assistant]. Transcript: [model, user, model, canceled].
         try std.testing.expectEqual(@as(usize, 0), revision.history.base);
         try std.testing.expectEqual(@as(usize, 2), revision.history.end);
         try std.testing.expectEqual(@as(usize, 1), revision.transcript_base);
@@ -10999,8 +9264,6 @@ test "account evidence removal rebases the revision anchors and keeps the offer"
     try std.testing.expectEqualStrings("fix it", app.session.editor.visible());
 }
 
-// A credential replacement that a fetch met takes the same path through the
-// command outcome. Its report lands after the range, and the removal keeps it.
 test "a credential replacement rebases both canonical ranges of the revision" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -11058,7 +9321,6 @@ test "a credential replacement rebases both canonical ranges of the revision" {
     try std.testing.expectEqual(@as(usize, 2), revision.history.end);
     try std.testing.expectEqual(@as(usize, 0), revision.transcript_base);
     try std.testing.expectEqual(@as(usize, 3), revision.transcript_end);
-    // [user, model, canceled, the report of the replacement]
     try std.testing.expectEqual(@as(usize, 4), app.session.transcript.blocks().len);
 
     try app.handleKey(&.{ .ctrl = 'n' });
@@ -11072,12 +9334,6 @@ test "a credential replacement rebases both canonical ranges of the revision" {
     ) != null);
 }
 
-// Ctrl+N over a turn of read-only calls removes the turn on the first press:
-// the agent history rewinds to the base of the turn, the transcript loses the
-// prompt, the committed round, and the cancellation event, and the prompt
-// returns to the editor above the text the editor holds. The removal starts no
-// turn, resets the screen, blanks the context gauge, and keeps the cost. A
-// second Ctrl+N does nothing, because the offer is gone.
 test "Ctrl+N after read-only calls removes the canceled turn on the first press" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -11106,7 +9362,6 @@ test "Ctrl+N after read-only calls removes the canceled turn on the first press"
 
     var result: WorkerResult = undefined;
     try beginCommittedPromptTurn(&app, &result, "fix it", "read");
-    // The turn measured the context and billed its work.
     app.agent.measured_context = .{
         .tokens = 1200,
         .model = test_anthropic_model,
@@ -11119,9 +9374,6 @@ test "Ctrl+N after read-only calls removes the canceled turn on the first press"
     try app.cancelTurn();
     try std.testing.expectEqual(@as(?u64, 1200), app.session.stats_shown.context_tokens);
     try app.session.paint(.{ .columns = 80, .rows = 24 });
-    // The chat holds every block. Only a completed turn arms the `Shorten`
-    // button, so the live serial names the answer of an earlier turn, which
-    // stands outside the range.
     app.mirror.cursor = app.session.transcript.blocks().len;
     app.mirror.answer_serial = 5;
 
@@ -11136,7 +9388,6 @@ test "Ctrl+N after read-only calls removes the canceled turn on the first press"
     try std.testing.expectEqualStrings("fix it\n\ndraft", app.session.editor.visible());
     try std.testing.expectEqual(app.session.editor.visible().len, app.session.editor.caret);
 
-    // Both histories hold what stood before the turn alone.
     try std.testing.expectEqual(@as(usize, 1), app.agent.items.items.len);
     try std.testing.expectEqualStrings("earlier", app.agent.items.items[0].message.text);
     const blocks = app.session.transcript.blocks();
@@ -11144,19 +9395,15 @@ test "Ctrl+N after read-only calls removes the canceled turn on the first press"
     try std.testing.expect(blocks[0].content == .intro);
     try std.testing.expectEqualStrings("earlier", blocks[1].content.user.items);
 
-    // The measurement no longer describes the history, and the cost stays.
     try std.testing.expect(app.agent.measured_context == null);
     try std.testing.expect(app.agent.stats.context_tokens == null);
     try std.testing.expect(app.session.stats_shown.context_tokens == null);
     try std.testing.expectEqual(@as(f64, 0.75), app.agent.stats.cost);
     try std.testing.expectEqual(@as(f64, 0.75), app.session.stats_shown.cost);
 
-    // The cursor of the mirror follows the removed blocks, and the button of
-    // the earlier answer stays live, because that answer is still the newest.
     try std.testing.expectEqual(@as(usize, 2), app.mirror.cursor);
     try std.testing.expect(app.mirror.namesAnswer(5));
 
-    // The removal repaints deeply, so no row of the turn stays reachable.
     try std.testing.expect(app.session.view.force_reset);
     try app.session.paint(.{ .columns = 80, .rows = 24 });
     const painted = try terminal.View.plainText(gpa, out.written()[removed_start..]);
@@ -11165,18 +9412,12 @@ test "Ctrl+N after read-only calls removes the canceled turn on the first press"
     try std.testing.expect(std.mem.indexOf(u8, painted, "the answer") == null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "You canceled the turn.") == null);
 
-    // The offer is gone, so a second Ctrl+N changes nothing.
     try app.handleKey(&.{ .ctrl = 'n' });
     try std.testing.expectEqualStrings("fix it\n\ndraft", app.session.editor.visible());
     try std.testing.expectEqual(@as(usize, 2), app.session.transcript.blocks().len);
     try std.testing.expect(app.turn_future == null);
 }
 
-// A turn that committed a call of a tool that changes the system warns first,
-// because the removal takes the turn out of the conversation while the change
-// stays. Every `bash` call counts, whatever its command, and a call that failed
-// counts too, because the call ran. The second consecutive Ctrl+N removes the
-// turn.
 test "Ctrl+N after a mutating call warns first and removes on the second press" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -11203,7 +9444,6 @@ test "Ctrl+N after a mutating call warns first and removes on the second press" 
         try app.cancelTurn();
         try std.testing.expect(app.revision.?.mutated);
 
-        // The first press changes no history and shows the warning alone.
         try app.handleKey(&.{ .ctrl = 'n' });
         try std.testing.expectEqualStrings(revision_warning, app.session.notice.?.content);
         try std.testing.expectEqual(ai.command.Outcome.Severity.warning, app.session.notice.?.severity);
@@ -11212,7 +9452,6 @@ test "Ctrl+N after a mutating call warns first and removes on the second press" 
         try std.testing.expectEqualStrings("", app.session.editor.visible());
         try std.testing.expectEqual(Session.PromptOffer.revision, app.session.prompt_offer);
 
-        // The second press removes the turn and appends no event of its own.
         try app.handleKey(&.{ .ctrl = 'n' });
         try std.testing.expect(app.revision == null);
         try std.testing.expect(app.session.notice == null);
@@ -11222,7 +9461,6 @@ test "Ctrl+N after a mutating call warns first and removes on the second press" 
         app.session.editor.clear();
     }
 
-    // A failed mutating call still ran, so it still requires the confirmation.
     var result: WorkerResult = undefined;
     var draft = try ui.Editor.Draft.fromText(gpa, "fix it");
     try stageCommittedPromptTurn(&app, &result, .{ .prompt = &draft });
@@ -11255,11 +9493,6 @@ test "Ctrl+N after a mutating call warns first and removes on the second press" 
     try std.testing.expectEqual(@as(usize, 4), app.session.transcript.blocks().len);
 }
 
-// The removal takes exactly the turn: a provider retry event of the turn goes,
-// because it happened during the turn, while a session event that landed inside
-// the range and a command event after the range stay. The same retry event
-// survives the abnormal rewind of the cancellation itself, because it records a
-// request that happened.
 test "Ctrl+N removes the retry event of the turn and keeps the events of the session" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -11284,9 +9517,6 @@ test "Ctrl+N removes the retry event of the turn and keeps the events of the ses
     var result: WorkerResult = undefined;
     var draft = try ui.Editor.Draft.fromText(gpa, "fix it");
     try stageCommittedPromptTurn(&app, &result, .{ .prompt = &draft });
-    // A session event lands inside the turn, and a retry of the next request
-    // follows the committed round. Nothing commits after them, so the rewind of
-    // the cancellation meets both.
     try app.recordAsyncEvent(.information, .{}, "You attached @bot.", .{});
     _ = try app.session.applyTurnEvent(&.{
         .generation = 1,
@@ -11305,16 +9535,12 @@ test "Ctrl+N removes the retry event of the turn and keeps the events of the ses
     try spawnStagedTurn(&app, &result);
     try app.cancelTurn();
 
-    // The rewind took the partial reply and kept the retry event.
-    // [before, user, model, attached, retry, canceled]
     const kept = app.session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 6), kept.len);
     try std.testing.expect(std.mem.indexOf(u8, kept[4].content.event.text.items, "retry attempt 2") != null);
     try std.testing.expectEqualStrings("You canceled the turn.", kept[5].content.event.text.items);
-    // A safe command reports after the range.
     try app.applyOutcome(try ai.command.Outcome.reportEvent(gpa, .information, "changed", .{}));
     try std.testing.expectEqual(@as(usize, 7), app.session.transcript.blocks().len);
-    // The chat holds every block up to the retry event.
     app.mirror.cursor = 5;
 
     try app.handleKey(&.{ .ctrl = 'n' });
@@ -11323,15 +9549,9 @@ test "Ctrl+N removes the retry event of the turn and keeps the events of the ses
     try std.testing.expectEqualStrings("before the turn", blocks[0].content.event.text.items);
     try std.testing.expectEqualStrings("You attached @bot.", blocks[1].content.event.text.items);
     try std.testing.expectEqualStrings("changed", blocks[2].content.event.text.items);
-    // The user box, the answer, and the retry event left below the cursor, so
-    // the cursor stands past the preserved event and sends it no second time.
     try std.testing.expectEqual(@as(usize, 2), app.mirror.cursor);
 }
 
-// Every restored message keeps its place in time: the prompt, then the
-// committed steering, then the uncommitted steering that the cancellation
-// returned, then the text the user typed since. A paste keeps its atom and its
-// exact payload, and the uncommitted steering returns once.
 test "a revision restores the prompt and the committed steering above the editor text" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -11352,8 +9572,6 @@ test "a revision restores the prompt and the committed steering above the editor
     defer app.session.deinit();
     defer app.dropRevision();
 
-    // The prompt is a paste, and two steering messages follow it: the first
-    // commits with the round, the second stays queued.
     const payload = "line\n" ** 15;
     var result: WorkerResult = undefined;
     try app.session.editor.paste(payload, true);
@@ -11384,8 +9602,6 @@ test "a revision restores the prompt and the committed steering above the editor
     try spawnStagedTurn(&app, &result);
     try app.cancelTurn();
 
-    // The uncommitted message returned above the draft, and the revision holds
-    // the prompt and the committed message.
     try std.testing.expectEqualStrings("later\n\ndraft", app.session.editor.visible());
     try std.testing.expectEqual(@as(usize, 1), app.revision.?.steering.items.len);
     try std.testing.expectEqualStrings("and test", app.revision.?.steering.items[0].visible.items);
@@ -11402,9 +9618,6 @@ test "a revision restores the prompt and the committed steering above the editor
     try std.testing.expect(app.turn_future == null);
 }
 
-// The prompt history keeps the entry of the removed prompt, because the user
-// sent it. Enter over the revised draft records the revised prompt as a new
-// entry.
 test "a revision keeps the prompt-history entry and a revised Enter records a new one" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -11436,9 +9649,6 @@ test "a revision keeps the prompt-history entry and a revised Enter records a ne
     try app.finishHistoryTurn();
 }
 
-// An allocation failure in the preflight keeps both histories, every draft,
-// and the offer, so the next Ctrl+N can remove the turn. A stale anchor is a
-// programming error and asserts instead, so no test drives one.
 test "a failed revision changes nothing and keeps the offer" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     const gpa = failing.allocator();
@@ -11464,9 +9674,6 @@ test "a failed revision changes nothing and keeps the offer" {
     try beginCommittedPromptTurn(&app, &result, "fix it", null);
     try app.cancelTurn();
 
-    // The cancellation reserved the editor for the prompt, so a fresh editor
-    // stands in for one whose capacity the user spent. The reserve of the editor
-    // is then the first allocation of the removal.
     app.session.editor.deinit();
     app.session.editor = ui.Editor.init(gpa);
     failing.fail_index = failing.alloc_index;
@@ -11480,18 +9687,12 @@ test "a failed revision changes nothing and keeps the offer" {
     try std.testing.expectEqualStrings("", app.session.editor.visible());
     try expectCanceledTurnStands(&app, 0, 0);
 
-    // The offer still works once memory returns.
     try app.handleKey(&.{ .ctrl = 'n' });
     try std.testing.expect(app.revision == null);
     try std.testing.expectEqualStrings("fix it", app.session.editor.visible());
     try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
 }
 
-// The storage of the capture reserves before the worker joins, so an
-// allocation failure there leaves the turn active with every draft in place.
-// A failure after the join, in the cancellation event, still leaves the
-// context published, and the context names the transcript end without that
-// event, so Ctrl+N removes exactly what stands.
 test "the revision survives an allocation failure around the cancellation" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     const gpa = failing.allocator();
@@ -11531,8 +9732,6 @@ test "the revision survives an allocation failure around the cancellation" {
     result.progress_sequence_committed = 2;
     try spawnStagedTurn(&app, &result);
 
-    // The restore reserve holds, so the capture reserve is the allocation that
-    // fails, and the turn stays active.
     try app.session.reserveSteeringRestore();
     failing.fail_index = failing.alloc_index;
     failing.resize_fail_index = failing.resize_index;
@@ -11544,9 +9743,6 @@ test "the revision survives an allocation failure around the cancellation" {
     try std.testing.expectEqualStrings("and test", app.session.steering.items[0].draft.visible.items);
     try std.testing.expectEqualStrings("fix it", app.session.turn_prompt.?.draft.visible.items);
 
-    // Both reserves hold, so the cancellation event is the allocation that
-    // fails. The context stands with every moved draft, and the transcript end
-    // names the list without the event.
     failing.fail_index = std.math.maxInt(usize);
     failing.resize_fail_index = std.math.maxInt(usize);
     try app.session.reserveRevisionCapture();
@@ -11561,7 +9757,6 @@ test "the revision survives an allocation failure around the cancellation" {
     try std.testing.expectEqualStrings("fix it", revision.prompt.visible.items);
     try std.testing.expectEqual(@as(usize, 1), revision.steering.items.len);
     try std.testing.expectEqualStrings("and test", revision.steering.items[0].visible.items);
-    // [user, model, user "and test"] and no cancellation event.
     try std.testing.expectEqual(@as(usize, 3), app.session.transcript.blocks().len);
     try std.testing.expectEqual(@as(usize, 3), revision.transcript_end);
 
@@ -11571,8 +9766,6 @@ test "the revision survives an allocation failure around the cancellation" {
     try std.testing.expectEqual(@as(usize, 0), app.agent.items.items.len);
 }
 
-// A removed item can carry the proof that a skill is loaded, so the guard
-// searches the shortened history again after the removal.
 test "a revision makes the skill guard search the shortened history again" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -11604,9 +9797,6 @@ test "a revision makes the skill guard search the shortened history again" {
     try std.testing.expect(!app.skill_guard.rules()[0].loaded.load(.monotonic));
 }
 
-// The two offers never coexist: a failure that arms a retry takes a waiting
-// revision, and a cancellation that offers a revision takes a waiting retry.
-// Ctrl+N then acts on the one offer that the caption names.
 test "a retry and a revision replace each other and Ctrl+N acts on the one that waits" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -11628,19 +9818,15 @@ test "a retry and a revision replace each other and Ctrl+N acts on the one that 
     defer app.dropRetry();
     defer app.dropRevision();
 
-    // A cancellation over a waiting retry replaces it with the revision.
     app.setRetry(.{ .failure = try gpa.dupe(u8, "The provider is overloaded.") });
     var result: WorkerResult = undefined;
     try beginCommittedPromptTurn(&app, &result, "fix it", null);
-    // The retry stays through the fake start, because the fake worker spawns
-    // outside `runTurn`.
     try std.testing.expect(app.retry != null);
     try app.cancelTurn();
     try std.testing.expect(app.retry == null);
     try std.testing.expect(app.revision != null);
     try std.testing.expectEqual(Session.PromptOffer.revision, app.session.prompt_offer);
 
-    // A committed failure over the waiting revision replaces it with the retry.
     app.session.beginTurn(2);
     var failed: WorkerResult = .{
         .outcome = .{
@@ -11660,8 +9846,6 @@ test "a retry and a revision replace each other and Ctrl+N acts on the one that 
     try std.testing.expectEqual(Session.PromptOffer.retry, app.session.prompt_offer);
     try std.testing.expectEqual(Herdr.State.blocked, app.herdrState());
 
-    // Ctrl+N over the retry continues: the signed-out worker reports the
-    // failure of the attempt, and the transcript keeps the canceled turn.
     try app.session.editor.insert("keep");
     try app.handleKey(&.{ .ctrl = 'n' });
     try std.testing.expect(app.session.mode == .prompt);
@@ -11674,9 +9858,6 @@ test "a retry and a revision replace each other and Ctrl+N acts on the one that 
     try std.testing.expectEqual(@as(usize, 2), app.agent.items.items.len);
 }
 
-// A retry belongs to the conversation, not to one configuration: an account switch
-// keeps it, and Ctrl+N then runs on the account the user chose. `/new` clears the
-// conversation and the retry together.
 test "a retry survives an account switch and Ctrl+N routes to it" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -11715,8 +9896,6 @@ test "a retry survives an account switch and Ctrl+N routes to it" {
     try app.expectModel(test_openai_model.name());
     try std.testing.expectEqual(@as(usize, 1), app.session.transcript.blocks().len);
 
-    // Ctrl+N reaches the turn start on the chosen account. The exhausted generation
-    // stops it there, and its rollback keeps the retry for another try.
     app.turn_generation = std.math.maxInt(u64);
     try std.testing.expectError(
         error.GenerationExhausted,
@@ -11730,13 +9909,10 @@ test "a retry survives an account switch and Ctrl+N routes to it" {
     try app.applyOutcome(.new_conversation);
     try std.testing.expect(app.retry == null);
     try std.testing.expectEqual(Session.PromptOffer.none, app.session.prompt_offer);
-    // The event of the account switch goes, and the intro line takes its place.
     try std.testing.expectEqual(@as(usize, 1), app.session.transcript.blocks().len);
     try std.testing.expect(app.session.transcript.blocks()[0].content == .intro);
 }
 
-// A waiting retry restricts no command, because it owns no key but Ctrl+N. A
-// `/skill:` line starts its own turn, and that start drops the stale context.
 test "a skill line runs while a retry waits and takes the context with it" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -11783,7 +9959,6 @@ test "a skill line runs while a retry waits and takes the context with it" {
     defer prompt.deinit(gpa);
     _ = try app.startSkillTurn(&prompt);
 
-    // The line ran, and its turn took the waiting context with it.
     try std.testing.expect(app.session.notice == null);
     try std.testing.expect(app.retry == null);
     try std.testing.expectEqual(Session.PromptOffer.none, app.session.prompt_offer);
@@ -11802,8 +9977,6 @@ test "a skill line runs while a retry waits and takes the context with it" {
     try app.finishWorkerResult(&result);
 }
 
-// Signed out, Drinky must refuse a normal message with a /login prompt rather
-// than spawn a turn against no client.
 test "a signed-out submit is refused with a login prompt" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -11832,11 +10005,6 @@ test "a signed-out submit is refused with a login prompt" {
     try std.testing.expect(std.mem.indexOf(u8, notice.content, "/login") != null);
 }
 
-// A refused slash line is no dead end. One Enter arms the send, and the next Enter
-// puts the line on the model path as typed. Every other key drops the arm, and a
-// turn end drops it too, so the send always belongs to the line on screen. Signed
-// out, the model path stops at the login prompt, which proves the line skipped the
-// registry.
 test "a refused command line reaches the model on the next Enter" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -11864,7 +10032,6 @@ test "a refused command line reaches the model on the next Enter" {
     );
     try std.testing.expectEqualStrings("/nope tell me about this", app.session.editor.visible());
 
-    // An edit invalidates the arm, so the line refuses again instead of sending.
     try app.handleKey(&.{ .char = 'x' });
     try std.testing.expect(!app.session.confirmations.contains(.message));
     try app.handleKey(&.backspace);
@@ -11874,9 +10041,6 @@ test "a refused command line reaches the model on the next Enter" {
     try std.testing.expect(app.session.confirmations.contains(.message));
     try app.handleKey(&.enter);
 
-    // The second Enter took the message path: no registry refusal, and the
-    // signed-out guard stopped the turn. That guard starts no turn, so the line
-    // stays where the user typed it.
     try std.testing.expect(!app.session.confirmations.contains(.message));
     try std.testing.expect(app.session.mode == .prompt);
     try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
@@ -11886,9 +10050,6 @@ test "a refused command line reaches the model on the next Enter" {
     try std.testing.expectEqualStrings("/nope tell me about this", app.session.editor.visible());
 }
 
-// The same confirmation during a turn queues the line as steering, so a slash line
-// can steer a running turn. A runnable command never arms, because the next Enter
-// runs it once the turn ends.
 test "a refused command line queues as steering on the next Enter" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -11908,7 +10069,6 @@ test "a refused command line queues as steering on the next Enter" {
     defer app.session.deinit();
     app.session.beginTurn(1);
 
-    // A runnable command offers no send, so a second Enter refuses again.
     try app.session.editor.insert("/model");
     try app.handleKey(&.enter);
     try std.testing.expect(!app.session.confirmations.contains(.message));
@@ -11935,10 +10095,6 @@ test "a refused command line queues as steering on the next Enter" {
     try std.testing.expectEqualStrings("/nope steer with this", taken[0]);
 }
 
-// The user can read the queue offer while the turn ends under it. The turn end is
-// no key event, so the offer and its row must both go: a row that stays invites an
-// Enter that no longer queues. The line waits in the editor, and the next Enter
-// offers the send that the prompt does.
 test "a turn that ends under the queue offer clears the row too" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -11965,7 +10121,6 @@ test "a turn that ends under the queue offer clears the row too" {
         app.session.notice.?.content,
     );
 
-    // The turn ends while that row is on screen.
     try app.session.endTurnWithReceipt(&.{
         .history_base = 0,
         .history_end = 0,
@@ -11975,7 +10130,6 @@ test "a turn that ends under the queue offer clears the row too" {
     try std.testing.expect(!app.session.confirmations.contains(.message));
     try std.testing.expect(app.session.notice == null);
 
-    // The line survived, so one Enter offers the send again and starts no turn.
     try app.handleKey(&.enter);
     try std.testing.expectEqualStrings(
         "/nope tell me about this",
@@ -11989,9 +10143,6 @@ test "a turn that ends under the queue offer clears the row too" {
     try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
 }
 
-// A sentence that starts with a command name is a command line, so an idle Enter
-// keeps it local. The command never runs, this Enter sends nothing, and the text
-// stays in the editor with one offer to send it.
 test "an idle submit of a slash line with a tail is refused and keeps its text" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -12014,8 +10165,6 @@ test "an idle submit of a slash line with a tail is refused and keeps its text" 
     try app.session.editor.insert("/new must clear the terminal scrollback");
     try app.submit();
 
-    // `/new` never ran, so the history stands and no conversation reset happened.
-    // No turn started either, so the line reached no provider.
     try std.testing.expectEqual(@as(usize, 1), app.session.transcript.blocks().len);
     try std.testing.expect(app.session.mode == .prompt);
     const notice = app.session.notice.?;
@@ -12028,12 +10177,9 @@ test "an idle submit of a slash line with a tail is refused and keeps its text" 
         "/new must clear the terminal scrollback",
         app.session.editor.visible(),
     );
-    // The row is a control hint, so the next Enter owns the send.
     try std.testing.expect(app.session.confirmations.contains(.message));
 }
 
-// Drinky classifies a large paste that expands to a slash command from its expanded
-// text, never its marker label. The label never reaches command dispatch.
 test "a large pasted slash command is classified from expanded text" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -12052,17 +10198,14 @@ test "a large pasted slash command is classified from expanded text" {
     app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
 
-    // One command name of more than 1000 bytes: large enough to collapse to a marker.
     try app.session.editor.paste("/nope" ++ "x" ** 1000, true);
     try std.testing.expectEqual(@as(usize, 1), app.session.editor.draft.atoms.items.len);
 
     try app.submit();
 
-    // The command ran off the expanded name, not the "[paste …]" label.
     try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
     const notice = app.session.notice.?;
     try std.testing.expectEqual(ai.command.Outcome.Severity.warning, notice.severity);
-    // The whole expanded name reached dispatch, not just its first bytes.
     try std.testing.expect(std.mem.startsWith(
         u8,
         notice.content,
@@ -12070,7 +10213,6 @@ test "a large pasted slash command is classified from expanded text" {
     ));
     try std.testing.expect(std.mem.endsWith(u8, notice.content, "x" ** 1000 ++ "."));
     try std.testing.expect(std.mem.indexOf(u8, notice.content, "paste") == null);
-    // The refused line stays in the editor, and its paste keeps its single atom.
     try std.testing.expectEqual(@as(usize, 1), app.session.editor.draft.atoms.items.len);
 }
 
@@ -12090,7 +10232,6 @@ test "Esc, Ctrl+C, and Ctrl+D each cancel the picker with context" {
         options[0] = .{ .name = try gpa.dupe(u8, "alpha") };
         try app.session.applyOutcome(.{
             .pick = .{
-                // Never called: every key under test cancels.
                 .select = undefined,
                 .title = "Sign in",
                 .cancellation_message = "You canceled the sign-in selection.",
@@ -12110,9 +10251,6 @@ test "Esc, Ctrl+C, and Ctrl+D each cancel the picker with context" {
     }
 }
 
-// Esc leaves one step of a stepped command, so a repeat walks the whole way out.
-// The mode stays in the picker on the way up, so the keys behind that Esc are
-// kept and a fast repeat reaches the prompt.
 test "Esc opens the step above the picker and cancels at the first step" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -12149,34 +10287,24 @@ test "Esc opens the step above the picker and cancels at the first step" {
     try std.testing.expectEqualStrings("Provider", vendors.title);
     try std.testing.expect(!vendors.can_step_back);
 
-    // The active account marks and opens on its own provider, and the walk goes
-    // down the other one. Each provider holds one authenticated account here, so
-    // the row opens the model list of that account and skips the account step.
     try std.testing.expectEqual(@as(usize, 0), vendors.cursor);
     try app.handleKey(&.down);
     try app.handleKey(&.enter);
     const listed_models = &app.session.mode.picking.picker;
     try std.testing.expectEqualStrings("Model: openai-api-key", listed_models.title);
-    // The remembered model gets the cursor. It is not current under the inactive account.
     try std.testing.expect(listed_models.marked == null);
     try std.testing.expectEqual(@as(usize, 1), listed_models.cursor);
     try std.testing.expect(listed_models.can_step_back);
 
-    // Two Escape bytes in one chunk. The first opens the step above, and the
-    // second stays for its own key instead of draining with an exit.
     try app.handleKeys("\x1b\x1b");
     try std.testing.expect(app.session.mode == .picking);
     const reopened_vendors = &app.session.mode.picking.picker;
     try std.testing.expectEqualStrings("Provider", reopened_vendors.title);
-    // The list opens on the row the walk left, not on the default row. One Enter
-    // therefore returns to the same branch.
     try std.testing.expectEqual(@as(usize, 1), reopened_vendors.cursor);
-    // The tag still names the account in use, which the walk did not change.
     try std.testing.expectEqual(@as(usize, 0), reopened_vendors.marked.?);
     try std.testing.expect(app.input.pendingEscape());
     try std.testing.expect(app.session.notice == null);
 
-    // The first step has no step above it, so Esc there leaves the command.
     try app.handleKey(&.escape);
     try std.testing.expect(app.session.mode == .prompt);
     try std.testing.expectEqualStrings(
@@ -12185,8 +10313,6 @@ test "Esc opens the step above the picker and cancels at the first step" {
     );
     try app.expectModel(test_anthropic_model.name());
 
-    // Ctrl+C leaves the whole command from any step, so a deep flow keeps a
-    // one-key way out.
     try app.session.editor.insert("/model");
     try app.submit();
     try app.handleKey(&.enter);
@@ -12195,15 +10321,10 @@ test "Esc opens the step above the picker and cancels at the first step" {
     try std.testing.expect(app.session.mode == .prompt);
 }
 
-// A fake fetch worker that returns a fixed result at once, so a test drives the
-// join and the picker rebuild without a socket.
 fn fakeFetch(result: *const ai.Accounts.Refresh) ai.Accounts.Refresh {
     return result.*;
 }
 
-/// Test scaffolding: an app at the model step of the `anthropic-api-key` account, with
-/// the provider step on the trail. The account offers no model yet, so the step
-/// holds the fetch row alone.
 fn openModelStepForTest(app: *App, out: *std.Io.Writer.Allocating, home: []const u8) !void {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -12231,9 +10352,6 @@ fn openModelStepForTest(app: *App, out: *std.Io.Writer.Allocating, home: []const
     try std.testing.expect(picker.can_step_back);
 }
 
-/// Test scaffolding: the state `startFetch` leaves behind, over a worker that
-/// returns `result` instead of a request. The real worker reaches the network,
-/// so a test never spawns it.
 fn spawnFakeFetch(app: *App, result: *const ai.Accounts.Refresh) !void {
     const generation = try reserveGeneration(&app.fetch_generation);
     app.fetch = .{
@@ -12244,9 +10362,6 @@ fn spawnFakeFetch(app: *App, result: *const ai.Accounts.Refresh) !void {
     try app.session.beginPickerWait(fetch_wait_text);
 }
 
-// The fetch leaves the consumer, so the picker waits with no rows until the
-// wakeup joins the result. The result rebuilds the same step over the list that
-// arrived, with the report beside it and the trail above it intact.
 test "a fetch wakeup rebuilds the model step over the fetched list" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -12272,13 +10387,10 @@ test "a fetch wakeup rebuilds the model step over the fetched list" {
     try std.testing.expect(app.session.animating());
     try std.testing.expectEqual(@as(usize, 0), app.session.mode.picking.picker.options.len);
 
-    // A wakeup of another generation belongs to a fetch that a cancel already
-    // joined, so it joins nothing.
     _ = try app.applyBatch(&.{.{ .fetch_ended = 99 }});
     try std.testing.expect(app.fetch != null);
     try std.testing.expect(app.session.pickerWaits());
 
-    // The worker stored the list before its wakeup. The join reads it.
     try ai.testing.seedAccount(&app.accounts, .anthropic_api_key, &.{"claude-opus-5"});
     _ = try app.applyBatch(&.{.{ .fetch_ended = app.fetch.?.generation }});
     try std.testing.expect(app.fetch == null);
@@ -12292,7 +10404,6 @@ test "a fetch wakeup rebuilds the model step over the fetched list" {
     try std.testing.expect(rebuilt.marked == null);
     try std.testing.expectEqual(@as(usize, 1), rebuilt.cursor);
     try std.testing.expect(rebuilt.can_step_back);
-    // The missed metadata states itself in the scrollback beside the list.
     const blocks = app.session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 1), blocks.len);
     try std.testing.expect(std.mem.indexOf(
@@ -12301,13 +10412,10 @@ test "a fetch wakeup rebuilds the model step over the fetched list" {
         "ConnectionTimedOut",
     ) != null);
 
-    // The rebuilt step still returns to the provider step above it.
     try app.handleKey(&.escape);
     try std.testing.expectEqualStrings("Provider", app.session.mode.picking.picker.title);
 }
 
-// A fetch whose account list never arrived opens no list. The picker closes and
-// the failure goes to the transcript, as the blocking fetch did before.
 test "a failed fetch closes the picker and records the failure" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -12340,9 +10448,6 @@ test "a failed fetch closes the picker and records the failure" {
     );
 }
 
-// Esc ends one thing. During a fetch that thing is the fetch: the worker joins,
-// the step that asked for it returns with its rows, and the trail above it
-// stands. A late wakeup of the joined fetch changes nothing.
 test "Esc cancels a fetch and returns the rows of its step" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -12365,7 +10470,6 @@ test "Esc cancels a fetch and returns the rows of its step" {
     try spawnFakeFetch(&app, &result);
     const generation = app.fetch.?.generation;
 
-    // A key that moves or selects a row has no row to act on, so the wait holds.
     try app.handleKey(&.down);
     try app.handleKey(&.enter);
     try std.testing.expect(app.fetch != null);
@@ -12385,19 +10489,14 @@ test "Esc cancels a fetch and returns the rows of its step" {
     );
     try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
 
-    // The joined worker can have left its wakeup in the queue.
     _ = try app.applyBatch(&.{.{ .fetch_ended = generation }});
     try std.testing.expect(app.fetch == null);
     try std.testing.expect(app.session.mode == .picking);
 
-    // The next Esc leaves the step, as it did before the fetch.
     try app.handleKey(&.escape);
     try std.testing.expectEqualStrings("Provider", app.session.mode.picking.picker.title);
 }
 
-// Ctrl+C and Ctrl+D leave the whole command from any step, and a fetch is no
-// exception. The worker joins with the picker, so no result reaches a picker
-// that is gone.
 test "Ctrl+C during a fetch leaves the command and joins the worker" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -12430,9 +10529,6 @@ test "Ctrl+C during a fetch leaves the command and joins the worker" {
     try std.testing.expect(app.session.mode == .prompt);
 }
 
-// The trail holds every picker the walk down replaced, so the walk up reaches the
-// command list that started it. A step that Drinky skipped opened no picker, so
-// it enters no trail and the walk up skips it too.
 test "Esc walks back through the command list that opened the command" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -12470,9 +10566,6 @@ test "Esc walks back through the command list that opened the command" {
         if (std.mem.eql(u8, option.name, "/model")) break index;
     } else return error.MissingModelRow;
 
-    // Down to the last row and back up to the model row, in a window too short
-    // for the list. The row then sits inside a scrolled window, so the walk must
-    // return the window too and not the row alone.
     const window: terminal.View.Size = .{ .columns = 80, .rows = 12 };
     const last_row = commands.options.len - 1;
     for (0..last_row) |_| try app.handleKey(&.down);
@@ -12484,8 +10577,6 @@ test "Esc walks back through the command list that opened the command" {
     try std.testing.expectEqual(model_row, left_cursor);
     try std.testing.expect(left_scroll > 0);
 
-    // Down to the model list: the list, the provider step, and the account step
-    // that one authenticated account per provider skips.
     try app.handleKey(&.enter);
     try std.testing.expectEqualStrings("Provider", app.session.mode.picking.picker.title);
     try app.handleKey(&.enter);
@@ -12494,8 +10585,6 @@ test "Esc walks back through the command list that opened the command" {
         app.session.mode.picking.picker.title,
     );
 
-    // Up again, one Esc per picker the walk down opened. Each step marks the
-    // frame, because a step that paints nothing leaves the old list on screen.
     app.session.dirty = false;
     try app.handleKey(&.escape);
     try std.testing.expectEqualStrings("Provider", app.session.mode.picking.picker.title);
@@ -12507,15 +10596,11 @@ test "Esc walks back through the command list that opened the command" {
     try std.testing.expectEqualStrings("Command", reopened.title);
     try std.testing.expect(!reopened.can_step_back);
     try std.testing.expect(app.session.dirty);
-    // The list opens where it was left, so the next Enter runs the same command
-    // and the window does not jump. The list marks no row, so nothing but the
-    // trail holds either value.
     try std.testing.expectEqualStrings("/model", reopened.options[reopened.cursor].name);
     try std.testing.expectEqual(left_cursor, reopened.cursor);
     try std.testing.expectEqual(left_scroll, reopened.scroll);
     try std.testing.expect(reopened.marked == null);
 
-    // The list is the first step, so the next Esc leaves the command.
     try app.handleKey(&.escape);
     try std.testing.expect(app.session.mode == .prompt);
     try std.testing.expectEqualStrings(
@@ -12524,9 +10609,6 @@ test "Esc walks back through the command list that opened the command" {
     );
 }
 
-// The command list is the first picker over a picker. A row that opens a list
-// replaces the layer, and the picked skill line lands in the editor, where the
-// user adds the task.
 test "the command list opens the skill list and writes the picked line" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -12566,13 +10648,11 @@ test "the command list opens the skill list and writes the picked line" {
     });
     defer app.skills.deinit();
 
-    // The bare slash opens the command list and clears the line it ran.
     try app.session.editor.insert("/");
     try app.submit();
     try std.testing.expect(app.session.mode == .picking);
     try std.testing.expect(app.session.editor.blank());
 
-    // The `/skill` row opens the skill list over the command list.
     const commands = &app.session.mode.picking.picker;
     commands.cursor = for (commands.options, 0..) |*option, index| {
         if (std.mem.eql(u8, option.name, "/skill")) break index;
@@ -12585,8 +10665,6 @@ test "the command list opens the skill list and writes the picked line" {
     try std.testing.expectEqualStrings("/skill:demo", listed_skills.options[0].name);
     try std.testing.expectEqualStrings("Shape a demo.", listed_skills.options[0].extra.?);
 
-    // The skill row closes the picker and writes its line, with the trailing
-    // blank that marks where the task goes.
     try app.handleKey(&enter);
     try std.testing.expect(app.session.mode == .prompt);
     try std.testing.expectEqualStrings("/skill:demo ", app.session.editor.visible());
@@ -12635,7 +10713,6 @@ test "a transcript event survives later typing" {
     try std.testing.expectEqualStrings("backend failed", blocks[0].content.event.text.items);
 }
 
-/// The absolute path of `suffix` inside a test temporary directory.
 fn tmpPath(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -12647,8 +10724,6 @@ fn tmpPath(
     return std.fs.path.join(gpa, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, suffix });
 }
 
-// The startup records no count. A file that a source skipped is the one thing
-// the user must fix, so it alone gets a line.
 test "the startup reports a skipped file alone" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -12730,9 +10805,6 @@ test "/sources opens the composed page alone and escape restores the conversatio
     try std.testing.expectEqual(@as(usize, 1), app.session.transcript.blocks().len);
 }
 
-// A configured rule reaches the guard only through a discovered skill. A name
-// that no skill carries must report itself, or a write passes that the user
-// believes is guarded.
 test "a configured required skill applies, and an unknown name reports" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -12786,8 +10858,6 @@ test "a configured required skill applies, and an unknown name reports" {
     try app.resolveRequiredSkills(&config, &notices, &missing);
     try app.reportNotices(notices.items);
 
-    // The pair that resolved guards its files, and it names the file that the
-    // scan discovered.
     try std.testing.expectEqual(@as(usize, 1), app.skill_guard.rules().len);
     const target = try std.fs.path.join(gpa, &.{ root, "src", "App.zig" });
     defer gpa.free(target);
@@ -12799,15 +10869,12 @@ test "a configured required skill applies, and an unknown name reports" {
     })).?;
     defer refused.deinit(gpa);
     try std.testing.expect(std.mem.indexOf(u8, refused.content, "skill demo") != null);
-    // The rule points at the file that the scan discovered, so a delivery and a
-    // proof both read that file.
     try std.testing.expect(std.mem.endsWith(
         u8,
         app.skill_guard.rules()[0].source,
         ".agents/skills/demo/SKILL.md",
     ));
 
-    // The pair Drinky could not resolve guards nothing and reports itself.
     const typescript = try std.fs.path.join(gpa, &.{ root, "src", "view.ts" });
     defer gpa.free(typescript);
     try std.testing.expect((try app.skill_guard.refusal(&.{
@@ -12816,8 +10883,6 @@ test "a configured required skill applies, and an unknown name reports" {
         .path = typescript,
         .history = &.{},
     })) == null);
-    // A missing name is a normal state of the global config, so it leaves no
-    // message of its own. Each pair that names it goes to the sources page.
     try std.testing.expectEqual(@as(usize, 0), notices.items.len);
     try std.testing.expectEqual(@as(usize, 2), missing.items.len);
     try std.testing.expectEqualStrings("**/*.ts", missing.items[0].glob);
@@ -12836,13 +10901,10 @@ test directoryLabel {
     defer gpa.free(inside);
     try std.testing.expectEqualStrings("~/github/drinky", inside);
 
-    // A sibling that shares a name prefix is not inside the home directory.
     const outside = try directoryLabel(gpa, "/home/clemens2/work", "/home/clemens");
     defer gpa.free(outside);
     try std.testing.expectEqualStrings("/home/clemens2/work", outside);
 
-    // A home directory that is a root already ends with the separator, which the
-    // directory below it keeps and the root itself does not.
     const below_root = try directoryLabel(gpa, "/work", "/");
     defer gpa.free(below_root);
     try std.testing.expectEqualStrings("~/work", below_root);
@@ -12851,7 +10913,6 @@ test directoryLabel {
     defer gpa.free(root);
     try std.testing.expectEqualStrings("~", root);
 
-    // A long path keeps its tail, and the cut lands on a display boundary.
     const capped = try directoryLabel(gpa, "/ä" ** 80, "/home");
     defer gpa.free(capped);
     try std.testing.expect(capped.len <= ui.status.directory_bytes_max);
@@ -12859,8 +10920,6 @@ test directoryLabel {
     try std.testing.expect(std.mem.startsWith(u8, capped, "…"));
     try std.testing.expect(std.mem.endsWith(u8, capped, "/ä"));
 
-    // A grapheme cluster survives the cut whole. Each flag is two code points,
-    // and the tail holds only whole flags.
     const flag = "/🇩🇪";
     const flags = try directoryLabel(gpa, flag ** 20, "/home");
     defer gpa.free(flags);
@@ -12885,13 +10944,10 @@ test homeDirectory {
     const link = try tmpPath(gpa, io, &tmp, "link");
     defer gpa.free(link);
 
-    // A symbolic link in HOME resolves, so the label can compare it with the
-    // canonical working directory.
     const canonical = try homeDirectory(gpa, io, "/", link);
     defer gpa.free(canonical);
     try std.testing.expectEqualStrings(real, canonical);
 
-    // A home directory that does not exist keeps its lexical path.
     const missing = try homeDirectory(gpa, io, "/work", "../elsewhere");
     defer gpa.free(missing);
     try std.testing.expectEqualStrings("/elsewhere", missing);
@@ -12915,7 +10971,6 @@ test refreshBranch {
     app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
 
-    // Outside a repository the status line shows the directory alone.
     app.refreshBranch();
     try std.testing.expect(app.session.branch() == null);
     try std.testing.expect(!app.session.dirty);
@@ -12923,20 +10978,16 @@ test refreshBranch {
     app.session.branch_root = root;
     app.refreshBranch();
     try std.testing.expectEqualStrings("topic", app.session.branch().?);
-    // A changed branch repaints, and an unchanged one does not.
     try std.testing.expect(app.session.dirty);
     app.session.dirty = false;
     app.refreshBranch();
     try std.testing.expect(!app.session.dirty);
 
-    // A head Drinky cannot read leaves the directory standing alone.
     try tmp.dir.writeFile(io, .{ .sub_path = ".git/HEAD", .data = "garbage\n" });
     app.refreshBranch();
     try std.testing.expect(app.session.branch() == null);
 }
 
-// Herdr labels its pane with the directory and the branch, so the status line
-// inside a pane shows neither, and no key reads the head.
 test showProject {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -12971,9 +11022,6 @@ test showProject {
     try std.testing.expectEqualStrings("topic", app.session.branch().?);
 }
 
-// A Herdr pane hides the place from the status line, because the pane shows it.
-// The status answer is one line that stands on its own in the chat and in a
-// copy, so it states the full place with the branch there too.
 test "the status answer states the branch inside a Herdr pane" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -13000,8 +11048,6 @@ test "the status answer states the branch inside a Herdr pane" {
     try std.testing.expectEqualStrings("", app.session.directory_shown);
     try std.testing.expect(app.session.branch() == null);
 
-    // The answer carries no bot name, because the state of the session is the
-    // same under every bot and under none.
     const text = try app.statusText();
     defer gpa.free(text);
     try std.testing.expectEqualStrings(
@@ -13011,8 +11057,6 @@ test "the status answer states the branch inside a Herdr pane" {
     );
 }
 
-// A checkout in another terminal shows on the next key, so the label needs no
-// turn to follow it.
 test "an input event re-reads the branch" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -13077,8 +11121,6 @@ test "cancel draining preserves non-turn events ahead of newer queue data" {
         .progress_sequence = 2,
         .payload = .{ .usage = .{} },
     } });
-    // A second cancellation before the loop consumes this prefix leaves newer
-    // data in the queue. It does not append beyond the bounded deferred buffer.
     try std.testing.expect(app.drainCanceledProgress(true) == null);
     try std.testing.expectEqual(queue_capacity - 1, app.deferred_event_count);
 
@@ -13145,9 +11187,6 @@ test "progress allocation failure still finalizes a canceled turn" {
     failing.resize_fail_index = std.math.maxInt(usize);
 }
 
-// A cancel that commits nothing returns the submitted prompt to the editor as a
-// rich draft, its collapsed paste preserved for an exact expansion. It shows no
-// `canceled` line (the turn simply vanished).
 test "cancel returns the submitted prompt as a rich draft with its paste placeholder" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -13167,7 +11206,6 @@ test "cancel returns the submitted prompt as a rich draft with its paste placeho
     defer app.session.deinit();
     app.session.beginTurn(1);
 
-    // The retained prompt is a rich draft, exactly as `submit` detaches it.
     const payload = "line\n" ** 15;
     try app.session.editor.paste(payload, true);
     var prompt = app.session.editor.detachTrimmed();
@@ -13181,12 +11219,9 @@ test "cancel returns the submitted prompt as a rich draft with its paste placeho
     const expanded = try app.session.editor.expanded(.none);
     defer gpa.free(expanded);
     try std.testing.expectEqualStrings(payload, expanded);
-    // Nothing committed, so the tail rewound to empty and no cancellation event shows.
     try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
 }
 
-// Committed progress queued but not yet read lands before the rewind, so a
-// partial-commit cancel keeps its presented round and adds `canceled`.
 test "a committed cancel drains queued progress into the transcript before rewinding" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -13212,8 +11247,6 @@ test "a committed cancel drains queued progress into the transcript before rewin
     var prompt = try ui.Editor.Draft.fromText(gpa, "prompt");
     app.session.retainTurnPrompt(&prompt, base);
 
-    // The committed round's progress is still queued, unread by the consumer.
-    // Its usage snapshot predates the final canceled-stream accounting.
     app.agent.stats.cost = 2.5;
     const queued = [_]UiEvent{
         .{ .turn = .{
@@ -13264,7 +11297,6 @@ test "a committed cancel drains queued progress into the transcript before rewin
 
     try std.testing.expect(app.session.mode == .prompt);
     const blocks = app.session.transcript.blocks();
-    // [user "prompt", model "answer", the read call and its box line, cancellation event]
     try std.testing.expectEqual(@as(usize, 4), blocks.len);
     try std.testing.expectEqualStrings("prompt", blocks[0].content.user.items);
     try std.testing.expectEqualStrings("answer", blocks[1].content.model.items);
@@ -13278,8 +11310,6 @@ test "a committed cancel drains queued progress into the transcript before rewin
         blocks[3].content.event.text.items,
     );
     try std.testing.expectEqual(@as(f64, 2.5), app.session.stats_shown.cost);
-    // The committed turn with its prompt leaves the revision offer, whose range
-    // covers the drained round and the cancellation event.
     defer app.dropRevision();
     const revision = app.revision.?;
     try std.testing.expectEqual(@as(usize, 0), revision.transcript_base);
@@ -13288,10 +11318,6 @@ test "a committed cancel drains queued progress into the transcript before rewin
 }
 
 test "the frame grid holds a fixed period through a late wake and a slow paint" {
-    // Model the consumer loop. The timer wakes late, the frame paints, and the
-    // loop then arms the next one. Every deadline must stay exactly one interval
-    // after the previous one, so the lateness and the paint cost never add to the
-    // period. A per-frame reset of the grid destroys this property.
     const wake_late_ns: i96 = 3 * std.time.ns_per_ms;
     const paint_ns: i96 = 5 * std.time.ns_per_ms;
     var grid: FrameGrid = .reset(1000);
@@ -13300,8 +11326,6 @@ test "the frame grid holds a fixed period through a late wake and a slow paint" 
         const armed_ns = previous_ns + wake_late_ns + paint_ns;
         grid.advance(armed_ns);
         try std.testing.expectEqual(previous_ns + FrameGrid.interval_ns, grid.deadline_ns);
-        // Anchored on the wake instead, the period grows by the lateness and the
-        // paint cost on every frame.
         try std.testing.expect(grid.deadline_ns != armed_ns + FrameGrid.interval_ns);
         previous_ns = grid.deadline_ns;
     }
@@ -13309,20 +11333,15 @@ test "the frame grid holds a fixed period through a late wake and a slow paint" 
 }
 
 test "the frame grid starts again after an overrun or an idle wait" {
-    // A frame that overran its slot fires at once and starts the grid again, so a
-    // slow frame cannot leave a backlog of missed deadlines behind it.
     var grid: FrameGrid = .reset(1000);
     const overrun_ns: i96 = 1000 + 20 * std.time.ns_per_ms;
     grid.advance(overrun_ns);
     try std.testing.expectEqual(overrun_ns, grid.deadline_ns);
 
-    // A wake from an idle channel starts the grid again too, so the first frame
-    // after it paints at once instead of after a whole interval.
     const idle_ns: i96 = 5 * std.time.ns_per_s;
     grid.advance(idle_ns);
     try std.testing.expectEqual(idle_ns, grid.deadline_ns);
 
-    // The grid picks the fixed period up again from there.
     grid.advance(idle_ns);
     try std.testing.expectEqual(idle_ns + FrameGrid.interval_ns, grid.deadline_ns);
 }
@@ -13333,9 +11352,6 @@ const remote_ok_true = "{\"ok\":true,\"result\":true}";
 const remote_ok_empty = "{\"ok\":true,\"result\":[]}";
 const remote_ok_sent = "{\"ok\":true,\"result\":{\"message_id\":1}}";
 
-/// Test scaffolding: an app whose Telegram calls reach the loopback `server`
-/// through `io`, with a session and a signed-out agent. The caller frees it with
-/// `deinitRemoteTest`.
 fn initRemoteTest(
     self: *App,
     gpa: std.mem.Allocator,
@@ -13362,8 +11378,6 @@ fn initRemoteTest(
 }
 
 fn deinitRemoteTest(self: *App) void {
-    // The bot ends without the last message of the chat, so no test waits out a
-    // drain window that it does not test.
     self.controller.detach(.exit) catch {};
     self.controller.abortDetach() catch {};
     self.controller.deinit();
@@ -13376,8 +11390,6 @@ fn deinitRemoteTest(self: *App) void {
     self.agent.deinit();
 }
 
-/// Apply queued events until `count_min` of them applied, and wait up to about
-/// five seconds for them. A worker that never reports fails the test.
 fn pumpRemoteEvents(self: *App, count_min: usize) !void {
     var batch: [queue_capacity]UiEvent = undefined;
     var applied: usize = 0;
@@ -13393,7 +11405,6 @@ fn pumpRemoteEvents(self: *App, count_min: usize) !void {
     return error.TestTimedOut;
 }
 
-/// The text of the last transcript event.
 fn lastEventText(self: *const App) []const u8 {
     const blocks = self.session.transcript.blocks();
     return blocks[blocks.len - 1].content.event.text.items;
@@ -13430,7 +11441,6 @@ test "/remote lists the saved bots, and the remove row drops one with an event" 
     try std.testing.expectEqualStrings("@first_bot", picker.options[0].name);
     try std.testing.expectEqualStrings("Remove a bot", picker.options[3].name);
 
-    // The remove row opens the second list, and one pick is the decision.
     try app.handleKeys("\x1b[B\x1b[B\x1b[B\r");
     try std.testing.expect(app.session.mode == .picking);
     try std.testing.expectEqualStrings("Remove a bot", app.session.mode.picking.picker.title);
@@ -13461,8 +11471,6 @@ test "the add row opens the token prompt, and every exit key or a bad token keep
     defer app.session.deinit();
     defer app.controller.deinit();
 
-    // With no saved bot the picker holds the add row alone, so Enter opens the
-    // token prompt under its caption.
     try app.session.editor.insert("/remote");
     try app.submit();
     try app.handleKeys("\r");
@@ -13474,8 +11482,6 @@ test "the add row opens the token prompt, and every exit key or a bad token keep
     try app.session.paint(.{ .columns = 80, .rows = 24 });
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "Enter: Save") != null);
 
-    // Enter on an empty prompt asks for the token, and a malformed token never
-    // reaches the network.
     try app.handleKeys("\r");
     try std.testing.expectEqualStrings("Type the bot token.", app.session.notice.?.content);
     try app.handleKeys("not a token\r");
@@ -13483,7 +11489,6 @@ test "the add row opens the token prompt, and every exit key or a bad token keep
     try std.testing.expect(std.mem.indexOf(u8, app.session.notice.?.content, "digits") != null);
     try std.testing.expectEqualStrings("not a token", app.session.editor.visible());
 
-    // Ctrl+C clears the draft first and ends the prompt at an empty editor.
     try app.handleKeys("\x03");
     try std.testing.expectEqual(remote.Controller.State.token_prompt, app.controller.state());
     try std.testing.expectEqualStrings("", app.session.editor.visible());
@@ -13493,7 +11498,6 @@ test "the add row opens the token prompt, and every exit key or a bad token keep
     try std.testing.expectEqualStrings("You canceled the bot token.", app.session.notice.?.content);
     try std.testing.expect(app.running);
 
-    // Esc and Ctrl+D end the prompt too, and neither reaches past it.
     try app.runCommand("/remote");
     try app.handleKeys("\r");
     try app.handleKeys("123:abc");
@@ -13514,7 +11518,6 @@ test "Enter on the token-check wait starts no turn" {
     const io = threaded.io();
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    // No script answers, so the check waits until shutdown.
     var server = try remote_testing.Server.init(gpa, io, &.{});
     defer server.deinit();
     try server.start();
@@ -13548,8 +11551,6 @@ test "a pairing shows its wait and its code in the picker, and the bind takes th
             .{ .status = 401, .body = "{\"ok\":false,\"error_code\":401,\"description\":\"Unauthorized\"}" },
             .{ .body = "{\"ok\":true,\"result\":{\"id\":42,\"is_bot\":true,\"username\":\"drinky_bot\"}}" },
         } },
-        // The pairing polls once and finds the code, then the attach registers
-        // the commands, confirms the old updates, and holds its long poll.
         .{ .method = "deleteWebhook", .replies = &.{ .{ .body = remote_ok_true }, .{ .body = remote_ok_true } } },
         .{ .method = "setMyCommands", .replies = &.{.{ .body = remote_ok_true }} },
         .{ .method = "getUpdates", .replies = &.{
@@ -13572,18 +11573,14 @@ test "a pairing shows its wait and its code in the picker, and the bind takes th
     try app.runCommand("/remote");
     try app.handleKeys("\r");
     try app.handleKeys("42:secret\r");
-    // The check runs on a worker, and the picker waits meanwhile.
     try std.testing.expect(app.session.pickerWaits());
     try std.testing.expect(app.session.input.caption == null);
     try app.pumpRemoteEvents(1);
-    // The rejected token returns to the prompt with the token.
     try std.testing.expect(app.session.mode == .prompt);
     try std.testing.expectEqualStrings("Bot token", app.session.input.caption.?.title);
     try std.testing.expectEqualStrings("42:secret", app.session.editor.visible());
     try std.testing.expectEqualStrings("Telegram rejected the bot token.", app.session.notice.?.content);
 
-    // The second try passes the check, so the wait row states the code and the
-    // link, as a terminal hyperlink.
     try app.handleKeys("\r");
     try app.pumpRemoteEvents(1);
     try std.testing.expectEqualStrings("Send the code x7kq4m2p to @drinky_bot", app.pairing_wait_text);
@@ -13595,9 +11592,6 @@ test "a pairing shows its wait and its code in the picker, and the bind takes th
         "\x1b]8;;https://t.me/drinky_bot?start=x7kq4m2p\x1b\\",
     ) != null);
 
-    // The bind closes the picker, takes the input, and the attach event names
-    // the bot and opens the chat. The event states no field of the session,
-    // because `/status` answers that on request.
     try app.pumpRemoteEvents(1);
     try std.testing.expect(app.session.mode == .prompt);
     try std.testing.expect(app.session.input.owner == .external);
@@ -13611,17 +11605,11 @@ test "a pairing shows its wait and its code in the picker, and the bind takes th
         sent,
         "\"text\":\"ℹ You attached @drinky_bot.\"",
     ) != null);
-    // The event went to the chat once: the block carries no mirror flag, so a
-    // step of the mirror sends nothing more.
     try app.syncMirror();
     try server.finish();
     try std.testing.expectEqual(@as(usize, 1), server.sendCount());
 }
 
-// The attach event of Drinky leaves through the sender while the poller still
-// runs its setup, so a total of three calls can hold that event instead of the
-// confirmation. A test that ends the bot at such a barrier drops a call of the
-// setup, and the reply of that call never goes out.
 test "the barrier of an attach waits for the poller and not for a count of calls" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -13629,9 +11617,6 @@ test "the barrier of an attach waits for the poller and not for a count of calls
     const io = threaded.io();
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    // The late reply of the registration keeps the poller short of its
-    // confirmation while the attach event arrives, so three calls stand without
-    // it. No script answers that event.
     var server = try remote_testing.Server.init(gpa, io, &.{
         .{ .method = "deleteWebhook", .replies = &.{.{ .body = remote_ok_true }} },
         .{ .method = "setMyCommands", .replies = &.{.{ .body = remote_ok_true, .delay_ms = 50 }} },
@@ -13647,12 +11632,8 @@ test "the barrier of an attach waits for the poller and not for a count of calls
     try app.controller.store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
 
     try app.controller.attachSaved(0);
-    // The attach event went out, so it stands among the calls of the setup. The
-    // race that this test guards is live from here on.
     try server.waitForSends(1);
     try server.waitForLongPoll();
-    // The whole setup went out: the webhook removal, the command registration,
-    // and the confirmation that the long poll follows.
     try std.testing.expectEqual(@as(usize, 1), server.countOf("/deleteWebhook"));
     try std.testing.expectEqual(@as(usize, 1), server.countOf("/setMyCommands"));
     try std.testing.expectEqual(@as(usize, 2), server.countOf("/getUpdates"));
@@ -13681,15 +11662,12 @@ test "while a bot holds the input the terminal takes a detach alone, and Enter n
     defer app.deinitRemoteTest();
     try app.controller.store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
 
-    // A saved bot with a chat id attaches without a pairing.
     try app.runCommand("/remote");
     try app.handleKeys("\r");
     try std.testing.expect(app.session.input.owner == .external);
     try std.testing.expect(app.session.mode == .prompt);
     try server.waitForLongPoll();
 
-    // Typed text and Enter reach no editor and no model, and a command line
-    // runs nothing, the status included.
     try app.handleKeys("hello\r");
     try std.testing.expectEqualStrings("", app.session.editor.visible());
     try std.testing.expect(app.session.mode == .prompt);
@@ -13706,8 +11684,6 @@ test "while a bot holds the input the terminal takes a detach alone, and Enter n
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "Remote: @drinky_bot") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "Esc: Detach") != null);
 
-    // Esc detaches and drops the rest of its exit attempt. The editor stays
-    // locked under the caption of the wait while the detach event goes out.
     try app.handleKeys("\x1b\x04");
     try std.testing.expect(app.session.input.owner == .none);
     try std.testing.expectEqualStrings("Remote: @drinky_bot", app.session.input.caption.?.title);
@@ -13728,8 +11704,6 @@ test "while a bot holds the input the terminal takes a detach alone, and Enter n
     ) != null);
     try server.finish();
 
-    // The sender reports its end, and the terminal holds the input again, so
-    // Ctrl+D quits.
     try app.pumpRemoteEvents(1);
     try std.testing.expect(app.session.input.owner == .terminal);
     try std.testing.expect(app.session.input.caption == null);
@@ -13737,9 +11711,6 @@ test "while a bot holds the input the terminal takes a detach alone, and Enter n
     try std.testing.expect(!app.running);
 }
 
-// An exit key during the wait for the last message frees the editor at once and
-// drops that message, so a second Esc never leaves the user behind a dead
-// network. The rest of the exit attempt stays out of the prompt.
 test "an exit key during the detach wait frees the editor at once and drops the last message" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -13747,7 +11718,6 @@ test "an exit key during the detach wait frees the editor at once and drops the 
     const io = threaded.io();
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    // No script answers a send, so the detach event stays in flight.
     var server = try remote_testing.Server.init(gpa, io, &.{
         .{ .method = "deleteWebhook", .replies = &.{.{ .body = remote_ok_true }} },
         .{ .method = "setMyCommands", .replies = &.{.{ .body = remote_ok_true }} },
@@ -13776,9 +11746,6 @@ test "an exit key during the detach wait frees the editor at once and drops the 
     try server.finish();
 }
 
-// A one-shot confirmation belongs to the key that armed it. An exit key under a
-// bot ends one thing, so it must clear an older warning like every other key,
-// and the next Esc at the turn warns again instead of a cancel without one.
 test "an exit key under a bot clears an armed confirmation" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -13800,14 +11767,12 @@ test "an exit key under a bot clears an armed confirmation" {
     defer app.deinitRemoteTest();
     try app.controller.store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
 
-    // Esc over a draft during a turn warns and arms the cancel.
     app.session.beginTurn(1);
     try app.handleKeys("draft");
     try app.handleKey(&.escape);
     try std.testing.expect(app.session.mode == .turn);
     try std.testing.expect(std.mem.indexOf(u8, app.session.notice.?.content, "Press Esc again") != null);
 
-    // A bot attaches, and two exit keys detach it and end its wait.
     try app.controller.attachSaved(0);
     try server.waitForLongPoll();
     try app.handleKey(&.escape);
@@ -13816,8 +11781,6 @@ test "an exit key under a bot clears an armed confirmation" {
     try std.testing.expectEqual(remote.Controller.State.idle, app.controller.state());
     try std.testing.expect(app.session.mode == .turn);
 
-    // The next Esc at the turn warns again, because the exit keys cleared the
-    // older confirmation.
     try app.handleKey(&.escape);
     try std.testing.expect(app.session.mode == .turn);
     try std.testing.expect(app.session.notice != null);
@@ -13863,12 +11826,10 @@ test "a Telegram message runs as a prompt, and its refusals answer in the chat" 
     try app.controller.store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
     try app.controller.attachSaved(0);
 
-    // Three messages, three events, and the signed-out refusal answers the prompt.
     try app.pumpRemoteEvents(3);
     try std.testing.expect(app.session.mode == .prompt);
     try std.testing.expectEqual(@as(usize, 1), app.session.transcript.blocks().len);
     try server.finish();
-    // A refusal warns, and the reply keeps that severity under its symbol.
     const login = try server.waitForSend(1);
     try std.testing.expect(std.mem.indexOf(
         u8,
@@ -13879,8 +11840,6 @@ test "a Telegram message runs as a prompt, and its refusals answer in the chat" 
     const unknown = try server.waitForSend(2);
     try std.testing.expect(std.mem.indexOf(u8, unknown, "⚠ Drinky does not recognize the command /nope.") != null);
     const signed_out = try server.waitForSend(3);
-    // The repair runs in the terminal alone, so the reply names it, and the
-    // refused send is a failure.
     try std.testing.expect(std.mem.indexOf(
         u8,
         signed_out,
@@ -13889,10 +11848,6 @@ test "a Telegram message runs as a prompt, and its refusals answer in the chat" 
     try std.testing.expect(std.mem.indexOf(u8, signed_out, "\"reply_parameters\":{\"message_id\":3}") != null);
 }
 
-// The chat asks for the status with a line of its own, so the answer goes to the
-// chat alone, as a reply to that line, and the terminal records no event for
-// it. The turn hosts the command from the chat as it does from the terminal,
-// while every other command refuses there too.
 test "a /status from Telegram gets one reply and no terminal event, also during a turn" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -13922,7 +11877,6 @@ test "a /status from Telegram gets one reply and no terminal event, also during 
     var app: App = undefined;
     app.initRemoteTest(gpa, io, &out, &server, &url_buffer);
     defer app.deinitRemoteTest();
-    // The session shows the signed-out agent, as it does after the start.
     app.session.showSetup(null, null, .low);
     try app.controller.store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
     try app.controller.attachSaved(0);
@@ -13931,16 +11885,12 @@ test "a /status from Telegram gets one reply and no terminal event, also during 
     const status_wrapped =
         "ℹ ~/work/drinky · Context: 0 · Cost: ~$0.00 · Model: signed out · Effort: low";
 
-    // The answer states the full place and every field of the line, under the
-    // information symbol, and it names no bot.
     try app.submitChatMessage("/status", 30);
     const answer = try server.waitForSend(1);
     try std.testing.expect(std.mem.indexOf(u8, answer, "\"text\":\"" ++ status_wrapped ++ "\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, answer, "\"reply_parameters\":{\"message_id\":30}") != null);
     try std.testing.expectEqual(blocks_before, app.session.transcript.blocks().len);
 
-    // The row of the command list answers the same way: the tap gets a silent
-    // answer, the list goes, and the answer is a message of its own.
     try app.submitChatMessage("/help", 31);
     _ = try server.waitForSend(2);
     try app.handleChatTap("900", .{ .row = .{ .serial = 1, .index = 4 } });
@@ -13958,8 +11908,6 @@ test "a /status from Telegram gets one reply and no terminal event, also during 
     try std.testing.expect(!app.chat_picker.isOpen());
     try std.testing.expectEqual(blocks_before, app.session.transcript.blocks().len);
 
-    // During a turn the status runs, and every other command refuses with its
-    // warning.
     app.session.beginTurn(1);
     try app.submitChatMessage("/effort", 32);
     const refusal = try server.waitForSend(4);
@@ -13979,10 +11927,6 @@ test "a /status from Telegram gets one reply and no terminal event, also during 
     try std.testing.expectEqual(@as(usize, 6), server.sendCount());
 }
 
-// A credential rejection detaches the bot, and the failed turn then returns its
-// uncommitted Telegram prompt to the editor like every message after a detach.
-// The detach must come first, or the reconciliation still runs under the bot and
-// drops the prompt that the login picker then opens over.
 test "a credential rejection returns the Telegram prompt to the editor" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -14030,8 +11974,6 @@ test "a credential rejection returns the Telegram prompt to the editor" {
     try app.controller.attachSaved(0);
     try server.waitForLongPoll();
 
-    // A Telegram prompt starts a turn, and the provider rejects the credential
-    // before the turn commits anything.
     app.session.beginTurn(1);
     const base = app.session.transcript.blocks().len;
     try app.session.transcript.append(.user, .{}, "from Telegram");
@@ -14044,8 +11986,6 @@ test "a credential rejection returns the Telegram prompt to the editor" {
     defer app.freeWorkerResult(&result);
     try app.finishWorkerResult(&result);
 
-    // The bot detached, the prompt is back in the editor, and the login picker
-    // stands over it.
     try std.testing.expectEqual(remote.Controller.State.detaching, app.controller.state());
     try std.testing.expect(app.session.input.owner == .none);
     try std.testing.expectEqualStrings("from Telegram", app.session.editor.visible());
@@ -14053,9 +11993,6 @@ test "a credential rejection returns the Telegram prompt to the editor" {
     try server.finish();
 }
 
-// The editor stays locked until the last message of the old bot went out, so no
-// command can run while a sender drains. The next pick then attaches at once,
-// and the chat of the old bot ended before the new chat opens.
 test "a pick after the detach wait attaches at once" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -14087,13 +12024,10 @@ test "a pick after the detach wait attaches at once" {
     try app.handleKey(&.escape);
     try std.testing.expectEqual(remote.Controller.State.detaching, app.controller.state());
 
-    // The editor is locked while the detach event goes out, so the `/remote`
-    // line reaches no editor.
     try app.handleKeys("/remote\r");
     try std.testing.expectEqualStrings("", app.session.editor.visible());
     try std.testing.expect(app.session.mode == .prompt);
 
-    // The drain reports its end, and the next pick attaches without a wait.
     _ = try server.waitForSend(1);
     try app.pumpRemoteEvents(1);
     try std.testing.expect(app.session.input.owner == .terminal);
@@ -14136,7 +12070,6 @@ test "a Telegram message during a turn queues as steering that drops while the b
     try server.waitForLongPoll();
     app.session.beginTurn(1);
 
-    // A typed message from before the attach and a Telegram message share the queue.
     try app.session.editor.insert("typed first");
     try app.submitSteering();
     try app.submitChatMessage("from the chat", 12);
@@ -14151,19 +12084,13 @@ test "a Telegram message during a turn queues as steering that drops while the b
     }
     try std.testing.expectEqual(@as(usize, 2), queued.len);
     try std.testing.expectEqualStrings("from the chat", queued[1]);
-    // The queued message takes the mark of a queued message, and a refused
-    // line gets its reply alone.
     const refusal = try server.waitForSend(1);
     try std.testing.expect(std.mem.indexOf(u8, refusal, "The command /new cannot run while a turn runs.") != null);
     const queued_mark = try server.waitForRequest("/setMessageReaction", 0);
     try std.testing.expect(std.mem.indexOf(u8, queued_mark, "\"message_id\":12,\"reaction\":[{\"type\":\"emoji\",\"emoji\":\"👀\"}]") != null);
-    // The registry decides first, so an unknown line keeps its own refusal
-    // instead of the one that names the turn.
     const unknown = try server.waitForSend(2);
     try std.testing.expect(std.mem.indexOf(u8, unknown, "Drinky does not recognize the command /nope.") != null);
 
-    // The turn ends with both uncommitted: the typed draft returns to the
-    // editor, and the Telegram message fills no editor while the bot holds the input.
     try app.session.endTurnWithReceipt(&.{
         .history_base = 0,
         .history_end = 0,
@@ -14174,8 +12101,6 @@ test "a Telegram message during a turn queues as steering that drops while the b
     try std.testing.expectEqualStrings("typed first", app.session.editor.visible());
     try std.testing.expectEqual(@as(usize, 0), app.session.steering.items.len);
 
-    // After a detach the bot holds the input no more, so a queued Telegram message
-    // returns like a typed one, also while the last message still goes out.
     app.session.editor.clear();
     app.session.beginTurn(2);
     try app.submitChatMessage("after the detach", 14);
@@ -14193,10 +12118,6 @@ test "a Telegram message during a turn queues as steering that drops while the b
     try server.finish();
 }
 
-// The chat follows the transcript: the activity message opens the turn, the
-// answer goes out when it commits, the activity message leaves, and a new
-// summary notifies. The prompt of the turn gets its mark at the round that
-// commits it.
 test "the chat mirrors a completed turn with its activity message, its answer, and its summary" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -14229,8 +12150,6 @@ test "the chat mirrors a completed turn with its activity message, its answer, a
     try app.controller.attachSaved(0);
     try server.waitForLongPoll();
 
-    // A Telegram prompt starts the turn, as `submitChatMessage` does past its
-    // gates, and the mirror opens the turn with its activity message.
     app.session.beginTurn(1);
     const base = app.session.transcript.blocks().len;
     try app.session.transcript.append(.user, .{}, "from Telegram");
@@ -14244,19 +12163,14 @@ test "the chat mirrors a completed turn with its activity message, its answer, a
         "\"text\":\"ℹ Thinking\"",
     ) != null);
 
-    // The reply streams: the activity message follows the state, and the answer
-    // waits for its commit.
     var opening = [_]UiEvent{.{ .turn = .{
         .generation = 1,
         .progress_sequence = 1,
         .payload = .{ .usage = .{} },
     } }};
     _ = try app.applyBatch(&opening);
-    // Nothing committed yet, so the prompt holds no mark.
     try std.testing.expectEqual(@as(usize, 0), server.countOf("/setMessageReaction"));
 
-    // The checkpoint of the worker commits the prompt, so it takes the mark of
-    // a committed message while the turn still runs.
     var events = [_]UiEvent{.{ .turn = .{
         .generation = 1,
         .progress_sequence = 2,
@@ -14266,8 +12180,6 @@ test "the chat mirrors a completed turn with its activity message, its answer, a
     _ = try app.applyBatch(&events);
     const committed_mark = try server.waitForRequest("/setMessageReaction", 0);
     try std.testing.expect(std.mem.indexOf(u8, committed_mark, "\"message_id\":7,\"reaction\":[{\"type\":\"emoji\",\"emoji\":\"👍\"}]") != null);
-    // The edit keeps the buttons of the turn, because an edit without them
-    // drops them, and it keeps the symbol with its parse mode.
     const writing = try server.waitForRequest("/editMessageText", 0);
     try std.testing.expectEqualStrings(
         "{\"chat_id\":99,\"message_id\":50,\"text\":\"ℹ Writing\"," ++
@@ -14278,8 +12190,6 @@ test "the chat mirrors a completed turn with its activity message, its answer, a
     );
     try std.testing.expectEqual(@as(usize, 2), server.sendCount());
 
-    // The receipt closes the turn: the answer goes out silent, the activity
-    // message leaves, and a new summary notifies.
     var result: WorkerResult = .{
         .outcome = .{
             .receipt = .{ .history_base = 0, .history_end = 2, .steering_committed_count = 0 },
@@ -14305,8 +12215,6 @@ test "the chat mirrors a completed turn with its activity message, its answer, a
         summary,
         "\"text\":\"ℹ Tools: 0 calls · Time: ",
     ) != null);
-    // A signed-out session with no model states its tokens alone, as the status
-    // line does. The summary holds no button, keeps its symbol, and notifies.
     try std.testing.expect(std.mem.indexOf(
         u8,
         summary,
@@ -14314,13 +12222,9 @@ test "the chat mirrors a completed turn with its activity message, its answer, a
     ) != null);
     try std.testing.expect(std.mem.indexOf(u8, summary, "reply_markup") == null);
     try server.finish();
-    // The prompt gets one mark: the commit marked it, so the receipt adds none.
     try std.testing.expectEqual(@as(usize, 1), server.countOf("/setMessageReaction"));
 }
 
-// A failed turn marks what it did not commit: the prompt of a turn that
-// committed nothing and the queued message alike get 👎. Its error event stays
-// silent, and the summary notifies.
 test "a failed turn marks its uncommitted messages and notifies its summary" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -14362,8 +12266,6 @@ test "a failed turn marks its uncommitted messages and notifies its summary" {
     var draft = try ui.Editor.Draft.fromText(gpa, "from Telegram");
     app.session.retainExternalTurnPrompt(&draft, base, 7);
     try app.mirror.beginTurn(&app.controller, app.nowMs());
-    // A second message queues as steering while the turn runs. It gets no mark
-    // before the receipt.
     try app.submitChatMessage("and this", 8);
     try std.testing.expectEqual(@as(usize, 1), app.session.steering.items.len);
 
@@ -14375,7 +12277,6 @@ test "a failed turn marks its uncommitted messages and notifies its summary" {
     try app.finishWorkerResult(&result);
     app.agent.steering.clear();
     try std.testing.expect(app.session.mode == .prompt);
-    // Neither message returns to the editor while the bot holds the input.
     try std.testing.expectEqualStrings("", app.session.editor.visible());
 
     const failure = try server.waitForSend(2);
@@ -14397,16 +12298,9 @@ test "a failed turn marks its uncommitted messages and notifies its summary" {
     const dropped = try server.waitForRequest("/setMessageReaction", 2);
     try std.testing.expect(std.mem.indexOf(u8, dropped, "\"message_id\":8,\"reaction\":[{\"type\":\"emoji\",\"emoji\":\"👎\"}]") != null);
     try server.finish();
-    // The queued mark of the steering message stands in front of the two marks
-    // of the receipt.
     try std.testing.expectEqual(@as(usize, 3), server.countOf("/setMessageReaction"));
 }
 
-// A command line from Telegram runs where the registry allows it. A picker
-// shows as an inline keyboard under one message, and a tap on a row runs the
-// command. The picker message is scaffolding, so it goes at the end, and the
-// event of the change states the result once through the mirror. A tap on the
-// closed list gets the toast alone.
 test "a Telegram command opens a keyboard, a tap picks a row, and a stale tap gets the toast" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -14437,8 +12331,6 @@ test "a Telegram command opens a keyboard, a tap picks a row, and a stale tap ge
     try app.controller.attachSaved(0);
     try server.waitForLongPoll();
 
-    // The picker is one message with one button per row, the current row
-    // marked, and a cancel button. The message that asked for it gets no reply.
     try app.submitChatMessage("/effort", 20);
     try std.testing.expect(app.chat_picker.isOpen());
     const picker = try server.waitForSend(1);
@@ -14453,8 +12345,6 @@ test "a Telegram command opens a keyboard, a tap picks a row, and a stale tap ge
     try std.testing.expect(std.mem.indexOf(u8, picker, "[{\"text\":\"Cancel\",\"callback_data\":\"close:1\"}]") != null);
     try std.testing.expect(std.mem.indexOf(u8, picker, "Back") == null);
 
-    // The tap sets the level. The answer is silent and the picker message goes,
-    // so the event of the mirror states the result once.
     try app.handleChatTap("900", .{ .row = .{ .serial = 1, .index = 2 } });
     try std.testing.expect(app.agent.effort == .high);
     try std.testing.expect(!app.chat_picker.isOpen());
@@ -14476,7 +12366,6 @@ test "a Telegram command opens a keyboard, a tap picks a row, and a stale tap ge
     ) != null);
     try std.testing.expectEqual(@as(usize, 0), server.countOf("/editMessageText"));
 
-    // The list is closed, so a tap on its keyboard in the history gets the toast.
     try app.handleChatTap("901", .{ .row = .{ .serial = 1, .index = 0 } });
     try std.testing.expectEqualStrings(
         "{\"callback_query_id\":\"901\",\"text\":\"This list is closed.\"}",
@@ -14486,9 +12375,6 @@ test "a Telegram command opens a keyboard, a tap picks a row, and a stale tap ge
     try server.finish();
 }
 
-// The buttons of the activity message drive the turn. The cancel button means
-// one thing, so one tap cancels the turn. A withdraw drops the queue like Ctrl+P
-// and marks each dropped Telegram message.
 test "the activity keyboard cancels the turn on one tap and withdraws the queue" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -14527,18 +12413,15 @@ test "the activity keyboard cancels the turn on one tap and withdraws the queue"
     try app.controller.attachSaved(0);
     try server.waitForLongPoll();
 
-    // A turn runs with its activity message, and a Telegram message queues.
     app.session.beginTurn(1);
     try app.mirror.beginTurn(&app.controller, app.nowMs());
     const activity = try server.waitForSend(1);
     try std.testing.expect(std.mem.indexOf(u8, activity, "[{\"text\":\"Cancel turn\",\"callback_data\":\"cancel:1\"}]") != null);
     try std.testing.expect(std.mem.indexOf(u8, activity, "[{\"text\":\"Withdraw\",\"callback_data\":\"withdraw:1\"}]") != null);
-    // The queued message takes the mark of a queued message at once.
     try app.submitChatMessage("queued", 12);
     const queued_mark = try server.waitForRequest("/setMessageReaction", 0);
     try std.testing.expect(std.mem.indexOf(u8, queued_mark, "\"message_id\":12,\"reaction\":[{\"type\":\"emoji\",\"emoji\":\"👀\"}]") != null);
 
-    // A tap on a keyboard of another turn gets the toast and changes nothing.
     try app.handleChatTap("900", .{ .cancel_turn = 7 });
     try std.testing.expectEqualStrings(
         "{\"callback_query_id\":\"900\",\"text\":\"The turn is over.\"}",
@@ -14547,8 +12430,6 @@ test "the activity keyboard cancels the turn on one tap and withdraws the queue"
     try std.testing.expect(app.session.mode == .turn);
     try std.testing.expectEqual(@as(usize, 1), server.countOf("/setMessageReaction"));
 
-    // The withdraw drops the queue and marks the message. The chat holds its
-    // text, so no editor takes it. A second withdraw finds nothing.
     try app.handleChatTap("901", .{ .withdraw = 1 });
     try std.testing.expectEqualStrings("{\"callback_query_id\":\"901\"}", try server.waitForRequest("/answerCallbackQuery", 1));
     const dropped = try server.waitForRequest("/setMessageReaction", 1);
@@ -14561,8 +12442,6 @@ test "the activity keyboard cancels the turn on one tap and withdraws the queue"
         try server.waitForRequest("/answerCallbackQuery", 2),
     );
 
-    // One tap on the running turn cancels it, and the summary opens with the
-    // outcome. No edit changes the label before it.
     try spawnCanceledTurn(&app);
     try app.handleChatTap("903", .{ .cancel_turn = 1 });
     try std.testing.expect(app.session.mode == .prompt);
@@ -14579,10 +12458,6 @@ test "the activity keyboard cancels the turn on one tap and withdraws the queue"
     try std.testing.expectEqual(@as(usize, 2), server.countOf("/setMessageReaction"));
 }
 
-// A failed turn that armed a retry gives the chat the two controls of the
-// terminal caption. A dismiss ends the retry and takes the buttons off, and a
-// stale tap gets the toast. The message goes out at the attach too, when the
-// retry waits there, and a detach leaves it as it stands.
 test "the failed turn message dismisses the retry from the chat and stands at the attach" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -14620,8 +12495,6 @@ test "the failed turn message dismisses the retry from the chat and stands at th
     try app.controller.attachSaved(0);
     try server.waitForLongPoll();
 
-    // A turn that committed a round fails, so the retry arms and the chat gets
-    // the failed turn message after the error event and the summary.
     app.session.beginTurn(1);
     try app.mirror.beginTurn(&app.controller, app.nowMs());
     try app.session.transcript.append(.user, .{}, "from Telegram");
@@ -14644,8 +12517,6 @@ test "the failed turn message dismisses the retry from the chat and stands at th
     try std.testing.expect(std.mem.indexOf(u8, failed, "[{\"text\":\"Try again\",\"callback_data\":\"retry:2\"}]") != null);
     try std.testing.expect(std.mem.indexOf(u8, failed, "[{\"text\":\"Dismiss\",\"callback_data\":\"dismiss:2\"}]") != null);
 
-    // A stale tap gets the toast, and the dismiss ends the retry: the caption
-    // goes, and the message keeps its text without its buttons.
     try app.handleChatTap("900", .{ .dismiss = 1 });
     try std.testing.expectEqualStrings(
         "{\"callback_query_id\":\"900\",\"text\":\"The retry is over.\"}",
@@ -14655,16 +12526,12 @@ test "the failed turn message dismisses the retry from the chat and stands at th
     try app.handleChatTap("901", .{ .dismiss = 2 });
     try std.testing.expect(app.retry == null);
     try std.testing.expectEqual(Session.PromptOffer.none, app.session.prompt_offer);
-    // The edit that takes the buttons off keeps the text and the symbol.
     try std.testing.expectEqualStrings(
         "{\"chat_id\":99,\"message_id\":70,\"text\":\"⚠ Failed turn\"," ++
             "\"parse_mode\":\"HTML\"}",
         try server.waitForRequest("/editMessageText", 0),
     );
 
-    // A retry that waits at the attach gets its message then. The detach sends
-    // the detach event alone and leaves the message as it stands, and the
-    // second attach sends a new one, so a tap on the old one reads as stale.
     try app.armRetry(&result, false);
     try app.handleKey(&.escape);
     try std.testing.expect(app.session.input.owner == .none);
@@ -14684,14 +12551,9 @@ test "the failed turn message dismisses the retry from the chat and stands at th
     _ = try server.waitForSend(8);
     try app.pumpRemoteEvents(1);
     try server.finish();
-    // The one edit is the dismiss. No edit went out at either detach.
     try std.testing.expectEqual(@as(usize, 1), server.countOf("/editMessageText"));
 }
 
-// The agent commits its last reply before the turn returns, so the usage event
-// that follows the commit carries the answer over the committed frontier while
-// the turn still runs. The answer of a completed turn takes its button in that
-// order too.
 test "the chat gives the answer its button when the commit lands before the receipt" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -14733,8 +12595,6 @@ test "the chat gives the answer its button when the commit lands before the rece
     } }};
     _ = try app.applyBatch(&events);
     _ = try server.waitForRequest("/editMessageText", 0);
-    // The commit of the last reply travels with the usage event that follows it,
-    // so the answer commits here and goes out before the receipt.
     var committed = [_]UiEvent{.{ .turn = .{
         .generation = 1,
         .progress_sequence = 2,
@@ -14765,9 +12625,6 @@ test "the chat gives the answer its button when the commit lands before the rece
     try server.finish();
 }
 
-// The last answer of a completed turn carries the `Shorten` button, and the tap
-// on it acts only between turns. A tap on an older answer, a tap during a turn,
-// and a tap without an account each state why nothing happens.
 test "the shorten button rides the last answer and its tap waits for the prompt" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -14806,7 +12663,6 @@ test "the shorten button rides the last answer and its tap waits for the prompt"
     try app.controller.attachSaved(0);
     try server.waitForLongPoll();
 
-    // A completed turn sends its answer with the button of the newest answer.
     app.session.beginTurn(1);
     try app.mirror.beginTurn(&app.controller, app.nowMs());
     _ = try server.waitForSend(1);
@@ -14827,7 +12683,6 @@ test "the shorten button rides the last answer and its tap waits for the prompt"
         "[{\"text\":\"Shorten\",\"callback_data\":\"shorten:2\"}]",
     ) != null);
 
-    // A tap on a button that names no live answer states that.
     try app.handleChatTap("900", .{ .shorten = 1 });
     try std.testing.expectEqualStrings(
         "{\"callback_query_id\":\"900\",\"text\":\"This answer is not the newest one.\"}",
@@ -14835,8 +12690,6 @@ test "the shorten button rides the last answer and its tap waits for the prompt"
     );
     try std.testing.expect(app.session.mode == .prompt);
 
-    // The session has no account, so the tap names the sign-in and starts no
-    // turn.
     try app.handleChatTap("901", .{ .shorten = 2 });
     try std.testing.expectEqualStrings(
         "{\"callback_query_id\":\"901\",\"text\":\"Sign in with /login in the terminal " ++
@@ -14845,7 +12698,6 @@ test "the shorten button rides the last answer and its tap waits for the prompt"
     );
     try std.testing.expect(app.session.mode == .prompt);
 
-    // An account with no model names the model instead.
     app.agent.deinit();
     app.accounts = ai.testing.accounts(.{ .anthropic = "sk-ant" });
     app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_api_key), .{
@@ -14861,7 +12713,6 @@ test "the shorten button rides the last answer and its tap waits for the prompt"
         try server.waitForRequest("/answerCallbackQuery", 2),
     );
 
-    // A page holds the terminal, so the tap waits for it.
     try app.session.openPage(&.{ .title = "Test page", .content = "body" });
     try app.handleChatTap("903", .{ .shorten = 2 });
     try std.testing.expectEqualStrings(
@@ -14870,8 +12721,6 @@ test "the shorten button rides the last answer and its tap waits for the prompt"
     );
     app.session.closePage();
 
-    // A turn runs, so the tap waits for its end. The button stays live, because
-    // no answer replaced it.
     app.session.beginTurn(2);
     try app.mirror.beginTurn(&app.controller, app.nowMs());
     try app.handleChatTap("904", .{ .shorten = 2 });
@@ -14883,10 +12732,6 @@ test "the shorten button rides the last answer and its tap waits for the prompt"
     try server.finish();
 }
 
-// A `/new` from the chat clears the conversation and opens the new one on the
-// bracket of the bot, so a reader of the transcript still sees which chat drove
-// every message. The mirror starts over at that event, and the bot stays
-// attached, because the clear empties the model conversation and not the chat.
 test "a /new from Telegram records the remote bracket as the first event" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -14931,14 +12776,9 @@ test "a /new from Telegram records the remote bracket as the first event" {
             "attached.\"",
     ) != null);
     try server.finish();
-    // The command itself gets no reply, because the event states it.
     try std.testing.expectEqual(@as(usize, 2), server.sendCount());
 }
 
-// A skill that a tap loads has no message in the chat and no line in an editor,
-// so its turn retains no prompt, like a retry attempt. A failure before the
-// first commit then returns nothing to the locked editor, and a new `/skill`
-// loads the skill again.
 test "a skill loaded by a tap retains no prompt, so its failed turn fills no editor" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -14978,7 +12818,6 @@ test "a skill loaded by a tap retains no prompt, so its failed turn fills no edi
     var app: App = undefined;
     app.initRemoteTest(gpa, io, &out, &server, &url_buffer);
     defer app.deinitRemoteTest();
-    // A model without a client, so the worker fails fast before any commit.
     app.agent.deinit();
     app.agent = ai.Agent.init(gpa, io, null, .{
         .model = test_anthropic_model,
@@ -15005,8 +12844,6 @@ test "a skill loaded by a tap retains no prompt, so its failed turn fills no edi
     try std.testing.expect(app.session.turn_prompt == null);
     try std.testing.expectEqualStrings("{\"callback_query_id\":\"900\"}", try server.waitForRequest("/answerCallbackQuery", 0));
 
-    // The turn fails before its first commit: the transcript rewinds to the
-    // attach event, the editor stays empty under the bot, and no retry arms.
     const result = app.awaitTurnFuture().?;
     defer app.freeWorkerResult(&result);
     try std.testing.expect(result.outcome.disposition == .failed);
@@ -15021,13 +12858,6 @@ test "a skill loaded by a tap retains no prompt, so its failed turn fills no edi
     try server.finish();
 }
 
-// The withdraw takes the agent queue and then moves the session with it. No
-// fallible step can stand between the two, or a failure leaves an agent queue
-// that is empty while the session still holds the messages. The one step that
-// can fail after the take is the mark, when the queue takes it after a run of
-// dropped messages, because the report of the run allocates. The sweep fails
-// every allocation of the withdraw in turn, and after each failure the two
-// sides must agree.
 test "a withdraw whose mark fails after the take leaves the session and the queue in agreement" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     const gpa = failing.allocator();
@@ -15036,8 +12866,6 @@ test "a withdraw whose mark fails after the take leaves the session and the queu
     const io = threaded.io();
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    // No script answers a send or a reaction, so the sender hangs on the first
-    // item and the queue keeps the rest.
     var server = try remote_testing.Server.init(std.testing.allocator, io, &.{
         .{ .method = "deleteWebhook", .replies = &.{.{ .body = remote_ok_true }} },
         .{ .method = "setMyCommands", .replies = &.{.{ .body = remote_ok_true }} },
@@ -15050,9 +12878,6 @@ test "a withdraw whose mark fails after the take leaves the session and the queu
     var app: App = undefined;
     app.initRemoteTest(gpa, io, &out, &server, &url_buffer);
     defer app.deinitRemoteTest();
-    // The tasks of the bot allocate on their own threads, so the attach hands
-    // them the plain allocator. The controller then takes the failing one back,
-    // so the sweep reaches the report of the run.
     app.controller.gpa = std.testing.allocator;
     defer app.controller.gpa = std.testing.allocator;
     try app.controller.store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
@@ -15062,8 +12887,6 @@ test "a withdraw whose mark fails after the take leaves the session and the queu
     app.session.beginTurn(1);
     try app.submitChatMessage("queued", 12);
     try std.testing.expectEqual(@as(usize, 1), app.agent.steering.messages.items.len);
-    // A run of drops waits for its report, so the mark of the withdraw carries
-    // it. A report that fails keeps the count, so every pass carries it again.
     app.controller.dropped_count = 1;
 
     var step: usize = 0;
@@ -15074,14 +12897,9 @@ test "a withdraw whose mark fails after the take leaves the session and the queu
         const pending = app.session.steering.items.len - app.session.steering_retained_count;
         try std.testing.expectEqual(pending, app.agent.steering.messages.items.len);
         if (result) |count| {
-            // The pass whose mark failed had taken the queue and moved the
-            // session with it, so the check above held after the take and this
-            // pass finds nothing left.
             try std.testing.expectEqual(@as(usize, 0), count);
             break;
         } else |err| try std.testing.expectEqual(error.OutOfMemory, err);
-        // The withdraw makes a handful of allocations, so a sweep past this
-        // count found a step that never fails.
         if (step == 32) return error.TestSweepTooLong;
     }
     try std.testing.expectEqual(@as(usize, 0), app.session.steering.items.len);

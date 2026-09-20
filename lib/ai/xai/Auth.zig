@@ -1,7 +1,3 @@
-//! The credential lifecycle for the xAI subscription account: the shared `auth`
-//! lifecycle instantiated over the device-code protocol of `oauth` for the
-//! `"xai-plan"` entry in `<home>/.drinky/auth.json`.
-
 const std = @import("std");
 
 const auth = @import("../auth.zig");
@@ -12,7 +8,6 @@ const oauth = @import("oauth.zig");
 
 const Auth = @This();
 
-/// The top-level key this account's credentials live under in `auth.json`.
 const account_key = llm.Account.xai_plan.id();
 
 gpa: std.mem.Allocator,
@@ -20,7 +15,6 @@ io: std.Io,
 timeouts: net.Timeouts,
 path: []const u8,
 tokens: ?oauth.Tokens,
-/// Where the credential in memory stands against the store.
 persistence: auth.Persistence = .saved,
 
 pub fn init(gpa: std.mem.Allocator, io: std.Io, home: []const u8, timeouts: net.Timeouts) !Auth {
@@ -33,44 +27,30 @@ pub fn deinit(self: *Auth) void {
     self.gpa.free(self.path);
 }
 
-/// Load stored tokens. Returns false when the file is absent or holds no
-/// `xai-plan` entry (this account is simply not logged in).
 pub fn load(self: *Auth) !bool {
     return auth.load(self, account_key);
 }
 
-/// Settle the credential on the open store `maybe_file`, or on an absent store
-/// when null, so a change in another instance shows here. The call reports
-/// what changed.
 pub fn reread(self: *Auth, maybe_file: ?*const json_store.File) !auth.Change {
     return auth.reread(self, account_key, maybe_file);
 }
 
-/// A valid access token, refreshed and persisted first if it has expired.
 pub fn accessToken(self: *Auth) ![]const u8 {
     return auth.accessToken(self, account_key, oauth.refresh);
 }
 
-/// Renew a credential the provider rejected on a request: adopt the token
-/// another instance saved, else refresh this one before it expires. It reports
-/// whether the credential changed.
 pub fn renew(self: *Auth) !bool {
     return auth.renew(self, account_key, oauth.refresh);
 }
 
-/// Run the interactive device-code login and return the committed credential's
-/// persistence outcome for the caller to present.
 pub fn login(self: *Auth, prompt: anytype) !auth.Login {
     return auth.loginDevice(self, account_key, oauth, prompt);
 }
 
-/// Drop this account's credentials: clear the in-memory tokens, remove its
-/// entry from `auth.json`, and keep every other account's entry.
 pub fn logout(self: *Auth) !void {
     return auth.logout(self, account_key);
 }
 
-/// Forget a rejected refresh credential, or reload its stored replacement.
 pub fn invalidate(self: *Auth) !bool {
     return auth.invalidate(self, account_key);
 }
@@ -87,9 +67,6 @@ test "load distinguishes signed out from corrupt credentials" {
 
     var subject = try init(gpa, io, home, .{});
     defer subject.deinit();
-    // An absent file and a file that holds only a sibling account's entry are
-    // both simply signed out. An own entry that lacks a field is corrupt, not
-    // ignored.
     try std.testing.expect(!try subject.load());
     try json_store.save(gpa, io, subject.path, "openai-plan", .{ .access = "a" }, .{});
     try std.testing.expect(!try subject.load());
@@ -127,14 +104,11 @@ test "save and load round-trip credentials an unexpired token serves unchanged" 
     var loaded = try init(gpa, io, home, .{});
     defer loaded.deinit();
     try std.testing.expect(try loaded.load());
-    // A second load replaces the installed tokens and does not leak them.
     try std.testing.expect(try loaded.load());
     try std.testing.expectEqualStrings("at", try loaded.accessToken());
     try std.testing.expectEqualStrings("user-1", loaded.tokens.?.subject.?);
 }
 
-// A credential from a response without an id token names no user. It stores
-// and loads as such, so a later load does not read the gap as corruption.
 test "a credential without a user round-trips" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});

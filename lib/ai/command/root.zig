@@ -1,19 +1,10 @@
-//! Slash-command registry that mirrors the tool registry. Each command module
-//! exposes `name`, `summary`, and `run`, and appears in the list below.
-//!
-//! `/help` is the one exception. It lists the registry itself, so it lives here
-//! with the table it reads. A module of its own would have to import this file,
-//! which inverts the dependency of the subsystem.
-
 const std = @import("std");
 
 const skills = @import("../skills.zig");
 
 pub const Context = @import("Context.zig");
 pub const Outcome = Context.Outcome;
-/// The app builds the picker of this command once it read the store again.
 pub const login = @import("login.zig");
-/// The app hands the result of a model fetch back to this command.
 pub const model = @import("model.zig");
 
 const effort = @import("effort.zig");
@@ -28,31 +19,17 @@ const testing = @import("testing.zig");
 
 const Entry = struct {
     name: []const u8,
-    /// What the command list shows after the name: the shortened sentence of
-    /// this command in `FEATURES.md`.
     summary: []const u8,
     run: *const fn (*Context) anyerror!Outcome,
-    /// Whether a remote host runs the command. A command that opens a page, an
-    /// editor prompt, or the credential flow of the terminal runs there alone.
     remote: bool,
-    /// Whether a turn hosts the command. A command that reads a snapshot and
-    /// opens no picker can run while a turn runs, and every other command
-    /// waits for the end of the turn.
     during_turn: bool,
 };
 
-/// The command that lists every other command. The bare `/` opens it too. The
-/// summary reaches no row, because the list leaves `/help` out. It states the
-/// command in the table, where every other entry states one.
 const help_name = "help";
 const help_summary = "List every command";
-/// The name prefix that loads a skill. It is the only command that takes an argument.
 const skill_prefix = skill.name ++ ":";
-/// Editor input can carry interior newlines (Shift+Enter, paste), so a newline
-/// ends a command name like a space.
 const whitespace = " \t\r\n";
 
-/// Every command, in the order the command list shows them.
 const commands = [_]Entry{
     .{
         .name = effort.name,
@@ -133,8 +110,6 @@ const commands = [_]Entry{
     },
 };
 
-// The table is the order of the list, and the list reads best in one
-// predictable order. A new command therefore takes its alphabetical place.
 comptime {
     for (commands[1..], 0..) |entry, index| {
         if (!std.mem.lessThan(u8, commands[index].name, entry.name))
@@ -142,28 +117,15 @@ comptime {
     }
 }
 
-/// One command as a host that documents Drinky reads it: its name, its summary,
-/// the line that opens it too, and the text it takes after its name.
 pub const Summary = struct {
     name: []const u8,
     summary: []const u8,
-    /// Another line that runs the same command, or empty for a command with one
-    /// line alone. A line that carries no name at all opens a list.
     alias: []const u8 = "",
-    /// What the command takes after its name, or empty for a command that takes
-    /// no argument. Only a skill line carries one.
     tail: []const u8 = "",
-    /// Whether a remote host runs the command, so a host that registers the
-    /// commands of a chat lists this one.
     remote: bool,
-    /// Whether a turn hosts the command, so a host can name it to a user who
-    /// waits on a turn.
     during_turn: bool,
 };
 
-/// The name and the summary of every command, in the order of the table. A host
-/// that describes Drinky reads the registry from here, so its document and the
-/// command list cannot drift.
 pub const summaries = blk: {
     var list: [commands.len + 1]Summary = undefined;
     for (commands, 0..) |entry, index| list[index] = .{
@@ -173,9 +135,6 @@ pub const summaries = blk: {
         .remote = entry.remote,
         .during_turn = entry.during_turn,
     };
-    // The skill prefix is no table entry, because it takes an argument tail. Its
-    // summary is its own on purpose: the `skill` entry states the list that the
-    // bare name opens, and this row states the load of one named skill.
     list[commands.len] = .{
         .name = skill_prefix ++ "name",
         .summary = "load a skill",
@@ -186,18 +145,12 @@ pub const summaries = blk: {
     break :blk list;
 };
 
-/// The line that runs `name` beside `/name`, or empty when none does. A line
-/// with no name at all is an alias of a list: `/` opens the command list, and
-/// `/skill:` opens the skill list. `lookup` resolves both.
 fn aliasOf(comptime name: []const u8) []const u8 {
     if (std.mem.eql(u8, name, help_name)) return "/";
     if (std.mem.eql(u8, name, skill.name)) return "/" ++ skill_prefix;
     return "";
 }
 
-/// The rows of the command list: every command but `/help`, which names the
-/// list that the user already reads. A remote host lists the commands that run
-/// there alone.
 fn listed(context: *const Context, out: *[commands.len]Entry) []const Entry {
     var count: usize = 0;
     for (commands) |entry| {
@@ -209,10 +162,6 @@ fn listed(context: *const Context, out: *[commands.len]Entry) []const Entry {
     return out[0..count];
 }
 
-/// The command name in an input line, or null when the line is a plain message.
-/// Every line that starts with a slash is a command line, because the registry must
-/// read it first. The name ends at the first whitespace, and `check` refuses a tail
-/// that the command does not take.
 pub fn parse(line: []const u8) ?[]const u8 {
     if (!std.mem.startsWith(u8, line, "/")) return null;
     const body = line[1..];
@@ -220,36 +169,20 @@ pub fn parse(line: []const u8) ?[]const u8 {
     return body[0..end];
 }
 
-/// Whether a turn hosts the command `name`. A caller with a running turn refuses
-/// every other command line after `check` accepted it, so a line the registry
-/// cannot run as typed keeps its own refusal. A skill line waits like every
-/// other command, because it starts a turn. `name` must come from `parse(line)`.
 pub fn runsDuringTurn(name: []const u8) bool {
     const entry = lookup(name) orelse return false;
     return entry.during_turn;
 }
 
-/// Whether `name` names the command that expands a skill into a generated request.
-/// A caller that cannot host such a request refuses the line before it runs. The
-/// bare prefix names no skill and opens the skill list, so it expands nothing.
-/// `name` must come from `parse(line)`.
 fn loadsSkill(name: []const u8) bool {
     return name.len > skill_prefix.len and std.mem.startsWith(u8, name, skill_prefix);
 }
 
-/// The text after the command name, without its edge whitespace. `name` must come
-/// from `parse(line)`, so it starts at the second byte of the line.
 fn tail(line: []const u8, name: []const u8) []const u8 {
     std.debug.assert(std.mem.startsWith(u8, line[1..], name));
     return std.mem.trim(u8, line[1 + name.len ..], whitespace);
 }
 
-/// The registry entry with `name`, or null when the registry holds no such command.
-/// A `skill:name` never has an entry, because that prefix takes an argument tail.
-///
-/// The empty name and the bare `skill:` prefix are aliases of a list: `/` opens
-/// the command list like `/help`, and `/skill:` opens the skill list like
-/// `/skill`. Both carry no name at all, so the list is the answer.
 fn lookup(name: []const u8) ?*const Entry {
     const resolved = if (name.len == 0)
         help_name
@@ -263,9 +196,6 @@ fn lookup(name: []const u8) ?*const Entry {
     return null;
 }
 
-/// The command list: one row per command, in the order of the table. A selection
-/// runs that command, so a command that opens a picker of its own becomes the
-/// second layer of the list.
 fn runHelp(context: *Context) !Outcome {
     var options: Outcome.Options = .{ .gpa = context.gpa };
     errdefer options.deinit();
@@ -273,8 +203,6 @@ fn runHelp(context: *Context) !Outcome {
     for (listed(context, &rows)) |entry| {
         try options.addExtraPrint(false, "/{s}", .{entry.name}, "{s}.", .{entry.summary});
     }
-    // The list builds itself again, so Esc in the picker that a row opens
-    // returns to the list.
     return .{ .pick = .{
         .select = selectCommand,
         .title = "Command",
@@ -294,15 +222,6 @@ fn selectCommand(context: *Context, selection: Outcome.Pick.Selection) !Outcome 
     return entries[index].run(context);
 }
 
-/// The refusal that the registry produces for `line`, or null when the registry
-/// can run the line as typed. `check` runs no command, so a caller that must
-/// refuse a command for a state restriction can name the true reason first: an
-/// unknown name, a terminal-only command on a remote host, and an unwanted tail
-/// never become runnable, but a restriction ends. A line that is not a command
-/// line returns null too.
-///
-/// Every refusal here warns, because a slash line can be plain text. The caller
-/// can offer to send the line to the model as typed.
 pub fn check(context: *Context, line: []const u8) !?Outcome.Message {
     const name = parse(line) orelse return null;
     if (loadsSkill(name)) return try checkSkill(context, name);
@@ -322,14 +241,9 @@ pub fn check(context: *Context, line: []const u8) !?Outcome.Message {
     return null;
 }
 
-/// Dispatch an input line to its command. Null reports that the line is not a
-/// command, so the caller sends it to the model. A line that the registry cannot
-/// run as typed returns the refusal of `check`, so the line stays local.
 pub fn run(context: *Context, line: []const u8) !?Outcome {
     const name = parse(line) orelse return null;
     if (try check(context, line)) |refusal| return .{ .refusal = refusal };
-    // `check` accepted the line, so every lookup below holds. This is the one place
-    // that resolves a name, so no other function carries that invariant.
     if (loadsSkill(name)) {
         const target = context.skill_registry.?.get(name[skill_prefix.len..]).?;
         return try skill.load(context, target, tail(line, name));
@@ -337,14 +251,6 @@ pub fn run(context: *Context, line: []const u8) !?Outcome {
     return try lookup(name).?.run(context);
 }
 
-/// Refuse a parsed command that the active state does not allow. The caller keeps
-/// the command text in the editor, sends nothing to the model, and opens no
-/// picker. `restriction` names the active state and completes the sentence
-/// `The command /name cannot run …`, as in `while a turn runs`.
-///
-/// The severity is a warning, not a failure: the line stays complete, and the next
-/// Enter runs it once the restriction ends. A failure paints red, which reads as a
-/// broken turn while a reply streams.
 pub fn refuse(
     gpa: std.mem.Allocator,
     name: []const u8,
@@ -358,10 +264,6 @@ pub fn refuse(
     );
 }
 
-/// The refusal for a `skill:` name that no discovered skill matches, or null when
-/// the registry holds it. A load failure stays with `runSkill`, because only the
-/// load itself can report one. The bare prefix never reaches here, because it
-/// names the skill list rather than a skill.
 fn checkSkill(context: *Context, command_name: []const u8) !?Outcome.Message {
     const name = command_name[skill_prefix.len..];
     const registry = context.skill_registry orelse return try unknownSkill(context.gpa, name);
@@ -387,9 +289,6 @@ fn unknownSkill(gpa: std.mem.Allocator, name: []const u8) !Outcome.Message {
     );
 }
 
-// A line that carries no name opens a list, so the registry states that line
-// beside the command it runs. A host that documents Drinky then names it, and a
-// reader learns what a bare `/` does.
 test "the registry names the alias line of each list" {
     for (summaries) |command| {
         const expected = if (std.mem.eql(u8, command.name, help_name))
@@ -419,7 +318,6 @@ test "a command that takes no argument refuses a tail instead of running" {
         .agent = undefined,
         .accounts = undefined,
     };
-    // The registry sends nothing, and `/new` never clears the conversation.
     try Outcome.expectRefusalContaining(
         (try run(&context, "/new must clear the scrollback")).?,
         .warning,
@@ -432,8 +330,6 @@ test "a command that takes no argument refuses a tail instead of running" {
     );
 }
 
-// A caller that must refuse a command for its own state restriction asks `check`
-// first, so the reason it reports is the true one. `check` runs no command.
 test "check reports only what keeps a line unrunnable" {
     const gpa = std.testing.allocator;
     var agent = testing.agent(gpa, .{ .anthropic_plan = undefined });
@@ -441,11 +337,9 @@ test "check reports only what keeps a line unrunnable" {
     agent.setEffort(.high);
     var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = undefined };
 
-    // The registry can run these, so the caller owns the refusal.
     try std.testing.expect((try check(&context, "/effort")) == null);
     try std.testing.expect((try check(&context, "not a command")) == null);
 
-    // These never become runnable, whatever the state does.
     const unknown_name = (try check(&context, "/nope")).?;
     try unknown_name.expect(.warning, "does not recognize the command");
     const unwanted_tail = (try check(&context, "/effort high")).?;
@@ -453,7 +347,6 @@ test "check reports only what keeps a line unrunnable" {
     const unknown_skill = (try check(&context, "/skill:nope")).?;
     try unknown_skill.expect(.warning, "does not recognize the skill");
 
-    // No command ran, so `/effort` opened no picker and changed no level.
     try std.testing.expect(agent.effort == .high);
 }
 
@@ -465,8 +358,6 @@ test "a line without a leading slash is not dispatched" {
         .accounts = undefined,
     };
     try std.testing.expect((try run(&context, "just a message")) == null);
-    // The registry reads the first byte. The app trims the prompt edges before
-    // dispatch, so a leading blank is no user-facing escape from a command line.
     try std.testing.expect((try run(&context, " /new")) == null);
 }
 
@@ -529,9 +420,6 @@ test "run routes status" {
     try std.testing.expect((try run(&context, "/status")).? == .show_status);
 }
 
-// The table holds the one command that a turn hosts, so the app and the document
-// that describes Drinky read the same answer. A list line, a skill line, and an
-// unknown name wait like every other command.
 test "the registry names the command that runs during a turn" {
     try std.testing.expect(runsDuringTurn("status"));
     const waiting = [_][]const u8{
@@ -628,8 +516,6 @@ test "skill prefix reports an unknown name" {
     );
 }
 
-// The list is the answer for a line that carries no name at all. `/` and `/help`
-// open the command list, and `/skill` and `/skill:` open the skill list.
 test "a line without a name opens its list" {
     const gpa = std.testing.allocator;
     var context: Context = .{
@@ -647,11 +533,8 @@ test "a line without a name opens its list" {
                     gpa.free(pick.options);
                 }
                 try std.testing.expectEqualStrings("Command", pick.title);
-                // The list builds itself again, so Esc in the picker that a row
-                // opens returns to the list.
                 try std.testing.expect(pick.reopen.? == &runHelp);
                 try std.testing.expectEqual(commands.len - 1, pick.options.len);
-                // Alphabetical, the summary after the name, and no `/help` row.
                 try std.testing.expectEqualStrings("/effort", pick.options[0].name);
                 try std.testing.expectEqualStrings("Set the reasoning effort.", pick.options[0].extra.?);
                 try std.testing.expectEqualStrings("/system", pick.options[pick.options.len - 1].name);
@@ -666,11 +549,9 @@ test "a line without a name opens its list" {
         }
     }
 
-    // No skill exists here, so both skill lines report that instead of a list.
     for ([_][]const u8{ "/skill", "/skill:" }) |line|
         try Outcome.expectNoticeContaining((try run(&context, line)).?, .warning, "found no skills");
 
-    // A list line takes no argument either.
     try Outcome.expectRefusalContaining(
         (try run(&context, "/skill: do it")).?,
         .warning,
@@ -683,8 +564,6 @@ test "a line without a name opens its list" {
     );
 }
 
-// A row of the list runs the command it names, so a command with a picker of its
-// own opens the second layer.
 test "a command row runs its command" {
     const gpa = std.testing.allocator;
     var agent = testing.agent(gpa, .{ .anthropic_plan = undefined });
@@ -722,10 +601,6 @@ test "a command row runs its command" {
     );
 }
 
-// A remote host has no editor, no page, and no credential flow, so the registry
-// refuses the commands that need one and lists the rest alone. The refusal is a
-// registry decision, so a caller that restricts a command for its own state
-// still names the true reason first.
 test "a remote host runs the commands that need no terminal" {
     const gpa = std.testing.allocator;
     var agent = testing.agent(gpa, .{ .anthropic_plan = undefined });
@@ -751,7 +626,6 @@ test "a remote host runs the commands that need no terminal" {
         .warning,
         "The command /system runs in the terminal alone.",
     );
-    // An unknown name keeps its own refusal, and a runnable command runs.
     try Outcome.expectRefusalContaining((try run(&context, "/nope")).?, .warning, "does not recognize");
     try std.testing.expect((try check(&context, "/effort")) == null);
     try std.testing.expect((try check(&context, "/new")) == null);
@@ -759,7 +633,6 @@ test "a remote host runs the commands that need no terminal" {
     try std.testing.expect((try run(&context, "/new")).? == .new_conversation);
     try std.testing.expect((try run(&context, "/status")).? == .show_status);
 
-    // The list holds the runnable commands alone, and its rows index that list.
     switch ((try run(&context, "/help")).?) {
         .pick => |pick| {
             defer {
@@ -784,7 +657,6 @@ test "a remote host runs the commands that need no terminal" {
         },
         else => return error.ExpectedPick,
     }
-    // The registered commands of a chat are the same set.
     var registered: usize = 0;
     for (summaries) |command| {
         if (command.remote and command.tail.len == 0) registered += 1;

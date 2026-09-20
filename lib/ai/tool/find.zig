@@ -1,5 +1,3 @@
-//! Finds files by glob pattern and returns the matching paths one per line.
-
 const std = @import("std");
 
 const format = @import("../format.zig");
@@ -58,14 +56,9 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
     return runTimed(context, &parsed.value, &timer);
 }
 
-/// The matching paths, or the sentence that states why the search found none.
-/// The walk polls `timer` between filesystem steps, so a walk of a tree too
-/// large for the window stops itself and keeps what it retained.
 fn runTimed(context: *const Context, input: *const Input, timer: *const search.Timer) !Result {
     const gpa = context.gpa;
     const pattern = input.pattern;
-    // A model sometimes sends an empty path instead of no path. An empty path
-    // means the default, so the search runs from the working directory.
     const base = if (input.path.len == 0) "." else input.path;
     const limit = input.limit;
 
@@ -78,8 +71,6 @@ fn runTimed(context: *const Context, input: *const Input, timer: *const search.T
         return Result.cannot(gpa, err, "search", base);
     defer matches.deinit(gpa);
 
-    // One reading of the clock serves the sentence below and the box line, so
-    // both report the same span. It leaves out the work of the report itself.
     var elapsed_buffer: [24]u8 = undefined;
     const elapsed = format.duration(&elapsed_buffer, timer.elapsedMs());
     const shown = matches.paths.len;
@@ -89,9 +80,6 @@ fn runTimed(context: *const Context, input: *const Input, timer: *const search.T
         if (index > 0) try out.writer.writeAll("\n");
         try out.writer.writeAll(path);
     }
-    // An empty search is a whole result, so its sentence is the content and the
-    // count below states it. The paths are empty here, so the sentence opens the
-    // content and takes no separator.
     if (matches.matched == 0) {
         switch (matches.stop) {
             .none => try out.writer.print("No files match {s}.", .{pattern}),
@@ -115,9 +103,6 @@ fn runTimed(context: *const Context, input: *const Input, timer: *const search.T
         );
     } else if (matches.stop == .time) {
         if (shown > 0) try out.writer.writeAll("\n");
-        // The same measure the notice above names: the walk retained the
-        // smallest matches of the part it walked, and `shown` can sit below the
-        // count it saw.
         try out.writer.print(
             "[Drinky stopped the search after {s}. Drinky shows the {d} smallest matches. " ++
                 "Use a narrower path or pattern.]",
@@ -137,18 +122,12 @@ fn runTimed(context: *const Context, input: *const Input, timer: *const search.T
 
     var summary_output: std.Io.Writer.Allocating = .init(gpa);
     errdefer summary_output.deinit();
-    // The run time comes first, because the row above counted up to it and a
-    // narrow window cuts the tail of this row.
     try summary_output.writer.print("Time: {s} · Matches: {d}", .{ elapsed, shown });
     switch (matches.stop) {
         .none => {},
         .entries => try summary_output.writer.writeAll(" · Search: Incomplete"),
         .time => try summary_output.writer.writeAll(" · Search: Timed out"),
     }
-    // A bound that stopped the walk does not hide the omitted count: the two ask
-    // the model for different changes, a narrower search and a higher limit. One
-    // processed entry holds at most one match, so a tiny limit is the one route
-    // to a stopped walk that omitted a match too.
     if (matches.matched > shown)
         try summary_output.writer.print(" · Omitted matches: {d}", .{matches.matched - shown});
     const summary = try summary_output.toOwnedSlice();
@@ -203,10 +182,6 @@ test "find reports how many more matched beyond the limit" {
     try search.expectMeasures(result.summary.?, "Matches: 1 · Omitted matches: 2");
 }
 
-// A model sometimes sends an empty path instead of no path. An empty path
-// means the default, so the search runs from the working directory and does
-// not fail with an invisible path. The spent timer stops the walk after one
-// entry, so the test does not scan the whole working tree.
 test "find treats an empty path as the working directory" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -231,33 +206,23 @@ test "find reports when no files match" {
     defer result.deinit(gpa);
     try std.testing.expect(!result.is_error);
     try std.testing.expectEqualStrings("No files match *.md.", result.content);
-    // An empty search still states its count, so the box reads like every other
-    // result of this tool.
     try search.expectMeasures(result.summary.?, "Matches: 0");
 }
 
-// A search checks a wall-clock timeout after each walk step. A stopped search
-// states the stop, so the model narrows the next search on evidence.
 test "find reports a search that ran out of time" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const context: Context = .{ .gpa = gpa, .io = io };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    // Two files, so a further entry proves the walk incomplete. Neither matches
-    // the pattern, so the stopped search reports no match at all.
     try tmp.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "" });
     try tmp.dir.writeFile(io, .{ .sub_path = "b.txt", .data = "" });
     var base_buf: [128]u8 = undefined;
     const base = try std.fmt.bufPrint(&base_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
 
-    // A timer that started a whole timeout ago is spent at the first check, so
-    // the walk keeps one entry and stops on the next one.
     const timer: search.Timer = .startedAgo(io, search.timeout_ms);
     const result = try runTimed(&context, &.{ .pattern = "**/*.zig", .path = base }, &timer);
     defer result.deinit(gpa);
-    // A stopped search is a whole result, not a failure, because it reports the
-    // matches it found.
     try std.testing.expect(!result.is_error);
     try std.testing.expect(
         std.mem.indexOf(u8, result.content, "Drinky stopped the search after") != null,
@@ -265,9 +230,6 @@ test "find reports a search that ran out of time" {
     try search.expectMeasures(result.summary.?, "Matches: 0 · Search: Timed out");
 }
 
-// A stopped walk keeps the matches it retained, so the result holds paths and
-// not one sentence. The notice names the same measure the whole-tree notice
-// names, because both show the smallest matches of what they walked.
 test "find keeps the matches it found before the clock ran out" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -279,8 +241,6 @@ test "find keeps the matches it found before the clock ran out" {
     var base_buf: [128]u8 = undefined;
     const base = try std.fmt.bufPrint(&base_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
 
-    // The walk keeps its first entry and stops on the second. Enumeration order
-    // decides which file it keeps.
     const timer: search.Timer = .startedAgo(io, search.timeout_ms);
     const result = try runTimed(&context, &.{ .pattern = "**/*.zig", .path = base }, &timer);
     defer result.deinit(gpa);
@@ -293,8 +253,6 @@ test "find keeps the matches it found before the clock ran out" {
     try search.expectMeasures(result.summary.?, "Matches: 1 · Search: Timed out");
 }
 
-// A stop does not hide the omitted count. A limit of zero retains nothing, which
-// is the one route to a stopped walk that also saw a match it did not keep.
 test "find states both the clock and the matches it omitted" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;

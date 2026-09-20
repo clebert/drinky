@@ -1,7 +1,3 @@
-//! Runs a shell command in the working directory and returns its combined
-//! stdout and stderr, bounded to a tail window and a wall-clock timeout.
-//! Sanitizes the output to valid UTF-8 so it can serialize as a JSON tool result.
-
 const std = @import("std");
 const builtin = @import("builtin");
 
@@ -12,26 +8,16 @@ const Context = @import("Context.zig");
 const Result = @import("Result.zig");
 const parse = @import("parse.zig");
 
-/// The hard cap on captured output. Beyond this, Drinky stops the command and
-/// does not buffer without bound. The configured window keeps only the tail
-/// below it.
 const capture_bytes_max = 8 << 20;
 
-/// The transfer buffer of one pipe read. One read takes up to this many bytes,
-/// so the size bounds the syscall count and the copy count of a loud command
-/// to a handful per megabyte.
 const read_buffer_bytes = 64 * 1024;
 
-/// A child setup step retries an interrupted or partial system call up to this count.
 const child_setup_attempts_max = 64;
 
-/// The child exits with this code after it sends a typed setup error to the parent.
 const child_error_exit_code = 1;
 
-/// The error pipe carries one child setup error as this integer.
 const ChildErrorInt = std.meta.Int(.unsigned, @sizeOf(anyerror) * 8);
 
-/// The UTF-8 replacement character, substituted for malformed input bytes.
 const replacement = "\u{FFFD}";
 
 pub const spec: llm.Tool = .{
@@ -52,8 +38,6 @@ pub const spec: llm.Tool = .{
             .required = true,
             .description = "The bash command line to run",
         },
-        // Every command runs under a limit, so the bounds belong in the
-        // description: they are what a caller needs to pick a value.
         .{
             .name = "timeout_seconds",
             .type = .integer,
@@ -74,11 +58,6 @@ const Input = struct {
     timeout_seconds: ?u64 = null,
 };
 
-/// The caller-owned state of one command run. The run races the timeout, and a
-/// timeout cancels the collecting task. The output streams into this state as
-/// it arrives, so a killed command still hands over the tail it printed. The
-/// collector writes between io operations, and the race joins it before the
-/// caller reads, so no read races a write.
 const Execution = struct {
     output: std.Io.Writer.Allocating,
     term: ?std.process.Child.Term = null,
@@ -98,10 +77,6 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
     return runWithTimeout(context, parsed.value.command, timeoutMs(&parsed.value, &context.bash));
 }
 
-/// The window a call runs under: its own `timeout_seconds`, else the configured
-/// default. Both sources take the same clamp, so a command always runs under a
-/// limit the interface can measure, and neither the model nor the config can
-/// lift it.
 fn timeoutMs(input: *const Input, limits: *const Context.Bash) u64 {
     return Context.Bash.clampTimeoutMs(if (input.timeout_seconds) |seconds|
         seconds *| std.time.ms_per_s
@@ -109,8 +84,6 @@ fn timeoutMs(input: *const Input, limits: *const Context.Bash) u64 {
         limits.timeout_ms);
 }
 
-/// Run `command` under `timeout_ms`, which `run` has clamped. A test passes a
-/// window below the floor, so a stop costs it no full second.
 fn runWithTimeout(context: *const Context, command: []const u8, timeout_ms: u64) !Result {
     const gpa = context.gpa;
     const limits = &context.bash;
@@ -119,14 +92,8 @@ fn runWithTimeout(context: *const Context, command: []const u8, timeout_ms: u64)
     defer execution.deinit();
     const executed = execute(context, command, timeout_ms, &execution);
     const elapsed_ms = std.Io.Timestamp.now(context.io, .awake).toMilliseconds() - started_ms;
-    // Every end state that holds output renders it through one path, so a
-    // stopped command reads like one that ran: the tail it printed, the notice
-    // that names the stop, and the measures the box shows.
     const stop: Stop = if (executed) |term| .{ .completed = term } else |err| switch (err) {
         error.Canceled => return error.Canceled,
-        // A command that ran out of time reports that time the way a command
-        // that finished does, because the row above it counted up to this
-        // moment and the box must not drop the number the user watched.
         error.Timeout => .{ .timed_out = timeout_ms },
         error.StreamTooLong => .oversized,
         else => return Result.report(
@@ -179,12 +146,6 @@ fn collect(context: *const Context, command: []const u8, execution: *Execution) 
 
     var read_buffer: [read_buffer_bytes]u8 = undefined;
     var reader = std.Io.File.Reader.initStreaming(output_files[0], io, &read_buffer);
-    // `peekGreedy` commits after one arrival, so a cancel or an overflow keeps
-    // every byte the pipe delivered before it. The direct routes (`stream`,
-    // `sendFile`, `readSliceShort`) fill a fixed destination across reads
-    // before they commit, and a cancel mid-fill takes the arrived bytes of
-    // that pass with it. The loop ends at end of stream or past the capture
-    // cap, so it is bounded.
     while (execution.output.written().len <= capture_bytes_max) {
         const chunk = reader.interface.peekGreedy(1) catch |err| switch (err) {
             error.EndOfStream => {
@@ -199,12 +160,6 @@ fn collect(context: *const Context, command: []const u8, execution: *Execution) 
     return error.StreamTooLong;
 }
 
-/// Start the shell as a session leader without a controlling terminal. A command cannot open
-/// `/dev/tty` or take terminal ownership from Drinky.
-///
-/// Zig 0.16 exposes no session option in `SpawnOptions`. This POSIX spawn mirrors the standard
-/// library steps and adds `setsid`. The error pipe stays, so a child setup failure keeps its type.
-/// The child calls raw system wrappers alone, so it needs no cancel guard of its own.
 fn spawnCommand(
     context: *const Context,
     command: []const u8,
@@ -243,7 +198,6 @@ fn spawnCommand(
         else => |err| return std.posix.unexpectedErrno(err),
     }
     const process_id: std.posix.pid_t = @intCast(fork_result);
-    // The child holds its own copy of this frame, so the pointer stays valid across the fork.
     if (process_id == 0) runCommandChild(&setup);
 
     error_files[1].close(io);
@@ -268,22 +222,15 @@ fn spawnCommand(
     };
 }
 
-/// Everything the child needs after the fork. A named field prevents a swap of two handles, or
-/// of the two string vectors, at the call.
 const ChildSetup = struct {
-    /// The child reads standard input from this handle.
     in_handle: std.posix.fd_t,
-    /// The child writes both standard output and standard error to this handle.
     out_handle: std.posix.fd_t,
-    /// The child reports a setup failure on this handle and closes it at a successful exec.
     error_handle: std.posix.fd_t,
     argv: [*:null]const ?[*:0]const u8,
     environ: [*:null]const ?[*:0]const u8,
-    /// The directory list that the executable search walks.
     path: []const u8,
 };
 
-/// This child path calls only async-signal-safe functions between fork and exec.
 fn runCommandChild(setup: *const ChildSetup) noreturn {
     duplicateCommandHandle(setup.in_handle, std.posix.STDIN_FILENO) catch |err|
         failCommandChild(setup.error_handle, err);
@@ -395,14 +342,11 @@ fn failCommandChild(error_handle: std.posix.fd_t, child_error: std.process.Spawn
     exitCommandChild(child_error_exit_code);
 }
 
-/// The setup error that the child sent, or null when the pipe closed at a successful exec.
-/// The io interface owns the read, so a canceled turn reaches the parent as `Canceled`.
 fn readCommandChildError(io: std.Io, error_file: std.Io.File) !?std.process.SpawnError {
     var buffer: [@sizeOf(ChildErrorInt)]u8 = undefined;
     var offset: usize = 0;
     for (0..child_setup_attempts_max) |_| {
         const count = error_file.readStreaming(io, &.{buffer[offset..]}) catch |err| switch (err) {
-            // The write end closes on exec, so a clean end of stream proves the exec.
             error.EndOfStream => return if (offset == 0) null else error.Unexpected,
             else => |read_error| return read_error,
         };
@@ -427,8 +371,6 @@ fn reapCommandChild(process_id: std.posix.pid_t) void {
     };
 }
 
-/// Stop a child that never reported its setup. Both signals are needed: the group covers a child
-/// that reached `setsid` and started work of its own, and the id covers the window before it.
 fn killAndReapCommandChild(process_id: std.posix.pid_t) void {
     _ = std.posix.system.kill(-process_id, .KILL);
     _ = std.posix.system.kill(process_id, .KILL);
@@ -451,15 +393,10 @@ fn stopAndReap(
     process_group: std.posix.pid_t,
 ) void {
     std.posix.kill(-process_group, .KILL) catch {};
-    // A canceled `Child.wait` clears the id but does not reap. Restore the
-    // saved group leader so the uncancelable kill path waits for it.
     if (child.id == null) child.id = process_group;
     child.kill(io);
 }
 
-/// Rewrite the output into valid UTF-8. Complete CSI terminal control sequences
-/// and other control bytes drop. Newlines and tabs pass. Malformed bytes become
-/// replacement characters.
 fn sanitize(gpa: std.mem.Allocator, input: []const u8) ![]u8 {
     var output_writer: std.Io.Writer.Allocating = .init(gpa);
     errdefer output_writer.deinit();
@@ -487,8 +424,6 @@ fn sanitize(gpa: std.mem.Allocator, input: []const u8) ![]u8 {
     return output_writer.toOwnedSlice();
 }
 
-/// The offset after a complete ESC-[ control sequence, or null when the bytes
-/// at `start` are another escape form, malformed, or incomplete.
 fn controlSequenceEnd(input: []const u8, start: usize) ?usize {
     std.debug.assert(start < input.len and input[start] == 0x1b);
     if (input.len - start < 3 or input[start + 1] != '[') return null;
@@ -506,8 +441,6 @@ fn controlSequenceEnd(input: []const u8, start: usize) ?usize {
     return null;
 }
 
-/// The byte length of the valid UTF-8 sequence that starts at `index`, or null
-/// when the bytes there are not a complete, valid sequence.
 fn decodeAt(bytes: []const u8, index: usize) ?usize {
     const length = std.unicode.utf8ByteSequenceLength(bytes[index]) catch return null;
     if (index + length > bytes.len) return null;
@@ -516,31 +449,17 @@ fn decodeAt(bytes: []const u8, index: usize) ?usize {
     return length;
 }
 
-/// How one command run ended. Every variant renders through the same path, so
-/// a stopped command keeps the measures a finished one reports.
 const Stop = union(enum) {
-    /// The command ended on its own, with this term.
     completed: std.process.Child.Term,
-    /// The wall killed the command at this clamped limit, in milliseconds.
     timed_out: u64,
-    /// The capture cap killed the command.
     oversized,
 };
 
-/// Build the tool result: a truncation note when the tail was cut, the kept
-/// window, and a status line when the command failed.
-///
-/// Every end state reports the same measures, so a command that exited with a
-/// non-zero code, or one that a limit killed, reads as a command that ran, not
-/// as a broken tool. The failure flag still reaches the model, and the box
-/// still marks it.
 fn render(
     gpa: std.mem.Allocator,
     output: []const u8,
     limits: *const Context.Bash,
     stop: Stop,
-    /// The wall-clock time the command ran. A long command is the one whose cost
-    /// the user weighs, so the box reports it beside the exit status.
     elapsed_ms: i64,
 ) !Result {
     const failed = switch (stop) {
@@ -548,8 +467,6 @@ fn render(
             .exited => |code| code != 0,
             else => true,
         },
-        // A killed command never completed its work, so the flag reaches the
-        // model even though the output above it stands.
         .timed_out, .oversized => true,
     };
     const start = tailStart(output, limits);
@@ -585,8 +502,6 @@ fn render(
                     "[The command stopped before it completed.]",
                 ),
             },
-            // The notice states the limit to the model, and the summary
-            // reports the run time instead.
             .timed_out => |timeout_ms| {
                 var limit_buffer: [24]u8 = undefined;
                 try result_writer.writer.print("[The command timed out after {s}.]", .{
@@ -602,13 +517,9 @@ fn render(
     var summary_output: std.Io.Writer.Allocating = .init(gpa);
     errdefer summary_output.deinit();
     var elapsed_buffer: [24]u8 = undefined;
-    // The run time comes first, because the row above counted up to it and a
-    // narrow window cuts the tail of this row.
     try summary_output.writer.print("Time: {s}", .{
         format.duration(&elapsed_buffer, elapsed_ms),
     });
-    // `code` is the number the command returned. `Status` names a state instead,
-    // so a killed command cannot read as one that exited.
     switch (stop) {
         .completed => |term| switch (term) {
             .exited => |code| try summary_output.writer.print(" · Exit code: {d}", .{code}),
@@ -617,9 +528,6 @@ fn render(
         .timed_out => try summary_output.writer.writeAll(" · Status: Timed out"),
         .oversized => try summary_output.writer.writeAll(" · Status: Output limit"),
     }
-    // The line count names the whole output, not the tail the box keeps. A
-    // command that printed nothing reports none, because a zero says less than
-    // its absence. A failed command reports the same fields as one that worked.
     const lines = format.lines(output);
     if (lines > 0) try summary_output.writer.print(" · Lines: {d}", .{lines});
     if (start > 0) try summary_output.writer.writeAll(" · Output: Truncated");
@@ -629,8 +537,6 @@ fn render(
     return .{ .content = content, .summary = .{ .text = summary }, .is_error = failed };
 }
 
-/// The offset of the largest tail within both configured limits. Prefer whole
-/// lines. When no whole trailing line fits, retain a UTF-8-safe byte tail.
 fn tailStart(text: []const u8, limits: *const Context.Bash) usize {
     if (text.len == 0) return 0;
     if (limits.lines_max == 0 or limits.bytes_max == 0) return text.len;
@@ -775,9 +681,6 @@ test "bash reports a non-zero exit as an error" {
     try std.testing.expect(result.is_error);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "boom") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.content, "code 3") != null);
-    // A real command takes a real, varying time, so the row's shape is what
-    // this pins down. A non-zero exit states the measures a success states, and
-    // the box shows them with no prefix of its own.
     try std.testing.expect(std.mem.startsWith(u8, result.summary.?.text, "Time: "));
     try std.testing.expect(
         std.mem.endsWith(u8, result.summary.?.text, " · Exit code: 3 · Lines: 1"),
@@ -795,7 +698,6 @@ test "bash reports empty successful output" {
     try std.testing.expect(!result.is_error);
     try std.testing.expectEqualStrings("(No output)", result.content);
     try std.testing.expect(std.mem.startsWith(u8, result.summary.?.text, "Time: "));
-    // A command that printed nothing reports no line count.
     try std.testing.expect(std.mem.endsWith(u8, result.summary.?.text, " · Exit code: 0"));
 }
 
@@ -804,8 +706,6 @@ test "bash rejects invalid input" {
     try std.testing.expectError(error.InvalidArguments, run(&context, "{}"));
 }
 
-// A per-call value wins over the config, and both stay inside the legal window.
-// A zero used to mean no limit, so a stale config file takes the floor.
 test "the timeout of a call comes from either source and takes the clamp" {
     const defaults: Context.Bash = .{};
     const config: Context.Bash = .{ .timeout_ms = 5_000 };
@@ -871,21 +771,14 @@ test "render summary discloses line and byte truncation" {
     }
 }
 
-// The timeout tests below run under a window that `run` never grants, so each
-// stop costs a fraction of a second. A command that must act before the stop
-// still has a wide margin for a slow start.
 const test_timeout_ms = 200;
 
-// A killed command keeps the tail it printed. The output is the evidence of
-// where the time went, so the model does not retry blind.
 test "a timed-out command keeps its output and states the stop" {
     const gpa = std.testing.allocator;
     const context: Context = .{ .gpa = gpa, .io = std.testing.io };
     const result = try runWithTimeout(&context, "echo started; sleep 5", test_timeout_ms);
     defer result.deinit(gpa);
     try std.testing.expect(result.is_error);
-    // The output stands first, the shared separator follows, and the notice
-    // closes the result.
     try std.testing.expectEqualStrings(
         "started\n\n\n[The command timed out after 200ms.]",
         result.content,
@@ -896,7 +789,6 @@ test "a timed-out command keeps its output and states the stop" {
     );
 }
 
-// The ticks arrive well inside the window, so an idle timeout would never fire.
 test "bash timeout is absolute while output arrives" {
     const gpa = std.testing.allocator;
     const context: Context = .{ .gpa = gpa, .io = std.testing.io };
@@ -933,9 +825,6 @@ test "bash timeout reaps a command after output closes" {
     try std.testing.expectEqual(std.posix.E.CHILD, std.posix.errno(wait_result));
 }
 
-// The stop reaches the whole process group, so a background child of the shell
-// dies with it. Its parent is gone, so the system reaps it, and the probe polls
-// for that moment inside a bound.
 test "bash timeout kills descendant processes" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -955,7 +844,6 @@ test "bash timeout kills descendant processes" {
     const process_id = try readProcessId(gpa, io, &tmp);
     var gone = false;
     for (0..200) |_| {
-        // Signal zero probes for existence and delivers nothing.
         std.posix.kill(process_id, @enumFromInt(0)) catch |err| switch (err) {
             error.ProcessNotFound => {
                 gone = true;
@@ -968,15 +856,12 @@ test "bash timeout kills descendant processes" {
     try std.testing.expect(gone);
 }
 
-/// The process id that a test command wrote to `pid` in its temporary directory.
 fn readProcessId(gpa: std.mem.Allocator, io: std.Io, tmp: *std.testing.TmpDir) !std.posix.pid_t {
     const text = try tmp.dir.readFileAlloc(io, "pid", gpa, .limited(64));
     defer gpa.free(text);
     return std.fmt.parseInt(std.posix.pid_t, std.mem.trimEnd(u8, text, "\n"), 10);
 }
 
-// The capture cap kills the flood but keeps the window before it, so the last
-// real step before the flood stays readable.
 test "an oversized command keeps its output tail and states the stop" {
     const gpa = std.testing.allocator;
     const context: Context = .{ .gpa = gpa, .io = std.testing.io };
@@ -994,7 +879,6 @@ test "an oversized command keeps its output tail and states the stop" {
         result.content,
         "[The command produced more than 8 MB of output, so Drinky stopped it.]",
     ) != null);
-    // The configured tail window keeps the flood, not the whole capture.
     try std.testing.expect(std.mem.indexOf(u8, result.content, "Drinky omitted") != null);
     try std.testing.expect(std.mem.startsWith(u8, result.summary.?.text, "Time: "));
     try std.testing.expect(

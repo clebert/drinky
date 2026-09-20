@@ -1,6 +1,3 @@
-//! Reads a UTF-8 text file, paginated by line. A large file returns a bounded
-//! window that points at the next offset to continue from.
-
 const std = @import("std");
 
 const format = @import("../format.zig");
@@ -10,8 +7,6 @@ const Result = @import("Result.zig");
 const fs = @import("fs.zig");
 const parse = @import("parse.zig");
 
-/// The window of one call. A file inside it comes back whole, so a caller that
-/// must show the model a whole file keeps that file below both bounds.
 pub const lines_max = 2000;
 pub const bytes_max = 50 * 1024;
 const file_bytes_max = 16 << 20;
@@ -80,9 +75,6 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
         );
     }
 
-    // A rule can require a skill for this file. A read is never refused, so it
-    // only asks Drinky to send that skill, which reaches the model at the next
-    // round. A role that reads and never writes still gets the rules.
     if (context.skill_guard) |guard| try guard.require(&.{
         .gpa = gpa,
         .io = context.io,
@@ -126,8 +118,6 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
         if (index < start) continue;
         if (shown >= shown_max) break;
         if (shown > 0 and bytes + line.len > bytes_max) break;
-        // The first line is exempt from the byte budget so a page always makes
-        // progress. It must not carry the whole cap away on its own.
         if (shown == 0 and line.len > bytes_max) {
             try out.writer.writeAll(line[0..utf8FloorLength(line, bytes_max)]);
             last = index;
@@ -163,9 +153,6 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
     }
 
     const truncation_suffix = if (truncated) " · Line: Truncated" else "";
-    // A read of the whole file states the one number that matters. A read that
-    // left part of the file out states the range against the total, which says
-    // what stayed out without a count of its own.
     const summary = if (start == 0 and last + 1 == total)
         try std.fmt.allocPrint(gpa, "Lines: {d}{s}", .{ shown, truncation_suffix })
     else
@@ -177,8 +164,6 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
     return .{ .content = content, .summary = .{ .text = summary }, .is_error = false };
 }
 
-/// The largest length no greater than `max` that does not split a UTF-8
-/// codepoint, so a truncated line stays valid UTF-8 for JSON serialization.
 fn utf8FloorLength(bytes: []const u8, max: usize) usize {
     var end = @min(bytes.len, max);
     while (end > 0 and end < bytes.len and bytes[end] & 0xC0 == 0x80) end -= 1;
@@ -214,8 +199,6 @@ test "read paginates and points at the next offset" {
     try std.testing.expect(!result.is_error);
     try std.testing.expect(std.mem.startsWith(u8, result.content, "one\n"));
     try std.testing.expect(std.mem.indexOf(u8, result.content, "Use offset=2 to continue") != null);
-    // The range against the total says what stayed out, so no second count
-    // repeats it.
     try std.testing.expectEqualStrings("Lines: 1–1 of 3", result.summary.?.text);
 }
 

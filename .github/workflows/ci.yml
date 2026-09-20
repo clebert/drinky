@@ -19,6 +19,4 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
-      - run: zig build
-      - run: zig fmt --check build.zig src lib scripts
-      - run: sh scripts/test-audit.sh
+      - run: sh scripts/check.sh

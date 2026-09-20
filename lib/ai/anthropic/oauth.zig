@@ -1,7 +1,3 @@
-//! The Anthropic subscription OAuth protocol: PKCE generation, token exchange,
-//! refresh, and the account profile. Credential storage and login orchestration
-//! live in `Auth`. This module only speaks the protocol.
-
 const std = @import("std");
 
 const json = @import("../json.zig");
@@ -24,10 +20,7 @@ const profile_response_bytes_max = 256 * 1024;
 pub const Tokens = struct {
     access: []const u8,
     refresh: []const u8,
-    /// The absolute epoch milliseconds at which `access` counts as stale.
     expires_ms: i64,
-    /// The stable account and organization markers from the OAuth profile.
-    /// Null keeps credentials from older Drinky versions usable.
     account_uuid: ?[]const u8 = null,
     organization_uuid: ?[]const u8 = null,
 
@@ -38,8 +31,6 @@ pub const Tokens = struct {
         if (self.organization_uuid) |organization_uuid| gpa.free(organization_uuid);
     }
 
-    /// Return true only when both complete principal markers match. An unknown
-    /// marker needs the safe replacement path.
     pub fn samePrincipal(self: *const Tokens, other: *const Tokens) bool {
         const account_uuid = self.account_uuid orelse return false;
         const other_account_uuid = other.account_uuid orelse return false;
@@ -50,7 +41,6 @@ pub const Tokens = struct {
     }
 };
 
-/// The stable principal markers returned by Anthropic's OAuth profile endpoint.
 pub const Identity = struct {
     account_uuid: []const u8,
     organization_uuid: []const u8,
@@ -61,7 +51,6 @@ pub const Identity = struct {
     }
 };
 
-/// The browser authorize URL for `code`. The caller frees the result.
 pub fn authorizeUrl(gpa: std.mem.Allocator, code: *const oauth_wire.Pkce) ![]u8 {
     return std.fmt.allocPrint(
         gpa,
@@ -73,23 +62,18 @@ pub fn authorizeUrl(gpa: std.mem.Allocator, code: *const oauth_wire.Pkce) ![]u8 
     );
 }
 
-/// The authorization grant traded for tokens: the callback's hostile `code` and
-/// `state` strings plus the local PKCE `verifier`.
 pub const Grant = struct {
     code: []const u8,
     state: []const u8,
     verifier: []const u8,
 };
 
-/// Exchange an authorization grant for tokens. The caller frees the result.
 pub fn exchange(gpa: std.mem.Allocator, io: std.Io, timeouts: net.Timeouts, grant: Grant) !Tokens {
     const body = try exchangeBody(gpa, grant);
     defer gpa.free(body);
     return post(gpa, io, timeouts, body);
 }
 
-/// The exchange body via the JSON serializer, so hostile callback bytes cannot
-/// inject members into the token request. The caller frees the result.
 fn exchangeBody(gpa: std.mem.Allocator, grant: Grant) error{OutOfMemory}![]u8 {
     return std.json.Stringify.valueAlloc(gpa, .{
         .grant_type = "authorization_code",
@@ -101,7 +85,6 @@ fn exchangeBody(gpa: std.mem.Allocator, grant: Grant) error{OutOfMemory}![]u8 {
     }, .{});
 }
 
-/// Trade a refresh token for a fresh access token. The caller frees the result.
 pub fn refresh(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -117,8 +100,6 @@ pub fn refresh(
     return post(gpa, io, timeouts, body);
 }
 
-/// Fetch the stable account and organization markers for an access token.
-/// Claude Code uses this private endpoint for its OAuth account profile.
 pub fn identity(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -219,7 +200,6 @@ fn parseTokens(gpa: std.mem.Allocator, io: std.Io, body: []const u8) !Tokens {
     const refresh_token = json.string(object.get("refresh_token")) orelse
         return error.MissingRefreshToken;
     const expires_in = json.integer(object.get("expires_in")) orelse return error.MissingExpiry;
-    // A crafted expiry must fail cleanly, not overflow and crash.
     const expires_scaled = std.math.mul(i64, expires_in, 1000) catch return error.MissingExpiry;
 
     const access_owned = try gpa.dupe(u8, access);

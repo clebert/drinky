@@ -1,15 +1,3 @@
-//! The remote control of one session: the saved bots, the pairing of a new one,
-//! the attached one, and the detached one whose last message still goes out. It owns
-//! every network task, every generation, and every Telegram id, and it is the
-//! one source of truth for the remote state.
-//!
-//! The controller reports to its owner through a `Sink` of small actions, and it
-//! exposes domain state alone. The owner maps that state to captions, pickers,
-//! and the transcript, and it hands the reports of the tasks back through
-//! `applyAttachmentEvent` and `applyPairingEvent`. The controller never waits on
-//! the network: a detached bot stays in the `detaching` state until it reports
-//! that its last message went out, or until the owner aborts the wait.
-
 const std = @import("std");
 
 const ai = @import("ai");
@@ -23,12 +11,8 @@ const Store = @import("Store.zig");
 
 const Controller = @This();
 
-/// The bytes of one toast. Telegram shows 200 characters, and a byte is at most
-/// one character, so the cut stays inside that bound.
 const toast_bytes_max = 200;
 
-/// The commands the chat completes after a slash: every command that runs from
-/// Telegram, with its `/help` summary.
 const bot_commands = blk: {
     var count = 0;
     for (ai.command.summaries) |summary| {
@@ -48,46 +32,28 @@ gpa: std.mem.Allocator,
 io: std.Io,
 store: Store,
 mode: Mode,
-/// Last generation reserved for an attachment or a pairing. A report of one that
-/// ended names a stale generation, so it drops.
 generation: u64,
 sink: Sink,
-/// The sinks that the tasks report through. The owner routes them into its own
-/// event channel and hands the events back to `applyAttachmentEvent` and
-/// `applyPairingEvent`.
 attachment_sink: Attachment.Sink,
 pairing_sink: Pairing.Sink,
-/// The API origin. A test points it at a loopback server.
 base_url: []const u8,
-/// The head window of one Telegram call.
 connect_ms: u64,
 pace: Attachment.Pace,
-/// The code of the next pairing, or null for a fresh random one. A test fixes
-/// it, so its scripted chat can send it.
 code: ?Pairing.Code,
-/// How many messages the full send queue dropped since the chat learned of the
-/// last run. The report of the run goes out once a put proves that the queue
-/// has room again.
 dropped_count: usize,
 
-/// Where the remote control stands. The tags are the `State` the owner reads.
 const Mode = union(enum) {
     idle,
-    /// The editor takes a token.
     token_prompt,
-    /// The token check runs on the worker.
     checking_token: *Pairing,
-    /// The wait for the code runs on the worker.
     pairing: *Pairing,
     attached: *Attachment,
-    /// The detached bot sends the last message of its chat.
     detaching: *Attachment,
 };
 
 pub const State = std.meta.Tag(Mode);
 
 pub const Options = struct {
-    /// The saved bots. The controller takes ownership.
     store: Store,
     sink: Sink,
     attachment_sink: Attachment.Sink,
@@ -98,25 +64,16 @@ pub const Options = struct {
     code: ?Pairing.Code = null,
 };
 
-/// Where the controller reports. The owner acts on each action at once.
 pub const Sink = struct {
     context: *anyopaque,
     act: *const fn (context: *anyopaque, action: Action) anyerror!void,
 };
 
-/// One report to the owner. Every text is borrowed for the call.
 pub const Action = union(enum) {
-    /// A text message from the bound chat. The owner runs it or queues it, and it
-    /// answers with `reply`.
     chat_message: ChatMessage,
-    /// A tap on a keyboard of the bound chat. The owner acts on it and answers
-    /// it with `answer`, with a toast or with nothing.
     chat_tap: ChatTap,
-    /// One line for the owner to show.
     report: Report,
-    /// The state changed. The owner reads `state` and the names it needs.
     state_changed,
-    /// The pairing changed what the owner shows for it.
     pairing_changed: PairingChange,
 
     pub const ChatMessage = struct {
@@ -135,32 +92,20 @@ pub const Action = union(enum) {
         text: []const u8,
 
         pub const Kind = enum {
-            /// A durable event of the transcript. A mirror of the transcript
-            /// sends it to the chat too.
             event,
-            /// A durable event that stays in the terminal, because it stands in
-            /// the chat already or a send to the chat caused it. A mirror that
-            /// sends it can feed its own failure.
             terminal_event,
-            /// A transient notice.
             notice,
         };
     };
 
     pub const PairingChange = enum {
-        /// The token check runs, so the owner shows a wait.
         check_started,
-        /// The bot and the code are known, so the owner shows them.
         code_ready,
-        /// The check ended without a bot, and the token prompt returns with the
-        /// token, so the owner closes the wait alone.
         prompt_restored,
-        /// The pairing ended, so the owner closes the wait and drops the token.
         ended,
     };
 };
 
-/// Why an attachment ends.
 pub const DetachCause = union(enum) {
     user,
     exit,
@@ -168,11 +113,8 @@ pub const DetachCause = union(enum) {
     failure: Attachment.Event.Reason,
 };
 
-/// How far a cancel of the pairing reaches.
 pub const CancelScope = enum {
-    /// Esc: a token check returns to the token prompt, and a code wait ends.
     step,
-    /// Ctrl+C and Ctrl+D: the whole command ends.
     command,
 };
 
@@ -194,23 +136,15 @@ pub fn init(gpa: std.mem.Allocator, io: std.Io, options: *const Options) Control
     };
 }
 
-/// Replace the store with the one at `home`. The startup calls it once the home
-/// directory is known.
 pub fn openStore(self: *Controller, home: []const u8) !void {
     const store = try Store.open(self.gpa, self.io, home);
     self.store.deinit();
     self.store = store;
 }
 
-/// End every task: detach with the exit event, end a pairing, and await the
-/// last message inside its window. The owner calls it while it can still show
-/// the reports, and `deinit` frees the rest later. The end of the tasks depends
-/// on no report: a bot whose exit event cannot be written still closes.
 pub fn shutdown(self: *Controller) void {
     self.detach(.exit) catch {};
     switch (self.mode) {
-        // An attached bot here failed its detach before the close, so it closes
-        // with no final message and ends like every other one.
         .attached, .detaching => |attachment| attachment.destroy(),
         .checking_token, .pairing => |pairing| pairing.destroy(),
         .idle, .token_prompt => {},
@@ -227,7 +161,6 @@ pub fn state(self: *const Controller) State {
     return self.mode;
 }
 
-/// Whether a pairing runs, so the owner routes the picker keys to it.
 pub fn pairs(self: *const Controller) bool {
     return switch (self.mode) {
         .checking_token, .pairing => true,
@@ -235,23 +168,18 @@ pub fn pairs(self: *const Controller) bool {
     };
 }
 
-/// The username of every saved bot, in the order of the store.
 pub fn usernames(self: *const Controller) []const []const u8 {
     return self.store.usernames.items;
 }
 
-/// The failure of the startup read of the store, or null when the file was
-/// absent or read whole. The owner reports it once.
 pub fn loadError(self: *const Controller) ?anyerror {
     return self.store.load_error;
 }
 
-/// The path of the store, for the report of a failed read.
 pub fn storePath(self: *const Controller) []const u8 {
     return self.store.path;
 }
 
-/// The username of the attached or detaching bot, or null while there is none.
 pub fn botUsername(self: *const Controller) ?[]const u8 {
     return switch (self.mode) {
         .attached, .detaching => |attachment| attachment.username,
@@ -259,22 +187,18 @@ pub fn botUsername(self: *const Controller) ?[]const u8 {
     };
 }
 
-/// The code of the running pairing. The wait must have started.
 pub fn pairingCode(self: *const Controller) *const Pairing.Code {
     return &self.mode.pairing.code;
 }
 
-/// The username of the bot that the running pairing waits for.
 pub fn pairingUsername(self: *const Controller) []const u8 {
     return self.mode.pairing.username;
 }
 
-/// The link that sends the code of the running pairing with one click.
 pub fn pairingLink(self: *const Controller, buffer: []u8) []const u8 {
     return self.mode.pairing.link(buffer);
 }
 
-/// Switch into the token prompt state. The owner cleared the editor.
 pub fn beginTokenPrompt(self: *Controller) !void {
     std.debug.assert(self.mode == .idle);
     self.mode = .token_prompt;
@@ -282,7 +206,6 @@ pub fn beginTokenPrompt(self: *Controller) !void {
     try self.emit(.state_changed);
 }
 
-/// Leave the token prompt state without a bot. The owner cleared the editor.
 pub fn cancelTokenPrompt(self: *Controller) !void {
     std.debug.assert(self.mode == .token_prompt);
     self.mode = .idle;
@@ -290,8 +213,6 @@ pub fn cancelTokenPrompt(self: *Controller) !void {
     try self.emit(.state_changed);
 }
 
-/// Prove `token` on a worker. The owner keeps the token in the editor, so a
-/// rejected token returns to it.
 pub fn submitToken(self: *Controller, token: []const u8) !void {
     std.debug.assert(self.mode == .token_prompt);
     if (token.len == 0) return self.showNotice(.warning, "Type the bot token.", .{});
@@ -303,8 +224,6 @@ pub fn submitToken(self: *Controller, token: []const u8) !void {
     const pairing = try self.createPairing(token);
     errdefer pairing.destroy();
     self.mode = .{ .checking_token = pairing };
-    // A failure below returns the prompt, and the owner learns that its wait is
-    // over, so no picker outlives the check that it showed.
     errdefer {
         self.mode = .token_prompt;
         self.emit(.{ .pairing_changed = .prompt_restored }) catch {};
@@ -314,7 +233,6 @@ pub fn submitToken(self: *Controller, token: []const u8) !void {
     try self.emit(.state_changed);
 }
 
-/// Cancel the pairing and report the result.
 pub fn cancelPairing(self: *Controller, scope: CancelScope) !void {
     switch (self.mode) {
         .checking_token => |pairing| {
@@ -342,8 +260,6 @@ pub fn cancelPairing(self: *Controller, scope: CancelScope) !void {
     try self.emit(.state_changed);
 }
 
-/// Attach the saved bot at `index` of the store. A bot without a chat id pairs
-/// first, and the bind attaches it.
 pub fn attachSaved(self: *Controller, index: usize) !void {
     const bot = self.store.get(index) orelse
         return self.showNotice(.failure, "Select a valid row.", .{});
@@ -352,8 +268,6 @@ pub fn attachSaved(self: *Controller, index: usize) !void {
     try self.startAttachment(bot);
 }
 
-/// Remove the saved bot at `index` of the store and record it. One pick is the
-/// decision, because BotFather restores a token.
 pub fn removeBot(self: *Controller, index: usize) !void {
     const bot = self.store.get(index) orelse
         return self.showNotice(.failure, "Select a valid row.", .{});
@@ -367,11 +281,6 @@ pub fn removeBot(self: *Controller, index: usize) !void {
     try self.recordEvent(.information, "Drinky removed the bot @{s}.", .{username});
 }
 
-/// Detach the bot: name the event as the final message of the chat, enter the
-/// `detaching` state while it goes out, and report the event. The bot reports
-/// its end, or `abortDetach` ends it first. The close comes before every report,
-/// so a failed report cannot leave a dead bot in the attached state. A controller
-/// without an attached bot changes nothing.
 pub fn detach(self: *Controller, cause: DetachCause) !void {
     const attachment = switch (self.mode) {
         .attached => |attachment| attachment,
@@ -389,14 +298,10 @@ pub fn detach(self: *Controller, cause: DetachCause) !void {
         error.OutOfMemory => {},
     };
     self.mode = .{ .detaching = attachment };
-    // The close above named the event as the last message, so no mirror sends it.
     try self.tell(.terminal_event, severity, text);
     try self.emit(.state_changed);
 }
 
-/// End the close of the detached bot now, so the owner is free at once. The last
-/// message of the chat never goes out. A controller without a detaching bot
-/// changes nothing.
 pub fn abortDetach(self: *Controller) !void {
     const attachment = switch (self.mode) {
         .detaching => |attachment| attachment,
@@ -407,9 +312,6 @@ pub fn abortDetach(self: *Controller) !void {
     try self.emit(.state_changed);
 }
 
-/// Queue one line of Drinky for the chat under the role of its severity, silent.
-/// The owner sends the attach event this way, and the answer to a question that
-/// a tap asked.
 pub fn sendEvent(
     self: *Controller,
     severity: ai.command.Outcome.Severity,
@@ -420,9 +322,6 @@ pub fn sendEvent(
     try self.send(line, &.{ .disable_notification = true, .parse_mode = html.parse_mode });
 }
 
-/// Answer the chat message `id` with `text`, silent, under the role of its
-/// severity. A refusal keeps its warning, and a failure its failure, so the chat
-/// reads each like the terminal footer does.
 pub fn reply(
     self: *Controller,
     id: i64,
@@ -438,16 +337,11 @@ pub fn reply(
     });
 }
 
-/// Queue `text` for the chat without a wait. A full queue drops the message, and
-/// the chat learns the count of the run later. A closed or absent attachment
-/// takes nothing.
 pub fn send(self: *Controller, text: []const u8, options: *const Client.SendOptions) !void {
     const attachment = self.attached() orelse return;
     try self.takeQueued(attachment, .message, attachment.send(text, options));
 }
 
-/// Queue `text` as a message that a later `edit` names, and return its handle.
-/// Null when no attached bot takes it or the queue dropped it.
 pub fn sendTracked(
     self: *Controller,
     text: []const u8,
@@ -462,8 +356,6 @@ pub fn sendTracked(
     return handle;
 }
 
-/// Replace the text and the keyboard of the tracked message `handle`, once it
-/// went out. An edit without a keyboard removes the one the message holds.
 pub fn edit(
     self: *Controller,
     handle: Attachment.Handle,
@@ -474,40 +366,31 @@ pub fn edit(
     try self.takeQueued(attachment, .state, attachment.edit(handle, text, options));
 }
 
-/// Take the tracked message `handle` out of the chat, once it went out.
 pub fn delete(self: *Controller, handle: Attachment.Handle) !void {
     const attachment = self.attached() orelse return;
     try self.takeQueued(attachment, .state, attachment.delete(handle));
 }
 
-/// Mark the chat message `message_id` with the state of its transcript entry.
 pub fn react(self: *Controller, message_id: i64, mark: Attachment.Reaction.Mark) !void {
     const attachment = self.attached() orelse return;
     try self.takeQueued(attachment, .state, attachment.react(message_id, mark));
 }
 
-/// Answer the tap `query_id`, with `text` as a toast or with nothing. A toast
-/// above the bound of Telegram cuts before a UTF-8 sequence.
 pub fn answer(self: *Controller, query_id: []const u8, text: ?[]const u8) !void {
     const attachment = self.attached() orelse return;
     var toast = text;
     if (toast) |*whole| {
         var length = @min(whole.len, toast_bytes_max);
-        // A continuation byte reads `10xxxxxx`, and a sequence holds at most three.
         while (length > 0 and length < whole.len and (whole.*[length] & 0xC0) == 0x80) length -= 1;
         whole.* = whole.*[0..length];
     }
     try self.takeQueued(attachment, .state, attachment.answer(query_id, toast));
 }
 
-/// Whether a bot is attached, so a message for the chat has a taker. The mirror
-/// renders nothing for a chat that does not listen.
 pub fn listens(self: *const Controller) bool {
     return self.mode == .attached;
 }
 
-/// The attached bot, or null in every other state. A detaching bot takes
-/// nothing more, because its close named the last message of the chat.
 fn attached(self: *Controller) ?*Attachment {
     return switch (self.mode) {
         .attached => |attachment| attachment,
@@ -515,15 +398,8 @@ fn attached(self: *Controller) ?*Attachment {
     };
 }
 
-/// What one queue put carries: a message that the chat keeps, or a state of one
-/// it has, such as a mark, an edit, a deletion, or an answer to a tap.
 const Put = enum { message, state };
 
-/// Settle the result of one queue put. A full queue drops the item. A dropped
-/// message counts, and the chat learns the count of the run once a later put
-/// proves that the queue has room again. A dropped state stays silent, because
-/// the chat loses no text with it and shows a stale mark or activity message.
-/// The terminal learns nothing, because its transcript is whole.
 fn takeQueued(
     self: *Controller,
     attachment: *Attachment,
@@ -541,10 +417,6 @@ fn takeQueued(
     try self.reportDrops(attachment);
 }
 
-/// Send the chat the count of a run of dropped messages, after a put that the
-/// queue took. A report that meets a full queue waits for the next such put, so
-/// the count stays until the chat has it. The report names the terminal, because
-/// the reader of the chat has the gap and the terminal has the text.
 fn reportDrops(self: *Controller, attachment: *Attachment) !void {
     const count = self.dropped_count;
     if (count == 0) return;
@@ -567,9 +439,6 @@ fn reportDrops(self: *Controller, attachment: *Attachment) !void {
     self.dropped_count = 0;
 }
 
-/// Apply one report of an attachment. A report of the attached bot acts, a
-/// `drained` report frees the detached bot it names, and every other report is
-/// stale and drops.
 pub fn applyAttachmentEvent(self: *Controller, event: *const Attachment.Event) !void {
     defer event.deinit(self.gpa);
     if (event.payload == .drained) return self.finishDrain(event.generation);
@@ -584,19 +453,12 @@ pub fn applyAttachmentEvent(self: *Controller, event: *const Attachment.Event) !
             .id = message.id,
             .text = message.text,
         } }),
-        // A tap that no keyboard of Drinky wrote gets its answer and no action,
-        // so its button stops its wait.
         .callback => |callback| if (keyboard.Tap.parse(callback.data)) |tap| {
             try self.emit(.{ .chat_tap = .{ .query_id = callback.query_id, .tap = tap } });
         } else {
             try self.answer(callback.query_id, null);
         },
-        // The message stays out, and a later one with text goes in, so the
-        // reply warns like every refusal that the user can pass.
         .unreadable => |id| try self.reply(id, .warning, "Drinky reads text alone."),
-        // An outage of a side stays in the terminal. A poll outage means that
-        // the chat is out of reach, so its report lands late and states
-        // nothing the user can act on, and a send outage feeds itself.
         .failed => |failure| try self.recordTerminalEvent(
             .failure,
             "Drinky could not {s} @{s} because of error {s}. Drinky tries again.",
@@ -625,7 +487,6 @@ pub fn applyAttachmentEvent(self: *Controller, event: *const Attachment.Event) !
     }
 }
 
-/// The noun of one rejected item, with the preposition that binds it to the bot.
 fn rejectedNoun(kind: Attachment.Event.Rejected.Kind) []const u8 {
     return switch (kind) {
         .message => "a message to",
@@ -635,8 +496,6 @@ fn rejectedNoun(kind: Attachment.Event.Rejected.Kind) []const u8 {
     };
 }
 
-/// Apply one report of the pairing worker. A report of a canceled pairing names
-/// a stale generation and drops.
 pub fn applyPairingEvent(self: *Controller, event: *const Pairing.Event) !void {
     defer event.deinit(self.gpa);
     const pairing = switch (self.mode) {
@@ -647,19 +506,13 @@ pub fn applyPairingEvent(self: *Controller, event: *const Pairing.Event) !void {
     switch (event.payload) {
         .token_checked => |check| switch (check) {
             .bot => |me| {
-                // The check task ended with its report, so the wait can start.
                 pairing.cancel();
                 {
-                    // The pairing owns the username once the wait started, so
-                    // the cleanup of the copy ends with this block.
                     const username = try self.gpa.dupe(u8, me.username);
                     errdefer self.gpa.free(username);
                     try pairing.startWait(me.id, username);
                 }
                 self.mode = .{ .pairing = pairing };
-                // The token is proven, so the bot is saved now, without a chat.
-                // A pairing that ends without a bind then keeps the bot in the
-                // picker, and one pick starts the wait again.
                 const bot: Store.Bot = .{
                     .token = pairing.token,
                     .id = pairing.id,
@@ -757,7 +610,6 @@ pub fn applyPairingEvent(self: *Controller, event: *const Pairing.Event) !void {
     }
 }
 
-/// Build the pairing worker for `token`.
 fn createPairing(self: *Controller, token: []const u8) !*Pairing {
     const generation = try reserveGeneration(&self.generation);
     return Pairing.create(self.gpa, self.io, &.{
@@ -770,21 +622,15 @@ fn createPairing(self: *Controller, token: []const u8) !*Pairing {
     });
 }
 
-/// Start the wait for the code of a saved bot that never paired. The bot is
-/// borrowed.
 fn startWait(self: *Controller, bot: *const Store.Bot) !void {
     const pairing = try self.createPairing(bot.token);
     errdefer pairing.destroy();
     {
-        // The pairing owns the copy once the wait started, so the cleanup of the
-        // copy ends with this block.
         const username = try self.gpa.dupe(u8, bot.username);
         errdefer self.gpa.free(username);
         try pairing.startWait(bot.id, username);
     }
     self.mode = .{ .pairing = pairing };
-    // A failure below ends the pairing, and the owner learns that its wait is
-    // over, so no picker outlives the pairing that it showed.
     errdefer {
         self.mode = .idle;
         self.emit(.{ .pairing_changed = .ended }) catch {};
@@ -794,7 +640,6 @@ fn startWait(self: *Controller, bot: *const Store.Bot) !void {
     try self.emit(.state_changed);
 }
 
-/// Start the tasks of a paired bot and take the input. The bot is borrowed.
 fn startAttachment(self: *Controller, bot: *const Store.Bot) !void {
     std.debug.assert(self.mode == .idle);
     const generation = try reserveGeneration(&self.generation);
@@ -812,16 +657,11 @@ fn startAttachment(self: *Controller, bot: *const Store.Bot) !void {
     errdefer attachment.destroy();
     try attachment.start();
     self.mode = .{ .attached = attachment };
-    // The destroy above runs after this, so no mode names the freed bot.
     errdefer self.mode = .idle;
-    // A run of drops belongs to the chat that lost the messages, and that chat
-    // had its last message at the detach.
     self.dropped_count = 0;
     try self.emit(.state_changed);
 }
 
-/// Free the detached bot of `generation` once its sender ended, and hand the
-/// input back. A report of a bot that an abort freed already names no bot.
 fn finishDrain(self: *Controller, generation: u64) !void {
     const attachment = switch (self.mode) {
         .detaching => |attachment| attachment,
@@ -833,7 +673,6 @@ fn finishDrain(self: *Controller, generation: u64) !void {
     try self.emit(.state_changed);
 }
 
-/// The event of a detach. The result is owned.
 fn detachText(self: *Controller, cause: DetachCause, username: []const u8) ![]u8 {
     return switch (cause) {
         .user => std.fmt.allocPrint(self.gpa, "You detached @{s}.", .{username}),
@@ -842,7 +681,6 @@ fn detachText(self: *Controller, cause: DetachCause, username: []const u8) ![]u8
             "Drinky detached @{s} because Drinky exits.",
             .{username},
         ),
-        // The repair is a login, and `/login` is terminal-only.
         .credential_rejected => std.fmt.allocPrint(
             self.gpa,
             "The provider rejected the credential, so Drinky detached @{s}. Sign in again in " ++
@@ -875,7 +713,6 @@ fn detachText(self: *Controller, cause: DetachCause, username: []const u8) ![]u8
     };
 }
 
-/// The verb of one side of the attachment in a failure or recovery event.
 fn sideVerb(side: Attachment.Event.Side) []const u8 {
     return switch (side) {
         .poll => "poll",
@@ -887,7 +724,6 @@ fn emit(self: *Controller, action: Action) !void {
     try self.sink.act(self.sink.context, action);
 }
 
-/// Hand one line to the owner.
 fn tell(
     self: *Controller,
     kind: Action.Report.Kind,
@@ -897,7 +733,6 @@ fn tell(
     try self.emit(.{ .report = .{ .kind = kind, .severity = severity, .text = text } });
 }
 
-/// Hand one durable event to the owner.
 fn recordEvent(
     self: *Controller,
     severity: ai.command.Outcome.Severity,
@@ -909,7 +744,6 @@ fn recordEvent(
     try self.tell(.event, severity, text);
 }
 
-/// Hand one durable event that stays in the terminal to the owner.
 fn recordTerminalEvent(
     self: *Controller,
     severity: ai.command.Outcome.Severity,
@@ -921,7 +755,6 @@ fn recordTerminalEvent(
     try self.tell(.terminal_event, severity, text);
 }
 
-/// Hand one transient notice to the owner.
 fn showNotice(
     self: *Controller,
     severity: ai.command.Outcome.Severity,
@@ -933,7 +766,6 @@ fn showNotice(
     try self.tell(.notice, severity, text);
 }
 
-/// Permanently reserve the next generation of `counter`.
 fn reserveGeneration(counter: *u64) error{GenerationExhausted}!u64 {
     if (counter.* == std.math.maxInt(u64)) return error.GenerationExhausted;
     counter.* += 1;
@@ -942,16 +774,10 @@ fn reserveGeneration(counter: *u64) error{GenerationExhausted}!u64 {
 
 const testing = @import("testing.zig");
 
-/// The owner of the tests: it records every action with a copy of its text, and
-/// it routes the reports of the tasks into one queue that the test drains into
-/// the controller.
 const Owner = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
     actions: std.ArrayList(Recorded) = .empty,
-    /// The count of recorded actions at which the sink fails once, or null. A
-    /// test sets it right after an ownership transfer, so the failure path of
-    /// the controller runs with a live owner.
     fail_at: ?usize = null,
     events_buffer: [64]Event = undefined,
     events: std.Io.Queue(Event) = undefined,
@@ -1047,8 +873,6 @@ const Owner = struct {
         self.events.putOne(self.io, .{ .pairing = event }) catch return error.Closed;
     }
 
-    /// Hand queued task reports to the controller until `count_min` of them
-    /// applied, and wait up to about five seconds for them.
     fn pump(self: *Owner, controller: *Controller, count_min: usize) !void {
         var batch: [64]Event = undefined;
         var applied: usize = 0;
@@ -1065,8 +889,6 @@ const Owner = struct {
         return error.TestTimedOut;
     }
 
-    /// Hand queued task reports to the controller until it reaches `target`, and
-    /// wait up to about five seconds for it.
     fn pumpUntil(self: *Owner, controller: *Controller, target: State) !void {
         var batch: [64]Event = undefined;
         for (0..500) |_| {
@@ -1081,7 +903,6 @@ const Owner = struct {
         return error.TestTimedOut;
     }
 
-    /// The text of the last report, or an error when no action is a report.
     fn lastReport(self: *const Owner) ![]const u8 {
         var index = self.actions.items.len;
         while (index > 0) : (index -= 1) {
@@ -1093,7 +914,6 @@ const Owner = struct {
         return error.TestExpectedReport;
     }
 
-    /// The report texts that contain `needle`, counted.
     fn countReports(self: *const Owner, needle: []const u8) usize {
         var count: usize = 0;
         for (self.actions.items) |action| switch (action) {
@@ -1110,9 +930,6 @@ const ok_true = "{\"ok\":true,\"result\":true}";
 const ok_empty = "{\"ok\":true,\"result\":[]}";
 const ok_sent = "{\"ok\":true,\"result\":{\"message_id\":1}}";
 
-/// End `controller` at the end of a test without the last message of the chat,
-/// so no test waits out a drain window that it does not test. A test of that
-/// window ends its own bot first.
 fn endTest(controller: *Controller) void {
     controller.detach(.exit) catch {};
     controller.abortDetach() catch {};
@@ -1157,8 +974,6 @@ test "a saved bot attaches, its messages and taps reach the owner, and a detach 
     try std.testing.expectEqualStrings("drinky_bot", controller.botUsername().?);
     try std.testing.expect(owner.actions.items[0] == .state_changed);
     try server.waitForLongPoll();
-    // The attach registers the commands that run from Telegram, each with its
-    // summary.
     const registered = try server.waitForRequest("/setMyCommands", 0);
     try std.testing.expectEqualStrings(
         "{\"commands\":[{\"command\":\"effort\",\"description\":\"Set the reasoning effort\"}," ++
@@ -1171,9 +986,6 @@ test "a saved bot attaches, its messages and taps reach the owner, and a detach 
     );
     try controller.sendEvent(.information, "You attached @drinky_bot.");
 
-    // The text message becomes an action, the sticker gets its reply, the tap
-    // becomes an action with its query, and a tap that no keyboard of Drinky
-    // wrote gets a silent answer alone.
     try owner.pump(&controller, 4);
     const message = owner.actions.items[1].chat_message;
     try std.testing.expectEqual(@as(i64, 7), message.id);
@@ -1193,17 +1005,14 @@ test "a saved bot attaches, its messages and taps reach the owner, and a detach 
         try server.waitForRequest("/answerCallbackQuery", 1),
     );
 
-    // The close drops what the queue still holds, so the reply goes out first.
     try server.waitForSends(3);
     try controller.detach(.user);
-    // The bot sends its last message, and the owner learns the state first.
     try std.testing.expectEqual(State.detaching, controller.state());
     try std.testing.expectEqualStrings("drinky_bot", controller.botUsername().?);
     try std.testing.expectEqualStrings("You detached @drinky_bot.", try owner.lastReport());
     try std.testing.expect(owner.actions.items[owner.actions.items.len - 1] == .state_changed);
     try controller.attachSaved(0);
     try std.testing.expect(std.mem.indexOf(u8, try owner.lastReport(), "cannot attach a bot now") != null);
-    // The sender reports its end, and the controller frees the bot.
     try owner.pump(&controller, 1);
     try std.testing.expectEqual(State.idle, controller.state());
     try std.testing.expect(controller.botUsername() == null);
@@ -1217,8 +1026,6 @@ test "a saved bot attaches, its messages and taps reach the owner, and a detach 
         sends[0],
         "\"text\":\"ℹ You attached @drinky_bot.\"",
     ) != null);
-    // A reply keeps the severity of its notice: the two refusals warn, so both
-    // take the warning symbol.
     try std.testing.expect(std.mem.indexOf(
         u8,
         sends[1],
@@ -1238,18 +1045,11 @@ test "a saved bot attaches, its messages and taps reach the owner, and a detach 
     ) != null);
 }
 
-// A full queue drops a message for good, and the chat is the one place with the
-// gap, so the report goes there and not to the terminal, which holds the whole
-// transcript. The report waits for a put that proves the queue has room again,
-// and then states the count of the run. A dropped mark does not count, because
-// the chat loses no text with it.
 test "a run of dropped messages reports its count in the chat once the queue has room" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    // The first reply waits, so the sender holds the first message while the
-    // queue fills behind it.
     const sends = [_]testing.Reply{.{ .body = ok_sent, .delay_ms = 100 }} ++
         [_]testing.Reply{.{ .body = ok_sent }} ** (Attachment.outbound_capacity + 2);
     var server = try testing.Server.init(gpa, io, &.{
@@ -1268,7 +1068,6 @@ test "a run of dropped messages reports its count in the chat once the queue has
     try store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
     var controller = Controller.init(gpa, io, &owner.options(store, &server, &url_buffer));
     defer endTest(&controller);
-    // The queue drains at full speed once the first reply lands.
     controller.pace.send_spacing_ms = 0;
     try controller.attachSaved(0);
     try server.waitForLongPoll();
@@ -1276,13 +1075,10 @@ test "a run of dropped messages reports its count in the chat once the queue has
     try controller.send("slow", &.{});
     try server.waitForSends(1);
     for (0..Attachment.outbound_capacity) |_| try controller.send("fill", &.{});
-    // The queue is full, so three messages and one mark drop.
     for (0..3) |_| try controller.send("lost", &.{});
     try controller.react(7, .committed);
     try std.testing.expectEqual(@as(usize, 0), owner.countReports("dropped"));
 
-    // The sender took several messages, so the next put fits and the report
-    // follows it.
     try server.waitForSends(10);
     try controller.send("room", &.{});
     try server.finish();
@@ -1296,19 +1092,14 @@ test "a run of dropped messages reports its count in the chat once the queue has
         "\"text\":\"⚠ Drinky dropped 3 messages while the send queue was full. " ++
             "The terminal holds the whole transcript.\"",
     ) != null);
-    // The terminal learns nothing, because its transcript is whole.
     try std.testing.expectEqual(@as(usize, 0), owner.countReports("dropped"));
 }
 
-// An exit key during the drain hands the input back at once. The detach event
-// then never reaches the chat, and the next attach starts without a wait,
-// because no sender drains once the input is free.
 test "an abort of the detach frees the owner at once and drops the last message" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    // No script answers a send, so the detach event stays in flight.
     var server = try testing.Server.init(gpa, io, &.{
         .{ .method = "deleteWebhook", .replies = &.{ .{ .body = ok_true }, .{ .body = ok_true } } },
         .{ .method = "setMyCommands", .replies = &.{ .{ .body = ok_true }, .{ .body = ok_true } } },
@@ -1338,9 +1129,6 @@ test "an abort of the detach frees the owner at once and drops the last message"
     try std.testing.expectEqual(State.idle, controller.state());
     try std.testing.expect(owner.actions.items[owner.actions.items.len - 1] == .state_changed);
 
-    // The next attach starts at once, and the stale drain report of the freed
-    // bot changes nothing. The second attach registers the commands again, so
-    // the count before it is the baseline.
     const registrations = server.countOf("/setMyCommands");
     try controller.attachSaved(0);
     try std.testing.expectEqual(State.attached, controller.state());
@@ -1400,8 +1188,6 @@ test "a token pairs a new bot, and a rejected token returns to the prompt" {
     }
     try std.testing.expect(restored);
 
-    // The rejected token saved nothing, and the proven one saves the bot with
-    // no chat before the wait, so a pairing that ends without a bind keeps it.
     try std.testing.expectEqual(@as(usize, 0), controller.usernames().len);
     try controller.submitToken("42:secret");
     try owner.pump(&controller, 1);
@@ -1416,7 +1202,6 @@ test "a token pairs a new bot, and a rejected token returns to the prompt" {
         controller.pairingLink(&link_buffer),
     );
 
-    // The bind saves the chat of the bot and attaches it.
     try owner.pump(&controller, 1);
     try std.testing.expectEqual(State.attached, controller.state());
     try std.testing.expectEqual(@as(usize, 1), controller.usernames().len);
@@ -1433,7 +1218,6 @@ test "a cancel of the pairing keeps or drops the token by its scope" {
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    // No script answers, so every check waits until the cancel.
     var server = try testing.Server.init(gpa, io, &.{});
     defer server.deinit();
     try server.start();
@@ -1525,15 +1309,10 @@ test "a failure of the chat reports once per run, and a permanent one detaches" 
     try std.testing.expectEqual(@as(usize, 1), owner.countReports("can poll @drinky_bot again"));
     try std.testing.expect(std.mem.indexOf(u8, try owner.lastReport(), "no longer knows the token") != null);
     try std.testing.expect(std.mem.indexOf(u8, try owner.lastReport(), "Remove the bot") != null);
-    // The error event is the last message of the chat, and its end frees the input.
     try owner.pumpUntil(&controller, .idle);
     try server.finish();
 }
 
-// The owner can fail at any action, because its sink allocates. After each
-// ownership transfer the controller alone frees what it holds, so a failure of
-// the action that follows the transfer leaves no double owner, no dangling
-// pointer, and no leak. The leak check of the test allocator proves the last part.
 test "an action failure after an ownership transfer leaves the controller whole" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -1559,8 +1338,6 @@ test "an action failure after an ownership transfer leaves the controller whole"
     var controller = Controller.init(gpa, io, &owner.options(store, &server, &url_buffer));
     defer endTest(&controller);
 
-    // The username moved into the pairing, and the `code_ready` action fails.
-    // The bot is saved by then, so the cancel keeps it.
     try controller.beginTokenPrompt();
     try controller.submitToken("44:new");
     owner.fail_at = owner.actions.items.len;
@@ -1572,23 +1349,14 @@ test "an action failure after an ownership transfer leaves the controller whole"
     try std.testing.expectEqual(@as(usize, 3), controller.usernames().len);
     try std.testing.expectEqualStrings("new_bot", controller.usernames()[2]);
 
-    // The pairing of a saved bot stands, and its first action fails: the pairing
-    // ends and the owner learns it.
     owner.fail_at = owner.actions.items.len;
     try std.testing.expectError(error.SinkFailed, controller.attachSaved(1));
     try std.testing.expectEqual(State.idle, controller.state());
 
-    // The attachment stands, and the `state_changed` action fails: no mode names
-    // the freed bot.
     owner.fail_at = owner.actions.items.len;
     try std.testing.expectError(error.SinkFailed, controller.attachSaved(0));
     try std.testing.expectEqual(State.idle, controller.state());
 
-    // The bot closed, and the detach event fails: the bot still drains in the
-    // `detaching` state, so no dead bot stays attached, and its end still frees
-    // the input. The registrations before this attach are the baseline, because
-    // a failed attach above can leave one of its own. A late registration of
-    // that freed bot can end the wait early, and the detach holds either way.
     const registrations = server.countOf("/setMyCommands");
     try controller.attachSaved(0);
     _ = try server.waitForRequest("/setMyCommands", registrations);
@@ -1598,9 +1366,6 @@ test "an action failure after an ownership transfer leaves the controller whole"
     try owner.pumpUntil(&controller, .idle);
 }
 
-// The exit must end the tasks of the bot whether or not the exit event can be
-// written. A shutdown whose report fails still closes the bot, so no task holds
-// the owner after its teardown. The leak check proves that the bot is freed.
 test "a shutdown closes the bot even when its report fails" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -1627,6 +1392,5 @@ test "a shutdown closes the bot even when its report fails" {
     owner.fail_at = owner.actions.items.len;
     controller.shutdown();
     try std.testing.expectEqual(State.idle, controller.state());
-    // The report failed, so the exit event never reached the owner.
     try std.testing.expectEqual(@as(usize, 0), owner.countReports("because Drinky exits"));
 }

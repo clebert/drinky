@@ -1,6 +1,3 @@
-//! The model list of a local DwarfStar server. The server answers in the
-//! OpenRouter list shape, but its fields describe the local engine directly.
-
 const std = @import("std");
 
 const json = @import("../json.zig");
@@ -10,8 +7,6 @@ const openai_models = @import("../openai/models.zig");
 
 const entry_count_max = 1024;
 
-/// Every model that the server at `base_url` offers. The caller owns the result.
-/// The deadline bounds the credential-free request.
 pub fn fetch(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -27,8 +22,6 @@ pub fn fetch(
     });
 }
 
-/// Decode the local compatibility table. A malformed envelope rejects the
-/// body. A malformed entry drops alone.
 fn parse(gpa: std.mem.Allocator, body: []const u8) ![]Model {
     var parsed = try std.json.parseFromSlice(std.json.Value, gpa, body, .{});
     defer parsed.deinit();
@@ -50,7 +43,6 @@ fn decode(value: std.json.Value) ?Model {
     const object = json.object(value) orelse return null;
     const id = json.string(object.get("id")) orelse return null;
     var model = Model.init(id) catch return null;
-    // A missing or unusable label still leaves the request id.
     if (json.string(object.get("name"))) |engine| model.setEngine(engine) catch {};
     model.context_window = positive(object.get("context_length"));
     if (json.object(object.get("top_provider"))) |top_provider| {
@@ -99,7 +91,6 @@ test parse {
     try std.testing.expectEqualStrings("", flash.servedName());
     try std.testing.expect(flash.price == null);
 
-    // Missing limits state no fact. The local thinking and tool facts keep the row.
     const pro = models[1];
     try std.testing.expectEqualStrings("deepseek-v4-pro", pro.name());
     try std.testing.expectEqual(@as(?u64, null), pro.context_window);

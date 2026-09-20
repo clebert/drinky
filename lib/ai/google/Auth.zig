@@ -1,8 +1,3 @@
-//! The credential of the `google-cloud-key` account. `init` reads a service account
-//! key file once and parses its RSA key. `accessToken` mints a short-lived
-//! access token from a signed JWT on demand and caches it. Nothing persists:
-//! the key file is the credential, so the account has no login and no logout.
-
 const std = @import("std");
 
 const json = @import("../json.zig");
@@ -13,12 +8,10 @@ const Transport = @import("Transport.zig");
 
 const Auth = @This();
 
-/// The cap on the key file. A real key file holds about 2.5 KiB.
 const key_file_bytes_max = 64 * 1024;
 const token_uri_default = "https://oauth2.googleapis.com/token";
 const scope = "https://www.googleapis.com/auth/cloud-platform";
 const token_lifetime_s = 3600;
-/// A cached token with less time left than this mints again.
 const renew_margin_ms = 5 * std.time.ms_per_min;
 const grant_type = "urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer";
 
@@ -34,13 +27,11 @@ token: ?Token,
 
 pub const Options = struct {
     key_path: []const u8,
-    /// The name of a `Transport.Location`, as the environment states it.
     location: []const u8,
 };
 
 const Token = struct {
     access: []const u8,
-    /// The epoch milliseconds at which the token expires.
     expires_ms: i64,
 
     fn deinit(self: Token, gpa: std.mem.Allocator) void {
@@ -48,8 +39,6 @@ const Token = struct {
     }
 };
 
-/// Read the key file and parse its key. No network request runs here. The
-/// location is checked first, so a bad one reports as such whatever the file.
 pub fn init(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -68,8 +57,6 @@ pub fn init(
     return fromKeyFile(gpa, io, timeouts, file, location);
 }
 
-/// The account that `file` describes. The key bytes live in `file` and in the
-/// unescaped `private_key` string of the parse, and this call zeros both.
 fn fromKeyFile(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -92,7 +79,6 @@ fn fromKeyFile(
     if (!validProject(project)) return error.BadCredentials;
     const email = try requiredString(object, "client_email");
     const private_key = try requiredString(object, "private_key");
-    // The arena owns this unescaped copy, so the cast to mutable is sound.
     defer std.crypto.secureZero(u8, @constCast(private_key));
     const token_uri = if (object.get("token_uri") == null)
         token_uri_default
@@ -127,8 +113,6 @@ pub fn deinit(self: *Auth) void {
     self.gpa.free(self.token_uri);
 }
 
-/// A valid access token. The cached one serves while more than the renew margin
-/// remains. Otherwise this mints a new one.
 pub fn accessToken(self: *Auth) ![]const u8 {
     return self.accessTokenWith(mint);
 }
@@ -141,8 +125,6 @@ fn accessTokenWith(self: *Auth, comptime mintFn: anytype) ![]const u8 {
     return self.token.?.access;
 }
 
-/// Mint a new token after the provider rejected the cached one, and report
-/// whether the bytes changed. A caller repeats a request only on a true result.
 pub fn renew(self: *Auth) !bool {
     return self.renewWith(mint);
 }
@@ -159,9 +141,6 @@ fn nowMs(self: *const Auth) i64 {
     return std.Io.Timestamp.now(self.io, .real).toMilliseconds();
 }
 
-/// POST the signed JWT to the token endpoint and decode the token it returns.
-/// A rejected grant is a rejected key. The agent maps `TokenGrantRejected` to
-/// a disposition that the app refuses for this account, so the name changes here.
 fn mint(self: *Auth) !Token {
     const now_ms = self.nowMs();
     const assertion = try self.jwt(@divFloor(now_ms, std.time.ms_per_s));
@@ -187,7 +166,6 @@ fn mint(self: *Auth) !Token {
     return parseToken(self.gpa, response, now_ms);
 }
 
-/// The signed JWT bearer assertion issued at `now_s`. The caller frees it.
 fn jwt(self: *const Auth, now_s: i64) ![]u8 {
     const gpa = self.gpa;
     const claims = try std.json.Stringify.valueAlloc(gpa, .{
@@ -240,7 +218,6 @@ fn requiredString(object: std.json.ObjectMap, name: []const u8) ![]const u8 {
     return json.string(object.get(name)) orelse error.BadCredentials;
 }
 
-/// The project enters the request path. A domain-scoped id carries `.` and `:`.
 fn validProject(project: []const u8) bool {
     if (project.len == 0) return false;
     for (project) |byte| {
@@ -250,7 +227,6 @@ fn validProject(project: []const u8) bool {
     return true;
 }
 
-/// A key file body with the fixture key and the given fields. The caller frees it.
 fn testKeyFile(gpa: std.mem.Allocator, fields: anytype) ![]u8 {
     return std.json.Stringify.valueAlloc(gpa, fields, .{});
 }
@@ -284,7 +260,6 @@ test "fromKeyFile reads the named fields, defaults the token URI, and zeros the 
     try std.testing.expectEqualStrings(token_uri_default, auth.token_uri);
     try std.testing.expectEqual(@as(usize, 256), auth.key.signatureLength());
     try std.testing.expect(auth.token == null);
-    // The file buffer held the key, so no byte of it survives the parse.
     try std.testing.expect(std.mem.allEqual(u8, file, 0));
 
     const custom = try testKeyFile(gpa, .{
@@ -339,7 +314,6 @@ test "fromKeyFile rejects a foreign type, a missing field, and a wrong field typ
             fromKeyFile(gpa, std.testing.io, .{}, file, .global),
         );
     }
-    // A well-formed file with a key that is no PEM block fails on the key.
     const bad_key = try gpa.dupe(u8,
         \\{"type":"service_account","project_id":"p","client_email":"e","private_key":"k"}
     );
@@ -385,8 +359,6 @@ test "init reads the key file from disk and refuses an absent one or a bad locat
         error.FileNotFound,
         init(gpa, io, .{}, &.{ .key_path = missing, .location = "global" }),
     );
-    // A region, a case variant, and an empty value name no location Drinky
-    // serves. The check runs before the file read, so the path does not matter.
     for ([_][]const u8{ "europe-west4", "EU", "", "us:443" }) |location| {
         try std.testing.expectError(
             error.BadLocation,
@@ -395,7 +367,6 @@ test "init reads the key file from disk and refuses an absent one or a bad locat
     }
 }
 
-/// Decode one base64url JWT segment into an owned JSON value.
 fn decodeSegment(gpa: std.mem.Allocator, segment: []const u8) !std.json.Parsed(std.json.Value) {
     const decoder = std.base64.url_safe_no_pad.Decoder;
     const buffer = try gpa.alloc(u8, try decoder.calcSizeForSlice(segment));
@@ -431,7 +402,6 @@ test "the JWT names the issuer, the scope, the audience, and the hour of validit
     try std.testing.expectEqual(@as(i64, 1_700_000_000), object.get("iat").?.integer);
     try std.testing.expectEqual(@as(i64, 1_700_003_600), object.get("exp").?.integer);
 
-    // The signature covers the two encoded segments and the dot between them.
     var signature: [256]u8 = undefined;
     try std.base64.url_safe_no_pad.Decoder.decode(&signature, signature_segment);
     const public_key = try std.crypto.Certificate.rsa.PublicKey.fromBytes(
@@ -469,13 +439,10 @@ test "accessToken serves the cached token and mints again inside the margin" {
     try std.testing.expectEqualStrings("token-1", try auth.accessTokenWith(countingMint));
     try std.testing.expectEqual(@as(usize, 1), mint_count);
 
-    // A token with less than the margin left mints again before a request.
     auth.token.?.expires_ms = auth.nowMs() + renew_margin_ms - 1;
     try std.testing.expectEqualStrings("token-2", try auth.accessTokenWith(countingMint));
     try std.testing.expectEqual(@as(usize, 2), mint_count);
 
-    // A failed mint keeps the cached token, so the caller reports the failure
-    // it has and the next call tries again.
     auth.token.?.expires_ms = 0;
     try std.testing.expectError(
         error.TokenServiceUnavailable,
@@ -498,7 +465,6 @@ test "renew mints without regard to the cache and reports a changed token" {
     try std.testing.expect(try auth.renewWith(countingMint));
     try std.testing.expectEqualStrings("token-2", auth.token.?.access);
     try std.testing.expectEqual(@as(usize, 2), mint_count);
-    // The same bytes again report no change, so the caller repeats no request.
     try std.testing.expect(!try auth.renewWith(sameMint));
 }
 
@@ -526,15 +492,12 @@ test parseToken {
     }) |body| try std.testing.expectError(error.BadTokenResponse, parseToken(gpa, body, 0));
 }
 
-/// One canned response for the loopback test. `request_body` receives the
-/// bytes the client sent.
 const Reply = struct {
     status: []const u8,
     body: []const u8,
     request_body: *std.ArrayList(u8),
 };
 
-/// Serve one connection: read the request, keep its body, answer `reply`.
 fn serveOne(io: std.Io, server: *std.Io.net.Server, reply: *const Reply) !void {
     var connection = try server.accept(io);
     defer connection.close(io);
@@ -542,7 +505,6 @@ fn serveOne(io: std.Io, server: *std.Io.net.Server, reply: *const Reply) !void {
     var read_buffer: [4096]u8 = undefined;
     var reader = connection.reader(io, &read_buffer);
     var content_length: usize = 0;
-    // The head of one request holds few lines, so the cap only stops a runaway.
     var lines_left: usize = 64;
     while (lines_left > 0) : (lines_left -= 1) {
         const raw = try reader.interface.takeDelimiterInclusive('\n');
@@ -619,7 +581,6 @@ test "mint reads a token, maps a rejected grant to a rejected key, and passes an
             defer token.deinit(gpa);
             try std.testing.expectEqualStrings("ya29.minted", token.access);
         }
-        // Every request carries the JWT bearer grant and a three-segment assertion.
         const prefix = "grant_type=" ++ grant_type ++ "&assertion=";
         try std.testing.expect(std.mem.startsWith(u8, request_body.items, prefix));
         const assertion = request_body.items[prefix.len..];

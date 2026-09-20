@@ -1,12 +1,3 @@
-//! The saved Telegram bots in `<home>/.drinky/remote.json`: an owner-only keyed
-//! JSON store like `auth.json`. The key of an entry is the bot id, and the entry
-//! holds the token, the id, the username, and the chat id that the pairing bound.
-//! The config file holds no bot, because the token is a secret.
-//!
-//! Drinky reads the file once, at startup. A change in another instance reaches
-//! the next start alone. Every write goes through `ai.json_store`, so it is
-//! atomic, owner-only, and preserves every other entry.
-
 const std = @import("std");
 
 const ai = @import("ai");
@@ -15,21 +6,11 @@ const Store = @This();
 
 gpa: std.mem.Allocator,
 io: std.Io,
-/// The `remote.json` path. Owned. Empty for an inert store.
 path: []const u8,
-/// The saved bots, in the order of the file. Every string is owned.
 bots: std.ArrayList(Bot),
-/// The username of every saved bot, in the order of `bots`. Each name borrows
-/// its bot, so a change to `bots` rebuilds this list. The command context
-/// reads it for the picker rows.
 usernames: std.ArrayList([]const u8),
-/// The failure of the startup read, or null when the file was absent or read
-/// whole. The app reports it once, because a file that Drinky cannot read
-/// leaves every saved bot out of the picker.
 load_error: ?anyerror,
 
-/// One saved bot, and the JSON shape of its entry. A bot without a chat id has
-/// not paired yet.
 pub const Bot = struct {
     token: []const u8,
     id: i64,
@@ -42,9 +23,6 @@ pub const Bot = struct {
     }
 };
 
-/// Resolve the path and read the saved bots. Only the path allocation can fail
-/// the open. The read itself reads a missing or unreadable file as no bot and
-/// keeps the failure in `load_error`.
 pub fn open(gpa: std.mem.Allocator, io: std.Io, home: []const u8) !Store {
     const path = try std.fs.path.join(gpa, &.{ home, ".drinky", "remote.json" });
     errdefer gpa.free(path);
@@ -62,8 +40,6 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, home: []const u8) !Store {
     return store;
 }
 
-/// A store that names no file. It holds its bots in memory alone, so a holder
-/// without a `remote.json` can still call every method on it.
 pub fn inert(gpa: std.mem.Allocator, io: std.Io) Store {
     return .{
         .gpa = gpa,
@@ -82,17 +58,11 @@ pub fn deinit(self: *Store) void {
     if (self.path.len > 0) self.gpa.free(self.path);
 }
 
-/// The saved bot at `index`, or null past the end.
 pub fn get(self: *const Store, index: usize) ?*const Bot {
     if (index >= self.bots.items.len) return null;
     return &self.bots.items[index];
 }
 
-/// Save `bot` and keep it in memory. A bot with the id of a saved one replaces
-/// that entry, and the entry moves to the end, because the file order is the
-/// write order and the memory mirrors the file. The strings of `bot` are
-/// borrowed, so the store copies them. Every allocation comes before the write,
-/// so a failure leaves the file and the memory in one state.
 pub fn save(self: *Store, bot: *const Bot) !void {
     const token = try self.gpa.dupe(u8, bot.token);
     errdefer self.gpa.free(token);
@@ -118,8 +88,6 @@ pub fn save(self: *Store, bot: *const Bot) !void {
     self.refreshUsernames();
 }
 
-/// Remove the saved bot at `index` from the file and from memory. A failed
-/// write keeps the memory as it was.
 pub fn remove(self: *Store, index: usize) !void {
     std.debug.assert(index < self.bots.items.len);
     var key_buffer: [24]u8 = undefined;
@@ -130,10 +98,6 @@ pub fn remove(self: *Store, index: usize) !void {
     self.refreshUsernames();
 }
 
-/// Read every entry of the file into `bots`. An entry that lacks a field or
-/// holds a field of another type drops in silence, because it can never attach.
-/// A failure leaves the store empty, so a store that reports a load error holds
-/// no bot.
 fn read(self: *Store) !void {
     var file = (try ai.json_store.open(self.gpa, self.io, self.path)) orelse return;
     defer file.deinit();
@@ -169,8 +133,6 @@ fn read(self: *Store) !void {
     self.refreshUsernames();
 }
 
-/// Rebuild the username list from `bots`. The caller reserved the capacity, so
-/// the rebuild cannot fail after a write.
 fn refreshUsernames(self: *Store) void {
     std.debug.assert(self.usernames.capacity >= self.bots.items.len);
     self.usernames.clearRetainingCapacity();
@@ -213,8 +175,6 @@ test "a missing file opens as no bot, and a save then reads back" {
     try std.testing.expectEqual(@as(usize, 2), store.usernames.items.len);
     try std.testing.expectEqualStrings("drinky_bot", store.usernames.items[0]);
 
-    // A second save of the same bot replaces the entry and moves it to the end,
-    // as the file does.
     try store.save(&.{ .token = "123:abc", .id = 123, .username = "drinky_bot", .chat_id = 42 });
     try std.testing.expectEqual(@as(usize, 2), store.bots.items.len);
     try std.testing.expectEqual(@as(?i64, 42), store.bots.items[1].chat_id);
@@ -273,7 +233,6 @@ test "a corrupt file reads as no bot and keeps its error" {
     defer store.deinit();
     try std.testing.expectEqual(@as(?anyerror, error.CorruptStore), store.load_error);
     try std.testing.expectEqual(@as(usize, 0), store.bots.items.len);
-    // A save refuses to replace a file it cannot read.
     try std.testing.expectError(
         error.CorruptStore,
         store.save(&.{ .token = "1:a", .id = 1, .username = "bot", .chat_id = null }),
@@ -303,13 +262,9 @@ test "an entry that lacks a field drops in silence" {
     try std.testing.expect(store.load_error == null);
     try std.testing.expectEqual(@as(usize, 1), store.bots.items.len);
     try std.testing.expectEqual(@as(i64, 2), store.bots.items[0].id);
-    // A chat id of another type reads as no pairing.
     try std.testing.expect(store.bots.items[0].chat_id == null);
 }
 
-// Every allocation of a read can fail. A failed read leaves no bot and keeps its
-// error, and a failed save leaves the file and the memory as they were. The leak
-// check of the test allocator proves that each path frees what it built.
 test "a read or a save that fails at any allocation leaks nothing and stays whole" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -327,8 +282,6 @@ test "a read or a save that fails at any allocation leaks nothing and stays whol
     });
 
     var fail_index: usize = 0;
-    // The read makes a bounded number of allocations, so the walk ends at the
-    // first index that lets it succeed.
     while (fail_index < 64) : (fail_index += 1) {
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
             .fail_index = fail_index,
@@ -359,8 +312,6 @@ test "a read or a save that fails at any allocation leaks nothing and stays whol
         const saved = store.save(&.{ .token = "3:c", .id = 3, .username = "third_bot", .chat_id = 7 });
         failing.fail_index = std.math.maxInt(usize);
         failing.resize_fail_index = std.math.maxInt(usize);
-        // The JSON writer reports a failed allocation as a failed write, so the
-        // name of the error is not the claim here.
         saved catch {
             try std.testing.expectEqual(@as(usize, 2), store.bots.items.len);
             try std.testing.expectEqual(@as(usize, 2), store.usernames.items.len);

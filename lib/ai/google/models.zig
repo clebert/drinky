@@ -1,8 +1,3 @@
-//! The model list of the Google publisher on the Agent Platform. The list names every
-//! publisher model of the location, so the decoder keeps the Gemini models of
-//! the generation Drinky serves. An entry states the name and nothing else
-//! Drinky reads, so `Catalog.merge` fills the facts from the public metadata.
-
 const std = @import("std");
 
 const json = @import("../json.zig");
@@ -12,15 +7,10 @@ const Transport = @import("Transport.zig");
 
 const body_bytes_max = 2 * 1024 * 1024;
 const entry_count_max = 1024;
-/// The page size the request asks for.
 const page_size = 100;
-/// The page cap. The list holds a few hundred models at most, so a server that
-/// keeps reporting more pages is one Drinky stops following.
 const pages_max = 8;
 const name_prefix = "publishers/google/models/";
 const id_prefix = "gemini-";
-/// The first generation Drinky serves. Older ones take another thinking control
-/// and stay out, whatever location lists them.
 const generation_min = 3;
 
 pub const Options = struct {
@@ -28,10 +18,8 @@ pub const Options = struct {
     location: Transport.Location,
 };
 
-/// One decoded page of the list.
 pub const Page = struct {
     models: []Model,
-    /// The token of the next page, owned, or null on the last page.
     next_page_token: ?[]u8,
 
     pub fn deinit(self: *Page, gpa: std.mem.Allocator) void {
@@ -40,8 +28,6 @@ pub const Page = struct {
     }
 };
 
-/// Every Gemini model the publisher lists, in list order. The caller owns the
-/// result. One `deadline` bounds every page.
 pub fn fetch(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -51,8 +37,6 @@ pub fn fetch(
     return fetchWith(gpa, io, deadline, options, fetchPage);
 }
 
-/// `fetch` over the page request `pageFn`. A test hands in a double, so it
-/// reaches the paging without a socket.
 fn fetchWith(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -135,7 +119,6 @@ fn request(
     out.* = try parse(gpa, body);
 }
 
-/// The list URL of one page. The token is opaque, so it travels percent-encoded.
 fn pageUrl(
     gpa: std.mem.Allocator,
     location: Transport.Location,
@@ -158,8 +141,6 @@ fn isUnreserved(byte: u8) bool {
     return std.ascii.isAlphanumeric(byte) or std.mem.indexOfScalar(u8, "-._~", byte) != null;
 }
 
-/// Decode one page. A malformed envelope rejects the page, while a malformed
-/// entry is skipped so one bad model costs no other.
 pub fn parse(gpa: std.mem.Allocator, body: []const u8) !Page {
     var parsed = std.json.parseFromSlice(std.json.Value, gpa, body, .{}) catch |err|
         return switch (err) {
@@ -169,7 +150,6 @@ pub fn parse(gpa: std.mem.Allocator, body: []const u8) !Page {
     defer parsed.deinit();
 
     const object = json.object(parsed.value) orelse return error.BadModelList;
-    // A region with no listed model answers an empty object.
     var listed: []const std.json.Value = &.{};
     if (object.get("publisherModels")) |value| {
         listed = (json.array(value) orelse return error.BadModelList).items;
@@ -190,7 +170,6 @@ pub fn parse(gpa: std.mem.Allocator, body: []const u8) !Page {
     return .{ .models = try models.toOwnedSlice(gpa), .next_page_token = next_page_token };
 }
 
-/// One Gemini model of a served generation, or null for every other entry.
 fn decode(value: std.json.Value) ?Model {
     const object = json.object(value) orelse return null;
     const name = json.string(object.get("name")) orelse return null;
@@ -200,8 +179,6 @@ fn decode(value: std.json.Value) ?Model {
     return Model.init(id) catch null;
 }
 
-/// The major version of a Gemini id: the digits behind `gemini-`. An id without
-/// them, such as `gemini-embedding-2` or `gemini-live-2.5-flash`, names none.
 fn generation(id: []const u8) ?u32 {
     if (!std.mem.startsWith(u8, id, id_prefix)) return null;
     const rest = id[id_prefix.len..];
@@ -231,12 +208,9 @@ test parse {
     var page = try parse(gpa, sample);
     defer page.deinit(gpa);
 
-    // Only a Gemini model of a served generation under the Google publisher
-    // survives the decode.
     try std.testing.expectEqual(@as(usize, 2), page.models.len);
     try std.testing.expectEqualStrings("gemini-3.5-flash", page.models[0].name());
     try std.testing.expectEqualStrings("gemini-3.1-pro-preview", page.models[1].name());
-    // The list states no fact beyond the name.
     try std.testing.expect(page.models[0].context_window == null);
     try std.testing.expect(page.models[0].price == null);
     try std.testing.expectEqual(Model.Thinking.unknown, page.models[0].thinking);
@@ -293,7 +267,6 @@ test pageUrl {
             "?pageSize=100&view=PUBLISHER_MODEL_VIEW_BASIC",
         first,
     );
-    // The token is opaque, so every byte outside the unreserved set encodes.
     const paged = try pageUrl(gpa, .global, "abc/def==&x");
     defer gpa.free(paged);
     try std.testing.expectEqualStrings(
@@ -303,9 +276,6 @@ test pageUrl {
     );
 }
 
-// The deadline of a fetch is shared with the requests around it, so a page must
-// take what is left of the window. A window that has closed refuses the page
-// before it opens a socket.
 test "an expired deadline refuses the list without a request" {
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
@@ -317,7 +287,6 @@ test "an expired deadline refuses the list without a request" {
     }));
 }
 
-/// The scripted pages of the paging tests, and the token each request must carry.
 var scripted_bodies: []const []const u8 = &.{};
 var scripted_tokens: []const ?[]const u8 = &.{};
 var scripted_index: usize = 0;

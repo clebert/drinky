@@ -1,23 +1,3 @@
-//! The global prompt history in `<home>/.drinky/prompt_history.json`: the
-//! terminal prompts that started a turn. Every project shares the one file, and
-//! no project key splits it, because a reusable prompt belongs to the user and
-//! not to a directory.
-//!
-//! The file is a keyed JSON object. Each key holds the SHA-256 digest of the
-//! normalized prompt. Its value holds the latest exact prompt as URL-safe
-//! Base64. The file order runs from the least recently used prompt to the most
-//! recently used one. A repeated prompt moves to the end.
-//!
-//! Drinky reads the file when Tab opens the picker, so a change in another
-//! instance reaches a running one without a watcher. A write happens once per
-//! submitted prompt. Both go through `ai.json_store`, so the write is atomic,
-//! owner-only, and locked. The file keeps `entries_max` prompts of at most
-//! `entry_bytes_max` bytes each, so a Drinky-written file stays below about
-//! 1.1 MiB.
-//!
-//! A failure stays out of memory. Drinky reports a failed write once and never
-//! retries it, and a malformed file is a failure that no write replaces.
-
 const std = @import("std");
 
 const ai = @import("ai");
@@ -26,35 +6,22 @@ const PromptHistory = @This();
 
 gpa: std.mem.Allocator,
 io: std.Io,
-/// The `prompt_history.json` path. Owned. Empty for an inert history.
 path: []const u8,
-/// Whether Drinky reads and writes the file. A disabled history loads nothing,
-/// records nothing, and leaves the file as it is.
 enabled: bool,
-/// The prompts of the last `load`, newest first. Each is the latest submitted
-/// text of one normalized prompt. A picker row indexes this list. Owned.
 entries: std.ArrayList([]const u8),
 
-/// The number of prompts the file keeps. A record drops the least recently used
-/// prompt past this count.
 pub const entries_max = 100;
-/// The largest prompt the file takes, inclusive. A larger prompt starts its turn
-/// and stays out of the file.
 pub const entry_bytes_max = 8 * 1024;
 
 const codec = std.base64.url_safe_no_pad;
 
-/// The Base64 form of the latest submitted prompt under one normalized key.
 const Entry = struct {
     prompt: []const u8,
 };
 
-/// The inputs `open` needs to find `prompt_history.json`. `home` can be
-/// relative, so it resolves against the working directory the app knows.
 pub const OpenOptions = struct {
     working_directory: []const u8,
     home: []const u8,
-    /// The configured `prompt_history.enabled` value.
     enabled: bool,
 };
 
@@ -64,15 +31,10 @@ pub fn deinit(self: *PromptHistory) void {
     self.gpa.free(self.path);
 }
 
-/// A history that names no file. It reads nothing, saves nothing, and owns no
-/// memory, so a holder without a `prompt_history.json` can still call every
-/// method on it.
 pub fn inert(gpa: std.mem.Allocator, io: std.Io) PromptHistory {
     return .{ .gpa = gpa, .io = io, .path = "", .enabled = false, .entries = .empty };
 }
 
-/// Resolve the path of the file. The open reads nothing, because Tab reads the
-/// file each time it opens the picker.
 pub fn open(gpa: std.mem.Allocator, io: std.Io, options: *const OpenOptions) !PromptHistory {
     const directory = try std.fs.path.resolve(
         gpa,
@@ -89,10 +51,6 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, options: *const OpenOptions) !Pr
     };
 }
 
-/// Replace `entries` with every prompt of the file, newest first. An absent
-/// file and a disabled history both read as no entry. A file Drinky cannot
-/// read or decode is a failure, and the list is then empty, so no picker shows
-/// half of a file.
 pub fn load(self: *PromptHistory) !void {
     self.clearEntries();
     if (!self.enabled) return;
@@ -103,18 +61,12 @@ pub fn load(self: *PromptHistory) !void {
     const first = keys.len -| entries_max;
     const count = keys.len - first;
     try self.entries.ensureTotalCapacity(self.gpa, count);
-    // The file holds the newest prompt last, and the list holds it first.
     for (0..count) |offset| {
         const index = keys.len - 1 - offset;
         self.entries.appendAssumeCapacity(try promptAlloc(self.gpa, &file, keys[index]));
     }
 }
 
-/// Record `prompt` as the most recently used one. Prompts that differ only in
-/// line endings, trailing spaces or tabs, or edge blank lines share one entry.
-/// The newest submitted text becomes its value. A prompt above
-/// `entry_bytes_max` is `error.PromptTooLarge` and changes nothing. A disabled
-/// history records nothing.
 pub fn record(self: *const PromptHistory, prompt: []const u8) !void {
     if (!self.enabled) return;
     if (prompt.len > entry_bytes_max) return error.PromptTooLarge;
@@ -139,7 +91,6 @@ fn clearEntries(self: *PromptHistory) void {
     self.entries.clearRetainingCapacity();
 }
 
-/// Decode the prompt in a current entry.
 fn promptAlloc(
     gpa: std.mem.Allocator,
     file: *const ai.json_store.File,
@@ -239,8 +190,6 @@ fn tmpHome(gpa: std.mem.Allocator, io: std.Io, tmp: *const std.testing.TmpDir) !
     return std.fs.path.join(gpa, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path });
 }
 
-/// Open the history of a temporary home directory from the working directory
-/// `project`, which the global file never reads.
 fn openForTest(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -250,7 +199,6 @@ fn openForTest(
     return open(gpa, io, &.{ .working_directory = project, .home = home, .enabled = true });
 }
 
-/// Write `data` as the `prompt_history.json` of a test temporary home directory.
 fn writeForTest(io: std.Io, tmp: *const std.testing.TmpDir, data: []const u8) !void {
     var directory = try tmp.dir.createDirPathOpen(io, ".drinky", .{});
     defer directory.close(io);
@@ -285,7 +233,6 @@ test "an absent file loads an empty list, and two projects share one file" {
     try expectEntries(&first, &.{});
 }
 
-// The value encodes the prompt, so every byte of a paste survives the file.
 test "a record survives a reload byte for byte under its normalized key" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -336,8 +283,6 @@ test "a repeated record moves to the newest position without a second entry" {
     try expectEntries(&history, &.{ "one", "three", "two" });
 }
 
-// Line endings, line-end spaces, and blank edge lines do not make distinct
-// prompts. A new record replaces the entry with the latest text.
 test "a normalized repeat keeps the latest submitted text" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -368,7 +313,6 @@ test "the entry past the count drops the least recently used one" {
     const home = try tmpHome(gpa, io, &tmp);
     defer gpa.free(home);
 
-    // A file at the count, written directly so the test saves once.
     var data: std.Io.Writer.Allocating = .init(gpa);
     defer data.deinit();
     try data.writer.writeByte('{');
@@ -399,8 +343,6 @@ test "the entry past the count drops the least recently used one" {
     for (history.entries.items) |entry| try std.testing.expect(!std.mem.eql(u8, entry, "prompt 0"));
 }
 
-// The limit is inclusive, and a prompt over it changes nothing: the file keeps
-// every entry, and the turn that carries the prompt runs anyway.
 test "an entry of the limit is accepted and one above it is refused" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -429,8 +371,6 @@ test "an entry of the limit is accepted and one above it is refused" {
     try std.testing.expectEqualStrings(before, after);
 }
 
-// An oversized stored value is corrupt file data. It does not describe the
-// next submitted prompt, so that prompt can still enter the file.
 test "an oversized stored prompt does not describe the next prompt" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -461,12 +401,9 @@ test "an oversized stored prompt does not describe the next prompt" {
     try expectEntries(&history, &.{});
 }
 
-// The two fixed limits bound the file, so the module can promise a size without
-// a byte budget of its own. The encoders state both payload sizes.
 test "the fixed limits keep a Drinky-written file below the documented budget" {
     const key_bytes = codec.Encoder.calcSize(std.crypto.hash.sha2.Sha256.digest_length);
     const prompt_bytes = codec.Encoder.calcSize(entry_bytes_max);
-    // The quotes, punctuation, field name, object braces, and comma of one entry.
     const entry_overhead_bytes = "\"\":{\"prompt\":\"\"},".len;
     const file_bytes_max = 2 + entries_max *
         (key_bytes + prompt_bytes + entry_overhead_bytes);
@@ -499,8 +436,6 @@ test "two instances merge their writes, and a reload sees the other one" {
     try expectEntries(&second, &.{ "first again", "from the second", "from the first" });
 }
 
-// A failed write stays out of memory. The next write carries its own prompt
-// alone, so no earlier prompt reaches the file behind the user.
 test "lock contention reports the failure and a later record replays nothing" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -550,8 +485,6 @@ test "a corrupt file fails every action and stays byte-identical" {
     try std.testing.expectEqualStrings("{ not json", data);
 }
 
-// A value that no encoder wrote is a read failure. The failed read leaves no
-// entry behind, so a picker never shows half of a file.
 test "invalid Base64 data fails the read and leaves no entry" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -609,7 +542,6 @@ test "a disabled history reads nothing, records nothing, and touches no file" {
     defer gpa.free(data);
     try std.testing.expectEqualStrings("{\"dmFsaWQ\":{}}", data);
 
-    // An inert history names no file and owns nothing.
     var idle: PromptHistory = .inert(gpa, io);
     defer idle.deinit();
     try std.testing.expect(!idle.enabled);

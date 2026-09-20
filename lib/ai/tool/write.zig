@@ -1,5 +1,3 @@
-//! Creates or overwrites a UTF-8 text file with the given contents.
-
 const std = @import("std");
 
 const format = @import("../format.zig");
@@ -40,7 +38,6 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
     const path = parsed.value.path;
     const contents = parsed.value.content;
 
-    // A rule that guards this file refuses the call before it changes anything.
     if (context.skill_guard) |guard| {
         if (try guard.refusal(&.{
             .gpa = gpa,
@@ -57,9 +54,6 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
         path,
     });
     errdefer result.deinit(gpa);
-    // The whole file is what the call produced, so the line counts it. `write`
-    // never reads the file it replaces, so it cannot state a change. The model
-    // keeps the exact byte count in the content above.
     result.summary = .{
         .text = try std.fmt.allocPrint(gpa, "Lines: {d}", .{format.lines(contents)}),
     };
@@ -137,8 +131,6 @@ test "write canceled mid-write propagates and leaves the file untouched" {
     try std.testing.expectEqualStrings("old", data);
 }
 
-// A rule that guards the file must stop the call before it writes anything.
-// A refusal after the write states a requirement the file no longer needs.
 test "a required skill refuses the write and leaves the file absent" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -170,7 +162,6 @@ test "a required skill refuses the write and leaves the file absent" {
         tmp.dir.readFileAlloc(io, "new.zig", gpa, .limited(64)),
     );
 
-    // The conversation carries the whole skill file, so the same call writes.
     const history = [_]llm.Item{
         .{ .tool_result = .{ .call_id = "1", .content = body, .is_error = false } },
     };
@@ -188,8 +179,6 @@ test "a required skill refuses the write and leaves the file absent" {
     try std.testing.expectEqualStrings("const x = 1;\n", data);
 }
 
-// `write` and `read` count lines under one rule, so a write and a read of the
-// same bytes cannot disagree about the number.
 test "the box reports the lines of what was written" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -204,6 +193,5 @@ test "the box reports the lines of what was written" {
     const result = try run(&context, input);
     defer result.deinit(gpa);
     try std.testing.expect(!result.is_error);
-    // A closing line break ends the third line, it does not open a fourth.
     try std.testing.expectEqualStrings("Lines: 3", result.summary.?.text);
 }

@@ -1,7 +1,3 @@
-//! Composition of the page that `/sources` opens: the instruction files, the
-//! skills, and the required skills that Drinky loaded at startup. The page
-//! names the file behind every count, so the startup itself reports no count.
-
 const std = @import("std");
 
 const ai = @import("ai");
@@ -12,24 +8,17 @@ pub const Options = struct {
     user_instructions: []const ai.instructions.File,
     project_instructions: []const ai.instructions.File,
     skills: *const ai.skills.Registry,
-    /// The path-triggered skill rules that the guard applies. Each one names a
-    /// discovered skill.
     required_skills: []const ai.tool.SkillGuard.Rule,
-    /// The configured pairs whose skill name no discovered skill carries. The
-    /// global config serves every project, so such a pair is a normal state.
     required_missing: []const Config.RequiredSkill,
-    /// The roots every shown path is measured against.
     roots: ai.format.Roots,
 };
 
-/// One instruction section: its title and the sentence of an empty list.
 const Section = struct {
     title: []const u8,
     empty: []const u8,
     files: []const ai.instructions.File,
 };
 
-/// Build the whole page. The caller owns the text.
 pub fn compose(gpa: std.mem.Allocator, options: *const Options) ![]u8 {
     var output: std.Io.Writer.Allocating = .init(gpa);
     errdefer output.deinit();
@@ -67,10 +56,6 @@ fn writeFiles(
     }
 }
 
-/// Every discovered skill, the hidden ones included, because the user loads a
-/// hidden skill by hand. A project skill that replaced a user skill names that
-/// file on its own row. The clash is by name, and the row already names the
-/// winner.
 fn writeSkills(gpa: std.mem.Allocator, writer: *std.Io.Writer, options: *const Options) !void {
     try writer.writeAll("\n## Skills\n\n");
     const skills = options.skills.items();
@@ -88,9 +73,6 @@ fn writeSkills(gpa: std.mem.Allocator, writer: *std.Io.Writer, options: *const O
     }
 }
 
-/// The rules that guard a file, then the configured pairs that guard nothing
-/// here. A pair that names no discovered skill is the one worth a look, so it
-/// stands apart from the rules.
 fn writeRequiredSkills(
     gpa: std.mem.Allocator,
     writer: *std.Io.Writer,
@@ -110,7 +92,6 @@ fn writeRequiredSkills(
     );
 }
 
-/// One path as a code span, in the form the interface shows every path.
 fn writePath(
     gpa: std.mem.Allocator,
     writer: *std.Io.Writer,
@@ -122,7 +103,6 @@ fn writePath(
     try writer.print("`{s}`", .{shown});
 }
 
-/// The absolute path of `suffix` inside a test temporary directory.
 fn tmpPath(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -140,8 +120,6 @@ test "the page names every file behind the startup counts" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // The `.git` marker bounds both ancestor scans, so the enclosing repository
-    // cannot add its own instruction files or skills to the page.
     var git = try tmp.dir.createDirPathOpen(io, "work/.git", .{});
     git.close(io);
     try tmp.dir.writeFile(io, .{ .sub_path = "work/AGENTS.md", .data = "Project.\n" });
@@ -161,8 +139,6 @@ test "the page names every file behind the startup counts" {
         .data = "---\nname: hidden\ndescription: a manual skill\n" ++
             "disable-model-invocation: true\n---\nbody\n",
     });
-    // A user skill with the same name. The project copy replaces it, and its
-    // row names the file that lost.
     var user_demo = try tmp.dir.createDirPathOpen(io, "home/.agents/skills/demo", .{});
     user_demo.close(io);
     try tmp.dir.writeFile(io, .{
@@ -212,7 +188,6 @@ test "the page names every file behind the startup counts" {
     });
     defer gpa.free(page);
 
-    // One section per source, in one order.
     const user = std.mem.indexOf(u8, page, "## User instructions").?;
     const project = std.mem.indexOf(u8, page, "## Project instructions").?;
     const skills_index = std.mem.indexOf(u8, page, "## Skills").?;
@@ -221,13 +196,9 @@ test "the page names every file behind the startup counts" {
     try std.testing.expect(project < skills_index);
     try std.testing.expect(skills_index < required);
 
-    // Every path takes the form the interface shows: below the working
-    // directory the relative part, below home the `~` form.
     try std.testing.expect(std.mem.indexOf(u8, page, "\n- `~/first.md`\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "\n- `AGENTS.md`\n") != null);
 
-    // Every discovered skill has a row with its scope, and the hidden one says
-    // so. The winner of a name clash names the user copy that it replaced.
     try std.testing.expect(std.mem.indexOf(
         u8,
         page,
@@ -247,7 +218,6 @@ test "the page names every file behind the startup counts" {
     ) != null);
     try std.testing.expect(std.mem.indexOf(u8, page, "the user copy") == null);
 
-    // A rule names its file, and a pair that resolved to no skill says so.
     try std.testing.expect(std.mem.indexOf(
         u8,
         page,
@@ -260,8 +230,6 @@ test "the page names every file behind the startup counts" {
     ) != null);
 }
 
-// A source with nothing to show states that, so the page never opens on a bare
-// heading.
 test "an empty source states its empty state" {
     const gpa = std.testing.allocator;
     var skills = ai.skills.Registry.init(gpa);

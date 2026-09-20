@@ -1,8 +1,3 @@
-//! RS256 over a PKCS#8 RSA private key, which signs the JWT of a Google service
-//! account: the PEM decode, the DER walk to the modulus and the private
-//! exponent, and the PKCS#1 v1.5 signature. Pure, no I/O. `std` exports no
-//! private RSA key, so this module holds the four pieces and nothing more.
-
 const std = @import("std");
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -14,17 +9,14 @@ const Modulus = std.crypto.ff.Modulus(modulus_bits_max);
 const pem_begin = "-----BEGIN PRIVATE KEY-----";
 const pem_end = "-----END PRIVATE KEY-----";
 
-/// The rsaEncryption OID, 1.2.840.113549.1.1.1.
 const rsa_encryption_oid = [_]u8{ 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01 };
 
-/// The DER prefix of a SHA-256 DigestInfo (RFC 8017, section 9.2, note 1).
 const sha256_digest_info = [_]u8{
     0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01,
     0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20,
 };
 
 pub const PrivateKey = struct {
-    /// The modulus and the private exponent, big-endian, owned.
     modulus: []const u8,
     exponent: []const u8,
 
@@ -39,8 +31,6 @@ pub const PrivateKey = struct {
     }
 };
 
-/// The modulus and the private exponent of a PEM `PRIVATE KEY` block. The
-/// caller owns the PEM text and the result.
 pub fn parsePem(gpa: std.mem.Allocator, pem: []const u8) !PrivateKey {
     const begin = std.mem.indexOf(u8, pem, pem_begin) orelse return error.BadPrivateKey;
     const body_start = begin + pem_begin.len;
@@ -57,12 +47,9 @@ pub fn parsePem(gpa: std.mem.Allocator, pem: []const u8) !PrivateKey {
     return parseDer(gpa, der[0..der_length]);
 }
 
-/// Sign `message` into `out`, whose length must equal `signatureLength`.
 pub fn sign(key: *const PrivateKey, message: []const u8, out: []u8) !void {
     const length = key.signatureLength();
     std.debug.assert(out.len == length);
-    // EM = 0x00 0x01 PS 0x00 T, where T is the DigestInfo and PS fills the rest
-    // with 0xff (RFC 8017, section 9.2).
     var encoded_buffer: [modulus_bits_max / 8]u8 = undefined;
     const encoded = encoded_buffer[0..length];
     const digest_start = length - Sha256.digest_length;
@@ -81,7 +68,6 @@ pub fn sign(key: *const PrivateKey, message: []const u8, out: []u8) !void {
     signature.toBytes(out, .big) catch return error.BadPrivateKey;
 }
 
-/// One DER element: its tag and the bounds of its content in the input.
 const Element = struct {
     tag: u8,
     start: usize,
@@ -92,8 +78,6 @@ const Element = struct {
     const octet_string = 0x04;
     const object_identifier = 0x06;
 
-    /// The element at `index`. Every read checks the input length, and the
-    /// content never reaches past the input.
     fn parse(bytes: []const u8, index: usize) error{BadPrivateKey}!Element {
         if (index + 2 > bytes.len) return error.BadPrivateKey;
         const tag = bytes[index];
@@ -123,8 +107,6 @@ const Element = struct {
     }
 };
 
-/// Walk `PrivateKeyInfo { version, algorithm, privateKey }` and then
-/// `RSAPrivateKey { version, n, e, d, ... }`. The CRT parameters stay unread.
 fn parseDer(gpa: std.mem.Allocator, der: []const u8) !PrivateKey {
     const info = try Element.expect(der, 0, Element.sequence);
     const version = try Element.expect(der, info.start, Element.integer);
@@ -151,8 +133,6 @@ fn parseDer(gpa: std.mem.Allocator, der: []const u8) !PrivateKey {
     return .{ .modulus = modulus_copy, .exponent = exponent_copy };
 }
 
-/// A DER INTEGER without its leading zero bytes. An empty or zero integer keeps
-/// one byte, so the caller always reads a first byte.
 fn unsignedBytes(integer: []const u8) []const u8 {
     if (integer.len == 0) return &.{0};
     var start: usize = 0;
@@ -160,8 +140,6 @@ fn unsignedBytes(integer: []const u8) []const u8 {
     return integer[start..];
 }
 
-/// A 2048-bit key generated for these tests. It guards no secret. The test
-/// wraps it in the PEM markers, so no key block reads as a real one.
 const fixture_body =
     "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCJKO7Ta0mj+Lutt13/EQ/MiETo\n" ++
     "Ct5d3dUY5VCO5KgYSeP3xcpIGiM/mYlQuzsk4ki8FapTEgWwd2dO50pZFUAjIwg0Oq6CPS+61b6t\n" ++
@@ -200,7 +178,6 @@ const fixture_modulus_hex =
 
 const fixture_message = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJhIn0";
 
-/// `openssl dgst -sha256 -sign key.pem` over `fixture_message`.
 const fixture_signature_hex =
     "880677e1aa20d14cb6bc90fbf3bc5076c9c874881e262f09998ec0ae747eff13" ++
     "9389d173660412396d229bf6ba8341cb06c53afb04612af8b9e995407d145ad1" ++
@@ -220,8 +197,6 @@ test "parsePem reads the modulus and the private exponent of a PKCS#8 key" {
     _ = try std.fmt.hexToBytes(&modulus, fixture_modulus_hex);
     try std.testing.expectEqualSlices(u8, &modulus, key.modulus);
     try std.testing.expectEqual(@as(usize, 256), key.signatureLength());
-    // The private exponent of this key has 255 significant bytes, so the walk
-    // reaches `d` and not `e` or a CRT parameter.
     try std.testing.expectEqual(@as(usize, 255), key.exponent.len);
 }
 
@@ -284,14 +259,10 @@ test "parsePem rejects a missing marker, bad base64, and a truncated body" {
         error.BadPrivateKey,
         parsePem(gpa, pem_begin ++ "\n!!!!\n" ++ pem_end),
     );
-    // A cut body leaves an element that reaches past the input, and the walk
-    // must refuse it without a read past the end.
     const cut = pem_begin ++ "\n" ++ fixture_body[0..400] ++ "\n" ++ pem_end;
     try std.testing.expectError(error.BadPrivateKey, parsePem(gpa, cut));
 }
 
-/// A PKCS#8 wrapper around `key_der` with `oid` as the algorithm, for the
-/// rejection tests. Every outer length here takes the two-byte long form.
 fn wrapPkcs8(gpa: std.mem.Allocator, oid: []const u8, key_der: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
@@ -312,8 +283,6 @@ fn wrapPkcs8(gpa: std.mem.Allocator, oid: []const u8, key_der: []const u8) ![]u8
     return out.toOwnedSlice(gpa);
 }
 
-/// An `RSAPrivateKey` with a modulus of `modulus_bytes` bytes and a one-byte
-/// private exponent.
 fn rsaKeyDer(gpa: std.mem.Allocator, modulus_bytes: usize) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
@@ -362,16 +331,12 @@ test "parseDer rejects a foreign algorithm and a modulus outside the range" {
 }
 
 test "Element.parse refuses every element that reaches past the input" {
-    // A short form whose length passes the end.
     try std.testing.expectError(error.BadPrivateKey, Element.parse(&.{ 0x02, 0x05, 0x01 }, 0));
-    // A long form whose length bytes are missing.
     try std.testing.expectError(error.BadPrivateKey, Element.parse(&.{ 0x30, 0x82, 0x01 }, 0));
-    // A long form of five length bytes, which no key of this size needs.
     try std.testing.expectError(
         error.BadPrivateKey,
         Element.parse(&.{ 0x30, 0x85, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00 }, 0),
     );
-    // An index at or past the end.
     try std.testing.expectError(error.BadPrivateKey, Element.parse(&.{0x02}, 0));
     try std.testing.expectError(error.BadPrivateKey, Element.parse(&.{ 0x02, 0x00 }, 2));
 

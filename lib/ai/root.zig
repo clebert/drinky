@@ -1,9 +1,3 @@
-//! The provider-neutral agent core: the `Agent` turn loop, the neutral `llm`
-//! wire types, the `Catalog` of discovered models, the `provider` client, the
-//! `command` registry, Agent Skills discovery, the `tool` registry, and the
-//! `anthropic`, `openai`, `xai`, `google`, `openrouter`, `deepseek`, `ds4`,
-//! and `Metadata` modules.
-
 const std = @import("std");
 
 const jwt = @import("jwt.zig");

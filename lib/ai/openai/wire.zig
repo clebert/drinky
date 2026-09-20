@@ -1,16 +1,8 @@
-//! Translates a neutral `llm.Request` into an OpenAI Responses API JSON body.
-//! Every Responses account shares this module. The accounts differ in their
-//! transport, authorization, and request options, never in their wire shape. It
-//! holds no state and does no I/O.
-//! `Transport` sends the bytes this module produces.
-
 const std = @import("std");
 
 const json = @import("../json.zig");
 const llm = @import("../llm.zig");
 
-/// Serialize `request` into an owned JSON body. Caller frees the result.
-/// `account` guards which stored reasoning items are replayed (see `writeItem`).
 pub fn serialize(gpa: std.mem.Allocator, request: *const llm.Request, account: llm.Account) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
@@ -25,25 +17,16 @@ pub fn serialize(gpa: std.mem.Allocator, request: *const llm.Request, account: l
     try stringify.objectField("instructions");
     try stringify.write(request.system);
 
-    // OpenAI prompt caching is automatic and server-side (a >=1024-token prefix
-    // caches on its own). The key only steers routing: the backend combines it
-    // with the prompt-prefix hash so a session's growing requests land on the
-    // same cache. The gpt-5.6 family needs it set for reliable matching.
     if (request.cache_key.len > 0) {
         try stringify.objectField("prompt_cache_key");
         try stringify.write(request.cache_key);
     }
 
-    // Steer reasoning depth with the control the request carries. A request
-    // that carries none omits the config.
     if (effortName(request)) |effort| {
         try stringify.objectField("reasoning");
         try stringify.write(Reasoning{ .effort = effort });
     }
 
-    // `request.tokens_max` is deliberately not sent as `max_output_tokens`: these
-    // are reasoning models, so a client-imposed output cap can truncate the
-    // reasoning pass mid-turn. The model's own default budget governs instead.
     if (request.tools.len > 0) {
         try stringify.objectField("tools");
         try stringify.beginArray();
@@ -51,25 +34,12 @@ pub fn serialize(gpa: std.mem.Allocator, request: *const llm.Request, account: l
         try stringify.endArray();
         try stringify.objectField("tool_choice");
         try stringify.write("auto");
-        // The endpoint rule: OpenRouter picks an endpoint that serves every
-        // named parameter, so this flag would drop the endpoints that do not
-        // take it. A vendor account names it, because it reaches one endpoint.
         if (account.provider() != .openrouter) {
             try stringify.objectField("parallel_tool_calls");
             try stringify.write(true);
         }
     }
 
-    // Stateless replay: never persist the turn server-side, and ask for the
-    // reasoning tokens encrypted so a stored reasoning item round-trips next
-    // turn (the model requires the reasoning that preceded a function call).
-    //
-    // The reasoning rule: an account that replays plain reasoning asks for no
-    // blob and accepts a proof that holds none. The wire still sends a blob
-    // when a proof holds one, which happens when the vendor returns it
-    // unasked. The endpoint rule above motivates the request, but the two
-    // rules govern different fields, so each names the account property it
-    // belongs to.
     try stringify.objectField("store");
     try stringify.write(false);
     if (!account.replaysPlainReasoning()) {
@@ -79,8 +49,6 @@ pub fn serialize(gpa: std.mem.Allocator, request: *const llm.Request, account: l
         try stringify.endArray();
     }
 
-    // Near pass-through: one input item per history item, in list order.
-    // Unlike Anthropic, OpenAI needs no envelope merging.
     try stringify.objectField("input");
     try stringify.beginArray();
     for (request.items) |*item| try writeItem(&stringify, gpa, item, account);
@@ -97,7 +65,6 @@ pub fn serialize(gpa: std.mem.Allocator, request: *const llm.Request, account: l
     return out.toOwnedSlice();
 }
 
-/// The wire name of the resolved control, or null when the request carries none.
 fn effortName(request: *const llm.Request) ?[]const u8 {
     return switch (request.reasoning) {
         .omitted => null,
@@ -105,8 +72,6 @@ fn effortName(request: *const llm.Request) ?[]const u8 {
     };
 }
 
-/// Adaptive reasoning control: the named effort steers depth, and a summary is
-/// returned so the reasoning can be shown.
 const Reasoning = struct {
     effort: []const u8,
     summary: []const u8 = "auto",
@@ -120,7 +85,6 @@ fn writeItem(
 ) !void {
     switch (item.*) {
         .message => |*message| try writeMessage(stringify, message),
-        // Only this exact account's complete Responses proof can replay here.
         .reasoning => |*reasoning| switch (reasoning.replay) {
             inline .openai_plan,
             .openai_api_key,
@@ -163,10 +127,6 @@ fn writeMessage(stringify: *std.json.Stringify, message: *const llm.Item.Message
     try stringify.endObject();
 }
 
-/// A stored reasoning run: its server-assigned id, optional summary, and
-/// verbatim encrypted token. A proof that carries no token replays its raw
-/// reasoning text instead, which only an account that replays plain reasoning
-/// holds.
 fn writeReasoning(
     stringify: *std.json.Stringify,
     replay: *const llm.Item.Reasoning.OpenAi,
@@ -212,15 +172,11 @@ fn writeToolCall(stringify: *std.json.Stringify, call: *const llm.Item.ToolCall)
     try stringify.write(call.call_id);
     try stringify.objectField("name");
     try stringify.write(call.name);
-    // Responses wants the arguments as a JSON string, not an embedded object, so
-    // write the raw JSON escaped as a string value. Empty means an empty object.
     try stringify.objectField("arguments");
     try stringify.write(if (call.arguments_json.len == 0) "{}" else call.arguments_json);
     try stringify.endObject();
 }
 
-/// A tool outcome fed back to the model. Responses has no error flag, so a
-/// prefix on the output text marks an error.
 fn writeToolResult(
     stringify: *std.json.Stringify,
     gpa: std.mem.Allocator,
@@ -250,8 +206,6 @@ fn writeTool(stringify: *std.json.Stringify, tool: *const llm.Tool) !void {
     try stringify.write(tool.name);
     try stringify.objectField("description");
     try stringify.write(tool.description);
-    // Non-strict: the parameters are a plain JSON schema, so a tool need not mark
-    // every property required or forbid extra keys the way strict mode demands.
     try stringify.objectField("strict");
     try stringify.write(false);
     try stringify.objectField("parameters");
@@ -416,11 +370,9 @@ test "a synthetic error result emits one function_call_output with one Error pre
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
     defer parsed.deinit();
     const input = parsed.value.object.get("input").?.array.items;
-    // One call, one matching output linked by call_id.
     try std.testing.expectEqual(@as(usize, 2), input.len);
     try std.testing.expectEqualStrings("function_call_output", input[1].object.get("type").?.string);
     try std.testing.expectEqualStrings("call_1", input[1].object.get("call_id").?.string);
-    // Exactly one `Error:` prefix. The stored content carries none of its own.
     const output = input[1].object.get("output").?.string;
     const expected = "Error: " ++ synthetic;
     try std.testing.expectEqualStrings(expected, output);
@@ -467,8 +419,6 @@ test "reasoning replays only the active account's complete proof" {
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
     defer parsed.deinit();
     const input = parsed.value.object.get("input").?.array.items;
-    // Only this account's complete reasoning item and the message survive. The
-    // OpenAI backend rejects a reasoning item without its blob, so `rs_2` goes.
     try std.testing.expectEqual(@as(usize, 2), input.len);
     try std.testing.expectEqualStrings("reasoning", input[0].object.get("type").?.string);
     try std.testing.expectEqualStrings("rs_1", input[0].object.get("id").?.string);
@@ -479,8 +429,6 @@ test "reasoning replays only the active account's complete proof" {
     );
     try std.testing.expectEqualStrings("message", input[1].object.get("type").?.string);
 
-    // An xAI proof has the same shape, but it belongs to its own account, so a
-    // Grok request replays none of the OpenAI items above.
     const grok_items = [_]llm.Item{
         .{ .reasoning = .{
             .replay = .{
@@ -525,16 +473,12 @@ test "assistant text uses output_text, and no control omits reasoning" {
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
     defer parsed.deinit();
     const root = parsed.value.object;
-    // The request carries no control, so it names no reasoning at all.
     try std.testing.expect(root.get("reasoning") == null);
     const content =
         root.get("input").?.array.items[0].object.get("content").?.array.items[0].object;
     try std.testing.expectEqualStrings("output_text", content.get("type").?.string);
 }
 
-// A multi-round conversation that exercises every serializer path.
-// Byte-identity guards the wire shape against drift the structural tests
-// above can miss.
 const golden_items = [_]llm.Item{
     .{ .message = .{ .role = .user, .text = "first" } },
     .{ .reasoning = .{ .replay = .{ .openai_api_key = .{
@@ -632,8 +576,6 @@ test "an OpenRouter request requires parameters and replays its own proof" {
     try std.testing.expect(root.get("parallel_tool_calls") == null);
     try std.testing.expectEqualStrings("auto", root.get("tool_choice").?.string);
     const input = root.get("input").?.array.items;
-    // The blob wins where the proof holds one, and the raw text replays where
-    // it holds none. The proof of the other OpenRouter account stays out.
     try std.testing.expectEqual(@as(usize, 2), input.len);
     try std.testing.expectEqualStrings("rs_or", input[0].object.get("id").?.string);
     try std.testing.expectEqualStrings("enc", input[0].object.get("encrypted_content").?.string);

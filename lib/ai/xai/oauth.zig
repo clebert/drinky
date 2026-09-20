@@ -1,14 +1,3 @@
-//! The xAI device-code OAuth protocol (RFC 8628) of the SuperGrok and X Premium
-//! subscription: the device authorization request, the token poll, and the
-//! refresh. Credential storage and the login orchestration live in `Auth`. This
-//! module only speaks the protocol.
-//!
-//! The client id is the public one of the Grok Build client, and the access
-//! token authorizes the public API at `api.x.ai` as a plain bearer token. xAI
-//! publishes its OIDC endpoints and the device grant in its discovery document,
-//! but documents no client for a third-party harness. This is an acknowledged
-//! off-label surface (the API-key account is the official fallback).
-
 const std = @import("std");
 
 const json = @import("../json.zig");
@@ -22,24 +11,15 @@ const device_url = "https://auth.x.ai/oauth2/device/code";
 const token_url = "https://auth.x.ai/oauth2/token";
 const scope = "openid profile email offline_access grok-cli:access api:access";
 const device_grant = "urn:ietf:params:oauth:grant-type:device_code";
-/// The `referrer` field names the client to xAI.
 const referrer = "drinky";
-/// The time before the stated expiry at which a token counts as stale. A short
-/// token keeps half its lifetime, so it never counts as stale on arrival.
 const refresh_margin_ms = 5 * 60 * 1000;
-/// The token lifetime when a response names none. The reference clients take
-/// the same value, and a guess that runs long costs one 401 renew.
 const lifetime_default_s = 3600;
-/// RFC 8628: a grant that names no interval polls every five seconds.
 const interval_default_ms = 5_000;
 
 pub const Tokens = struct {
     access: []const u8,
     refresh: []const u8,
-    /// The absolute epoch milliseconds at which `access` counts as stale.
     expires_ms: i64,
-    /// The `sub` claim of the id token, which names the user. Null when the
-    /// response carries no such claim.
     subject: ?[]const u8 = null,
 
     pub fn deinit(self: Tokens, gpa: std.mem.Allocator) void {
@@ -48,8 +28,6 @@ pub const Tokens = struct {
         if (self.subject) |subject_owned| gpa.free(subject_owned);
     }
 
-    /// Whether both credentials name the same user. An unknown user matches
-    /// nobody.
     pub fn samePrincipal(self: *const Tokens, other: *const Tokens) bool {
         const subject_own = self.subject orelse return false;
         const subject_other = other.subject orelse return false;
@@ -57,16 +35,12 @@ pub const Tokens = struct {
     }
 };
 
-/// One open device-code grant, as the authorization endpoint stated it.
 pub const Device = struct {
     device_code: []const u8,
     user_code: []const u8,
     verification_uri: []const u8,
-    /// The verification URI with the user code filled in, when the server
-    /// names one.
     verification_uri_complete: ?[]const u8,
     interval_ms: u64,
-    /// How long the grant stays open, from the moment the server issued it.
     lifetime_ms: u64,
 
     pub fn deinit(self: Device, gpa: std.mem.Allocator) void {
@@ -76,14 +50,11 @@ pub const Device = struct {
         if (self.verification_uri_complete) |complete| gpa.free(complete);
     }
 
-    /// The URL that the browser opens. The complete one carries the user code,
-    /// so the page asks for none.
     pub fn url(self: *const Device) []const u8 {
         return self.verification_uri_complete orelse self.verification_uri;
     }
 };
 
-/// Open a device-code grant. The caller frees the result.
 pub fn requestDevice(gpa: std.mem.Allocator, io: std.Io, timeouts: net.Timeouts) !Device {
     const body = try oauth_wire.formBody(gpa, &.{
         .{ .name = "client_id", .value = client_id },
@@ -103,8 +74,6 @@ pub fn requestDevice(gpa: std.mem.Allocator, io: std.Io, timeouts: net.Timeouts)
     return parseDevice(gpa, response);
 }
 
-/// Ask the token endpoint once for the tokens of `device_code`. The caller frees
-/// a granted result.
 pub fn poll(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -127,9 +96,6 @@ pub fn poll(
     return .{ .granted = try parseTokens(gpa, io, response, .{}) };
 }
 
-/// Trade a refresh token for fresh tokens. A refresh response can omit the
-/// refresh token and the id token, so the current values carry over when the
-/// response leaves them out. The caller frees the result.
 pub fn refresh(gpa: std.mem.Allocator, io: std.Io, timeouts: net.Timeouts, tokens: Tokens) !Tokens {
     const body = try oauth_wire.formBody(gpa, &.{
         .{ .name = "grant_type", .value = "refresh_token" },
@@ -152,9 +118,6 @@ pub fn refresh(gpa: std.mem.Allocator, io: std.Io, timeouts: net.Timeouts, token
     });
 }
 
-/// Decode a device authorization response. A verification URI that is not
-/// HTTPS rejects the response, because Drinky hands that URI to the browser
-/// launcher of the system.
 fn parseDevice(gpa: std.mem.Allocator, body: []const u8) !Device {
     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, body, .{});
     defer parsed.deinit();
@@ -207,8 +170,6 @@ fn isHttps(uri: []const u8) bool {
     return std.mem.startsWith(u8, uri, "https://");
 }
 
-/// The values that carry over when a refresh response leaves them out. An empty
-/// value carries nothing.
 const Fallback = struct { refresh: []const u8 = "", subject: []const u8 = "" };
 
 fn parseTokens(gpa: std.mem.Allocator, io: std.Io, body: []const u8, fallback: Fallback) !Tokens {
@@ -221,7 +182,6 @@ fn parseTokens(gpa: std.mem.Allocator, io: std.Io, body: []const u8, fallback: F
     if (refresh_token.len == 0) return error.MissingRefreshToken;
     const expires_in = json.integer(object.get("expires_in")) orelse lifetime_default_s;
     if (expires_in <= 0) return error.MissingExpiry;
-    // A crafted expiry must fail cleanly, not overflow and crash.
     const lifetime_ms = std.math.mul(i64, expires_in, 1000) catch return error.MissingExpiry;
     const margin_ms = @min(refresh_margin_ms, @divFloor(lifetime_ms, 2));
     const now_ms = std.Io.Timestamp.now(io, .real).toMilliseconds();
@@ -242,8 +202,6 @@ fn parseTokens(gpa: std.mem.Allocator, io: std.Io, body: []const u8, fallback: F
     };
 }
 
-/// The user id: the `sub` claim of the id token, then of the access token, then
-/// the carried-over value. An owned copy, or null when no source names one.
 fn subject(
     gpa: std.mem.Allocator,
     maybe_id_token: ?[]const u8,
@@ -276,8 +234,6 @@ test parseDevice {
     try std.testing.expectEqual(@as(u64, 600_000), device.lifetime_ms);
     try std.testing.expectEqual(@as(u64, 5_000), device.interval_ms);
 
-    // Without the complete URI the browser opens the plain one, and a grant
-    // that names no interval takes the default of the RFC.
     const plain = try parseDevice(gpa,
         \\{ "device_code": "dev-2", "user_code": "WXYZ",
         \\  "verification_uri": "https://auth.x.ai/activate", "expires_in": 300, "interval": 0 }
@@ -289,7 +245,6 @@ test parseDevice {
 
 test "parseDevice rejects a grant it cannot poll or open" {
     const gpa = std.testing.allocator;
-    // The browser launcher of the system takes the URI, so only HTTPS passes.
     try std.testing.expectError(error.BadDeviceResponse, parseDevice(gpa,
         \\{ "device_code": "d", "user_code": "u", "verification_uri": "file:///etc/passwd",
         \\  "expires_in": 600 }
@@ -298,7 +253,6 @@ test "parseDevice rejects a grant it cannot poll or open" {
         \\{ "device_code": "d", "user_code": "u", "verification_uri": "https://auth.x.ai/activate",
         \\  "verification_uri_complete": "http://evil.test/", "expires_in": 600 }
     ));
-    // A grant without a window never ends, so it is refused.
     try std.testing.expectError(error.BadDeviceResponse, parseDevice(gpa,
         \\{ "device_code": "d", "user_code": "u", "verification_uri": "https://auth.x.ai/activate" }
     ));
@@ -329,7 +283,6 @@ test parseTokens {
     try std.testing.expectEqualStrings("at", tokens.access);
     try std.testing.expectEqualStrings("rt", tokens.refresh);
     try std.testing.expectEqualStrings("user-1", tokens.subject.?);
-    // The expiry lies ahead of now by the lifetime less the refresh margin.
     const now_ms = std.Io.Timestamp.now(std.testing.io, .real).toMilliseconds();
     try std.testing.expect(tokens.expires_ms > now_ms);
     try std.testing.expect(tokens.expires_ms <= now_ms + 3600 * 1000 - refresh_margin_ms);
@@ -352,7 +305,6 @@ test "parseTokens carries the refresh token and the user over a partial refresh"
     defer tokens.deinit(gpa);
     try std.testing.expectEqualStrings("old_rt", tokens.refresh);
     try std.testing.expectEqualStrings("user-1", tokens.subject.?);
-    // A response that names no lifetime takes the default of one hour.
     const now_ms = std.Io.Timestamp.now(std.testing.io, .real).toMilliseconds();
     try std.testing.expect(tokens.expires_ms > now_ms + (lifetime_default_s - 600) * 1000);
 }
@@ -381,8 +333,6 @@ test "parseTokens reads the user off a JWT access token and stays silent otherwi
     try std.testing.expect(bare.subject == null);
 }
 
-// A token shorter than the refresh margin keeps half its lifetime, so a fresh
-// token never reads as stale on arrival.
 test "a short token keeps half its lifetime before it counts as stale" {
     const gpa = std.testing.allocator;
     const tokens = try parseTokens(

@@ -41,9 +41,22 @@ pub fn build(b: *std.Build) void {
 
     run_step.dependOn(&run.step);
 
+    const comment_scan_module = b.createModule(.{
+        .root_source_file = b.path("scripts/comment_scan.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
+
     const test_step = b.step("test", "Build and run all tests");
 
-    for ([_]*std.Build.Module{ terminal_module, ai_module, root_module }) |module| {
+    const tested_modules = [_]*std.Build.Module{
+        terminal_module,
+        ai_module,
+        root_module,
+        comment_scan_module,
+    };
+
+    for (tested_modules) |module| {
         const tests = b.addTest(.{ .root_module = module });
         test_step.dependOn(&b.addRunArtifact(tests).step);
     }
@@ -61,7 +74,10 @@ pub fn build(b: *std.Build) void {
     run_unicode.setCwd(b.path("."));
     run_unicode.has_side_effects = true;
 
-    const unicode_step = b.step("unicode", "Regenerate lib/terminal/unicode_data.zig from the Unicode Character Database");
+    const unicode_step = b.step(
+        "unicode",
+        "Regenerate lib/terminal/unicode_data.zig from the Unicode Character Database",
+    );
     unicode_step.dependOn(&run_unicode.step);
 
     const check_step = b.step("check", "Check Zig code for errors (used by ZLS)");

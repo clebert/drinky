@@ -1,7 +1,3 @@
-//! The credential lifecycle for subscription OAuth: the shared `auth` lifecycle
-//! instantiated over `oauth`'s protocol for the `"anthropic-plan"`
-//! entry in `<home>/.drinky/auth.json`.
-
 const std = @import("std");
 
 const auth = @import("../auth.zig");
@@ -14,7 +10,6 @@ const oauth = @import("oauth.zig");
 
 const Auth = @This();
 
-/// The top-level key this account's credentials live under in `auth.json`.
 const account_key = llm.Account.anthropic_plan.id();
 
 gpa: std.mem.Allocator,
@@ -22,7 +17,6 @@ io: std.Io,
 timeouts: net.Timeouts,
 path: []const u8,
 tokens: ?oauth.Tokens,
-/// Where the credential in memory stands against the store.
 persistence: auth.Persistence = .saved,
 
 pub fn init(gpa: std.mem.Allocator, io: std.Io, home: []const u8, timeouts: net.Timeouts) !Auth {
@@ -35,33 +29,22 @@ pub fn deinit(self: *Auth) void {
     self.gpa.free(self.path);
 }
 
-/// Load stored tokens. The call returns false when the file is absent or holds
-/// no Anthropic subscription credential.
 pub fn load(self: *Auth) !bool {
     return auth.load(self, account_key);
 }
 
-/// Settle the credential on the open store `maybe_file`, or on an absent store
-/// when null, so a change in another instance shows here. The call reports
-/// what changed.
 pub fn reread(self: *Auth, maybe_file: ?*const json_store.File) !auth.Change {
     return auth.reread(self, account_key, maybe_file);
 }
 
-/// A valid access token. If the stored token has expired, this call refreshes
-/// and persists it first.
 pub fn accessToken(self: *Auth) ![]const u8 {
     return auth.accessToken(self, account_key, refreshTokens);
 }
 
-/// Renew a credential the provider rejected on a request: adopt the token
-/// another instance saved, else refresh this one before it expires. It reports
-/// whether the credential changed.
 pub fn renew(self: *Auth) !bool {
     return auth.renew(self, account_key, refreshTokens);
 }
 
-/// `oauth.refresh` in the shared lifecycle's shape (which passes whole tokens).
 fn refreshTokens(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -71,8 +54,6 @@ fn refreshTokens(
     return refreshTokensWith(gpa, io, timeouts, tokens, oauth.refresh, oauth.identity);
 }
 
-/// The refresh over its two protocol calls, so a test pins the credential
-/// lifecycle without the network.
 fn refreshTokensWith(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -88,18 +69,6 @@ fn refreshTokensWith(
     return fresh;
 }
 
-/// Give a credential from before the principal markers its own markers, so a
-/// store copy another instance saved stays comparable. A marked credential
-/// makes no request.
-///
-/// The refresh already consumed the stored token, so the fresh credential must
-/// survive this best-effort request: every failure leaves it unmarked and
-/// usable. The request stays cancelable, because blocking a cancel here holds
-/// the interface for the whole connect timeout, which a configured zero makes
-/// unbounded. A cancel is re-armed instead: `accessToken` installs and saves
-/// the credential cancel-protected, and the request after that save is the next
-/// cancellation point. A login answers a cancel differently (see
-/// `attachIdentity`), because its credential replaces nothing.
 fn healIdentity(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -133,14 +102,10 @@ fn copyIdentity(
         null;
 }
 
-/// Run the interactive OAuth login and return the committed credential's
-/// persistence outcome for the caller to present.
 pub fn login(self: *Auth, prompt: anytype) !auth.Login {
     return auth.login(self, account_key, oauth, prompt, exchangeRedirect);
 }
 
-/// `oauth.exchange` over the received redirect: the code, its `state`, and the
-/// PKCE verifier all go into the token request.
 fn exchangeRedirect(
     self: *Auth,
     redirect: *const oauth_callback.Redirect,
@@ -156,12 +121,6 @@ fn exchangeRedirect(
     return tokens;
 }
 
-/// Mark a credential the login just exchanged. An ordinary profile failure only
-/// costs the markers, so the login keeps the credential and commits it. A cancel
-/// is the user's word on the whole sign-in, and it ends the login: this
-/// credential is new, so nothing breaks when the caller frees it, and the next
-/// `/login` mints another one. A refresh cannot answer a cancel this way, which
-/// is why `healIdentity` re-arms one instead.
 fn attachIdentity(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -177,13 +136,10 @@ fn attachIdentity(
     tokens.organization_uuid = found.organization_uuid;
 }
 
-/// Drop this account's credentials: clear the in-memory tokens and remove its
-/// entry from `auth.json`. The removal preserves every other account's entry.
 pub fn logout(self: *Auth) !void {
     return auth.logout(self, account_key);
 }
 
-/// Forget a rejected refresh credential, or reload its stored replacement.
 pub fn invalidate(self: *Auth) !bool {
     return auth.invalidate(self, account_key);
 }
@@ -233,7 +189,6 @@ test "a canceled profile ends the login, and an ordinary failure does not" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
-    // The markers are optional, so the login keeps this credential and commits it.
     var kept: oauth.Tokens = .{
         .access = try gpa.dupe(u8, "exchanged"),
         .refresh = try gpa.dupe(u8, "exchanged_refresh"),
@@ -244,8 +199,6 @@ test "a canceled profile ends the login, and an ordinary failure does not" {
     try std.testing.expect(kept.account_uuid == null);
     try std.testing.expectEqualStrings("exchanged", kept.access);
 
-    // A cancel ends the sign-in. The caller frees the exchanged credential,
-    // which no account depends on.
     var canceled: oauth.Tokens = .{
         .access = try gpa.dupe(u8, "exchanged"),
         .refresh = try gpa.dupe(u8, "exchanged_refresh"),
@@ -257,7 +210,6 @@ test "a canceled profile ends the login, and an ordinary failure does not" {
         attachIdentity(gpa, io, .{}, &canceled, cancelIdentity),
     );
 
-    // The profile marks a credential the login can compare later.
     var marked: oauth.Tokens = .{
         .access = try gpa.dupe(u8, "exchanged"),
         .refresh = try gpa.dupe(u8, "exchanged_refresh"),
@@ -315,7 +267,6 @@ test "a credential from before the markers heals at its next refresh" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
 
-    // A refused profile leaves the refreshed credential unmarked and usable.
     var unmarked: oauth.Tokens = .{
         .access = try gpa.dupe(u8, "fresh"),
         .refresh = try gpa.dupe(u8, "next"),
@@ -326,13 +277,10 @@ test "a credential from before the markers heals at its next refresh" {
     try std.testing.expect(unmarked.account_uuid == null);
     try std.testing.expectEqualStrings("fresh", unmarked.access);
 
-    // The profile fills both markers, so the next cross-instance handoff can
-    // compare principals instead of taking the replacement path.
     healIdentity(gpa, io, .{}, &unmarked, grantIdentity);
     try std.testing.expectEqualStrings("healed_account", unmarked.account_uuid.?);
     try std.testing.expectEqualStrings("healed_organization", unmarked.organization_uuid.?);
 
-    // A marked credential keeps its own markers and makes no request.
     var marked: oauth.Tokens = .{
         .access = try gpa.dupe(u8, "fresh"),
         .refresh = try gpa.dupe(u8, "next"),
@@ -366,8 +314,6 @@ fn grantRefresh(
     return fresh;
 }
 
-/// A server that has already rotated the refresh token: only the token the
-/// store holds now still buys a new credential.
 fn grantRotatedRefresh(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -378,20 +324,14 @@ fn grantRotatedRefresh(
     return grantRefresh(gpa, io, timeouts, tokens);
 }
 
-/// Test scaffolding: the store that `refuseRefreshAfterSave` fills. The refresher
-/// takes no path, so the race the hook plays needs one here. A test that sets it
-/// must clear it again, because the path lives on that test's stack.
 var race_path: []const u8 = "";
 
-/// A refresh that loses a race: another instance saves its own renewal while this
-/// one runs, and the spent token that this one holds is rejected.
 fn refuseRefreshAfterSave(
     gpa: std.mem.Allocator,
     io: std.Io,
     _: net.Timeouts,
     _: oauth.Tokens,
 ) anyerror!oauth.Tokens {
-    // A caller that set no path would write through a dead one.
     std.debug.assert(race_path.len > 0);
     try json_store.save(gpa, io, race_path, account_key, .{
         .access = "winner_access",
@@ -409,9 +349,6 @@ fn grantRefreshAfterCancel(
     timeouts: net.Timeouts,
     tokens: oauth.Tokens,
 ) anyerror!oauth.Tokens {
-    // Park until the test's cancel request lands, then re-arm it: the next
-    // cancelation point — without protection, the save — sees the cancel exactly
-    // as if it arrived while the refresh response was in flight.
     io.sleep(.fromSeconds(60), .awake) catch io.recancel();
     return grantRefresh(gpa, io, timeouts, tokens);
 }
@@ -454,7 +391,6 @@ test "a failed refresh leaves the stored credential intact" {
     };
     defer subject.tokens.?.deinit(gpa);
 
-    // There is no store file, so the failure has no second token to try.
     try std.testing.expectError(
         error.TokenGrantRejected,
         auth.accessToken(&subject, account_key, refuseRefresh),
@@ -462,7 +398,6 @@ test "a failed refresh leaves the stored credential intact" {
     try std.testing.expectEqualStrings("stale", subject.tokens.?.access);
     try std.testing.expectEqualStrings("keep", subject.tokens.?.refresh);
 
-    // The store holds the same refresh token, so the failure is real and stands.
     try auth.save(&subject, account_key);
     try std.testing.expectError(
         error.TokenGrantRejected,
@@ -472,10 +407,6 @@ test "a failed refresh leaves the stored credential intact" {
     try std.testing.expectEqualStrings("keep", subject.tokens.?.refresh);
 }
 
-// The rotation-staleness bug: the refresh token is single use, so a second Drinky
-// instance that refreshes first leaves this process with a dead cached token.
-// Every turn then fails until a restart. A failed refresh must reload the store
-// and try the token it finds there once.
 test "a refresh token rotated by another instance recovers without a restart" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -518,9 +449,6 @@ test "a refresh token rotated by another instance recovers without a restart" {
     try std.testing.expectEqualStrings("next", file.entry(account_key).?.get("refresh").?.string);
 }
 
-// Every refresh rotates the token that every other instance holds. A live
-// credential from the store is therefore used as it stands, so two instances
-// cannot chase each other through one rotation after another.
 test "a live credential from another instance is used without a refresh" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -550,15 +478,12 @@ test "a live credential from another instance is used without a refresh" {
     };
     defer subject.tokens.?.deinit(gpa);
 
-    // `refuseRefresh` fails every refresh, so the token can only come from the
-    // store. The expired credential in memory spends its own refresh once.
     try std.testing.expectEqualStrings(
         "saved_access",
         try auth.accessToken(&subject, account_key, refuseRefresh),
     );
     try std.testing.expectEqualStrings("saved", subject.tokens.?.refresh);
 
-    // The store still holds that credential, because no rotation happened.
     var file = (try json_store.open(gpa, io, path)).?;
     defer file.deinit();
     const entry = file.entry(account_key).?;
@@ -607,9 +532,6 @@ test "a stored credential for another principal stops before a model request" {
     try std.testing.expectEqualStrings("other_account", subject.tokens.?.account_uuid.?);
 }
 
-// The retry is the one path that changes the tokens in memory and still fails.
-// The stored credential is the only one that can still be live, so the reload
-// keeps it. The caller sees the refusal, and the store file stays untouched.
 test "a retry that also fails keeps the credential the store holds" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -651,9 +573,6 @@ test "a retry that also fails keeps the credential the store holds" {
     try std.testing.expectEqualStrings("stored", file.entry(account_key).?.get("refresh").?.string);
 }
 
-// The revoked-token bug: a refresh in another instance kills the access token
-// this one holds, and that token still reads as live here. The rejected request
-// must take the credential the store holds and repeat, with no restart.
 test "a rejected access token takes the credential another instance saved" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -676,7 +595,6 @@ test "a rejected access token takes the credential another instance saved" {
         .tokens = .{
             .access = try gpa.dupe(u8, "revoked"),
             .refresh = try gpa.dupe(u8, "dead"),
-            // The provider revoked this token, but its own clock reads live.
             .expires_ms = std.math.maxInt(i64),
             .account_uuid = try gpa.dupe(u8, "account"),
             .organization_uuid = try gpa.dupe(u8, "organization"),
@@ -684,7 +602,6 @@ test "a rejected access token takes the credential another instance saved" {
     };
     defer subject.tokens.?.deinit(gpa);
 
-    // The store answers, so the renewal buys no new credential.
     try std.testing.expect(try auth.renew(&subject, account_key, refuseRefresh));
     try std.testing.expectEqualStrings("saved_access", subject.tokens.?.access);
     try std.testing.expectEqualStrings("saved", subject.tokens.?.refresh);
@@ -694,9 +611,6 @@ test "a rejected access token takes the credential another instance saved" {
     );
 }
 
-// Two instances can meet the rejection at the same moment. The loser finds an
-// empty store, refreshes into the rejection of a spent token, and must then read
-// the store that the winner filled in the meantime.
 test "a renewal whose refresh fails takes the credential that landed meanwhile" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -719,10 +633,7 @@ test "a renewal whose refresh fails takes the credential that landed meanwhile" 
     };
     defer subject.tokens.?.deinit(gpa);
 
-    // The store is empty until the refresh runs, so the renewal adopts nothing
-    // first. The hook then fills the store and rejects the spent token.
     race_path = path;
-    // The path lives on this stack, so the hook must not keep it.
     defer race_path = "";
     try std.testing.expect(try auth.renew(&subject, account_key, refuseRefreshAfterSave));
     try std.testing.expectEqualStrings("winner_access", subject.tokens.?.access);
@@ -751,7 +662,6 @@ test "a rejected access token refreshes although its own clock reads live" {
     };
     defer subject.tokens.?.deinit(gpa);
 
-    // The store holds nothing newer, so the renewal spends the refresh token.
     try std.testing.expect(try auth.renew(&subject, account_key, grantRefresh));
     try std.testing.expectEqualStrings("fresh", subject.tokens.?.access);
     try std.testing.expectEqualStrings("next", subject.tokens.?.refresh);
@@ -761,7 +671,6 @@ test "a rejected access token refreshes although its own clock reads live" {
     defer file.deinit();
     try std.testing.expectEqualStrings("next", file.entry(account_key).?.get("refresh").?.string);
 
-    // A signed-out account renews nothing, so no caller repeats its request.
     var empty: Auth = .{ .gpa = gpa, .io = io, .timeouts = .{}, .path = path, .tokens = null };
     try std.testing.expect(!try auth.renew(&empty, account_key, refuseRefresh));
 }
@@ -889,11 +798,6 @@ test "a busy store retries a refreshed credential before the next request" {
     try std.testing.expectEqualStrings("next", file.entry(account_key).?.get("refresh").?.string);
 }
 
-// The rotation-durability race: the server has already consumed the old refresh
-// token when a cancel (the catalog fetch's timeout, a turn cancel) lands at the
-// save. The commit+save runs cancel-protected, so the rotated credential still
-// reaches memory and disk. The cancel fires at the caller's next cancelation
-// point.
 test "a cancel landing at the save cannot lose the rotated credential" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;

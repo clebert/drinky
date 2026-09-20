@@ -1,22 +1,12 @@
-//! Pure composition of Drinky's provider-neutral system prompt.
-
 const std = @import("std");
 
 const ai = @import("ai");
 
-/// The core that Drinky compiles in. It states the mechanical facts of the
-/// harness: the role, the tools, the edit contract, and the medium. Workflow,
-/// tone, and review rules stay out, because the user cannot switch off what the
-/// binary holds. The user instructions, the project instructions, and the skills
-/// carry that guidance, and the user controls all three.
 pub const default_core =
     "# System prompt\n\n" ++
     "You are a coding assistant. You run inside Drinky, a terminal coding-agent harness.\n\n" ++
     "Complete the user's request.\n" ++
     "Use the available tools according to their schemas.\n" ++
-    // A model can reach for a shell grep that the grep tool already covers. The
-    // tools skip the noise directories, cost no process, and give the transcript
-    // a pattern row instead of a command.
     "Use the find tool and the grep tool to search files.\n" ++
     "Run a search in bash only when these tools cannot express it.\n" ++
     "Read a file before you change it, because an edit must match the current bytes.\n" ++
@@ -24,23 +14,16 @@ pub const default_core =
     "memory.\n" ++
     "Drinky renders your answer as Markdown in a terminal, so keep it short.";
 
-/// The final nanosecond of 9999-12-31 UTC.
 const date_timestamp_nanoseconds_max: i96 =
     253_402_300_800 * std.time.ns_per_s - 1;
 
 pub const Options = struct {
     core: []const u8,
-    /// The wall clock at startup. Drinky reads it once, so the prompt stays byte
-    /// stable for the session and the provider can cache it. A session that runs
-    /// past midnight therefore keeps the date it started on.
     current_time: std.Io.Timestamp,
     working_directory: []const u8,
     user_instructions: []const ai.instructions.File,
     project_instructions: *const ai.instructions.Result,
     skills: ai.skills.Catalog,
-    /// The path-triggered skill rules of the session. Each one already names a
-    /// discovered skill, so a configured rule that resolved to none states
-    /// nothing here. An empty list leaves the section out.
     required_skills: []const ai.tool.SkillGuard.Rule = &.{},
 };
 
@@ -73,9 +56,6 @@ pub fn compose(gpa: std.mem.Allocator, options: *const Options) ![]u8 {
     return output.toOwnedSlice();
 }
 
-/// Rank the instruction sources for the model. Drinky lists only the sources that
-/// this prompt carries, so the model never reads about a section it cannot see.
-/// A prompt with no source at all gets no ranking.
 fn writePrecedence(writer: *std.Io.Writer, options: *const Options) !void {
     const project_files = options.project_instructions.files();
     const has_skills = options.skills.count() > 0;
@@ -105,13 +85,6 @@ fn writePrecedence(writer: *std.Io.Writer, options: *const Options) !void {
     );
 }
 
-/// Write one instruction section. The user and the project sections differ only
-/// in their title and their tag, so both stream through here.
-///
-/// The content goes in as it is, because escaping it corrupts the Markdown
-/// the user wrote. The tags mark the bounds, so a heading inside a file cannot
-/// end the section. A file that forges a closing tag can still claim a higher
-/// rank, which is why Drinky trusts only what the user and the repository own.
 fn writeInstructions(
     gpa: std.mem.Allocator,
     writer: *std.Io.Writer,
@@ -129,8 +102,6 @@ fn writeInstructions(
     try writer.print("</{s}>", .{options.tag});
 }
 
-/// Render the UTC date of `timestamp`. Null reports a wall clock outside the
-/// years 1970 through 9999, which must not stop Drinky from starting.
 fn dateUtc(timestamp: std.Io.Timestamp) ?[10]u8 {
     const timestamp_nanoseconds = timestamp.toNanoseconds();
     if (timestamp_nanoseconds < 0 or
@@ -206,9 +177,6 @@ fn writeSkills(
     try writer.writeAll("</skills>");
 }
 
-/// Name every path-triggered skill rule, so the model reads a skill before a
-/// write rather than after a refusal. The guard stays the backstop: it refuses
-/// the call whatever this section says.
 fn writeRequiredSkills(
     gpa: std.mem.Allocator,
     writer: *std.Io.Writer,
@@ -404,8 +372,6 @@ test "composition orders sections and preserves instruction Markdown" {
         prompt,
         "<current_date>1970-01-01</current_date>",
     ) != null);
-    // This prompt carries no user instructions, so the ranking skips that source
-    // and the skills take rank 3.
     try std.testing.expect(std.mem.indexOf(
         u8,
         prompt,
@@ -496,8 +462,6 @@ test "configured user instructions have their own section" {
             "  <working_directory>/work</working_directory>\n" ++
             "  <repository_root />\n" ++
             "</environment>\n\n" ++
-            // The user files are the only source here, so the ranking names
-            // them alone and drops the subtree rule of the project files.
             "## Instruction precedence\n\n" ++
             "Drinky gives you instructions from the sources below. Where two conflict, obey " ++
             "this order:\n\n" ++
@@ -518,8 +482,6 @@ test "configured user instructions have their own section" {
     );
 }
 
-// The model reads a required skill before a write, rather than after a
-// refusal, so the prompt must name every rule the guard applies.
 test "the required skills section names every rule and stays out without one" {
     const gpa = std.testing.allocator;
     var empty_instructions = ai.instructions.Result.init(gpa, .project);
@@ -551,7 +513,6 @@ test "the required skills section names every rule and stays out without one" {
     });
     defer gpa.free(prompt);
 
-    // The rules follow the catalog, because a rule names a skill of it.
     const skills_index = std.mem.indexOf(u8, prompt, "## Skills").?;
     const required_index = std.mem.indexOf(u8, prompt, "## Required skills").?;
     try std.testing.expect(skills_index < required_index);
@@ -568,7 +529,6 @@ test "the required skills section names every rule and stays out without one" {
             "</required_skills>",
     ) != null);
 
-    // A session with no rule at all carries no section.
     const plain = try compose(gpa, &.{
         .core = "core",
         .current_time = .zero,

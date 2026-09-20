@@ -1,22 +1,3 @@
-//! Every model Drinky knows, and the two caches behind it. No request runs here
-//! and none runs at startup: `init` reads the files alone, and the user asks for
-//! a fetch when a list is stale or empty.
-//!
-//! The two caches differ in what they belong to, so they never share a file.
-//! `models.json` holds the list of each account that fetches its own models,
-//! which belongs to the principal behind that credential. A logout and a
-//! credential replacement drop that list from memory, and a removal that fails
-//! leaves it in the file, so the next start loads it again. An account that
-//! reads its key from the environment has no such event, so its list stands
-//! until the next fetch. A DwarfStar list also drops when the base URL changes
-//! at startup. `metadata.json` holds the public facts of a vendor model, which
-//! belong to nobody and survive every logout. It also holds the OpenRouter list,
-//! which is public, so an OpenRouter account reads that list and never writes
-//! `models.json`.
-//!
-//! A merge joins them, and the vendor wins every field it states. Only the
-//! aggregator prices a model.
-
 const std = @import("std");
 
 const json = @import("json.zig");
@@ -27,54 +8,31 @@ const Model = @import("Model.zig");
 
 const Catalog = @This();
 
-/// The longest effort list one model can encode: every rung and its separator.
 const efforts_bytes_max = 64;
 const models_key = "models";
 const base_url_key = "base_url";
 
 gpa: std.mem.Allocator,
 io: std.Io,
-/// Where the account lists live. An empty path holds the catalog in memory
-/// alone, which is what a test wants and what a store failure leaves behind.
 models_path: []const u8,
-/// Where the public metadata lives, under the same empty-path rule.
 metadata_path: []const u8,
-/// The vendor list of each account that fetches its own models, exactly as the
-/// vendor stated it. An empty list means the user has not fetched that account
-/// yet. An OpenRouter account holds no such list.
 accounts: std.EnumArray(llm.Account, []Model),
-/// The base URL stored with each account list. Only DwarfStar sets one.
-/// Each non-null value is owned.
 base_urls: std.EnumArray(llm.Account, ?[]const u8),
-/// The public metadata of every vendor model Drinky reaches, and the OpenRouter
-/// list under that provider.
 metadata: []Metadata.Entry,
 
-/// The stored shape of one model. The writer emits an optional field that no
-/// source stated as a JSON null, so a reader cannot mistake a default for a
-/// fact. A decoder takes that null as the absent value it is.
 const Encoded = struct {
     name: []const u8,
-    /// The engine behind this request id, or null when no source states one.
     engine: ?[]const u8,
-    /// The id behind an alias, or null when the name is the id itself.
     served_as: ?[]const u8,
     context_window: ?u64,
     tokens_max: ?u32,
     thinking: []const u8,
     tools: []const u8,
-    /// The effort levels as one comma-separated list, which reads as a list in
-    /// the file and needs no allocation to build.
     efforts: []const u8,
-    /// Whether the vendor denied the effort control. An empty list is silent
-    /// about that, so the denial needs a field of its own.
     efforts_denied: bool,
     price: ?Model.Price,
 };
 
-/// Open both caches. A file that is absent leaves its half empty, and a file
-/// Drinky cannot read leaves it empty too, because a cache is a convenience and
-/// never a reason to refuse a start.
 pub fn init(gpa: std.mem.Allocator, io: std.Io, home: []const u8) !Catalog {
     const models_path = try std.fs.path.join(gpa, &.{ home, ".drinky", "models.json" });
     errdefer gpa.free(models_path);
@@ -105,8 +63,6 @@ pub fn deinit(self: *Catalog) void {
     self.gpa.free(self.metadata_path);
 }
 
-/// Whether `account` has no model at all, so the user must fetch its list before
-/// anything can run on it.
 pub fn isEmpty(self: *const Catalog, account: llm.Account) bool {
     if (account.provider() == .openrouter) {
         for (self.metadata) |entry| {
@@ -120,9 +76,6 @@ pub fn isEmpty(self: *const Catalog, account: llm.Account) bool {
     return true;
 }
 
-/// Append every model `account` offers, in the order the vendor listed it. A
-/// model that no source describes stays out, because a bare id states nothing
-/// the user can choose by.
 pub fn list(
     self: *const Catalog,
     account: llm.Account,
@@ -142,7 +95,6 @@ pub fn list(
     }
 }
 
-/// The model `name` of `account`, or null when the account does not offer it.
 pub fn find(self: *const Catalog, account: llm.Account, name: []const u8) ?Model {
     if (account.provider() == .openrouter) {
         for (self.metadata) |entry| {
@@ -158,23 +110,14 @@ pub fn find(self: *const Catalog, account: llm.Account, name: []const u8) ?Model
     return null;
 }
 
-/// One vendor model under its public metadata, or null when the result
-/// describes nothing. The vendor wins every field it states, so a subscription
-/// keeps the window of its own backend even where the public API contradicts it.
 fn merge(self: *const Catalog, account: llm.Account, vendor: Model) ?Model {
     var merged = vendor;
-    // DwarfStar states local facts. Public metadata cannot describe that server.
     const public = if (account == .ds4) null else self.lookup(account.provider(), vendor.name());
     if (public) |extra| {
         merged.price = extra.price;
         if (merged.context_window == null) merged.context_window = extra.context_window;
-        // A vendor that states no thinking at all takes the state of the
-        // aggregator. A vendor that named a level proves that the model reasons,
-        // so the aggregator can never deny the reasoning of such a model.
         const denies = extra.thinking == .unsupported and merged.efforts.count() != 0;
         if (merged.thinking == .unknown and !denies) merged.thinking = extra.thinking;
-        // A model that takes no level keeps its empty list, so no aggregator can
-        // name a control that the vendor refuses.
         if (merged.takesEffort() and merged.efforts.count() == 0) merged.efforts = extra.efforts;
         if (merged.tools == .unknown) merged.tools = extra.tools;
     }
@@ -191,18 +134,11 @@ fn lookup(self: *const Catalog, provider: llm.Provider, name: []const u8) ?Model
     return metadata.lookup(provider, name);
 }
 
-/// Replace the list of `account` and write it through. The caller owns
-/// `discovered` until this returns, because the catalog copies it.
-///
-/// An OpenRouter account fetches the public metadata instead, and every read
-/// path skips its `models.json` entry, so a write here would leave a list that
-/// nothing reads.
 pub fn setAccount(self: *Catalog, account: llm.Account, discovered: []const Model) !void {
     std.debug.assert(account != .ds4);
     try self.replaceAccount(account, .{ .models = discovered });
 }
 
-/// Replace an account list and store the base URL that supplied it.
 pub fn setAccountAt(
     self: *Catalog,
     account: llm.Account,
@@ -231,13 +167,10 @@ fn replaceAccount(
     if (self.base_urls.get(account)) |old| self.gpa.free(old);
     self.accounts.set(account, models);
     self.base_urls.set(account, base_url);
-    // A failed write leaves the list in memory for this session.
     installed = true;
     try self.saveAccount(account);
 }
 
-/// Drop a stored list when `base_url` differs from its source. A legacy list
-/// has no source and therefore differs. An absent list needs no file change.
 pub fn dropAccountFromAnotherUrl(
     self: *Catalog,
     account: llm.Account,
@@ -251,10 +184,6 @@ pub fn dropAccountFromAnotherUrl(
     self.dropAccount(account);
 }
 
-/// Drop the list of `account` from memory, and remove it from the file. The
-/// list belongs to the principal behind a credential, so a replaced credential
-/// takes it along for this session in every case. A removal that fails leaves
-/// the file as it stands, so the next start loads that list again.
 pub fn dropAccount(self: *Catalog, account: llm.Account) void {
     self.gpa.free(self.accounts.get(account));
     if (self.base_urls.get(account)) |base_url| self.gpa.free(base_url);
@@ -264,7 +193,6 @@ pub fn dropAccount(self: *Catalog, account: llm.Account) void {
     json_store.remove(self.gpa, self.io, self.models_path, account.id()) catch {};
 }
 
-/// Replace the public metadata and write it through.
 pub fn setMetadata(self: *Catalog, entries: []const Metadata.Entry) !void {
     const copy = try self.gpa.dupe(Metadata.Entry, entries);
     self.gpa.free(self.metadata);
@@ -434,8 +362,6 @@ fn boolean(value: ?std.json.Value) bool {
     };
 }
 
-/// A count that states a limit, or null when it is absent or not one. A cached
-/// limit reads like a fetched one, so a non-positive count states no limit.
 fn positive(value: ?std.json.Value) ?u64 {
     const found = json.integer(value) orelse return null;
     return if (found > 0) @intCast(found) else null;
@@ -490,8 +416,6 @@ fn vendorModel(name: []const u8, window: ?u64, level: ?llm.Effort) Model {
     return model;
 }
 
-// A catalog with no path writes nothing, so a test and a failed store both keep
-// their models in memory alone.
 test "a catalog with no path holds its models in memory" {
     const gpa = std.testing.allocator;
     var catalog = testCatalog(gpa);
@@ -508,8 +432,6 @@ test "the vendor wins every field it states and the aggregator fills the rest" {
     const gpa = std.testing.allocator;
     var catalog = testCatalog(gpa);
 
-    // The subscription states a window of its own backend, which the public
-    // metadata contradicts. The vendor wins.
     var vendor = vendorModel("gpt-5.6-sol", 272_000, .high);
     vendor.tokens_max = null;
     const vendor_models = [_]Model{vendor};
@@ -527,11 +449,8 @@ test "the vendor wins every field it states and the aggregator fills the rest" {
 
     const merged = catalog.find(.openai_plan, "gpt-5.6-sol").?;
     try std.testing.expectEqual(@as(?u64, 272_000), merged.context_window);
-    // The vendor named a level, so its list stands whole.
     try std.testing.expect(merged.offers(.high));
     try std.testing.expect(!merged.offers(.low));
-    // Only the aggregator prices a model. The Codex list states no thinking
-    // state, so the aggregator fills it.
     try std.testing.expectEqual(@as(f64, 2), merged.price.?.input);
     try std.testing.expectEqual(Model.Thinking.supported, merged.thinking);
 }
@@ -540,7 +459,6 @@ test "a vendor that states no reasoning keeps every aggregator level out" {
     const gpa = std.testing.allocator;
     var catalog = testCatalog(gpa);
 
-    // The vendor states that the model never reasons, and it names no level.
     var vendor = vendorModel("claude-haiku-4-5-20251001", 200_000, null);
     vendor.thinking = .unsupported;
     const vendor_models = [_]Model{vendor};
@@ -568,7 +486,6 @@ test "a vendor that denies the effort control keeps every aggregator level out" 
     const gpa = std.testing.allocator;
     var catalog = testCatalog(gpa);
 
-    // The vendor states that the model reasons but takes no effort level.
     var vendor = vendorModel("claude-fable-5", 200_000, null);
     vendor.efforts_denied = true;
     const vendor_models = [_]Model{vendor};
@@ -583,14 +500,11 @@ test "a vendor that denies the effort control keeps every aggregator level out" 
     defer gpa.free(catalog.metadata);
 
     const merged = catalog.find(.anthropic_api_key, "claude-fable-5").?;
-    // The aggregator still states the thinking state.
     try std.testing.expectEqual(Model.Thinking.supported, merged.thinking);
     try std.testing.expect(!merged.offers(.high));
     try std.testing.expect(merged.reasoning(.high) == .omitted);
 }
 
-// A named level proves that the model reasons, so aggregator silence about the
-// reasoning never takes that ladder away.
 test "an aggregator that states no reasoning keeps the levels of the vendor" {
     const gpa = std.testing.allocator;
     var catalog = testCatalog(gpa);
@@ -615,8 +529,6 @@ test "a model that no source describes is not offered" {
     const gpa = std.testing.allocator;
     var catalog = testCatalog(gpa);
 
-    // An OpenAI key states an id and nothing else, so an embedding model and a
-    // chat model arrive alike. Only the described one reaches the user.
     const vendor_models = [_]Model{
         vendorModel("text-embedding-3-large", null, null),
         vendorModel("gpt-5.6-sol", null, null),
@@ -716,32 +628,23 @@ test "a stored model survives a round trip through both files" {
     try std.testing.expect(restored.offers(.xhigh));
     try std.testing.expect(!restored.offers(.high));
     try std.testing.expectEqual(@as(f64, 6.25), restored.price.?.cache_write);
-    // The long-context tier survives the file with its threshold and rates.
     const restored_tier = restored.price.?.long_context.?;
     try std.testing.expectEqual(@as(u64, 200_000), restored_tier.prompt_tokens_min);
     try std.testing.expectEqual(@as(f64, 10), restored_tier.input);
     try std.testing.expectEqual(@as(f64, 37.5), restored_tier.output);
     try std.testing.expectEqual(@as(f64, 1), restored_tier.cache_read);
     try std.testing.expectEqual(@as(f64, 12.5), restored_tier.cache_write);
-    // The public-only model states a price without a tier, so the file holds a
-    // null there and the read states none.
     try std.testing.expect(read.metadata[0].model.price.?.long_context == null);
     try std.testing.expectEqualStrings("", restored.servedName());
-    // The id behind an alias survives the file, so a reply under that id still
-    // reads as the model of the alias after a restart.
     try std.testing.expectEqualStrings(
         "grok-4.20-0309-reasoning",
         read.accounts.get(.anthropic_plan)[1].servedName(),
     );
-    // The metadata file survives its own round trip, under its vendor.
     try std.testing.expectEqual(@as(usize, 1), read.metadata.len);
     try std.testing.expectEqual(llm.Provider.anthropic, read.metadata[0].provider);
     try std.testing.expectEqualStrings("public-only", read.metadata[0].model.name());
-    // The denial of the effort control survives the file too.
     try std.testing.expect(read.metadata[0].model.efforts_denied);
 
-    // A dropped account leaves the file without its key, and the metadata
-    // stands, because it belongs to no principal.
     read.dropAccount(.anthropic_plan);
     var reopened = try init(gpa, io, home);
     defer reopened.deinit();
@@ -803,9 +706,6 @@ test "a DwarfStar list with no stored URL is foreign" {
     try std.testing.expect(catalog.isEmpty(.ds4));
 }
 
-// A cache write that failed leaves the fetched list in memory, so the account
-// offers every model of this session and the caller reports a failed save
-// rather than a failed fetch.
 test "a locked cache file keeps the fetched list of this session" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -821,7 +721,6 @@ test "a locked cache file keeps the fetched list of this session" {
     json_store.lock_policy = .{ .attempts_max = 2, .wait_ms = 0 };
     defer json_store.lock_policy = .{};
 
-    // Another Drinky instance holds the lock of the models file.
     const lock_path = try std.fmt.allocPrint(gpa, "{s}.lock", .{catalog.models_path});
     defer gpa.free(lock_path);
     var held = try std.Io.Dir.cwd().createFile(io, lock_path, .{
@@ -837,9 +736,6 @@ test "a locked cache file keeps the fetched list of this session" {
     try std.testing.expect(catalog.find(.anthropic_api_key, "claude-opus-4-8") != null);
 }
 
-// A cache holds what a vendor stated, so a limit that is not a count states
-// nothing. A window of zero prints a percentage that Drinky cannot know, and an
-// output limit of zero fails every turn at the provider.
 test "a cached limit that is not a count reads as unstated" {
     const gpa = std.testing.allocator;
     var parsed = try std.json.parseFromSlice(std.json.Value, gpa,
@@ -861,8 +757,6 @@ test "a cached limit that is not a count reads as unstated" {
     try std.testing.expectEqual(@as(?u32, 64_000), stated.tokens_max);
 }
 
-// A tier without a positive threshold or without an input rate states no tier,
-// and the standard price stands, because the tier is an addition to it.
 test "a cached tier that is not complete reads as no tier" {
     const gpa = std.testing.allocator;
     var parsed = try std.json.parseFromSlice(std.json.Value, gpa,
@@ -888,7 +782,6 @@ test "a cached tier that is not complete reads as no tier" {
     const tier = complete.price.?.long_context.?;
     try std.testing.expectEqual(@as(u64, 200_000), tier.prompt_tokens_min);
     try std.testing.expectEqual(@as(f64, 4), tier.input);
-    // A cache rate the file omits reads as zero, like the standard price.
     try std.testing.expectEqual(@as(f64, 0), tier.cache_read);
 }
 
@@ -909,8 +802,6 @@ test "a missing or unreadable cache leaves an empty catalog" {
     try tmp.dir.writeFile(io, .{ .sub_path = ".drinky/models.json", .data = "not json" });
     try tmp.dir.writeFile(io, .{ .sub_path = ".drinky/metadata.json", .data = "[]" });
 
-    // A cache is a convenience, so a broken one starts Drinky with no model
-    // rather than with an error.
     var broken = try init(gpa, io, home);
     defer broken.deinit();
     try std.testing.expect(broken.isEmpty(.anthropic_api_key));
@@ -976,8 +867,6 @@ test "an OpenRouter account reads the public list and never the account cache" {
     const gpa = std.testing.allocator;
     var catalog = testCatalog(gpa);
 
-    // `setAccount` refuses this account, so the stray list goes in by hand. No
-    // read path may return it.
     const stray = [_]Model{vendorModel("ignored", 10, .high)};
     catalog.accounts.set(.openrouter_api_key, try gpa.dupe(Model, &stray));
     defer gpa.free(catalog.accounts.get(.openrouter_api_key));

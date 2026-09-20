@@ -1,13 +1,3 @@
-//! The set of configured accounts and their live credentials: the OAuth login
-//! stores, the environment-sourced API keys, the Google service account key
-//! file, and the local DwarfStar base URL. It owns what a `provider.Client`
-//! points into: the `Auth` structs and (by borrow) the key bytes. A client built
-//! here stays valid for the whole session. It reports which accounts are
-//! authenticated and builds a client for one on demand. The selection is always
-//! an explicit account, never inferred from a precedence. It also owns the
-//! model catalog, because a fetch needs the credential of the account it fetches
-//! for. No fetch runs at startup: the user asks for one.
-
 const std = @import("std");
 
 const anthropic = @import("anthropic/root.zig");
@@ -32,90 +22,49 @@ const Accounts = @This();
 
 gpa: std.mem.Allocator,
 io: std.Io,
-/// One timeout pair per provider. Every auth store and every client of a
-/// provider takes that provider's pair.
 timeouts: net.ProviderTimeouts,
 anthropic_auth: anthropic.Auth,
 anthropic_console_auth: anthropic.ConsoleAuth,
 openai_auth: openai.Auth,
 xai_auth: xai.Auth,
 openrouter_auth: openrouter.Auth,
-/// The key file credential, or null when the environment names no readable key
-/// file beside a location Drinky serves.
 google_auth: ?google.Auth,
-/// Why the account that both variables name did not load, or null. Startup
-/// reports nothing, because the key path is also the variable of every other
-/// Google client. The login picker names the cause when the user picks the
-/// account.
 google_error: ?anyerror,
-/// The validated DwarfStar base URL without a trailing slash. It borrows the
-/// process environment.
 ds4_base_url: ?[]const u8,
-/// Why a set `DS4_BASE_URL` did not load, or null.
 ds4_error: ?anyerror,
 environment: Environment,
-/// Whether each subscription store loaded a credential from `auth.json`.
 anthropic_plan_ready: bool,
 openai_plan_ready: bool,
 xai_plan_ready: bool,
-/// Whether the Console store loaded a minted key from `auth.json`.
 anthropic_api_ready: bool,
-/// Whether the OpenRouter OAuth store loaded a minted key from `auth.json`.
 openrouter_api_ready: bool,
-/// Every model Drinky knows, loaded from its caches. A fetch replaces the list
-/// of one account, and the user asks for that fetch.
 catalog: Catalog,
 
-/// What one fetch achieved. A part that failed leaves the cached part of its
-/// own kind untouched, so a user who fetches again keeps what already arrived.
 pub const Refresh = struct {
-    /// The models the account offers after the fetch.
     count: usize = 0,
-    /// Why the account list did not arrive, or null when it did.
     models_error: ?anyerror = null,
-    /// Why the public metadata did not arrive, or null when it did.
     metadata_error: ?anyerror = null,
-    /// Why the fetched account list did not reach its cache file, or null when
-    /// that write succeeded or never ran. The list serves this session in every
-    /// case.
     models_save_error: ?anyerror = null,
-    /// Why the fetched public metadata did not reach its cache file, or null
-    /// when that write succeeded or never ran. The metadata serves this session
-    /// in every case.
     metadata_save_error: ?anyerror = null,
 };
 
-/// What one reread of the credential store changed. An account without a login
-/// never changes here, because its credential comes from the environment.
 pub const Reread = struct {
     changes: std.EnumArray(llm.Account, auth.Change) = .initFill(.unchanged),
-    /// Why Drinky could not read the file, or null when it could. No store
-    /// settles on a file that Drinky cannot read.
     read_error: ?anyerror = null,
-    /// Why the entry of an account did not decode, or null. Every other store
-    /// settles on its own entry.
     entry_errors: std.EnumArray(llm.Account, ?anyerror) = .initFill(null),
 };
 
-/// The credentials of the accounts without a login, each null when its
-/// environment variable is unset. The values are borrowed for the process
-/// lifetime (they point into the environment), so they are never freed here.
 pub const Environment = struct {
     anthropic: ?[]const u8 = null,
     openai: ?[]const u8 = null,
     xai: ?[]const u8 = null,
     openrouter: ?[]const u8 = null,
     deepseek: ?[]const u8 = null,
-    /// `GOOGLE_APPLICATION_CREDENTIALS`, the path of the service account key file.
     google_key_path: ?[]const u8 = null,
-    /// `GOOGLE_CLOUD_LOCATION`: `eu`, `us`, or `global`.
     google_location: ?[]const u8 = null,
-    /// `DS4_BASE_URL`, which enables the credential-free local account.
     ds4_base_url: ?[]const u8 = null,
 };
 
-/// A committed subscription login's persistence outcome. Both variants mean
-/// the replacement credential is live. The caller owns the final presentation.
 pub const Login = union(enum) {
     saved: []const u8,
     memory_only: struct {
@@ -124,18 +73,11 @@ pub const Login = union(enum) {
     },
 };
 
-/// The OAuth redirect listener of one login: the loopback port it answers on,
-/// and what binds a redirect to it.
 pub const Callback = struct {
     port: u16,
     binding: oauth_callback.Binding,
 };
 
-/// Open the OAuth login stores, load any stored credential, take the
-/// environment API keys, and read the Google key file. A malformed `auth.json`
-/// surfaces here and is not silently ignored. A key file that does not load
-/// leaves the key file account absent and records why, because the other accounts
-/// must still serve.
 pub fn init(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -210,7 +152,6 @@ pub fn init(
     };
 }
 
-/// Validate and normalize one DwarfStar base URL. The result borrows `configured`.
 fn normalizeDs4BaseUrl(configured: []const u8) error{BadBaseUrl}![]const u8 {
     const base_url = std.mem.trimEnd(u8, configured, "/");
     const uri = std.Uri.parse(base_url) catch return error.BadBaseUrl;
@@ -233,9 +174,6 @@ pub fn deinit(self: *Accounts) void {
     if (self.google_auth) |*cloud_auth| cloud_auth.deinit();
 }
 
-/// Whether `account` has a usable credential: an env key for an API account, a
-/// loaded key file for the key file account, or a loaded credential for a login
-/// account.
 pub fn isAuthenticated(self: *const Accounts, account: llm.Account) bool {
     return switch (account) {
         .anthropic_api_key => self.environment.anthropic != null,
@@ -253,8 +191,6 @@ pub fn isAuthenticated(self: *const Accounts, account: llm.Account) bool {
     };
 }
 
-/// Why the environment names `account` and the account still did not load, or
-/// null. A key file or a malformed local base URL can fail at startup.
 pub fn loadError(self: *const Accounts, account: llm.Account) ?anyerror {
     return switch (account) {
         .google_cloud_key => self.google_error,
@@ -263,23 +199,10 @@ pub fn loadError(self: *const Accounts, account: llm.Account) ?anyerror {
     };
 }
 
-/// The credential file that every login store shares.
 pub fn storePath(self: *const Accounts) []const u8 {
     return self.anthropic_auth.path;
 }
 
-/// Reread every login store, so a sign-in, a sign-out, or a replacement in
-/// another Drinky instance shows here. The registry settles itself: a signed-out
-/// account and a replaced principal leave with their model list, exactly as
-/// after a logout or an invalidation here. The caller settles the session on
-/// the report, because a client borrows into the credential of its account and
-/// the evidence of a replaced principal must go.
-///
-/// The stores share one file, so the reread opens it once. A file that Drinky
-/// cannot read settles no store. An entry that does not decode settles no store
-/// of its own account, and every other store still settles. The report names
-/// both failures. A registry whose stores hold no path keeps its credentials in
-/// memory alone, exactly as a catalog with no path keeps its models.
 pub fn reread(self: *Accounts) Reread {
     var report: Reread = .{};
     if (self.storePath().len == 0) return report;
@@ -327,9 +250,6 @@ pub fn reread(self: *Accounts) Reread {
     return report;
 }
 
-/// Settle one store on the open store `file` into `report`, and return whether
-/// its account is ready afterwards. `ready` is the state before the reread,
-/// which a store that did not change keeps.
 fn rereadStore(
     self: *Accounts,
     report: *Reread,
@@ -357,10 +277,6 @@ fn rereadStore(
     }
 }
 
-/// The first authenticated account, or null when none is. The session's active
-/// account is chosen this way at startup (there is no configured active
-/// account). A signed-in login is preferred over an environment API key, across
-/// vendors. Within a tier, enum declaration order decides.
 pub fn firstAuthenticated(self: *const Accounts) ?llm.Account {
     for (std.enums.values(llm.Account)) |account| {
         if (account.hasLogin() and self.isAuthenticated(account)) return account;
@@ -371,8 +287,6 @@ pub fn firstAuthenticated(self: *const Accounts) ?llm.Account {
     return null;
 }
 
-/// A client for `account` that points into this registry's owned credentials,
-/// or null when the account is not authenticated.
 pub fn client(self: *Accounts, account: llm.Account) ?provider.Client {
     const credentials: provider.Credentials = switch (account) {
         .anthropic_api_key => .{
@@ -415,18 +329,14 @@ pub fn client(self: *Accounts, account: llm.Account) ?provider.Client {
     return provider.Client.init(self.gpa, self.io, credentials, self.timeoutsOf(account));
 }
 
-/// The model `name` of `account`, or null when the account does not offer it.
 pub fn findModel(self: *const Accounts, account: llm.Account, name: []const u8) ?Model {
     return self.catalog.find(account, name);
 }
 
-/// Whether `account` offers at least one model, so a pick can run without a
-/// fetch. An account whose list no fetch cached offers none.
 pub fn offersModel(self: *const Accounts, account: llm.Account) bool {
     return !self.catalog.isEmpty(account);
 }
 
-/// Append every model `account` offers, in the order its provider listed it.
 pub fn listModels(
     self: *const Accounts,
     account: llm.Account,
@@ -436,23 +346,11 @@ pub fn listModels(
     try self.catalog.list(account, out, gpa);
 }
 
-/// Fetch the model list of `account` and store it. A remote account also
-/// fetches public metadata. Those two requests are independent. DwarfStar
-/// skips the metadata request. Only the user starts this.
-///
-/// One window bounds the whole fetch: the token refresh, every page of the
-/// list, and the metadata request behind it. A list runs up to eight pages, so a
-/// bound per request would let a hung provider hold the fetch open for minutes.
-/// The window takes the connect bound of the provider, because no stream runs
-/// here and no idle bound applies.
 pub fn refresh(self: *Accounts, account: llm.Account) Refresh {
     const deadline = net.Deadline.start(self.io, self.timeoutsOf(account).connect_ms);
     return self.refreshWithin(account, deadline, fetchModels, Metadata.fetch);
 }
 
-/// `refresh` inside a window that the caller opened, over the list request
-/// `listFn` and the metadata request `metadataFn`. A test hands in doubles, so
-/// it reaches every exit without a socket.
 fn refreshWithin(
     self: *Accounts,
     account: llm.Account,
@@ -477,10 +375,6 @@ fn refreshWithin(
         } else |err| {
             result.models_error = err;
         }
-        // A cancel is one-shot: the blocking call that took it acknowledged it, and
-        // every later blocking call runs to its end. The metadata request would then
-        // hold the join for the rest of the window, so the fetch ends here. The
-        // caller discards the result of a canceled fetch.
         if (isCanceled(result.models_error) or isCanceled(result.models_save_error)) return result;
 
         if (account != .ds4) {
@@ -502,7 +396,6 @@ fn refreshWithin(
     return result;
 }
 
-/// Store one fetched list with the source facts that its account needs.
 fn storeModels(self: *Accounts, account: llm.Account, discovered: []const Model) !void {
     if (account != .ds4) return self.catalog.setAccount(account, discovered);
     try self.catalog.setAccountAt(.ds4, .{
@@ -511,24 +404,16 @@ fn storeModels(self: *Accounts, account: llm.Account, discovered: []const Model)
     });
 }
 
-/// Fold the outcome of one cache write into `slot`. The catalog holds what
-/// arrived before it writes the file, so a failed write is a failed save and
-/// never a failed fetch. Each write owns its own slot, so a report names the
-/// cache that failed.
 fn recordSave(slot: *?anyerror, outcome: anyerror!void) void {
     outcome catch |err| {
         slot.* = err;
     };
 }
 
-/// Whether a cancel ended the part of a fetch that `slot` reports.
 fn isCanceled(slot: ?anyerror) bool {
     return (slot orelse return false) == error.Canceled;
 }
 
-/// The vendor list of `account`, fetched with that account's own credential
-/// inside `deadline`. The subscription token can need a refresh first, and that
-/// request draws on the same window.
 fn fetchModels(self: *Accounts, account: llm.Account, deadline: net.Deadline) ![]Model {
     return switch (account) {
         .anthropic_plan => anthropic.models.fetch(
@@ -602,7 +487,6 @@ fn fetchModels(self: *Accounts, account: llm.Account, deadline: net.Deadline) ![
     };
 }
 
-/// The timeout pair of the provider behind `account`.
 fn timeoutsOf(self: *const Accounts, account: llm.Account) net.Timeouts {
     return switch (account.provider()) {
         .anthropic => self.timeouts.anthropic,
@@ -615,10 +499,6 @@ fn timeoutsOf(self: *const Accounts, account: llm.Account) net.Timeouts {
     };
 }
 
-/// The OAuth redirect listener for `account`, or null for an account without a
-/// callback login. A pasted callback URL replays to this port, and the paste
-/// filter demands this binding. The xAI subscription signs in with a device
-/// code, so its login listens on no port.
 pub fn callback(account: llm.Account) ?Callback {
     return switch (account) {
         .anthropic_plan => callbackOf(anthropic.oauth),
@@ -637,15 +517,10 @@ pub fn callback(account: llm.Account) ?Callback {
     };
 }
 
-/// The listener of one OAuth protocol module, which states both parts of it.
 fn callbackOf(comptime oauth: type) Callback {
     return .{ .port = oauth.callback_port, .binding = oauth_callback.bindingOf(oauth) };
 }
 
-/// Run the interactive OAuth login for `account`, mark its committed
-/// replacement authenticated, and return its persistence outcome. An account
-/// without a login (its credential comes from the environment) is an error. No
-/// error is returned after the credential has been replaced.
 pub fn login(self: *Accounts, account: llm.Account, prompt: anytype) !Login {
     const provider_login: auth.Login = switch (account) {
         .anthropic_plan => committed: {
@@ -691,9 +566,6 @@ pub fn login(self: *Accounts, account: llm.Account, prompt: anytype) !Login {
     };
 }
 
-/// Drop a login `account`'s stored credentials and mark it no longer
-/// authenticated. An account without a login has nothing to drop (its
-/// credential comes from the environment), so it is an error.
 pub fn logout(self: *Accounts, account: llm.Account) !void {
     switch (account) {
         .anthropic_plan => {
@@ -732,12 +604,6 @@ pub fn logout(self: *Accounts, account: llm.Account) !void {
     }
 }
 
-/// Forget a rejected subscription credential. Return true when another
-/// instance replaced the stored token and this account reloaded it. The model
-/// list leaves this session in every case, because it belongs to the principal
-/// behind the replaced credential. The account offers no model until the next
-/// fetch. A cache file that Drinky cannot rewrite keeps that list, so the next
-/// start loads it again.
 pub fn invalidate(self: *Accounts, account: llm.Account) !bool {
     switch (account) {
         .anthropic_plan => {
@@ -782,15 +648,10 @@ pub fn invalidate(self: *Accounts, account: llm.Account) !bool {
     }
 }
 
-/// Drop the data that belongs to the principal behind a replaced credential.
-/// The model list of an account is such data, so the account offers no model
-/// for the rest of this session, until the user fetches again.
 pub fn dropPrincipalMetadata(self: *Accounts, account: llm.Account) void {
     self.catalog.dropAccount(account);
 }
 
-/// The shared memory registry with the two readiness flags that the tests here
-/// vary. A test that needs a real store replaces the one store it reads.
 fn testAccounts(environment: Environment, anthropic_ready: bool, openai_ready: bool) Accounts {
     var accounts = testing.accounts(environment);
     accounts.anthropic_plan_ready = anthropic_ready;
@@ -798,7 +659,6 @@ fn testAccounts(environment: Environment, anthropic_ready: bool, openai_ready: b
     return accounts;
 }
 
-/// Give `account` one model, as a fetch does.
 fn seedModel(accounts: *Accounts, account: llm.Account, name: []const u8) !void {
     try testing.seedAccount(accounts, account, &.{name});
 }
@@ -809,14 +669,11 @@ test "isAuthenticated and firstAuthenticated read keys and readiness, subscripti
     try std.testing.expect(accounts.isAuthenticated(.anthropic_api_key));
     try std.testing.expect(accounts.isAuthenticated(.openai_api_key));
     try std.testing.expect(!accounts.isAuthenticated(.openai_plan));
-    // Both anthropic credentials are present. The subscription precedes its API
-    // key in enum order, so it is the active account.
     try std.testing.expectEqual(
         llm.Account.anthropic_plan,
         accounts.firstAuthenticated().?,
     );
 
-    // With only API keys, the first authenticated in enum order (anthropic) wins.
     var api_only = testAccounts(.{ .anthropic = "sk-ant", .openai = "sk-openai" }, false, false);
     try std.testing.expectEqual(llm.Account.anthropic_api_key, api_only.firstAuthenticated().?);
 
@@ -842,9 +699,6 @@ test "an account has a callback listener exactly when it has a callback login" {
         const callback_login = account.hasLogin() and account != .xai_plan;
         try std.testing.expectEqual(callback_login, callback(account) != null);
     }
-    // The pinned ports keep the four listeners apart and match each provider
-    // OAuth registration. A grant of the OpenRouter login carries no state, so
-    // its random callback path binds the redirect instead.
     try std.testing.expectEqual(@as(u16, 53692), callback(.anthropic_plan).?.port);
     try std.testing.expectEqual(@as(u16, 53693), callback(.anthropic_api).?.port);
     try std.testing.expectEqual(@as(u16, 1455), callback(.openai_plan).?.port);
@@ -955,13 +809,11 @@ test "the key file account loads from the key file and records a failed load" {
     var key_buffer: [160]u8 = undefined;
     const key_path = try std.fmt.bufPrint(&key_buffer, "{s}/key.json", .{home});
 
-    // One variable alone leaves the account absent with no failure to report.
     var half = try Accounts.init(gpa, io, home, .{}, .{ .google_location = "global" });
     defer half.deinit();
     try std.testing.expect(!half.isAuthenticated(.google_cloud_key));
     try std.testing.expect(half.google_error == null);
 
-    // Both variables and no file: the account is absent and the error names why.
     var missing = try Accounts.init(gpa, io, home, .{}, .{
         .google_key_path = key_path,
         .google_location = "global",
@@ -998,7 +850,6 @@ test "the key file account loads from the key file and records a failed load" {
     );
     try std.testing.expectEqualStrings("my-project", ready.google_auth.?.project);
 
-    // A region is a failed load too, and every other account still serves.
     var bad_location = try Accounts.init(gpa, io, home, .{}, .{
         .anthropic = "sk-ant",
         .google_key_path = key_path,
@@ -1105,7 +956,6 @@ test "invalidation forgets a rejected credential when store removal fails" {
     defer accounts.deinit();
     try std.testing.expect(accounts.isAuthenticated(.anthropic_plan));
 
-    // A corrupt file blocks removal. The rejected token must still leave memory.
     try tmp.dir.writeFile(io, .{ .sub_path = ".drinky/auth.json", .data = "not json" });
     try std.testing.expectError(
         error.BadCredentials,
@@ -1145,7 +995,6 @@ test "OpenAI invalidation drops the model list when store removal fails" {
     try seedModel(&accounts, .openai_plan, "gpt-5.6-sol");
     try std.testing.expect(!accounts.catalog.isEmpty(.openai_plan));
 
-    // A failed removal must drop both the credential and the list behind it.
     try tmp.dir.writeFile(io, .{ .sub_path = ".drinky/auth.json", .data = "not json" });
     try std.testing.expectError(
         error.BadCredentials,
@@ -1185,8 +1034,6 @@ test "OpenAI invalidation reloads a replacement without its model list" {
     try std.testing.expect(try accounts.openai_auth.load());
     try seedModel(&accounts, .openai_plan, "gpt-5.6-sol");
 
-    // Another instance saved a replacement. The reloaded credential can belong
-    // to another principal, so its discovered limits go with the old one.
     try tmp.dir.writeFile(io, .{
         .sub_path = ".drinky/auth.json",
         .data =
@@ -1204,9 +1051,6 @@ test "OpenAI invalidation reloads a replacement without its model list" {
     try std.testing.expect(accounts.catalog.isEmpty(.openai_plan));
 }
 
-// The xAI subscription runs the same lifecycle as the OpenAI one: a rejected
-// credential leaves with its model list, and a replacement that another instance
-// saved comes back without that list.
 test "xAI invalidation forgets a rejected credential and reloads a replacement" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -1237,7 +1081,6 @@ test "xAI invalidation forgets a rejected credential and reloads a replacement" 
     accounts.xai_plan_ready = true;
     try seedModel(&accounts, .xai_plan, "grok-4.6");
 
-    // Another instance saved a replacement of the same user.
     try tmp.dir.writeFile(io, .{
         .sub_path = ".drinky/auth.json",
         .data =
@@ -1251,8 +1094,6 @@ test "xAI invalidation forgets a rejected credential and reloads a replacement" 
     try std.testing.expectEqualStrings("new_refresh", accounts.xai_auth.tokens.?.refresh);
     try std.testing.expect(accounts.catalog.isEmpty(.xai_plan));
 
-    // Without a replacement, the rejected credential leaves the store and the
-    // account signs out.
     try seedModel(&accounts, .xai_plan, "grok-4.6");
     try std.testing.expect(!try accounts.invalidate(.xai_plan));
     try std.testing.expect(!accounts.isAuthenticated(.xai_plan));
@@ -1263,8 +1104,6 @@ test "xAI invalidation forgets a rejected credential and reloads a replacement" 
     try std.testing.expect(file.entry("xai-plan") == null);
 }
 
-// The registry settles itself on the store, as after a logout or an
-// invalidation here, and it reports each change so the session can follow.
 test "a reread settles every login store and reports each change" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -1290,15 +1129,12 @@ test "a reread settles every login store and reports each change" {
     try seedModel(&accounts, .anthropic_api, "claude-opus-5");
     try seedModel(&accounts, .openai_plan, "gpt-5.6-sol");
 
-    // The same file again: nothing changed, and every list stays.
     const same = accounts.reread();
     try std.testing.expect(same.read_error == null);
     for (std.enums.values(llm.Account)) |account|
         try std.testing.expectEqual(auth.Change.unchanged, same.changes.get(account));
     try std.testing.expect(!accounts.catalog.isEmpty(.anthropic_plan));
 
-    // Another instance refreshed the subscription, signed the Console key out,
-    // and signed in to OpenAI.
     try tmp.dir.writeFile(io, .{
         .sub_path = ".drinky/auth.json",
         .data =
@@ -1320,12 +1156,10 @@ test "a reread settles every login store and reports each change" {
     try std.testing.expectEqualStrings("r2", accounts.anthropic_auth.tokens.?.refresh);
     try std.testing.expect(!accounts.isAuthenticated(.anthropic_api));
     try std.testing.expect(accounts.isAuthenticated(.openai_plan));
-    // A rotation keeps the principal and its list. A sign-out takes the list.
     try std.testing.expect(!accounts.catalog.isEmpty(.anthropic_plan));
     try std.testing.expect(accounts.catalog.isEmpty(.anthropic_api));
     try std.testing.expect(!accounts.catalog.isEmpty(.openai_plan));
 
-    // Another principal took the subscription slot, so its list goes.
     try tmp.dir.writeFile(io, .{
         .sub_path = ".drinky/auth.json",
         .data =
@@ -1340,7 +1174,6 @@ test "a reread settles every login store and reports each change" {
     try std.testing.expect(accounts.isAuthenticated(.anthropic_plan));
     try std.testing.expect(accounts.catalog.isEmpty(.anthropic_plan));
 
-    // A file that Drinky cannot read changes nothing and names the failure.
     try tmp.dir.writeFile(io, .{ .sub_path = ".drinky/auth.json", .data = "not json" });
     const failed = accounts.reread();
     try std.testing.expectEqual(@as(?anyerror, error.BadCredentials), failed.read_error);
@@ -1351,8 +1184,6 @@ test "a reread settles every login store and reports each change" {
     try std.testing.expect(accounts.isAuthenticated(.anthropic_plan));
     try std.testing.expectEqualStrings("rb", accounts.anthropic_auth.tokens.?.refresh);
 
-    // An entry that does not decode keeps its own account and names the
-    // failure there, and every other store still settles.
     try tmp.dir.writeFile(io, .{
         .sub_path = ".drinky/auth.json",
         .data =
@@ -1399,30 +1230,21 @@ test "a principal replacement drops the list of that account alone" {
     try std.testing.expect(accounts.catalog.isEmpty(.openai_plan));
 }
 
-// A fetch that arrived serves this session, whatever the cache file did, so a
-// failed write is a failed save and never a failed fetch. A picker that reads
-// `models_error` must therefore stay open over the list that arrived.
 test "a failed cache write reports a failed save, not a failed fetch" {
     var result: Refresh = .{};
     recordSave(&result.models_save_error, {});
     try std.testing.expect(result.models_save_error == null);
 
-    // Another Drinky instance holds the lock of the cache file.
     recordSave(&result.models_save_error, error.StoreBusy);
     try std.testing.expectEqual(@as(?anyerror, error.StoreBusy), result.models_save_error);
     try std.testing.expect(result.models_error == null);
     try std.testing.expect(result.metadata_error == null);
 
-    // Each write owns its own slot, so a report names the cache that failed and
-    // no failure hides behind another.
     recordSave(&result.metadata_save_error, error.AccessDenied);
     try std.testing.expectEqual(@as(?anyerror, error.StoreBusy), result.models_save_error);
     try std.testing.expectEqual(@as(?anyerror, error.AccessDenied), result.metadata_save_error);
 }
 
-// One window covers the list and the metadata, so a window that has closed
-// refuses both requests before either opens a socket. Each part records the
-// timeout as its own failure, so the report names what the user lost.
 test "an expired window ends both parts of a fetch without a request" {
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
@@ -1452,11 +1274,6 @@ fn refuseMetadata(_: std.mem.Allocator, _: std.Io, _: net.Deadline) anyerror!Met
     return error.MetadataRequestFailed;
 }
 
-// A cancel is one-shot: the blocking call that takes it acknowledges it, and
-// every later blocking call runs to its end. A metadata request after a canceled
-// list would therefore hold the join for the rest of the window, and the
-// interface with it. The fetch must end on the cancel. An ordinary failure of
-// the list keeps the metadata request, because the two are independent.
 test "a canceled list ends the fetch before the metadata request" {
     var accounts = testAccounts(.{ .anthropic = "sk-ant" }, false, false);
     const unbounded: net.Deadline = .{ .at = null };
@@ -1468,7 +1285,6 @@ test "a canceled list ends the fetch before the metadata request" {
         refuseMetadata,
     );
     try std.testing.expectEqual(@as(?anyerror, error.Canceled), canceled.models_error);
-    // The metadata double fails, so a null here proves that it never ran.
     try std.testing.expect(canceled.metadata_error == null);
 
     const refused = accounts.refreshWithin(
@@ -1563,7 +1379,6 @@ test "an account lists the models of its own catalog entry" {
     try std.testing.expectEqualStrings("gpt-5.6-sol", listed.items[0].name());
     try std.testing.expect(accounts.findModel(.openai_plan, "gpt-5.6-sol") != null);
 
-    // The list of one account never reaches another.
     try std.testing.expect(accounts.findModel(.openai_api_key, "gpt-5.6-sol") == null);
     try std.testing.expect(accounts.catalog.isEmpty(.openai_api_key));
     try std.testing.expect(!accounts.offersModel(.openai_api_key));

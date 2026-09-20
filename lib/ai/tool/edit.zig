@@ -1,5 +1,3 @@
-//! Replaces one exact, unique span of text in an existing file.
-
 const std = @import("std");
 
 const format = @import("../format.zig");
@@ -51,7 +49,6 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
     const old = parsed.value.old_text;
     const new = parsed.value.new_text;
 
-    // A rule that guards this file refuses the call before it changes anything.
     if (context.skill_guard) |guard| {
         if (try guard.refusal(&.{
             .gpa = gpa,
@@ -106,12 +103,6 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
         return Result.cannot(gpa, err, "write", path);
     var result = try Result.report(gpa, .ok, "Drinky edited {s}.", .{path});
     errdefer result.deinit(gpa);
-    // The line counts the lines `old_text` took out against the lines
-    // `new_text` put in, and it borrows the `-` and `+` of a diff to show them.
-    // The two numbers measure the span the call replaced, not the lines that
-    // differ inside it, so an edit that rewrites part of a line reports that
-    // whole line on both sides. The size of the file the edit left says nothing
-    // about what the call did.
     result.summary = .{ .text = try std.fmt.allocPrint(gpa, "Lines: -{d} +{d}", .{
         format.lines(old),
         format.lines(new),
@@ -119,10 +110,6 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
     return result;
 }
 
-/// Replace the single occurrence of `edit.old` in `edit.data` with `edit.new`.
-/// Errors when the match is absent or ambiguous so the caller never edits the
-/// wrong span. A second match that starts anywhere past the first — even an
-/// overlapping one like "aa" in "aaa" — counts as ambiguous.
 fn applyEdit(
     gpa: std.mem.Allocator,
     edit: struct { data: []const u8, old: []const u8, new: []const u8 },
@@ -182,9 +169,6 @@ test "edit rewrites the file on disk" {
     try std.testing.expectEqualStrings("one 2 three", data);
 }
 
-// The box line counts the span the call replaced, in the `-` and `+` of a diff.
-// A replacement inside one line takes that whole line out and puts one line in.
-// A deletion puts none in.
 test "the box reports the lines the edit took out and put in" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -262,8 +246,6 @@ test "edit rejects an oversized file" {
     try std.testing.expect(std.mem.indexOf(u8, result.content, "larger than") != null);
 }
 
-// The guard runs before the file is read, so its sentence names the skill the
-// call needs rather than a file that the call never reached.
 test "a required skill refuses the edit before it reads the file" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;

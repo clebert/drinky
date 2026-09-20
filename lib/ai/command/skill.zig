@@ -1,13 +1,3 @@
-//! `/skill` and `/skill:`: a picker over every discovered skill. A selection
-//! writes the `/skill:name ` line into the editor, so the user can add the task
-//! that the skill works on. On a remote host, which has no editor, a selection
-//! loads the skill at once with no task. The command takes no argument, and
-//! `load` expands one named skill for the `/skill:name` line of the registry.
-//!
-//! The list holds every skill of the registry, not the catalog the model reads.
-//! A skill that disables model invocation still loads by hand, so the user must
-//! see it too.
-
 const std = @import("std");
 
 const skills = @import("../skills.zig");
@@ -26,7 +16,6 @@ pub fn run(context: *Context) !Context.Outcome {
         return Context.Outcome.reportNotice(gpa, .warning, "Drinky found no skills.", .{});
     var options: Context.Outcome.Options = .{ .gpa = gpa };
     errdefer options.deinit();
-    // The row shows the line it writes, so the user learns the typed form.
     for (items) |target| try options.addExtraPrint(
         false,
         "/{s}:{s}",
@@ -43,10 +32,6 @@ pub fn run(context: *Context) !Context.Outcome {
     } };
 }
 
-/// Write the picked skill line into the editor. The trailing blank marks the
-/// place where the task goes. The line runs on the next Enter, so a restriction
-/// that blocks a skill turn still reports itself there. A remote host has no
-/// editor, so the pick loads the skill at once with no task.
 pub fn select(context: *Context, selection: Context.Outcome.Pick.Selection) !Context.Outcome {
     const gpa = context.gpa;
     const index = selection.row;
@@ -62,14 +47,10 @@ pub fn select(context: *Context, selection: Context.Outcome.Pick.Selection) !Con
     ) };
 }
 
-/// Expand `target` with its optional task into a user turn. The caller resolved
-/// the skill, so this function holds no name invariant.
 pub fn load(context: *Context, target: *const skills.Skill, arguments: []const u8) !Context.Outcome {
     const gpa = context.gpa;
     const content = target.invoke(gpa, context.io, arguments) catch |err| {
         if (err == error.Canceled or err == error.OutOfMemory) return err;
-        // A failure, not a warning: the name is right and the load broke, so the
-        // way forward is another try, not a send to the model.
         return .{ .refusal = try Context.Outcome.Message.print(
             gpa,
             .failure,
@@ -91,9 +72,6 @@ pub fn load(context: *Context, target: *const skills.Skill, arguments: []const u
     } };
 }
 
-/// Every discovered skill, ordered by the name that the rows show. `run` and
-/// `select` index the same order, so both build it here. The caller owns the
-/// slice, and the registry owns the skills it points to.
 fn sorted(
     gpa: std.mem.Allocator,
     maybe_registry: ?*const skills.Registry,
@@ -110,14 +88,6 @@ fn nameLessThan(_: void, a: *const skills.Skill, b: *const skills.Skill) bool {
     return std.mem.lessThan(u8, a.name, b.name);
 }
 
-/// The first sentence of `description`, or the whole text when it holds none. A
-/// description can run several sentences, and one row states the summary alone.
-/// The picker cuts what is still too wide for the window.
-///
-/// A sentence ends at a dot, a blank, and a word that does not start with a
-/// lowercase letter. The lowercase test keeps a dotted abbreviation such as
-/// `e.g.` inside its sentence. A second sentence that starts lowercase reads on,
-/// and the width of the window then cuts the row.
 fn firstSentence(description: []const u8) []const u8 {
     var index: usize = 0;
     while (std.mem.indexOfScalarPos(u8, description, index, '.')) |stop| {
@@ -153,8 +123,6 @@ test "the list shows one row per skill, ordered by name" {
             }
             try std.testing.expectEqualStrings("Skill", pick.title);
             try std.testing.expectEqual(@as(usize, 2), pick.options.len);
-            // The row holds the line it writes, and the summary stops at the
-            // first sentence of the description.
             try std.testing.expectEqualStrings("/skill:alpha", pick.options[0].name);
             try std.testing.expectEqualStrings("The first skill.", pick.options[0].extra.?);
             try std.testing.expectEqualStrings("/skill:omega", pick.options[1].name);
@@ -190,8 +158,6 @@ test "a selection writes the skill line with a trailing blank" {
     );
 }
 
-// A remote host has no editor to complete a line in, so its pick loads the
-// skill with no task at once.
 test "a selection on a remote host loads the skill with no task" {
     const gpa = std.testing.allocator;
     var discovered: Discovered = try .init(gpa);
@@ -236,22 +202,16 @@ test "a summary holds the first sentence of the description" {
     try std.testing.expectEqualStrings("One sentence.", firstSentence("One sentence."));
     try std.testing.expectEqualStrings("First.", firstSentence("First. Second."));
     try std.testing.expectEqualStrings("no end at all", firstSentence("no end at all"));
-    // A dotted abbreviation stays inside its sentence, because the word after it
-    // starts lowercase.
     try std.testing.expectEqualStrings(
         "Use e.g. this form.",
         firstSentence("Use e.g. this form. And not that one."),
     );
-    // A second sentence that starts lowercase reads on. The picker cuts the row.
     try std.testing.expectEqualStrings(
         "First. second one.",
         firstSentence("First. second one."),
     );
 }
 
-/// Test scaffolding: two discovered skills whose directory order is the reverse
-/// of their name order, so the sort of the rows is visible. The temporary
-/// directory holds the files that the registry points to.
 const Discovered = struct {
     tmp: std.testing.TmpDir,
     registry: skills.Registry,

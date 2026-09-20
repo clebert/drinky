@@ -30,8 +30,6 @@ the features your workflow needs.
    can maintain your config for you.
 6. **No compiled-in models:** Every model, limit, and price comes from the provider at runtime.
 
-See [`FEATURES.md`](FEATURES.md) for the complete capability overview.
-
 ## Build and run
 
 Drinky requires Zig 0.16.0, a POSIX system, and the `HOME` variable. A terminal with the Kitty

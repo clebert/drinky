@@ -1,36 +1,3 @@
-//! One attached bot: the bound chat, the poller task that reads it, the sender
-//! task that writes to it, and the answerer task that answers its taps. The
-//! attachment reports to its owner through a `Sink`, so it knows nothing of the
-//! session or the interface.
-//!
-//! The poller registers the commands, runs the long poll, and hands every
-//! message and every tap of the bound chat to the sink. The sender drains the
-//! outbound queue at the pace of the chat, so the owner never waits for
-//! Telegram. The answerer drains the answers to the taps with no pace, because
-//! a tap expires after a few seconds and an answer is no message of the chat.
-//! Each task holds a client of its own, because a client keeps the description
-//! of its last failure.
-//!
-//! A send returns at once, and the id of the new message arrives later on the
-//! sender. A tracked send returns a handle, and an edit names that handle. The
-//! queue holds the edit behind the send, and the newest text of a pending edit
-//! replaces an older one, so a burst of state changes costs one edit. An edit
-//! carries the parse mode of its text and the keyboard of the message too,
-//! because an edit without a keyboard drops it. A reaction names the id of a
-//! message of the chat.
-//!
-//! A formatted message or edit that Telegram cannot parse goes again as plain
-//! text: the same words without their tags, to the same target, with the same
-//! reply and keyboard. The ordered queue then never stalls on one block.
-//!
-//! A close ends the sender and the answerer at once and drops what their queues
-//! still hold, because the chat is the record of the session up to the close and
-//! the terminal shows the rest. A drain task then sends the final message of the
-//! close inside one bounded window, stops the poller, and reports `drained` to
-//! the sink, so the owner learns the end without a wait. `destroy` awaits that
-//! task, so the last message of the chat goes out before the memory does.
-//! `abort` ends the drain at once instead, and the chat gets no last message.
-
 const std = @import("std");
 
 const ai = @import("ai");
@@ -40,63 +7,34 @@ const html = @import("html.zig");
 
 const Attachment = @This();
 
-/// The messages the queue holds before a send refuses. The sender runs at one
-/// message per second, so this is minutes of backlog, and the owner never waits
-/// on it.
 pub const outbound_capacity = 256;
 
-/// The time the close has for its final message. The owner locks the terminal
-/// input for the whole drain, so a dead network cannot hold the user past it,
-/// and a healthy one needs one call.
 const drain_ms_default = 2_000;
 
-/// The least time between two sends to one chat, because Telegram allows about
-/// one message per second there.
 const send_spacing_ms_default = 1_000;
 
-/// The backoff of a failed poll or send: the initial wait doubled per failure
-/// and capped. Every attempt is allowed, because the attachment stays until a
-/// permanent failure or a detach ends it.
 const backoff_default: ai.net.Retry = .{
     .attempts_max = std.math.maxInt(u32),
     .backoff_ms_initial = 500,
     .backoff_ms_max = 16_000,
 };
 
-/// How long an outage must last before the attachment reports it. A short
-/// outage repairs itself between two long polls, and the user can do nothing
-/// about it, so it stays silent.
 const outage_ms_min_default = 30_000;
 
-/// The tracked messages the attachment remembers at once. A slot stays taken
-/// while its send waits in the queue or in flight, or while an edit or a deletion
-/// of its message waits in the queue. One slot per queue item and one for the
-/// send in flight cover every taken slot, and one more keeps a free slot for the
-/// next reservation, so a reservation never fails and never takes a slot with
-/// work.
 const tracked_capacity = outbound_capacity + 2;
 
-/// The answers to taps the queue holds before one refuses. A tap is a human
-/// action, and each answer leaves within a network round trip, so a small queue
-/// never fills in use.
 const answers_capacity = 32;
 
-/// The description Telegram sends for a text whose formatting it cannot parse.
 const parse_failure_description = "can't parse entities";
 
 gpa: std.mem.Allocator,
 io: std.Io,
-/// The bot token. Owned, and never part of any text this attachment produces.
 token: []const u8,
-/// The bot username without the `@`. Owned.
 username: []const u8,
 chat_id: i64,
-/// The generation that every event of this attachment carries, so the owner
-/// drops an event of an attachment that ended.
 generation: u64,
 sink: Sink,
 pace: Pace,
-/// The commands the poller registers at the attach. Borrowed.
 commands: []const Client.Command,
 poll_client: Client,
 send_client: Client,
@@ -105,90 +43,53 @@ outbound_buffer: [outbound_capacity]Outbound,
 outbound: std.Io.Queue(Outbound),
 answers_buffer: [answers_capacity]Answer,
 answers: std.Io.Queue(Answer),
-/// The messages that an edit can name. The owner and the sender both touch them,
-/// so the mutex guards every access.
 tracked: [tracked_capacity]Tracked,
 tracked_mutex: std.Io.Mutex,
-/// The slot after the last reserved one. A reservation scans from here, so the
-/// slots take turns and a freed slot rests before the next message takes it.
 tracked_next: usize,
-/// The handle of the next tracked send. It starts at one, so no handle is zero.
 handle_next: Handle,
 poll_future: ?std.Io.Future(void),
 send_future: ?std.Io.Future(void),
 answer_future: ?std.Io.Future(void),
-/// The drain task of the close, or null before it. It owns the end of the sender.
 drain_future: ?std.Io.Future(void),
-/// The message that the close named as the last one of the chat, or null. The
-/// close writes it before it starts the drain task, which alone reads it.
 final: ?Outbound.Send,
-/// The instant the close must end, in milliseconds on the awake clock, or zero
-/// while the attachment is open.
 drain_deadline_ms: std.atomic.Value(i64),
 
-/// What the attachment needs to start. It borrows every string and copies what
-/// it keeps.
 pub const Options = struct {
-    /// The API origin. A test points it at a loopback server.
     base_url: []const u8 = Client.api_url,
     token: []const u8,
     username: []const u8,
     chat_id: i64,
-    /// The head window of one call, and the source of the poll timeout.
     connect_ms: u64,
     generation: u64,
     sink: Sink,
     pace: Pace = .{},
-    /// The commands the chat completes after a slash. Borrowed for the life of
-    /// the attachment.
     commands: []const Client.Command = &.{},
 };
 
-/// The waits of the sender and the poller. The defaults fit Telegram, and a test
-/// shortens them.
 pub const Pace = struct {
-    /// The window of the final message after a close.
     drain_ms: u64 = drain_ms_default,
-    /// The least time between two sends.
     send_spacing_ms: u64 = send_spacing_ms_default,
-    /// The backoff of a failed poll or send.
     backoff: ai.net.Retry = backoff_default,
-    /// How long an outage must last before it reports. A network that flaps
-    /// heals inside this time, and its outage stays silent, so a night of short
-    /// outages costs no line.
     outage_ms_min: u64 = outage_ms_min_default,
 };
 
-/// Where the tasks report. The owner wraps each event into its own queue.
 pub const Sink = struct {
     context: *anyopaque,
-    /// Take one event. `error.Closed` tells the task that no one listens, so it
-    /// ends.
     emit: *const fn (context: *anyopaque, event: Event) error{Closed}!void,
 };
 
-/// One report of the poller or the sender. The event owns its payload.
 pub const Event = struct {
     generation: u64,
     payload: Payload,
 
     pub const Payload = union(enum) {
-        /// A text message from the bound chat.
         message: Message,
-        /// A message from the bound chat that holds no text: the id to answer.
         unreadable: i64,
-        /// A tap on a keyboard in the bound chat. The owner answers it with
-        /// `answer`.
         callback: Callback,
-        /// The first failure of a run of failures on one side.
         failed: Failure,
-        /// The first success after a run of failures on one side.
         recovered: Side,
-        /// Telegram refused one item for good, and the sender dropped it.
         send_rejected: Rejected,
-        /// A permanent condition that ends the attachment.
         detach: Reason,
-        /// The sender ended after a close, so a `destroy` waits for nothing.
         drained,
     };
 
@@ -198,40 +99,29 @@ pub const Event = struct {
     };
 
     pub const Callback = struct {
-        /// The id of the query, which the answer names.
         query_id: []u8,
-        /// The message that holds the keyboard.
         message_id: i64,
-        /// The callback data of the button.
         data: []u8,
     };
 
     pub const Failure = struct {
         side: Side,
-        /// The name of the error.
         name: []const u8,
     };
 
     pub const Rejected = struct {
         kind: Kind,
-        /// The description of Telegram, or empty.
         description: []u8,
 
-        /// What the sender tried: a new message, an edit, a deletion, or a
-        /// reaction.
         pub const Kind = enum { message, edit, deletion, reaction };
     };
 
     pub const Side = enum { poll, send };
 
     pub const Reason = enum {
-        /// 401: Telegram no longer knows the token.
         unauthorized,
-        /// 403: the user blocked the bot.
         forbidden,
-        /// 409: another instance polls the same bot.
         conflict,
-        /// Any other 4xx on the poll: a repeat of the same request cannot succeed.
         poll_rejected,
     };
 
@@ -248,20 +138,13 @@ pub const Event = struct {
     }
 };
 
-/// The name of a tracked message on the side of the owner. The sender learns the
-/// id of the message later, and an edit reaches it through the handle.
 pub const Handle = u64;
 
-/// One reaction of the bot on a message of the chat.
 pub const Reaction = struct {
     message_id: i64,
     mark: Mark,
 
-    /// The state of a Telegram message in the transcript, as the emoji that
-    /// shows it. Telegram allows a fixed emoji list for a bot, and that list
-    /// holds neither ✅ nor ❌ nor ⏳.
     pub const Mark = enum {
-        /// Drinky took the message and it waits for the turn.
         queued,
         committed,
         dropped,
@@ -276,38 +159,24 @@ pub const Reaction = struct {
     };
 };
 
-/// The errors of a put into the outbound queue.
 pub const SendError = error{ Closed, Canceled, QueueFull, OutOfMemory };
 
-/// One item on its way to the chat.
 const Outbound = union(enum) {
-    /// A new message. The queue owns the text and the keyboard.
     send: Send,
-    /// A pending edit of the tracked message with this handle. The text waits
-    /// in the slot of the handle, so a later edit replaces it there and the
-    /// sender takes the newest one.
     edit: Handle,
-    /// The tracked message with this handle leaves the chat. It stands behind
-    /// every edit of the same message, so the chat shows each state first.
     delete: Handle,
     react: Reaction,
 
     const Send = struct {
         text: []u8,
-        /// The options without the keyboard, which `markup` owns.
         options: Client.SendOptions,
-        /// The keyboard of the message as JSON, or null.
         markup: ?[]u8,
-        /// The slot that takes the id of the new message, or null for a message
-        /// that no edit names later.
         handle: ?Handle,
     };
 };
 
-/// One answer to a tap. The queue owns the strings.
 const Answer = struct {
     query_id: []u8,
-    /// The toast, or null for an answer that ends the wait of the button alone.
     text: ?[]u8,
 
     fn deinit(self: *const Answer, gpa: std.mem.Allocator) void {
@@ -316,9 +185,6 @@ const Answer = struct {
     }
 };
 
-/// The new state of an edited message: its text, the parse mode of the text,
-/// and its keyboard. The text and the keyboard are owned, and the parse mode
-/// stays valid for the life of the attachment.
 const Pending = struct {
     text: []u8,
     parse_mode: ?[]const u8,
@@ -330,20 +196,11 @@ const Pending = struct {
     }
 };
 
-/// One message that an edit or a deletion can name. The owner fills the handle,
-/// the sender fills the id once the send returned it, and the pending edit waits
-/// between them.
 const Tracked = struct {
-    /// The handle of the message, or zero for a slot no message took yet.
     handle: Handle,
-    /// The id of the message, or null before the send returned or after it
-    /// failed for good.
     message_id: ?i64,
-    /// The newest state of a pending edit, or null while none waits.
     edit: ?Pending,
-    /// Whether the send of the message left the sender, delivered or dropped.
     settled: bool,
-    /// Whether a deletion of the message waits in the queue.
     deleting: bool,
 
     const empty: Tracked = .{
@@ -354,34 +211,25 @@ const Tracked = struct {
         .deleting = false,
     };
 
-    /// Whether the next reservation can take this slot: no send waits for it,
-    /// and no edit or deletion of its message waits in the queue.
     fn free(self: *const Tracked) bool {
         return self.settled and self.edit == null and !self.deleting;
     }
 };
 
-/// What a pending edit found in its slot.
 const Replace = enum {
-    /// No edit waited, so the queue needs a marker for this one.
     opened,
-    /// An older pending state gave its place up, and its marker stands.
     replaced,
-    /// The slot belongs to another message, so the state drops.
     stale,
 };
 
-/// One edit that the sender resolved from its slot: the message and its state.
 const Edit = struct {
     message_id: i64,
     pending: Pending,
 };
 
-/// One call of the chat, as the sender delivers it.
 const Delivery = union(enum) {
     send: Outbound.Send,
     edit: Edit,
-    /// The id of the message that leaves the chat.
     delete: i64,
     react: Reaction,
 
@@ -395,8 +243,6 @@ const Delivery = union(enum) {
     }
 };
 
-/// Build an attachment on the heap, because the queue borrows its buffer. The
-/// tasks start in `start`, after the owner recorded the pointer.
 pub fn create(gpa: std.mem.Allocator, io: std.Io, options: *const Options) !*Attachment {
     const self = try gpa.create(Attachment);
     errdefer gpa.destroy(self);
@@ -414,8 +260,6 @@ pub fn create(gpa: std.mem.Allocator, io: std.Io, options: *const Options) !*Att
         .sink = options.sink,
         .pace = options.pace,
         .commands = options.commands,
-        // The poll holds its connection open on purpose, so it takes the poll
-        // window and not the configured one.
         .poll_client = .{
             .gpa = gpa,
             .io = io,
@@ -457,7 +301,6 @@ pub fn create(gpa: std.mem.Allocator, io: std.Io, options: *const Options) !*Att
     return self;
 }
 
-/// Start the sender, the answerer, and the poller.
 pub fn start(self: *Attachment) !void {
     std.debug.assert(self.poll_future == null and self.send_future == null);
     std.debug.assert(self.answer_future == null);
@@ -467,16 +310,10 @@ pub fn start(self: *Attachment) !void {
     self.poll_future = try self.io.concurrent(runPoller, .{self});
 }
 
-/// Queue one message for the chat without a wait. The attachment copies `text`
-/// and the keyboard. A full queue refuses with `error.QueueFull`, so the owner
-/// never blocks behind the pace of the chat, and a closed attachment takes
-/// nothing.
 pub fn send(self: *Attachment, text: []const u8, options: *const Client.SendOptions) SendError!void {
     try self.queueSend(text, options, null);
 }
 
-/// Queue the answer to the tap `query_id`, with `text` as a toast or with
-/// nothing. The answerer sends it without a wait behind the messages.
 pub fn answer(self: *Attachment, query_id: []const u8, text: ?[]const u8) SendError!void {
     const id_copy = try self.gpa.dupe(u8, query_id);
     errdefer self.gpa.free(id_copy);
@@ -490,8 +327,6 @@ pub fn answer(self: *Attachment, query_id: []const u8, text: ?[]const u8) SendEr
     if (count == 0) return error.QueueFull;
 }
 
-/// Queue one message that a later edit names, and return its handle. The sender
-/// records the id of the message under the handle once the send returned it.
 pub fn sendTracked(
     self: *Attachment,
     text: []const u8,
@@ -505,12 +340,6 @@ pub fn sendTracked(
     return handle;
 }
 
-/// Replace the text of the tracked message `handle` with `text` and its
-/// keyboard with the one of `options`, once it and every item before it went
-/// out. An edit without a keyboard removes the one the message holds. A pending
-/// edit of the same message gives its state up for this one, so the chat sees
-/// the newest state and skips the older ones. An edit of a message whose slot
-/// another message took drops in silence.
 pub fn edit(
     self: *Attachment,
     handle: Handle,
@@ -526,11 +355,8 @@ pub fn edit(
         self.gpa.free(pending.text);
         return err;
     } else null;
-    // The slot owns the state from here on, and a failed put takes it back.
     switch (self.replaceEdit(handle, &pending)) {
         .stale => return pending.deinit(self.gpa),
-        // The marker of the older state stands, and the sender takes the newest
-        // state when it reaches it.
         .replaced => return,
         .opened => {},
     }
@@ -540,11 +366,6 @@ pub fn edit(
     };
 }
 
-/// Take the tracked message `handle` out of the chat, once it and every item
-/// before it went out. A pending edit of it drops, because the message goes. The
-/// slot stays with the message until the sender reaches the deletion, and a
-/// failed put gives it back. A delete of a message whose slot another message
-/// took drops in silence.
 pub fn delete(self: *Attachment, handle: Handle) SendError!void {
     if (!self.markDeletion(handle)) return;
     self.queueOne(.{ .delete = handle }) catch |err| {
@@ -553,7 +374,6 @@ pub fn delete(self: *Attachment, handle: Handle) SendError!void {
     };
 }
 
-/// Queue one reaction on the message `message_id` of the chat.
 pub fn react(self: *Attachment, message_id: i64, mark: Reaction.Mark) SendError!void {
     try self.queueOne(.{ .react = .{ .message_id = message_id, .mark = mark } });
 }
@@ -587,9 +407,6 @@ fn queueOne(self: *Attachment, item: Outbound) SendError!void {
     if (count == 0) return error.QueueFull;
 }
 
-/// Take the next handle and give it the next free slot. A slot with a send, an
-/// edit, or a deletion still waiting stays with its message, so a fast run of
-/// turns cannot leave an older activity message without its summary.
 fn reserveHandle(self: *Attachment) Handle {
     self.tracked_mutex.lockUncancelable(self.io);
     defer self.tracked_mutex.unlock(self.io);
@@ -609,13 +426,9 @@ fn reserveHandle(self: *Attachment) Handle {
         self.tracked_next = index + 1;
         return handle;
     }
-    // The slots outnumber the items that can hold one, so the scan always ends
-    // on a free slot while the sender runs.
     unreachable;
 }
 
-/// Put `pending` into the slot of `handle` as its pending edit, and report what
-/// it found there. The caller drops a stale state.
 fn replaceEdit(self: *Attachment, handle: Handle, pending: *const Pending) Replace {
     self.tracked_mutex.lockUncancelable(self.io);
     defer self.tracked_mutex.unlock(self.io);
@@ -626,9 +439,6 @@ fn replaceEdit(self: *Attachment, handle: Handle, pending: *const Pending) Repla
     return found;
 }
 
-/// Take the pending edit of `handle` with the id of its message, or null when
-/// none waits or the message has no id. A state with no id to reach drops here,
-/// because its send failed for good.
 fn takeEdit(self: *Attachment, handle: Handle) ?Edit {
     self.tracked_mutex.lockUncancelable(self.io);
     defer self.tracked_mutex.unlock(self.io);
@@ -642,8 +452,6 @@ fn takeEdit(self: *Attachment, handle: Handle) ?Edit {
     return .{ .message_id = message_id, .pending = pending };
 }
 
-/// Hold the slot of `handle` for a deletion of its message, and report whether
-/// the slot still belongs to it.
 fn markDeletion(self: *Attachment, handle: Handle) bool {
     self.tracked_mutex.lockUncancelable(self.io);
     defer self.tracked_mutex.unlock(self.io);
@@ -652,7 +460,6 @@ fn markDeletion(self: *Attachment, handle: Handle) bool {
     return true;
 }
 
-/// Give the slot of `handle` back after a deletion that never reached the queue.
 fn unmarkDeletion(self: *Attachment, handle: Handle) void {
     self.tracked_mutex.lockUncancelable(self.io);
     defer self.tracked_mutex.unlock(self.io);
@@ -660,10 +467,6 @@ fn unmarkDeletion(self: *Attachment, handle: Handle) void {
     slot.deleting = false;
 }
 
-/// Take the id of the message `handle` for its deletion, and free its slot. A
-/// pending edit of it goes with it, because the message leaves the chat. The
-/// result is null when the slot belongs to another message or its send failed
-/// for good.
 fn takeDeletion(self: *Attachment, handle: Handle) ?i64 {
     self.tracked_mutex.lockUncancelable(self.io);
     defer self.tracked_mutex.unlock(self.io);
@@ -676,7 +479,6 @@ fn takeDeletion(self: *Attachment, handle: Handle) ?i64 {
     return message_id;
 }
 
-/// Record the id that the send of `handle` returned.
 fn recordMessageId(self: *Attachment, handle: Handle, message_id: i64) void {
     self.tracked_mutex.lockUncancelable(self.io);
     defer self.tracked_mutex.unlock(self.io);
@@ -684,8 +486,6 @@ fn recordMessageId(self: *Attachment, handle: Handle, message_id: i64) void {
     slot.message_id = message_id;
 }
 
-/// Record that the send of `handle` left the sender, delivered or dropped, so a
-/// slot with no pending edit is free again.
 fn settle(self: *Attachment, handle: Handle) void {
     self.tracked_mutex.lockUncancelable(self.io);
     defer self.tracked_mutex.unlock(self.io);
@@ -693,30 +493,20 @@ fn settle(self: *Attachment, handle: Handle) void {
     slot.settled = true;
 }
 
-/// The slot that `handle` holds, or null once another message took it. The
-/// caller holds the lock.
 fn slotOf(self: *Attachment, handle: Handle) ?*Tracked {
     for (&self.tracked) |*slot| if (slot.handle == handle) return slot;
     return null;
 }
 
-/// Whether `close` ran.
 fn closed(self: *const Attachment) bool {
     return self.drain_deadline_ms.load(.acquire) != 0;
 }
 
-/// The last message of the chat, which the close names. It borrows its text,
-/// and its parse mode stays valid for the life of the attachment.
 pub const Final = struct {
     text: []const u8,
     parse_mode: ?[]const u8 = null,
 };
 
-/// End the attachment: the sender and the answerer stop, their queues drop, and
-/// `final` goes out as the last message of the chat inside the drain window. The
-/// attachment copies the text of `final`, and a copy that fails closes without
-/// it. The drain task does the rest and reports `drained`, so the owner never
-/// waits on a cancel. A second close changes nothing.
 pub fn close(self: *Attachment, final: ?Final) error{OutOfMemory}!void {
     if (self.closed()) return;
     defer {
@@ -726,8 +516,6 @@ pub fn close(self: *Attachment, final: ?Final) error{OutOfMemory}!void {
         );
         self.outbound.close(self.io);
         self.answers.close(self.io);
-        // A drain task that cannot start runs inline, so the sender still ends
-        // at the deadline and the owner still learns it.
         self.drain_future = self.io.concurrent(runDrain, .{self}) catch null;
         if (self.drain_future == null) self.runDrain();
     }
@@ -743,9 +531,6 @@ pub fn close(self: *Attachment, final: ?Final) error{OutOfMemory}!void {
     };
 }
 
-/// End the attachment now and free everything. The drain deadline moves to this
-/// instant, so the final message never goes out. The chat then learns nothing of
-/// the end.
 pub fn abort(self: *Attachment) void {
     self.close(null) catch unreachable;
     self.drain_deadline_ms.store(@max(1, self.nowMs()), .release);
@@ -756,8 +541,6 @@ pub fn abort(self: *Attachment) void {
     self.destroy();
 }
 
-/// Wait for the drain task, then free everything. The wait is bounded by the
-/// drain window of the close, so a dead network cannot hold the exit.
 pub fn destroy(self: *Attachment) void {
     self.close(null) catch unreachable;
     if (self.drain_future) |*future| {
@@ -793,10 +576,6 @@ fn freeOutbound(gpa: std.mem.Allocator, item: *const Outbound) void {
     }
 }
 
-/// The drain task: end the sender and the answerer, send the final message
-/// inside the window, stop the poller, and report. The cancel ends a send in
-/// flight, so nothing can hold the final message back. The poller stops last and
-/// on this task, so its cancel never holds the owner or the final message.
 fn runDrain(self: *Attachment) void {
     if (self.send_future) |*future| {
         future.cancel(self.io);
@@ -818,19 +597,12 @@ fn runDrain(self: *Attachment) void {
     self.emit(.drained) catch {};
 }
 
-/// Send the final message of the close inside the time left. The sender ended,
-/// so this task alone uses its client, and every call is bounded by that time. A
-/// 429 and a transient failure wait and try again inside it. The message skips
-/// the pacing sleep, because the window is its whole room and a 429 answers a
-/// send that came early.
 fn deliverFinal(self: *Attachment, final: *const Outbound.Send) void {
     const client = &self.send_client;
     var failures: u32 = 0;
     var delivery: Delivery = .{ .send = final.* };
     var maybe_plain: ?[]u8 = null;
     defer if (maybe_plain) |plain| self.gpa.free(plain);
-    // The loop ends on a send, a permanent failure, or the end of the window,
-    // and every other pass waits on the network.
     while (true) {
         const remaining = self.drainRemainingMs() orelse unreachable;
         if (remaining == 0) return;
@@ -850,8 +622,6 @@ fn deliverFinal(self: *Attachment, final: *const Outbound.Send) void {
                 self.pause(@min(wait, remaining)) catch return;
                 continue;
             },
-            // The last message of the chat goes again as plain text, because a
-            // formatting that Telegram cannot parse must not drop it.
             error.Rejected => {
                 if (!rejectedParse(client)) return;
                 maybe_plain = self.plainOf(&delivery) orelse return;
@@ -867,11 +637,6 @@ fn deliverFinal(self: *Attachment, final: *const Outbound.Send) void {
     }
 }
 
-/// Turn the formatted text of `delivery` into plain text, so the same words go
-/// again without a parse mode after Telegram refused their formatting. The
-/// delivery then names the plain text, which the caller owns and frees. Null
-/// for an item without formatting, and for a text that cannot allocate, which
-/// then drops with its report.
 fn plainOf(self: *Attachment, delivery: *Delivery) ?[]u8 {
     const text: *[]u8, const parse_mode: *?[]const u8 = switch (delivery.*) {
         .send => |*send_item| .{ &send_item.text, &send_item.options.parse_mode },
@@ -889,8 +654,6 @@ fn emit(self: *Attachment, payload: Event.Payload) error{Closed}!void {
     return self.sink.emit(self.sink.context, .{ .generation = self.generation, .payload = payload });
 }
 
-/// Whether the rejection that `client` holds names a formatting that Telegram
-/// cannot parse, so the same text can go again as plain text.
 fn rejectedParse(client: *const Client) bool {
     return std.mem.indexOf(u8, client.description(), parse_failure_description) != null;
 }
@@ -899,25 +662,16 @@ fn nowMs(self: *const Attachment) i64 {
     return std.Io.Timestamp.now(self.io, .awake).toMilliseconds();
 }
 
-/// The time left before the end of the close, or null while the attachment is
-/// open. Zero once the deadline passed.
 fn drainRemainingMs(self: *const Attachment) ?u64 {
     const deadline = self.drain_deadline_ms.load(.acquire);
     if (deadline == 0) return null;
     return @intCast(@max(0, deadline - self.nowMs()));
 }
 
-/// Sleep `wait_ms`. A cancel ends the task, so it propagates, and the close
-/// cancels the sender, so no sleep of the sender outlives it.
 fn pause(self: *const Attachment, wait_ms: u64) error{Canceled}!void {
     self.io.sleep(.fromMilliseconds(@intCast(wait_ms)), .awake) catch return error.Canceled;
 }
 
-/// The poller: confirm the updates from before the attach, then read the chat
-/// until a cancel or a permanent failure. An update from another chat drops in
-/// silence. A failed poll waits and tries again. An outage that outlives
-/// `outage_ms_min` reports once, and its recovery reports once, so a short
-/// outage costs no report.
 fn runPoller(self: *Attachment) void {
     self.pollUntilEnd() catch {};
 }
@@ -926,8 +680,6 @@ fn pollUntilEnd(self: *Attachment) error{ Closed, Canceled }!void {
     var state: PollState = .{};
     var outage: Outage = .{};
     var failures: u32 = 0;
-    // The loop ends on a cancel, a closed sink, or a permanent failure, and
-    // every other pass waits on the network.
     while (true) {
         self.pollOnce(&state) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
@@ -953,18 +705,11 @@ fn pollUntilEnd(self: *Attachment) error{ Closed, Canceled }!void {
     }
 }
 
-/// One run of failures on one side, and whether it reported. An outage reports
-/// once it outlives `outage_ms_min`, and it reports its first error, because
-/// that error names the start of the run.
 const Outage = struct {
-    /// When the run started, or null while the side works.
     started_ms: ?i64 = null,
-    /// The name of the first error of the run.
     name: []const u8 = "",
     reported: bool = false,
 
-    /// Count one failure with the error `name`, and report whether the outage
-    /// reports at this failure: it outlived `outage_ms_min` and has no report yet.
     fn reports(self: *Outage, attachment: *const Attachment, name: []const u8) bool {
         const now_ms = attachment.nowMs();
         const started_ms = self.started_ms orelse start: {
@@ -978,8 +723,6 @@ const Outage = struct {
         return true;
     }
 
-    /// End the run, and report whether its end needs a report. A run that never
-    /// reported ends in silence.
     fn ends(self: *Outage) bool {
         const reported = self.reported;
         self.* = .{};
@@ -987,8 +730,6 @@ const Outage = struct {
     }
 };
 
-/// Where the poller stands: the steps before the first long poll, and the
-/// offset of the next one.
 const PollState = struct {
     webhook_deleted: bool = false,
     commands_set: bool = false,
@@ -996,9 +737,6 @@ const PollState = struct {
     offset: ?i64 = null,
 };
 
-/// One step of the poller: the webhook removal, the command registration, then
-/// the confirmation of the waiting updates, then one long poll whose updates go
-/// to the sink.
 fn pollOnce(self: *Attachment, state: *PollState) (Client.Error || error{Closed})!void {
     const client = &self.poll_client;
     if (!state.webhook_deleted) {
@@ -1021,7 +759,6 @@ fn pollOnce(self: *Attachment, state: *PollState) (Client.Error || error{Closed}
     for (updates.items) |update| {
         state.offset = update.update_id + 1;
         if (update.callback) |callback| {
-            // A tap from another chat cannot be answered, so it expires there.
             if (callback.chat_id != self.chat_id) continue;
             const query_id = try self.gpa.dupe(u8, callback.id);
             errdefer self.gpa.free(query_id);
@@ -1046,32 +783,21 @@ fn pollOnce(self: *Attachment, state: *PollState) (Client.Error || error{Closed}
     }
 }
 
-/// The sender: take one item at a time and deliver it. A 429 waits the named
-/// seconds. A transient failure waits and tries the same item again, and an
-/// outage that outlives `outage_ms_min` reports once, as its recovery does. Any
-/// other 4xx drops the item with one report. A 401, a 403, and a 409 end the
-/// attachment. The close cancels the sender, and the rest of the queue drops.
 fn runSender(self: *Attachment) void {
     var state: SendState = .{};
     self.sendUntilClosed(&state) catch {};
 }
 
-/// The state of the sender across its messages: the failure run and the pace.
 const SendState = struct {
     outage: Outage = .{},
     failures: u32 = 0,
-    /// When the last send went out, or null before the first.
     sent_ms: ?i64 = null,
 };
 
-/// The sender: every item of the queue, until a cancel or a permanent failure
-/// ends it.
 fn sendUntilClosed(
     self: *Attachment,
     state: *SendState,
 ) error{ Closed, Canceled, Detached }!void {
-    // The loop ends on a cancel, a closed queue, or a permanent failure, and
-    // every other pass waits on the queue or the network.
     while (true) {
         var batch: [1]Outbound = undefined;
         const count = self.outbound.get(self.io, &batch, 1) catch |err| switch (err) {
@@ -1083,15 +809,9 @@ fn sendUntilClosed(
         defer freeOutbound(self.gpa, &item);
         switch (item) {
             .send => |send_item| {
-                // The slot settles whether the send went out or dropped, so a
-                // failed send cannot pin it.
                 defer if (send_item.handle) |handle| self.settle(handle);
                 try self.deliver(state, .{ .send = send_item });
             },
-            // The marker stands for the newest state of the slot, and it takes
-            // one state alone: an edit that arrives while this one goes out
-            // opens a marker of its own, so it keeps its place behind the items
-            // queued before it.
             .edit => |handle| if (self.takeEdit(handle)) |taken| {
                 defer taken.pending.deinit(self.gpa);
                 try self.deliver(state, .{ .edit = taken });
@@ -1104,18 +824,12 @@ fn sendUntilClosed(
     }
 }
 
-/// The answerer: answer each tap as soon as it arrives. An answer that fails
-/// drops, because a repeat lands after the tap expired and a toast is a
-/// courtesy. A 401, a 403, and a 409 end the attachment like on every other
-/// call.
 fn runAnswerer(self: *Attachment) void {
     self.answerUntilClosed() catch {};
 }
 
 fn answerUntilClosed(self: *Attachment) error{ Closed, Canceled, Detached }!void {
     const client = &self.answer_client;
-    // The loop ends when the queue closes, on a cancel, or on a permanent
-    // failure, and every other pass waits on the queue or the network.
     while (true) {
         var batch: [1]Answer = undefined;
         const count = self.answers.get(self.io, &batch, 1) catch |err| switch (err) {
@@ -1140,8 +854,6 @@ fn answerUntilClosed(self: *Attachment) error{ Closed, Canceled, Detached }!void
     }
 }
 
-/// One call of the chat for `delivery`. A tracked send records the id of its
-/// message, so a later edit finds it.
 fn callChat(self: *Attachment, delivery: *const Delivery) Client.Error!void {
     const client = &self.send_client;
     switch (delivery.*) {
@@ -1167,10 +879,6 @@ fn callChat(self: *Attachment, delivery: *const Delivery) Client.Error!void {
     }
 }
 
-/// Deliver one item, with the waits and the retries of the pace. The item drops
-/// when Telegram rejects it for good. A message or an edit whose formatting
-/// Telegram cannot parse goes again as plain text, so the ordered queue never
-/// stalls on one block.
 fn deliver(
     self: *Attachment,
     state: *SendState,
@@ -1180,8 +888,6 @@ fn deliver(
     var maybe_plain: ?[]u8 = null;
     defer if (maybe_plain) |plain| self.gpa.free(plain);
     const client = &self.send_client;
-    // The loop ends on a send, a drop, or an end of the task, and every other
-    // pass waits on the network.
     while (true) {
         if (state.sent_ms) |last| {
             const elapsed: u64 = @intCast(@max(0, self.nowMs() - last));
@@ -1205,7 +911,6 @@ fn deliver(
                         continue;
                     }
                 }
-                // A copy that fails costs the description alone, not the report.
                 const text: []u8 = self.gpa.dupe(u8, client.description()) catch &.{};
                 self.emit(.{ .send_rejected = .{
                     .kind = delivery.kind(),
@@ -1231,7 +936,6 @@ fn deliver(
     }
 }
 
-/// Report a permanent condition and end the sender.
 fn detach(self: *Attachment, reason: Event.Reason) error{ Closed, Detached } {
     try self.emit(.{ .detach = reason });
     return error.Detached;
@@ -1245,8 +949,6 @@ const ok_true = "{\"ok\":true,\"result\":true}";
 const ok_empty = "{\"ok\":true,\"result\":[]}";
 const ok_sent = "{\"ok\":true,\"result\":{\"message_id\":1}}";
 
-/// The poller script of a quiet chat: the webhook goes, the confirmation finds
-/// nothing, and the long poll then waits without an answer.
 const quiet_scripts = [_]testing.Script{
     .{ .method = "deleteWebhook", .replies = &.{.{ .body = ok_true }} },
     .{ .method = "setMyCommands", .replies = &.{.{ .body = ok_true }} },
@@ -1295,7 +997,6 @@ test "the poller registers the commands, confirms the old updates, gates on the 
         .{
             .method = "getUpdates",
             .replies = &.{
-                // The confirmation returns the newest waiting update alone.
                 .{ .body =
                 \\{"ok":true,"result":[{"update_id":40,"message":{"message_id":1,"date":0,"chat":{"id":99,"type":"private"},"text":"old"}}]}
                 },
@@ -1332,8 +1033,6 @@ test "the poller registers the commands, confirms the old updates, gates on the 
         "{\"offset\":-1,\"timeout\":0,\"allowed_updates\":[\"message\",\"callback_query\"]}",
         server.requests.items[2].body,
     );
-    // The poll starts after the confirmed update, and it waits five seconds
-    // under the head window.
     try std.testing.expectEqualStrings(
         "{\"offset\":41,\"timeout\":55,\"allowed_updates\":[\"message\",\"callback_query\"]}",
         server.requests.items[3].body,
@@ -1343,17 +1042,11 @@ test "the poller registers the commands, confirms the old updates, gates on the 
     try std.testing.expectEqual(@as(i64, 2), events[0].payload.message.id);
     try std.testing.expectEqualStrings("hello", events[0].payload.message.text);
     try std.testing.expectEqual(@as(i64, 4), events[1].payload.unreadable);
-    // The tap of the bound chat reports with its query, and the tap of the
-    // other chat drops.
     try std.testing.expectEqualStrings("901", events[2].payload.callback.query_id);
     try std.testing.expectEqual(@as(i64, 50), events[2].payload.callback.message_id);
     try std.testing.expectEqualStrings("cancel:3", events[2].payload.callback.data);
 }
 
-// The configured head window bounds the head of one provider request. A long
-// poll holds its connection open on purpose, so a short configured window must
-// not shorten it: a poll that returns at once asks again every second, and
-// Telegram answers that with a 429.
 test "a short configured window does not shorten the long poll" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -1378,16 +1071,12 @@ test "a short configured window does not shorten the long poll" {
     defer attachment.destroy();
     try attachment.start();
 
-    // The webhook removal, the command registration, the confirmation, and
-    // then the long poll.
     try server.waitForLongPoll();
     try server.finish();
     try std.testing.expectEqual(
         @as(u64, Client.poll_connect_ms_min),
         attachment.poll_client.connect_ms,
     );
-    // A send and an answer keep the configured window, because both are short
-    // calls.
     try std.testing.expectEqual(@as(u64, 5_000), attachment.send_client.connect_ms);
     try std.testing.expectEqual(@as(u64, 5_000), attachment.answer_client.connect_ms);
     try std.testing.expect(std.mem.indexOf(u8, server.requests.items[3].body, "\"timeout\":25,") != null);
@@ -1427,9 +1116,6 @@ test "a failed poll reports once, recovers once, and a 409 detaches" {
     try std.testing.expectEqual(Event.Reason.conflict, events[2].payload.detach);
 }
 
-// A network that flaps costs the user nothing: the poll fails, waits, and works
-// again, and neither step reports. Only an outage that outlives the threshold
-// reaches the transcript.
 test "a poll outage under the threshold reports nothing" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -1456,8 +1142,6 @@ test "a poll outage under the threshold reports nothing" {
     defer attachment.destroy();
     try attachment.start();
 
-    // The detach is the one event, so the failure and the recovery stayed
-    // silent.
     try collector.waitFor(1);
     try server.finish();
     const events = collector.events.items;
@@ -1501,7 +1185,6 @@ test "the sender delivers in order, retries a transient failure, and drops a rej
     }
     try std.testing.expectEqual(@as(usize, 4), count);
     try std.testing.expect(std.mem.indexOf(u8, sends[0], "\"text\":\"first\"") != null);
-    // The same message goes again after the transient failure.
     try std.testing.expect(std.mem.indexOf(u8, sends[1], "\"text\":\"first\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, sends[2], "\"reply_parameters\":{\"message_id\":5}") != null);
     try std.testing.expect(std.mem.indexOf(u8, sends[3], "\"text\":\"third\"") != null);
@@ -1515,22 +1198,14 @@ test "the sender delivers in order, retries a transient failure, and drops a rej
     );
 }
 
-/// The rejection of a text whose formatting Telegram cannot parse.
 const cannot_parse_reply: testing.Reply = .{
     .status = 400,
     .body = "{\"ok\":false,\"error_code\":400,\"description\":\"Bad Request: can't parse entities\"}",
 };
 
-/// A formatted answer with a tag, an escaped literal tag, and an escaped
-/// ampersand, and the plain text that it becomes: the tag goes, and every
-/// reference decodes once.
 const formatted_text = "<b>Telegram</b> rejected &lt;b&gt; &amp; more.";
 const formatted_plain = "Telegram rejected <b> & more.";
 
-// A formatted block that Telegram cannot parse must not stall the queue behind
-// it, and the chat must still get its words. The plain text of the same message
-// goes again without a parse mode, to the same reply and with the same keyboard,
-// and the block behind it follows.
 test "a message whose formatting fails to parse goes again as plain text" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -1566,13 +1241,9 @@ test "a message whose formatting fails to parse goes again as plain text" {
         sends[1],
     );
     try std.testing.expect(std.mem.indexOf(u8, sends[2], "\"text\":\"next\"") != null);
-    // The resend is no rejection, so nothing reports.
     try std.testing.expectEqual(@as(usize, 0), collector.events.items.len);
 }
 
-// An edit carries formatting too, and the same rule holds for it: the plain
-// text of the state goes again as an edit of the same message, with its
-// keyboard, so the activity message never freezes on a parse failure.
 test "an edit whose formatting fails to parse goes again as plain text on the same message" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -1636,12 +1307,8 @@ test "an edit waits behind its tracked send, and the newest text replaces a pend
         .disable_notification = true,
         .markup = keyboard,
     });
-    // Both edits queue while the send still waits for its reply, so one edit
-    // goes out with the newest state, keyboard included.
     try attachment.edit(handle, "Writing", &.{ .markup = keyboard });
     try attachment.edit(handle, "Running: bash", &.{ .markup = keyboard });
-    // The sender took that state once its edit arrived, so the next edit opens
-    // a pending one of its own. The summary drops the keyboard.
     _ = try server.waitForRequest("/editMessageText", 0);
     try attachment.edit(handle, "Tools: 1 call", &.{});
     _ = try server.waitForRequest("/editMessageText", 1);
@@ -1668,9 +1335,6 @@ test "an edit waits behind its tracked send, and the newest text replaces a pend
     );
 }
 
-// A deletion stands behind every item of its message, so the chat shows each
-// state first and the message goes at the end. The slot holds no message from
-// there on, so a later edit of that handle drops in silence.
 test "a deletion follows the edits of its message, and a later edit of it drops" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -1693,8 +1357,6 @@ test "a deletion follows the edits of its message, and a later edit of it drops"
     try attachment.start();
 
     const handle = try attachment.sendTracked("Effort", &.{ .disable_notification = true });
-    // Both queue while the send still waits for its reply, so the step of the
-    // picker goes out and the deletion follows it.
     try attachment.edit(handle, "Model", &.{});
     try attachment.delete(handle);
     try std.testing.expectEqualStrings(
@@ -1706,23 +1368,16 @@ test "a deletion follows the edits of its message, and a later edit of it drops"
         try server.waitForRequest("/deleteMessage", 0),
     );
 
-    // The message is gone, so its handle names none and a late edit drops.
     try attachment.edit(handle, "late", &.{});
     try server.finish();
     try std.testing.expectEqual(@as(usize, 1), server.countOf("/editMessageText"));
 }
 
-// A deletion in the queue holds the slot of its message, so a run of tracked
-// sends that fills the queue behind it cannot take that slot before the sender
-// reaches the deletion. The scan of the slots starts behind the send in flight
-// and wraps, so the slot of the oldest settled message is the one at risk.
 test "a queued deletion keeps the slot of its message while the queue fills" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    // The fourth reply waits, so the sender holds that send while the queue
-    // fills behind the deletion.
     var server = try testing.Server.init(gpa, io, &quiet_scripts ++ [_]testing.Script{
         .{ .method = "sendMessage", .replies = &.{
             .{ .body = "{\"ok\":true,\"result\":{\"message_id\":314}}" },
@@ -1738,8 +1393,6 @@ test "a queued deletion keeps the slot of its message while the queue fills" {
     var collector: Collector = .{ .gpa = gpa, .io = io };
     defer collector.deinit();
     var url_buffer: [64]u8 = undefined;
-    // The order of the queue carries this test, not the pace, so the sender
-    // takes each item at full speed.
     var pace = testing.pace;
     pace.send_spacing_ms = 0;
     const attachment = try testAttachmentPaced(gpa, io, &server, &url_buffer, &collector, pace);
@@ -1751,11 +1404,8 @@ test "a queued deletion keeps the slot of its message while the queue fills" {
     _ = try attachment.sendTracked("slow", &.{});
     try server.waitForSends(4);
     try attachment.delete(picker);
-    // The deletion and the run fill the queue, and the scan of the last
-    // reservation wraps around to the slot of the picker message and must skip it.
     for (0..outbound_capacity - 1) |_| _ = try attachment.sendTracked("filler", &.{});
 
-    // The sender takes the deletion before the first send of the run.
     _ = try server.waitForRequest("/sendMessage", 4);
     try std.testing.expectEqual(@as(usize, 1), server.countOf("/deleteMessage"));
     try std.testing.expectEqualStrings(
@@ -1764,9 +1414,6 @@ test "a queued deletion keeps the slot of its message while the queue fills" {
     );
 }
 
-// A tap expires after a few seconds, so its answer cannot wait behind the
-// messages of the chat. The answerer sends it at once, ahead of a send that
-// holds the sender, and a failed answer drops without a report.
 test "an answer leaves ahead of the paced sends, and a failed one drops in silence" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -1785,17 +1432,12 @@ test "an answer leaves ahead of the paced sends, and a failed one drops in silen
     var collector: Collector = .{ .gpa = gpa, .io = io };
     defer collector.deinit();
     var url_buffer: [64]u8 = undefined;
-    // The server answers one call at a time, so the three answers leave one
-    // after the other once the late reply frees it. The spacing of the sender
-    // must outlast those round trips, and the pace of the suite is shorter.
     var pace = testing.pace;
     pace.send_spacing_ms = 50;
     const attachment = try testAttachmentPaced(gpa, io, &server, &url_buffer, &collector, pace);
     defer attachment.destroy();
     try attachment.start();
 
-    // The first send holds the sender until its late reply, and the second
-    // waits in the queue behind it.
     try attachment.send("slow", &.{});
     try server.waitForSends(1);
     try attachment.send("behind", &.{});
@@ -1813,7 +1455,6 @@ test "an answer leaves ahead of the paced sends, and a failed one drops in silen
     _ = try server.waitForRequest("/answerCallbackQuery", 2);
     try server.waitForSends(2);
     try server.finish();
-    // Every answer reached the server before the second send did.
     var last_answer: usize = 0;
     var second_send: usize = 0;
     for (server.requests.items, 0..) |request, index| {
@@ -1824,9 +1465,6 @@ test "an answer leaves ahead of the paced sends, and a failed one drops in silen
     try std.testing.expectEqual(@as(usize, 0), collector.events.items.len);
 }
 
-// The marker of an edit takes one text alone. An edit that arrives while the
-// marker goes out queues behind the items before it, so an answer that queued
-// before the summary of its turn reaches the chat before that summary.
 test "an edit that arrives during an edit keeps its place in the queue" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -1853,7 +1491,6 @@ test "an edit that arrives during an edit keeps its place in the queue" {
 
     const handle = try attachment.sendTracked("Thinking", &.{});
     try attachment.edit(handle, "Writing", &.{});
-    // The first edit is in flight, and its reply waits.
     _ = try server.waitForRequest("/editMessageText", 0);
     try attachment.send("answer", &.{});
     try attachment.edit(handle, "Tools: 0 calls", &.{});
@@ -1875,9 +1512,6 @@ test "an edit that arrives during an edit keeps its place in the queue" {
     try std.testing.expect(std.mem.indexOf(u8, order[3], "\"text\":\"Tools: 0 calls\"") != null);
 }
 
-// A slot with a send or an edit still waiting stays with its message, however
-// many tracked sends follow. The summary of a turn then reaches its activity
-// message after a fast run of later turns.
 test "a tracked message with pending work keeps its slot through later tracked sends" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -1896,8 +1530,6 @@ test "a tracked message with pending work keeps its slot through later tracked s
     var collector: Collector = .{ .gpa = gpa, .io = io };
     defer collector.deinit();
     var url_buffer: [64]u8 = undefined;
-    // The slots carry this test, not the pace, so the run of sends leaves at
-    // full speed.
     var pace = testing.pace;
     pace.send_spacing_ms = 0;
     const attachment = try testAttachmentPaced(gpa, io, &server, &url_buffer, &collector, pace);
@@ -1915,9 +1547,6 @@ test "a tracked message with pending work keeps its slot through later tracked s
     try server.finish();
 }
 
-// An edit can name a message whose send Telegram refused, so no id exists for
-// it. The edit drops in silence, because the report of the send already told the
-// owner, and the item behind it still goes out.
 test "an edit of a message that never went out drops" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -1982,9 +1611,6 @@ test "a 403 on a send detaches" {
     try std.testing.expectEqual(Event.Reason.forbidden, collector.events.items[0].payload.detach);
 }
 
-// The chat is the record of the session up to the close, and the terminal shows
-// the rest, so the close sends the final message alone. A message that waits in
-// the queue at the close drops, and a send after the close refuses.
 test "a close drops the queue, sends the final message alone, and then refuses a send" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -1998,8 +1624,6 @@ test "a close drops the queue, sends the final message alone, and then refuses a
     var collector: Collector = .{ .gpa = gpa, .io = io };
     defer collector.deinit();
     var url_buffer: [64]u8 = undefined;
-    // The spacing outlasts the window, so the second message waits in its pacing
-    // sleep when the close arrives.
     var pace = testing.pace;
     pace.send_spacing_ms = 10 * testing.pace.drain_ms;
     const attachment = try create(gpa, io, &.{
@@ -2023,9 +1647,6 @@ test "a close drops the queue, sends the final message alone, and then refuses a
     const started_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds();
     try attachment.close(.{ .text = "final" });
     try std.testing.expectError(error.Closed, attachment.send("too late", &.{}));
-    // The drain reports its end without a wait of the owner, and the destroy
-    // then waits for nothing. The final message went out at once, because the
-    // close ended the pacing sleep of the sender instead of a wait for it.
     try collector.waitFor(1);
     try std.testing.expect(collector.events.items[0].payload == .drained);
     const elapsed_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds() - started_ms;
@@ -2047,8 +1668,6 @@ test "a full queue refuses a send, and the final message still ends the chat" {
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    // The first reply waits, so the sender holds the first message while the
-    // queue fills.
     var server = try testing.Server.init(gpa, io, &quiet_scripts ++ [_]testing.Script{
         .{ .method = "sendMessage", .replies = &.{
             .{ .body = ok_sent, .delay_ms = 200 },
@@ -2068,13 +1687,9 @@ test "a full queue refuses a send, and the final message still ends the chat" {
 
     try attachment.send("first", &.{});
     try server.waitForSends(1);
-    // The sender took the first message, so the queue takes the capacity and
-    // refuses the one after it without a wait.
     for (0..outbound_capacity) |_| try attachment.send("ordinary", &.{});
     try std.testing.expectError(error.QueueFull, attachment.send("one too many", &.{}));
 
-    // The ordinary messages drop with the close, and the final message ends
-    // the chat.
     try attachment.close(.{ .text = "final" });
     destroyed = true;
     attachment.destroy();
@@ -2091,8 +1706,6 @@ test "a send in flight at the close cannot hold the final message back" {
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    // The reply to the first send comes late, so the sender still waits on it
-    // when the close ends it.
     var server = try testing.Server.init(gpa, io, &quiet_scripts ++ [_]testing.Script{
         .{ .method = "sendMessage", .replies = &.{
             .{ .body = ok_sent, .delay_ms = testing.drain_half_ms },
@@ -2123,8 +1736,6 @@ test "a send in flight at the close cannot hold the final message back" {
     try std.testing.expect(std.mem.indexOf(u8, sends[1], "\"text\":\"final\"") != null);
 }
 
-// The final message of the chat follows the rule of every other message: a
-// parse failure sends its plain text, so the chat learns of its end.
 test "a final message whose formatting fails to parse goes again as plain text" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -2158,9 +1769,6 @@ test "a final message whose formatting fails to parse goes again as plain text" 
     );
 }
 
-// The final message goes again as plain text for a parse failure alone. Any
-// other rejection ends the drain at once, because the same call meets the same
-// answer.
 test "a rejected final message that no parse failure caused goes out once" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -2189,16 +1797,11 @@ test "a rejected final message that no parse failure caused goes out once" {
     try std.testing.expectEqual(@as(usize, 1), server.sendCount());
 }
 
-// An exit key during the drain must free the terminal at once. The abort ends a
-// send in flight, drops the queue, and sends no final message, so no message can
-// reach the chat after it.
 test "an abort ends the drain at once and sends no final message" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    // The reply to the first send never comes, so the sender holds it when the
-    // abort arrives.
     var server = try testing.Server.init(gpa, io, &quiet_scripts);
     defer server.deinit();
     try server.start();
@@ -2212,7 +1815,6 @@ test "an abort ends the drain at once and sends no final message" {
     try attachment.send("in flight", &.{});
     try attachment.send("queued", &.{});
     try server.waitForSends(1);
-    // The poller made its scripted calls, so the abort cannot leave one unmade.
     _ = try server.waitForRequest("/getUpdates", 0);
 
     try attachment.close(.{ .text = "final" });
@@ -2220,14 +1822,11 @@ test "an abort ends the drain at once and sends no final message" {
     ended = true;
     attachment.abort();
     const elapsed_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds() - started_ms;
-    // The abort ends well inside the drain window of the tests.
     try std.testing.expect(elapsed_ms < testing.drain_half_ms);
     try std.testing.expectEqual(@as(usize, 1), server.sendCount());
     try server.finish();
 }
 
-// The owner locks the terminal input for the whole drain, so the window is the
-// longest wait a user can see after a detach. A healthy network needs one call.
 test "the default drain window is two seconds" {
     const pace: Pace = .{};
     try std.testing.expectEqual(@as(u64, 2_000), pace.drain_ms);
@@ -2238,7 +1837,6 @@ test "a dead network cannot hold the drain past its deadline" {
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    // No script answers a send, so the call waits for its head.
     var server = try testing.Server.init(gpa, io, &quiet_scripts);
     defer server.deinit();
     try server.start();
@@ -2257,8 +1855,6 @@ test "a dead network cannot hold the drain past its deadline" {
     destroyed = true;
     attachment.destroy();
     const elapsed_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds() - started_ms;
-    // The drain held the close for its whole window, and it ended at the
-    // deadline. Each bound keeps a margin for a late wake.
     try std.testing.expect(elapsed_ms >= testing.pace.drain_ms - 10);
     try std.testing.expect(elapsed_ms < testing.pace.drain_ms + 500);
     try server.finish();

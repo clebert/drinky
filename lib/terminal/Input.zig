@@ -1,9 +1,3 @@
-//! Incremental terminal-input parser: raw bytes in, `Key` events out.
-//!
-//! Bytes arrive in whatever chunks `read` returns. A single key or paste can
-//! span several chunks. The parser retains unconsumed bytes, so a sequence
-//! split across reads decodes once the rest arrives.
-
 const std = @import("std");
 
 const escape = @import("escape.zig");
@@ -13,27 +7,15 @@ const Input = @This();
 gpa: std.mem.Allocator,
 pending: std.ArrayList(u8),
 start: usize,
-/// Set while the parser flushes an over-limit paste in chunks. The begin marker
-/// is consumed, but the terminator has not arrived yet.
 in_paste: bool,
 
-/// A single decoded input event from the terminal.
 pub const Key = union(enum) {
-    /// A printable Unicode codepoint the user typed.
     char: u21,
-    /// A control combination with the lowercase letter (`0x03` -> `'c'`).
     ctrl: u8,
-    /// Bracketed-paste payload, borrowed from the parser's buffer for the call.
-    /// `final` is true when this event completes the paste and false for a
-    /// mid-paste flush of an over-long unterminated body.
     paste: struct { bytes: []const u8, final: bool },
     enter,
-    /// Shift+Enter (Kitty protocol): a literal newline that does not submit.
     newline,
-    /// The Tab key without a modifier. A legacy terminal reports Ctrl+I as the
-    /// same byte, so that byte reads as Tab too.
     tab,
-    /// The Escape key (Kitty protocol reports it as `CSI 27 u`).
     escape,
     backspace,
     left,
@@ -44,19 +26,13 @@ pub const Key = union(enum) {
     page_down,
     home,
     end,
-    /// A recognized-but-unhandled sequence. Callers ignore it.
     unknown,
 };
 
 const Decoded = struct { key: Key, consumed: usize, in_paste: bool = false };
 
-/// The retained bytes at which the parser flushes an unterminated paste as a
-/// partial payload, so a missing terminator cannot buffer unboundedly or wedge
-/// input.
 const paste_flush_len = 1 << 20;
 
-/// The retained bytes at which the parser abandons an unterminated control
-/// sequence, so a missing final byte cannot buffer unboundedly or wedge input.
 const sequence_flush_len = 64;
 
 const escape_start = 0x1b;
@@ -74,7 +50,6 @@ pub fn deinit(self: *Input) void {
     self.pending.deinit(self.gpa);
 }
 
-/// Drop the consumed prefix, then append the freshly read bytes.
 pub fn feed(self: *Input, bytes: []const u8) !void {
     if (self.start > 0) {
         const kept = self.pending.items.len - self.start;
@@ -85,28 +60,18 @@ pub fn feed(self: *Input, bytes: []const u8) !void {
     try self.pending.appendSlice(self.gpa, bytes);
 }
 
-/// Whether the retained bytes are one lone Escape byte. A terminal without the
-/// Kitty protocol reports the Escape key this way, and the same byte starts every
-/// longer sequence. Only the bytes after it, or their absence, tell the two apart,
-/// so the caller times the wait and calls `takeEscape`.
 pub fn pendingEscape(self: *const Input) bool {
     if (self.in_paste) return false;
     const data = self.pending.items[self.start..];
     return data.len == 1 and data[0] == escape_start;
 }
 
-/// Consume a lone retained Escape byte, so the caller emits one `.escape` key.
-/// Reports whether the byte was there. The caller calls this after the wait that
-/// proves no sequence follows.
 pub fn takeEscape(self: *Input) bool {
     if (!self.pendingEscape()) return false;
     self.start += 1;
     return true;
 }
 
-/// The next decoded event, or null when the remaining bytes are empty or form
-/// an incomplete sequence that awaits more input. A returned `.paste` event's
-/// `bytes` borrow the internal buffer and are valid only until the next `feed`.
 pub fn next(self: *Input) ?Key {
     const data = self.pending.items[self.start..];
     if (data.len == 0) return null;
@@ -150,9 +115,6 @@ fn decodeEscape(data: []const u8) ?Decoded {
             if (data.len < 3) return null;
             return .{ .key = mapFinal(data[2]), .consumed = 3 };
         },
-        // No sequence continues with a control byte, so this Escape stands alone.
-        // Consume it alone too, so the control key that follows keeps its own
-        // event. A user who presses Esc and then Ctrl+C needs both.
         0x00...0x1f => return .{ .key = .escape, .consumed = 1 },
         else => return .{ .key = .unknown, .consumed = 2 },
     }
@@ -180,10 +142,6 @@ fn decodeControlSequence(data: []const u8) ?Decoded {
     return .{ .key = .unknown, .consumed = data.len };
 }
 
-/// A paste body whose begin marker is already consumed. The terminator ends the
-/// logical paste with `final` set. Otherwise a body that reaches `paste_flush_len`
-/// flushes as a bounded, non-`final` continuation (`in_paste` set). The flush holds
-/// back a partial terminator, so a marker split across reads still ends the paste.
 fn decodePasteBody(body: []const u8) ?Decoded {
     if (std.mem.indexOf(u8, body, escape.paste_end)) |end| {
         return .{
@@ -209,14 +167,9 @@ fn mapControlSequence(parameters: []const u8, final: u8) Key {
         return .unknown;
     }
     if (final == 'u') return mapCsiU(parameters);
-    // A modified arrow arrives as `CSI 1 ; modifiers <final>` (Kitty leaves
-    // these in the legacy encoding). The UI binds no modified arrow, so every
-    // modifier combination decodes as the bare key.
     return mapFinal(final);
 }
 
-/// Decode a Kitty-protocol `CSI codepoint;modifiers u` key. The parser
-/// recognizes only the events the UI acts on. Anything else is `.unknown`.
 fn mapCsiU(parameters: []const u8) Key {
     var codepoint_field = parameters;
     var modifier_field: []const u8 = "1";
@@ -230,9 +183,6 @@ fn mapCsiU(parameters: []const u8) Key {
     const ctrl = modifiers & ctrl_bit != 0;
     if (codepoint == enter_key and shift) return .newline;
     if (codepoint == escape_key) return .escape;
-    // Drinky asks for the disambiguate flag alone, so a plain Tab arrives as its
-    // byte. The report stays decoded for a terminal that sends it anyway. A
-    // modified Tab binds nothing, so it never reads as Tab.
     if (codepoint == tab_key) return if (modifiers == 0) .tab else .unknown;
     if (ctrl) {
         const letter = asciiLetter(codepoint) orelse return .unknown;
@@ -291,18 +241,12 @@ test "kitty csi-u keys" {
     try expectKeys("\x1b[13u", &.{.unknown});
 }
 
-// A legacy terminal reports Tab and Ctrl+I as one byte, and Drinky reads that
-// byte as Tab. The Kitty protocol tells the two apart, so its Ctrl+I stays a
-// control key. A modified Tab binds nothing, so every modified report stays
-// unknown and never opens what Tab opens.
 test "tab decodes as its own key, and a modified tab stays unknown" {
     try expectKeys("\t", &.{.tab});
     try expectKeys("\x1b[105;5u", &.{.{ .ctrl = 'i' }});
     try expectKeys("\x1b[9u", &.{.tab});
     try expectKeys("\x1b[Z", &.{.unknown});
     try expectKeys("\x1b[9;2u", &.{.unknown});
-    // Every modifier field the protocol defines: shift through the caps and num
-    // lock bits, alone and in every combination.
     for (2..257) |modifier| {
         var sequence_buffer: [16]u8 = undefined;
         const sequence = try std.fmt.bufPrint(&sequence_buffer, "\x1b[9;{d}u", .{modifier});
@@ -344,7 +288,6 @@ test "a complete paste is one final event" {
         escape.paste_begin ++ escape.paste_end,
         &.{.{ .paste = .{ .bytes = "", .final = true } }},
     );
-    // The first key after the end marker decodes normally.
     try expectKeys(
         escape.paste_begin ++ "ab\ncd" ++ escape.paste_end ++ "Z",
         &.{ .{ .paste = .{ .bytes = "ab\ncd", .final = true } }, .{ .char = 'Z' } },
@@ -358,7 +301,6 @@ test "a complete large paste in one feed is not capped" {
     const body = try gpa.alloc(u8, paste_flush_len + 100);
     defer gpa.free(body);
     @memset(body, 'x');
-    // The parser buffers the terminator before any flush, so the whole paste emits once.
     try input.feed(escape.paste_begin);
     try input.feed(body);
     try input.feed(escape.paste_end);
@@ -376,7 +318,6 @@ test "begin and end markers split at every byte boundary" {
         var input = Input.init(gpa);
         defer input.deinit();
         try input.feed(full[0..split]);
-        // A partial prefix must not emit the paste before its terminator arrives.
         if (split < full.len) try std.testing.expectEqual(@as(?Key, null), input.next());
         try input.feed(full[split..]);
         try std.testing.expectEqualDeep(
@@ -402,7 +343,6 @@ test "an unterminated paste flushes as a non-final continuation then terminates"
         paste_flush_len - escape.paste_end.len + 1,
         flushed.paste.bytes.len,
     );
-    // Later bytes stay paste payload — not keystrokes — until the terminator.
     try input.feed("\rab");
     try std.testing.expectEqual(@as(?Key, null), input.next());
     try input.feed(escape.paste_end ++ "c");
@@ -442,7 +382,6 @@ test "a payload over multiple caps yields continuations then one final" {
     try std.testing.expect(last.paste.final);
     total += last.paste.bytes.len;
 
-    // The parser delivers every fed payload byte exactly once across the chunks.
     try std.testing.expectEqual(2 * paste_flush_len, total);
     try std.testing.expectEqual(@as(?Key, null), input.next());
 }
@@ -455,7 +394,6 @@ test "an exact-cap flush leaves an empty final chunk before the terminator" {
     const body = try gpa.alloc(u8, paste_flush_len);
     defer gpa.free(body);
     @memset(body, 'x');
-    // End the body with a partial terminator so the flush holds it back.
     @memcpy(body[body.len - kept ..], escape.paste_end[0..kept]);
     try input.feed(escape.paste_begin);
     try input.feed(body);
@@ -463,7 +401,6 @@ test "an exact-cap flush leaves an empty final chunk before the terminator" {
     try std.testing.expectEqual(false, flushed.paste.final);
     try std.testing.expectEqual(paste_flush_len - kept, flushed.paste.bytes.len);
     try std.testing.expectEqual(@as(?Key, null), input.next());
-    // The retained partial terminator completes with no more payload.
     try input.feed(escape.paste_end[kept..]);
     const final = input.next() orelse return error.MissingKey;
     try std.testing.expect(final.paste.final);
@@ -492,19 +429,15 @@ test "an unterminated csi past the limit is abandoned as unknown" {
 test "a legacy escape byte waits, then takes effect on its own" {
     var input = Input.init(std.testing.allocator);
     defer input.deinit();
-    // A terminal without the Kitty protocol reports Escape as this one byte. The
-    // parser holds it back, because every longer sequence starts the same way.
     try input.feed("\x1b");
     try std.testing.expectEqual(@as(?Key, null), input.next());
     try std.testing.expect(input.pendingEscape());
 
-    // The caller times the wait out and takes the key.
     try std.testing.expect(input.takeEscape());
     try std.testing.expect(!input.pendingEscape());
     try std.testing.expect(!input.takeEscape());
     try std.testing.expectEqual(@as(?Key, null), input.next());
 
-    // A sequence that completes is not a lone Escape.
     try input.feed("\x1b");
     try std.testing.expect(input.pendingEscape());
     try input.feed("[A");
@@ -513,15 +446,10 @@ test "a legacy escape byte waits, then takes effect on its own" {
 }
 
 test "a control byte after a legacy escape keeps both keys" {
-    // A terminal without the Kitty protocol sends Esc as one byte. The control
-    // key after it must not disappear into an unknown two-byte sequence.
     try expectKeys("\x1b\x03", &.{ .escape, .{ .ctrl = 'c' } });
     try expectKeys("\x1b\x04", &.{ .escape, .{ .ctrl = 'd' } });
-    // Alt with a printable key stays one unknown event, so no text is inserted.
     try expectKeys("\x1ba", &.{.unknown});
 
-    // Two Escape bytes give one key each: the first stands alone, and the second
-    // waits like any lone Escape.
     var input = Input.init(std.testing.allocator);
     defer input.deinit();
     try input.feed("\x1b\x1b");

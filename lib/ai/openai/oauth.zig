@@ -1,13 +1,3 @@
-//! The OpenAI ChatGPT-subscription (Codex) OAuth protocol: PKCE generation,
-//! the authorize URL, and the token exchange/refresh HTTP calls. It also reads
-//! the account id out of the returned JWT. Credential storage and the login
-//! orchestration live in `Auth`. This module only speaks the protocol.
-//!
-//! These constants and the backend they authenticate against come from the
-//! open-source Codex client, not a documented public API. This is an
-//! acknowledged off-label surface (the API-key provider is the official
-//! fallback).
-
 const std = @import("std");
 
 const json = @import("../json.zig");
@@ -25,17 +15,12 @@ const scope_encoded = "openid%20profile%20email%20offline_access";
 const originator = "drinky";
 const refresh_margin_ms = 5 * 60 * 1000;
 
-/// The JWT claim namespace OpenAI nests the ChatGPT identity under.
 const auth_claim = "https://api.openai.com/auth";
 
 pub const Tokens = struct {
     access: []const u8,
     refresh: []const u8,
-    /// Absolute epoch milliseconds at which `access` becomes stale, derived
-    /// from the access token's JWT `exp` claim less a refresh margin.
     expires_ms: i64,
-    /// The ChatGPT account id (from the id-token JWT), sent as the
-    /// `chatgpt-account-id` header on every request.
     account_id: []const u8,
 
     pub fn deinit(self: Tokens, gpa: std.mem.Allocator) void {
@@ -44,15 +29,12 @@ pub const Tokens = struct {
         gpa.free(self.account_id);
     }
 
-    /// Return true only when both credentials name the same ChatGPT account.
     pub fn samePrincipal(self: *const Tokens, other: *const Tokens) bool {
         return self.account_id.len != 0 and
             std.mem.eql(u8, self.account_id, other.account_id);
     }
 };
 
-/// The browser authorize URL for `code`. Caller frees the result. The verifier
-/// doubles as the CSRF `state`, so the callback's state must match it.
 pub fn authorizeUrl(gpa: std.mem.Allocator, code: *const oauth_wire.Pkce) ![]u8 {
     return std.fmt.allocPrint(
         gpa,
@@ -65,16 +47,11 @@ pub fn authorizeUrl(gpa: std.mem.Allocator, code: *const oauth_wire.Pkce) ![]u8 
     );
 }
 
-/// The authorization grant traded for tokens: the callback's `code` and the
-/// local PKCE `verifier`.
 pub const Grant = struct {
     code: []const u8,
     verifier: []const u8,
 };
 
-/// Exchange an authorization grant for tokens (form-urlencoded body). Caller
-/// frees the result. `code` stays as received from the callback, not
-/// re-encoded, so the form body does not double-escape it.
 pub fn exchange(gpa: std.mem.Allocator, io: std.Io, timeouts: net.Timeouts, grant: Grant) !Tokens {
     const body = try std.fmt.allocPrint(
         gpa,
@@ -89,10 +66,6 @@ pub fn exchange(gpa: std.mem.Allocator, io: std.Io, timeouts: net.Timeouts, gran
     }, .{});
 }
 
-/// Trade a refresh token for fresh tokens (JSON body). A refresh response can
-/// omit the refresh token or id token, so the current `account_id` and
-/// `refresh_token` carry over when the response leaves them out. Caller
-/// frees the result.
 pub fn refresh(gpa: std.mem.Allocator, io: std.Io, timeouts: net.Timeouts, tokens: Tokens) !Tokens {
     const body = try refreshBody(gpa, tokens.refresh);
     defer gpa.free(body);
@@ -102,8 +75,6 @@ pub fn refresh(gpa: std.mem.Allocator, io: std.Io, timeouts: net.Timeouts, token
     });
 }
 
-/// The refresh body via the JSON serializer, so a refresh token that needs
-/// escaping cannot break the request. Caller frees the result.
 fn refreshBody(gpa: std.mem.Allocator, refresh_token: []const u8) error{OutOfMemory}![]u8 {
     return std.json.Stringify.valueAlloc(gpa, .{
         .grant_type = "refresh_token",
@@ -136,15 +107,11 @@ fn parseTokens(gpa: std.mem.Allocator, body: []const u8, fallback: Fallback) !To
 
     const access = json.string(object.get("access_token")) orelse return error.MissingAccessToken;
     const maybe_id_token = json.string(object.get("id_token"));
-    // A refresh can reissue neither the refresh token nor the id token. Carry
-    // the current values over when the response omits them.
     const refresh_token = json.string(object.get("refresh_token")) orelse fallback.refresh;
     if (refresh_token.len == 0) return error.MissingRefreshToken;
 
     const expires_ms = (try jwtExpiryMs(gpa, access)) orelse return error.MissingExpiry;
 
-    // The account id lives in the id-token JWT, but the same claim rides on the
-    // access token. Try both, then fall back to the stored id.
     const account_owned = try accountId(gpa, maybe_id_token, access, fallback.account_id);
     errdefer gpa.free(account_owned);
 
@@ -160,9 +127,6 @@ fn parseTokens(gpa: std.mem.Allocator, body: []const u8, fallback: Fallback) !To
     };
 }
 
-/// The ChatGPT account id: from the id token, then the access token, then the
-/// carried-over value. An owned dupe. Caller frees. Errors only on OOM: a
-/// malformed or claimless token is skipped cleanly.
 fn accountId(
     gpa: std.mem.Allocator,
     maybe_id_token: ?[]const u8,
@@ -177,8 +141,6 @@ fn accountId(
     return error.MissingAccountId;
 }
 
-/// The `chatgpt_account_id` claim from `token`'s JWT payload as an owned dupe, or
-/// null when the token is malformed or lacks the claim (never a crash).
 fn claimAccountId(gpa: std.mem.Allocator, token: []const u8) error{OutOfMemory}!?[]const u8 {
     const parsed = (try jwt.payload(gpa, token)) orelse return null;
     defer parsed.deinit();
@@ -188,16 +150,11 @@ fn claimAccountId(gpa: std.mem.Allocator, token: []const u8) error{OutOfMemory}!
     return try gpa.dupe(u8, id);
 }
 
-/// Absolute expiry in epoch milliseconds from `token`'s JWT `exp` claim
-/// (seconds) less the refresh margin. Null when the token is malformed or has
-/// no `exp`.
 fn jwtExpiryMs(gpa: std.mem.Allocator, token: []const u8) error{OutOfMemory}!?i64 {
     const parsed = (try jwt.payload(gpa, token)) orelse return null;
     defer parsed.deinit();
     const object = json.object(parsed.value) orelse return null;
     const exp = json.integer(object.get("exp")) orelse return null;
-    // A crafted `exp` must be skipped, not crash: overflow yields a null expiry
-    // (a clean MissingExpiry upstream) rather than a panic.
     const millis = std.math.mul(i64, exp, 1000) catch return null;
     return std.math.sub(i64, millis, refresh_margin_ms) catch return null;
 }
@@ -224,7 +181,6 @@ test refreshBody {
 
 test parseTokens {
     const gpa = std.testing.allocator;
-    // The expiry rides on the access token. The account id rides on the id token.
     const access = try jwt.testToken(gpa, "{\"exp\":2000000000}");
     defer gpa.free(access);
     const id = try jwt.testToken(
@@ -293,8 +249,6 @@ test "parseTokens rejects a token whose JWT has no expiry" {
 
 test "parseTokens skips a crafted expiry that overflows" {
     const gpa = std.testing.allocator;
-    // An `exp` near maxInt(i64) must fail cleanly like a missing one, not crash
-    // in the conversion to milliseconds.
     const access = try jwt.testToken(gpa, "{\"exp\":9223372036854775807}");
     defer gpa.free(access);
     const body = try std.fmt.allocPrint(

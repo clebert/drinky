@@ -1,14 +1,7 @@
-//! OAuth wire plumbing shared by the provider flows: verifier/challenge
-//! generation, form bodies, and bounded POST requests with decompression. This
-//! module reads the standard OAuth error code. Each provider parses its
-//! successful payload.
-
 const std = @import("std");
 
 const net = @import("net.zig");
 
-/// The hard cap on a token response body, well above any real exchange or
-/// refresh payload.
 const token_response_bytes_max = 256 * 1024;
 
 const verifier_len = std.base64.url_safe_no_pad.Encoder.calcSize(32);
@@ -25,13 +18,11 @@ pub const BearerOptions = struct {
     authorization: []const u8,
 };
 
-/// One field of a form body.
 pub const Field = struct {
     name: []const u8,
     value: []const u8,
 };
 
-/// A fresh PKCE verifier/challenge pair drawn from the Io's CSPRNG.
 pub fn pkce(io: std.Io) Pkce {
     var seed: [32]u8 = undefined;
     io.random(&seed);
@@ -43,9 +34,6 @@ pub fn pkce(io: std.Io) Pkce {
     return result;
 }
 
-/// The form-urlencoded body of `fields`. Every byte outside the unreserved set
-/// percent-encodes, so a server value that holds a delimiter cannot split a
-/// field. The caller frees the result.
 pub fn formBody(gpa: std.mem.Allocator, fields: []const Field) error{OutOfMemory}![]u8 {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
@@ -60,15 +48,10 @@ pub fn formBody(gpa: std.mem.Allocator, fields: []const Field) error{OutOfMemory
     return out.toOwnedSlice();
 }
 
-/// The unreserved set of RFC 3986, which every form-urlencoded decoder passes
-/// through unchanged.
 fn isUnreserved(byte: u8) bool {
     return std.ascii.isAlphanumeric(byte) or std.mem.indexOfScalar(u8, "-._~", byte) != null;
 }
 
-/// POST `body` to an OAuth endpoint and return its owned success body. The
-/// caller frees it. An `invalid_grant` error becomes `TokenGrantRejected`. The
-/// connect timeout bounds the complete request and body read.
 pub fn post(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -86,10 +69,6 @@ pub fn post(
     return send(gpa, io, timeouts, &fetch);
 }
 
-/// POST the form `body` of a device-code grant (RFC 8628) and return the owned
-/// success body. The caller frees it. The poll answers of the grant read as
-/// errors of their own: `AuthorizationPending`, `SlowDown`,
-/// `AuthorizationDenied`, and `DeviceCodeExpired`.
 pub fn postDevice(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -106,8 +85,6 @@ pub fn postDevice(
     return send(gpa, io, timeouts, &fetch);
 }
 
-/// POST an empty body under a `Bearer` authorization and return the owned
-/// success body. The caller frees it. This endpoint has no OAuth error body.
 pub fn postBearer(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -119,8 +96,6 @@ pub fn postBearer(
     return send(gpa, io, timeouts, &fetch);
 }
 
-/// One POST: its target and the optional content-type, body, and authorization
-/// each path installs.
 const Fetch = struct {
     url: []const u8,
     content_type: ?[]const u8 = null,
@@ -128,14 +103,9 @@ const Fetch = struct {
     authorization: ?[]const u8 = null,
     error_body: ErrorBody = .generic,
 
-    /// What an error body of the endpoint states: nothing Drinky reads, the
-    /// standard OAuth code of a token exchange, or that code plus the poll
-    /// answers of a device-code grant.
     const ErrorBody = enum { generic, oauth, device };
 };
 
-/// The standard OAuth error codes Drinky acts on. Every other code is a plain
-/// failure.
 const Code = enum {
     invalid_grant,
     authorization_pending,
@@ -157,8 +127,6 @@ fn send(gpa: std.mem.Allocator, io: std.Io, timeouts: net.Timeouts, fetch: *cons
     ) catch |err| return tokenTransportError(err);
 }
 
-/// Keep an ambiguous endpoint failure out of the whole-request retry. A failure
-/// before the connection opens stays retryable because no request byte was sent.
 fn tokenTransportError(err: anyerror) anyerror {
     return switch (err) {
         error.Timeout,
@@ -172,10 +140,6 @@ fn tokenTransportError(err: anyerror) anyerror {
     };
 }
 
-/// Run `work` (which writes its result into `out`) bounded by `timeout_ms`. The
-/// timeout races the request, so one that finished right at the deadline can
-/// still surface as an error with its result discarded. Reclaim anything left
-/// in `out` on any error so a completed-at-the-deadline request cannot leak.
 fn awaitBody(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -231,8 +195,6 @@ fn fetchInto(gpa: std.mem.Allocator, io: std.Io, fetch: *const Fetch, out: *?[]u
     out.* = body;
 }
 
-/// The response body: a body over `token_response_bytes_max` fails with
-/// `error.TokenResponseTooLarge` and does not allocate without bound.
 fn readBody(gpa: std.mem.Allocator, reader: *std.Io.Reader) ![]u8 {
     return reader.allocRemaining(gpa, .limited(token_response_bytes_max)) catch |err| switch (err) {
         error.StreamTooLong => error.TokenResponseTooLarge,
@@ -240,11 +202,6 @@ fn readBody(gpa: std.mem.Allocator, reader: *std.Io.Reader) ![]u8 {
     };
 }
 
-/// Classify a response after its capped body is available. Only an OAuth
-/// `invalid_grant` under 400, 401, or 403 proves that the submitted grant is no
-/// longer valid. A device-code poll states its wait and its refusal in the same
-/// code field, and its code reads under every client error status, because a
-/// rate limiter can answer a `slow_down` with 429.
 fn checkResponse(
     gpa: std.mem.Allocator,
     status: std.http.Status,
@@ -273,8 +230,6 @@ fn checkResponse(
     return error.TokenRequestFailed;
 }
 
-/// The standard OAuth error code of `body`, or null for a code Drinky does not
-/// act on. A malformed body has no destructive meaning.
 fn errorCode(gpa: std.mem.Allocator, body: []const u8) !?Code {
     const parsed = std.json.parseFromSlice(std.json.Value, gpa, body, .{}) catch |err|
         return switch (err) {
@@ -326,8 +281,6 @@ test "an OAuth response reads its error before it classifies the status" {
     );
 }
 
-// A device-code poll answers its wait and its refusal in the OAuth code field,
-// so the same status reads differently under each body kind.
 test "a device response reads the poll answers of its grant" {
     const gpa = std.testing.allocator;
     try std.testing.expectError(
@@ -350,9 +303,6 @@ test "a device response reads the poll answers of its grant" {
         error.DeviceCodeExpired,
         checkResponse(gpa, .bad_request, "{\"error\":\"expired_token\"}", .device),
     );
-    // A rate limiter can answer the wait with 429, and a 429 without a code is
-    // still an unavailable service. A token exchange reads no code under 429,
-    // so a rejected grant there stays an unavailable service, as before.
     try std.testing.expectError(
         error.SlowDown,
         checkResponse(gpa, .too_many_requests, "{\"error\":\"slow_down\"}", .device),
@@ -373,7 +323,6 @@ test "a device response reads the poll answers of its grant" {
         error.TokenRequestFailed,
         checkResponse(gpa, .bad_request, "{\"error\":\"invalid_client\"}", .device),
     );
-    // A token exchange never polls, so the poll answers read as plain failures there.
     try std.testing.expectError(
         error.TokenRequestFailed,
         checkResponse(gpa, .bad_request, "{\"error\":\"authorization_pending\"}", .oauth),
@@ -483,7 +432,6 @@ fn produceThenFail(gpa: std.mem.Allocator, out: *?[]u8) anyerror!void {
 test "a token request that fails after producing a result frees it" {
     const gpa = std.testing.allocator;
     var out: ?[]u8 = null;
-    // The leak-detecting allocator proves the discarded result was freed.
     try std.testing.expectError(
         error.Canceled,
         awaitBody(gpa, std.testing.io, 1000, &out, produceThenFail, .{ gpa, &out }),

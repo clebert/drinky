@@ -1,35 +1,3 @@
-//! A renderer that reconciles a frame on the primary or alternate terminal screen.
-//!
-//! The caller composes complete, pre-fitted physical rows through the `Sink` from
-//! `beginFrame`: the last `pages` pages of the newest content, never the whole
-//! model. `render` diffs against the frame on screen and repaints the smallest
-//! correct region. The two frames ping-pong with retained capacity, so after
-//! warmup no frame allocates.
-//!
-//! Reconciliation uses row **anchors**, not screen positions. A sliding window
-//! can then append without a reset. The repaint starts no lower than the previous
-//! last row. Its `\r\n` sequences scroll at the bottom margin.
-//!
-//! The view tracks screen lines for the frame, the screen top, and the cursor.
-//! These lines increase until a reset starts a new epoch. A shrink can therefore
-//! end above the bottom and leave blank rows. A height loss advances the top only
-//! enough to keep the cursor visible. A later height growth can add blank rows below.
-//!
-//! A fresh inline frame starts at the shell cursor. Tracked line zero need not be
-//! physical row zero. This offset does not change cursor distances or when tracked
-//! rows enter scrollback.
-//!
-//! The view never pulls inaccessible scrollback back onto the screen. When a
-//! bounded frame adds an older prefix, the view discards that prefix and keeps
-//! its printed top. It can reprint a backward slide when the previous top remains
-//! on screen. A frame that also replaces a row above the screen top leaves that
-//! row stale, and no incremental repaint reaches it. The view resets for such a
-//! frame, so the newest rows stay on screen.
-//!
-//! Every frame line is one physical row. Each repaint is one synchronized-output
-//! burst. Primary-screen resets clear inaccessible scrollback. An alternate-screen
-//! view can preserve it.
-
 const std = @import("std");
 
 const Emulator = @import("Emulator.zig");
@@ -42,40 +10,21 @@ const View = @This();
 gpa: std.mem.Allocator,
 writer: *std.Io.Writer,
 frames: [2]Frame,
-/// Index of the frame currently on screen. The view composes into the other frame.
 front: u1,
 columns: usize,
 rows: usize,
 pages: usize,
-/// First tracked line that remains on screen in this reset epoch. Smaller tracked
-/// lines are native scrollback.
 screen_top_line: usize,
-/// Line of the hardware cursor in the current reset epoch.
 cursor_line: usize,
-/// Terminal cursor visibility, so the view emits show/hide only on a change. The
-/// owning `Tty` hides the cursor at startup, which matches the initial value here.
 cursor_visible: bool,
-/// The sink handed out by `beginFrame`. It composes into the back frame until
-/// the paired `render`.
 sink: Sink,
-/// Set by `beginFrame` when the columns or page count changed. This forces
-/// `render` to repaint the whole window. A height change reconciles incrementally.
 structural_change: bool,
-/// Set by `resetScreen`: the next `render` must clear the screen and reprint the
-/// whole window, whatever the diff finds.
 force_reset: bool,
-/// How many resets this view painted. A reset clears every row above the
-/// window, so a caller that tracks rows outside the frame compares the epoch of
-/// its last paint with this count.
 reset_epoch: u64,
-/// Full resets leave native scrollback intact, for a view on an alternate screen.
 preserve_scrollback: bool,
 
 pub const Size = struct { columns: usize, rows: usize };
 
-/// Stable identity of one physical row's content, so the diff survives a
-/// sliding window. Opaque to the view (compared only for equality). Ids come
-/// from disjoint namespaces so they never alias as the model grows.
 pub const Anchor = struct {
     id: usize,
     line: usize,
@@ -85,22 +34,12 @@ pub const Anchor = struct {
     }
 };
 
-/// One complete physical line, fitted to at most the terminal width. An offset
-/// into the frame's `blob`, not a slice: `blob` grows during composition and
-/// can reallocate, which dangles a slice. An offset survives. `columns` holds
-/// the display columns the row took, so a capture can restore them.
 const Row = struct { offset: usize, len: usize, columns: usize, anchor: Anchor };
 
-/// Rows that one frame composed, retained for the frames that follow. A producer
-/// captures the rows of a component once and replays them while the content and
-/// the width behind them hold, so no later frame composes that component again.
-/// Only a `Sink` fills a store, so every byte in it passed the checks of the
-/// composition that wrote it.
 pub const Lines = struct {
     blob: std.ArrayList(u8),
     spans: std.ArrayList(Span),
 
-    /// One captured row: its bytes in `blob`, and the display columns it took.
     const Span = struct { offset: usize, len: usize, columns: usize };
 
     pub const empty: Lines = .{ .blob = .empty, .spans = .empty };
@@ -110,19 +49,16 @@ pub const Lines = struct {
         self.spans.deinit(gpa);
     }
 
-    /// Drop every row and free the buffers that held them.
     pub fn clear(self: *Lines, gpa: std.mem.Allocator) void {
         self.blob.clearAndFree(gpa);
         self.spans.clearAndFree(gpa);
     }
 
-    /// Drop every row and keep the buffers for the next capture.
     pub fn clearRetainingCapacity(self: *Lines) void {
         self.blob.clearRetainingCapacity();
         self.spans.clearRetainingCapacity();
     }
 
-    /// The rows this store holds.
     pub fn count(self: *const Lines) usize {
         return self.spans.items.len;
     }
@@ -140,19 +76,8 @@ pub const Lines = struct {
     }
 };
 
-/// Hardware cursor position after a repaint: a display `column` on window-relative
-/// `row` (a producer reports it relative to its own rows, and the assembler
-/// rebases). Absent when no input is focused.
 pub const Caret = struct { row: usize, column: usize };
 
-/// Composes rows directly into the back frame's `blob`. The caller opens a row
-/// with `begin` and writes inert display content through `text` and application
-/// styling through `sgr`. An optional `setCaret` marks the caret, and `end`
-/// closes the row. A caller can `capture` the rows it composed into a `Lines`
-/// store and `replay` them into a later frame, so an unchanged component
-/// composes once. The sink never exposes the underlying writer. The one piece
-/// of runtime content that reaches the trusted terminal-control channel is the
-/// hyperlink URL, which `linkable` clears before `linkSet` writes any.
 pub const Sink = struct {
     frame: *Frame,
     columns: usize,
@@ -160,23 +85,13 @@ pub const Sink = struct {
     offset: usize,
     columns_written: usize,
     has_text: bool,
-    /// Whether the tail of the last fragment written joins whatever follows it,
-    /// such as a Prepend or a ZWJ. The next seam then takes a guard, whatever
-    /// the fragment after it starts with.
     tail_joining: bool,
-    /// Whether a hyperlink is open on the row under composition.
     link_open: bool,
 
-    /// The longest URL a hyperlink carries. Every frame repeats the target of
-    /// every visible link, so the cap keeps one row small.
     pub const url_bytes_max = 2048;
 
-    /// The schemes a hyperlink can name. A terminal hands the target of a click
-    /// to the system, so a click must not reach a scheme the user does not
-    /// expect. The scheme reads case-insensitively, as a terminal accepts it.
     const url_schemes = [_][]const u8{ "http://", "https://", "mailto:" };
 
-    /// Open a row and capture the current `blob` end.
     pub fn begin(self: *Sink) void {
         self.offset = self.frame.blob.writer.end;
         self.columns_written = 0;
@@ -185,16 +100,10 @@ pub const Sink = struct {
         self.link_open = false;
     }
 
-    /// Append inert display text. The same scanner used for layout and width
-    /// accounting canonicalizes terminal controls and malformed UTF-8. A seam
-    /// that can fuse takes a zero-width guard, so separately measured fragments
-    /// do not become one terminal grapheme.
     pub fn text(self: *Sink, bytes: []const u8) !void {
         return self.textFitted(bytes, self.columns -| self.columns_written);
     }
 
-    /// Append inert display text fitted to both `columns_max` and the row's
-    /// remaining capacity. This lets a caller reserve trailing decoration.
     fn textFitted(self: *Sink, bytes: []const u8, columns_max: usize) !void {
         if (bytes.len == 0) return;
         try self.guard(bytes);
@@ -204,15 +113,10 @@ pub const Sink = struct {
         self.trackTail(start);
     }
 
-    /// Append up to `count` ordinary spaces and keep the row writer private.
     pub fn spaces(self: *Sink, count: usize) !void {
         return self.repeat(" ", count);
     }
 
-    /// Append up to `count` copies of a compile-time single-column `cell` as one
-    /// contiguous run. A filled row then carries no inter-cell boundaries. `cell`
-    /// must be a plain decorative glyph (such as a rule dash) whose copies do not
-    /// combine into a wider cluster. `count` copies then stay `count` columns.
     pub fn repeat(self: *Sink, comptime cell: []const u8, count: usize) !void {
         comptime std.debug.assert(width.ofText(cell) == 1);
         const shown = @min(count, self.columns -| self.columns_written);
@@ -224,18 +128,12 @@ pub const Sink = struct {
         self.trackTail(start);
     }
 
-    /// Append a compile-time-known Select Graphic Rendition sequence. The sink
-    /// accepts only SGR syntax. Cursor, screen, and string controls remain
-    /// private to the renderer.
     pub fn sgr(self: *Sink, comptime sequence: []const u8) !void {
         comptime if (!validSgr(sequence))
             @compileError("trusted style must be one complete SGR sequence");
         try self.frame.blob.writer.writeAll(sequence);
     }
 
-    /// Make the text that follows a hyperlink to `url`, which `linkReset`
-    /// closes again. The sink writes nothing for a URL that `linkable` refuses,
-    /// so an unsupported target still renders as plain text.
     pub fn linkSet(self: *Sink, url: []const u8) !void {
         if (!linkable(url)) return;
         const writer = &self.frame.blob.writer;
@@ -245,20 +143,12 @@ pub const Sink = struct {
         self.link_open = true;
     }
 
-    /// Close the hyperlink that `linkSet` opened. It writes nothing when no link
-    /// is open, so a row that carries none stays free of the string control.
     pub fn linkReset(self: *Sink) !void {
         if (!self.link_open) return;
         self.link_open = false;
         try self.frame.blob.writer.writeAll(escape.link_reset);
     }
 
-    /// Whether `linkSet` accepts `url`. The URL is the only runtime content in
-    /// the terminal control channel, so the sink is the one boundary that
-    /// clears it. It must be bounded, hold printable ASCII alone, and name a
-    /// scheme in `url_schemes`. No space, control byte, or string terminator
-    /// can then leave the URL field of the string control, and no click can
-    /// reach an unexpected scheme.
     pub fn linkable(url: []const u8) bool {
         if (url.len == 0 or url.len > url_bytes_max) return false;
         for (url) |byte| if (byte <= ' ' or byte >= 0x7f) return false;
@@ -268,16 +158,10 @@ pub const Sink = struct {
         return false;
     }
 
-    /// Close the row opened by `begin` and record it under `anchor`.
     pub fn end(self: *Sink, anchor: Anchor) void {
         std.debug.assert(self.columns_written <= self.columns);
-        // A row must close its own hyperlink. An open one makes every row under
-        // it clickable.
         std.debug.assert(!self.link_open);
         const len = self.frame.blob.writer.end - self.offset;
-        // A measure/render parity slip that overflows `beginFrame`'s row
-        // reservation is loud in safe builds. In unsafe builds it is a dropped
-        // row: a visible glitch, not an out-of-bounds write.
         std.debug.assert(self.frame.rows.items.len < self.rows_max);
         if (self.frame.rows.items.len == self.rows_max) return;
         self.frame.rows.appendAssumeCapacity(.{
@@ -288,58 +172,36 @@ pub const Sink = struct {
         });
     }
 
-    /// The rows the frame under composition holds. A producer records this
-    /// before it composes a component and passes it to `capture` after.
     pub fn composed(self: *const Sink) usize {
         return self.frame.rows.items.len;
     }
 
-    /// Copy every row from `first` on into `lines`, so a later frame can replay
-    /// them. The bytes fit the width of this composition alone, so the producer
-    /// that keeps the store must drop it when that width or its content changes.
     pub fn capture(self: *const Sink, gpa: std.mem.Allocator, first: usize, lines: *Lines) !void {
         for (self.frame.rows.items[first..]) |row| {
             try lines.append(gpa, self.frame.bytes(row), row.columns);
         }
     }
 
-    /// Compose the captured row at `index` into the row that `begin` opened. A
-    /// captured row is complete, so it takes the open row whole.
     pub fn replay(self: *Sink, lines: *const Lines, index: usize) !void {
         std.debug.assert(!self.has_text);
         const span = lines.spans.items[index];
-        // A store captured at another width overflows the row. In safe builds
-        // that is loud, and in unsafe builds it is one over-wide row.
         std.debug.assert(span.columns <= self.columns);
         try self.frame.blob.writer.writeAll(lines.bytes(index));
         self.columns_written = span.columns;
         self.has_text = true;
-        // The captured tail is unknown, so a fragment after it takes a guard.
-        // A complete row gets none, so no frame carries a guard for it.
         self.tail_joining = true;
     }
 
-    /// Place the caret at display `column` on the row under composition, the
-    /// one opened by the most recent `begin`.
     pub fn setCaret(self: *Sink, column: usize) void {
         self.frame.caret = .{ .row = self.frame.rows.items.len, .column = column };
     }
 
-    /// Write a zero-width guard before `bytes` when the seam can fuse. A seam
-    /// fuses when the row ends on an open join, or when `bytes` starts with a
-    /// code point that continues the cluster before it. A seam that cannot fuse
-    /// stays bare, so a frame carries almost no guards. A terminal that gives a
-    /// guard a column then does not shift the row. A row with no columns left
-    /// can keep a guard whose fragment wrote nothing. That guard costs nothing.
     fn guard(self: *Sink, bytes: []const u8) !void {
         if (!self.has_text) return;
         if (!self.tail_joining and !grapheme.startsJoining(bytes)) return;
         try self.frame.blob.writer.writeAll("\u{200B}");
     }
 
-    /// Classify the tail of the bytes written since `start`, so the next seam
-    /// knows whether it can fuse. A fragment that the column budget dropped
-    /// whole writes nothing and leaves the tail of the row as it was.
     fn trackTail(self: *Sink, start: usize) void {
         const written = self.frame.blob.writer.buffered()[start..];
         if (written.len == 0) return;
@@ -348,13 +210,10 @@ pub const Sink = struct {
     }
 };
 
-/// A frame's two reused buffers, caret, and printed top line. `blob` holds all
-/// row bytes in screen order. `rows` indexes them with fixed capacity.
 const Frame = struct {
     blob: std.Io.Writer.Allocating,
     rows: std.ArrayList(Row),
     caret: ?Caret,
-    /// Screen line that contains row zero in the current reset epoch.
     top_line: usize,
 
     fn init(gpa: std.mem.Allocator) Frame {
@@ -392,13 +251,9 @@ const Frame = struct {
     }
 };
 
-/// How `paint` positions the cursor before it reprints from its anchor row.
 const Mode = enum {
-    /// First frame: print from the current cursor, no clear.
     fresh,
-    /// Clear the screen under the configured scrollback policy, then reprint.
     reset,
-    /// Move to the anchor row, clear below, and reprint the changed suffix.
     incremental,
 };
 
@@ -428,42 +283,23 @@ pub fn deinit(self: *View) void {
     for (&self.frames) |*frame| frame.deinit(self.gpa);
 }
 
-/// Force the next `render` to clear and reprint under the configured scrollback
-/// policy. A view on the primary screen drops the native scrollback with it, so
-/// no earlier row stays reachable. The reprint holds the window alone, so the
-/// reset also trims reachable history back to the window. A model change must use
-/// this only when the model discards all of its content, or when it changes a row
-/// above the window, which no frame composes and no incremental repaint reaches.
-/// A model that discards part of its content keeps more history through the
-/// incremental diff. The reset does not change the cursor visibility, so the
-/// tracked state stays. Call `invalidate` instead when external output can have
-/// moved the cursor.
 pub fn resetScreen(self: *View) void {
     self.force_reset = true;
 }
 
-/// The count of resets this view painted. Every row above the window belongs to
-/// the epoch of the frame that printed it, and a reset ends that epoch, so a
-/// row of an earlier epoch is gone from the terminal.
 pub fn resetEpoch(self: *const View) u64 {
     return self.reset_epoch;
 }
 
-/// Reset the screen through `resetScreen` and record the cursor as hidden. Use
-/// this after external output has moved the terminal out from under the diff. The
-/// caller has re-hidden the cursor, so tracking resets to match.
 pub fn invalidate(self: *View) void {
     self.resetScreen();
     self.cursor_visible = false;
 }
 
-/// Make visible-screen resets leave native scrollback intact.
 pub fn preserveScrollback(self: *View) void {
     self.preserve_scrollback = true;
 }
 
-/// Forget both retained frames and write nothing to the terminal. The caller
-/// has switched to a fresh screen before the next render.
 pub fn forget(self: *View) void {
     for (&self.frames) |*frame| frame.reset();
     self.front = 0;
@@ -477,9 +313,6 @@ pub fn forget(self: *View) void {
     self.force_reset = false;
 }
 
-/// Begin the next frame at `size` and `pages`: reset the back frame and hand
-/// back the `Sink` that composes rows into it. Pair every `beginFrame` with a
-/// `render`, which diffs the composed frame against the one on screen.
 pub fn beginFrame(self: *View, size: Size, pages: usize) !*Sink {
     const width_changed = self.columns != 0 and self.columns != size.columns;
     const height_changed = self.rows != 0 and self.rows != size.rows;
@@ -507,9 +340,6 @@ pub fn beginFrame(self: *View, size: Size, pages: usize) !*Sink {
     return &self.sink;
 }
 
-/// Diff the frame just composed through the `Sink` against the one on screen,
-/// repaint the smallest correct region, and swap frames. One row can carry the
-/// caret. The view moves the real cursor there and shows it, or else hides it.
 pub fn render(self: *View) !void {
     const back = &self.frames[self.front ^ 1];
     const prev = &self.frames[self.front];
@@ -525,14 +355,11 @@ pub fn render(self: *View) !void {
         if (alignment.back_index == 0) {
             try self.paintAligned(prev, back, alignment.prev_index);
         } else if (self.lineVisible(prev.top_line)) {
-            // The previous top is still addressable. Reprint the backward slide there.
             back.top_line = prev.top_line;
             try self.paint(.incremental, back, .{ .line = prev.top_line });
         } else if (alignment.prev_index == 0 and
             !self.staleAbove(prev, back, alignment.back_index))
         {
-            // The producer pulled inaccessible history into the bounded frame.
-            // Keep the printed top and discard that backward prefix.
             back.dropLeadingRows(alignment.back_index);
             try self.paintDroppedPrefix(prev, back);
         } else {
@@ -545,9 +372,6 @@ pub fn render(self: *View) !void {
     self.front ^= 1;
 }
 
-/// Move the hardware cursor to the last frame row and show it. Call this at
-/// shutdown, so the shell prompt continues below the interface. This is a no-op
-/// when the frame has no addressable row.
 pub fn parkCursor(self: *View) !void {
     const frame = &self.frames[self.front];
     const count = frame.rows.items.len;
@@ -564,10 +388,6 @@ pub fn parkCursor(self: *View) !void {
     try writer.flush();
 }
 
-/// The visible text of painted frame bytes: the CSI sequences, the hyperlink
-/// strings, and the zero-width seam guards of the sink stripped away. The rows
-/// keep their `\r\n` separators. A style can open inside a row, so a caller that
-/// reads a whole row reads it here. The caller owns the returned bytes.
 pub fn plainText(gpa: std.mem.Allocator, bytes: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
@@ -595,16 +415,12 @@ pub fn plainText(gpa: std.mem.Allocator, bytes: []const u8) ![]u8 {
     return out.toOwnedSlice(gpa);
 }
 
-/// Reconcile frames that share the new top row. `delta` locates that row in
-/// `prev`.
 fn paintAligned(self: *View, prev: *const Frame, back: *Frame, delta: usize) !void {
     const scrolled = back.rows.items.len + delta > prev.rows.items.len;
     const aligned_top = prev.top_line + delta;
     if (delta > 0 and !scrolled) {
         const printed_top = @max(prev.top_line, self.screen_top_line);
         if (aligned_top > printed_top) {
-            // The producer removed rows that remain on screen. Move the tail to
-            // the first tracked line and erase those rows without a reset.
             back.top_line = printed_top;
             try self.paint(.incremental, back, .{ .line = printed_top });
             return;
@@ -623,9 +439,6 @@ fn paintAligned(self: *View, prev: *const Frame, back: *Frame, delta: usize) !vo
     }
 }
 
-/// Reconcile a frame after the view discards its inaccessible backward prefix.
-/// The scan starts at the first visible row. `staleAbove` has already compared
-/// the rows above it, which the terminal cannot address.
 fn paintDroppedPrefix(self: *View, prev: *const Frame, back: *Frame) !void {
     back.top_line = prev.top_line;
     const visible_start = self.screen_top_line -| back.top_line;
@@ -634,9 +447,7 @@ fn paintDroppedPrefix(self: *View, prev: *const Frame, back: *Frame) !void {
         .back_start = visible_start,
     });
     if (maybe_changed) |changed| {
-        // The visible scan can start after a frame that ends in scrollback.
         if (changed >= back.rows.items.len) {
-            // Keep the cleared rows blank instead of resurrecting scrollback with a reset.
             const screen_line = @max(back.top_line + changed, self.screen_top_line);
             std.debug.assert(self.lineVisible(screen_line));
             try self.paint(.incremental, back, .{
@@ -652,7 +463,6 @@ fn paintDroppedPrefix(self: *View, prev: *const Frame, back: *Frame) !void {
     }
 }
 
-/// Repaint an unchanged tail when a height loss moved it below the screen.
 fn paintTailOrCaret(self: *View, frame: *Frame) !void {
     const screen_bottom = self.screen_top_line + self.screenHeight() - 1;
     const last_line = frame.top_line + frame.rows.items.len - 1;
@@ -668,7 +478,6 @@ fn paintTailOrCaret(self: *View, frame: *Frame) !void {
     try self.paint(.incremental, frame, .{ .anchor = anchor, .line = screen_bottom });
 }
 
-/// Repaint a changed suffix. Start at the previous last row when output must scroll.
 fn paintChangedSuffix(
     self: *View,
     prev: *const Frame,
@@ -683,12 +492,9 @@ fn paintChangedSuffix(
     var anchor = @min(options.changed, deepest);
     var screen_line = back.top_line + anchor;
     if (!self.lineVisible(screen_line)) {
-        // The previous last row entered scrollback. Start at the first changed row.
-        // Every skipped row is then above the screen.
         anchor = options.changed;
         screen_line = back.top_line + anchor;
         if (!self.lineVisible(screen_line)) {
-            // The changed suffix remains inaccessible. Reset so its new rows can appear.
             try self.paint(.reset, back, .{});
             return;
         }
@@ -696,8 +502,6 @@ fn paintChangedSuffix(
     try self.paint(.incremental, back, .{ .anchor = anchor, .line = screen_line });
 }
 
-/// Reprint `frame` from `options.anchor`. An incremental paint starts on
-/// `options.line`. The caller sets `frame.top_line` only for incremental mode.
 fn paint(self: *View, mode: Mode, frame: *Frame, options: struct {
     anchor: usize = 0,
     line: usize = 0,
@@ -737,7 +541,6 @@ fn paint(self: *View, mode: Mode, frame: *Frame, options: struct {
     try writer.flush();
 }
 
-/// The rows are unchanged. Only the caret or its visibility can differ.
 fn paintCaretOnly(self: *View, frame: *const Frame) !void {
     const writer = self.writer;
     try writer.writeAll(escape.sync_set);
@@ -746,8 +549,6 @@ fn paintCaretOnly(self: *View, frame: *const Frame) !void {
     try writer.flush();
 }
 
-/// Nothing to show: wipe the region and hide the cursor. The app always emits at
-/// least the status line, so this only guards misuse.
 fn paintEmpty(self: *View, prev_empty: bool) !void {
     const writer = self.writer;
     try writer.writeAll(escape.sync_set);
@@ -781,8 +582,6 @@ fn screenHeight(self: *const View) usize {
     return @max(self.rows, 1);
 }
 
-/// Keep the tracked cursor visible when the terminal loses rows. Added rows stay
-/// below the current screen, so a later growth does not pull scrollback down.
 fn resizeHeight(self: *View, rows: usize) void {
     const height = @max(rows, 1);
     if (height >= self.screenHeight()) return;
@@ -812,8 +611,6 @@ fn moveCursor(self: *View, screen_line: usize) !void {
     self.cursor_line = screen_line;
 }
 
-/// Move the hardware cursor to the frame caret and show it. Hide it when the
-/// caret is outside the screen.
 fn restoreCursor(self: *View, frame: *const Frame) !void {
     const writer = self.writer;
     if (frame.caret) |caret| {
@@ -835,13 +632,6 @@ fn restoreCursor(self: *View, frame: *const Frame) !void {
     }
 }
 
-/// Whether the frames disagree on a row above the screen top. `count` is the
-/// backward prefix of `back` that the drop removes, so `back[count + index]` and
-/// `prev[index]` share one screen line. The terminal cannot address a line above
-/// the screen top, so a replaced row there stays stale. A repaint of the visible
-/// rows then also pushes the rows below that line out of reach. Only a row that
-/// both frames hold counts. A row that one frame lacks says nothing about what
-/// the terminal shows on its line.
 fn staleAbove(self: *const View, prev: *const Frame, back: *const Frame, count: usize) bool {
     const prev_rows = prev.rows.items;
     const back_rows = back.rows.items;
@@ -854,8 +644,6 @@ fn staleAbove(self: *const View, prev: *const Frame, back: *const Frame, count: 
     return false;
 }
 
-/// The first anchor `back` shares with `prev`: its index in `back` and its index
-/// in `prev`. Anchors are unique per frame, so the match is unambiguous.
 fn findAlignment(prev: *const Frame, back: *const Frame) ?Alignment {
     for (back.rows.items, 0..) |back_row, back_index| {
         for (prev.rows.items, 0..) |prev_row, prev_index| {
@@ -867,9 +655,6 @@ fn findAlignment(prev: *const Frame, back: *const Frame) ?Alignment {
     return null;
 }
 
-/// Scan from `back_start` and compare `back[index]` with `prev[prev_start + index]`.
-/// Return the first difference. A missing row counts as a difference. Return null
-/// when both remaining suffixes are equal.
 fn firstChangeFrom(
     prev: *const Frame,
     back: *const Frame,
@@ -902,7 +687,6 @@ fn validSgr(comptime sequence: []const u8) bool {
     return true;
 }
 
-// Drives one `render` and replays only the bytes it produced into the emulator.
 const Harness = struct {
     out: std.Io.Writer.Allocating,
     view: View,
@@ -939,7 +723,6 @@ const Harness = struct {
         try std.testing.expectEqual(self.view.cursor_line, self.emulator.cursor_row);
     }
 
-    // Bytes emitted by the most recent `render`, to assert the repaint shape.
     fn lastBytes(self: *Harness) []const u8 {
         return self.out.written()[self.last_from..self.consumed];
     }
@@ -959,8 +742,6 @@ fn makeHarness(gpa: std.mem.Allocator, columns: usize) !*Harness {
     return self;
 }
 
-/// The row a test composes through the view's `Sink`: bytes, anchor, and an
-/// optional caret column.
 const Line = struct { bytes: []const u8, anchor: Anchor, caret: ?usize = null, bold: bool = false };
 
 fn line(bytes: []const u8, id: usize) Line {
@@ -979,11 +760,6 @@ fn caretLine(bytes: []const u8, options: struct { id: usize, column: usize }) Li
     };
 }
 
-// Regression: a canceled turn rewinds the transcript to its checkpoint and
-// removes the rows above the shared editor and status anchors while nothing has
-// scrolled off. Those rows sit on screen, so the frame must reprint from row
-// zero and erase them. It must not treat the removal as a forward slide and
-// strand them above the tail.
 test "a shrink to the tail with nothing scrolled off erases the rows above" {
     const gpa = std.testing.allocator;
     const harness = try makeHarness(gpa, 20);
@@ -1031,13 +807,11 @@ test "a sliding-window append repaints incrementally and keeps the caret synced"
         harness.deinit();
         gpa.destroy(harness);
     }
-    // Two pages of three rows: the window holds six rows before it slides.
     const first = [_]Line{ line("a", 0), line("b", 1), caretLine("c", .{ .id = 2, .column = 1 }) };
     try harness.render(&first, .{ .columns = 10, .rows = 3 }, 2);
     try harness.emulator.expectVisible(&.{ "a", "b", "c" });
     try harness.emulator.expectCaret(.{ .frame_len = 3, .row = 2, .column = 1 });
 
-    // Append four rows to evict the top row and slide the window by one.
     const second = [_]Line{
         line("a", 0),
         line("b", 1),
@@ -1049,8 +823,6 @@ test "a sliding-window append repaints incrementally and keeps the caret synced"
     };
     try harness.render(&second, .{ .columns = 10, .rows = 3 }, 2);
     try harness.emulator.expectVisible(&.{ "b", "c", "d", "e", "f", "g" });
-    // No reset: the append reprinted from the old last row. The Δ rebase keeps
-    // the caret synced.
     try harness.emulator.expectCaret(.{ .frame_len = 6, .row = 5, .column = 1 });
     try std.testing.expect(std.mem.indexOf(u8, harness.lastBytes(), escape.screen_reset) == null);
 }
@@ -1062,7 +834,6 @@ test "a clipped backward slide preserves the printed top" {
         harness.deinit();
         gpa.destroy(harness);
     }
-    // Window of four rows (two pages of two). The last four of six show.
     const tall = [_]Line{
         line("r0", 0), line("r1", 1), line("r2", 2),
         line("r3", 3), line("r4", 4), line("r5", 5),
@@ -1071,8 +842,6 @@ test "a clipped backward slide preserves the printed top" {
     try harness.emulator.expectVisible(&.{ "r2", "r3", "r4", "r5" });
     const screen_top = harness.emulator.screen_top;
 
-    // The shrink pulls r0 and r1 into the bounded frame. They cannot re-enter
-    // the screen, so the view discards them and clears the removed visible tail.
     const short = [_]Line{ line("r0", 0), line("r1", 1), line("r2", 2) };
     try harness.render(&short, .{ .columns = 10, .rows = 2 }, 2);
     try harness.emulator.expectScreen(&.{ "", "" });
@@ -1081,7 +850,6 @@ test "a clipped backward slide preserves the printed top" {
     try std.testing.expectEqualStrings("r3", harness.emulator.document.items[1].items);
     try std.testing.expect(std.mem.indexOf(u8, harness.lastBytes(), escape.screen_reset) == null);
 
-    // Growth skips inaccessible new rows and starts at the first visible line.
     const grown = [_]Line{
         line("r0", 0), line("r1", 1), line("r2", 2), line("r3", 3), line("r4", 4),
     };
@@ -1137,7 +905,6 @@ test "a mixed backward jump resets" {
     try harness.render(&first, .{ .columns = 10, .rows = 2 }, 3);
     try harness.emulator.expectScreen(&.{ "c", "d" });
 
-    // The prefix starts before a shared inner row, not before the previous top.
     const mixed = [_]Line{ line("x", 10), line("c", 2), line("d", 3) };
     try harness.render(&mixed, .{ .columns = 10, .rows = 2 }, 3);
     try harness.emulator.expectScreen(&.{ "c", "d" });
@@ -1162,8 +929,6 @@ test "a one-row editor shrink preserves clipped session scrollback" {
     try harness.render(&before_clip, .{ .columns = 20, .rows = 3 }, 2);
     try harness.emulator.expectScreen(&.{ "edit", "wrap", "status" });
 
-    // The next transcript row clips history 0 from the retained frame. Its
-    // existing terminal row remains at the start of native scrollback.
     const expanded = [_]Line{
         line("history 0", 0),
         line("history 1", 1),
@@ -1178,8 +943,6 @@ test "a one-row editor shrink preserves clipped session scrollback" {
     const screen_top = harness.emulator.screen_top;
     try std.testing.expectEqualStrings("history 0", harness.emulator.document.items[0].items);
 
-    // The bounded projection pulls history 0 into the frame when the editor
-    // loses one row. The view discards that prefix and keeps history 1 intact.
     const shrunk = [_]Line{
         line("history 0", 0),
         line("history 1", 1),
@@ -1204,7 +967,6 @@ test "a one-row editor shrink preserves clipped session scrollback" {
     try std.testing.expect(std.mem.indexOf(u8, shrink_bytes, "\x1b[3J") == null);
     try std.testing.expect(std.mem.indexOf(u8, shrink_bytes, escape.screen_clear_below) != null);
 
-    // Growth consumes the blank row without a reset or a forward scroll.
     try harness.render(&expanded, .{ .columns = 20, .rows = 3 }, 2);
     try harness.emulator.expectScreen(&.{ "edit", "wrap", "status" });
     try std.testing.expectEqual(screen_top, harness.emulator.screen_top);
@@ -1225,9 +987,6 @@ test "repeated shrinks accumulate blank rows below" {
         harness.deinit();
         gpa.destroy(harness);
     }
-    // Eight rows in a four-row screen: r0..r3 scroll off and r4..r7 show. The
-    // frame stays whole (well under the page budget), so its top anchor is
-    // always shared and the diff takes the forward path.
     const tall = [_]Line{
         line("r0", 0), line("r1", 1), line("r2", 2), line("r3", 3),
         line("r4", 4), line("r5", 5), line("r6", 6), line("r7", 7),
@@ -1235,8 +994,6 @@ test "repeated shrinks accumulate blank rows below" {
     try harness.render(&tall, .{ .columns = 10, .rows = 4 }, 8);
     try harness.emulator.expectScreen(&.{ "r4", "r5", "r6", "r7" });
 
-    // Drop a row from the tail. The view keeps r3 in scrollback and moves the
-    // shorter tail up. The terminal leaves the row below it blank.
     const screen_top = harness.emulator.screen_top;
     const short = [_]Line{
         line("r0", 0), line("r1", 1), line("r2", 2), line("r3", 3),
@@ -1248,7 +1005,6 @@ test "repeated shrinks accumulate blank rows below" {
     try std.testing.expectEqualStrings("r3", harness.emulator.document.items[3].items);
     try std.testing.expect(std.mem.indexOf(u8, harness.lastBytes(), escape.screen_reset) == null);
 
-    // Each additional shrink moves the tail up and adds another blank row.
     const shorter = [_]Line{
         line("r0", 0), line("r1", 1), line("r2", 2),
         line("r3", 3), line("r4", 4), line("r7", 7),
@@ -1274,7 +1030,6 @@ test "a backward slide within one page reprints from row zero" {
         harness.deinit();
         gpa.destroy(harness);
     }
-    // Single-page window of three rows. The last three of five show.
     const tall = [_]Line{
         line("r0", 0), line("r1", 1), line("r2", 2), line("r3", 3), line("r4", 4),
     };
@@ -1284,7 +1039,6 @@ test "a backward slide within one page reprints from row zero" {
     const short = [_]Line{ line("r0", 0), line("r1", 1), line("r2", 2) };
     try harness.render(&short, .{ .columns = 10, .rows = 3 }, 1);
     try harness.emulator.expectVisible(&.{ "r0", "r1", "r2" });
-    // Reprint from row 0, not a full reset: no scrollback clear, but a clear-below.
     const last = harness.lastBytes();
     try std.testing.expect(std.mem.indexOf(u8, last, escape.screen_reset) == null);
     try std.testing.expect(std.mem.indexOf(u8, last, escape.screen_clear_below) != null);
@@ -1297,12 +1051,10 @@ test "a change above the viewport resets" {
         harness.deinit();
         gpa.destroy(harness);
     }
-    // Four rows over two pages of two: rows 0 and 1 sit in scrollback.
     const first = [_]Line{ line("r0", 0), line("r1", 1), line("r2", 2), line("r3", 3) };
     try harness.render(&first, .{ .columns = 10, .rows = 2 }, 2);
     try harness.emulator.expectVisible(&.{ "r0", "r1", "r2", "r3" });
 
-    // Change the top row (its anchor is stable). It is above the viewport.
     const second = [_]Line{ line("R0", 0), line("r1", 1), line("r2", 2), line("r3", 3) };
     try harness.render(&second, .{ .columns = 10, .rows = 2 }, 2);
     try harness.emulator.expectVisible(&.{ "R0", "r1", "r2", "r3" });
@@ -1357,8 +1109,6 @@ test "a height resize preserves scrollback and leaves blank rows below" {
     try harness.render(&first, .{ .columns = 20, .rows = 4 }, 2);
     try harness.emulator.expectScreen(&.{ "answer 2", "answer 3", "editor", "status" });
 
-    // Extend past the retained window. The thinking row now lives only in
-    // native scrollback, so a bounded repaint cannot reconstruct it.
     const extended = [_]Line{
         line("history", 0),
         line("thinking", 1),
@@ -1401,11 +1151,6 @@ test "a height resize preserves scrollback and leaves blank rows below" {
     try std.testing.expect(std.mem.indexOf(u8, growth, "status") == null);
 }
 
-// Regression: a retry drops the partial reply during a turn. The bounded frame
-// then slides back over older rows, and the reply rows it loses sit above the
-// screen top. A comparison of the visible rows alone finds a small change, so
-// the view repainted one row and stranded the editor above the screen. It must
-// reset, so the live tail stays on screen.
 test "a shrink above the screen top keeps the tail on screen" {
     const gpa = std.testing.allocator;
     const harness = try makeHarness(gpa, 20);
@@ -1413,7 +1158,6 @@ test "a shrink above the screen top keeps the tail on screen" {
         harness.deinit();
         gpa.destroy(harness);
     }
-    // A window of eight rows (two pages of four) over a four-row screen.
     const streaming = [_]Line{
         line("old 0", 0),
         line("old 1", 1),
@@ -1472,8 +1216,6 @@ test "a full-width row places the caret at the pending-wrap margin" {
         harness.deinit();
         gpa.destroy(harness);
     }
-    // "abc" is exactly three columns and leaves the terminal pending-wrap. The
-    // `\r` before caret placement resolves it and CUF clamps at the last cell.
     const frame = [_]Line{caretLine("abc", .{ .id = 0, .column = 3 })};
     try harness.render(&frame, .{ .columns = 3, .rows = 3 }, 1);
     try harness.emulator.expectVisible(&.{"abc"});
@@ -1490,7 +1232,6 @@ test "an over-wide row clips at the margin and keeps the cursor synced" {
     const sink = try harness.view.beginFrame(.{ .columns = 3, .rows = 4 }, 1);
     sink.begin();
     try sink.text("abcdef");
-    // A second fragment after the budget runs out adds no columns.
     try sink.text("gh");
     sink.end(.{ .id = 0, .line = 0 });
     sink.begin();
@@ -1500,7 +1241,6 @@ test "an over-wide row clips at the margin and keeps the cursor synced" {
     try harness.view.render();
     harness.emulator.rows = 4;
     try harness.emulator.feed(harness.out.written());
-    // The over-wide row never wraps, so the frame stays two physical rows.
     try std.testing.expectEqual(@as(usize, 2), harness.emulator.document.items.len);
     const top_row = harness.emulator.document.items[0].items;
     try std.testing.expect(std.mem.indexOf(u8, top_row, "abc") != null);
@@ -1524,14 +1264,9 @@ test "a fitted fragment preserves room for trailing cells" {
     harness.emulator.rows = 1;
     try harness.emulator.feed(harness.out.written());
     try std.testing.expectEqual(@as(usize, 2), sink.columns_written);
-    // The replacement brings its own boundaries and `|` joins nothing, so the
-    // seam between the two fragments stays bare.
     try harness.emulator.expectVisible(&.{"\u{200B}�\u{200B}|"});
 }
 
-// A producer that keeps the rows of an unchanged component replays them instead
-// of composing them again. The replay must reproduce the captured bytes exactly,
-// so the diff of the frame that follows finds no change at all.
 test "a replayed capture composes the rows of the composition it captured" {
     const gpa = std.testing.allocator;
     const harness = try makeHarness(gpa, 10);
@@ -1571,8 +1306,6 @@ test "a replayed capture composes the rows of the composition it captured" {
     try harness.emulator.feed(harness.out.written()[harness.consumed..]);
     harness.consumed = harness.out.written().len;
     try harness.emulator.expectVisible(&.{ "bold", "你好" });
-    // The replayed rows carry the captured bytes, so the repaint prints none of
-    // them again.
     try std.testing.expect(std.mem.indexOf(u8, harness.lastBytes(), "bold") == null);
     try std.testing.expect(std.mem.indexOf(u8, harness.lastBytes(), "你好") == null);
 }
@@ -1587,12 +1320,9 @@ test "the caret is hidden with no caret and when above the viewport" {
     const none = [_]Line{ line("a", 0), line("b", 1) };
     try harness.render(&none, .{ .columns = 5, .rows = 2 }, 2);
     try std.testing.expect(!harness.emulator.cursor_visible);
-    // The cursor is already hidden, so a caret-less frame emits no redundant hide.
     try harness.render(&none, .{ .columns = 5, .rows = 2 }, 2);
     try std.testing.expect(std.mem.indexOf(u8, harness.lastBytes(), escape.cursor_hide) == null);
 
-    // A caret on the top row of a four-row window whose viewport is two rows:
-    // it is above the viewport and must stay hidden.
     const above = [_]Line{
         caretLine("a", .{ .id = 0, .column = 1 }), line("b", 1), line("c", 2), line("d", 3),
     };
@@ -1607,7 +1337,6 @@ test "parkCursor moves the cursor to the last row below the caret" {
         harness.deinit();
         gpa.destroy(harness);
     }
-    // The caret sits on the editor row, one row above the status line.
     const frame = [_]Line{
         line("body", 0),
         caretLine("prompt", .{ .id = 1, .column = 6 }),
@@ -1621,8 +1350,6 @@ test "parkCursor moves the cursor to the last row below the caret" {
     try harness.emulator.feed(bytes[harness.consumed..]);
     harness.consumed = bytes.len;
 
-    // The cursor now sits on the last row (the status line), at column zero, so
-    // the shell prompt after exit prints below the whole interface.
     try std.testing.expectEqual(
         harness.emulator.document.items.len - 1,
         harness.emulator.cursor_row,
@@ -1668,7 +1395,6 @@ test "an unchanged frame emits only caret motion" {
     try harness.render(&first, .{ .columns = 10, .rows = 4 }, 2);
     try harness.emulator.expectCaret(.{ .frame_len = 1, .row = 0, .column = 2 });
 
-    // Same bytes, caret moved left: no reprint, just a cursor move.
     const moved = [_]Line{caretLine("ab", .{ .id = 0, .column = 1 })};
     try harness.render(&moved, .{ .columns = 10, .rows = 4 }, 2);
     try harness.emulator.expectCaret(.{ .frame_len = 1, .row = 0, .column = 1 });
@@ -1676,7 +1402,6 @@ test "an unchanged frame emits only caret motion" {
     try std.testing.expect(std.mem.indexOf(u8, last, escape.screen_reset) == null);
     try std.testing.expect(std.mem.indexOf(u8, last, escape.screen_clear_below) == null);
     try std.testing.expect(std.mem.indexOf(u8, last, "ab") == null);
-    // The caret was already visible, so the view emits no redundant show.
     try std.testing.expect(std.mem.indexOf(u8, last, escape.cursor_show) == null);
 }
 
@@ -1691,9 +1416,6 @@ test "a top-trim with nothing scrolled off reprints from row zero" {
     try harness.render(&first, .{ .columns = 10, .rows = 3 }, 1);
     try harness.emulator.expectCaret(.{ .frame_len = 3, .row = 2, .column = 1 });
 
-    // The second frame removes the top row on screen (nothing scrolled off) and
-    // keeps the remaining rows byte-identical. The view reprints from row zero
-    // to erase it, with no full reset.
     const second = [_]Line{ line("b", 1), caretLine("c", .{ .id = 2, .column = 1 }) };
     try harness.render(&second, .{ .columns = 10, .rows = 3 }, 1);
     try harness.emulator.expectScreen(&.{ "b", "c" });
@@ -1713,14 +1435,12 @@ test "a pure top-trim with rows scrolled off preserves the screen" {
         harness.deinit();
         gpa.destroy(harness);
     }
-    // Four rows over two pages of two: rows 0 and 1 sit in scrollback.
     const first = [_]Line{
         line("r0", 0), line("r1", 1), line("r2", 2), caretLine("r3", .{ .id = 3, .column = 1 }),
     };
     try harness.render(&first, .{ .columns = 10, .rows = 2 }, 2);
     try harness.emulator.expectScreen(&.{ "r2", "r3" });
 
-    // Trim an inaccessible top row. The byte-identical visible tail stays in place.
     const second = [_]Line{
         line("r1", 1), line("r2", 2), caretLine("r3", .{ .id = 3, .column = 1 }),
     };
@@ -1743,8 +1463,6 @@ test "invalidate forces a full reset even when content is unchanged" {
     try harness.render(&frame, .{ .columns = 10, .rows = 4 }, 2);
     try harness.emulator.expectVisible(&.{ "hello", "world" });
 
-    // External output scrolled the terminal. The same content must reprint from
-    // a full clear rather than diff to a caret-only paint.
     harness.view.invalidate();
     try harness.render(&frame, .{ .columns = 10, .rows = 4 }, 2);
     try harness.emulator.expectVisible(&.{ "hello", "world" });
@@ -1758,9 +1476,6 @@ test "a screen reset drops the scrollback and keeps the cursor visible" {
         harness.deinit();
         gpa.destroy(harness);
     }
-    // Six rows in a two-row screen: r0 to r3 sit in native scrollback. The caret
-    // and status rows keep their anchors across the clear. The diff alone then
-    // reconciles the tail and leaves r0 to r3 reachable.
     const tall = [_]Line{
         line("r0", 0),
         line("r1", 1),
@@ -1774,8 +1489,6 @@ test "a screen reset drops the scrollback and keeps the cursor visible" {
     try std.testing.expectEqual(@as(usize, 6), harness.emulator.document.items.len);
     try std.testing.expect(harness.emulator.cursor_visible);
 
-    // The model discarded its content. The reset must take every earlier row out
-    // of the terminal, not only the rows the new frame replaces.
     harness.view.resetScreen();
     const cleared = [_]Line{
         caretLine("P", .{ .id = 100, .column = 1 }),
@@ -1788,7 +1501,6 @@ test "a screen reset drops the scrollback and keeps the cursor visible" {
     const last = harness.lastBytes();
     try std.testing.expect(std.mem.indexOf(u8, last, escape.screen_reset) != null);
     try std.testing.expect(std.mem.indexOf(u8, last, "r0") == null);
-    // The caret stayed on screen, so the reset emits no redundant show.
     try std.testing.expect(harness.emulator.cursor_visible);
     try std.testing.expect(std.mem.indexOf(u8, last, escape.cursor_show) == null);
 }
@@ -1800,10 +1512,6 @@ test "canonical text boundaries survive separate sink writes" {
     var view = View.init(gpa, &out.writer);
     defer view.deinit();
 
-    // These fragments have adjacent edges that can fuse into different graphemes
-    // (an emoji ZWJ join, a variation selector after a replacement, one after a
-    // space). Each row must measure as the sum of its separately measured
-    // fragments once composed.
     const sink = try view.beginFrame(.{ .columns = 9, .rows = 4 }, 1);
     sink.begin();
     try sink.text("\x1b");
@@ -1834,7 +1542,6 @@ test "a seam takes a guard only where the two fragments can fuse" {
     defer view.deinit();
 
     const sink = try view.beginFrame(.{ .columns = 40, .rows = 4 }, 1);
-    // Ordinary spans, spaces, and a rule cannot fuse, so this row holds no guard.
     sink.begin();
     try sink.text("model");
     try sink.spaces(1);
@@ -1845,8 +1552,6 @@ test "a seam takes a guard only where the two fragments can fuse" {
     try std.testing.expectEqualStrings("model (account)────", plain);
     try std.testing.expectEqual(sink.columns_written, width.ofText(plain));
 
-    // A leading combining mark joins the text before it, and a trailing ZWJ
-    // joins the emoji after it. Both seams take the guard.
     sink.begin();
     try sink.text("e");
     try sink.text("\u{0301}");
@@ -1857,8 +1562,6 @@ test "a seam takes a guard only where the two fragments can fuse" {
     try std.testing.expectEqualStrings("e\u{200B}\u{0301}👨\u{200D}\u{200B}👩", joined);
     try std.testing.expectEqual(sink.columns_written, width.ofText(joined));
 
-    // An open tail guards the run that `repeat` writes too, even though a space
-    // and a rule dash join nothing on their own.
     sink.begin();
     try sink.text("👨\u{200D}");
     try sink.spaces(1);
@@ -1870,9 +1573,6 @@ test "a seam takes a guard only where the two fragments can fuse" {
     try view.render();
 }
 
-// A hyperlink frames its own text and closes inside the row. The target rides
-// in a string control, so the screen shows the text alone. A URL the sink
-// refuses opens no link at all and loses only the target.
 test "a hyperlink frames its text and closes within its row" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -1899,8 +1599,6 @@ test "a hyperlink frames its text and closes within its row" {
     try emulator.feed(out.written());
     try emulator.expectVisible(&.{"docs!"});
 
-    // The URL must be bounded printable ASCII under a scheme a click can open.
-    // The scheme reads case-insensitively, and every other one stays inert.
     try std.testing.expect(Sink.linkable("mailto:someone@example.com"));
     try std.testing.expect(Sink.linkable("HTTPS://X.Y/a"));
     try std.testing.expect(!Sink.linkable(""));
@@ -1923,17 +1621,12 @@ test "a styled row reprinted from its own start carries its escapes" {
     const first = [_]Line{ line("a", 0), line("b", 1) };
     try harness.render(&first, .{ .columns = 20, .rows = 4 }, 2);
 
-    // Only the second row changes, so the incremental repaint begins at it.
     const second = [_]Line{ line("a", 0), boldLine("BOLD", 1) };
     try harness.render(&second, .{ .columns = 20, .rows = 4 }, 2);
     try harness.emulator.expectVisible(&.{ "a", "BOLD" });
-    // The row re-opens and closes its own SGR. It relies on no state from above.
     try std.testing.expect(std.mem.indexOf(u8, harness.lastBytes(), styled) != null);
 }
 
-// A reader of a painted frame wants its text, not its styles. The strip drops
-// the SGR sequences, the target of a hyperlink, and the seam guards, and it keeps
-// the row separators.
 test "the plain text of painted bytes holds the rows alone" {
     const gpa = std.testing.allocator;
     const bytes = escape.sync_set ++ "\x1b[1mbold\x1b[0m\r\n" ++

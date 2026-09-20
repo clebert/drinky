@@ -1,76 +1,38 @@
-//! The ANSI escape sequences the renderer trusts: mode set/reset pairs, screen
-//! clears, and bounded cursor motion. Only the hyperlink frame encloses runtime
-//! content, and `View.Sink.linkable` clears that content before the sink writes
-//! any.
-
 const std = @import("std");
 
-/// Begin/end a synchronized-output burst so a multi-line repaint lands atomically.
 pub const sync_set = "\x1b[?2026h";
 pub const sync_reset = "\x1b[?2026l";
 
-/// Enable/disable bracketed paste, so pasted text arrives framed and the parser
-/// does not mistake it for typed control sequences.
 pub const paste_set = "\x1b[?2004h";
 pub const paste_reset = "\x1b[?2004l";
 
-/// The framing a terminal wraps around pasted text once bracketed paste is enabled.
 pub const paste_begin = "\x1b[200~";
 pub const paste_end = "\x1b[201~";
 
-/// Push/pop the Kitty keyboard protocol with the disambiguate flag. It leaves
-/// plain Enter, Backspace, and printable keys as their legacy bytes but reports
-/// Shift+Enter, Escape, and Ctrl combinations as distinct `CSI ... u` sequences.
-/// The pop restores whatever mode was active before.
 pub const keyboard_set = "\x1b[>1u";
 pub const keyboard_reset = "\x1b[<u";
 
-/// Enable/disable grapheme cluster processing. The terminal then advances the
-/// cursor one grapheme cluster at a time, which is how `width` measures a row.
-/// A terminal ignores a private mode it does not know. `Tty` pairs the set with
-/// the reset, so the mode does not outlive the session.
 pub const grapheme_set = "\x1b[?2027h";
 pub const grapheme_reset = "\x1b[?2027l";
 
-/// The String Terminator that ends an OSC string. Both the open and the close
-/// of a hyperlink end with it, so it belongs to no single sequence.
 pub const string_end = "\x1b\\";
 
-/// Open and close an OSC 8 hyperlink over the text between them. The target URL
-/// goes between `link_set` and `string_end`. `link_reset` closes the link, so
-/// the text after it carries no target. A terminal that does not know OSC 8
-/// drops both strings and shows the text alone.
 pub const link_set = "\x1b]8;;";
 pub const link_reset = link_set ++ string_end;
 
 pub const cursor_hide = "\x1b[?25l";
 pub const cursor_show = "\x1b[?25h";
 
-/// Enter or leave the modern alternate screen. This preserves the primary screen and its
-/// scrollback.
 pub const screen_alternate_set = "\x1b[?1049h";
 pub const screen_alternate_reset = "\x1b[?1049l";
 
-/// Save the alternate-scroll mode, then ask for it. The terminal turns a wheel notch on the
-/// alternate screen into an arrow key. The app needs no mouse report, so the mouse keeps its
-/// normal text selection.
 pub const scroll_alternate_set = "\x1b[?1007s\x1b[?1007h";
-/// Restore the saved alternate-scroll mode. A terminal without the mode stack keeps the mode
-/// enabled, which is the common default. No reset can leave such a terminal worse than it was.
 pub const scroll_alternate_reset = "\x1b[?1007r";
 
-/// Erase from the cursor to the end of the screen.
 pub const screen_clear_below = "\x1b[0J";
-/// Clear the visible screen and home the cursor. The scrollback stays untouched.
 pub const screen_repaint = "\x1b[2J\x1b[H";
-/// Clear the whole screen, home the cursor, then drop the scrollback. This is
-/// the full reset for a change that lands above the viewport, where the buffer
-/// must be reprinted from scratch.
 pub const screen_reset = screen_repaint ++ "\x1b[3J";
 
-/// Move the cursor `count` steps: up (`'A'`), down (`'B'`), or right (`'C'`).
-/// A zero count is a no-op, so the sequence is never emitted with an implicit
-/// argument.
 pub fn cursorMove(writer: *std.Io.Writer, comptime final: u8, count: usize) !void {
     if (count == 0) return;
     try writer.print("\x1b[{d}{c}", .{ count, final });

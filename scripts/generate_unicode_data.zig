@@ -1,22 +1,11 @@
-//! Regenerates lib/terminal/unicode_data.zig from the Unicode Character Database.
-//!
-//! Fetches a pinned Unicode version's UCD files and emits two sorted, disjoint
-//! interval tables. The width table maps code point ranges to a display width
-//! of zero or two (a code point in no range is one column). Width zero is
-//! General_Category Mn, Me, or Cf (minus U+00AD, plus U+1160..U+11FF and
-//! U+200B). Width two is East_Asian_Width Wide or Fullwidth plus
-//! Emoji_Presentation, minus the width-zero set. The grapheme-break table maps
-//! code point ranges to their UAX #29 Grapheme_Cluster_Break class, refined
-//! with Indic_Conjunct_Break (for rule GB9c) and Extended_Pictographic (for
-//! GB11). With this table, `grapheme` can segment clusters. Also vendors the
-//! GraphemeBreakTest.txt conformance corpus. Run with `zig build unicode`.
-
 const std = @import("std");
 
 const version = "17.0.0";
 const base = "https://www.unicode.org/Public/" ++ version ++ "/ucd";
+const license_url = "https://www.unicode.org/license.txt";
 const output_path = "lib/terminal/unicode_data.zig";
 const test_output_path = "lib/terminal/GraphemeBreakTest.txt";
+const license_output_path = "lib/terminal/UNICODE_LICENSE";
 const codepoint_max = 0x10FFFF;
 
 const WidthRange = struct { first: u21, last: u21, columns: u8 };
@@ -56,9 +45,9 @@ pub fn main() !void {
     var client: std.http.Client = .{ .allocator = arena, .io = io };
     defer client.deinit();
 
-    const categories = try fetch(arena, &client, "/extracted/DerivedGeneralCategory.txt");
-    const east_asian = try fetch(arena, &client, "/EastAsianWidth.txt");
-    const emoji = try fetch(arena, &client, "/emoji/emoji-data.txt");
+    const categories = try fetch(arena, &client, base ++ "/extracted/DerivedGeneralCategory.txt");
+    const east_asian = try fetch(arena, &client, base ++ "/EastAsianWidth.txt");
+    const emoji = try fetch(arena, &client, base ++ "/emoji/emoji-data.txt");
 
     const zero = try arena.alloc(bool, codepoint_max + 1);
     @memset(zero, false);
@@ -74,8 +63,12 @@ pub fn main() !void {
 
     const width_ranges = try coalesce(arena, zero, wide);
 
-    const grapheme_break = try fetch(arena, &client, "/auxiliary/GraphemeBreakProperty.txt");
-    const derived = try fetch(arena, &client, "/DerivedCoreProperties.txt");
+    const grapheme_break = try fetch(
+        arena,
+        &client,
+        base ++ "/auxiliary/GraphemeBreakProperty.txt",
+    );
+    const derived = try fetch(arena, &client, base ++ "/DerivedCoreProperties.txt");
 
     const classes = try arena.alloc(Class, codepoint_max + 1);
     @memset(classes, .other);
@@ -84,7 +77,9 @@ pub fn main() !void {
     @memset(pictographic, false);
     mark(emoji, &.{"Extended_Pictographic"}, pictographic);
     for (0..codepoint_max + 1) |codepoint| {
-        if (pictographic[codepoint] and classes[codepoint] == .other) classes[codepoint] = .extended_pictographic;
+        if (pictographic[codepoint] and classes[codepoint] == .other) {
+            classes[codepoint] = .extended_pictographic;
+        }
     }
     assignIndicConjunct(derived, classes);
     const class_ranges = try coalesceClasses(arena, classes);
@@ -93,19 +88,27 @@ pub fn main() !void {
     try emit(&out.writer, width_ranges, class_ranges);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = output_path, .data = out.written() });
 
-    const break_test = try fetch(arena, &client, "/auxiliary/GraphemeBreakTest.txt");
+    const break_test = try fetch(arena, &client, base ++ "/auxiliary/GraphemeBreakTest.txt");
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = test_output_path, .data = break_test });
+
+    const license = try fetch(arena, &client, license_url);
+    var notice: std.Io.Writer.Allocating = .init(arena);
+    try notice.writer.print(license_header, .{version});
+    try notice.writer.writeAll(license);
+    try std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = license_output_path,
+        .data = notice.written(),
+    });
 
     std.debug.print(
         "wrote {s}: {d} width ranges, {d} grapheme classes from Unicode {s}\n",
         .{ output_path, width_ranges.len, class_ranges.len, version },
     );
     std.debug.print("wrote {s}\n", .{test_output_path});
+    std.debug.print("wrote {s}\n", .{license_output_path});
 }
 
-/// The body of `base ++ path`, or an error when the server does not answer with 200.
-fn fetch(arena: std.mem.Allocator, client: *std.http.Client, path: []const u8) ![]const u8 {
-    const url = try std.fmt.allocPrint(arena, "{s}{s}", .{ base, path });
+fn fetch(arena: std.mem.Allocator, client: *std.http.Client, url: []const u8) ![]const u8 {
     var response: std.Io.Writer.Allocating = .init(arena);
     const result = try client.fetch(.{
         .location = .{ .url = url },
@@ -118,8 +121,6 @@ fn fetch(arena: std.mem.Allocator, client: *std.http.Client, path: []const u8) !
     return response.written();
 }
 
-/// Sets `flags` true for every code point of a UCD data line whose property
-/// value is one of `wanted`.
 fn mark(text: []const u8, wanted: []const []const u8, flags: []bool) void {
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |raw| {
@@ -136,8 +137,6 @@ fn mark(text: []const u8, wanted: []const []const u8, flags: []bool) void {
     }
 }
 
-/// Sorted, non-overlapping ranges of the code points that are not one column.
-/// Adjacent code points of the same width merge into one range.
 fn coalesce(arena: std.mem.Allocator, zero: []const bool, wide: []const bool) ![]WidthRange {
     var width_ranges: std.ArrayList(WidthRange) = .empty;
     var open: ?WidthRange = null;
@@ -161,7 +160,6 @@ fn coalesce(arena: std.mem.Allocator, zero: []const bool, wide: []const bool) ![
     return width_ranges.toOwnedSlice(arena);
 }
 
-/// Assigns each code point its Grapheme_Cluster_Break class from a UCD line.
 fn assignGraphemeBreak(text: []const u8, classes: []Class) void {
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |raw| {
@@ -200,9 +198,6 @@ fn graphemeBreakClass(value: []const u8) ?Class {
     return null;
 }
 
-/// Refines Extend and Other code points with their Indic_Conjunct_Break value
-/// so `grapheme` can apply rule GB9c. `linker` is the virama, `extend_incb` the
-/// marks that can sit inside a conjunct, and `consonant` the conjunct bases.
 fn assignIndicConjunct(text: []const u8, classes: []Class) void {
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |raw| {
@@ -228,9 +223,6 @@ fn assignIndicConjunct(text: []const u8, classes: []Class) void {
     }
 }
 
-/// Sorted, non-overlapping ranges of the code points with a non-`other`
-/// grapheme-break class. Adjacent code points of the same class merge into one
-/// range.
 fn coalesceClasses(arena: std.mem.Allocator, classes: []const Class) ![]ClassRange {
     var ranges: std.ArrayList(ClassRange) = .empty;
     var open: ?ClassRange = null;
@@ -254,9 +246,12 @@ fn coalesceClasses(arena: std.mem.Allocator, classes: []const Class) ![]ClassRan
     return ranges.toOwnedSlice(arena);
 }
 
-fn emit(writer: *std.Io.Writer, width_ranges: []const WidthRange, class_ranges: []const ClassRange) !void {
-    try writer.print(header_prefix, .{version});
-    try writer.writeAll(header_rest);
+fn emit(
+    writer: *std.Io.Writer,
+    width_ranges: []const WidthRange,
+    class_ranges: []const ClassRange,
+) !void {
+    try writer.writeAll(width_section);
     for (width_ranges) |range| try writer.print(
         "    .{{ .first = 0x{x:0>4}, .last = 0x{x:0>4}, .columns = {d} }},\n",
         .{ range.first, range.last, range.columns },
@@ -297,36 +292,16 @@ fn parseHex(text: []const u8) ?u21 {
     return std.fmt.parseInt(u21, std.mem.trim(u8, text, " \t"), 16) catch null;
 }
 
-const header_prefix =
-    \\//! Interval tables generated from the Unicode Character Database, version {s}.
-    \\//! Do not edit this file by hand. Regenerate it with `zig build unicode`.
+const license_header =
+    \\The tables in unicode_data.zig and the corpus in GraphemeBreakTest.txt derive from the Unicode
+    \\Character Database, version {s}. Unicode, Inc. distributes the data under the license below.
+    \\
     \\
 ;
 
-const header_rest =
-    \\//!
-    \\//! The tables below are derived from Unicode data files and are distributed under
-    \\//! the Unicode License V3:
-    \\//!
-    \\//!   Copyright (c) 1991-2025 Unicode, Inc. All rights reserved.
-    \\//!   Distributed under the Terms of Use at https://www.unicode.org/copyright.html
-    \\//!
-    \\//!   Permission is hereby granted, free of charge, to any person obtaining a
-    \\//!   copy of the Unicode data files and any associated documentation (the "Data
-    \\//!   Files") to deal in the Data Files without restriction, including without
-    \\//!   limitation the rights to use, copy, modify, merge, publish, distribute,
-    \\//!   and/or sell copies of the Data Files, and to permit persons to whom the
-    \\//!   Data Files are furnished to do so, provided that this copyright and
-    \\//!   permission notice appear with all copies of the Data Files.
-    \\
+const width_section =
     \\pub const WidthRange = struct { first: u21, last: u21, columns: u8 };
     \\
-    \\/// Code points whose display width is not one column, sorted and
-    \\/// non-overlapping. Width zero covers nonspacing and enclosing combining marks,
-    \\/// format controls, Hangul Jamo medial and final letters, and the zero-width
-    \\/// space. Width two covers East Asian Wide and Fullwidth code points and the
-    \\/// code points with default emoji presentation. A code point in no range is one
-    \\/// column.
     \\pub const width_ranges = [_]WidthRange{
     \\
 ;
@@ -356,12 +331,6 @@ const class_section =
     \\
     \\pub const ClassRange = struct { first: u21, last: u21, class: Class };
     \\
-    \\/// Code points with a non-`other` UAX #29 Grapheme_Cluster_Break class,
-    \\/// sorted and non-overlapping. The class is refined past the raw property so
-    \\/// the segmenter can apply every rule from one table: `linker` and
-    \\/// `extend_incb` mark the Indic_Conjunct_Break virama and interior marks and
-    \\/// `consonant` the conjunct bases (rule GB9c), and `extended_pictographic`
-    \\/// marks emoji bases (rule GB11). A code point in no range is `other`.
     \\pub const class_ranges = [_]ClassRange{
     \\
 ;

@@ -1,21 +1,10 @@
-//! This module translates a neutral `llm.Request` into an Anthropic Messages
-//! API JSON body. It holds no state and does no I/O. Callers own the request
-//! and its backing memory. `Transport` sends the bytes this module produces.
-
 const std = @import("std");
 
 const json = @import("../json.zig");
 const llm = @import("../llm.zig");
 
-/// The exact leading identity the Claude Code compatibility path expects. Both
-/// the subscription and the Console account send it, so the Console key reaches
-/// every model. The plain API-key path omits it and sends only the user's own
-/// prompt.
 const system_header = "You are Claude Code, Anthropic's official CLI for Claude.";
 
-/// Whether `account` leads its system prompt with the Claude Code identity
-/// header. The subscription and Console accounts send it, so their keys reach
-/// every model. A plain API key omits it. A new account must decide here.
 fn sendsSystemHeader(account: llm.Account) bool {
     return switch (account) {
         .anthropic_plan, .anthropic_api => true,
@@ -33,10 +22,6 @@ fn sendsSystemHeader(account: llm.Account) bool {
     };
 }
 
-/// Serialize `request` into an owned JSON body. The caller frees the result.
-/// `account` decides whether to prepend the Claude Code `system_header` (the
-/// subscription and Console accounts) and which stored reasoning replays (see
-/// `emitsBlock`).
 pub fn serialize(gpa: std.mem.Allocator, request: *const llm.Request, account: llm.Account) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
@@ -53,8 +38,6 @@ pub fn serialize(gpa: std.mem.Allocator, request: *const llm.Request, account: l
     try stringify.objectField("stream");
     try stringify.write(true);
 
-    // The request carries no control, or adaptive thinking with a named level.
-    // The Agent resolved it against the model.
     const emit_thinking = request.reasoning.replaysReasoning(.anthropic);
     switch (request.reasoning) {
         .omitted => {},
@@ -66,10 +49,6 @@ pub fn serialize(gpa: std.mem.Allocator, request: *const llm.Request, account: l
         },
     }
 
-    // Prompt-cache breakpoints, model-independent: Anthropic caches the prefix
-    // (tools, then system, then messages) up to each marked block and applies
-    // its per-model minimum server side. Mark the last system block, the last
-    // tool, and the two history blocks of `Breakpoints` — all four allowed.
     try stringify.objectField("system");
     try stringify.beginArray();
     if (sendsSystemHeader(account))
@@ -86,12 +65,6 @@ pub fn serialize(gpa: std.mem.Allocator, request: *const llm.Request, account: l
         try stringify.endArray();
     }
 
-    // The loop writes one envelope per run of consecutive same-role items and
-    // one block per item in list order. It never reorders or concatenates
-    // adjacent text. An item that emits no block (dropped reasoning) must not
-    // open an envelope: a reasoning-only assistant run then serializes as empty
-    // `content`, which Anthropic rejects with a 400. User runs left adjacent by
-    // such a skip merge.
     try stringify.objectField("messages");
     try stringify.beginArray();
     const breakpoints = historyBreakpoints(request.items, emit_thinking, account);
@@ -117,18 +90,13 @@ pub fn serialize(gpa: std.mem.Allocator, request: *const llm.Request, account: l
     return out.toOwnedSlice();
 }
 
-/// A prompt-cache breakpoint: Anthropic caches the request prefix up to and
-/// including the block that carries it (5-minute ephemeral).
 const CacheControl = struct { type: []const u8 = "ephemeral" };
 
-/// The adaptive extended-thinking switch: the model sizes its own budget, and
-/// the API returns `summarized` reasoning for display.
 const AdaptiveThinking = struct {
     type: []const u8 = "adaptive",
     display: []const u8 = "summarized",
 };
 
-/// The named effort level that steers reasoning depth (and answer effort).
 const OutputConfig = struct { effort: []const u8 };
 
 const ThinkingBlock = struct {
@@ -179,9 +147,6 @@ fn writeTool(stringify: *std.json.Stringify, tool: *const llm.Tool, cache: bool)
     try stringify.endObject();
 }
 
-/// Whether an item serializes to a content block. Reasoning drops when the
-/// request names no thinking control, when it belongs to another account, or
-/// when it carries a different provider's replay proof.
 fn emitsBlock(item: llm.Item, emit_thinking: bool, account: llm.Account) bool {
     return switch (item) {
         .reasoning => |reasoning| if (!emit_thinking)
@@ -212,15 +177,8 @@ fn emitsBlock(item: llm.Item, emit_thinking: bool, account: llm.Account) bool {
     };
 }
 
-/// The item indices that carry the two history cache breakpoints, or null
-/// where no item emits a block.
 const Breakpoints = struct {
-    /// The last emitted block. It writes the entry for this request.
     current: ?usize = null,
-    /// The last block of the most recent closed user envelope. It carried the
-    /// breakpoint of the previous request. The server then reads that entry even
-    /// when the new turn adds more blocks than its automatic prefix check scans
-    /// back (about 20).
     previous: ?usize = null,
 
     fn carries(self: *const Breakpoints, index: usize) bool {
@@ -245,8 +203,6 @@ fn historyBreakpoints(
     return breakpoints;
 }
 
-/// The Anthropic message role an item belongs to: reasoning and tool calls are
-/// assistant output. A tool result feeds back as a user item.
 fn itemRole(item: llm.Item) llm.Role {
     return switch (item) {
         .message => |message| message.role,
@@ -267,10 +223,7 @@ fn writeItem(stringify: *std.json.Stringify, item: *const llm.Item, cache: bool)
             .text = message.text,
             .cache_control = control,
         }),
-        // Reasoning sits at the head of an assistant message, never as the
-        // cached last block, so it carries no cache breakpoint.
         .reasoning => |*reasoning| try writeThinking(stringify, reasoning),
-        // The model emits tool arguments as JSON already, so embed them verbatim.
         .tool_call => |call| try stringify.write(ToolUseBlock{
             .id = call.call_id,
             .name = call.name,
@@ -286,7 +239,6 @@ fn writeItem(stringify: *std.json.Stringify, item: *const llm.Item, cache: bool)
     }
 }
 
-/// Serialize a stored Anthropic replay proof as normal or redacted thinking.
 fn writeThinking(stringify: *std.json.Stringify, reasoning: *const llm.Item.Reasoning) !void {
     switch (reasoning.replay) {
         inline .anthropic_plan,
@@ -419,24 +371,19 @@ test "synthetic error results group in one user envelope before steering text" {
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
     defer parsed.deinit();
     const messages = parsed.value.object.get("messages").?.array.items;
-    // One assistant envelope for the calls, then one user envelope that groups
-    // both immediate error results ahead of the steering text.
     try std.testing.expectEqual(@as(usize, 2), messages.len);
     const content = messages[1].object.get("content").?.array.items;
     try std.testing.expectEqual(@as(usize, 3), content.len);
     try std.testing.expectEqualStrings("tool_result", content[0].object.get("type").?.string);
     try std.testing.expectEqual(true, content[0].object.get("is_error").?.bool);
     try std.testing.expectEqualStrings("t1", content[0].object.get("tool_use_id").?.string);
-    // Stored verbatim with no `Error:` prefix.
     try std.testing.expectEqualStrings(synthetic, content[0].object.get("content").?.string);
     try std.testing.expectEqualStrings("tool_result", content[1].object.get("type").?.string);
     try std.testing.expectEqualStrings("t2", content[1].object.get("tool_use_id").?.string);
-    // The steering text follows the results in the same user envelope.
     try std.testing.expectEqualStrings("text", content[2].object.get("type").?.string);
     try std.testing.expectEqualStrings("steer", content[2].object.get("text").?.string);
 }
 
-// The model string is arbitrary: the serializer places breakpoints the same way for every model.
 test "cache_control marks the system prompt, last tool, previous user block, and last block" {
     const tools = [_]llm.Tool{
         .{ .name = "read", .description = "d", .parameters = &.{} },
@@ -477,10 +424,6 @@ test "cache_control marks the system prompt, last tool, previous user block, and
     try std.testing.expect(last_blocks[1].object.get("cache_control") != null);
 }
 
-// The previous request ended at the steering text, so its breakpoint sat there.
-// The breakpoint on that block lets the server read the entry when the new turn
-// adds more blocks than its prefix check scans back. The tool result in the same
-// envelope carries none.
 test "cache_control also marks the last block of the previous user envelope" {
     const items = [_]llm.Item{
         .{ .message = .{ .role = .user, .text = "hello" } },
@@ -503,7 +446,6 @@ test "cache_control also marks the last block of the previous user envelope" {
     defer parsed.deinit();
     const envelopes = parsed.value.object.get("messages").?.array.items;
     try std.testing.expectEqual(@as(usize, 5), envelopes.len);
-    // One flag per block in envelope order: hello, t1, result, steer, a, next.
     const marked = [_]bool{ false, false, false, true, false, true };
     var block_index: usize = 0;
     for (envelopes) |envelope| {
@@ -528,8 +470,6 @@ test "every reasoning control renders its own block" {
         .tools = &.{},
     };
 
-    // A request that names no control writes no thinking block at all, so the
-    // model keeps its own default.
     {
         const body = try serialize(gpa, &request, .anthropic_plan);
         defer gpa.free(body);
@@ -539,7 +479,6 @@ test "every reasoning control renders its own block" {
         try std.testing.expect(parsed.value.object.get("output_config") == null);
     }
 
-    // A named level renders adaptive thinking and states the level verbatim.
     {
         var named = request;
         named.reasoning = .{ .named = .xhigh };
@@ -577,8 +516,6 @@ test "an omitted control writes no thinking and no output_config" {
     try std.testing.expectEqual(@as(i64, 8192), parsed.value.object.get("max_tokens").?.integer);
 }
 
-// Anthropic rejects a thinking block in a request that names no thinking control,
-// so an omitted control drops the stored replay.
 test "an omitted control drops the replay" {
     const items = [_]llm.Item{
         .{ .message = .{ .role = .user, .text = "hi" } },
@@ -643,10 +580,6 @@ test "a named control writes adaptive thinking and keeps the replay" {
     try std.testing.expectEqualStrings("thinking", assistant[0].object.get("type").?.string);
 }
 
-// A multi-round conversation that exercises every byte-affecting serializer
-// path: a two-text-block user turn, normal and redacted reasoning at an
-// assistant head, [tool_call, text] interleaving, both is_error values, role
-// transitions.
 const golden_items = [_]llm.Item{
     .{ .message = .{ .role = .user, .text = "first" } },
     .{ .message = .{ .role = .user, .text = "second" } },
@@ -681,10 +614,6 @@ const golden_none =
     \\{"model":"claude-opus-4-8","max_tokens":8192,"stream":true,"system":[{"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."},{"type":"text","text":"be terse","cache_control":{"type":"ephemeral"}}],"messages":[{"role":"user","content":[{"type":"text","text":"first"},{"type":"text","text":"second"}]},{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"read","input":{"path":"a.zig"}},{"type":"text","text":"checking"}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","is_error":false,"content":"contents"}]},{"role":"assistant","content":[{"type":"tool_use","id":"t2","name":"write","input":{"path":"b"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"t2","is_error":true,"content":"done","cache_control":{"type":"ephemeral"}}]},{"role":"assistant","content":[{"type":"text","text":"all set","cache_control":{"type":"ephemeral"}}]}]}
 ;
 
-// Golden bytes keep the serialized prefix stable for Anthropic's server-side
-// prompt cache: a changed prefix invalidates the cache across a deploy.
-// Reasoning on vs. effort none proves the none level drops the thinking
-// blocks and the reasoning config with no other byte change.
 test "golden bytes keep the serialized prefix stable" {
     const on = try serialize(std.testing.allocator, &.{
         .model = "claude-opus-4-8",
@@ -708,8 +637,6 @@ test "golden bytes keep the serialized prefix stable" {
     try std.testing.expectEqualStrings(golden_none, none);
 }
 
-// The API-key account drops the `system_header` and replays its own account's
-// reasoning, with every other block byte-identical to the subscription path.
 const golden_items_api = [_]llm.Item{
     .{ .message = .{ .role = .user, .text = "first" } },
     .{ .reasoning = .{ .replay = .{ .anthropic_api_key = .{ .signature = .{
@@ -772,9 +699,6 @@ test "the console account prepends the Claude Code header and replays its own re
 }
 
 test "a reasoning-only run dropped by an account switch emits no empty envelope" {
-    // Exact-account replay drops the reasoning-only assistant run between two
-    // user turns. The serializer must skip it, not write `"content":[]`, and
-    // the user turns then share one envelope.
     const items = [_]llm.Item{
         .{ .message = .{ .role = .user, .text = "hi" } },
         .{ .reasoning = .{ .replay = .{ .anthropic_plan = .{ .signature = .{
@@ -806,7 +730,6 @@ test "a reasoning-only run dropped by an account switch emits no empty envelope"
 }
 
 test "reasoning is dropped when its replay account differs within the vendor" {
-    // Replay is an exact account match, so it drops though both are Anthropic.
     const items = [_]llm.Item{
         .{ .reasoning = .{ .replay = .{ .anthropic_plan = .{ .signature = .{
             .text = "weigh it",

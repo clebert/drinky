@@ -1,32 +1,10 @@
-//! Networking policy shared across the provider seam: the timeout and retry
-//! knobs (defaults live here, so the config file only patches them), three
-//! bounds, and one bounded read. `withTimeout` bounds one blocking operation.
-//! `Deadline` bounds a run of reads by one fixed instant. `Budget` caps a
-//! stream's total bytes. `getJson` reads one small JSON body behind a bearer
-//! credential.
-
 const std = @import("std");
 
-/// Per-request timeout bounds, applied in the transport. A bound of 0 disables
-/// that timeout.
 pub const Timeouts = struct {
-    /// The time to the response head: DNS, connect, TLS, request send, and
-    /// first byte. This bounds `Transport.send`.
     connect_ms: u64 = 30_000,
-    /// The longest gap tolerated between real streamed events. Keepalive pings
-    /// do not count as progress. This bounds the read of each event.
     idle_ms: u64 = 60_000,
 };
 
-/// The timeout pair of each provider. The idle defaults differ: an Anthropic
-/// stream stays busy with reasoning and argument deltas, so a 60 s gap means a
-/// dead connection. The OpenAI backend sends nothing while the model reasons
-/// privately, and its official client tolerates a 300 s gap, so the OpenAI
-/// window matches that. Gemini and Grok can hold a stream silent while they
-/// think. DeepSeek can take a long time before its first reasoning event.
-/// These providers take the same idle window. A local DwarfStar server can
-/// queue a request or prefill for many minutes, so both of its windows are
-/// one hour.
 pub const ProviderTimeouts = struct {
     anthropic: Timeouts = .{},
     openai: Timeouts = .{ .idle_ms = 300_000 },
@@ -37,31 +15,18 @@ pub const ProviderTimeouts = struct {
     ds4: Timeouts = .{ .connect_ms = 3_600_000, .idle_ms = 3_600_000 },
 };
 
-/// Whole-request retry policy, applied above the transport.
 pub const Retry = struct {
-    /// The total tries per request, the initial attempt included. A value of 1 disables retries.
     attempts_max: u32 = 3,
     backoff_ms_initial: u64 = 500,
     backoff_ms_max: u64 = 16_000,
 
-    /// One failed try: which `attempt` failed (1-based) and the server's
-    /// `retry-after` hint in milliseconds. The hint is 0 when the server gave
-    /// none.
     pub const Failure = struct { attempt: u32, suggested_ms: u64 = 0 };
 
-    /// Whether the policy allows another try after `failure`. A spent attempt
-    /// bound refuses one. A `retry-after` hint longer than `backoff_ms_max`
-    /// refuses one too: the cap bounds every wait, so no wait this policy can
-    /// serve clears a failure that asks for more.
     pub fn allows(self: Retry, failure: Failure) bool {
         if (failure.attempt >= self.attempts_max) return false;
         return failure.suggested_ms <= self.backoff_ms_max;
     }
 
-    /// The wait before the retry that follows `failure`: the initial delay
-    /// doubled once per prior attempt, capped at `backoff_ms_max`. A server hint
-    /// takes precedence over the computed backoff but is capped too. A server
-    /// cannot make a turn wait longer than the local policy allows.
     pub fn backoffMs(self: Retry, failure: Failure) u64 {
         if (failure.suggested_ms > 0) return @min(failure.suggested_ms, self.backoff_ms_max);
         const steps: u6 = @intCast(@min(failure.attempt -| 1, 20));
@@ -78,35 +43,16 @@ fn Timed(comptime Function: type) type {
     return anyerror!payload;
 }
 
-/// Run `function(args)` bounded by `timeout_ms`. It returns the function's
-/// result if it finishes first, or `error.Timeout` if the timer wins (the
-/// operation is canceled and reaped first). A cancel of the calling task
-/// propagates as `error.Canceled`. A `timeout_ms` of 0, or an io without
-/// concurrency, runs the operation unbounded.
-///
-/// Zig's `std.http` offers no request deadline, so the bound is a race of two
-/// concurrent tasks. An operation that finishes right at the deadline can
-/// still surface `error.Timeout` (its reaped result is discarded here). A
-/// caller whose operation acquires resources must be able to reclaim them on
-/// `error.Timeout` (e.g. a flag the operation sets last, checked on the error
-/// path).
 pub fn withTimeout(
     io: std.Io,
     timeout_ms: u64,
     comptime function: anytype,
     args: std.meta.ArgsTuple(@TypeOf(function)),
 ) Timed(@TypeOf(function)) {
-    // A zero bound disables the timeout: run the operation unbounded.
     if (timeout_ms == 0) return @call(.auto, function, args);
     return race(io, timeout_ms, function, args) catch @call(.auto, function, args);
 }
 
-/// The bare race behind `withTimeout`. The timer is registered before the
-/// work, so the operation never starts without its bound. A failed
-/// registration surfaces as the outer `error.ConcurrencyUnavailable`, distinct
-/// from the operation's own result, which lives in the payload. The caller
-/// maps the outer error to its policy (run unbounded, or refuse as the OAuth
-/// callback must).
 pub fn race(
     io: std.Io,
     timeout_ms: u64,
@@ -135,33 +81,20 @@ fn sleep(io: std.Io, milliseconds: u64) std.Io.Cancelable!void {
     return io.sleep(.fromMilliseconds(@intCast(@min(milliseconds, std.math.maxInt(i64)))), .awake);
 }
 
-/// An idle window shared across a run of timed reads: one fixed instant bounds
-/// each read by the time left until it. A read that makes no progress draws
-/// the window down and does not reset it. A source that stays busy without
-/// progress (an Anthropic stream that sends only keepalive pings) still trips.
 pub const Deadline = struct {
-    /// The monotonic instant when the window closes, or null when unbounded.
     at: ?std.Io.Timestamp,
 
-    /// A window `timeout_ms` wide that opens now. The window is unbounded when `timeout_ms` is 0.
     pub fn start(io: std.Io, timeout_ms: u64) Deadline {
         if (timeout_ms == 0) return .{ .at = null };
         const ms: i64 = @intCast(@min(timeout_ms, std.math.maxInt(i64)));
         return .{ .at = std.Io.Clock.awake.now(io).addDuration(.fromMilliseconds(ms)) };
     }
 
-    /// Whether the window has already closed. An unbounded deadline never has.
-    /// This lets a caller time out a source that stays busy without blocking a
-    /// read, which the read-bounding `call` never reaches.
     pub fn expired(self: Deadline, io: std.Io) bool {
         const at = self.at orelse return false;
         return std.Io.Clock.awake.now(io).durationTo(at).nanoseconds <= 0;
     }
 
-    /// Run `function(args)` bounded by the time left until the deadline. It
-    /// returns the function's result if it finishes first, or `error.Timeout`
-    /// once the window has closed. A call already past the deadline is refused
-    /// without a run. An unbounded deadline runs it without a bound.
     pub fn call(
         self: Deadline,
         io: std.Io,
@@ -176,8 +109,6 @@ pub const Deadline = struct {
     }
 };
 
-/// A decompression window sized for `encoding`, or an empty slice when the body
-/// is not compressed. The caller frees a non-empty result.
 pub fn decompressBuffer(gpa: std.mem.Allocator, encoding: std.http.ContentEncoding) ![]u8 {
     return switch (encoding) {
         .identity => &.{},
@@ -187,32 +118,17 @@ pub fn decompressBuffer(gpa: std.mem.Allocator, encoding: std.http.ContentEncodi
     };
 }
 
-/// Whether a runtime string is safe as an HTTP header value: non-empty and free
-/// of CR/LF, so a hostile credential cannot split the request head.
 pub fn validHeaderValue(value: []const u8) bool {
     return value.len != 0 and std.mem.indexOfAny(u8, value, "\r\n") == null;
 }
 
-/// One GET of a JSON body behind a bearer credential. The billing reads of the
-/// status line share this shape: a small body, a short bound, and no retry.
-/// The defaults are that policy, so a read names its endpoint and its
-/// credential alone.
 pub const Get = struct {
     url: []const u8,
     bearer: []const u8,
-    /// The bound on the whole request, or 0 for none. The GET only fills the
-    /// status line. A hung proxy must not stall the reply or the tools. The
-    /// end of the round can still wait on this bound.
     timeout_ms: u64 = 5_000,
-    /// A billing body holds a few hundred bytes. The cap bounds a hostile one,
-    /// at the size the OAuth token response takes.
     body_bytes_max: usize = 256 * 1024,
 };
 
-/// The body of an OK response to `get`, or null for any other status. The
-/// caller owns a body. A credential that cannot be a header value refuses the
-/// request before it opens. A body that arrives after the bound is freed here,
-/// so a timeout leaks nothing.
 pub fn getJson(gpa: std.mem.Allocator, io: std.Io, get: *const Get) !?[]u8 {
     if (!validHeaderValue(get.bearer)) return error.BadCredentials;
     var out: ?[]u8 = null;
@@ -252,45 +168,19 @@ fn getInto(gpa: std.mem.Allocator, io: std.Io, get: *const Get, out: *?[]u8) !vo
     out.* = try reader.allocRemaining(gpa, .limited(get.body_bytes_max));
 }
 
-/// A hard ceiling on the total wire bytes one streamed response body can
-/// deliver. The budget of one stream is a running total over the whole body,
-/// and every provider shares this ceiling. A DeepSeek reasoning frame carries
-/// about 167 bytes for one token, so a 384k-token reply projects to about
-/// 63 MiB. A slightly denser frame passes 64 MiB, so this ceiling keeps
-/// headroom above the projection, and it still bounds a stream that never
-/// ends. A safety limit, not a tunable, like the OAuth token-response cap.
 pub const stream_response_bytes_max = 256 << 20;
 
-/// The bytes of a failed response body that a transport captures for the error
-/// report. The report reads the message out of the captured JSON, so the whole
-/// body must fit. An Anthropic or OpenAI body stays under 512 bytes. An
-/// OpenRouter body embeds the whole upstream body as a string, with remedy hints
-/// around it, so it runs to a few thousand bytes. A Google body carries a
-/// `details` array. A longer body reports its cut raw bytes.
 pub const error_body_bytes_max = 4096;
 
-/// A running byte budget for one streamed response, shared across its reads.
-/// It is the volume counterpart to `Deadline`, so a peer that continues to
-/// make valid progress still hits an aggregate ceiling. Bytes are charged
-/// after decompression, the memory-relevant quantity.
 pub const Budget = struct {
-    /// The bytes charged so far.
     used: usize = 0,
-    /// The ceiling. A charge that carries `used` past it fails.
     max: usize,
 
-    /// Charge `bytes` against the budget. The charge fails once the running
-    /// total passes the ceiling. The addition saturates, so no single charge
-    /// can wrap the counter back under the ceiling.
     pub fn take(self: *Budget, bytes: usize) error{StreamResponseTooLarge}!void {
         self.used +|= bytes;
         if (self.used > self.max) return error.StreamResponseTooLarge;
     }
 
-    /// The bytes the stream can still deliver before the ceiling, or zero once
-    /// spent. Bound one line's read by this value. Then a single oversized
-    /// frame cannot allocate past the whole stream's allowance before it is
-    /// buffered.
     pub fn remaining(self: Budget) usize {
         return self.max -| self.used;
     }
@@ -302,9 +192,6 @@ test "credential header values cannot inject another header" {
     try std.testing.expect(!validHeaderValue("token\r\nleaked: value"));
 }
 
-// The defaults are the policy of every billing read. A zero bound would let a
-// hung proxy hold the round, and a bound past the connect bound would wait
-// longer for a billing head than a model request waits for its own.
 test "a billing read takes a short bound and a small body cap by default" {
     const get: Get = .{ .url = "https://example.invalid/", .bearer = "token" };
     const timeouts: Timeouts = .{};
@@ -327,11 +214,9 @@ test "getJson refuses a credential that cannot be a header before it opens" {
 test "Budget charges until the running total passes its ceiling" {
     var budget: Budget = .{ .max = 10 };
     try budget.take(4);
-    try budget.take(6); // used == max is still within the budget
+    try budget.take(6);
     try std.testing.expectEqual(@as(usize, 10), budget.used);
     try std.testing.expectError(error.StreamResponseTooLarge, budget.take(1));
-    // The addition saturates, so an absurd charge trips and does not wrap the
-    // counter back under the ceiling.
     try std.testing.expectError(error.StreamResponseTooLarge, budget.take(std.math.maxInt(usize)));
     try std.testing.expectEqual(@as(usize, std.math.maxInt(usize)), budget.used);
 }
@@ -341,10 +226,8 @@ test "Budget reports the bytes remaining before its ceiling" {
     try std.testing.expectEqual(@as(usize, 10), budget.remaining());
     try budget.take(4);
     try std.testing.expectEqual(@as(usize, 6), budget.remaining());
-    try budget.take(6); // exactly spent
+    try budget.take(6);
     try std.testing.expectEqual(@as(usize, 0), budget.remaining());
-    // The addition saturates, so an overshooting charge leaves remaining at
-    // zero, never wrapped.
     try std.testing.expectError(error.StreamResponseTooLarge, budget.take(5));
     try std.testing.expectEqual(@as(usize, 0), budget.remaining());
 }
@@ -353,17 +236,13 @@ test "allows refuses a spent attempt bound and a hint past the cap" {
     const retry: Retry = .{ .attempts_max = 3, .backoff_ms_max = 16_000 };
     try std.testing.expect(retry.allows(.{ .attempt = 1 }));
     try std.testing.expect(retry.allows(.{ .attempt = 2 }));
-    // The third try is the last one, so no retry follows its failure.
     try std.testing.expect(!retry.allows(.{ .attempt = 3 }));
     try std.testing.expect(!retry.allows(.{ .attempt = 4 }));
 
-    // A hint the policy can serve keeps the retry. A hint past the cap asks for
-    // a wait no retry here can serve, so no retry follows it.
     try std.testing.expect(retry.allows(.{ .attempt = 1, .suggested_ms = 16_000 }));
     try std.testing.expect(!retry.allows(.{ .attempt = 1, .suggested_ms = 16_001 }));
     try std.testing.expect(!retry.allows(.{ .attempt = 1, .suggested_ms = 3_600_000 }));
 
-    // A policy of one try disables retries.
     const once: Retry = .{ .attempts_max = 1 };
     try std.testing.expect(!once.allows(.{ .attempt = 1 }));
 }
@@ -378,9 +257,6 @@ test "backoffMs without a hint doubles per attempt and caps" {
 
 test "backoffMs caps a server hint at the max backoff" {
     const retry: Retry = .{ .backoff_ms_initial = 500, .backoff_ms_max = 16_000 };
-    // A hint longer than the local policy is capped, so a turn never waits
-    // longer than the computed backoff's ceiling. A saturated hint cannot wrap
-    // past it either.
     try std.testing.expectEqual(
         @as(u64, 16_000),
         retry.backoffMs(.{ .attempt = 1, .suggested_ms = 3_600_000 }),
@@ -393,8 +269,6 @@ test "backoffMs caps a server hint at the max backoff" {
         @as(u64, 16_000),
         retry.backoffMs(.{ .attempt = 1, .suggested_ms = std.math.maxInt(u64) }),
     );
-    // A hint at or below the cap takes precedence over the computed backoff,
-    // whether it is longer or shorter than that backoff.
     try std.testing.expectEqual(
         @as(u64, 5000),
         retry.backoffMs(.{ .attempt = 1, .suggested_ms = 5000 }),
@@ -403,7 +277,6 @@ test "backoffMs caps a server hint at the max backoff" {
         @as(u64, 200),
         retry.backoffMs(.{ .attempt = 3, .suggested_ms = 200 }),
     );
-    // No hint falls back to the exponential backoff.
     try std.testing.expectEqual(@as(u64, 1000), retry.backoffMs(.{ .attempt = 2 }));
 }
 
@@ -455,11 +328,8 @@ test "Deadline draws its window down instead of resetting per read" {
     defer threaded.deinit();
     const io = threaded.io();
     const deadline = Deadline.start(io, 100);
-    // A read inside the window returns its result and, unlike a fresh per-read
-    // timeout, does not extend the window.
     try std.testing.expect(!deadline.expired(io));
     try std.testing.expectEqual(@as(u64, 42), try deadline.call(io, fastWork, .{io}));
-    // Past the window, it is expired and the next read is refused without a run.
     try io.sleep(.fromMilliseconds(150), .awake);
     try std.testing.expect(deadline.expired(io));
     try std.testing.expectError(error.Timeout, deadline.call(io, fastWork, .{io}));
@@ -472,7 +342,6 @@ test "the DwarfStar timeout defaults are one hour and independent" {
     try std.testing.expectEqual(timeouts.anthropic.connect_ms, timeouts.xai.connect_ms);
     try std.testing.expectEqual(timeouts.anthropic.connect_ms, timeouts.openrouter.connect_ms);
     try std.testing.expectEqual(timeouts.anthropic.connect_ms, timeouts.deepseek.connect_ms);
-    // The generic pair serves the short OAuth and token requests.
     try std.testing.expectEqual(@as(Timeouts, .{}), timeouts.anthropic);
     try std.testing.expect(timeouts.openai.idle_ms > timeouts.anthropic.idle_ms);
     try std.testing.expectEqual(timeouts.openai.idle_ms, timeouts.google.idle_ms);

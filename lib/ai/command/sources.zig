@@ -1,6 +1,3 @@
-//! `/sources`: ask the app to show the instruction files, the skills, and the
-//! required skills that it loaded at startup. The command takes no argument.
-
 const std = @import("std");
 
 const Context = @import("Context.zig");

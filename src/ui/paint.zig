@@ -1,16 +1,3 @@
-//! Row painters: the primitives that stream one styled row at a time straight
-//! into the view's `Sink` through a `Placement`. They drop the clip's hidden top
-//! rows, so a clipped component never materializes its whole body. The
-//! transcript `block`s and the chrome (the tool box, the input area, and the
-//! status line) share them. Each painter names a `role.Name`, and that role
-//! decides the color, so no painter holds a color value of its own.
-//!
-//! One wrap rule serves every notice: a row breaks at a separator first. A hint
-//! that is still too wide keeps one row and marks its cut, so no hint splits. A
-//! line that holds no separator is a sentence, and it breaks between its words.
-//! Each painter states its rows through a count of its own, so a measure and a
-//! paint cannot diverge.
-
 const std = @import("std");
 
 const terminal = @import("terminal");
@@ -19,74 +6,38 @@ const attribute = @import("attribute.zig");
 const role = @import("role.zig");
 
 const activity_length_default: usize = 6;
-// At 16 ms per frame, wait about 500 ms. Then add one cell every 100 ms.
 const activity_growth_delay_ticks: u64 = 31;
 const activity_growth_interval_ticks: u64 = 6;
-// At 16 ms per frame, show the caret about 600 ms and hide it about 600 ms.
 const caret_blink_ticks: u64 = 37;
 
-/// How a notice paints: the role of its body and the tag that opens it. It
-/// states how a line wider than one row fits too.
 pub const Notice = struct {
-    /// The role of the body.
     role: role.Name,
-    /// A semantic tag, or empty. It stands on the first row of the notice alone.
-    /// Continuation rows start without an indent, so copied text holds no blanks.
     prefix: []const u8 = "",
     fit: Fit = .wrap,
 };
 
-/// The separator between two parts of a legend: a blank, a middle dot, and a
-/// blank. A notice row breaks here first, and the break drops all three, so no
-/// row starts or ends with a separator.
 pub const separator = " \u{00B7} ";
 
-/// The prefixes that open a notice by its kind, so copied text keeps the kind
-/// where the color is gone: information, a warning or a failure, and a line that
-/// Drinky wrote for the user. A warning and a failure share the symbol, and the
-/// role of the notice keeps them apart.
 pub const information_prefix = "ℹ ";
 pub const warning_prefix = "⚠ ";
 pub const note_prefix = "→ ";
 
-/// One row of one logical line: where the content of the row ends, whether that
-/// row cut a hint, and where the next row starts. A `next` at the end of the line
-/// closes that line.
 const Row = struct { end: usize, next: usize, marked: bool = false };
 
-/// A notice as physical rows. Each row breaks at a separator first, so a legend
-/// keeps every hint whole. A hint too wide for a row of its own keeps that row
-/// and states its cut, so no hint ever splits over two rows. A line that holds no
-/// separator is a sentence: it wraps between its words and keeps its tail. The
-/// prefix takes room on the first row alone, and every later row starts at the
-/// first column.
 const Wrap = struct {
     rest: []const u8,
     columns: usize,
-    /// The columns the prefix takes. The first row gives them up, and `next`
-    /// then clears it.
     lead: usize,
-    /// Whether the open logical line holds a separator. The whole line decides
-    /// it, so the last hint of a legend cuts like every hint in front of it.
     legend: bool = false,
-    /// Whether `rest` still starts at the head of a logical line, which is where
-    /// `legend` reads that line.
     fresh: bool = true,
     done: bool = false,
 
-    /// The cells of the next row and the mark of its cut, or null once the notice
-    /// is complete. An empty notice yields one empty row, as an empty line does.
     fn next(self: *Wrap) ?Cut {
         if (self.done) return null;
         const lead = self.lead;
         self.lead = 0;
-        // A prefix that fills the row leaves no cell for content. The row then
-        // holds the prefix alone, and the text opens on the row under it. A row
-        // that takes a cluster there loses it to the clip of the sink.
         if (lead > 0 and lead >= self.columns and self.rest.len > 0) {
             const break_at = std.mem.indexOfScalar(u8, self.rest, '\n') orelse self.rest.len;
-            // The prefix row stands for the first line, so an empty first line
-            // takes no row of its own behind it.
             if (break_at < self.rest.len and lineText(self.rest[0..break_at]).len == 0)
                 self.rest = self.rest[break_at + 1 ..];
             return .{ .kept = "", .marked = false };
@@ -108,9 +59,6 @@ const Wrap = struct {
     }
 };
 
-/// The row that `line` opens with at `room` columns. The row takes as many
-/// separated pieces as it holds. A piece too wide for a row of its own cuts on a
-/// `legend` line, and breaks between its words on a line that holds one sentence.
 fn nextRow(line: []const u8, room: usize, legend: bool) Row {
     const separator_columns = terminal.width.ofText(separator);
     var index: usize = 0;
@@ -127,28 +75,20 @@ fn nextRow(line: []const u8, room: usize, legend: bool) Row {
             index = @min(piece_end + separator.len, line.len);
             continue;
         }
-        // The break drops the separator in front of the piece, so the next row
-        // opens on the piece itself, where the branches below cut or wrap it.
         if (index > 0) return .{ .end = end, .next = index };
         const behind = @min(piece_end + separator.len, line.len);
         if (legend) {
-            // One hint keeps one row, and the mark states what the row dropped.
-            // A hint that splits reads as two hints.
             const shown = cut(piece, room);
             return .{ .end = shown.kept.len, .next = behind, .marked = shown.marked };
         }
         var iterator = terminal.width.wrapper(piece, room);
         const span = iterator.nextSpan().?;
-        // A piece that the word wrap takes whole still did not fit the measure
-        // above, so the row ends on it and the next row opens behind it.
         if (span.end == piece.len) return .{ .end = piece_end, .next = behind };
         return .{ .end = span.end, .next = span.end };
     }
     return .{ .end = end, .next = line.len };
 }
 
-/// The physical rows `text` occupies as a notice at `columns`. Must equal
-/// exactly what `notice` paints, because the window math relies on the parity.
 pub fn noticeRows(look: *const Notice, text: []const u8, columns: usize) usize {
     if (look.fit == .head) return 1;
     var wrap = noticeWrap(look, text, columns);
@@ -161,17 +101,10 @@ fn noticeWrap(look: *const Notice, text: []const u8, columns: usize) Wrap {
     return .{
         .rest = text,
         .columns = columns,
-        // Saturating: a cluster wider than the whole budget survives `truncate`
-        // as a one-column replacement but measures its true width here. A prefix
-        // that opens on one can then report more columns than the row has.
         .lead = terminal.width.ofText(terminal.width.truncate(look.prefix, columns)),
     };
 }
 
-/// One box content row: the text it paints, how that text fits the row, the
-/// emphasized run inside it, and the role that colors it. The row applies that
-/// role at its start, and again behind the run. The role is the one source of
-/// the color of the row, so no caller states it twice.
 const Line = struct {
     content: []const u8,
     fit: Fit,
@@ -179,16 +112,8 @@ const Line = struct {
     role: role.Name = .text,
 };
 
-/// An emphasized run of bytes, as offsets into the text that holds it. A row
-/// paints the part of the run that it holds. An empty run paints nothing.
 const Run = struct { start: usize = 0, end: usize = 0 };
 
-/// A run of a body that takes a role of its own, as byte offsets into that body.
-/// A collapsed paste marker is such a run. A row paints the part of the run that
-/// it holds in that role, so a run wider than the row keeps its role on every
-/// row it crosses. A run with a `url` is a terminal hyperlink to it, underlined
-/// like a link in a reply. `underline` without a url marks emphasis, such as the
-/// name of a current picker value.
 pub const Mark = struct {
     start: usize,
     end: usize,
@@ -197,11 +122,6 @@ pub const Mark = struct {
     underline: bool = false,
 };
 
-/// Where a component composes its rows: the sink to write into, the anchor `id`
-/// its rows carry, the terminal width, the line its content starts at (`base`,
-/// after any leading separator), and how many of its top rows to drop (`skip`,
-/// nonzero only for the clip). A renderer that derives a placement copies its
-/// parent and changes the geometry alone.
 pub const Placement = struct {
     sink: *terminal.View.Sink,
     id: usize,
@@ -210,39 +130,22 @@ pub const Placement = struct {
     skip: usize,
 };
 
-/// How an element fits a logical line that is wider than one row.
 pub const Fit = enum {
-    /// Break the line across as many rows as it needs.
     wrap,
-    /// Keep one row and show the start of the line. One `…` marks the cut. A
-    /// caller picks this when the start of a line identifies it, so the cut
-    /// falls on the detail behind that. A box keeps one row per line, and a
-    /// notice keeps one row for the whole text.
     head,
 };
 
-/// The body of one box: its text, how a long line fits, and which part of the
-/// text the paint emphasizes. The role that colors the box is a paint-time
-/// choice, so the measure does not take it.
 pub const Box = struct {
     text: []const u8,
     fit: Fit = .wrap,
     emphasis: Emphasis = .none,
 
-    /// Which part of a box body the paint emphasizes. The caller names the part
-    /// and never the byte range, so the text and the range cannot disagree.
     pub const Emphasis = enum {
-        /// No part. Every row paints one style from end to end.
         none,
-        /// The value of the first key in the head row, such as the name of a
-        /// tool. That name then stands out from the keys around it.
         first_value,
     };
 };
 
-/// The run that `.first_value` names: the value of the first key of the head
-/// row. The run ends at the blank behind the value, or at the end of the head
-/// row. The run is empty for a head row that holds no key.
 fn firstValue(text: []const u8) Run {
     const head = text[0 .. std.mem.indexOfScalar(u8, text, '\n') orelse text.len];
     const key_separator = ": ";
@@ -253,9 +156,6 @@ fn firstValue(text: []const u8) Run {
     return .{ .start = start, .end = start + length };
 }
 
-/// The physical rows a box occupies at `columns`: the two padding rows around
-/// the body plus the body itself. A `wrap` body counts its wrapped rows, and a
-/// `head` body counts one row per logical line.
 pub fn boxRows(body: *const Box, columns: usize) usize {
     var count: usize = 2;
     var lines = std.mem.splitScalar(u8, body.text, '\n');
@@ -266,21 +166,12 @@ pub fn boxRows(body: *const Box, columns: usize) usize {
     return count;
 }
 
-/// The animation of the live input while a turn runs: the tick that moves the
-/// separator segment, the ticks since the last progress event, and the blink
-/// clock of the caret.
 pub const Activity = struct {
     motion_tick: u64,
     progress_age_ticks: u64,
-    /// The blink clock of the caret, or null for an input that paints no caret,
-    /// such as a picker that waits. The producer restarts it at zero on each
-    /// edit, so the caret stays visible while the user types.
     caret_tick: ?u64 = null,
 };
 
-/// Whether `activity` changes the input area at this width: the separator
-/// segment moves, or the caret blink flips. An input without a caret has no
-/// blink, so its motion alone decides.
 pub fn activityChanged(activity: *const Activity, columns: usize) bool {
     if (activity.caret_tick) |caret_tick| if (caretBlinkChanged(caret_tick)) return true;
     if (columns == 0) return false;
@@ -288,47 +179,27 @@ pub fn activityChanged(activity: *const Activity, columns: usize) bool {
         activityHead(activity.motion_tick -% 1, columns);
 }
 
-/// The columns one row leaves to content: every column of the row.
 pub fn contentColumns(columns: usize) usize {
     return @max(columns, 1);
 }
 
-/// The one character that marks a cut row.
 pub const ellipsis = "…";
 
-/// What a cut leaves of a row: the text that fits, and whether the cut dropped
-/// anything. A caller that keeps `marked` writes `ellipsis` after `kept`.
 pub const Cut = struct { kept: []const u8, marked: bool };
 
-/// `text` cut to `columns_max`. A cut row reserves the one column that the mark
-/// of the cut takes, so the row and its mark together hold the width. Every row
-/// that states a measure or an option takes this rule, so one row stays one row.
 pub fn cut(text: []const u8, columns_max: usize) Cut {
     const shown = terminal.width.truncate(text, columns_max);
     if (shown.len == text.len) return .{ .kept = shown, .marked = false };
     const room = columns_max -| 1;
     const kept = terminal.width.truncate(text, room);
-    // Saturating: `truncate` keeps a cluster wider than its whole budget, because
-    // a row that narrow shows it as a one-column replacement. A row of the full
-    // width paints the real cells of that cluster instead, and the mark then
-    // reaches no cell at all. Such a cluster opens the text and is the whole of
-    // `kept`, so the cut drops it and the mark takes the row.
     if (terminal.width.ofText(kept) > room) return .{ .kept = "", .marked = true };
     return .{ .kept = kept, .marked = true };
 }
 
-/// One box line without the carriage return of a CRLF break. The split that
-/// yields the line breaks on the line feed alone, so that byte stays on the end,
-/// where a row paints it as a replacement glyph. It terminates the line and is
-/// no content, so the row sheds it. A markdown block sheds it the same way.
 fn lineText(line: []const u8) []const u8 {
     return std.mem.trimEnd(u8, line, "\r");
 }
 
-/// `text` as a notice (a notice, an error, the intro, a hint, or a header): the
-/// wrapped rows of every line, with the prefix on the first row alone. A hint
-/// too wide for a row keeps that row and marks its cut. A `head` notice keeps one
-/// row of the first line and marks the cut the same way.
 pub fn notice(placement: *const Placement, look: *const Notice, text: []const u8) !void {
     if (look.fit == .head) return noticeHead(placement, look, text);
     const shown_prefix = terminal.width.truncate(look.prefix, placement.columns);
@@ -346,15 +217,12 @@ pub fn notice(placement: *const Placement, look: *const Notice, text: []const u8
     }
 }
 
-/// Paint the prefix in its role. An absent prefix emits no role bytes.
 fn noticePrefix(sink: *terminal.View.Sink, look: *const Notice, prefix: []const u8) !void {
     if (prefix.len == 0) return;
     try role.apply(sink, look.role);
     try sink.text(prefix);
 }
 
-/// Paint one body row in the body role. `role_active` states that the prefix
-/// already applied that role to the row.
 fn noticeBody(
     sink: *terminal.View.Sink,
     look: *const Notice,
@@ -365,9 +233,6 @@ fn noticeBody(
     try sink.text(text);
 }
 
-/// What one row keeps of `text`: the head of its first line, and whether the row
-/// dropped anything. A line break ends the row, so every line behind it is a cut
-/// too, and the mark states it even where the first line fits whole.
 pub fn headCut(text: []const u8, columns_max: usize) Cut {
     const line_end = std.mem.indexOfScalar(u8, text, '\n') orelse text.len;
     const line = lineText(text[0..line_end]);
@@ -375,14 +240,8 @@ pub fn headCut(text: []const u8, columns_max: usize) Cut {
     return .{ .kept = terminal.width.truncate(line, columns_max -| 1), .marked = true };
 }
 
-/// One row of a fixed label and the head of the text behind it: the label that
-/// opens the row, the cells it leaves to the text, and the mark of the cut.
 const Head = struct { label: []const u8, kept: []const u8, marked: bool };
 
-/// The one row that `label` and `text` share at `columns`. The label comes first,
-/// so a window narrower than the label can never overflow the row. The mark of a
-/// cut takes the last column of the row, and a label that leaves no column for it
-/// gives up its own last column. Every cut then states itself.
 fn headRow(label: []const u8, text: []const u8, columns: usize) Head {
     const shown_label = terminal.width.truncate(label, columns);
     const room = columns -| terminal.width.ofText(shown_label);
@@ -399,9 +258,6 @@ fn headRow(label: []const u8, text: []const u8, columns: usize) Head {
     };
 }
 
-/// The one row of a `head` notice: the prefix, the head of its first line, and
-/// one `…` where the row cut the rest. A caller takes this form where a taller
-/// notice would move the interface around it.
 fn noticeHead(placement: *const Placement, look: *const Notice, text: []const u8) !void {
     if (placement.base < placement.skip) return;
     const row = headRow(look.prefix, text, placement.columns);
@@ -413,11 +269,6 @@ fn noticeHead(placement: *const Placement, look: *const Notice, text: []const u8
     placement.sink.end(.{ .id = placement.id, .line = placement.base });
 }
 
-/// A filled box in one role: a blank padding row, the body fitted to the row
-/// width with the fill carried to full width, then a blank padding row. A box
-/// role reverses the video, so the fill takes the color of the role and the text
-/// keeps the terminal background. It streams one row at a time and separates
-/// itself inside the block gap around it.
 pub fn box(placement: *const Placement, name: role.Name, body: *const Box) !void {
     var line = placement.base;
     try boxPad(placement, &line, name);
@@ -428,8 +279,6 @@ pub fn box(placement: *const Placement, name: role.Name, body: *const Box) !void
     var offset: usize = 0;
     var lines = std.mem.splitScalar(u8, body.text, '\n');
     while (lines.next()) |source| {
-        // The line break the split consumed belongs to the offset of the next
-        // line, so the run keeps its place in the whole text.
         defer offset += source.len + 1;
         const content = lineText(source);
         switch (body.fit) {
@@ -455,14 +304,10 @@ pub fn box(placement: *const Placement, name: role.Name, body: *const Box) !void
     try boxPad(placement, &line, name);
 }
 
-/// `run` in the coordinates of a row that starts at `offset` in the box text. A
-/// row that starts in front of the run keeps its offsets. The row cuts its own
-/// text later, so `boxLineText` alone drops what the row does not hold.
 fn rowRun(run: Run, offset: usize) Run {
     return .{ .start = run.start -| offset, .end = run.end -| offset };
 }
 
-/// A box's blank padding row: the fill carried to full width.
 fn boxPad(placement: *const Placement, line: *usize, name: role.Name) !void {
     defer line.* += 1;
     if (line.* < placement.skip) return;
@@ -473,8 +318,6 @@ fn boxPad(placement: *const Placement, line: *usize, name: role.Name) !void {
     placement.sink.end(.{ .id = placement.id, .line = line.* });
 }
 
-/// A box's content row: the text from the first column, then the fill carried to
-/// full width.
 fn boxLine(placement: *const Placement, line: *usize, row: *const Line) !void {
     defer line.* += 1;
     if (line.* < placement.skip) return;
@@ -488,7 +331,6 @@ fn boxLine(placement: *const Placement, line: *usize, row: *const Line) !void {
 fn boxLineCells(sink: *terminal.View.Sink, columns: usize, row: *const Line) !void {
     const room = contentColumns(columns);
     switch (row.fit) {
-        // The wrap already cut the row, so it needs no mark of its own.
         .wrap => try boxLineText(sink, terminal.width.truncate(row.content, room), row),
         .head => {
             const shown = cut(row.content, room);
@@ -499,13 +341,7 @@ fn boxLineCells(sink: *terminal.View.Sink, columns: usize, row: *const Line) !vo
     try sink.spaces(columns -| sink.columns_written);
 }
 
-/// The text of one box row, with the part of the run that `text` holds in the
-/// emphasis of the box role. The reset that closes the emphasis also closes the
-/// color, so the row applies that role again behind the run.
 fn boxLineText(sink: *terminal.View.Sink, text: []const u8, row: *const Line) !void {
-    // The row cuts its text after the run reaches it, so the clamp lives here
-    // alone. A cut inside the run then emphasizes what the row kept of it. The
-    // clamp keeps the order of the bounds, because `@min` is monotone.
     const start = @min(row.run.start, text.len);
     const end = @min(row.run.end, text.len);
     if (start == end) return sink.text(text);
@@ -519,42 +355,22 @@ fn boxLineText(sink: *terminal.View.Sink, text: []const u8, row: *const Line) !v
 
 const frame_separator_rows = 2;
 
-/// The physical rows an input area occupies: two separators plus `body_rows`.
 pub fn framedRows(body_rows: usize) usize {
     return frame_separator_rows + body_rows;
 }
 
-/// The tallest a framed body can grow before it scrolls within its frame: about
-/// a quarter of the viewport, never fewer than five rows nor more than fifteen.
-/// The live input stays usable and does not crowd out the transcript. The
-/// editor and the picker share it, so both window to the same limit.
 pub fn bodyLimit(viewport_rows: usize) usize {
     return @min(@max(@divFloor(viewport_rows, 4) + 1, 5), 15);
 }
 
-/// An input area between two open separators. While `activity` is set, one
-/// heavy segment moves across both separators as a loop. It grows when progress
-/// is quiet.
 pub const Framing = struct {
     body: []const u8,
     body_rows: usize,
-    /// When set, places the terminal caret on the body row it names
-    /// (component-local row 0 is the top separator). The row counts relative to
-    /// the window.
     caret: ?terminal.View.Caret = null,
-    /// Body rows dropped above the window, and the top separator's "N more" count.
     hidden_above: usize = 0,
-    /// Body rows dropped below the window, and the bottom separator's "N more" count.
     hidden_below: usize = 0,
-    /// An extra empty body row after the wrapped body: the row a caret at a
-    /// full-width final line wraps onto, which the wrap itself never yields. It
-    /// is the last body row, so it shows only when the window reaches it.
     trailing_row: bool = false,
-    /// The role per logical `\n`-delimited body line (lines past the end are
-    /// plain). Wrapped continuations retain their source line's role.
     line_roles: []const ?role.Name = &.{},
-    /// The runs of the body that take a role of their own, sorted by `start` and
-    /// non-overlapping. The role of a line takes over again behind each one.
     marks: []const Mark = &.{},
     activity: ?Activity = null,
 };
@@ -578,8 +394,6 @@ const HorizontalWeights = struct { left: bool, right: bool };
 const RuleRange = struct { rule: Rule, start: usize, end: usize };
 const LabelOptions = struct { arrow: []const u8, more: usize, columns: usize };
 
-/// Stream the input area that `framing` describes. It contains a labelled top
-/// separator, its open body rows, and a labelled bottom separator.
 pub fn framed(placement: *const Placement, framing: *const Framing) !void {
     const content_columns = contentColumns(placement.columns);
     const maybe_activity = framing.activity;
@@ -587,10 +401,6 @@ pub fn framed(placement: *const Placement, framing: *const Framing) !void {
         .columns = placement.columns,
         .activity = maybe_activity,
     };
-    // Drinky blinks the caret itself while the input animates. A terminal holds
-    // its own cursor solid under a continuous repaint, and an animated input
-    // repaints about every 16 ms. An idle input writes nothing, so the terminal
-    // blinks the caret there.
     const caret_shown = if (maybe_activity) |activity|
         caretVisible(activity.caret_tick orelse 0)
     else
@@ -611,9 +421,6 @@ pub fn framed(placement: *const Placement, framing: *const Framing) !void {
         if (index >= window_end) break;
         const roles = framing.line_roles;
         const maybe_role = if (source_line < roles.len) roles[source_line] else null;
-        // The span carries the bytes the row covers, so the paint takes the cells
-        // out of it. A row that keeps the blanks it breaks at puts them in every
-        // copy of the input.
         const content = terminal.width.rowText(framing.body[span.start..span.end]);
         try framedRow(placement, maybe_caret, &line, &.{
             .content = content,
@@ -623,8 +430,6 @@ pub fn framed(placement: *const Placement, framing: *const Framing) !void {
         });
         body_count += 1;
     }
-    // The wrapper exhausts at `index == wrapped rows`, the trailing row's index.
-    // Emit it when the window reaches it (a `break` above leaves it out of view).
     if (framing.trailing_row and index >= framing.hidden_above and index < window_end) {
         try framedRow(placement, maybe_caret, &line, &.{ .content = "" });
         body_count += 1;
@@ -633,8 +438,6 @@ pub fn framed(placement: *const Placement, framing: *const Framing) !void {
     try ruleRow(placement, &separators, &line, .bottom, "↓", framing.hidden_below);
 }
 
-/// One body row of an input area: its cells, where they start in the body, the
-/// role of its logical line, and the marks of the body.
 const FramedRow = struct {
     content: []const u8,
     offset: usize = 0,
@@ -642,9 +445,6 @@ const FramedRow = struct {
     marks: []const Mark = &.{},
 };
 
-/// One open body row. It adds no side glyphs or padding, and it ends on the last
-/// cell it fills, so a terminal copy contains only the body text. The function
-/// drops rows in the clipped top.
 fn framedRow(
     placement: *const Placement,
     maybe_caret: ?terminal.View.Caret,
@@ -662,16 +462,10 @@ fn framedRow(
     placement.sink.end(.{ .id = placement.id, .line = line.* });
 }
 
-/// The text of one framed row, with the part of each mark that the row holds in
-/// the role of the mark. The reset that closes a mark also closes the role of the
-/// line, so the row applies that role again behind the mark. A row with no line
-/// role and no mark writes no escape at all.
 fn framedRowText(sink: *terminal.View.Sink, row: *const FramedRow) !void {
     const text = row.content;
     var position: usize = 0;
     for (row.marks) |mark| {
-        // A mark in front of the row or behind it clamps to an empty run. The
-        // clamp keeps the order of the bounds, because `@min` is monotone.
         const start = @min(mark.start -| row.offset, text.len);
         const end = @min(mark.end -| row.offset, text.len);
         if (start == end) continue;
@@ -680,8 +474,6 @@ fn framedRowText(sink: *terminal.View.Sink, row: *const FramedRow) !void {
         try role.apply(sink, mark.role);
         if (mark.underline or mark.url != null) try attribute.apply(sink, .underline);
         if (mark.url) |url| {
-            // The link opens and closes inside this row, so it covers exactly
-            // the text on this row and never leaks into the row under it.
             try sink.linkSet(url);
         }
         try sink.text(text[start..end]);
@@ -693,10 +485,6 @@ fn framedRowText(sink: *terminal.View.Sink, row: *const FramedRow) !void {
     try sink.text(text[position..]);
 }
 
-/// One labelled horizontal separator. A label masks the moving segment, and the
-/// segment never overwrites it. The label is secondary text, so it takes the
-/// muted role while the glyphs around it keep the frame color. Narrow labels
-/// compact to `↑N` or `↓N` before they hide.
 fn ruleRow(
     placement: *const Placement,
     separators: *const Separators,
@@ -738,7 +526,6 @@ fn ruleCells(
         try sink.text(" ");
         try sink.text(label);
         try sink.text(" ");
-        // Clear faint before the range applies its first frame or activity role.
         try attribute.apply(sink, .reset);
         try drawRuleRange(sink, separators, &.{
             .rule = rule,
@@ -815,8 +602,6 @@ fn separatorCell(separators: *const Separators, rule: Rule, column: usize) Separ
     };
 }
 
-/// Treat the top separator and then the bottom separator as one virtual line.
-/// The segment moves right and crosses between opposite separator ends.
 fn activityAt(separators: *const Separators, rule: Rule, column: usize) bool {
     const maybe_activity = separators.activity;
     if (maybe_activity) |activity| {
@@ -835,8 +620,6 @@ fn activityAt(separators: *const Separators, rule: Rule, column: usize) bool {
     return false;
 }
 
-/// Place the initial segment at the start of the top separator. Move its head
-/// one virtual cell per tick.
 fn activityHead(motion_tick: u64, columns: usize) usize {
     std.debug.assert(columns > 0);
     const track_columns = 2 * columns;
@@ -847,14 +630,10 @@ fn activityHead(motion_tick: u64, columns: usize) usize {
     return if (phase >= wrap_at) phase - wrap_at else phase + offset;
 }
 
-/// Whether the caret shows on this tick. The caret shows for one blink interval
-/// and hides for the next.
 fn caretVisible(caret_tick: u64) bool {
     return caret_tick % (2 * caret_blink_ticks) < caret_blink_ticks;
 }
 
-/// Whether the blink flips on this tick. Each half cycle starts on a multiple of
-/// the blink interval, so tick zero shows the caret again after an edit.
 fn caretBlinkChanged(caret_tick: u64) bool {
     return caret_tick % caret_blink_ticks == 0;
 }
@@ -895,8 +674,6 @@ fn writeSeparatorGlyph(
     }
 }
 
-// A box wraps its text between words, so a copy of its rows out of the terminal
-// holds whole words.
 test "a box breaks its rows between words" {
     const gpa = std.testing.allocator;
     var output: std.Io.Writer.Allocating = .init(gpa);
@@ -922,8 +699,6 @@ test "a box breaks its rows between words" {
     try std.testing.expect(std.mem.indexOf(u8, painted, "four five") != null);
 }
 
-// One rule everywhere: a box adds no pad of its own, so a box row and an input
-// row both take every column and start at the first one.
 test "every row leaves the complete width to content" {
     try std.testing.expectEqual(@as(usize, 1), contentColumns(0));
     try std.testing.expectEqual(@as(usize, 1), contentColumns(1));
@@ -931,9 +706,6 @@ test "every row leaves the complete width to content" {
     try std.testing.expectEqual(@as(usize, 80), contentColumns(80));
 }
 
-// A paste from a CRLF source ends every line with a carriage return. That byte
-// terminates the line and is no content, so the row sheds it instead of painting
-// a replacement glyph at the end of every row.
 test "a box row sheds the carriage return of a CRLF break" {
     const gpa = std.testing.allocator;
     var output: std.Io.Writer.Allocating = .init(gpa);
@@ -954,16 +726,12 @@ test "a box row sheds the carriage return of a CRLF break" {
     try view.render();
 
     const painted = output.written();
-    // Two padding rows and one row a line: the shed byte adds no row.
     try std.testing.expectEqual(@as(usize, 4), boxRows(&body, columns));
     try std.testing.expect(std.mem.indexOf(u8, painted, "first line") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "second line") != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, "\u{FFFD}") == null);
 }
 
-// A one-row fit shows the head of a line and marks the cut with one ellipsis.
-// The head of each line identifies it, so the cut falls on the detail behind it.
-// Each logical line keeps its own row.
 test "a fitted box holds one row per line" {
     const gpa = std.testing.allocator;
     const columns = 20;
@@ -987,13 +755,9 @@ test "a fitted box holds one row per line" {
     const painted = output.written();
     try std.testing.expectEqual(@as(usize, 4), boxRows(&body, columns));
     try std.testing.expect(std.mem.indexOf(u8, painted, "Tool: write · File:\u{2026}") != null);
-    // The summary line keeps its own row and fits whole.
     try std.testing.expect(std.mem.indexOf(u8, painted, "Lines: 1") != null);
 }
 
-// The head row of a tool box names the tool, and that name takes the emphasis of
-// the box role. The reset that closes the emphasis also closes the color, so the
-// row applies that role again behind the name. No other row emphasizes anything.
 test "a box emphasizes the value of its first key" {
     const gpa = std.testing.allocator;
     var output: std.Io.Writer.Allocating = .init(gpa);
@@ -1023,16 +787,12 @@ test "a box emphasizes the value of its first key" {
     try std.testing.expect(std.mem.indexOf(u8, painted, head) != null);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, painted, "\x1b[1m"));
 
-    // A terminal copy loses every style, so each row reads as one line of text.
     const plain = try terminal.View.plainText(gpa, painted);
     defer gpa.free(plain);
     try std.testing.expect(std.mem.indexOf(u8, plain, "Tool: read \u{00B7} File: a.zig") != null);
     try std.testing.expect(std.mem.indexOf(u8, plain, "Lines: 3") != null);
 }
 
-// A row cuts its text after the run reaches it. The row then emphasizes what it
-// kept of the run, and a wrap carries the rest to the row below. Every row still
-// carries its fill to the full width.
 test "a narrow box cuts its run and carries the rest to the next row" {
     const gpa = std.testing.allocator;
     var output: std.Io.Writer.Allocating = .init(gpa);
@@ -1056,15 +816,12 @@ test "a narrow box cuts its run and carries the rest to the next row" {
     try view.render();
 
     const painted = output.written();
-    // The name is wider than the row, so the row that opens it emphasizes every
-    // cell, and the row below emphasizes the rest of the name alone.
     const opened = comptime role.sequence(.tool_pending) ++ "\x1b[1mread_the_fil";
     const carried = comptime "\x1b[1me\x1b[0m" ++ role.sequence(.tool_pending) ++
         " \u{00B7} File: a";
     try std.testing.expect(std.mem.indexOf(u8, painted, opened) != null);
     try std.testing.expect(std.mem.indexOf(u8, painted, carried) != null);
 
-    // Two padding rows around three content rows, each one full row of fill.
     const plain = try terminal.View.plainText(gpa, painted);
     defer gpa.free(plain);
     var rows = std.mem.splitSequence(u8, plain, "\r\n");
@@ -1074,22 +831,15 @@ test "a narrow box cuts its run and carries the rest to the next row" {
     try std.testing.expectEqual(boxRows(&body, columns), count);
 }
 
-// The run covers the value of the first key of the head row. A body that holds no
-// key states no run. A row keeps the offsets of the run, and only the paint
-// clamps them to the text that the row shows.
 test "the emphasized run covers the first value alone" {
     try std.testing.expectEqual(Run{ .start = 6, .end = 10 }, firstValue(
         "Tool: read \u{00B7} File: a.zig\nLines: 3",
     ));
-    // A call with no subject is its name alone, and the name ends the row.
     try std.testing.expectEqual(Run{ .start = 6, .end = 21 }, firstValue("Tool: describe_drinky"));
-    // A user message holds no key, so no part of the box takes the emphasis.
     try std.testing.expectEqual(Run{}, firstValue("please read a.zig"));
 
     const run: Run = .{ .start = 6, .end = 10 };
-    // A row behind the run keeps no offset of it, so the paint shows no run.
     try std.testing.expectEqual(Run{ .start = 0, .end = 0 }, rowRun(run, 25));
-    // A row in front of the run keeps every byte of it.
     try std.testing.expectEqual(run, rowRun(run, 0));
 }
 
@@ -1143,8 +893,6 @@ test "a separator label reads as muted text between the frame glyphs" {
     try ruleRow(&placement, &separators, &line, .top, "↑", 3);
     try view.render();
 
-    // The count is secondary text. The reset clears its faint intensity before
-    // the frame color starts again behind it.
     const label = comptime role.sequence(.muted) ++ " ↑ Hidden: 3 \x1b[0m" ++
         role.sequence(.input_frame);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), label) != null);
@@ -1245,7 +993,6 @@ test "the caret blinks in equal halves and each flip repaints" {
     try std.testing.expect(!caretVisible(2 * caret_blink_ticks - 1));
     try std.testing.expect(caretVisible(2 * caret_blink_ticks));
 
-    // A flip repaints even where the separator segment cannot move.
     try std.testing.expect(activityChanged(
         &.{ .motion_tick = 1, .progress_age_ticks = 0, .caret_tick = caret_blink_ticks },
         0,
@@ -1254,8 +1001,6 @@ test "the caret blinks in equal halves and each flip repaints" {
         &.{ .motion_tick = 1, .progress_age_ticks = 0, .caret_tick = caret_blink_ticks + 1 },
         0,
     ));
-    // An input without a caret has no flip, so a segment that cannot move
-    // repaints nothing.
     try std.testing.expect(!activityChanged(&.{ .motion_tick = 0, .progress_age_ticks = 0 }, 0));
 }
 
@@ -1295,8 +1040,6 @@ test "an animated input places its caret only on the visible half" {
     }
 }
 
-/// Paint `framing` into a fresh view of `columns` and return the bytes of the
-/// frame. The caller owns the result.
 fn paintedFramed(gpa: std.mem.Allocator, columns: usize, framing: *const Framing) ![]u8 {
     var output: std.Io.Writer.Allocating = .init(gpa);
     defer output.deinit();
@@ -1314,8 +1057,6 @@ fn paintedFramed(gpa: std.mem.Allocator, columns: usize, framing: *const Framing
     return gpa.dupe(u8, output.written());
 }
 
-// A mark takes its role for its own bytes alone. The text around it stays plain,
-// so a row with no line role writes no escape outside the mark.
 test "a framed row paints a mark in its role and keeps the rest plain" {
     const gpa = std.testing.allocator;
     const marker = "\u{200B}[Paste #1: 11 lines]\u{200B}";
@@ -1330,8 +1071,6 @@ test "a framed row paints a mark in its role and keeps the rest plain" {
     try std.testing.expect(std.mem.indexOf(u8, painted, row) != null);
 }
 
-// A mark wider than the row breaks with the wrap. Each row paints the part of
-// the mark that it holds in the role of the mark, so no part of it reads plain.
 test "a mark that wraps keeps its role on every row it crosses" {
     const gpa = std.testing.allocator;
     const marker = "\u{200B}[Paste #1: 11 lines]\u{200B}";
@@ -1347,8 +1086,6 @@ test "a mark that wraps keeps its role on every row it crosses" {
     try std.testing.expect(std.mem.indexOf(u8, painted, carried) != null);
 }
 
-// A line role opens the row, and it takes over again behind a mark, so the text
-// behind the mark keeps the color of its line.
 test "a mark can underline without a link" {
     const gpa = std.testing.allocator;
     const painted = try paintedFramed(gpa, 40, &.{
@@ -1409,8 +1146,6 @@ test "overflow labels compact before disappearing" {
     }) == null);
 }
 
-// The case the width of an error tag makes: the tag fills the row, so the
-// sentence starts under it and keeps every word.
 test "a notice keeps its text where the prefix fills the row" {
     const gpa = std.testing.allocator;
     const look: Notice = .{ .role = .@"error", .prefix = "Error: " };
@@ -1425,18 +1160,12 @@ fn expectCut(shown: Cut, kept: []const u8, marked: bool) !void {
     try std.testing.expectEqual(marked, shown.marked);
 }
 
-// One cut keeps the column of its mark, whatever the clusters of the text do. A
-// row that paints a wide cluster in the cells of the mark cuts silently, and a
-// silent cut is the one thing the mark exists to stop.
 test "a cut always leaves the mark a column of its own" {
     try expectCut(cut("ab", 2), "ab", false);
     try expectCut(cut("abc", 2), "a", true);
-    // A cluster that fits the room stays, and the mark takes the column behind it.
     try expectCut(cut("\u{4F60}ab", 3), "\u{4F60}", true);
-    // A cluster wider than the room goes away whole, so the mark stands alone.
     try expectCut(cut("\u{4F60}x", 2), "", true);
     try expectCut(cut("\u{4F60}x", 1), "", true);
-    // Every cut holds the width: the cells it keeps plus the one of the mark.
     for ([_][]const u8{ "abc", "\u{4F60}x", "a\u{4F60}b", "\u{4F60}\u{4F60}" }) |text| {
         for (1..6) |columns| {
             const shown = cut(text, columns);
@@ -1446,8 +1175,6 @@ test "a cut always leaves the mark a column of its own" {
     }
 }
 
-// The rows one notice paints at `columns`, as one plain text the caller owns.
-// Every style goes, so each row reads as one line of text.
 fn paintedNotice(
     gpa: std.mem.Allocator,
     look: *const Notice,
@@ -1470,9 +1197,6 @@ fn paintedNotice(
     return terminal.View.plainText(gpa, output.written());
 }
 
-// A legend breaks at its separators, so every hint stays whole and no row starts
-// or ends with a separator. A hint too wide for a row of its own keeps one row
-// and states its cut. The count and the paint agree at every width.
 test "a notice breaks its rows at a separator" {
     const gpa = std.testing.allocator;
     const parts = [_][]const u8{
@@ -1495,12 +1219,9 @@ test "a notice breaks its rows at a separator" {
             try std.testing.expect(!std.mem.endsWith(u8, row, "\u{00B7}"));
         }
         try std.testing.expectEqual(noticeRows(&look, text, columns), count);
-        // A row that holds the widest hint keeps every hint whole. A row too
-        // narrow for one hint breaks that hint between its words instead.
         if (columns < 21) continue;
         for (parts) |part| try std.testing.expect(std.mem.indexOf(u8, plain, part) != null);
     }
-    // A width that holds two hints and their separator holds no third one.
     const plain = try paintedNotice(gpa, &look, text, 40);
     defer gpa.free(plain);
     try std.testing.expect(std.mem.indexOf(
@@ -1509,8 +1230,6 @@ test "a notice breaks its rows at a separator" {
         "Enter: Send \u{00B7} Shift+Enter: New line\r\n",
     ) != null);
 
-    // A hint wider than the whole row cuts, because a hint that splits over two
-    // rows reads as two hints. Every hint then holds exactly one row.
     const narrow = try paintedNotice(gpa, &look, text, 12);
     defer gpa.free(narrow);
     var narrow_rows = std.mem.splitSequence(u8, narrow, "\r\n");
@@ -1521,9 +1240,6 @@ test "a notice breaks its rows at a separator" {
     try std.testing.expect(narrow_rows.next() == null);
 }
 
-// A line that holds no separator is a sentence. It breaks between its words, as
-// the plain wrap breaks one, so a notice never loses the tail of a sentence and
-// never marks a cut it did not make.
 test "a notice sentence breaks between its words and keeps its tail" {
     const gpa = std.testing.allocator;
     const look: Notice = .{ .role = .muted };
@@ -1539,14 +1255,11 @@ test "a notice sentence breaks between its words and keeps its tail" {
     try std.testing.expect(std.mem.indexOf(u8, plain, "Drinky could not") != null);
     try std.testing.expect(std.mem.indexOf(u8, plain, "AccessDenied.") != null);
     try std.testing.expect(std.mem.indexOf(u8, plain, ellipsis) == null);
-    // A word wider than the whole row still breaks inside itself, as it must.
     const word = try paintedNotice(gpa, &look, "AccessDeniedError", 8);
     defer gpa.free(word);
     try std.testing.expectEqualStrings("AccessDe\r\nniedErro\r\nr", word);
 }
 
-// The tag of an error stands on the first row of one notice alone. Two tags read
-// as two errors, and an indent puts blanks into a copied row.
 test "a notice prefix opens its first row alone" {
     const gpa = std.testing.allocator;
     const look: Notice = .{ .role = .@"error", .prefix = "Error: " };
@@ -1560,15 +1273,12 @@ test "a notice prefix opens its first row alone" {
     var count: usize = 0;
     while (rows.next()) |row| : (count += 1) {
         try std.testing.expect(terminal.width.ofText(row) <= 24);
-        // Every row after the first one opens on its own first character.
         if (count > 0) try std.testing.expect(!std.mem.startsWith(u8, row, " "));
     }
     try std.testing.expectEqual(noticeRows(&look, text, 24), count);
     try std.testing.expect(std.mem.indexOf(u8, plain, "Try again.") != null);
 }
 
-// A one-row notice keeps its height and marks what the row cut. The footer
-// takes this form, because a row that grows moves the interface under it.
 test "a head notice keeps one row and marks its cut" {
     const gpa = std.testing.allocator;
     const look: Notice = .{ .role = .muted, .fit = .head };
@@ -1579,37 +1289,27 @@ test "a head notice keeps one row and marks its cut" {
     defer gpa.free(plain);
     try std.testing.expectEqualStrings("Drinky returned" ++ ellipsis, plain);
 
-    // A row that holds the whole text takes no mark.
     const short = try paintedNotice(gpa, &look, "Ctrl+P: Edit", 16);
     defer gpa.free(short);
     try std.testing.expectEqualStrings("Ctrl+P: Edit", short);
 
-    // A first line that fits still hides every line behind it, so the mark
-    // states that cut too.
     const dropped = try paintedNotice(gpa, &look, "boom\nmore", 16);
     defer gpa.free(dropped);
     try std.testing.expectEqualStrings("boom" ++ ellipsis, dropped);
 
-    // A cluster wider than the room of the row would take the cells of the mark,
-    // so the cut drops it and the mark states the row on its own.
     const wide = try paintedNotice(gpa, &look, "\u{4F60}x", 2);
     defer gpa.free(wide);
     try std.testing.expectEqualStrings(ellipsis, wide);
 
-    // A prefix that fills the row gives up its last column to the mark, because
-    // the mark states the cut of a row that shows no content at all.
     const tagged: Notice = .{ .role = .@"error", .prefix = "Error: ", .fit = .head };
     const filled = try paintedNotice(gpa, &tagged, "boom", 7);
     defer gpa.free(filled);
     try std.testing.expectEqualStrings("Error:" ++ ellipsis, filled);
-    // A row that holds the whole text keeps the whole prefix.
     const fits = try paintedNotice(gpa, &tagged, "boom", 11);
     defer gpa.free(fits);
     try std.testing.expectEqualStrings("Error: boom", fits);
 }
 
-// A wrapped notice behind a full-width prefix opens on the row under the prefix.
-// An empty first line needs no row there, because the prefix row is that line.
 test "a notice prefix row stands for an empty first line" {
     const gpa = std.testing.allocator;
     const look: Notice = .{ .role = .@"error", .prefix = "Error: " };
@@ -1619,9 +1319,6 @@ test "a notice prefix row stands for an empty first line" {
     try std.testing.expectEqual(@as(usize, 3), noticeRows(&look, "\nTry again.", 7));
 }
 
-// A prefix wider than the whole row takes that row for itself, and the text
-// opens on the row under it. No row overflows the width, and no cluster of the
-// text falls behind the prefix, where the clip of the sink would eat it.
 test "a wide notice prefix fits in a one-column row" {
     const gpa = std.testing.allocator;
     var output: std.Io.Writer.Allocating = .init(gpa);
@@ -1631,7 +1328,6 @@ test "a wide notice prefix fits in a one-column row" {
 
     const look: Notice = .{ .role = .muted, .prefix = "你" };
     try std.testing.expectEqual(@as(usize, 3), noticeRows(&look, "hi", 1));
-    // An empty notice states its prefix and needs no row of its own for content.
     try std.testing.expectEqual(@as(usize, 1), noticeRows(&look, "", 1));
 
     const sink = try view.beginFrame(.{ .columns = 1, .rows = 8 }, 1);
@@ -1649,7 +1345,6 @@ test "a wide notice prefix fits in a one-column row" {
     const plain = try terminal.View.plainText(gpa, output.written());
     defer gpa.free(plain);
     var rows = std.mem.splitSequence(u8, plain, "\r\n");
-    // The prefix holds the first row, and the text follows it whole.
     try std.testing.expectEqualStrings("\u{FFFD}", rows.next().?);
     try std.testing.expectEqualStrings("h", rows.next().?);
     try std.testing.expectEqualStrings("i", rows.next().?);

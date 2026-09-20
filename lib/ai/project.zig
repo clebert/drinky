@@ -1,43 +1,19 @@
-//! The repository boundary of one working directory. This module owns what marks
-//! a repository, where a scan must stop, and whether a path stays inside that
-//! boundary. Every scan that must not cross a repository reads the rule here, so
-//! one answer serves all of them.
-
 const std = @import("std");
 const builtin = @import("builtin");
 
-/// The name of the file or directory that marks the root of a repository. A
-/// normal clone carries a directory. A worktree and a submodule carry a file.
 pub const marker_name = ".git";
 
-/// Where the search for the repository root ended. Every path is a slice of the
-/// working directory the search started in, so the caller keeps the memory.
 pub const Boundary = struct {
-    /// The highest directory a scan can read. It is the repository root when
-    /// `has_root` is true. It is the working directory when there is no root, and
-    /// the directory of an unreadable marker when the search stopped there.
     path: []const u8,
-    /// Whether `path` holds the repository marker. It is always false when
-    /// `unreadable_marker` is set, because a marker Drinky cannot read proves
-    /// nothing about the directory that holds it.
     has_root: bool,
-    /// The marker Drinky could not read, if the search met one. The search treats
-    /// that directory as the top of the walk. It is worse to cross a repository
-    /// than to miss a file below an unreadable marker. Only the caller knows
-    /// which noun its messages use, so only the caller reports it.
     unreadable_marker: ?Marker = null,
 
     pub const Marker = struct {
-        /// The directory that holds the marker. Join `marker_name` for a message.
         directory: []const u8,
         err: anyerror,
     };
 };
 
-/// Find the repository root at or above `working_directory`, which must be an
-/// absolute, canonical path. The walk stops at the first marker it can read.
-/// Only cancellation and an allocation failure stop it, so a caller always gets
-/// a boundary it can scan.
 pub fn findBoundary(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -73,18 +49,12 @@ pub fn findBoundary(
     return .{ .path = working_directory, .has_root = false };
 }
 
-/// A marker file or a `HEAD` file above this size holds no head Drinky can use.
 const head_file_bytes_max = 4096;
 
-/// The longest head name Drinky retains. The status line can abbreviate this name.
 pub const head_name_bytes_max = head_file_bytes_max;
 
-/// The number of characters of an object name that a detached head shows. Git
-/// itself prints seven.
 const object_name_columns = 7;
 
-/// The head of one repository: a branch name, or the short object name of a
-/// detached head. It carries its own bytes, so the caller owns nothing.
 pub const Head = struct {
     buffer: [head_name_bytes_max]u8,
     length: usize,
@@ -94,13 +64,6 @@ pub const Head = struct {
     }
 };
 
-/// The head of the repository at `root`, which `findBoundary` reports. Drinky never
-/// runs the git binary. It reads the one small `HEAD` file, so a caller can name
-/// the branch that a command in this directory acts on.
-///
-/// Null when `root` holds no repository, when Drinky cannot read the head, or when
-/// the head has no valid display name. Nothing here is authoritative, so every
-/// failure reads as no head at all.
 pub fn head(gpa: std.mem.Allocator, io: std.Io, root: []const u8) ?Head {
     const directory = headDirectory(gpa, io, root) orelse return null;
     defer gpa.free(directory);
@@ -111,9 +74,6 @@ pub fn head(gpa: std.mem.Allocator, io: std.Io, root: []const u8) ?Head {
     return parseHead(data);
 }
 
-/// The directory that holds `HEAD`. A marker directory is that directory itself.
-/// A marker file names it on a `gitdir:` line, which is how a worktree and a
-/// submodule point at the repository. The result is owned.
 fn headDirectory(gpa: std.mem.Allocator, io: std.Io, root: []const u8) ?[]u8 {
     const marker_path = std.fs.path.join(gpa, &.{ root, marker_name }) catch return null;
     const stat = std.Io.Dir.cwd().statFile(io, marker_path, .{
@@ -134,8 +94,6 @@ fn headDirectory(gpa: std.mem.Allocator, io: std.Io, root: []const u8) ?[]u8 {
     const target = std.mem.trim(u8, line[prefix.len..], " \t");
     if (target.len == 0) return null;
     if (std.fs.path.isAbsolute(target)) return gpa.dupe(u8, target) catch null;
-    // A relative target resolves against the directory that holds the marker
-    // file, which is how Git writes a worktree.
     return std.fs.path.resolve(gpa, &.{ root, target }) catch null;
 }
 
@@ -143,9 +101,6 @@ fn readHeadFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ?[]u8 {
     return std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(head_file_bytes_max)) catch null;
 }
 
-/// The head that the content of a `HEAD` file names. A symbolic head names a
-/// branch. A detached head holds an object name, which shows as its first seven
-/// characters.
 fn parseHead(data: []const u8) ?Head {
     const line = std.mem.trim(u8, data, " \t\r\n");
     const prefix = "ref: ";
@@ -155,16 +110,12 @@ fn parseHead(data: []const u8) ?Head {
         if (std.mem.startsWith(u8, reference, branches)) {
             return headName(reference[branches.len..]);
         }
-        // A head outside `refs/heads/` still names the work, so show its tail
-        // rather than nothing.
         return headName(std.fs.path.basename(reference));
     }
     if (!objectName(line)) return null;
     return headName(line[0..object_name_columns]);
 }
 
-/// Whether `text` is a Git object name: 40 hexadecimal digits for SHA-1, or 64
-/// for SHA-256.
 fn objectName(text: []const u8) bool {
     if (text.len != 40 and text.len != 64) return false;
     for (text) |byte| {
@@ -173,9 +124,6 @@ fn objectName(text: []const u8) bool {
     return true;
 }
 
-/// `text` as a head name, or null when it has no valid bounded display name.
-/// This layer keeps the complete name. The interface can abbreviate it at a
-/// grapheme boundary. A control byte or invalid UTF-8 rejects the complete name.
 fn headName(text: []const u8) ?Head {
     if (text.len == 0 or text.len > head_name_bytes_max) return null;
     if (!std.unicode.utf8ValidateSlice(text)) return null;
@@ -192,9 +140,6 @@ pub const ContainsOptions = struct {
     target: []const u8,
 };
 
-/// Whether `target` is `boundary` itself or a path below it. The test is textual,
-/// so both paths must be absolute and canonical. A separator must follow the
-/// prefix, so `/repository` does not read as a path inside `/repo`.
 pub fn contains(options: *const ContainsOptions) bool {
     if (std.mem.eql(u8, options.boundary, options.target)) return true;
     if (!std.mem.startsWith(u8, options.target, options.boundary) or
@@ -223,7 +168,6 @@ test "the nearest readable marker is the root, whatever kind it is" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // A worktree and a submodule carry a marker file, not a marker directory.
     var work = try tmp.dir.createDirPathOpen(io, "clone/module/work", .{});
     work.close(io);
     var clone = try tmp.dir.createDirPathOpen(io, "clone/.git", .{});
@@ -250,9 +194,6 @@ test "an unreadable marker stops the walk and travels back as a value" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // A symbolic link to itself makes the stat of the marker below it fail for a
-    // reason Drinky cannot act on. The walk must stop here and not climb into the
-    // repository above.
     try tmp.dir.symLink(io, "loop", "loop", .{});
     const working_directory = try tmpPath(gpa, io, &tmp, "loop");
     defer gpa.free(working_directory);
@@ -269,8 +210,6 @@ test "outside a repository the boundary is the working directory" {
     if (std.fs.path.sep != '/') return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    // The cache directory sits inside this repository, so the walk must start
-    // where no ancestor carries a marker.
     var seed = std.testing.tmpDir(.{});
     defer seed.cleanup();
     const outside_root = try std.fmt.allocPrint(gpa, "/tmp/drinky-project-{s}", .{seed.sub_path});
@@ -280,8 +219,6 @@ test "outside a repository the boundary is the working directory" {
     defer gpa.free(created);
     var work = try std.Io.Dir.cwd().createDirPathOpen(io, created, .{});
     work.close(io);
-    // `/tmp` is a symbolic link on some hosts, and `findBoundary` takes a
-    // canonical path.
     const working_directory = try std.Io.Dir.realPathFileAbsoluteAlloc(io, created, gpa);
     defer gpa.free(working_directory);
 
@@ -303,31 +240,25 @@ fn expectHeadName(expected: ?[]const u8, data: []const u8) !void {
 test parseHead {
     try expectHeadName("main", "ref: refs/heads/main\n");
     try expectHeadName("feature/status-bar", "ref: refs/heads/feature/status-bar\n");
-    // A head outside `refs/heads/` shows its tail.
     try expectHeadName("v1.2.0", "ref: refs/tags/v1.2.0\n");
-    // A detached head shows the short object name, for SHA-1 and for SHA-256.
     try expectHeadName("6ab94da", "6ab94da2f0a1b3c4d5e6f708192a3b4c5d6e7f80\n");
     try expectHeadName("6ab94da", "6ab94da2f0a1b3c4d5e6f708192a3b4c5d6e7f80" ++ "0" ** 24);
     try expectHeadName(null, "");
     try expectHeadName(null, "ref: \n");
     try expectHeadName(null, "ref: refs/heads/\n");
-    // Neither a reference nor an object name.
     try expectHeadName(null, "6ab94da\n");
     try expectHeadName(null, "gitdir: /elsewhere\n");
 }
 
 test headName {
-    // A control byte or invalid UTF-8 rejects the whole name.
     try std.testing.expect(headName("main\x1b[31m") == null);
     try std.testing.expect(headName("main\n") == null);
     try std.testing.expect(headName("\xff\xfe") == null);
     try std.testing.expectEqualStrings("wörk", headName("wörk").?.name());
 
-    // A name above the old 64-byte display limit stays available to the interface.
     const long_unicode = "ä" ** 40;
     try std.testing.expectEqualStrings(long_unicode, headName(long_unicode).?.name());
 
-    // A name that fills the bounded `HEAD` storage exactly still survives.
     const longest = "b" ** head_name_bytes_max;
     try std.testing.expectEqualStrings(longest, headName(longest).?.name());
     try std.testing.expect(headName(longest ++ "b") == null);
@@ -341,12 +272,10 @@ test head {
 
     const root = try tmpPath(gpa, io, &tmp, "repo");
     defer gpa.free(root);
-    // No repository at all.
     try std.testing.expect(head(gpa, io, root) == null);
 
     var marker = try tmp.dir.createDirPathOpen(io, "repo/.git", .{});
     marker.close(io);
-    // A repository whose head Drinky cannot read.
     try std.testing.expect(head(gpa, io, root) == null);
 
     try tmp.dir.writeFile(io, .{
@@ -355,8 +284,6 @@ test head {
     });
     try std.testing.expectEqualStrings("main", head(gpa, io, root).?.name());
 
-    // A worktree holds a marker file that names the real directory. The relative
-    // spelling resolves against the directory that holds that file.
     var worktree_marker = try tmp.dir.createDirPathOpen(io, "repo/.git/worktrees/next", .{});
     worktree_marker.close(io);
     try tmp.dir.writeFile(io, .{
@@ -373,7 +300,6 @@ test head {
     defer gpa.free(worktree_root);
     try std.testing.expectEqualStrings("next", head(gpa, io, worktree_root).?.name());
 
-    // A marker file that names no directory reads as no head.
     try tmp.dir.writeFile(io, .{ .sub_path = "next/.git", .data = "nothing\n" });
     try std.testing.expect(head(gpa, io, worktree_root) == null);
 }

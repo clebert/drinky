@@ -1,10 +1,3 @@
-//! `/login`: a picker over every account (also the first-run bootstrap and the
-//! fall-through after the last logout). The picker shows the credential store
-//! as it stands, so `run` asks the app to read the store again, and the app
-//! builds the picker with `picker` once the session settled on what it found.
-//! `picker` and `select` index the same enum-order account list. The command
-//! takes no argument.
-
 const std = @import("std");
 
 const llm = @import("../llm.zig");
@@ -14,14 +7,11 @@ const testing = @import("testing.zig");
 pub const name = "login";
 pub const summary = "Sign in or switch the account";
 
-/// Hand the open to the app. The registry table fixes the signature, and the
-/// rows come from `picker` once the app settled the session on the store.
 pub fn run(context: *Context) !Context.Outcome {
     _ = context;
     return .login_picker;
 }
 
-/// The picker over every account, on the registry as it stands.
 pub fn picker(context: *Context) !Context.Outcome {
     var options: Context.Outcome.Options = .{ .gpa = context.gpa };
     errdefer options.deinit();
@@ -53,11 +43,8 @@ pub fn select(context: *Context, selection: Context.Outcome.Pick.Selection) !Con
             "{s} is already the active account.",
             .{account.id()},
         );
-    // Authenticated but inactive: the app performs the switch so the model that
-    // account ran last applies, exactly as in a startup on this account.
     if (context.accounts.isAuthenticated(account)) return .{ .switch_account = account };
     if (account.hasLogin()) return .{ .login = account };
-    // The environment names the account, and the credential still did not load.
     if (context.accounts.loadError(account)) |err| return Context.Outcome.reportNotice(
         gpa,
         .failure,
@@ -72,9 +59,6 @@ pub fn select(context: *Context, selection: Context.Outcome.Pick.Selection) !Con
     );
 }
 
-/// Write the picker row of `account`: its identifier and its state. The
-/// identifier already names the credential source, so the state says whether
-/// that source delivered.
 fn writeRow(options: *Context.Outcome.Options, context: *const Context, account: llm.Account) !void {
     const id = account.id();
     if (isActive(context, account)) return options.print("{s}", .{id});
@@ -92,8 +76,6 @@ fn isActive(context: *const Context, account: llm.Account) bool {
     return client.account() == account;
 }
 
-// The rows must show the store as it stands, and only the app can settle the
-// session on a change there, so the command hands the open to the app.
 test "run asks the app to read the store before it opens the picker" {
     const gpa = std.testing.allocator;
     var accounts = testing.accounts(.{ .anthropic = "sk-ant" }, .{});
@@ -140,7 +122,6 @@ test "the picker lists every account, marking the active and authenticated ones"
     }
 }
 
-/// The row of `account` as the picker prints it. The caller frees it.
 fn row(context: *const Context, account: llm.Account) !Context.Outcome.Pick.Option {
     var options: Context.Outcome.Options = .{ .gpa = context.gpa };
     errdefer options.deinit();
@@ -167,7 +148,6 @@ test "the picker marks a loaded key file, a failed one, and an API key apart" {
     try std.testing.expectEqualStrings("openai-api-key", active.name);
     try std.testing.expect(active.tag == null);
 
-    // A key file that did not load shows as such, and a pick names the error.
     accounts.google_auth = null;
     accounts.google_error = error.FileNotFound;
     const failed = try row(&context, .google_cloud_key);
@@ -181,7 +161,6 @@ test "the picker marks a loaded key file, a failed one, and an API key apart" {
         "because of error FileNotFound",
     );
 
-    // Without a load failure, the account is simply not set up.
     accounts.google_error = null;
     const absent = try row(&context, .google_cloud_key);
     defer absent.deinit(gpa);

@@ -1,13 +1,3 @@
-//! The Gemini `streamGenerateContent` transport of the Agent Platform. It sends a
-//! serialized request and exposes the response as a pull stream of decoded SSE
-//! chunks on the shared `sse` engine. It knows nothing about conversation state
-//! or tools. It turns bytes into `Event`s.
-//!
-//! One chunk can carry several parts, and one function call part emits several
-//! events, so the stream queues the events of a chunk and hands them out one at
-//! a time. The wire sends no terminal frame, so the stream emits its stop when
-//! the body ends.
-
 const std = @import("std");
 
 const json = @import("../json.zig");
@@ -20,12 +10,8 @@ const Transport = @This();
 gpa: std.mem.Allocator,
 io: std.Io,
 timeouts: net.Timeouts,
-/// The full request URL (see `url`).
 endpoint: []const u8,
 
-/// The locations Drinky serves. The host decides where a request runs, and a
-/// multi-region host keeps the processing inside its jurisdiction. A regional
-/// host offers the legacy models alone, so Drinky names none.
 pub const Location = enum {
     global,
     us,
@@ -40,27 +26,19 @@ pub const Location = enum {
     }
 };
 
-/// The three names that form a request URL, named so no two can swap.
 pub const Target = struct {
     project: []const u8,
     location: Location,
     model: []const u8,
 };
 
-/// One request's confusable string pair, named so body and token cannot swap.
 pub const Payload = struct {
     body: []const u8,
     access_token: []const u8,
 };
 
-/// A single request in flight on the shared SSE engine, which supplies the
-/// reading half. This struct keeps the Gemini chunk vocabulary (`decode`) and
-/// its state. Pin it: the HTTP response borrows the request and the SSE reader
-/// borrows this struct's buffers.
 pub const Stream = struct {
     gpa: std.mem.Allocator,
-    /// A full connect sets this last. `sse.Engine.open`'s timeout path frees
-    /// only an established stream.
     established: bool,
     client: std.http.Client,
     request: std.http.Client.Request,
@@ -73,43 +51,24 @@ pub const Stream = struct {
     error_length: usize,
     error_retryable: bool,
     retry_after_ms: ?u64,
-    /// Scratch for one decoded frame. Events can borrow it until the next read.
     frame_arena: std.heap.ArenaAllocator,
-    /// The events of the last chunk, in the frame arena, and the next one to
-    /// hand out. Every slice of a queued event lives in the arena too, so a
-    /// later part of the same chunk can reuse the retained buffers below.
     events: std.ArrayList(llm.Event),
     event_index: usize,
-    /// Whether the body ended and the stop went out.
     ended: bool,
-    /// The `thoughtSignature` that waits for the next part. Thought text shows
-    /// through display deltas alone, because no wire needs it back.
     signature: std.ArrayList(u8),
-    /// The answer text of the open text run.
     text: std.ArrayList(u8),
-    /// The function calls emitted so far. Gemini sends no call id, so the count
-    /// names each call within this reply.
     call_count: u64,
-    /// Where the streamed reasoning display stands (see `sse.Reasoning`).
     reasoning: sse.Reasoning,
-    /// The completeness that `finishReason` named, or null while none arrived.
     finish_status: ?llm.Event.Status,
-    /// A wire outcome that makes this reply unretainable, latched until the stop.
     rejection: ?llm.Event.Stop.Rejection,
-    /// The four cumulative counts of `usageMetadata`. A chunk can omit any of
-    /// them, so each keeps its last value.
     prompt_tokens: u64,
     cached_tokens: u64,
     candidate_tokens: u64,
     thought_tokens: u64,
     usage: llm.Usage,
-    /// The `modelVersion` the reply names. Owned, because the frame arena drops
-    /// the chunk it arrives in. Empty until a chunk names one.
     served_model: std.ArrayList(u8),
     decompress: std.http.Decompress,
     decompress_buffer: []u8,
-    /// The composed Authorization value. The retained request points at it for
-    /// the stream's whole lifetime, so the stream owns the bytes.
     authorization: []u8,
     error_buffer: [net.error_body_bytes_max]u8,
     redirect_buffer: [4096]u8,
@@ -124,16 +83,11 @@ pub const Stream = struct {
     pub const retryAfterMs = engine.retryAfterMs;
     pub const usageSoFar = engine.usageSoFar;
 
-    /// The next decoded event, or null after the stop. A queued event of the
-    /// last chunk goes out first. The end of the body closes the open text run
-    /// and emits the stop.
     pub fn next(self: *Stream) !?llm.Event {
         if (self.takeQueued()) |event| return event;
         if (self.ended) return null;
         if (try engine.next(self)) |event| return event;
         self.ended = true;
-        // The engine reset the arena before it met the end, so the queue
-        // starts over in fresh memory.
         self.events = .empty;
         self.event_index = 0;
         try self.closeText();
@@ -153,13 +107,10 @@ pub const Stream = struct {
         return self.events.items[self.event_index];
     }
 
-    /// The Agent Platform reports no allowance in the head.
     pub fn quotaSoFar(_: *const Stream) ?llm.Quota {
         return null;
     }
 
-    /// The message a failed head's error body carries (see
-    /// `sse.Engine.refineError`). Null keeps the raw body.
     pub fn describeError(self: *Stream, body: []const u8) !?[]const u8 {
         const object = (try json.parseObject(self.frame_arena.allocator(), body)) orelse
             return null;
@@ -167,8 +118,6 @@ pub const Stream = struct {
         return json.string(detail.get("message"));
     }
 
-    /// Set the decode state and the owned values to a blank start. The engine's
-    /// `begin` calls it, so every construction site shares one list.
     pub fn beginDecode(self: *Stream) void {
         self.events = .empty;
         self.event_index = 0;
@@ -194,14 +143,10 @@ pub const Stream = struct {
         self.served_model.deinit(self.gpa);
     }
 
-    /// Free the owned Authorization value. The engine calls it after the
-    /// request dies, so the request never points at freed bytes.
     pub fn deinitHeaders(self: *Stream) void {
         self.gpa.free(self.authorization);
     }
 
-    /// Latch a rejection. `unsupported` and `uncorrelated` win over `invalid`,
-    /// and the first of them to latch stays.
     fn markRejection(self: *Stream, rejection: llm.Event.Stop.Rejection) void {
         const latched = self.rejection orelse {
             self.rejection = rejection;
@@ -210,14 +155,10 @@ pub const Stream = struct {
         if (rejection.outranks(latched)) self.rejection = rejection;
     }
 
-    /// Decode one `GenerateContentResponse` chunk. The parts of its first
-    /// candidate become events, and the rest of the chunk updates the state.
     pub fn decode(self: *Stream, payload: []const u8) !sse.Decoded {
         const arena = self.frame_arena.allocator();
         self.events = .empty;
         self.event_index = 0;
-        // A malformed payload is filler, not progress. A truncated tail then
-        // surfaces as an incomplete reply at end of stream, which is retried.
         const object = (try json.parseObject(arena, payload)) orelse return .ignored;
 
         if (json.object(object.get("error"))) |detail| {
@@ -263,8 +204,6 @@ pub const Stream = struct {
         } else if (std.mem.eql(u8, reason, "MALFORMED_FUNCTION_CALL")) {
             self.markRejection(.invalid);
         } else {
-            // SAFETY, RECITATION, BLOCKLIST, PROHIBITED_CONTENT, SPII, OTHER, and
-            // every reason this design does not know.
             self.markRejection(.unsupported);
         }
     }
@@ -272,17 +211,10 @@ pub const Stream = struct {
     fn decodePart(self: *Stream, value: std.json.Value) !void {
         const arena = self.frame_arena.allocator();
         const part = json.object(value) orelse return self.markRejection(.invalid);
-        // Inline data, executable code, and every part this design does not
-        // know cannot enter the history, so the reply cannot stand.
         for (part.keys()) |key| {
             if (!knownPartKey(key)) return self.markRejection(.unsupported);
         }
         if (json.object(part.get("functionCall"))) |call| {
-            // The order of these reads decides where the signature lands. The
-            // open text run takes the signature that earlier parts left, and
-            // this call takes its own. A read before the close puts the
-            // signature of the call on the text, and Gemini 3 then refuses the
-            // call without it.
             try self.closeText();
             try self.takeSignature(part);
             const name = json.string(call.get("name")) orelse return self.markRejection(.invalid);
@@ -315,7 +247,6 @@ pub const Stream = struct {
         try self.takeSignature(part);
     }
 
-    /// A `thoughtSignature` on `part` replaces the pending one.
     fn takeSignature(self: *Stream, part: std.json.ObjectMap) !void {
         const proof = json.string(part.get("thoughtSignature")) orelse return;
         if (proof.len == 0) return;
@@ -323,8 +254,6 @@ pub const Stream = struct {
         try self.signature.appendSlice(self.gpa, proof);
     }
 
-    /// Close the open text run: a reasoning item when a signature is pending,
-    /// then a message item when the text has bytes.
     fn closeText(self: *Stream) !void {
         try self.emitReasoning();
         if (self.text.items.len == 0) return;
@@ -333,8 +262,6 @@ pub const Stream = struct {
         self.text.clearRetainingCapacity();
     }
 
-    /// Emit the reasoning item of a pending signature, which consumes it, so one
-    /// signature reaches one item.
     fn emitReasoning(self: *Stream) !void {
         self.reasoning.end();
         if (self.signature.items.len == 0) return;
@@ -346,9 +273,6 @@ pub const Stream = struct {
         self.signature.clearRetainingCapacity();
     }
 
-    /// Overwrite each count the chunk carries and derive the neutral usage. The
-    /// cached tokens are part of the prompt count, so the uncached input is the
-    /// difference. Thought tokens bill as output.
     fn mergeUsage(self: *Stream, object: std.json.ObjectMap) void {
         if (json.unsigned(object.get("promptTokenCount"))) |count| self.prompt_tokens = count;
         if (json.unsigned(object.get("cachedContentTokenCount"))) |count| self.cached_tokens = count;
@@ -362,7 +286,6 @@ pub const Stream = struct {
     }
 };
 
-/// The `streamGenerateContent` URL of `target`. The caller frees the result.
 pub fn url(gpa: std.mem.Allocator, target: *const Target) ![]u8 {
     return std.fmt.allocPrint(
         gpa,
@@ -372,7 +295,6 @@ pub fn url(gpa: std.mem.Allocator, target: *const Target) ![]u8 {
     );
 }
 
-/// Whether a part key names content this design reads.
 fn knownPartKey(key: []const u8) bool {
     for ([_][]const u8{ "text", "thought", "thoughtSignature", "functionCall" }) |known| {
         if (std.mem.eql(u8, key, known)) return true;
@@ -380,29 +302,22 @@ fn knownPartKey(key: []const u8) bool {
     return false;
 }
 
-/// A rate limit and every server fault are worth a retry.
 fn errorRetryable(detail: std.json.ObjectMap) bool {
     const code = json.integer(detail.get("code")) orelse return false;
     return code == 429 or (code >= 500 and code < 600);
 }
 
-/// Open a streaming request bounded by the connect timeout. Any failure tears
-/// down `out`, so a caller that sees an error owns nothing (see
-/// `sse.Engine.open`).
 pub fn send(self: *Transport, out: *Stream, payload: *const Payload) !void {
     return sse.Engine(Stream).open(out, self.io, self.timeouts, connect, .{ self, out, payload });
 }
 
 fn connect(self: *Transport, out: *Stream, payload: *const Payload) anyerror!void {
-    // The token becomes a header value. Reject one that can split the head.
     if (!net.validHeaderValue(payload.access_token)) return error.BadCredentials;
     const engine = sse.Engine(Stream);
     engine.begin(out, self.gpa, self.io);
     errdefer out.client.deinit();
     errdefer out.frame_arena.deinit();
 
-    // The retained request points at this header value until `deinit`, so the
-    // stream owns the bytes.
     out.authorization = try std.fmt.allocPrint(self.gpa, "Bearer {s}", .{payload.access_token});
     errdefer self.gpa.free(out.authorization);
 
@@ -411,8 +326,6 @@ fn connect(self: *Transport, out: *Stream, payload: *const Payload) anyerror!voi
         .headers = .{
             .content_type = .{ .override = "application/json" },
             .authorization = .{ .override = out.authorization },
-            // Read the event stream uncompressed so event delivery stays
-            // independent of any decompressor's own buffering.
             .accept_encoding = .{ .override = "identity" },
         },
     });
@@ -421,8 +334,6 @@ fn connect(self: *Transport, out: *Stream, payload: *const Payload) anyerror!voi
     try engine.finish(out, payload.body);
 }
 
-/// A stream over `body` for the tests: test allocator and fresh decode state.
-/// The connection fields stay undefined. Pair with `defer stream.deinitDecode()`.
 fn testStream(io: std.Io, body: *std.Io.Reader) Stream {
     var stream: Stream = undefined;
     sse.Engine(Stream).begin(&stream, std.testing.allocator, io);
@@ -434,8 +345,6 @@ fn testStream(io: std.Io, body: *std.Io.Reader) Stream {
     return stream;
 }
 
-/// Drain a stream over `body` and write one line per event, so a test states
-/// the whole event order in one string. The caller frees the result.
 fn trace(gpa: std.mem.Allocator, body: []const u8) ![]u8 {
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
@@ -511,8 +420,6 @@ test "thought parts display only, and a call ends their run" {
             "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"more\",\"thought\":true}]}," ++
             "\"finishReason\":\"STOP\"}]}\n\n",
     );
-    // Thought parts across chunks form one run. A call ends the run, so the
-    // thought text behind it takes the blank line.
     try expectTrace(
         \\thinking:a
         \\thinking:b
@@ -565,8 +472,6 @@ test "a function call without args is a call with an empty object" {
     );
 }
 
-// The text parts carry no signature, and the call part does. The call must
-// carry it, and the message must carry none, or Gemini 3 refuses the replay.
 test "a signature on a call part after unsigned text lands on the call alone" {
     try expectTrace(
         \\thinking:hmm
@@ -604,7 +509,6 @@ test "two signed calls in one reply each reach one reasoning item" {
             "{\"functionCall\":{\"name\":\"read\",\"args\":{\"path\":\"b\"}},\"thoughtSignature\":\"s2\"}" ++
             "]},\"finishReason\":\"STOP\"}]}\n\n",
     );
-    // A second call without a signature emits no second reasoning item.
     try expectTrace(
         \\reasoning:s1
         \\tool_name:read
@@ -637,7 +541,6 @@ test "a signature on the last empty text part emits a reasoning item alone" {
             "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"\",\"thoughtSignature\":\"sig\"}]}," ++
             "\"finishReason\":\"STOP\"}]}\n\n",
     );
-    // With no text at all, the item stands alone before the stop.
     try expectTrace(
         \\reasoning:sig
         \\stop:complete|-||0/0/0
@@ -737,9 +640,6 @@ test "usage counts are cumulative and a chunk can omit any of them" {
     );
 }
 
-// A provider can switch a request to another model. The chunk names the model
-// that serves the reply, so the stop carries it past every frame-arena reset,
-// and the agent compares it to the requested name.
 test "the stop names the served model verbatim" {
     try expectTrace(
         \\text:x
@@ -764,7 +664,6 @@ test "a part of an unknown kind latches unsupported" {
             "{\"inlineData\":{\"mimeType\":\"image/png\",\"data\":\"AA==\"}}]}," ++
             "\"finishReason\":\"STOP\"}]}\n\n",
     );
-    // A signature beside unknown content saves nothing: the reply still falls.
     try expectTrace(
         \\stop:complete|unsupported||0/0/0
         \\
@@ -772,7 +671,6 @@ test "a part of an unknown kind latches unsupported" {
         "data: {\"candidates\":[{\"content\":{\"parts\":[{\"inlineData\":{\"mimeType\":\"image/png\"," ++
             "\"data\":\"AA==\"},\"thoughtSignature\":\"sig\"}]},\"finishReason\":\"STOP\"}]}\n\n",
     );
-    // A part that carries a signature alone is a known shape.
     try expectTrace(
         \\reasoning:sig
         \\stop:complete|-||0/0/0
@@ -873,8 +771,6 @@ test "connect rejects a token that splits the request head" {
     }));
 }
 
-/// One accepted connection for the header-lifetime test: read the whole
-/// request, then answer with one chunk and end the body.
 fn serveOneResponse(io: std.Io, server: *std.Io.net.Server) !void {
     const body = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hi\"}]}," ++
         "\"finishReason\":\"STOP\"}]}\n\n";
@@ -884,7 +780,6 @@ fn serveOneResponse(io: std.Io, server: *std.Io.net.Server) !void {
     var read_buffer: [4096]u8 = undefined;
     var reader = connection.reader(io, &read_buffer);
     var content_length: usize = 0;
-    // The head of one request holds few lines, so the cap only stops a runaway.
     var lines_left: usize = 64;
     while (lines_left > 0) : (lines_left -= 1) {
         const raw = try reader.interface.takeDelimiterInclusive('\n');

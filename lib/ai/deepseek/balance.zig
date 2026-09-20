@@ -1,9 +1,3 @@
-//! The prepaid USD balance of a DeepSeek API-key account. The Responses
-//! endpoint states no pool, so Drinky reads `GET /user/balance` of the same
-//! key. A key that the endpoint refuses states no pool, and the status line
-//! shows none. A CNY row is not a dollar figure, so Drinky takes a USD row
-//! alone.
-
 const std = @import("std");
 
 const json = @import("../json.zig");
@@ -12,8 +6,6 @@ const net = @import("../net.zig");
 
 const endpoint = "https://api.deepseek.com/user/balance";
 
-/// The remaining USD balance behind `key`, or null when the endpoint refuses
-/// the request or the body names no USD row. The caller owns nothing.
 pub fn fetch(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -25,9 +17,6 @@ pub fn fetch(
     return parse(gpa, body);
 }
 
-/// Decode the balance body into one remaining USD amount. Null when the body
-/// names no USD row. The pool type stores spend as well, and this endpoint
-/// states remaining funds alone, so `used` is zero.
 fn parse(gpa: std.mem.Allocator, body: []const u8) error{OutOfMemory}!?llm.Credits {
     const parsed = std.json.parseFromSlice(std.json.Value, gpa, body, .{}) catch |err|
         return switch (err) {
@@ -47,9 +36,6 @@ fn parse(gpa: std.mem.Allocator, body: []const u8) error{OutOfMemory}!?llm.Credi
     return null;
 }
 
-/// A remaining amount in USD. A negative or non-finite value is no figure, and
-/// neither is one past the money bound. The endpoint spells the figure as a
-/// decimal string.
 fn amountUsd(value: ?std.json.Value) ?f64 {
     const amount = switch (value orelse return null) {
         .integer => |found| @as(f64, @floatFromInt(found)),
@@ -87,7 +73,6 @@ test parse {
     try std.testing.expectEqual(@as(f64, 0), credits.used);
     try std.testing.expectEqual(@as(f64, 7.14), credits.remaining());
 
-    // A CNY row is not a dollar figure, so a body with no USD row states no pool.
     const cny_only =
         \\{"is_available":true,"balance_infos":[
         \\  {"currency":"CNY","total_balance":"110.00",

@@ -1,10 +1,3 @@
-//! Hands the model the Drinky document that the host injects through `Context`.
-//! The document describes the harness itself: its commands, its config file, its
-//! keys, and the files that it discovers. The tool reads no file and writes
-//! nothing. The host owns the text, so this module keeps no knowledge of any
-//! command or config key. The tool description is the always-present pointer,
-//! and the document itself arrives only when the model calls the tool.
-
 const std = @import("std");
 
 const llm = @import("../llm.zig");
@@ -22,7 +15,6 @@ pub const spec: llm.Tool = .{
 };
 
 pub fn run(context: *const Context, input_json: []const u8) !Result {
-    // The tool takes no arguments, so whatever the model sent says nothing.
     _ = input_json;
     const document = context.document;
     if (document.len == 0) return Result.report(
@@ -31,9 +23,6 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
         "This harness exposes no document of itself.",
         .{},
     );
-    // The box keeps the call row alone. The document is the same text at every
-    // call, so a measure of it states nothing that the user can act on. The
-    // document names the config file, and that path belongs to the answer.
     return .{ .content = try context.gpa.dupe(u8, document), .is_error = false };
 }
 

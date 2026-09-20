@@ -1,24 +1,13 @@
-//! Composition of the document that the `describe_drinky` tool returns: one
-//! section per topic of the harness. The app owns the text, because the app owns
-//! the commands, the config file, the keys, and the discovery rules that the
-//! sections state. The model reads it instead of its own memory of Drinky.
-
 const std = @import("std");
 
 const ai = @import("ai");
 
 const Config = @import("Config.zig");
 
-/// What the app holds and the document states: the config file, the effort
-/// level that the app compiles in, the key hints of the intro line, and the
-/// window of the double Ctrl+C.
 pub const Options = struct {
     config: *const Config,
-    /// The effort level a session starts on when no file and no state names one.
     effort_default: ai.llm.Effort,
-    /// The key hints of the intro line, in the order the line shows them.
     key_hints: []const []const u8,
-    /// The window in which a second Ctrl+C quits, in milliseconds.
     ctrl_c_window_ms: i64,
 };
 
@@ -76,8 +65,6 @@ const repository =
     \\
 ;
 
-/// Build the whole document. The caller owns the text and keeps it alive for the
-/// session, because the agent hands it to every tool call.
 pub fn compose(gpa: std.mem.Allocator, options: *const Options) ![]u8 {
     var output: std.Io.Writer.Allocating = .init(gpa);
     errdefer output.deinit();
@@ -94,11 +81,6 @@ pub fn compose(gpa: std.mem.Allocator, options: *const Options) ![]u8 {
     return output.toOwnedSlice();
 }
 
-/// One row per command, from the registry that runs them. A row also names the
-/// line that runs the same command, such as the bare `/` of the command list, the
-/// text that the command takes, the terminal where a command runs alone, and the
-/// turn that hosts a command. The row then holds the whole shape of a line, and
-/// the closing sentences state the default of a row that says nothing.
 fn writeCommands(writer: *std.Io.Writer) !void {
     for (ai.command.summaries) |command| {
         try writer.print("- `/{s}` \u{2014} {s}.", .{ command.name, command.summary });
@@ -118,9 +100,6 @@ fn writeCommands(writer: *std.Io.Writer) !void {
     );
 }
 
-/// The key hints of the intro line, then the keys of the prompt, of a sign-in,
-/// and of a running turn. The hints come from the same constant that the intro
-/// line shows. One key can mean two things, so each list states its own mode.
 fn writeKeys(writer: *std.Io.Writer, options: *const Options) !void {
     try writer.writeAll(key_head);
     for (options.key_hints) |hint| try writer.print("- {s}\n", .{hint});
@@ -169,8 +148,6 @@ fn writeKeys(writer: *std.Io.Writer, options: *const Options) !void {
     , .{options.ctrl_c_window_ms});
 }
 
-/// The size cap of a skill file, from the window of the one `read` call that
-/// must hold it. A larger file is skipped, so the cap belongs to the rules.
 fn writeSkillCap(writer: *std.Io.Writer) !void {
     try writer.print(
         \\- A `SKILL.md` file above the window of one `read` call, {d} lines or {d} KiB, is skipped
@@ -198,7 +175,6 @@ test "the document states every command, key, and discovery rule" {
     });
     defer gpa.free(text);
 
-    // One section per topic, in one order.
     const commands = std.mem.indexOf(u8, text, "## Commands").?;
     const configuration = std.mem.indexOf(u8, text, "## Configuration").?;
     const keys = std.mem.indexOf(u8, text, "## Key bindings").?;
@@ -209,28 +185,20 @@ test "the document states every command, key, and discovery rule" {
     try std.testing.expect(keys < discovery_index);
     try std.testing.expect(discovery_index < repository_index);
 
-    // Every command of the registry reaches the document, the skill line with
-    // its tail. The config section keeps its own keys under the section head.
     for (ai.command.summaries) |command| {
         const row = try std.fmt.allocPrint(gpa, "- `/{s}` \u{2014} ", .{command.name});
         defer gpa.free(row);
         try std.testing.expect(std.mem.indexOf(u8, text, row) != null);
     }
     try std.testing.expect(std.mem.indexOf(u8, text, "as trailing text") != null);
-    // A line that carries no name opens a list, so the rows name both such lines.
     try std.testing.expect(std.mem.indexOf(u8, text, "The line `/` runs it too.") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "The line `/skill:` runs it too.") != null);
-    // A command that needs the terminal states it, so the model can tell the
-    // user what an attached bot can run.
     try std.testing.expect(std.mem.indexOf(
         u8,
         text,
         "- `/login` \u{2014} Sign in or switch the account. It runs in the terminal alone",
     ) != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "- `/new` \u{2014} Clear the conversation.\n") != null);
-    // The status runs where no other command runs, so the model can name it
-    // to a user who waits on a turn. Its row states the run, and no other row
-    // does.
     try std.testing.expect(std.mem.indexOf(
         u8,
         text,
@@ -249,20 +217,15 @@ test "the document states every command, key, and discovery rule" {
     try std.testing.expect(std.mem.indexOf(u8, text, "`bash.timeout_ms`") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "/unused/config.json") != null);
 
-    // Every list opens under a blank line, so the Markdown reads as a list.
     try std.testing.expect(std.mem.indexOf(u8, text, "must type.\n\n- `/effort`") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "these keys:\n\n- Enter: Send\n") != null);
 
-    // The keys come from the intro line, and each mode states its own keys after
-    // them. One key can mean two things, so the lists must stay apart.
     try std.testing.expect(std.mem.indexOf(u8, text, "- Ctrl+D: Quit\n") != null);
     const prompt = std.mem.indexOf(u8, text, "The prompt takes these keys:").?;
     const login = std.mem.indexOf(u8, text, "A sign-in takes these keys:").?;
     const turn = std.mem.indexOf(u8, text, "A running turn takes these keys:").?;
     try std.testing.expect(prompt < login);
     try std.testing.expect(login < turn);
-    // The prompt owns quitting and the two recovery offers. A sign-in owns
-    // callback replay. The turn owns steering and its cancel.
     try std.testing.expect(std.mem.indexOf(u8, text[prompt..login], "within 500 milli") != null);
     try std.testing.expect(std.mem.indexOf(
         u8,
@@ -275,8 +238,6 @@ test "the document states every command, key, and discovery rule" {
         "`Canceled turn`, Ctrl+N removes the canceled turn",
     ) != null);
     try std.testing.expect(std.mem.indexOf(u8, text[prompt..login], "Tool changes stay.") != null);
-    // Tab opens the enabled history at the prompt alone. A turn answers it with
-    // a notice, so the model never promises the list during a turn.
     try std.testing.expect(std.mem.indexOf(
         u8,
         text[prompt..login],
@@ -310,14 +271,10 @@ test "the document states every command, key, and discovery rule" {
         "milliseconds",
     ) == null);
 
-    // The discovery rules carry no config key, so only this document holds them.
     try std.testing.expect(std.mem.indexOf(u8, text, "`AGENTS.md`") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "~/.agents/skills/") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "2000 lines or 50 KiB") != null);
-    // A skill body loads on demand, so the section must not promise a restart
-    // for every change that a user makes.
     try std.testing.expect(std.mem.indexOf(u8, text, "reaches the session that runs now") != null);
-    // The keys of a page and of the editor stay out, so the section says so.
     try std.testing.expect(std.mem.indexOf(u8, text, "own keys in its header") != null);
     try std.testing.expect(std.mem.indexOf(
         u8,

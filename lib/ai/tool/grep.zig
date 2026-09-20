@@ -1,6 +1,3 @@
-//! Searches file contents for a literal substring and returns matches as
-//! 'path:line:text'.
-
 const std = @import("std");
 
 const format = @import("../format.zig");
@@ -15,17 +12,12 @@ const walk = @import("walk.zig");
 const limit_default = 100;
 const file_bytes_max = 4 << 20;
 const line_bytes_max = 300;
-// The retained candidate paths bound the path-list memory. The running total of
-// bytes read across searched files bounds the actual I/O work. A bare
-// `files_max * file_bytes_max` ceiling leaves the I/O work at hundreds of gigabytes.
 const files_max = 100_000;
 const bytes_read_max = 256 << 20;
 
 pub const spec: llm.Tool = .{
     .name = "grep",
     .description = "Search file contents for a literal substring (not a regex). " ++
-        // The routing sentence belongs here, not in the bash description alone.
-        // A model reads the bash schema after it chose bash.
         "Use this tool for a literal search instead of a grep or rg command in bash. " ++
         "Returns matching lines as 'path:line:text', with paths relative to the working " ++
         "directory. Skips common version-control stores, dependency directories, virtual " ++
@@ -91,22 +83,12 @@ pub fn run(context: *const Context, input_json: []const u8) !Result {
     return runTimed(context, &parsed.value, &timer);
 }
 
-/// The matching lines, or the sentence that states why the search found none.
-/// The walk and the file loop poll `timer` between filesystem steps, so a
-/// search of a tree too large for the window stops itself and keeps the matches
-/// it found.
 fn runTimed(context: *const Context, input: *const Input, timer: *const search.Timer) !Result {
     const gpa = context.gpa;
     const pattern = input.pattern;
-    // A model sometimes sends an empty path instead of no path. An empty path
-    // means the default, so the search runs from the working directory.
     const base = if (input.path.len == 0) "." else input.path;
     const limit = input.limit;
 
-    // Drinky walks a directory for its files. Drinky searches a path that names a
-    // single file directly and ignores the glob. The glob only filters a
-    // traversal, and a named file needs none. `maybe_match` owns the walked
-    // paths. The file case borrows `base`, which outlives the search.
     const single_file: [1][]const u8 = .{base};
     var paths: []const []const u8 = &single_file;
     var files_incomplete = false;
@@ -121,14 +103,9 @@ fn runTimed(context: *const Context, input: *const Input, timer: *const search.T
     })) |match| {
         maybe_match = match;
         paths = match.paths;
-        // A walk that retains fewer candidates than it found, or a walk that
-        // reached its entry cap, leaves some files unsearched. A walk that ran
-        // out of time states the stop, because a walk that retained no path
-        // leaves the loop below with no file to read and no check to make.
         files_incomplete = match.stop == .entries or match.matched > match.paths.len;
         timed_out = match.stop == .time;
     } else |err| switch (err) {
-        // Not a directory: `base` names a file, so search that one path.
         error.NotDir => {},
         else => return Result.cannot(gpa, err, "search", base),
     }
@@ -141,16 +118,6 @@ fn runTimed(context: *const Context, input: *const Input, timer: *const search.T
     var bytes_read: usize = 0;
     var bytes_capped = false;
     search: for (paths, 0..) |path, index| {
-        // One clock read per file, which costs far less than the read of that
-        // file. The first file always runs, so a search that spent its whole
-        // budget on the walk still reports what one file holds, and a stop only
-        // lands once a further file proves the search is incomplete.
-        //
-        // Both bounds take their reading before the loop ends, so a file that
-        // meets both reports both. The readings are local, because a walk that
-        // ran out of time set the flag before this loop started and must not
-        // stop it here. No test covers the pair, because the byte bound takes
-        // 256 MB of reads.
         const out_of_time = index > 0 and timer.spent();
         const out_of_bytes = bytes_read >= bytes_read_max;
         if (out_of_time) timed_out = true;
@@ -163,7 +130,6 @@ fn runTimed(context: *const Context, input: *const Input, timer: *const search.T
             .limited(file_bytes_max),
         ) catch |err| switch (err) {
             error.Canceled, error.OutOfMemory => return err,
-            // An oversized file streams the full limit off disk before it fails.
             error.StreamTooLong => {
                 bytes_read += file_bytes_max;
                 continue;
@@ -190,7 +156,6 @@ fn runTimed(context: *const Context, input: *const Input, timer: *const search.T
             const shown = line[0..utf8FloorLength(line, line_bytes_max)];
             if (shown.len < line.len) lines_truncated = true;
             if (count > 0) try out.writer.writeAll("\n");
-            // Substitute U+FFFD for invalid bytes so the result serializes as a JSON string.
             try out.writer.print("{f}:{d}:{f}", .{
                 std.unicode.fmtUtf8(path),
                 line_number,
@@ -200,21 +165,9 @@ fn runTimed(context: *const Context, input: *const Input, timer: *const search.T
         }
     }
 
-    // One reading of the clock serves the sentence below and the box line, so
-    // both report the same span. It leaves out the work of the report itself.
     var elapsed_buffer: [24]u8 = undefined;
     const elapsed = format.duration(&elapsed_buffer, timer.elapsedMs());
-    // Every bound above already implies that files went unsearched, so this one
-    // speaks for a search that no bound stopped. One name serves the notice and
-    // the box line, so the two cannot drift apart. No test reaches it, because
-    // the flag needs a tree of a million entries or a hundred thousand
-    // candidate files.
     const files_unsearched = files_incomplete and !timed_out and !line_capped and !bytes_capped;
-    // An empty search is a whole result, so its sentence is the content and the
-    // count below states it. No match line precedes it, so it takes no
-    // separator. A result with matches states every bound that cut it instead,
-    // because the clock and the result limit ask the model for different
-    // changes, and one that swallows the other hides the change it asks for.
     if (count == 0) {
         if (timed_out) {
             try out.writer.print(
@@ -238,9 +191,6 @@ fn runTimed(context: *const Context, input: *const Input, timer: *const search.T
             }
         }
     } else {
-        // The clock and a result budget can both cut one search: a walk can
-        // spend the whole budget, and the first file it retained can then fill
-        // the result limit. Each notice states the change it asks for.
         if (timed_out) try out.writer.print(
             "\n[Drinky stopped the search after {s}. Drinky shows the matches that it found. " ++
                 "Use a narrower path or glob.]",
@@ -262,11 +212,7 @@ fn runTimed(context: *const Context, input: *const Input, timer: *const search.T
 
     var summary_output: std.Io.Writer.Allocating = .init(gpa);
     errdefer summary_output.deinit();
-    // The run time comes first, because the row above counted up to it and a
-    // narrow window cuts the tail of this row.
     try summary_output.writer.print("Time: {s} · Matches: {d}", .{ elapsed, count });
-    // Every bound that cut the result names itself, in the order the notices
-    // above take.
     if (timed_out) try summary_output.writer.writeAll(" · Search: Timed out");
     if (line_capped) try summary_output.writer.writeAll(" · Limit: Reached");
     if (bytes_capped) try summary_output.writer.print(
@@ -281,8 +227,6 @@ fn runTimed(context: *const Context, input: *const Input, timer: *const search.T
     return .{ .content = content, .summary = .{ .text = summary }, .is_error = false };
 }
 
-/// The largest length no greater than `max` that does not split a UTF-8
-/// codepoint, so a truncated line stays valid UTF-8 for JSON serialization.
 fn utf8FloorLength(bytes: []const u8, max: usize) usize {
     var end = @min(bytes.len, max);
     while (end > 0 and end < bytes.len and bytes[end] & 0xC0 == 0x80) end -= 1;
@@ -364,10 +308,6 @@ test "grep ignores the glob when the path is a single file" {
     try std.testing.expectEqualStrings(expected, result.content);
 }
 
-// A model sometimes sends an empty path instead of no path. An empty path
-// means the default, so the search runs from the working directory and does
-// not fail with an invisible path. The spent timer stops the walk after one
-// entry, so the test does not scan the whole working tree.
 test "grep treats an empty path as the working directory" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -512,8 +452,6 @@ test "grep reports an incomplete search when nothing was shown" {
     try search.expectMeasures(result.summary.?, "Matches: 0 · Limit: Reached");
 }
 
-// An empty search still states its count, so the box reads like every other
-// result of this tool.
 test "grep reports no matches of a complete search" {
     const gpa = std.testing.allocator;
     const context: Context = .{ .gpa = gpa, .io = std.testing.io };
@@ -557,28 +495,20 @@ test "grep reports skipped noise after an empty search" {
     try search.expectMeasures(result.summary.?, "Matches: 0");
 }
 
-// A search checks a wall-clock timeout between bounded steps. A stopped search
-// states the stop, so the model narrows the next search on evidence.
 test "grep reports a search that ran out of time" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const context: Context = .{ .gpa = gpa, .io = io };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    // Two files, so a further entry proves the walk incomplete. Neither holds
-    // the pattern, so the stopped search reports no match at all.
     try tmp.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "nope\n" });
     try tmp.dir.writeFile(io, .{ .sub_path = "b.txt", .data = "nope\n" });
     var base_buf: [128]u8 = undefined;
     const base = try std.fmt.bufPrint(&base_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
 
-    // A timer that started a whole timeout ago is spent at the first check, so
-    // the walk keeps one entry and stops on the next one.
     const timer: search.Timer = .startedAgo(io, search.timeout_ms);
     const result = try runTimed(&context, &.{ .pattern = "hit", .path = base }, &timer);
     defer result.deinit(gpa);
-    // A stopped search is a whole result, not a failure, because it reports the
-    // matches it found.
     try std.testing.expect(!result.is_error);
     try std.testing.expect(
         std.mem.indexOf(u8, result.content, "Drinky stopped the search after") != null,
@@ -586,8 +516,6 @@ test "grep reports a search that ran out of time" {
     try search.expectMeasures(result.summary.?, "Matches: 0 · Search: Timed out");
 }
 
-// A search that read a file before the clock ran out keeps those matches, so the
-// model narrows the next search on evidence rather than on one sentence.
 test "grep keeps the matches it found before the clock ran out" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -599,14 +527,10 @@ test "grep keeps the matches it found before the clock ran out" {
     var base_buf: [128]u8 = undefined;
     const base = try std.fmt.bufPrint(&base_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
 
-    // The walk keeps its first entry and stops on the second, and the loop reads
-    // that one file. Enumeration order decides which file it is.
     const timer: search.Timer = .startedAgo(io, search.timeout_ms);
     const result = try runTimed(&context, &.{ .pattern = "hit", .path = base }, &timer);
     defer result.deinit(gpa);
     try std.testing.expect(!result.is_error);
-    // The match line stands, and the notice behind it states the stop. The span
-    // it names varies with the machine, so the head and the tail pin the rest.
     try std.testing.expect(std.mem.indexOf(u8, result.content, ".txt:1:hit\n[Drinky ") != null);
     try std.testing.expectStringEndsWith(
         result.content,
@@ -615,10 +539,6 @@ test "grep keeps the matches it found before the clock ran out" {
     try search.expectMeasures(result.summary.?, "Matches: 1 · Search: Timed out");
 }
 
-// The clock and the result limit ask the model for different changes, a narrower
-// search and a higher limit, so a search that met both states both. A walk that
-// spent the whole budget hands the loop one file, and that file alone fills the
-// limit.
 test "grep states both the clock and the result limit" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;

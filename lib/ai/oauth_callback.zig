@@ -1,25 +1,13 @@
-//! The loopback OAuth redirect receiver: one bounded request line per
-//! connection under a shared five-minute deadline, with stray connections
-//! ignored. A pasted redirect line replays into the same listener, so a browser
-//! policy that blocks the plain-HTTP callback cannot strand the login.
-
 const std = @import("std");
 
 const net = @import("net.zig");
 
 const callback_timeout_ms = 5 * std.time.ms_per_min;
-/// The longest wait for the request line of one connection. A local browser and
-/// a paste replay send their request line at once, so a peer that stays silent
-/// this long is stray. The loop drops its connection and listens on, because a
-/// silent peer holds the only accept unread and strands every request behind it.
 const request_line_timeout_ms = std.time.ms_per_s;
 const request_bytes_max = 8 * 1024;
 const request_frame_bytes = "GET ".len + " HTTP/1.1\r\n".len;
 const response_page = "Drinky received authorization. Close this tab.";
 
-/// The longest pasted line that fits the wire byte limit with the request
-/// frame around it. The paste filter refuses a longer line, so the two limits
-/// cannot disagree.
 pub const paste_bytes_max = request_bytes_max - request_frame_bytes;
 
 pub const Redirect = struct {
@@ -27,24 +15,11 @@ pub const Redirect = struct {
     state: ?[]const u8 = null,
 };
 
-/// What binds a redirect to the login that waits for it. A grant that carries
-/// the wrong binding belongs to another sign-in, so the exchange or the listener
-/// refuses it, and the paste filter demands the same binding.
 pub const Binding = enum {
-    /// The grant carries a `state`, and the exchange compares it. A paste that
-    /// carries the state of another sign-in reaches the exchange, which names
-    /// that mismatch.
     state,
-    /// The listener answers on one random callback path alone, so a grant must
-    /// name the path of its own login. A paste of an earlier sign-in names the
-    /// path of that sign-in, and the paste filter refuses it.
     path,
 };
 
-/// The binding of one OAuth protocol module. A module that states the length of
-/// a callback path binds its redirect with that path, and every other module
-/// binds with `state`. The login and the paste filter both read it here, so one
-/// declaration decides both.
 pub fn bindingOf(comptime oauth: type) Binding {
     return if (@hasDecl(oauth, "callback_path_len")) .path else .state;
 }
@@ -61,19 +36,11 @@ pub fn receive(
     }, path);
 }
 
-/// The two deadlines of one redirect wait. The fields are named, because two
-/// durations can swap at a call site and a swap still compiles.
 const Wait = struct {
-    /// The deadline of the whole wait, accept included.
     timeout_ms: u64,
-    /// The deadline of the request line of one connection.
     request_line_timeout_ms: u64,
 };
 
-/// The redirect wait under explicit deadlines. `receive` holds the deadlines of
-/// the product, and a socket test holds short ones, so a stalled peer reads as
-/// a failed test and not as a five-minute hang. Both callers share this one
-/// wire path.
 fn receiveBounded(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -90,16 +57,6 @@ fn receiveBounded(
     return receiveWith(gpa, &bound, &source, path);
 }
 
-/// Whether a pasted line can carry the redirect of a login that binds with
-/// `state`: a callback outcome, no byte that breaks a request line, and room
-/// for the request frame within the wire byte limit.
-///
-/// RFC 6749 fixes the name of each outcome: `code` for a grant and `error` for
-/// a failure. The filter demands of each outcome exactly what this login
-/// demands, so a line that passes reaches the verdict of the listener. A grant
-/// needs its `code` and its `state`, which the exchange compares. A failure
-/// needs nothing more, because its own name ends the login. A state of another
-/// sign-in still reaches the exchange, which names that mismatch.
 pub fn holdsStateRedirect(line: []const u8) bool {
     if (!fitsRequestLine(line)) return false;
     if (std.mem.indexOf(u8, line, "error=") != null) return true;
@@ -107,24 +64,11 @@ pub fn holdsStateRedirect(line: []const u8) bool {
         std.mem.indexOf(u8, line, "state=") != null;
 }
 
-/// The pasted line and the callback path that the listener of the waiting login
-/// answers on. The fields are named, because the two slices can swap at a call
-/// site and a swap still compiles.
 pub const PasteOptions = struct {
     line: []const u8,
     path: []const u8,
 };
 
-/// Whether a pasted line can carry the redirect of the login whose listener
-/// answers on `options.path` alone: a callback outcome for that path, no byte
-/// that breaks a request line, and room for the request frame within the wire
-/// byte limit.
-///
-/// `options.path` is the callback path of the waiting login. The listener
-/// answers no other path, and it answers a failure under the `error` name as it
-/// answers a grant. A line that passes therefore reaches the verdict of the
-/// listener. The filter refuses a line that names another path, because the
-/// listener skips that line and waits on.
 pub fn holdsPathRedirect(options: *const PasteOptions) bool {
     if (!fitsRequestLine(options.line)) return false;
     if (std.mem.indexOf(u8, options.line, "error=") == null and
@@ -139,11 +83,6 @@ fn fitsRequestLine(line: []const u8) bool {
     return true;
 }
 
-/// Replay a pasted redirect line to the local listener on `port` as one HTTP
-/// request, with the line as the request target. The listener parses only the
-/// request line, and its success response is best effort, so replay closes
-/// right after the flush and never waits on the listener. A listener stuck on
-/// a stalled stray connection therefore cannot stall the caller.
 pub fn replay(io: std.Io, port: u16, line: []const u8) !void {
     var address: std.Io.net.IpAddress = .{ .ip4 = .loopback(port) };
     const stream = try address.connect(io, .{ .mode = .stream, .protocol = .tcp });
@@ -196,13 +135,6 @@ fn Wire(comptime Source: type, comptime Bound: type) type {
             request_buffer: *[request_bytes_max]u8,
             output: *Output,
         ) !void {
-            // A stray connection must not consume the only accept. A probe, a
-            // prefetch, a favicon fetch, a TLS handshake, and a peer that sends
-            // nothing are all stray. Ignore one and listen on until the
-            // deadline.
-            //
-            // A request that carries `code=` or `error=` is the provider
-            // redirect. It still fails fast when malformed or denied.
             while (true) {
                 var connection = try source.accept();
                 defer connection.close();
@@ -224,10 +156,6 @@ fn Wire(comptime Source: type, comptime Bound: type) type {
                 }
                 output.code = queryParameter(gpa, request_line, "code=") catch |err|
                     switch (err) {
-                        // RFC 6749 fixes the `error` parameter of a failed
-                        // authorization, so its presence marks a real redirect
-                        // that carries no code. Every code of that parameter
-                        // ends this login, so the reason stays unread.
                         error.MissingCallbackParam => if (std.mem.indexOf(
                             u8,
                             request_line,
@@ -240,10 +168,6 @@ fn Wire(comptime Source: type, comptime Bound: type) type {
                         error.MissingCallbackParam => null,
                         else => return err,
                     };
-                // The captured redirect authorizes the login. A torn success
-                // page must not fail it, so the response is best effort. A
-                // replayed paste closes its connection right after the send,
-                // and this tolerance is what makes that close harmless.
                 connection.respondAuthorized() catch {};
                 return;
             }
@@ -289,18 +213,11 @@ const Connection = struct {
 };
 
 fn takeRequestLine(reader: *std.Io.Reader) ![]const u8 {
-    // An HTTP method starts with an uppercase letter, while a TLS handshake
-    // from a browser HTTPS upgrade starts with 0x16. Such a client waits for a
-    // TLS response and sends no request line, so a wait for a newline holds
-    // the accept loop until the deadline. Classify the first byte, so a fast
-    // close lets the browser fall back to plain HTTP.
     if (!std.ascii.isUpper(try reader.peekByte())) return error.StrayProtocol;
     const request_line = try reader.takeDelimiterInclusive('\n');
     return request_line[0 .. request_line.len - 1];
 }
 
-/// The request path of `request_line`, without its query, or null when the line
-/// names no path.
 fn requestPath(request_line: []const u8) ?[]const u8 {
     if (!std.mem.startsWith(u8, request_line, "GET ")) return null;
     const rest = request_line["GET ".len..];
@@ -308,8 +225,6 @@ fn requestPath(request_line: []const u8) ?[]const u8 {
     return targetPath(rest[0..end]);
 }
 
-/// The path of a request target, without its query. An absolute URL yields the
-/// path after its host, and a target that names no path yields null.
 fn targetPath(target: []const u8) ?[]const u8 {
     if (target.len == 0) return null;
     const after_host = if (std.mem.indexOf(u8, target, "://")) |scheme| body: {
@@ -344,16 +259,9 @@ const TimeoutBound = struct {
         comptime function: anytype,
         args: std.meta.ArgsTuple(@TypeOf(function)),
     ) anyerror!void {
-        // `net.race` reserves the timer before the work, and its outer error
-        // propagates: the callback refuses to run unbounded.
         return try net.race(self.io, self.timeout_ms, function, args);
     }
 
-    /// Read the request line of one connection under its own bound. A peer that
-    /// sends no line inside the bound is stray: the read is canceled, and the
-    /// loop drops the connection and listens on. The timeout of this bound is
-    /// `error.RequestLineTimeout` alone, so a dropped connection cannot read as
-    /// an elapsed whole wait.
     fn readRequestLine(
         self: *const TimeoutBound,
         comptime function: anytype,
@@ -377,7 +285,6 @@ const TimeoutBound = struct {
 const Fake = struct {
     behavior: Behavior = .request,
     request: []const u8 = "",
-    /// Request lines served one per accept before `request`.
     stray_requests: []const []const u8 = &.{},
     clock_ms: u64 = 0,
     timeout_ms: u64 = 3,
@@ -411,9 +318,6 @@ const Fake = struct {
             if (self.fake.behavior == .deadline_wins_after_success) return error.Timeout;
         }
 
-        /// The doubles hold no real socket, so they answer their script at
-        /// once. The bound of one connection's request line stays a socket
-        /// test: a silent peer needs a stream that stays open.
         fn readRequestLine(
             self: Bound,
             comptime function: anytype,
@@ -644,8 +548,6 @@ test "callback accepts normal requests for both provider paths" {
 test "callback ignores stray connections until the real redirect arrives" {
     var fake: Fake = .{
         .stray_requests = &.{
-            // A connection closed before its request line completes, then a
-            // request without callback parameters.
             "GET /callback?code=code&state=state HTTP/1.1\r",
             "GET /favicon.ico HTTP/1.1\r\n",
         },
@@ -664,9 +566,6 @@ test "callback ignores stray connections until the real redirect arrives" {
 }
 
 test "callback classifies a TLS handshake from its first byte" {
-    // A browser HTTPS upgrade sends a TLS ClientHello to this plaintext port.
-    // Such a stream carries no newline, so a wait for one stalls the accept
-    // loop and shows the browser an error page instead of a fast failure.
     var buffer: [request_bytes_max]u8 = undefined;
     var reader = std.testing.Reader.init(&buffer, &.{
         .{ .buffer = "\x16\x03\x01\x02\x00\x01\x00\x01\xfc\x03\x03" },
@@ -692,9 +591,6 @@ test "callback ignores a TLS handshake until the real redirect arrives" {
 }
 
 test "a torn success response does not fail an authorized login" {
-    // A replayed paste closes its connection right after the send, so the
-    // success-page write can fail. The captured redirect already authorizes
-    // the login, and the failure must stay cosmetic.
     var fake: Fake = .{
         .request = "GET /auth/callback?code=code&state=state HTTP/1.1\r\n",
         .respond_fails = true,
@@ -711,8 +607,6 @@ test "a torn success response does not fail an authorized login" {
 }
 
 test "callback provider error redirects close without success response" {
-    // Every code ends this login, registered or not, and an absent state does
-    // not change the verdict.
     for ([_][]const u8{
         "GET /callback?error=access_denied&state=anthropic-state HTTP/1.1\r\n",
         "GET /auth/callback?error=access_denied&state=openai-state HTTP/1.1\r\n",
@@ -776,9 +670,6 @@ test bindingOf {
     try std.testing.expectEqual(Binding.state, bindingOf(state_flow));
 }
 
-// A path-bound listener answers on one random path. A line of an earlier
-// sign-in names the path of that sign-in, so the listener skips it and waits
-// on. The filter must refuse such a line, or the paste reports nothing.
 test "a pasted line of another callback path cannot complete a sign-in" {
     try std.testing.expect(!holdsPathRedirect(&.{
         .line = "http://localhost:53694/other?code=only",
@@ -804,8 +695,6 @@ test "a pasted state line must hold a callback outcome and fit the request line"
         "https://localhost:1455/auth/callback?code=paste-code&state=paste-state",
     ));
     try std.testing.expect(holdsStateRedirect("code=paste-code&state=paste-state"));
-    // The listener ends the login on the `error` name alone, so a failure line
-    // needs nothing more than that name.
     try std.testing.expect(holdsStateRedirect(
         "https://localhost:1455/auth/callback?error=access_denied&state=paste-state",
     ));
@@ -816,23 +705,18 @@ test "a pasted state line must hold a callback outcome and fit the request line"
     try std.testing.expect(!holdsStateRedirect("https://localhost:1455/auth/callback"));
     try std.testing.expect(!holdsStateRedirect("code=a&state=b with a space"));
     try std.testing.expect(!holdsStateRedirect("code=a&state=b\x1b"));
-    // A grant of a `state` login reaches no token exchange without its state,
-    // so the paste stops here and asks for the complete URL.
     try std.testing.expect(!holdsStateRedirect(
         "https://localhost:1455/auth/callback?code=only",
     ));
     try std.testing.expect(!holdsStateRedirect(
         "https://localhost:1455/auth/callback?state=only",
     ));
-    // One byte past the limit cannot fit the wire byte limit with its frame.
     var oversized: [paste_bytes_max + 1]u8 = @splat('x');
     @memcpy(oversized[0.."code=x&state=".len], "code=x&state=");
     try std.testing.expect(!holdsStateRedirect(&oversized));
 }
 
 test "a pasted path line must name the callback path and an outcome" {
-    // A grant of a path-bound login needs no state, and the listener answers on
-    // its path alone, so a line that names none reaches no verdict.
     try std.testing.expect(!holdsPathRedirect(&.{ .line = "code=only", .path = "/deadbeef" }));
     try std.testing.expect(!holdsPathRedirect(&.{ .line = "code=a&state=b", .path = "/deadbeef" }));
     try std.testing.expect(!holdsPathRedirect(&.{ .line = "", .path = "/deadbeef" }));
@@ -852,9 +736,6 @@ test "a pasted path line must name the callback path and an outcome" {
 }
 
 test "a maximal paste frames a request line at the wire byte limit" {
-    // The two limits meet here. The longest accepted paste must produce the
-    // longest request line the listener can read, so an edit of the frame
-    // constant cannot silently reject a maximal paste.
     var line: [paste_bytes_max]u8 = @splat('x');
     const prefix = "/callback?code=code&state=state&padding=";
     @memcpy(line[0..prefix.len], prefix);
@@ -875,11 +756,8 @@ test "a maximal paste frames a request line at the wire byte limit" {
     try std.testing.expectEqual(request.len, fake.request_byte_count);
 }
 
-/// The aggregate deadline of a socket test below. It bounds a stalled accept,
-/// and every loopback accept of a test lands far inside it.
 const socket_test_timeout_ms = 5 * std.time.ms_per_s;
 
-/// The deadlines of a socket test whose peer sends its request line at once.
 const socket_test_wait: Wait = .{
     .timeout_ms = socket_test_timeout_ms,
     .request_line_timeout_ms = request_line_timeout_ms,
@@ -929,8 +807,6 @@ test "a replayed denial line ends the redirect wait with the listener's verdict"
         std.testing.allocator.free(canceled.code);
         if (canceled.state) |state| std.testing.allocator.free(state);
     } else |_| {};
-    // A denial line carries no state, so the listener's verdict alone can end
-    // this wait.
     try replay(
         io,
         server.socket.address.getPort(),
@@ -939,14 +815,7 @@ test "a replayed denial line ends the redirect wait with the listener's verdict"
     try std.testing.expectError(error.AuthorizationFailed, future.await(io));
 }
 
-// A peer can open a connection and send no byte: an HTTPS upgrade that stops
-// before its handshake, a preconnect, or a probe. The listener reads one
-// connection at a time, so a silent peer holds the accept loop, and the paste
-// that follows waits unread. The login then ends with no redirect and no
-// verdict, which is the silence this test refuses.
 test "a silent connection cannot blind the listener to a replayed paste" {
-    // The silent peer must leave the listener inside its own bound, so the test
-    // holds a short one.
     const wait: Wait = .{
         .timeout_ms = socket_test_timeout_ms,
         .request_line_timeout_ms = 50,

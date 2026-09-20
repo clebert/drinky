@@ -1,13 +1,3 @@
-//! The global configuration loaded from `<home>/.drinky/config.json`. The file is
-//! optional and can be partial. An absent file, section, or field falls back to a
-//! built-in default. Drinky ignores unknown keys, so an older binary can read a
-//! newer file. The `File` struct below is the authoritative shape and default for
-//! every key. More sections join it as the harness grows. It carries no secrets.
-//! API keys come from the environment.
-//!
-//! The load also reads the user instruction files that the file names, through
-//! `ai.instructions`, so the config owns their content for the session.
-
 const std = @import("std");
 
 const ai = @import("ai");
@@ -17,67 +7,28 @@ const ui = @import("ui/root.zig");
 
 const Config = @This();
 
-/// The absolute path of `config.json`, present whether or not the file exists.
-/// The config document and the notices name it, so the user and the model both
-/// read the same path. Owned. `deinit` frees it.
 path: []const u8,
 timeouts: ai.net.ProviderTimeouts = .{},
 retry: ai.net.Retry = .{},
 bash: ai.tool.Context.Bash = .{},
-/// The pages of the newest conversation that one frame retains. A count outside
-/// the window that the layout accepts falls back to the compiled count.
 window_pages: usize = layout.window_pages_default,
-/// The shares at which a status gauge takes the warning color and the error
-/// color. A pair that names no valid shares falls back to the compiled pair.
 gauge: ui.status.Gauge = .{},
-/// The configured default reasoning-effort level, or null when the file names
-/// none or names an unknown level. The caller falls back to a compiled default.
 default_effort: ?ai.llm.Effort = null,
-/// Whether Drinky records and opens the global prompt history.
 prompt_history_enabled: bool = false,
-/// The user instruction files that `config.json` names, in the configured order,
-/// with the messages the load produced. Owned.
 user_instructions: ai.instructions.Result,
-/// The path-triggered skills that `config.json` names, in the configured order.
-/// The load resolves no name here, because the skill scan runs later. The app
-/// pairs each entry with a discovered skill and reports one it cannot pair.
-/// Owned. `deinit` frees them.
 required_skills: []const RequiredSkill = &.{},
-/// The configured default effort level that did not resolve. The config keeps it
-/// so the app can tell the user Drinky ignored their line. Owned. `deinit` frees
-/// it.
 dropped_effort: ?[]const u8 = null,
-/// The configured command timeout that Drinky cannot use, in milliseconds. The
-/// config keeps it so the app can tell the user Drinky ignored their line, and the
-/// bash tool falls back to the built-in timeout. Null on a legal value.
 dropped_bash_timeout_ms: ?u64 = null,
-/// The configured page count that Drinky cannot use. The config keeps it so the
-/// app can tell the user Drinky ignored their line, and the frame falls back to
-/// the compiled count. Null on a legal value.
 dropped_window_pages: ?usize = null,
-/// The gauge shares that Drinky cannot use, as the load resolved them. The file
-/// can state one share alone, and the other is then the compiled one. The config
-/// keeps the pair so the app can tell the user Drinky ignored their line, and the
-/// status line falls back to the compiled pair. The two shares hold one rule
-/// between them, so they drop together. Null on a legal pair.
 dropped_gauge: ?ui.status.Gauge = null,
-/// The keys of `config.json` that no field of `File` matches, as paths in file
-/// order. The parse ignores them, so the app reports them and a typo does not
-/// disappear silently. Owned. `deinit` frees them.
 unknown_keys: []const []const u8 = &.{},
-/// Whether more unknown keys followed the retained keys. The app reports the
-/// omission once, so the diagnostic cap never hides silently.
 unknown_keys_omitted: bool = false,
 
-/// One configured path-triggered skill: the path glob and the name of the skill
-/// that a matching file requires. Owns both strings (duped out of the parsed
-/// file).
 pub const RequiredSkill = struct {
     glob: []const u8,
     skill: []const u8,
 };
 
-/// The on-disk shape. Each field defaults to the built-in, so any subset parses.
 const File = struct {
     user_instructions: []const File.UserInstruction = &.{},
     required_skills: []const File.RequiredSkill = &.{},
@@ -85,13 +36,8 @@ const File = struct {
     bash: Bash = .{},
     interface: Interface = .{},
     default_effort: ?JsonString = null,
-    // Last on purpose: the leaf walk keeps the file order, so this row closes
-    // the generated key list.
     prompt_history: PromptHistory = .{},
 
-    /// A JSON value that must be a string. The default parser for `[]const u8`
-    /// also accepts an array of numbers, which turns a mistyped path into bytes
-    /// without a complaint. This parser rejects every value that is not a string.
     const JsonString = struct {
         value: []const u8,
 
@@ -113,22 +59,16 @@ const File = struct {
         }
     };
 
-    /// One configured user instruction file. A relative path resolves against
-    /// `<home>/.drinky/`.
     const UserInstruction = struct {
         path: JsonString,
     };
 
-    /// One configured path-triggered skill. The glob measures against the path
-    /// relative to the working directory.
     const RequiredSkill = struct {
         glob: JsonString,
         skill: JsonString,
     };
 
     const Request = struct {
-        // Remote providers share the network connect timeout. DwarfStar uses a
-        // separate window because a local server can load weights for minutes.
         connect_timeout_ms: u64 = timeouts_default.anthropic.connect_ms,
         ds4_connect_timeout_ms: u64 = timeouts_default.ds4.connect_ms,
         anthropic_idle_timeout_ms: u64 = timeouts_default.anthropic.idle_ms,
@@ -149,24 +89,17 @@ const File = struct {
         timeout_ms: u64 = bash_default.timeout_ms,
     };
 
-    /// How much of the conversation one frame retains, and where a status gauge
-    /// leaves the muted role. A value outside its window states an interface
-    /// that Drinky cannot paint, so the load reports it and keeps the default.
     const Interface = struct {
         window_pages: usize = layout.window_pages_default,
         gauge_percent_warning: f64 = gauge_default.percent_warning,
         gauge_percent_error: f64 = gauge_default.percent_error,
     };
 
-    /// Whether Drinky records and opens the global prompt history. A false
-    /// value leaves the saved history file unchanged.
     const PromptHistory = struct {
         enabled: bool = false,
     };
 };
 
-/// The inputs `load` needs to find `config.json`. `home` can be relative, so it
-/// resolves against the working directory the app already knows.
 pub const LoadOptions = struct {
     working_directory: []const u8,
     home: []const u8,
@@ -183,15 +116,8 @@ const retry_default: ai.net.Retry = .{};
 const bash_default: ai.tool.Context.Bash = .{};
 const gauge_default: ui.status.Gauge = .{};
 
-/// A malformed file must not fill the startup transcript with one event per
-/// key. Sixteen paths identify a broad shape mismatch. One final event reports
-/// that the cap omitted the remaining paths.
 const unknown_keys_max = 16;
 
-/// The prose for one leaf key of `File`. The `keys` table below must hold one
-/// entry per leaf, and `leaves` turns a missing or a stale entry into a compile
-/// error. The type and the default are read off `File`, so a default can never
-/// drift out of the document.
 const Key = struct {
     path: []const u8,
     description: []const u8,
@@ -358,21 +284,16 @@ const keys = [_]Key{
     },
 };
 
-/// One leaf key of `File`, with its JSON type and its default. A null default
-/// marks a required field inside an array entry.
 const Leaf = struct {
     path: []const u8,
     type_name: []const u8,
     default_text: ?[]const u8,
 };
 
-/// Whether a field is a nested object rather than a leaf value. Every struct is
-/// an object except `JsonString`, which is one string on the wire.
 fn isSection(comptime T: type) bool {
     return @typeInfo(T) == .@"struct" and T != File.JsonString;
 }
 
-/// Whether a field is an array whose entries are objects with their own keys.
 fn isObjectSlice(comptime T: type) bool {
     return switch (@typeInfo(T)) {
         .pointer => |pointer| pointer.size == .slice and isSection(pointer.child),
@@ -380,7 +301,6 @@ fn isObjectSlice(comptime T: type) bool {
     };
 }
 
-/// The JSON type of a leaf field of `File`.
 fn jsonTypeName(comptime T: type) []const u8 {
     const inner = switch (@typeInfo(T)) {
         .optional => |optional| optional.child,
@@ -397,32 +317,23 @@ fn jsonTypeName(comptime T: type) []const u8 {
     };
 }
 
-/// The default of a leaf field, rendered for the document. A required field in
-/// an array entry has no default and returns null.
 fn maybeDefaultText(comptime field: std.builtin.Type.StructField) ?[]const u8 {
     const pointer = field.default_value_ptr orelse return null;
     const value = @as(*const field.type, @ptrCast(@alignCast(pointer))).*;
     return switch (@typeInfo(field.type)) {
         .bool => if (value) "true" else "false",
         .int, .float => std.fmt.comptimePrint("{d}", .{value}),
-        // "unset", never "none": a provider spells a reasoning level `none`, so
-        // that word reads as a value rather than as the absence of one.
         .optional => if (value == null) "unset" else @compileError("expected a null default"),
         .pointer => if (value.len == 0) "empty" else @compileError("expected an empty default"),
         else => @compileError("the config field " ++ field.name ++ " has no printable default"),
     };
 }
 
-/// Every field in `File` and its object sections needs a default, because a
-/// partial file must parse. Only a field inside an array entry can be required.
 fn defaultText(comptime field: std.builtin.Type.StructField) []const u8 {
     return maybeDefaultText(field) orelse
         @compileError("the config field " ++ field.name ++ " declares no default");
 }
 
-/// Every leaf key of `File`, in declaration order. This walk is the drift guard:
-/// it reads the shape off the struct that parses the file, so a new field cannot
-/// reach a release undocumented.
 const leaves: []const Leaf = blk: {
     @setEvalBranchQuota(20_000);
     var list: []const Leaf = &.{};
@@ -456,12 +367,7 @@ const leaves: []const Leaf = blk: {
     break :blk list;
 };
 
-/// The key list of the config document, rendered from `leaves` and `keys`. A
-/// leaf with no entry, a duplicate entry, and an entry that names no leaf are
-/// all compile errors.
 const key_lines = blk: {
-    // The walk pairs every leaf with every key, so its work grows with the
-    // square of the key count. Each new key needs a little more room here.
     @setEvalBranchQuota(20_000);
     var text: []const u8 = "";
     var used = [_]bool{false} ** keys.len;
@@ -489,7 +395,6 @@ const key_lines = blk: {
     break :blk text;
 };
 
-/// Join `list` into one comma-separated line for the document.
 fn joinNames(comptime list: []const []const u8) []const u8 {
     comptime {
         var text: []const u8 = "";
@@ -509,8 +414,6 @@ const effort_levels = blk: {
     break :blk joinNames(list);
 };
 
-/// The example that the document carries. A test parses it back through the
-/// loader and proves that every key resolves, so the example cannot go stale.
 const example =
     \\{
     \\  "user_instructions": [{ "path": "instructions.md" }],
@@ -522,21 +425,8 @@ const example =
     \\}
 ;
 
-/// The key list of the section. It is a compiled constant, so the section costs
-/// no work at startup beyond one format call.
 const keys_section = "\n### Keys\n\n" ++ key_lines;
 
-/// Build the configuration section of the document that the `describe_drinky`
-/// tool returns: a compiled key list between a head and a part that states the
-/// fallbacks the app compiles in. The head names the real file, so the model
-/// edits the path that Drinky reads. The caller owns the text.
-///
-/// `effort_default` is the level a session starts on when neither the file nor
-/// the project state names one. The app owns it, so the app passes it in.
-///
-/// The tool shows no box line beside the call, so this measures nothing. The
-/// document is the same text at every call, and a measure of it states nothing
-/// that the user can act on.
 pub fn document(
     self: *const Config,
     gpa: std.mem.Allocator,
@@ -585,8 +475,6 @@ pub fn document(
     });
 }
 
-/// Free the path, the user instruction files, their messages, the required
-/// skills, the dropped-default names, and the unknown keys.
 pub fn deinit(self: *Config, gpa: std.mem.Allocator) void {
     gpa.free(self.path);
     self.user_instructions.deinit();
@@ -600,8 +488,6 @@ pub fn deinit(self: *Config, gpa: std.mem.Allocator) void {
     gpa.free(self.unknown_keys);
 }
 
-/// Load `<home>/.drinky/config.json`, or the built-in defaults when it is absent.
-/// Every configured user instruction path resolves against `<home>/.drinky/`.
 pub fn load(gpa: std.mem.Allocator, io: std.Io, options: *const LoadOptions) !Config {
     const directory = try std.fs.path.resolve(
         gpa,
@@ -612,8 +498,6 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, options: *const LoadOptions) !Co
     defer gpa.free(path);
     const cwd = std.Io.Dir.cwd();
     const data = cwd.readFileAlloc(io, path, gpa, .unlimited) catch |err| switch (err) {
-        // An absent file is the built-in default, and it still names its path.
-        // The config document then tells the model where to create it.
         error.FileNotFound => return .{
             .path = try gpa.dupe(u8, path),
             .user_instructions = .init(gpa, .user),
@@ -624,16 +508,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, options: *const LoadOptions) !Co
     return loadFromData(gpa, io, &.{ .directory = directory, .path = path, .data = data });
 }
 
-/// Build the config from the bytes of `config.json` and fold each section into
-/// the neutral option structs. This also reads every configured user instruction
-/// file, so it needs `io`. Only a malformed file fails the load. A path Drinky
-/// cannot use becomes a message, so a bad entry never stops Drinky.
 fn loadFromData(gpa: std.mem.Allocator, io: std.Io, options: *const DataOptions) !Config {
-    // Every number keeps its text, and the typed parse converts it exactly. A
-    // dynamic parse would send a decimal or an exponent form through `f64`
-    // first. The value `18446744073709551615.0` then rounds up past every
-    // `u64`. The typed parse asserts that cast, so such a file would crash
-    // Drinky. Drinky must report a value it cannot use instead.
     const source = try std.json.parseFromSlice(
         std.json.Value,
         gpa,
@@ -652,10 +527,6 @@ fn loadFromData(gpa: std.mem.Allocator, io: std.Io, options: *const DataOptions)
     const bash = parsed.value.bash;
     const interface = parsed.value.interface;
 
-    // The paths borrow the parsed arena, and the loader dupes what it keeps. The
-    // loader inspects at most `files_max` entries, and one entry past that cap
-    // is enough to make it report the rest. A long list therefore cannot grow
-    // this buffer.
     var path_buffer: [ai.instructions.files_max + 1][]const u8 = undefined;
     const path_count = @min(parsed.value.user_instructions.len, path_buffer.len);
     const configured_paths = parsed.value.user_instructions[0..path_count];
@@ -705,8 +576,6 @@ fn loadFromData(gpa: std.mem.Allocator, io: std.Io, options: *const DataOptions)
     const unknown_keys_omitted = try collectUnknownKeys(gpa, &source.value, &unknown);
     const owned_path = try gpa.dupe(u8, options.path);
     errdefer gpa.free(owned_path);
-    // Take the owned slices before the literal. A `try` inside it can fail after
-    // an earlier field already took its list, and that list frees nothing then.
     const unknown_keys = try unknown.toOwnedSlice(gpa);
     errdefer {
         for (unknown_keys) |key| gpa.free(key);
@@ -770,10 +639,6 @@ fn loadFromData(gpa: std.mem.Allocator, io: std.Io, options: *const DataOptions)
     };
 }
 
-/// Collect every object key that the typed config ignores. The parsed value is
-/// also the source of the typed config, so syntax and allocation errors cannot
-/// disappear in a diagnostic-only parse. Returns true after the retained-key
-/// cap hides at least one key.
 fn collectUnknownKeys(
     gpa: std.mem.Allocator,
     source: *const std.json.Value,
@@ -798,7 +663,6 @@ fn collectUnknownKeys(
     return false;
 }
 
-/// Collect unknown direct fields from one configured object section.
 fn collectUnknownSection(
     comptime T: type,
     gpa: std.mem.Allocator,
@@ -814,9 +678,6 @@ fn collectUnknownSection(
     return false;
 }
 
-/// Collect unknown direct fields from every object in one configured array. The
-/// typed parse validated the array, so its length bounds the loop and every
-/// entry is an object, even one past the instruction-file cap.
 fn collectUnknownEntries(
     comptime T: type,
     gpa: std.mem.Allocator,
@@ -840,7 +701,6 @@ fn collectUnknownEntries(
     return false;
 }
 
-/// Whether `T` has the configured field `name`.
 fn hasField(comptime T: type, name: []const u8) bool {
     inline for (@typeInfo(T).@"struct".fields) |field| {
         if (std.mem.eql(u8, field.name, name)) return true;
@@ -848,7 +708,6 @@ fn hasField(comptime T: type, name: []const u8) bool {
     return false;
 }
 
-/// Retain one formatted unknown key. Returns true instead when the cap is full.
 fn appendUnknownKey(
     gpa: std.mem.Allocator,
     out: *std.ArrayList([]const u8),
@@ -862,9 +721,6 @@ fn appendUnknownKey(
     return false;
 }
 
-/// Resolve the configured default effort level. An unknown name resolves to
-/// null. The function also records it in `dropped` so the app can surface it. An
-/// unset name is just null.
 fn resolveEffort(
     gpa: std.mem.Allocator,
     dropped: *?[]const u8,
@@ -876,10 +732,6 @@ fn resolveEffort(
     return null;
 }
 
-/// Resolve the configured command timeout. Every command runs under a limit, so
-/// a value outside the legal window states a wait that no command can take. Such
-/// a value falls back to the built-in timeout, and the function records it in
-/// `dropped` so the app can surface it.
 fn resolveBashTimeout(dropped: *?u64, configured: u64) u64 {
     if (configured >= ai.tool.Context.Bash.timeout_ms_min and
         configured <= ai.tool.Context.Bash.timeout_ms_max)
@@ -888,10 +740,6 @@ fn resolveBashTimeout(dropped: *?u64, configured: u64) u64 {
     return bash_default.timeout_ms;
 }
 
-/// Resolve the configured page count. A count of no page retains nothing, and a
-/// count above the window costs work in every frame that no user sees. Such a
-/// count falls back to the compiled count, and the function records it in
-/// `dropped` so the app can surface it.
 fn resolveWindowPages(dropped: *?usize, configured: usize) usize {
     if (configured >= layout.window_pages_min and configured <= layout.window_pages_max)
         return configured;
@@ -899,11 +747,6 @@ fn resolveWindowPages(dropped: *?usize, configured: usize) usize {
     return layout.window_pages_default;
 }
 
-/// Resolve the configured gauge shares. Each share names a part of a limit, and
-/// the warning color comes before the error color, so the warning share must not
-/// pass the error share. A pair that breaks either rule falls back to the
-/// compiled pair, and the function records it in `dropped` so the app can
-/// surface it. The rule spans both shares, so the pair drops as one.
 fn resolveGauge(dropped: *?ui.status.Gauge, configured: *const File.Interface) ui.status.Gauge {
     const gauge: ui.status.Gauge = .{
         .percent_warning = configured.gauge_percent_warning,
@@ -915,15 +758,10 @@ fn resolveGauge(dropped: *?ui.status.Gauge, configured: *const File.Interface) u
     return gauge_default;
 }
 
-/// Whether `percent` names a share of a limit. A huge literal parses as an
-/// infinity, and a quoted word can parse as a not-a-number value. Neither one
-/// orders against a bound, so both fail here and drop.
 fn isShare(percent: f64) bool {
     return percent >= ui.status.Gauge.percent_min and percent <= ui.status.Gauge.percent_max;
 }
 
-/// Whether `path` names a leaf key of `File`. Only the tests read `leaves`
-/// through it, to prove the walk reached sections and array entries.
 fn isLeafPath(path: []const u8) bool {
     for (leaves) |leaf| {
         if (std.mem.eql(u8, leaf.path, path)) return true;
@@ -939,8 +777,6 @@ fn loadDataForTest(data: []const u8) !Config {
     });
 }
 
-/// Load the config of a temporary home directory. The working directory only
-/// matters for a relative home, which the tests never build.
 fn loadForTest(gpa: std.mem.Allocator, io: std.Io, home: []const u8) !Config {
     const working_directory = try std.process.currentPathAlloc(io, gpa);
     defer gpa.free(working_directory);
@@ -967,7 +803,6 @@ test "load reads the request section" {
         \\  "backoff_ms_initial": 100, "backoff_ms_max": 900 } }
     );
     defer config.deinit(std.testing.allocator);
-    // Remote providers share the connect bound. DwarfStar uses its own.
     try std.testing.expectEqual(@as(u64, 1000), config.timeouts.anthropic.connect_ms);
     try std.testing.expectEqual(@as(u64, 1000), config.timeouts.openai.connect_ms);
     try std.testing.expectEqual(@as(u64, 1000), config.timeouts.xai.connect_ms);
@@ -1008,7 +843,6 @@ test "load reads the interface section" {
     try std.testing.expect(config.dropped_window_pages == null);
     try std.testing.expect(config.dropped_gauge == null);
 
-    // Without the section the compiled interface applies.
     var empty = try loadDataForTest("{}");
     defer empty.deinit(std.testing.allocator);
     try std.testing.expectEqual(layout.window_pages_default, empty.window_pages);
@@ -1018,9 +852,6 @@ test "load reads the interface section" {
     try std.testing.expect(empty.dropped_gauge == null);
 }
 
-// A window of no page retains nothing, and a count above the window costs work
-// in every frame that no user sees. Both keep the line for the report and fall
-// back to the compiled count, as every other value Drinky cannot use does.
 test "a page count Drinky cannot use falls back to the default and is reported" {
     const cases = [_]usize{ 0, layout.window_pages_max + 1, 100_000 };
     for (cases) |configured| {
@@ -1036,7 +867,6 @@ test "a page count Drinky cannot use falls back to the default and is reported" 
         try std.testing.expectEqual(@as(?usize, configured), config.dropped_window_pages);
     }
 
-    // Both edges of the window are legal counts, so neither is reported.
     const edges = [_]usize{ layout.window_pages_min, layout.window_pages_max };
     for (edges) |configured| {
         const data = try std.fmt.allocPrint(
@@ -1052,23 +882,16 @@ test "a page count Drinky cannot use falls back to the default and is reported" 
     }
 }
 
-// A share outside 0 to 100 names no part of a limit, and a warning share above
-// the error share would hide the warning color. The pair holds one rule, so it
-// drops as one and the report names both shares as the file states them.
 test "gauge shares Drinky cannot use fall back to the compiled pair and are reported" {
     const cases = [_][]const u8{
         \\{ "interface": { "gauge_percent_warning": -20, "gauge_percent_error": 90 } }
         ,
         \\{ "interface": { "gauge_percent_warning": 75, "gauge_percent_error": 250 } }
         ,
-        // A huge literal parses as an infinity, and a quoted word parses as a
-        // not-a-number value. Neither one orders against a bound.
         \\{ "interface": { "gauge_percent_warning": 75, "gauge_percent_error": 1e999 } }
         ,
         \\{ "interface": { "gauge_percent_warning": "nan", "gauge_percent_error": 90 } }
         ,
-        // The warning color comes first, so the warning share must not pass the
-        // error share.
         \\{ "interface": { "gauge_percent_warning": 90, "gauge_percent_error": 40 } }
         ,
     };
@@ -1080,8 +903,6 @@ test "gauge shares Drinky cannot use fall back to the compiled pair and are repo
         try std.testing.expect(config.dropped_gauge != null);
     }
 
-    // The report names the pair the file states, so the user reads their own
-    // line back.
     var config = try loadDataForTest(
         \\{ "interface": { "gauge_percent_warning": 90, "gauge_percent_error": 40 } }
     );
@@ -1089,7 +910,6 @@ test "gauge shares Drinky cannot use fall back to the compiled pair and are repo
     try std.testing.expectEqual(@as(f64, 90), config.dropped_gauge.?.percent_warning);
     try std.testing.expectEqual(@as(f64, 40), config.dropped_gauge.?.percent_error);
 
-    // Both edges and an equal pair are legal, so none of them is reported.
     var edges = try loadDataForTest(
         \\{ "interface": { "gauge_percent_warning": 0, "gauge_percent_error": 100 } }
     );
@@ -1103,9 +923,6 @@ test "gauge shares Drinky cannot use fall back to the compiled pair and are repo
     try std.testing.expect(equal.dropped_gauge == null);
 }
 
-// Every command runs under a limit. A zero used to mean no limit, so a stale
-// file still names one. The load keeps the line for the report and falls back to
-// the built-in timeout.
 test "a command timeout Drinky cannot use falls back to the default and is reported" {
     const cases = [_]u64{
         0,
@@ -1125,7 +942,6 @@ test "a command timeout Drinky cannot use falls back to the default and is repor
         try std.testing.expectEqual(@as(?u64, configured), config.dropped_bash_timeout_ms);
     }
 
-    // Both edges of the window are legal values, so neither is reported.
     const edges = [_]u64{ ai.tool.Context.Bash.timeout_ms_min, ai.tool.Context.Bash.timeout_ms_max };
     for (edges) |configured| {
         const data = try std.fmt.allocPrint(
@@ -1141,9 +957,6 @@ test "a command timeout Drinky cannot use falls back to the default and is repor
     }
 }
 
-// A count of milliseconds holds no sign, and one past the counter names a wait
-// that no clock can hold. Such a file is malformed, so the load fails instead of
-// a fallback that reports a value Drinky could not even read.
 test "a configured number that no counter can hold fails the load" {
     try std.testing.expectError(error.Overflow, loadDataForTest(
         \\{ "bash": { "timeout_ms": -1 } }
@@ -1152,9 +965,6 @@ test "a configured number that no counter can hold fails the load" {
         \\{ "request": { "anthropic_idle_timeout_ms": 99999999999999999999 } }
     ));
 
-    // A decimal or an exponent form counts milliseconds too. The load keeps the
-    // text, so a value past the counter reports as one that Drinky cannot read.
-    // Through a double it would round to 2^64 and crash the typed parse.
     try std.testing.expectError(error.Overflow, loadDataForTest(
         \\{ "bash": { "timeout_ms": 1.8446744073709552e19 } }
     ));
@@ -1162,8 +972,6 @@ test "a configured number that no counter can hold fails the load" {
         \\{ "request": { "openai_idle_timeout_ms": 18446744073709551616.0 } }
     ));
 
-    // A whole count that such a form writes stays legal, and the bash timeout
-    // holds it, because 300 seconds are inside the legal window.
     var config = try loadDataForTest(
         \\{ "bash": { "timeout_ms": 3e5 } }
     );
@@ -1222,8 +1030,6 @@ test "load reads the required skills in file order" {
     try std.testing.expectEqualStrings("src/**/*.ts", config.required_skills[1].glob);
     try std.testing.expectEqualStrings("ts-style", config.required_skills[1].skill);
 
-    // An entry states both halves, and each one is a string. The load resolves
-    // no name here, because the skill scan runs later.
     try std.testing.expectError(error.MissingField, loadDataForTest(
         \\{ "required_skills": [{ "glob": "**/*.zig" }] }
     ));
@@ -1231,15 +1037,11 @@ test "load reads the required skills in file order" {
         \\{ "required_skills": [{ "glob": "**/*.zig", "skill": ["zig-style"] }] }
     ));
 
-    // Without the key no file requires a skill.
     var empty = try loadDataForTest("{}");
     defer empty.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 0), empty.required_skills.len);
 }
 
-// The five `default_models` keys went away with the compiled model table. A file
-// that still holds them reads them as unknown keys, so the next start reports
-// them and keeps running.
 test "a stale default_models key reads as an unknown key" {
     var config = try loadDataForTest(
         \\{ "default_models": { "anthropic-plan": "claude-sonnet-5" } }
@@ -1249,9 +1051,6 @@ test "a stale default_models key reads as an unknown key" {
     try std.testing.expectEqualStrings("default_models", config.unknown_keys[0]);
 }
 
-// The history is off by default. A true value turns the whole feature on for
-// the next start, and the document states the type and the default so the model
-// writes the key with a JSON boolean and never with a string.
 test "load reads prompt_history.enabled and documents it last" {
     var absent = try loadDataForTest("{}");
     defer absent.deinit(std.testing.allocator);
@@ -1269,14 +1068,11 @@ test "load reads prompt_history.enabled and documents it last" {
     defer disabled.deinit(std.testing.allocator);
     try std.testing.expect(!disabled.prompt_history_enabled);
 
-    // The document reports the boolean type and the false default. The section
-    // sits last in `File`, so its row closes the key list.
     const row = "- `prompt_history.enabled` — boolean, default: false.";
     const row_index = std.mem.indexOf(u8, key_lines, row) orelse return error.MissingRow;
     try std.testing.expect(std.mem.indexOfPos(u8, key_lines, row_index + row.len, "\n- `") == null);
     try std.testing.expect(isLeafPath("prompt_history.enabled"));
 
-    // A typo inside the section reaches the report like a typo in any section.
     var typo = try loadDataForTest(
         \\{ "prompt_history": { "enabld": false } }
     );
@@ -1301,7 +1097,6 @@ test "load resolves default_effort, dropping an unknown level" {
     try std.testing.expect(dropped.default_effort == null);
     try std.testing.expectEqualStrings("enormous", dropped.dropped_effort.?);
 
-    // An unset level is null, with nothing dropped.
     var empty = try loadDataForTest("{}");
     defer empty.deinit(std.testing.allocator);
     try std.testing.expect(empty.default_effort == null);
@@ -1321,8 +1116,6 @@ test "a configured name must be a JSON string" {
             \\{ "user_instructions": [{ "path": ["one.md", "two.md"] }] }
         ),
     );
-    // The default parser for `[]const u8` reads an array of numbers as bytes.
-    // A path rejects it.
     try std.testing.expectError(
         error.UnexpectedToken,
         loadDataForTest(
@@ -1344,10 +1137,7 @@ test "load applies the known keys and reports the unknown ones" {
         \\  "future": { "x": 1 }, "default_effot": "high" }
     );
     defer config.deinit(std.testing.allocator);
-    // An unknown key never stops the load, so every known key still applies.
     try std.testing.expectEqual(@as(u64, 42), config.timeouts.anthropic.connect_ms);
-    // Misspelled section, entry, and top-level keys all report. An unknown
-    // section reports once, not once per nested key.
     try std.testing.expectEqual(@as(usize, 4), config.unknown_keys.len);
     try std.testing.expectEqualStrings("request.connect_timeout", config.unknown_keys[0]);
     try std.testing.expectEqualStrings("user_instructions[0].pth", config.unknown_keys[1]);
@@ -1378,8 +1168,6 @@ test "the scan reaches an entry past the instruction-file cap" {
     try data.writer.writeAll(
         \\{ "user_instructions": [
     );
-    // The loader inspects at most `files_max + 1` entries. One entry past that
-    // cap carries the only typo, so it reports only when the scan is unbounded.
     for (0..ai.instructions.files_max + 1) |index| {
         try data.writer.print("{{\"path\":\"f{d}.md\"}},", .{index});
     }
@@ -1398,9 +1186,6 @@ test "the scan reaches an entry past the instruction-file cap" {
 }
 
 test "the config document describes every key of the file, and only those" {
-    // `leaves` walks `File` and `key_lines` pairs each leaf with its prose, so
-    // both are compile errors when they disagree. This test proves the walk
-    // reached object sections and array entries.
     try std.testing.expectEqual(@as(usize, keys.len), leaves.len);
     try std.testing.expect(isLeafPath("bash.timeout_ms"));
     try std.testing.expect(isLeafPath("default_effort"));
@@ -1410,7 +1195,6 @@ test "the config document describes every key of the file, and only those" {
     try std.testing.expect(hasField(File.Request, "attempts_max"));
     try std.testing.expect(!hasField(File.Request, "nope"));
 
-    // Every documented default is the one the struct declares.
     try std.testing.expect(std.mem.indexOf(
         u8,
         key_lines,
@@ -1427,8 +1211,6 @@ test "the config document names the file and its own example loads clean" {
     defer gpa.free(text);
     try std.testing.expect(std.mem.indexOf(u8, text, "/unused/config.json") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "`bash.timeout_ms`") != null);
-    // The effort enum feeds the document, so a new level cannot go missing from
-    // it. The document names no model, because Drinky compiles none in.
     try std.testing.expect(std.mem.indexOf(u8, text, "low, medium, high, xhigh, max") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "This file names no model") != null);
     try std.testing.expect(std.mem.indexOf(
@@ -1437,56 +1219,39 @@ test "the config document names the file and its own example loads clean" {
         "`user_instructions[].path` — string, required.",
     ) != null);
 
-    // An unset key reads as "unset", never as "none". A provider spells a
-    // reasoning level `none`, so that word reads as a value rather than as no
-    // value.
     try std.testing.expect(std.mem.indexOf(u8, text, "`default_effort` — string, " ++
         "default: unset.") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "default: none") == null);
 
-    // The app's compiled fallback reaches the document, so a key left out never
-    // looks like it has no value at all.
     try std.testing.expect(std.mem.indexOf(u8, text, "Without the key, Drinky uses " ++
         "xhigh.") != null);
 
-    // An unknown key warns at the next start and never fails it. The document
-    // states both facts, so the model does not have to guess which one holds.
     try std.testing.expect(std.mem.indexOf(u8, text, "still succeeds") != null);
 
-    // The remembered per-project choice outranks the file, so the warning sits on
-    // every key it governs. A reader that misses it promises an inert change.
     try std.testing.expect(std.mem.indexOf(u8, text, "outranks this file") != null);
     try std.testing.expectEqual(
         @as(usize, 1),
         std.mem.count(u8, text, "Only a new project reads it."),
     );
 
-    // A description states behavior that the key name does not imply, so a
-    // reader never has to derive it and cannot derive it wrong.
     try std.testing.expect(std.mem.indexOf(u8, text, "retry-after") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "keepalive") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "folds a level") != null);
-    // A bounded key states its window, so a reader knows which value Drinky
-    // reports and drops.
     try std.testing.expect(std.mem.indexOf(u8, text, std.fmt.comptimePrint(
         "count must be from {d} to {d}",
         .{ layout.window_pages_min, layout.window_pages_max },
     )) != null);
-    // The instruction caps come from the loader that enforces them.
     try std.testing.expect(std.mem.indexOf(u8, text, std.fmt.comptimePrint(
         "at most {d} files",
         .{ai.instructions.files_max},
     )) != null);
 
-    // The example the document shows must load with nothing unknown and nothing
-    // dropped, so the model never copies a stale shape out of it.
     var from_example = try loadDataForTest(example);
     defer from_example.deinit(gpa);
     try std.testing.expectEqual(@as(usize, 0), from_example.unknown_keys.len);
     try std.testing.expect(from_example.dropped_effort == null);
     try std.testing.expectEqual(ai.llm.Effort.high, from_example.default_effort.?);
     try std.testing.expectEqual(@as(u64, 90_000), from_example.timeouts.anthropic.idle_ms);
-    // The example touches one idle key, so the other keeps its own default.
     try std.testing.expectEqual(
         timeouts_default.openai.idle_ms,
         from_example.timeouts.openai.idle_ms,
@@ -1503,8 +1268,6 @@ test "load resolves user instruction paths against the config directory in order
 
     var drinky_directory = try tmp.dir.createDirPathOpen(io, ".drinky", .{});
     defer drinky_directory.close(io);
-    // The `\u002e` escape is the `.` of `second.md`. It proves that the parsed
-    // value and the typed parser preserve a decoded path.
     try drinky_directory.writeFile(io, .{
         .sub_path = "config.json",
         .data =
@@ -1532,7 +1295,6 @@ test "load resolves user instruction paths against the config directory in order
     try std.testing.expectEqualStrings("Second.\n", files[0].content);
     try std.testing.expectEqualStrings(first_path, files[1].path);
     try std.testing.expectEqualStrings("First.\n", files[1].content);
-    // The loader reports a path it cannot use, and the config carries it through.
     try std.testing.expectEqual(@as(usize, 1), config.user_instructions.notices().len);
     try std.testing.expect(std.mem.indexOf(
         u8,

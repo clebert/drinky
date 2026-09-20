@@ -1,18 +1,3 @@
-//! The model selection flow is a stepped picker that ends on one model. The
-//! `/model` command starts at the provider. A successful sign-in opens its
-//! account's model or author list. The first row fetches or refreshes the list.
-//! A remembered choice preselects its row. Only an active model is current. A
-//! step with one row opens the next step at once. A selection always chooses a
-//! model together with its account. The command takes no argument.
-//!
-//! Every step names the opener that builds it again, so Esc in a later step
-//! returns to it. The app keeps the trail, and a step that the flow skipped
-//! opened no picker, so Esc never lands on a list that the user never saw.
-//!
-//! A selector receives the tapped row and the payload the command set. A step
-//! that depends on an earlier choice needs one selector for each value of that
-//! choice. Every step re-derives its lists from the live state.
-
 const std = @import("std");
 
 const Accounts = @import("../Accounts.zig");
@@ -26,29 +11,17 @@ const testing = @import("testing.zig");
 pub const name = "model";
 pub const summary = "Switch the model";
 
-/// Every step belongs to one `/model` run, so every step reports one cancellation.
 const cancellation_message = "You canceled the model selection.";
 
-/// The first row of the model step. It reads as a fetch while the account
-/// offers nothing, because no list exists to refresh yet. The row hands its
-/// account to the app, which runs the fetch and returns the result to
-/// `fetchOutcome`.
 const fetch_row = "Fetch the model list";
 const refresh_row = "Refresh the model list";
 
-/// The mark of a model whose output limit no source states. Drinky then sends a
-/// low default, which can cut a long reply short, so the row states that Drinky
-/// does not know the output support of the model.
 const extra_output_limit = "The output limit is unknown.";
 
-/// The mark of a request id that names the engine behind it. Several ids can
-/// reach one loaded set of weights.
 const extra_engine = "Weights: {s}";
 
-/// A picker selector. It takes the tapped row and the payload the command set.
 const Selector = *const fn (*Context, Context.Outcome.Pick.Selection) anyerror!Context.Outcome;
 
-/// The parts of the model picker that name one account.
 const ModelStep = struct {
     select: Selector,
     open: Context.Outcome.Opener,
@@ -65,7 +38,6 @@ pub fn run(context: *Context) !Context.Outcome {
             "Sign in to an account before you select a model.",
             .{},
         );
-    // One provider answers this step already, so the flow opens the next one.
     if (vendors.len == 1) return accountStep(context, vendors[0]);
 
     var options: Context.Outcome.Options = .{ .gpa = context.gpa };
@@ -104,9 +76,6 @@ fn selectProvider(
     return accountStep(context, vendors[index]);
 }
 
-/// The account step of `vendor`: a picker over its authenticated accounts, or
-/// the model step when it holds one account alone. The caller guarantees that
-/// `vendor` has an authenticated account.
 fn accountStep(context: *Context, vendor: llm.Provider) !Context.Outcome {
     var buffer: [std.enums.values(llm.Account).len]llm.Account = undefined;
     const list = authenticatedAccounts(context.accounts, vendor, &buffer);
@@ -137,7 +106,6 @@ fn accountStep(context: *Context, vendor: llm.Provider) !Context.Outcome {
     } };
 }
 
-/// The opener of the account picker of `vendor`.
 fn accountStepOf(comptime vendor: llm.Provider) Context.Outcome.Opener {
     return struct {
         fn open(context: *Context) anyerror!Context.Outcome {
@@ -146,7 +114,6 @@ fn accountStepOf(comptime vendor: llm.Provider) Context.Outcome.Opener {
     }.open;
 }
 
-/// The selector of the account picker of `vendor`.
 fn selectAccountOf(comptime vendor: llm.Provider) Selector {
     return struct {
         fn select(
@@ -167,8 +134,6 @@ fn selectAccountOf(comptime vendor: llm.Provider) Selector {
     }.select;
 }
 
-/// Open the model flow of one authenticated account. A remembered model
-/// preselects its model row. OpenRouter preselects its author first.
 pub fn forAccount(context: *Context, account: llm.Account) !Context.Outcome {
     if (account.provider() == .openrouter) return authorStep(context, account);
     return modelStep(context, account);
@@ -180,8 +145,6 @@ const AuthorRow = struct {
     first: usize,
 };
 
-/// The author step of an OpenRouter account: the fetch row, then one row per
-/// author. An author row opens the models of that author.
 fn authorStep(context: *Context, account: llm.Account) !Context.Outcome {
     const gpa = context.gpa;
     const preferred_model = rememberedModel(context, account);
@@ -227,20 +190,10 @@ fn authorStep(context: *Context, account: llm.Account) !Context.Outcome {
     } };
 }
 
-/// The payload of the model step of one author. A key names the author, so a
-/// row of that step lands on a model of that author after a fetch reordered the
-/// list. An index cannot, because a stale index that meets the first model of
-/// another author reads valid.
 fn authorKey(author_name: []const u8) usize {
     return @truncate(std.hash.Wyhash.hash(0, author_name));
 }
 
-/// The index of the tapped model in the list that `grouped` describes, or null
-/// when the row names no model of the author the selection carries.
-///
-/// Two rows of `grouped` that share one key name one author, so the list is
-/// grouped wrong or two names collide under `authorKey`. The step then knows no
-/// author and reports, rather than land the row on the models of the wrong one.
 fn authorModelIndex(
     grouped: []const AuthorRow,
     selection: Context.Outcome.Pick.Selection,
@@ -256,10 +209,6 @@ fn authorModelIndex(
     return author.first + selection.row;
 }
 
-/// The authors of `models`, one row per run of one author. `Metadata` groups
-/// the models of one author, so one run is one author. A list that broke that
-/// order yields two rows of one author, and `authorModelIndex` refuses such a
-/// pair rather than guess.
 fn authorsOf(models: []const Model, out: []AuthorRow) []AuthorRow {
     var count: usize = 0;
     var index: usize = 0;
@@ -331,8 +280,6 @@ fn authorStepOf(comptime account: llm.Account) ModelStep {
     };
 }
 
-/// The model step of one author: that author's models, no fetch row, and the
-/// key of the author as the payload.
 fn authorModelsStep(context: *Context, account: llm.Account, first: usize) !Context.Outcome {
     const gpa = context.gpa;
     const preferred_model = rememberedModel(context, account);
@@ -403,12 +350,6 @@ fn authorModelsOf(comptime account: llm.Account) ModelStep {
     };
 }
 
-/// The last step: the fetch row, then a picker over the models of `account`.
-/// The title names the account, because the flow can skip the step that names
-/// it. Drinky compiles no model in, so an account that the user has not fetched
-/// yet holds the fetch row alone. A remote host runs no fetch, so its step lists
-/// the cached models alone, and an account with no cached list answers with a
-/// notice that names the terminal.
 fn modelStep(context: *Context, account: llm.Account) !Context.Outcome {
     const gpa = context.gpa;
     const preferred_model = rememberedModel(context, account);
@@ -447,24 +388,14 @@ fn modelStep(context: *Context, account: llm.Account) !Context.Outcome {
     } };
 }
 
-/// The label of the row that leads a model step over `count` models. It reads
-/// as a fetch while the account offers no model, because no list exists to
-/// refresh yet.
 fn firstRow(count: usize) []const u8 {
     return if (count == 0) fetch_row else refresh_row;
 }
 
-/// The rows before the first model of a model step: the fetch row in the
-/// terminal, and none on a remote host, which runs no fetch. The step and its
-/// selector both count them, so a row index stays stable.
 fn leadRows(context: *const Context) usize {
     return if (context.remote) 0 else 1;
 }
 
-/// Write the picker row of `model` under `account`. A model whose output limit
-/// no source states carries the mark, because a request for it then sends the
-/// low default of `Model.tokens_max_fallback`. A DwarfStar id names the engine
-/// behind it.
 fn row(
     options: *Context.Outcome.Options,
     account: llm.Account,
@@ -477,7 +408,6 @@ fn row(
     return options.print("{s}", .{model.name()});
 }
 
-/// The selector, the opener, and the title of the model picker of `account`.
 fn modelStepOf(comptime account: llm.Account) ModelStep {
     return .{
         .select = struct {
@@ -486,8 +416,6 @@ fn modelStepOf(comptime account: llm.Account) ModelStep {
                 selection: Context.Outcome.Pick.Selection,
             ) anyerror!Context.Outcome {
                 const gpa = context.gpa;
-                // This step sets no payload, because its rows already name
-                // every model of the account.
                 const index = selection.row;
                 const lead = leadRows(context);
                 if (index < lead) return .{ .fetch = account };
@@ -512,11 +440,6 @@ fn modelStepOf(comptime account: llm.Account) ModelStep {
     };
 }
 
-/// Run `model` under `account` from the next turn on. The account of a picked
-/// row is authenticated, so it always has a client. A pick that repeats the
-/// active pair switches too, because a fetch can have replaced the description
-/// behind that name. Only the pair that already runs in every part reports
-/// itself and switches nothing.
 fn apply(context: *Context, account: llm.Account, model: *const Model) !Context.Outcome {
     const gpa = context.gpa;
     if (isCurrent(context, account, model)) return Context.Outcome.reportNotice(
@@ -534,8 +457,6 @@ fn apply(context: *Context, account: llm.Account, model: *const Model) !Context.
     );
 }
 
-/// The providers with at least one authenticated account, in enum order. Every
-/// step re-derives its list identically, so a row index stays stable.
 fn authenticatedProviders(registry: *const Accounts, out: []llm.Provider) []llm.Provider {
     var count: usize = 0;
     for (std.enums.values(llm.Provider)) |vendor| {
@@ -549,7 +470,6 @@ fn authenticatedProviders(registry: *const Accounts, out: []llm.Provider) []llm.
     return out[0..count];
 }
 
-/// The authenticated accounts of `vendor`, in enum order.
 fn authenticatedAccounts(
     registry: *const Accounts,
     vendor: llm.Provider,
@@ -564,14 +484,11 @@ fn authenticatedAccounts(
     return out[0..count];
 }
 
-/// The account that runs now, or null while Drinky is signed out.
 fn activeAccount(context: *const Context) ?llm.Account {
     const client = context.agent.client orelse return null;
     return client.account();
 }
 
-/// Whether `account` and `model_name` are the pair that runs now. A row marks
-/// the active model by its name, because that name is what the row shows.
 fn isActive(context: *const Context, account: llm.Account, model_name: []const u8) bool {
     const active_account = activeAccount(context) orelse return false;
     const model = context.agent.model orelse return false;
@@ -589,29 +506,12 @@ fn isPreferred(preferred_model: ?*const Model, model: *const Model) bool {
     return model.sameName(preferred.name());
 }
 
-/// Whether the session already runs `model` under `account`, description and
-/// all. A fetch replaces the description of a model and keeps its name, so a
-/// comparison of names alone leaves the session on the description that the
-/// fetch replaced.
 fn isCurrent(context: *const Context, account: llm.Account, model: *const Model) bool {
     const active_account = activeAccount(context) orelse return false;
     const active = context.agent.model orelse return false;
     return active_account == account and active.eql(model);
 }
 
-/// The outcome of one fetch of `account` over `result`: its step, reopened over
-/// the list that arrived. Drinky asks the provider and the public metadata in
-/// one fetch, so the user chooses a model out of a list that is current. A fetch
-/// has three exits. A failed account list reports itself and opens nothing, so
-/// the user reads what went wrong before another try. That report names a cache
-/// write that failed with it. A failed metadata request opens the list and
-/// states itself beside it. A failed cache write does the same, because that
-/// list arrived.
-///
-/// The fetch row returns `Outcome.fetch`, and the app runs the two requests on a
-/// worker, so the interface stays live and Esc can cancel them. The app then
-/// hands the result here. The function holds no request, so a test reaches every
-/// exit without a socket.
 pub fn fetchOutcome(
     context: *Context,
     account: llm.Account,
@@ -625,15 +525,6 @@ pub fn fetchOutcome(
     return outcome;
 }
 
-/// The outcome of a fetch of `account` whose account list never arrived. The
-/// metadata request runs even then, so `metadata_save_failure` names the cache
-/// write that failed with it, and one line states both. The metadata that
-/// arrived serves this session alone.
-///
-/// A store that held the credential of another principal stopped the request
-/// before it ran. The evidence of that principal must leave the session, and
-/// only the app can drop it. The account therefore goes to the app in place of
-/// a line that states an error name and no step.
 fn fetchFailure(
     gpa: std.mem.Allocator,
     account: llm.Account,
@@ -657,35 +548,19 @@ fn fetchFailure(
     );
 }
 
-/// The head of every line that reports a fetch whose public metadata never
-/// arrived. Three of those lines share it, so they state that miss alike. The
-/// list and the metadata take one sentence each, because they arrived apart.
 const metadata_gone_head = "Drinky fetched the model list of {s}. Drinky could not fetch the " ++
     "public metadata because of error {t}.";
 
-/// The sentence that states an empty list, or nothing while the account offers a
-/// model. A fetch that described no model returns the user to the same fetch
-/// row, so every report of such a fetch ends on this one fact.
 fn emptyNote(count: usize) []const u8 {
     return if (count == 0) " The account offers no model now." else "";
 }
 
-/// The line that states what a fetch of `account` missed, or null when the
-/// metadata and both caches took what arrived and the list holds a model. A
-/// fetch writes one cache per kind, so the line names the cache that failed. The
-/// list stands beside the line, because neither failure costs this session a
-/// model.
-///
-/// A fetch that arrived and described no model returns the user to the same
-/// fetch row, so every line states that result too.
 fn fetchReport(
     gpa: std.mem.Allocator,
     account: llm.Account,
     result: *const Accounts.Refresh,
 ) !?Context.Outcome.Message {
     const empty = emptyNote(result.count);
-    // No metadata arrived, so its cache write never ran. The list write is the
-    // one write that can have failed here.
     if (result.metadata_error) |metadata_failure| {
         if (result.models_save_error) |save_failure| return try Context.Outcome.Message.print(
             gpa,
@@ -747,13 +622,11 @@ fn fetchReport(
     );
 }
 
-/// Free the rows of a picker that reaches no caller.
 fn freePick(gpa: std.mem.Allocator, pick: *const Context.Outcome.Pick) void {
     for (pick.options) |*option| option.deinit(gpa);
     gpa.free(pick.options);
 }
 
-/// Test helper: the picker of `outcome`, which the caller must free.
 fn expectPick(outcome: Context.Outcome) !Context.Outcome.Pick {
     return switch (outcome) {
         .pick => |pick| pick,
@@ -761,9 +634,6 @@ fn expectPick(outcome: Context.Outcome) !Context.Outcome.Pick {
     };
 }
 
-/// Test helper: tap `row` of `pick`, the way the app taps it. The app hands the
-/// payload of the picker back with the row, so a test that builds the selection
-/// by hand cannot drift from that pairing.
 fn selectRow(
     pick: *const Context.Outcome.Pick,
     context: *Context,
@@ -772,9 +642,6 @@ fn selectRow(
     return pick.select(context, .{ .payload = pick.payload, .row = index });
 }
 
-// A cache write that failed costs this session no model, and a metadata request
-// that failed costs it none either, so each states itself beside the list that
-// arrived. A failed account list alone opens nothing.
 test "a fetch opens the list that arrived and states what it missed" {
     const gpa = std.testing.allocator;
     var accounts = testing.accounts(.{ .anthropic = "sk-ant" }, .{});
@@ -784,7 +651,6 @@ test "a fetch opens the list that arrived and states what it missed" {
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
 
-    // The account list never arrived, so no list can open.
     try Context.Outcome.expectEvent(
         try fetchOutcome(
             &context,
@@ -794,14 +660,12 @@ test "a fetch opens the list that arrived and states what it missed" {
         .failure,
     );
 
-    // Every part arrived, so the list opens and states nothing beside itself.
     const complete = try expectPick(
         try fetchOutcome(&context, .anthropic_api_key, &.{ .count = 2 }),
     );
     defer freePick(gpa, &complete);
     try std.testing.expect(complete.report == null);
 
-    // The metadata never arrived, so the list opens beside that failure.
     const metadata_gone = try expectPick(try fetchOutcome(&context, .anthropic_api_key, &.{
         .count = 2,
         .metadata_error = error.ConnectionTimedOut,
@@ -820,7 +684,6 @@ test "a fetch opens the list that arrived and states what it missed" {
         metadata_gone.report.?.content,
     );
 
-    // The list write failed, so the list opens beside that failure.
     const save_gone = try expectPick(try fetchOutcome(&context, .anthropic_api_key, &.{
         .count = 2,
         .models_save_error = error.StoreBusy,
@@ -833,7 +696,6 @@ test "a fetch opens the list that arrived and states what it missed" {
         save_gone.report.?.content,
     );
 
-    // Both failed, so one line states both beside the list.
     const both_gone = try expectPick(try fetchOutcome(&context, .anthropic_api_key, &.{
         .count = 2,
         .metadata_error = error.ConnectionTimedOut,
@@ -849,9 +711,6 @@ test "a fetch opens the list that arrived and states what it missed" {
     );
 }
 
-// The metadata request runs even when the account list fails, so a cache write
-// can fail on that path too. The metadata that arrived serves this session
-// alone, so the line that names the failed fetch names that write as well.
 test "a failed fetch states the cache write that failed with it" {
     const gpa = std.testing.allocator;
     var accounts = testing.accounts(.{ .anthropic = "sk-ant" }, .{});
@@ -878,10 +737,6 @@ test "a failed fetch states the cache write that failed with it" {
     }
 }
 
-// A store that holds the credential of another principal stops the fetch before
-// its model request. The evidence of that principal must leave the session, and
-// only the app can drop it. The outcome therefore names the account and no
-// error.
 test "a fetch that meets a replaced credential hands its account to the app" {
     const gpa = std.testing.allocator;
     var accounts = testing.accounts(.{}, .{ .anthropic = true });
@@ -898,8 +753,6 @@ test "a fetch that meets a replaced credential hands its account to the app" {
         outcome.credential_replaced,
     );
 
-    // The metadata request runs even then. A failed cache write of that metadata
-    // changes no principal, so the transition stands alone.
     const with_save_failure = try fetchOutcome(&context, .anthropic_plan, &.{
         .models_error = error.CredentialReplaced,
         .metadata_save_error = error.StoreBusy,
@@ -924,7 +777,6 @@ test "the first step lists the providers with an authenticated account" {
     try std.testing.expectEqual(@as(usize, 2), pick.options.len);
     try std.testing.expectEqualStrings("anthropic", pick.options[0].name);
     try std.testing.expectEqualStrings("openai", pick.options[1].name);
-    // The active account marks its provider.
     try std.testing.expectEqual(@as(usize, 0), pick.current.?);
 }
 
@@ -954,29 +806,21 @@ test "one account alone opens the model step at once" {
     defer agent.deinit();
     var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
 
-    // Both earlier steps hold one row, so the model list is the whole command.
     const pick = try expectPick(try run(&context));
     defer freePick(gpa, &pick);
     try std.testing.expectEqualStrings("Model: anthropic-api-key", pick.title);
-    // The fetch row leads the list, so the user can replace a stale one.
     try std.testing.expectEqual(@as(usize, 3), pick.options.len);
     try std.testing.expectEqualStrings("Refresh the model list", pick.options[0].name);
     try std.testing.expectEqualStrings("claude-fable-5", pick.options[1].name);
     try std.testing.expectEqualStrings("claude-sonnet-4-6", pick.options[pick.current.?].name);
 }
 
-// Anthropic takes the output limit from every request, so a model that states
-// none runs at the fallback and can lose the tail of a long reply. The row
-// states that, because Drinky does not know the output support of that model.
-// OpenAI takes no limit from the request, so no row of such an account carries
-// the mark, whatever its list states.
 test "a model row marks an output limit that no source states" {
     const gpa = std.testing.allocator;
     var accounts = testing.accounts(.{ .anthropic = "sk-ant", .openai = "sk-openai" }, .{});
     defer testing.deinitAccounts(&accounts);
     try testing.seed(&accounts, .anthropic_api_key, &.{ "claude-fable-5", "claude-sonnet-4-6" });
     try testing.seed(&accounts, .openai_api_key, &.{"gpt-5.6-sol"});
-    // No source states an output limit for these two models.
     accounts.catalog.accounts.get(.anthropic_api_key)[1].tokens_max = null;
     accounts.catalog.accounts.get(.openai_api_key)[0].tokens_max = null;
     var agent = testing.agent(gpa, .{ .anthropic_api_key = "sk-ant" });
@@ -985,7 +829,6 @@ test "a model row marks an output limit that no source states" {
 
     const anthropic_models = try expectPick(try modelStep(&context, .anthropic_api_key));
     defer freePick(gpa, &anthropic_models);
-    // The vendor stated the limit of this model, so its row stands as it is.
     try std.testing.expectEqualStrings("claude-fable-5", anthropic_models.options[1].name);
     try std.testing.expectEqualStrings("claude-sonnet-4-6", anthropic_models.options[2].name);
     try std.testing.expectEqualStrings(extra_output_limit, anthropic_models.options[2].extra.?);
@@ -1017,8 +860,6 @@ test "a DwarfStar model row names the engine behind the request id" {
     try std.testing.expectEqualStrings("Weights: DeepSeek V4 Flash", pick.options[2].extra.?);
 }
 
-// Drinky compiles no model in, so an account the user never fetched offers the
-// fetch row and nothing else.
 test "an account with no model offers the fetch row alone" {
     const gpa = std.testing.allocator;
     var accounts = testing.accounts(.{ .anthropic = "sk-ant" }, .{});
@@ -1109,7 +950,6 @@ test "an OpenRouter account opens the author step then the models of that author
     try std.testing.expectEqualStrings("qwen/qwen-new", qwen_models.options[0].name);
     try std.testing.expectEqual(authorKey("qwen"), qwen_models.payload);
 
-    // A row past the models of the author must not reach the next author.
     try Context.Outcome.expectNoticeContaining(
         try selectRow(&openai_models, &context, 2),
         .failure,
@@ -1117,15 +957,11 @@ test "an OpenRouter account opens the author step then the models of that author
     );
     try std.testing.expectEqualStrings("openai/gpt-old", agent.model.?.name());
 
-    // A fetch that reorders the authors while the step stands open moves the
-    // models of the author. The payload names the author, so a row still lands
-    // on a model of that author.
     std.mem.rotate(Metadata.Entry, metadata, 2);
     try std.testing.expectEqualStrings("qwen/qwen-new", metadata[0].model.name());
     try Context.Outcome.expectEvent(try selectRow(&openai_models, &context, 0), .information);
     try std.testing.expectEqualStrings("openai/gpt-new", agent.model.?.name());
 
-    // An author that a fetch dropped reports, and the model stays.
     try Context.Outcome.expectNoticeContaining(
         try openai_models.select(&context, .{ .payload = authorKey("gone"), .row = 0 }),
         .failure,
@@ -1134,10 +970,6 @@ test "an OpenRouter account opens the author step then the models of that author
     try std.testing.expectEqualStrings("openai/gpt-new", agent.model.?.name());
 }
 
-// The key of an author names one author. Two rows that carry one key therefore
-// name no author at all: the list broke its grouping, or two names collide
-// under the hash. The step must report, and never land the row on the models of
-// the wrong author.
 test "a key that two author rows carry names no model" {
     const rows = [_]AuthorRow{
         .{ .name = "openai", .count = 2, .first = 0 },
@@ -1150,7 +982,6 @@ test "a key that two author rows carry names no model" {
         @as(?usize, 2),
         authorModelIndex(&rows, .{ .payload = authorKey("qwen"), .row = 0 }),
     );
-    // One row alone carries the key, so the row of the selection lands.
     try std.testing.expectEqual(
         @as(?usize, 1),
         authorModelIndex(rows[0..2], .{ .payload = key, .row = 1 }),
@@ -1158,9 +989,6 @@ test "a key that two author rows carry names no model" {
     try std.testing.expect(authorModelIndex(rows[0..2], .{ .payload = key, .row = 2 }) == null);
 }
 
-// A remote host runs no fetch, so the author step holds no fetch row and its
-// rows start at the first author. The step below it names the models of that
-// author, exactly as it does in the terminal.
 test "a remote host lists the authors with no fetch row" {
     const gpa = std.testing.allocator;
     var accounts = testing.accounts(.{ .openrouter = "sk-or" }, .{});
@@ -1208,8 +1036,6 @@ test "a remote host lists the authors with no fetch row" {
     );
 }
 
-// An OpenRouter account that the user never fetched holds no cached list, and a
-// remote host cannot fetch one, so the author step names the terminal.
 test "a remote host names the terminal when the OpenRouter list is empty" {
     const gpa = std.testing.allocator;
     var accounts = testing.accounts(.{ .openrouter = "sk-or" }, .{});
@@ -1231,10 +1057,6 @@ test "a remote host names the terminal when the OpenRouter list is empty" {
     );
 }
 
-// A remote host cannot run a fetch, so its model step lists the cached models
-// alone and a row index counts from the first model. An account that the user
-// never fetched answers with a notice that names the terminal, because the
-// fetch happens there.
 test "a remote host lists the cached models with no fetch row" {
     const gpa = std.testing.allocator;
     var accounts = testing.accounts(.{ .anthropic = "sk-ant", .openai = "sk-openai" }, .{});
@@ -1273,10 +1095,6 @@ test "a remote host lists the cached models with no fetch row" {
     );
 }
 
-// A fetch reaches the network, and a command runs on the thread that paints and
-// reads the keys. The row therefore runs no request of its own and names the
-// account for the app, which fetches on a worker. The row of a stale list does
-// the same, because both rows lead to one fetch.
 test "the fetch row hands its account to the app" {
     const gpa = std.testing.allocator;
     var accounts = testing.accounts(.{ .anthropic = "sk-ant", .openai = "sk-openai" }, .{});
@@ -1303,7 +1121,6 @@ test "the fetch row hands its account to the app" {
         llm.Account.openai_api_key,
         (try selectRow(&openai_models, &context, 0)).fetch,
     );
-    // The row itself changes nothing: the catalog and the agent stand as before.
     try std.testing.expect(!accounts.offersModel(.anthropic_api_key));
     try std.testing.expectEqualStrings("claude-sonnet-4-6", agent.model.?.name());
 }
@@ -1332,10 +1149,8 @@ test "a provider row opens its accounts, and an account row opens its models" {
         "Model: anthropic-plan",
         anthropic_models.title,
     );
-    // The subscription is not the active account, so no row is the current one.
     try std.testing.expect(anthropic_models.current == null);
 
-    // OpenAI holds one authenticated account, so its row skips the account step.
     const openai_models = try expectPick(try selectRow(&vendors, &context, 1));
     defer freePick(gpa, &openai_models);
     try std.testing.expectEqualStrings("Model: openai-api-key", openai_models.title);
@@ -1343,8 +1158,6 @@ test "a provider row opens its accounts, and an account row opens its models" {
     try std.testing.expectEqualStrings("gpt-5.6-sol", openai_models.options[1].name);
 }
 
-// Esc returns to the picker that a row opened, so every step names the opener
-// that builds it again. The app keeps the trail of those openers.
 test "each step names the opener that builds it again" {
     const gpa = std.testing.allocator;
     var accounts = testing.accounts(
@@ -1370,16 +1183,12 @@ test "each step names the opener that builds it again" {
         anthropic_models.reopen.? == modelStepOf(.anthropic_plan).open,
     );
 
-    // An opener builds the same picker again: the same rows, and the same
-    // opener on the rebuilt one.
     const reopened = try expectPick(try anthropic_accounts.reopen.?(&context));
     defer freePick(gpa, &reopened);
     try std.testing.expectEqualStrings("Account", reopened.title);
     try std.testing.expectEqualStrings("anthropic-plan", reopened.options[0].name);
     try std.testing.expect(reopened.reopen.? == accountStepOf(.anthropic));
 
-    // A step that the flow skipped opens no picker, so it enters no trail and
-    // Esc cannot land on it.
     const openai_models = try expectPick(try selectRow(&vendors, &context, 1));
     defer freePick(gpa, &openai_models);
     try std.testing.expect(openai_models.reopen.? == modelStepOf(.openai_api_key).open);
@@ -1399,7 +1208,6 @@ test "a model row switches to the chosen account and model" {
     const openai_models = try expectPick(try selectRow(&vendors, &context, 1));
     defer freePick(gpa, &openai_models);
 
-    // The selection crosses vendors, so it switches the account too.
     try Context.Outcome.expectEvent(try selectRow(&openai_models, &context, 1), .information);
     try std.testing.expectEqualStrings("gpt-5.6-sol", agent.model.?.name());
     try std.testing.expectEqual(llm.Account.openai_api_key, agent.client.?.account());
@@ -1408,9 +1216,6 @@ test "a model row switches to the chosen account and model" {
     try std.testing.expectEqualStrings("gpt-5.6-sol", agent.model.?.name());
 }
 
-// A fetch replaces the description of a model and keeps its name. The row of
-// the model that already runs is the common pick after a fetch, so that pick
-// must carry the fetched description into the session.
 test "a pick of the active model adopts the fetched description" {
     const gpa = std.testing.allocator;
     var accounts = testing.accounts(.{ .anthropic = "sk-ant" }, .{});
@@ -1419,7 +1224,6 @@ test "a pick of the active model adopts the fetched description" {
     var agent = testing.agent(gpa, .{ .anthropic_api_key = "sk-ant" });
     defer agent.deinit();
 
-    // The session runs the description that the fetch replaced.
     var stale = try Model.init("claude-opus-5");
     stale.context_window = 7;
     stale.tokens_max = 11;
@@ -1443,13 +1247,9 @@ test "a pick of the active model adopts the fetched description" {
     try std.testing.expectEqual(@as(?u32, 128_000), active.tokens_max);
     try std.testing.expect(active.offers(.max));
     try std.testing.expectEqual(@as(f64, 3), active.price.?.input);
-    // The description changed, so the line states the switch.
     try std.testing.expect(outcome == .event);
 }
 
-// The two cache writes of a fetch fail on their own, so a line must name the
-// cache that failed. A user who reads the wrong cache fetches a list that
-// already reached the disk, and the write that failed stays unnamed.
 test "a report of a failed metadata write names the metadata" {
     const gpa = std.testing.allocator;
     const report = (try fetchReport(gpa, .anthropic_api_key, &.{
@@ -1465,8 +1265,6 @@ test "a report of a failed metadata write names the metadata" {
     );
 }
 
-// A fetch that arrived and described no model returns the user to the same
-// fetch row. Without a line, that result reads like a fetch that never ran.
 test "a report of a fetch that described no model states that result" {
     const gpa = std.testing.allocator;
     const report = (try fetchReport(gpa, .anthropic_api_key, &.{ .count = 0 })).?;
@@ -1477,13 +1275,9 @@ test "a report of a fetch that described no model states that result" {
         report.content,
     );
 
-    // A list that holds a model needs no line, because the list itself shows it.
     try std.testing.expect(try fetchReport(gpa, .anthropic_api_key, &.{ .count = 1 }) == null);
 }
 
-// A failed write and a missed metadata leave the picker on the fetch row too
-// when no model arrived. Each report therefore ends on the same one fact, so a
-// user never reads that a list serves a session that has no model.
 test "every report of a fetch that described no model states that result" {
     const gpa = std.testing.allocator;
     const cases = [_]struct {
@@ -1540,7 +1334,6 @@ test "every report of a fetch that described no model states that result" {
     }
 }
 
-// A line that counts models must read correctly for one model.
 test "a report of a missed metadata counts one model in the singular" {
     const gpa = std.testing.allocator;
     const report = (try fetchReport(gpa, .anthropic_api_key, &.{
@@ -1568,7 +1361,6 @@ test "a report of a failed list write names the list" {
         report.content,
     );
 
-    // Both writes can fail together, so one line states both.
     const both = (try fetchReport(gpa, .anthropic_api_key, &.{
         .count = 2,
         .models_save_error = error.StoreBusy,
@@ -1637,8 +1429,6 @@ test "no authenticated accounts reports an error instead of a picker" {
 
 test "the active mark matches the account, not just the model name" {
     const gpa = std.testing.allocator;
-    // Both Anthropic accounts are authenticated, so every model name appears
-    // under two accounts. The mark must land inside the active account's list.
     var accounts = testing.accounts(.{ .anthropic = "sk-ant" }, .{ .anthropic = true });
     defer testing.deinitAccounts(&accounts);
     try testing.seed(&accounts, .anthropic_plan, &.{"claude-sonnet-4-6"});
@@ -1661,7 +1451,6 @@ test "the active mark matches the account, not just the model name" {
         subscription_models.options[subscription_models.current.?].name,
     );
 
-    // The same model name under the API account marks no row.
     const api_models = try expectPick(try selectRow(&anthropic_accounts, &context, 1));
     defer freePick(gpa, &api_models);
     try std.testing.expect(api_models.current == null);
@@ -1685,8 +1474,6 @@ fn runUnderOom(gpa: std.mem.Allocator) !void {
     const anthropic_models = try expectPick(try selectRow(&anthropic_accounts, &context, 0));
     defer freePick(gpa, &anthropic_models);
 
-    // Row 0 hands off to the app and allocates nothing, so the walk picks a
-    // model row.
     switch (try selectRow(&anthropic_models, &context, 1)) {
         .event => |event| gpa.free(event.content),
         else => return error.ExpectedEvent,

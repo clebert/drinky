@@ -1,12 +1,3 @@
-//! The pairing of a new bot: the token check, then the wait for the code. Both
-//! run as one worker task each, and each reports through the `Sink`, so the
-//! interface keeps painting and reading keys meanwhile.
-//!
-//! The wait polls the bot for a private message that carries the code, as text
-//! or as the payload of `/start`. The chat that sends it binds. A wrong code from
-//! any private chat counts, and `wrong_codes_max` of them end the pairing,
-//! because the bot name is public. A message from a group counts as nothing.
-
 const std = @import("std");
 
 const ai = @import("ai");
@@ -15,18 +6,11 @@ const Client = @import("Client.zig");
 
 const Pairing = @This();
 
-/// The 31 symbols of a code: the digits and the lowercase letters without `0`,
-/// `o`, `1`, `i`, and `l`, so no symbol reads as another one. Lowercase, because
-/// an on-screen keyboard opens in lowercase.
 const code_alphabet = "23456789abcdefghjkmnpqrstuvwxyz";
 const code_length = 8;
-/// How long the wait holds for the code.
 const window_ms_default = 5 * std.time.ms_per_min;
-/// How many wrong codes end the pairing.
 pub const wrong_codes_max = 3;
 
-/// The backoff of a failed poll during the wait. The wait ends at its window,
-/// so every attempt inside it is allowed.
 const backoff_default: ai.net.Retry = .{
     .attempts_max = std.math.maxInt(u32),
     .backoff_ms_initial = 500,
@@ -37,11 +21,8 @@ pub const Code = [code_length]u8;
 
 gpa: std.mem.Allocator,
 io: std.Io,
-/// The bot token. Owned, and never part of any text this pairing produces.
 token: []const u8,
-/// The bot id, or zero before the check named it.
 id: i64,
-/// The bot username without the `@`, or empty before the check named it. Owned.
 username: []const u8,
 code: Code,
 generation: u64,
@@ -49,18 +30,13 @@ sink: Sink,
 window_ms: u64,
 backoff: ai.net.Retry,
 client: Client,
-/// The head window of a poll of the wait, or zero before the wait started. Each
-/// poll runs under this window or under the rest of the pairing window, so the
-/// client keeps the shorter one per call.
 poll_connect_ms: u64,
 future: ?std.Io.Future(void),
 
 pub const Options = struct {
-    /// The API origin. A test points it at a loopback server.
     base_url: []const u8 = Client.api_url,
     token: []const u8,
     code: Code,
-    /// The head window of one call, and the source of the poll timeout.
     connect_ms: u64,
     generation: u64,
     sink: Sink,
@@ -68,28 +44,22 @@ pub const Options = struct {
     backoff: ai.net.Retry = backoff_default,
 };
 
-/// Where the worker reports. The owner wraps each event into its own queue.
 pub const Sink = struct {
     context: *anyopaque,
     emit: *const fn (context: *anyopaque, event: Event) error{Closed}!void,
 };
 
-/// One report of the worker. The event owns its payload.
 pub const Event = struct {
     generation: u64,
     payload: Payload,
 
     pub const Payload = union(enum) {
-        /// The result of the token check.
         token_checked: TokenCheck,
-        /// The private chat with this id sent the code.
         paired: i64,
-        /// The wait ended without a bind.
         ended: End,
     };
 
     pub const TokenCheck = union(enum) {
-        /// The token names this bot. The payload owns the username.
         bot: Client.Me,
         failed: Client.Error,
     };
@@ -111,7 +81,6 @@ pub const Event = struct {
     }
 };
 
-/// A fresh code from the CSPRNG of the io.
 pub fn generateCode(io: std.Io) Code {
     var bytes: Code = undefined;
     io.random(&bytes);
@@ -120,7 +89,6 @@ pub fn generateCode(io: std.Io) Code {
     return code;
 }
 
-/// Build a pairing on the heap, because the worker reads it through the pointer.
 pub fn create(gpa: std.mem.Allocator, io: std.Io, options: *const Options) !*Pairing {
     const self = try gpa.create(Pairing);
     errdefer gpa.destroy(self);
@@ -150,7 +118,6 @@ pub fn create(gpa: std.mem.Allocator, io: std.Io, options: *const Options) !*Pai
     return self;
 }
 
-/// Cancel the worker and free everything.
 pub fn destroy(self: *Pairing) void {
     self.cancel();
     if (self.username.len > 0) self.gpa.free(self.username);
@@ -158,8 +125,6 @@ pub fn destroy(self: *Pairing) void {
     self.gpa.destroy(self);
 }
 
-/// Stop the worker. An event it already reported stays in the queue of the
-/// owner, which drops it by its generation.
 pub fn cancel(self: *Pairing) void {
     if (self.future) |*future| {
         future.cancel(self.io);
@@ -167,28 +132,21 @@ pub fn cancel(self: *Pairing) void {
     }
 }
 
-/// Prove the token with `getMe`. The result arrives as `token_checked`.
 pub fn startCheck(self: *Pairing) !void {
     std.debug.assert(self.future == null);
     self.future = try self.io.concurrent(runCheck, .{self});
 }
 
-/// Wait for the code from the bot with `id` and `username`, as the check or the
-/// store named it. The pairing takes ownership of `username`. The result arrives
-/// as `paired` or `ended`.
 pub fn startWait(self: *Pairing, id: i64, username: []const u8) !void {
     std.debug.assert(self.future == null);
     std.debug.assert(self.username.len == 0);
     self.id = id;
     self.username = username;
-    // The check ran under the configured window. The wait polls, and a poll
-    // holds its connection open on purpose, so it takes the poll window.
     self.poll_connect_ms = Client.pollConnectMs(self.client.connect_ms);
     self.client.connect_ms = self.poll_connect_ms;
     self.future = try self.io.concurrent(runWait, .{self});
 }
 
-/// The link that sends the code from Telegram Desktop with one click.
 pub fn link(self: *const Pairing, buffer: []u8) []const u8 {
     return std.fmt.bufPrint(
         buffer,
@@ -197,9 +155,6 @@ pub fn link(self: *const Pairing, buffer: []u8) []const u8 {
     ) catch unreachable;
 }
 
-/// Whether `text` carries the code: the code alone, or `/start` with the code as
-/// its payload. The case does not count, because an on-screen keyboard can
-/// capitalize the first letter of a message.
 fn matches(code: *const Code, text: []const u8) bool {
     var candidate = std.mem.trim(u8, text, " \t\r\n");
     if (std.mem.startsWith(u8, candidate, "/start")) {
@@ -239,8 +194,6 @@ fn waitForCode(self: *Pairing) error{ Closed, Canceled }!void {
     const deadline_ms = self.nowMs() + @as(i64, @intCast(self.window_ms));
     var state: WaitState = .{};
     var failures: u32 = 0;
-    // The loop ends at the window, on a cancel, a closed sink, a bind, or a
-    // permanent failure, and every other pass waits on the network.
     while (true) {
         if (self.nowMs() >= deadline_ms) return self.emit(.{ .ended = .expired });
         const step = self.waitOnce(&state, deadline_ms) catch |err| switch (err) {
@@ -283,17 +236,10 @@ const Step = union(enum) {
     too_many_codes,
 };
 
-/// One step of the wait: the webhook removal, then the confirmation of the
-/// waiting updates, then one poll whose private text messages count. Every call
-/// ends inside the window, else a network that never answers holds the pairing
-/// open past it.
 fn waitOnce(self: *Pairing, state: *WaitState, deadline_ms: i64) (Client.Error || error{Closed})!Step {
     const client = &self.client;
-    // The caller saw time left, so the floor of one millisecond only guards the
-    // head window against zero, which would disable the bound.
     const remaining_ms: u64 = @intCast(@max(1, deadline_ms - self.nowMs()));
     client.connect_ms = @min(self.poll_connect_ms, remaining_ms);
-    // One call per step, so each call takes a fresh bound.
     if (!state.webhook_deleted) {
         try client.deleteWebhook();
         state.webhook_deleted = true;
@@ -306,15 +252,12 @@ fn waitOnce(self: *Pairing, state: *WaitState, deadline_ms: i64) (Client.Error |
         state.confirmed = true;
         return .waiting;
     }
-    // The Telegram timeout of the poll shrinks toward the end of the window too.
     const timeout_s = @max(1, @min(
         Client.pollTimeoutSeconds(self.poll_connect_ms),
         @divFloor(remaining_ms, std.time.ms_per_s),
     ));
     const updates = try client.getUpdates(state.offset, timeout_s);
     defer updates.deinit(self.gpa);
-    // The timeout rounds up to a second, so the last poll can return after the
-    // window. A code in that reply came too late.
     if (self.nowMs() >= deadline_ms) return .waiting;
     for (updates.items) |update| {
         state.offset = update.update_id + 1;
@@ -336,9 +279,6 @@ const test_code: Code = "x7kq4m2p".*;
 const ok_true = "{\"ok\":true,\"result\":true}";
 const ok_empty = "{\"ok\":true,\"result\":[]}";
 
-/// The window of a test that waits for the expiry. A reply that must land after
-/// that expiry takes a multiple of it, so the two cannot drift apart. A wider
-/// margin costs no time, because the wait ends at the window.
 const test_window_ms = 100;
 
 fn testPairing(
@@ -452,8 +392,6 @@ test "the wait binds the private chat that sends the code and ignores a group" {
     try std.testing.expectEqual(@as(i64, 99), collector.events.items[0].payload.paired);
 }
 
-// The wait polls, so a short configured head window must not shorten its poll
-// either. The check above it ran under the configured window.
 test "a short configured window does not shorten the wait poll" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -484,7 +422,6 @@ test "a short configured window does not shorten the wait poll" {
         @as(u64, Client.poll_connect_ms_min),
         pairing.client.connect_ms,
     );
-    // The webhook removal, the confirmation, and then the long poll.
     try server.waitForLongPoll();
     try server.finish();
     try std.testing.expect(std.mem.indexOf(u8, server.requests.items[2].body, "\"timeout\":25,") != null);
@@ -522,7 +459,6 @@ test "three wrong codes end the wait, and so does a 409" {
     defer bounded.destroy();
     try bounded.startWait(42, try gpa.dupe(u8, "drinky_bot"));
     try collector.waitFor(1);
-    // The third wrong code ends the wait before the right one arrives.
     try std.testing.expect(collector.events.items[0].payload.ended == .too_many_codes);
 
     const conflicted = try testPairing(gpa, io, &server, &url_buffer, &collector, window_ms_default);
@@ -536,9 +472,6 @@ test "three wrong codes end the wait, and so does a 409" {
     );
 }
 
-// The last poll of the window can return after the window ended, because its
-// Telegram timeout rounds up to a second and its head window is longer. A code in
-// that reply came too late, so it must not bind.
 test "a code that arrives after the window does not bind" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -568,15 +501,11 @@ test "a code that arrives after the window does not bind" {
     try std.testing.expect(collector.events.items[0].payload.ended == .expired);
 }
 
-// The head window of a poll is thirty seconds at least. A network that never
-// answers must not hold the pairing open past its own window, so the last poll
-// is bounded by the time that the window has left.
 test "a poll that never returns ends at the window, not at the poll head window" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    // No script answers the long poll, so its connection waits without a reply.
     var server = try testing.Server.init(gpa, io, &.{
         .{ .method = "deleteWebhook", .replies = &.{.{ .body = ok_true }} },
         .{ .method = "getUpdates", .replies = &.{.{ .body = ok_empty }} },
@@ -590,21 +519,16 @@ test "a poll that never returns ends at the window, not at the poll head window"
     defer pairing.destroy();
     try pairing.startWait(42, try gpa.dupe(u8, "drinky_bot"));
 
-    // The collector waits about five seconds, and the poll head window is sixty.
     try collector.waitFor(1);
     try server.finish();
     try std.testing.expect(collector.events.items[0].payload.ended == .expired);
 }
 
-// The webhook removal and the confirmation run before the first poll, and a retry
-// runs them again late in the window. A stalled setup call must not hold the
-// pairing open past the window either.
 test "a setup call that never returns ends at the window too" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    // No script answers, so the webhook removal waits without a reply.
     var server = try testing.Server.init(gpa, io, &.{});
     defer server.deinit();
     try server.start();
@@ -644,6 +568,5 @@ test "the wait expires at its window and clamps the poll to it" {
     try collector.waitFor(1);
     try server.finish();
     try std.testing.expect(collector.events.items[0].payload.ended == .expired);
-    // The poll ran with under a second left, so its timeout took the floor.
     try std.testing.expect(std.mem.indexOf(u8, server.requests.items[2].body, "\"timeout\":1,") != null);
 }

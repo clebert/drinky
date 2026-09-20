@@ -1,8 +1,3 @@
-//! `/remote`: a picker over the saved Telegram bots, then an `Add a bot` row and,
-//! while a bot is saved, a `Remove a bot` row that opens the list of bots to
-//! remove. The command takes no argument. The app owns the network and the
-//! store, so every row hands an action back to it.
-
 const std = @import("std");
 
 const Context = @import("Context.zig");
@@ -38,7 +33,6 @@ pub fn select(context: *Context, selection: Context.Outcome.Pick.Selection) !Con
     return Context.Outcome.reportNotice(context.gpa, .failure, "Select a valid row.", .{});
 }
 
-/// The second list: every saved bot, and one pick removes it.
 fn openRemoval(context: *Context) !Context.Outcome {
     var options: Context.Outcome.Options = .{ .gpa = context.gpa };
     errdefer options.deinit();
@@ -80,7 +74,6 @@ test "a picker with no saved bot holds the add row alone" {
         else => return error.ExpectedPick,
     }
     try std.testing.expect((try select(&context, .ofRow(0))) == .remote_add);
-    // No remove row exists, so its index is no row.
     try Context.Outcome.expectNotice(try select(&context, .ofRow(1)), .failure);
 }
 
@@ -129,7 +122,6 @@ test "the remove row opens the second list, and one pick removes" {
             try std.testing.expectEqualStrings("Remove a bot", pick.title);
             try std.testing.expectEqual(@as(usize, 2), pick.options.len);
             try std.testing.expectEqualStrings("@other_bot", pick.options[1].name);
-            // The list builds itself again, so Esc returns to the first step.
             try std.testing.expect(pick.reopen.? == &openRemoval);
             switch (try pick.select(&context, .ofRow(1))) {
                 .remote_remove => |index| try std.testing.expectEqual(@as(usize, 1), index),

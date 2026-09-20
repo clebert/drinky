@@ -1,19 +1,3 @@
-//! The open picker of the chat: one message whose inline keyboard holds one
-//! button per row, a `✓` on the current row, and the `Cancel` button. A stepped
-//! picker edits the same message per step and adds the `‹ Back` button, so a
-//! `/model` flow walks the same steps as in the terminal.
-//!
-//! The picker holds the state alone. Its owner runs the selector of a tapped
-//! row and applies the outcome, because the outcome reaches the session. Every
-//! keyboard takes a fresh serial, so a tap on a step that an edit replaced, on
-//! a picker that a newer one made stale, or on a picker the chat closed names a
-//! serial the picker no longer holds, and the owner answers it as stale.
-//!
-//! The message of the picker is scaffolding: it leaves the chat when the picker
-//! ends, so the result of the command stands in the chat once. Its title is a
-//! line that Drinky wrote, so it takes the information symbol through every
-//! step.
-
 const std = @import("std");
 
 const ai = @import("ai");
@@ -25,12 +9,8 @@ const keyboard = @import("keyboard.zig");
 
 const Picker = @This();
 
-/// The rows one keyboard shows. Telegram bounds a keyboard at 100 buttons, and
-/// the two control buttons take the rest.
 const rows_max = 98;
 
-/// The steps a picker can return to. The deepest flow today is the command list
-/// and the three steps of `/model`.
 const trail_max = 8;
 
 const back_label = "‹ Back";
@@ -38,31 +18,21 @@ const cancel_label = "Cancel";
 const current_mark = "✓ ";
 
 gpa: std.mem.Allocator,
-/// The serial of the newest keyboard. Every keyboard takes the next one. The
-/// owner seeds it per process, so a keyboard that an earlier process left in the
-/// chat names no serial of this one.
 serial: u64,
 open: ?Open,
 
-/// One picker message with its rows and the steps above it.
 const Open = struct {
-    /// The message, or null when the chat dropped the send.
     handle: ?Attachment.Handle,
     serial: u64,
     select: *const fn (
         *ai.command.Context,
         ai.command.Outcome.Pick.Selection,
     ) anyerror!ai.command.Outcome,
-    /// The value the command set on this step. It reaches the selector beside
-    /// the tapped row.
     payload: usize,
-    /// The rows. Owned.
     options: []const ai.command.Outcome.Pick.Option,
-    /// Borrowed from the command, which names it in a literal.
     title: []const u8,
     cancellation_message: []const u8,
     reopen: ?ai.command.Outcome.Opener,
-    /// The openers of the steps above this one, oldest first.
     trail: [trail_max]ai.command.Outcome.Opener,
     trail_len: usize,
 
@@ -72,14 +42,9 @@ const Open = struct {
     }
 };
 
-/// What a tap on the open picker asks for.
 pub const Action = union(enum) {
-    /// The selector of the picker runs with this row.
     row: usize,
-    /// The step above builds itself again with this opener, and `replace` shows
-    /// it.
     back: ai.command.Outcome.Opener,
-    /// The picker ends with its cancellation message.
     close,
 };
 
@@ -87,7 +52,6 @@ pub fn init(gpa: std.mem.Allocator) Picker {
     return .{ .gpa = gpa, .serial = 0, .open = null };
 }
 
-/// Start the serials at `seed`. The owner draws one random seed per process.
 pub fn seedSerials(self: *Picker, seed: u64) void {
     self.serial = seed;
 }
@@ -96,18 +60,14 @@ pub fn deinit(self: *Picker) void {
     self.close();
 }
 
-/// Whether a picker stands open in the chat.
 pub fn isOpen(self: *const Picker) bool {
     return self.open != null;
 }
 
-/// The cancellation message of the open picker.
 pub fn cancellationMessage(self: *const Picker) []const u8 {
     return self.open.?.cancellation_message;
 }
 
-/// Show `pick` as a new message. A picker that stands open becomes stale, and
-/// its keyboard stays in the chat history. Takes ownership of `pick.options`.
 pub fn show(self: *Picker, chat: anytype, pick: *const ai.command.Outcome.Pick) !void {
     self.close();
     var open = self.take(pick, &.{});
@@ -124,18 +84,12 @@ pub fn show(self: *Picker, chat: anytype, pick: *const ai.command.Outcome.Pick) 
     self.open = open;
 }
 
-/// Show `pick` as the next step of the open picker: the same message takes the
-/// new rows, and the open step goes on the trail, so `‹ Back` returns to it. A
-/// step that rebuilds itself stays one step. Without an open picker the pick
-/// shows as a new message. Takes ownership of `pick.options`.
 pub fn step(self: *Picker, chat: anytype, pick: *const ai.command.Outcome.Pick) !void {
     const above = self.open orelse return self.show(chat, pick);
     var trail = above.trail[0..above.trail_len];
     var buffer: [trail_max]ai.command.Outcome.Opener = undefined;
     if (!sameStep(above.reopen, pick.reopen)) {
         if (above.reopen) |opener| {
-            // A flow deeper than the trail drops its oldest step, so Back ends
-            // the walk early and never returns to the wrong picker.
             const kept = if (trail.len == trail_max) trail[1..] else trail;
             @memcpy(buffer[0..kept.len], kept);
             buffer[kept.len] = opener;
@@ -147,9 +101,6 @@ pub fn step(self: *Picker, chat: anytype, pick: *const ai.command.Outcome.Pick) 
     try self.replace(chat, pick, trail);
 }
 
-/// Show `pick` in place of the open picker, after `‹ Back` rebuilt the step
-/// above. The trail already lost the step that the tap left. Takes ownership of
-/// `pick.options`.
 pub fn replace(
     self: *Picker,
     chat: anytype,
@@ -172,22 +123,17 @@ pub fn replace(
     self.open = open;
 }
 
-/// Whether two pickers are the same step: each step names the one opener that
-/// builds it again.
 fn sameStep(step_open: ?ai.command.Outcome.Opener, other: ?ai.command.Outcome.Opener) bool {
     const one = step_open orelse return false;
     const two = other orelse return false;
     return one == two;
 }
 
-/// The state of `pick` under a fresh serial and `trail`.
 fn take(
     self: *Picker,
     pick: *const ai.command.Outcome.Pick,
     trail: []const ai.command.Outcome.Opener,
 ) Open {
-    // A random seed can stand near the end of the range, so the count wraps
-    // instead of an overflow.
     self.serial +%= 1;
     var open: Open = .{
         .handle = null,
@@ -205,10 +151,6 @@ fn take(
     return open;
 }
 
-/// The action that `tap` asks of the open picker, or null for a tap on a
-/// keyboard the picker no longer holds. A `‹ Back` tap takes its step off the
-/// trail, and the owner shows the outcome of the opener with `replace`. The
-/// trail of the open picker is then the one that `replace` takes.
 pub fn resolve(self: *Picker, tap: keyboard.Tap) ?Action {
     const open = if (self.open) |*open| open else return null;
     switch (tap) {
@@ -229,8 +171,6 @@ pub fn resolve(self: *Picker, tap: keyboard.Tap) ?Action {
     }
 }
 
-/// Run the selector of the open picker over the row `index`, which `resolve`
-/// named.
 pub fn select(
     self: *const Picker,
     context: *ai.command.Context,
@@ -239,15 +179,11 @@ pub fn select(
     return self.open.?.select(context, .{ .payload = self.open.?.payload, .row = index });
 }
 
-/// The steps above the open picker, for the `replace` that follows a `‹ Back`.
 pub fn openers(self: *const Picker) []const ai.command.Outcome.Opener {
     const open = if (self.open) |*open| open else return &.{};
     return open.trail[0..open.trail_len];
 }
 
-/// End the open picker: its message leaves the chat. The message is the
-/// scaffolding of the list alone, so the event of the command, or the toast of
-/// the tap, states the result without a second line beside it.
 pub fn dismiss(self: *Picker, chat: anytype) !void {
     const open = self.open orelse return;
     defer self.close();
@@ -255,17 +191,12 @@ pub fn dismiss(self: *Picker, chat: anytype) !void {
     try chat.delete(handle);
 }
 
-/// Forget the open picker without a deletion. Its keyboard stays in the chat
-/// history, and a tap on it answers as stale.
 pub fn close(self: *Picker) void {
     const open = self.open orelse return;
     open.deinit(self.gpa);
     self.open = null;
 }
 
-/// The keyboard of `open`: one button per row, the current row marked, then
-/// the `‹ Back` button where a step stands above, then `Cancel`. The result is
-/// owned.
 fn buildMarkup(self: *Picker, open: *const Open, current: ?usize) ![]u8 {
     var buttons: std.ArrayList(keyboard.Button) = .empty;
     defer {
@@ -315,14 +246,11 @@ fn rowLabel(
     return out.toOwnedSlice();
 }
 
-/// The callback data of `tap`, owned.
 fn dataOf(gpa: std.mem.Allocator, tap: keyboard.Tap) ![]u8 {
     var buffer: [keyboard.data_bytes_max]u8 = undefined;
     return gpa.dupe(u8, tap.write(&buffer));
 }
 
-/// The chat of the tests: it records every send and every edit with the
-/// keyboard of each, and every deletion.
 const Recorder = struct {
     gpa: std.mem.Allocator,
     sends: std.ArrayList(Message) = .empty,
@@ -399,7 +327,6 @@ const Recorder = struct {
     }
 };
 
-/// A pick of the tests over owned copies of `rows`.
 fn testPick(
     gpa: std.mem.Allocator,
     rows: []const []const u8,
@@ -427,8 +354,6 @@ fn selectNothing(
     return ai.command.Outcome.reportNotice(context.gpa, .failure, "Select a valid row.", .{});
 }
 
-/// A selector that states the whole selection it received, so a test can read
-/// what the chat handed back.
 fn reportSelection(
     context: *ai.command.Context,
     selection: ai.command.Outcome.Pick.Selection,
@@ -458,7 +383,6 @@ test "a picker shows its rows as buttons with the current mark and a cancel, and
 
     try picker.show(&chat, &(try testPick(gpa, &.{ "low", "high" }, 1, null)));
     try std.testing.expect(picker.isOpen());
-    // The title is a line of Drinky, so it takes the information symbol.
     try std.testing.expectEqualStrings("ℹ Effort", chat.sends.items[0].text);
     try std.testing.expectEqualStrings(html.parse_mode, chat.sends.items[0].parse_mode.?);
     try std.testing.expectEqualStrings(
@@ -468,8 +392,6 @@ test "a picker shows its rows as buttons with the current mark and a cancel, and
         chat.sends.items[0].markup.?,
     );
     try std.testing.expectEqual(@as(usize, 0), picker.resolve(.{ .row = .{ .serial = 1, .index = 0 } }).?.row);
-    // A row past the list, a serial of another keyboard, and a back where no
-    // step stands above all name nothing.
     try std.testing.expect(picker.resolve(.{ .row = .{ .serial = 1, .index = 2 } }) == null);
     try std.testing.expect(picker.resolve(.{ .row = .{ .serial = 2, .index = 0 } }) == null);
     try std.testing.expect(picker.resolve(.{ .back = 1 }) == null);
@@ -477,8 +399,6 @@ test "a picker shows its rows as buttons with the current mark and a cancel, and
     try std.testing.expect(picker.resolve(.{ .close = 1 }).? == .close);
     try std.testing.expectEqualStrings("You canceled the effort selection.", picker.cancellationMessage());
 
-    // The message of the list goes at the end, so the event of the command
-    // states the result alone.
     try picker.dismiss(&chat);
     try std.testing.expect(!picker.isOpen());
     try std.testing.expectEqual(@as(usize, 0), chat.edits.items.len);
@@ -486,10 +406,6 @@ test "a picker shows its rows as buttons with the current mark and a cancel, and
     try std.testing.expect(picker.resolve(.{ .close = 1 }) == null);
 }
 
-// A stepped command reads its earlier choice from the payload of the step. The
-// chat must therefore hand that payload back with the tapped row, exactly as
-// the terminal does. The author step of `/model` under an OpenRouter account
-// selects nothing without it.
 test "a tapped row carries the payload of its step to the selector" {
     const gpa = std.testing.allocator;
     var chat: Recorder = .{ .gpa = gpa };
@@ -502,7 +418,6 @@ test "a tapped row carries the payload of its step to the selector" {
     pick.payload = 4242;
     try picker.show(&chat, &pick);
 
-    // The selector reads the allocator alone, so no session stands behind it.
     var context: ai.command.Context = .{
         .gpa = gpa,
         .io = undefined,
@@ -528,7 +443,6 @@ test "a step edits the same message, adds the back button, and a back takes the 
     try picker.step(&chat, &(try testPick(gpa, &.{ "Subscription", "API" }, null, openSecond)));
     try std.testing.expectEqual(@as(usize, 1), chat.sends.items.len);
     try std.testing.expectEqual(@as(?Attachment.Handle, 1), chat.lastEdit().handle);
-    // Every step keeps the symbol of the title.
     try std.testing.expectEqualStrings("ℹ Effort", chat.lastEdit().text);
     try std.testing.expectEqualStrings(html.parse_mode, chat.lastEdit().parse_mode.?);
     try std.testing.expectEqualStrings(
@@ -538,13 +452,10 @@ test "a step edits the same message, adds the back button, and a back takes the 
             "[{\"text\":\"Cancel\",\"callback_data\":\"close:2\"}]]}",
         chat.lastEdit().markup.?,
     );
-    // The replaced step is stale, and a step that rebuilds itself stays one step.
     try std.testing.expect(picker.resolve(.{ .row = .{ .serial = 1, .index = 0 } }) == null);
     try picker.step(&chat, &(try testPick(gpa, &.{"Subscription"}, null, openSecond)));
     try std.testing.expectEqual(@as(usize, 1), picker.openers().len);
 
-    // Back names the step above and leaves the trail without it, so the
-    // replacement stands at the top again.
     const action = picker.resolve(.{ .back = 3 }).?;
     try std.testing.expect(action.back == &openFirst);
     try std.testing.expectEqual(@as(usize, 0), picker.openers().len);
@@ -571,14 +482,10 @@ test "a newer picker makes the older one stale, and a close forgets the picker w
     picker.close();
     try std.testing.expect(!picker.isOpen());
     try std.testing.expect(picker.resolve(.{ .close = 2 }) == null);
-    // A closed picker deletes nothing.
     try picker.dismiss(&chat);
     try std.testing.expectEqual(@as(usize, 0), chat.deletions.items.len);
 }
 
-// A stale keyboard stays in the chat history, and a later process starts its
-// count again, so a seed per process keeps the rows of one process apart from
-// those of an earlier one.
 test "a seed moves the serials past the keyboards of an earlier process" {
     const gpa = std.testing.allocator;
     var chat: Recorder = .{ .gpa = gpa };

@@ -1,16 +1,9 @@
-//! The app's inline text attributes. A span adds these operations to its semantic
-//! role. The `role` map owns every color and the faint muted tone. This module
-//! owns emphasis, italic, underline, and strikethrough. `reset` closes every
-//! style.
-
 const std = @import("std");
 
 const terminal = @import("terminal");
 
 const role = @import("role.zig");
 
-/// One text attribute that does not depend on the active role, plus the `reset`
-/// that closes every open attribute and color.
 pub const Name = enum {
     reset,
     italic,
@@ -20,8 +13,6 @@ pub const Name = enum {
 
 const Emphasis = enum { bold, underline, double_underline };
 
-/// The complete SGR sequence `name` writes. This map is the only place where an
-/// attribute becomes bytes, so a test can pin them instead of repeating them.
 pub fn sequence(comptime name: Name) []const u8 {
     return switch (name) {
         .reset => "\x1b[0m",
@@ -31,16 +22,12 @@ pub fn sequence(comptime name: Name) []const u8 {
     };
 }
 
-/// Apply one role-independent attribute through the sink's validated SGR path.
 pub fn apply(sink: *terminal.View.Sink, name: Name) !void {
     switch (name) {
         inline else => |tag| try sink.sgr(sequence(tag)),
     }
 }
 
-/// Apply visible emphasis without replacing the faint intensity of muted text.
-/// Other roles use bold. A muted span uses double underline when it already has
-/// underline.
 pub fn emphasize(sink: *terminal.View.Sink, name: role.Name, underlined: bool) !void {
     switch (emphasis(name, underlined)) {
         .bold => try sink.sgr("\x1b[1m"),
@@ -55,8 +42,6 @@ fn emphasis(name: role.Name, underlined: bool) Emphasis {
 }
 
 test "the attribute map pins the SGR sequence for each attribute" {
-    // The switch is exhaustive, so a new attribute fails to compile until this
-    // test pins its bytes too.
     inline for (std.enums.values(Name)) |name| {
         const pinned = switch (name) {
             .reset => "\x1b[0m",

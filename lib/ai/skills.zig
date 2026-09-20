@@ -1,7 +1,3 @@
-//! Agent Skills discovery and progressive disclosure. A registry owns only skill
-//! metadata and absolute `SKILL.md` paths. Instruction bodies remain on disk
-//! until the model reads one or the user invokes it explicitly.
-
 const std = @import("std");
 
 const format = @import("format.zig");
@@ -16,10 +12,6 @@ const skills_max = 1024;
 const notices_max = 1024;
 const skill_file_bytes_max = 16 << 20;
 
-/// A skill must fit the window of one `read` call. The model then holds the
-/// whole file after one call, and Drinky can prove from the conversation that it
-/// loaded the skill. A file above either bound comes back in parts, which
-/// proves nothing, so the scan skips it and says so.
 const skill_lines_max = tool.read_lines_max;
 const skill_bytes_max = tool.read_bytes_max;
 
@@ -30,9 +22,6 @@ pub const Skill = struct {
     path: []const u8,
     model_invocation_disabled: bool,
     scope: Scope,
-    /// The `SKILL.md` path of the user skill that this project skill replaced,
-    /// or null. The replacement is the documented precedence, so it warns
-    /// nowhere, and this path is its one record. Owned.
     replaced_path: ?[]const u8 = null,
 
     pub const Scope = enum { user, project };
@@ -45,9 +34,6 @@ pub const Skill = struct {
         self.* = undefined;
     }
 
-    /// Load this skill's complete `SKILL.md`. Identify its base directory for
-    /// relative resources. Append explicit invocation arguments. `gpa` owns
-    /// the returned content.
     pub fn invoke(
         self: *const Skill,
         gpa: std.mem.Allocator,
@@ -84,8 +70,6 @@ pub const Skill = struct {
     }
 };
 
-/// Read-only metadata for the skills advertised to the model. Skills disabled
-/// for model invocation remain in the registry but never appear in this view.
 pub const Catalog = struct {
     skill_items: []const Skill,
     visible_count: usize,
@@ -131,8 +115,6 @@ pub const Catalog = struct {
 pub const Registry = struct {
     gpa: std.mem.Allocator,
     skill_items: std.ArrayList(Skill) = .empty,
-    /// The startup messages of the scan, in the shape every instruction source
-    /// reports, so the app has one way to show them all.
     notice_items: std.ArrayList(instructions.Notice) = .empty,
     skills_capped: bool = false,
     notices_capped: bool = false,
@@ -149,9 +131,6 @@ pub const Registry = struct {
         self.* = undefined;
     }
 
-    /// Every discovered skill, in scan order. The skill list of the user holds
-    /// them all, because a skill that disables model invocation still loads by
-    /// hand. The catalog that the model reads leaves that one out.
     pub fn items(self: *const Registry) []const Skill {
         return self.skill_items.items;
     }
@@ -190,9 +169,6 @@ pub const Registry = struct {
         var paths: PathKeeper = .{};
         defer paths.deinit(self.gpa);
 
-        // Canonical directories already entered. The walk does not follow a
-        // symlink to the root or to another followed directory twice. The
-        // root seeds the set. The traversal cap backstops any residual cycle.
         var visited: std.StringHashMapUnmanaged(void) = .empty;
         defer {
             var keys = visited.keyIterator();
@@ -255,10 +231,6 @@ pub const Registry = struct {
         for (paths.heap.items) |path| try self.loadPath(io, path, scope);
     }
 
-    /// Follow a symlink entry: enter a linked directory or offer a linked
-    /// `SKILL.md`. Canonical paths dedupe linked directories, so the walk
-    /// enters cycles and diamonds once. The walk skips dangling and
-    /// unreadable links.
     fn followLink(
         self: *Registry,
         io: std.Io,
@@ -389,9 +361,6 @@ pub const Registry = struct {
             );
             return;
         }
-        // The check above rejects a raw NUL. An escape that decodes to one
-        // still must not reach the catalog. This keeps the advertised text
-        // NUL-free end to end.
         if (std.mem.indexOfScalar(u8, description, 0) != null) {
             try self.warn(
                 "Drinky skipped {s} because the skill description contains a NUL byte.",
@@ -453,12 +422,10 @@ pub const Registry = struct {
         try self.insert(&skill);
     }
 
-    /// Takes `incoming` on success. Leaves it untouched on error.
     fn insert(self: *Registry, incoming: *Skill) !void {
         for (self.skill_items.items) |*existing| {
             if (!std.mem.eql(u8, existing.name, incoming.name)) continue;
             if (incoming.scope == .project and existing.scope == .user) {
-                // A user skill never replaces a skill, so no record is lost here.
                 std.debug.assert(existing.replaced_path == null);
                 incoming.replaced_path = try self.gpa.dupe(u8, existing.path);
                 existing.deinit(self.gpa);
@@ -486,8 +453,6 @@ pub const Registry = struct {
         incoming.* = undefined;
     }
 
-    /// Record one message about the scan. Every one of them reports something
-    /// the user must fix, so they all carry `.failure`.
     fn warn(
         self: *Registry,
         comptime template: []const u8,
@@ -509,21 +474,8 @@ pub const Registry = struct {
 };
 
 pub const DiscoverOptions = struct {
-    /// Absolute `~/.agents/skills` path.
     user_root: []const u8,
-    /// The absolute, canonical working directory where the project ancestor scan
-    /// starts. `instructions.discover` takes the same contract, so both scans
-    /// read one directory the same way.
     project_start: []const u8,
-    /// The highest directory the project scan reaches, which is the Git root that
-    /// `project.findBoundary` reports. It must be absolute and canonical, and
-    /// `project_start` must resolve inside it.
-    ///
-    /// Null means that the caller found no Git root, and then the scan covers
-    /// `project_start` alone. The AGENTS.md scan applies that same rule. A
-    /// caller that could not read a repository marker also passes null, so this
-    /// scan then stops below an ancestor that the AGENTS.md scan still reads.
-    /// That errs toward fewer skills, never toward another repository.
     project_root: ?[]const u8,
 };
 
@@ -551,11 +503,6 @@ const PathKeeper = struct {
     }
 };
 
-/// Discover user skills, then project skills from `project_start` up to
-/// `project_root`. A project skill replaces a user skill of the same name. Among
-/// the project directories the skill closest to `project_start` wins. A null
-/// `project_root` bounds the scan at `project_start`. See
-/// `DiscoverOptions.project_root`.
 pub fn discover(
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -569,9 +516,6 @@ pub fn discover(
     if (options.project_root) |project_root| {
         if (!std.fs.path.isAbsolute(project_root)) return error.SkillPathNotAbsolute;
     }
-    // The repository bounds the ancestor scan. Outside a repository the working
-    // directory is the whole project, so the boundary is the start itself and the
-    // loop stops after one pass.
     const boundary = options.project_root orelse options.project_start;
     if (!project.contains(&.{ .boundary = boundary, .target = options.project_start })) {
         return error.SkillProjectRootNotAncestor;
@@ -587,8 +531,6 @@ pub fn discover(
     for (0..std.fs.max_path_bytes) |_| {
         const skills_root = try std.fs.path.join(gpa, &.{ current, ".agents", "skills" });
         defer gpa.free(skills_root);
-        // At the home directory the user and project conventions can resolve to
-        // the same path. Do not rediscover every file as its own shadow.
         var matches_user_root = std.mem.eql(u8, skills_root, options.user_root);
         if (!matches_user_root and user_root_canonical != null) {
             const skills_root_canonical = try canonicalPath(gpa, io, skills_root);
@@ -599,8 +541,6 @@ pub fn discover(
                 false;
         }
         if (!matches_user_root) try registry.scanRoot(io, skills_root, .project);
-        // `project_start` resolves inside `boundary`, and every step shortens the
-        // path, so the length alone stops the walk at the boundary.
         if (current.len <= boundary.len) break;
         const parent = std.fs.path.dirname(current) orelse break;
         if (std.mem.eql(u8, parent, current)) break;
@@ -640,9 +580,6 @@ fn descriptionPrefix(description: []const u8) []const u8 {
     return description[0..end];
 }
 
-/// A bounded, transcript-safe rendering of an untrusted value for a warning.
-/// It caps the source length and escapes control and non-UTF-8 bytes as
-/// `\xNN`. Valid UTF-8 passes through so paths and names stay legible.
 fn diagnostic(gpa: std.mem.Allocator, text: []const u8) ![]u8 {
     const source_bytes_max = 96;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -762,9 +699,6 @@ test "discovery is recursive and project skills shadow user and ancestor skills"
     try std.testing.expectEqualStrings("nearest copy", registry.get("shared").?.description);
     try std.testing.expect(registry.get("other") != null);
     try std.testing.expect(registry.get("outside") == null);
-    // The project copy replaces the user copy silently, because that is the
-    // documented precedence. The winner records the path of the user copy, so
-    // the user can still find it. Only the same-scope clash still warns.
     try std.testing.expect(std.mem.endsWith(
         u8,
         registry.get("shared").?.replaced_path.?,
@@ -779,7 +713,6 @@ test "discovery is recursive and project skills shadow user and ancestor skills"
 
 test "a path that is not absolute and a root that is not an ancestor both fail safely" {
     const gpa = std.testing.allocator;
-    // Every case fails before the first directory read, so none of them uses io.
     try std.testing.expectError(error.SkillPathNotAbsolute, discover(gpa, undefined, &.{
         .user_root = "relative",
         .project_start = "/work",
@@ -795,13 +728,11 @@ test "a path that is not absolute and a root that is not an ancestor both fail s
         .project_start = "/work",
         .project_root = "relative",
     }));
-    // A root the start does not resolve inside lets the walk climb past it.
     try std.testing.expectError(error.SkillProjectRootNotAncestor, discover(gpa, undefined, &.{
         .user_root = "/home/.agents/skills",
         .project_start = "/work",
         .project_root = "/elsewhere",
     }));
-    // A shared name prefix is not a directory boundary.
     try std.testing.expectError(error.SkillProjectRootNotAncestor, discover(gpa, undefined, &.{
         .user_root = "/home/.agents/skills",
         .project_start = "/workspace",
@@ -833,16 +764,12 @@ test "without a Git root the project scan covers only the working directory" {
     });
     defer registry.deinit();
 
-    // The user root still loads. Only the ancestor scan stops, so no directory
-    // above the working directory can add or replace a skill.
     try std.testing.expectEqual(@as(usize, 2), registry.items().len);
     try std.testing.expect(registry.get("helper") != null);
     try std.testing.expect(registry.get("local") != null);
     try std.testing.expect(registry.get("ancestor") == null);
 }
 
-// A skill above the window of one `read` call comes back in parts, and a part
-// proves nothing about a loaded skill. The scan keeps every skill provable.
 test "a skill file above the window of one read call is skipped" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -861,7 +788,6 @@ test "a skill file above the window of one read call is skipped" {
     try tall.writer.print(head, .{"tall"});
     for (0..skill_lines_max) |_| try tall.writer.writeAll("body\n");
     try writeTestSkill(io, tmp.dir, "user/tall/SKILL.md", tall.written());
-    // The last file that still fits: the bounds are inclusive.
     var edge: std.Io.Writer.Allocating = .init(gpa);
     defer edge.deinit();
     try edge.writer.print(head, .{"edge"});
@@ -914,7 +840,6 @@ test "invalid names fall back, empty descriptions skip, and hidden skills stay o
         "x" ** 1025 ++ "\n---\nbody\n");
     try writeTestSkill(io, tmp.dir, "user/Bad Name/SKILL.md", "---\n" ++
         "description: a directory name that is not a valid skill name\n---\nbody\n");
-    // The working directory holds no skills, so every skill here is a user one.
     var work = try tmp.dir.createDirPathOpen(io, "work", .{});
     work.close(io);
 
@@ -987,7 +912,6 @@ test "discovery follows directory symlinks once and skips cycles" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // A skill body outside the skills root, linked in as a directory.
     try writeTestSkill(io, tmp.dir, "external/pdf-tools/SKILL.md", "---\n" ++
         "name: pdf-tools\ndescription: linked skill\n---\nbody\n");
     var user_dir = try tmp.dir.createDirPathOpen(io, "user", .{});
@@ -1000,7 +924,6 @@ test "discovery follows directory symlinks once and skips cycles" {
     const user_root = try tmpPath(gpa, io, &tmp, "user");
     defer gpa.free(user_root);
     try tmp.dir.symLink(io, external, "user/pdf-tools", .{});
-    // The walk must not follow a symlink back to the skills root a second time.
     try tmp.dir.symLink(io, user_root, "user/loop", .{});
 
     const project_start = try tmpPath(gpa, io, &tmp, "work");
@@ -1018,8 +941,6 @@ test "discovery follows directory symlinks once and skips cycles" {
 
 test "a skill whose path is not valid UTF-8 is skipped with a safe warning" {
     const gpa = std.testing.allocator;
-    // Host filesystems reject non-UTF-8 names, so exercise the guard directly.
-    // loadPath validates the path before any I/O and so never touches `io`.
     var registry = Registry.init(gpa);
     defer registry.deinit();
     try registry.loadPath(undefined, "user/\xff\xfe/SKILL.md", .user);
@@ -1029,6 +950,5 @@ test "a skill whose path is not valid UTF-8 is skipped with a safe warning" {
     const notice = registry.notices()[0];
     try std.testing.expectEqual(instructions.Notice.Severity.failure, notice.severity);
     try std.testing.expect(std.mem.indexOf(u8, notice.text, "not valid UTF-8") != null);
-    // The raw bytes must not reach the transcript verbatim.
     try std.testing.expect(std.mem.indexOf(u8, notice.text, "\\xff") != null);
 }
