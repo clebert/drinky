@@ -434,11 +434,6 @@ pub const Parts = struct {
     open: Stack = .{},
     done: bool = false,
 
-    pub const Part = struct {
-        text: []u8,
-        last: bool,
-    };
-
     const depth_max = 8;
 
     const Stack = struct {
@@ -478,7 +473,7 @@ pub const Parts = struct {
         return .{ .html = html, .limit = limit };
     }
 
-    pub fn next(self: *Parts, gpa: std.mem.Allocator) !?Part {
+    pub fn next(self: *Parts, gpa: std.mem.Allocator) !?[]u8 {
         if (self.done) return null;
         while (self.open.len == 0 and self.position < self.html.len and
             self.html[self.position] == '\n') self.position += 1;
@@ -522,7 +517,7 @@ pub const Parts = struct {
             try writeClosers(&out.writer, &stack);
             self.position = self.html.len;
             self.done = true;
-            return .{ .text = try out.toOwnedSlice(), .last = true };
+            return try out.toOwnedSlice();
         };
         const settled = self.settle(&cut);
         var body = self.html[start..settled.end];
@@ -531,7 +526,7 @@ pub const Parts = struct {
         try writeClosers(&out.writer, &settled.open);
         self.position = settled.resume_at;
         self.open = settled.open;
-        return .{ .text = try out.toOwnedSlice(), .last = false };
+        return try out.toOwnedSlice();
     }
 
     fn settle(self: *const Parts, cut: *const Cut) Cut {
@@ -717,8 +712,7 @@ fn collectParts(gpa: std.mem.Allocator, html: []const u8, limit: usize) !std.Arr
     }
     for (0..html.len + 1) |_| {
         const part = try parts.next(gpa) orelse break;
-        try list.append(gpa, part.text);
-        if (part.last) break;
+        try list.append(gpa, part);
     }
     return list;
 }

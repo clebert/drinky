@@ -48,12 +48,6 @@ pub const Refresh = struct {
     metadata_save_error: ?anyerror = null,
 };
 
-pub const Reread = struct {
-    changes: std.EnumArray(llm.Account, auth.Change) = .initFill(.unchanged),
-    read_error: ?anyerror = null,
-    entry_errors: std.EnumArray(llm.Account, ?anyerror) = .initFill(null),
-};
-
 pub const Environment = struct {
     anthropic: ?[]const u8 = null,
     openai: ?[]const u8 = null,
@@ -197,84 +191,6 @@ pub fn loadError(self: *const Accounts, account: llm.Account) ?anyerror {
         .ds4 => self.ds4_error,
         else => null,
     };
-}
-
-pub fn storePath(self: *const Accounts) []const u8 {
-    return self.anthropic_auth.path;
-}
-
-pub fn reread(self: *Accounts) Reread {
-    var report: Reread = .{};
-    if (self.storePath().len == 0) return report;
-    var maybe_file = auth.openStore(self.gpa, self.io, self.storePath()) catch |err| {
-        report.read_error = err;
-        return report;
-    };
-    defer if (maybe_file) |*file| file.deinit();
-    const file: ?*const json_store.File = if (maybe_file) |*opened| opened else null;
-    self.anthropic_plan_ready = self.rereadStore(
-        &report,
-        file,
-        .anthropic_plan,
-        &self.anthropic_auth,
-        self.anthropic_plan_ready,
-    );
-    self.anthropic_api_ready = self.rereadStore(
-        &report,
-        file,
-        .anthropic_api,
-        &self.anthropic_console_auth,
-        self.anthropic_api_ready,
-    );
-    self.openai_plan_ready = self.rereadStore(
-        &report,
-        file,
-        .openai_plan,
-        &self.openai_auth,
-        self.openai_plan_ready,
-    );
-    self.xai_plan_ready = self.rereadStore(
-        &report,
-        file,
-        .xai_plan,
-        &self.xai_auth,
-        self.xai_plan_ready,
-    );
-    self.openrouter_api_ready = self.rereadStore(
-        &report,
-        file,
-        .openrouter_api,
-        &self.openrouter_auth,
-        self.openrouter_api_ready,
-    );
-    return report;
-}
-
-fn rereadStore(
-    self: *Accounts,
-    report: *Reread,
-    file: ?*const json_store.File,
-    account: llm.Account,
-    store: anytype,
-    ready: bool,
-) bool {
-    const change = store.reread(file) catch |err| failed: {
-        report.entry_errors.set(account, err);
-        break :failed .unchanged;
-    };
-    report.changes.set(account, change);
-    switch (change) {
-        .unchanged => return ready,
-        .signed_in, .rotated => return true,
-        .replaced => {
-            self.catalog.dropAccount(account);
-            return true;
-        },
-        .signed_out => {
-            self.catalog.dropAccount(account);
-            return false;
-        },
-    }
 }
 
 pub fn firstAuthenticated(self: *const Accounts) ?llm.Account {
@@ -646,10 +562,6 @@ pub fn invalidate(self: *Accounts, account: llm.Account) !bool {
             return error.AccountHasNoRefreshCredential;
         },
     }
-}
-
-pub fn dropPrincipalMetadata(self: *Accounts, account: llm.Account) void {
-    self.catalog.dropAccount(account);
 }
 
 fn testAccounts(environment: Environment, anthropic_ready: bool, openai_ready: bool) Accounts {
@@ -1102,132 +1014,6 @@ test "xAI invalidation forgets a rejected credential and reloads a replacement" 
     var file = (try json_store.open(gpa, io, accounts.xai_auth.path)).?;
     defer file.deinit();
     try std.testing.expect(file.entry("xai-plan") == null);
-}
-
-test "a reread settles every login store and reports each change" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var directory = try tmp.dir.createDirPathOpen(io, ".drinky", .{});
-    directory.close(io);
-    try tmp.dir.writeFile(io, .{
-        .sub_path = ".drinky/auth.json",
-        .data =
-        \\{ "anthropic-plan":
-        \\    { "access": "a", "refresh": "r", "expires_ms": 4102444800000,
-        \\      "account_uuid": "user-1", "organization_uuid": "org-1" },
-        \\  "anthropic-api": { "api_key": "minted" } }
-        ,
-    });
-    var home_buffer: [128]u8 = undefined;
-    const home = try std.fmt.bufPrint(&home_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-
-    var accounts = try Accounts.init(gpa, io, home, .{}, .{});
-    defer accounts.deinit();
-    try seedModel(&accounts, .anthropic_plan, "claude-opus-5");
-    try seedModel(&accounts, .anthropic_api, "claude-opus-5");
-    try seedModel(&accounts, .openai_plan, "gpt-5.6-sol");
-
-    const same = accounts.reread();
-    try std.testing.expect(same.read_error == null);
-    for (std.enums.values(llm.Account)) |account|
-        try std.testing.expectEqual(auth.Change.unchanged, same.changes.get(account));
-    try std.testing.expect(!accounts.catalog.isEmpty(.anthropic_plan));
-
-    try tmp.dir.writeFile(io, .{
-        .sub_path = ".drinky/auth.json",
-        .data =
-        \\{ "anthropic-plan":
-        \\    { "access": "a2", "refresh": "r2", "expires_ms": 4102444800000,
-        \\      "account_uuid": "user-1", "organization_uuid": "org-1" },
-        \\  "openai-plan":
-        \\    { "access": "o", "refresh": "or", "expires_ms": 4102444800000,
-        \\      "account_id": "account" } }
-        ,
-    });
-    const changed = accounts.reread();
-    try std.testing.expect(changed.read_error == null);
-    try std.testing.expectEqual(auth.Change.rotated, changed.changes.get(.anthropic_plan));
-    try std.testing.expectEqual(auth.Change.signed_out, changed.changes.get(.anthropic_api));
-    try std.testing.expectEqual(auth.Change.signed_in, changed.changes.get(.openai_plan));
-    try std.testing.expectEqual(auth.Change.unchanged, changed.changes.get(.xai_plan));
-    try std.testing.expect(accounts.isAuthenticated(.anthropic_plan));
-    try std.testing.expectEqualStrings("r2", accounts.anthropic_auth.tokens.?.refresh);
-    try std.testing.expect(!accounts.isAuthenticated(.anthropic_api));
-    try std.testing.expect(accounts.isAuthenticated(.openai_plan));
-    try std.testing.expect(!accounts.catalog.isEmpty(.anthropic_plan));
-    try std.testing.expect(accounts.catalog.isEmpty(.anthropic_api));
-    try std.testing.expect(!accounts.catalog.isEmpty(.openai_plan));
-
-    try tmp.dir.writeFile(io, .{
-        .sub_path = ".drinky/auth.json",
-        .data =
-        \\{ "anthropic-plan":
-        \\    { "access": "b", "refresh": "rb", "expires_ms": 4102444800000,
-        \\      "account_uuid": "user-2", "organization_uuid": "org-2" } }
-        ,
-    });
-    const replaced = accounts.reread();
-    try std.testing.expectEqual(auth.Change.replaced, replaced.changes.get(.anthropic_plan));
-    try std.testing.expectEqual(auth.Change.signed_out, replaced.changes.get(.openai_plan));
-    try std.testing.expect(accounts.isAuthenticated(.anthropic_plan));
-    try std.testing.expect(accounts.catalog.isEmpty(.anthropic_plan));
-
-    try tmp.dir.writeFile(io, .{ .sub_path = ".drinky/auth.json", .data = "not json" });
-    const failed = accounts.reread();
-    try std.testing.expectEqual(@as(?anyerror, error.BadCredentials), failed.read_error);
-    for (std.enums.values(llm.Account)) |account| {
-        try std.testing.expectEqual(auth.Change.unchanged, failed.changes.get(account));
-        try std.testing.expect(failed.entry_errors.get(account) == null);
-    }
-    try std.testing.expect(accounts.isAuthenticated(.anthropic_plan));
-    try std.testing.expectEqualStrings("rb", accounts.anthropic_auth.tokens.?.refresh);
-
-    try tmp.dir.writeFile(io, .{
-        .sub_path = ".drinky/auth.json",
-        .data =
-        \\{ "anthropic-plan": { "access": 1 },
-        \\  "anthropic-api": { "api_key": "minted" } }
-        ,
-    });
-    const partial = accounts.reread();
-    try std.testing.expect(partial.read_error == null);
-    try std.testing.expectEqual(
-        @as(?anyerror, error.BadCredentials),
-        partial.entry_errors.get(.anthropic_plan),
-    );
-    try std.testing.expect(partial.entry_errors.get(.anthropic_api) == null);
-    try std.testing.expectEqual(auth.Change.unchanged, partial.changes.get(.anthropic_plan));
-    try std.testing.expectEqual(auth.Change.signed_in, partial.changes.get(.anthropic_api));
-    try std.testing.expectEqualStrings("rb", accounts.anthropic_auth.tokens.?.refresh);
-    try std.testing.expect(accounts.isAuthenticated(.anthropic_api));
-}
-
-test "a registry with no store keeps its credentials in memory alone" {
-    var accounts = testAccounts(.{}, true, false);
-    const report = accounts.reread();
-    try std.testing.expect(report.read_error == null);
-    for (std.enums.values(llm.Account)) |account|
-        try std.testing.expectEqual(auth.Change.unchanged, report.changes.get(account));
-    try std.testing.expect(accounts.isAuthenticated(.anthropic_plan));
-}
-
-test "a principal replacement drops the list of that account alone" {
-    const gpa = std.testing.allocator;
-    var accounts = testAccounts(.{}, false, true);
-    defer for (std.enums.values(llm.Account)) |account|
-        gpa.free(accounts.catalog.accounts.get(account));
-
-    try seedModel(&accounts, .openai_plan, "gpt-5.6-sol");
-    try seedModel(&accounts, .anthropic_plan, "claude-opus-5");
-
-    accounts.dropPrincipalMetadata(.anthropic_plan);
-    try std.testing.expect(accounts.catalog.isEmpty(.anthropic_plan));
-    try std.testing.expect(!accounts.catalog.isEmpty(.openai_plan));
-
-    accounts.dropPrincipalMetadata(.openai_plan);
-    try std.testing.expect(accounts.catalog.isEmpty(.openai_plan));
 }
 
 test "a failed cache write reports a failed save, not a failed fetch" {

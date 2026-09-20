@@ -21,24 +21,6 @@ pub fn payload(
     };
 }
 
-pub fn stringClaim(
-    gpa: std.mem.Allocator,
-    token: []const u8,
-    name: []const u8,
-) error{OutOfMemory}!?[]const u8 {
-    const parsed = (try payload(gpa, token)) orelse return null;
-    defer parsed.deinit();
-    const object = switch (parsed.value) {
-        .object => |object| object,
-        else => return null,
-    };
-    const claim = switch (object.get(name) orelse return null) {
-        .string => |string| string,
-        else => return null,
-    };
-    return try gpa.dupe(u8, claim);
-}
-
 pub fn testToken(gpa: std.mem.Allocator, body: []const u8) ![]u8 {
     var encoded: [1024]u8 = undefined;
     const middle = std.base64.url_safe_no_pad.Encoder.encode(&encoded, body);
@@ -59,19 +41,4 @@ test payload {
     const not_json = try testToken(gpa, "not json");
     defer gpa.free(not_json);
     try std.testing.expect(try payload(gpa, not_json) == null);
-}
-
-test stringClaim {
-    const gpa = std.testing.allocator;
-    const token = try testToken(gpa, "{\"sub\":\"user-1\",\"exp\":2000000000}");
-    defer gpa.free(token);
-    const subject = (try stringClaim(gpa, token, "sub")).?;
-    defer gpa.free(subject);
-    try std.testing.expectEqualStrings("user-1", subject);
-    try std.testing.expect(try stringClaim(gpa, token, "email") == null);
-    try std.testing.expect(try stringClaim(gpa, token, "exp") == null);
-    try std.testing.expect(try stringClaim(gpa, "opaque-token", "sub") == null);
-    const list = try testToken(gpa, "[1,2]");
-    defer gpa.free(list);
-    try std.testing.expect(try stringClaim(gpa, list, "sub") == null);
 }

@@ -1,130 +1,55 @@
 const std = @import("std");
 
-pub const data_bytes_max = 64;
+const cancel_label = "Cancel turn";
+const cancel_prefix = "cancel:";
 
-pub const Button = struct {
-    text: []const u8,
-    data: []const u8,
-};
-
-pub const Tap = union(enum) {
-    cancel_turn: u64,
-    withdraw: u64,
-    retry: u64,
-    dismiss: u64,
-    shorten: u64,
-    row: Row,
-    back: u64,
-    close: u64,
-
-    pub const Row = struct {
-        serial: u64,
-        index: usize,
-    };
-
-    const Word = enum { cancel, withdraw, retry, dismiss, shorten, row, back, close };
-
-    pub fn write(self: Tap, buffer: *[data_bytes_max]u8) []const u8 {
-        return switch (self) {
-            .cancel_turn => |serial| std.fmt.bufPrint(buffer, "cancel:{d}", .{serial}),
-            .withdraw => |serial| std.fmt.bufPrint(buffer, "withdraw:{d}", .{serial}),
-            .retry => |serial| std.fmt.bufPrint(buffer, "retry:{d}", .{serial}),
-            .dismiss => |serial| std.fmt.bufPrint(buffer, "dismiss:{d}", .{serial}),
-            .shorten => |serial| std.fmt.bufPrint(buffer, "shorten:{d}", .{serial}),
-            .row => |row| std.fmt.bufPrint(buffer, "row:{d}:{d}", .{ row.serial, row.index }),
-            .back => |serial| std.fmt.bufPrint(buffer, "back:{d}", .{serial}),
-            .close => |serial| std.fmt.bufPrint(buffer, "close:{d}", .{serial}),
-        } catch unreachable;
-    }
-
-    pub fn parse(data: []const u8) ?Tap {
-        var parts = std.mem.splitScalar(u8, data, ':');
-        const word = std.meta.stringToEnum(Word, parts.first()) orelse return null;
-        const serial = std.fmt.parseInt(u64, parts.next() orelse return null, 10) catch return null;
-        const tap: Tap = switch (word) {
-            .cancel => .{ .cancel_turn = serial },
-            .withdraw => .{ .withdraw = serial },
-            .retry => .{ .retry = serial },
-            .dismiss => .{ .dismiss = serial },
-            .shorten => .{ .shorten = serial },
-            .row => .{ .row = .{
-                .serial = serial,
-                .index = std.fmt.parseInt(usize, parts.next() orelse return null, 10) catch
-                    return null,
-            } },
-            .back => .{ .back = serial },
-            .close => .{ .close = serial },
-        };
-        if (parts.next() != null) return null;
-        return tap;
-    }
-};
-
-pub fn markup(gpa: std.mem.Allocator, buttons: []const Button) ![]u8 {
+pub fn cancelMarkup(gpa: std.mem.Allocator, serial: u64) ![]u8 {
+    var buffer: [cancel_prefix.len + 20]u8 = undefined;
+    const data = std.fmt.bufPrint(&buffer, cancel_prefix ++ "{d}", .{serial}) catch unreachable;
     var out: std.Io.Writer.Allocating = .init(gpa);
     errdefer out.deinit();
     var json: std.json.Stringify = .{ .writer = &out.writer, .options = .{} };
     try json.beginObject();
     try json.objectField("inline_keyboard");
     try json.beginArray();
-    for (buttons) |button| {
-        try json.beginArray();
-        try json.write(.{ .text = button.text, .callback_data = button.data });
-        try json.endArray();
-    }
+    try json.beginArray();
+    try json.write(.{ .text = cancel_label, .callback_data = data });
+    try json.endArray();
     try json.endArray();
     try json.endObject();
     return out.toOwnedSlice();
 }
 
-test "a tap writes its data and reads it back" {
-    const taps = [_]Tap{
-        .{ .cancel_turn = 3 },
-        .{ .withdraw = 3 },
-        .{ .retry = 8 },
-        .{ .dismiss = 8 },
-        .{ .shorten = 9 },
-        .{ .row = .{ .serial = 12, .index = 4 } },
-        .{ .back = 12 },
-        .{ .close = 12 },
-        .{ .row = .{ .serial = std.math.maxInt(u64), .index = std.math.maxInt(usize) } },
-    };
-    for (taps) |tap| {
-        var buffer: [data_bytes_max]u8 = undefined;
-        const data = tap.write(&buffer);
-        try std.testing.expect(data.len <= data_bytes_max);
-        try std.testing.expectEqualDeep(tap, Tap.parse(data).?);
-    }
-    var buffer: [data_bytes_max]u8 = undefined;
-    try std.testing.expectEqualStrings("row:12:4", (Tap{ .row = .{ .serial = 12, .index = 4 } }).write(&buffer));
-    try std.testing.expectEqualStrings("cancel:3", (Tap{ .cancel_turn = 3 }).write(&buffer));
+pub fn parseCancel(data: []const u8) ?u64 {
+    if (!std.mem.startsWith(u8, data, cancel_prefix)) return null;
+    return std.fmt.parseInt(u64, data[cancel_prefix.len..], 10) catch null;
+}
+
+test "the cancel keyboard names the serial of its turn, and the tap data reads back" {
+    const gpa = std.testing.allocator;
+    const json = try cancelMarkup(gpa, 3);
+    defer gpa.free(json);
+    try std.testing.expectEqualStrings(
+        "{\"inline_keyboard\":[[{\"text\":\"Cancel turn\",\"callback_data\":\"cancel:3\"}]]}",
+        json,
+    );
+    try std.testing.expectEqual(@as(?u64, 3), parseCancel("cancel:3"));
+    const largest = try cancelMarkup(gpa, std.math.maxInt(u64));
+    defer gpa.free(largest);
+    try std.testing.expectEqual(
+        @as(?u64, std.math.maxInt(u64)),
+        parseCancel("cancel:18446744073709551615"),
+    );
 }
 
 test "data that no keyboard wrote parses to nothing" {
-    try std.testing.expect(Tap.parse("") == null);
-    try std.testing.expect(Tap.parse("cancel") == null);
-    try std.testing.expect(Tap.parse("cancel:") == null);
-    try std.testing.expect(Tap.parse("cancel:x") == null);
-    try std.testing.expect(Tap.parse("cancel:3:4") == null);
-    try std.testing.expect(Tap.parse("row:3") == null);
-    try std.testing.expect(Tap.parse("row:3:4:5") == null);
-    try std.testing.expect(Tap.parse("quit:3") == null);
-    try std.testing.expect(Tap.parse("cancel:-3") == null);
-}
-
-test "a markup holds one button per row" {
-    const gpa = std.testing.allocator;
-    const json = try markup(gpa, &.{
-        .{ .text = "Cancel turn", .data = "cancel:3" },
-        .{ .text = "Withdraw", .data = "withdraw:3" },
-    });
-    defer gpa.free(json);
-    try std.testing.expectEqualStrings(
-        "{\"inline_keyboard\":[[{\"text\":\"Cancel turn\",\"callback_data\":\"cancel:3\"}]," ++
-            "[{\"text\":\"Withdraw\",\"callback_data\":\"withdraw:3\"}]]}",
-        json,
-    );
-    const empty = try markup(gpa, &.{});
-    defer gpa.free(empty);
-    try std.testing.expectEqualStrings("{\"inline_keyboard\":[]}", empty);
+    try std.testing.expect(parseCancel("") == null);
+    try std.testing.expect(parseCancel("cancel") == null);
+    try std.testing.expect(parseCancel("cancel:") == null);
+    try std.testing.expect(parseCancel("cancel:x") == null);
+    try std.testing.expect(parseCancel("cancel:3:4") == null);
+    try std.testing.expect(parseCancel("cancel:-3") == null);
+    try std.testing.expect(parseCancel("shorten:3") == null);
+    try std.testing.expect(parseCancel("row:3:4") == null);
+    try std.testing.expect(parseCancel("close:3") == null);
 }

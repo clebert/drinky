@@ -7,10 +7,7 @@ const Config = @import("Config.zig");
 const describe = @import("describe.zig");
 const Herdr = @import("Herdr.zig");
 const layout = @import("layout.zig");
-const PromptHistory = @import("PromptHistory.zig");
 const remote = @import("remote/root.zig");
-const Retry = @import("Retry.zig");
-const Revision = @import("Revision.zig");
 const Session = @import("Session.zig");
 const sources = @import("sources.zig");
 const State = @import("State.zig");
@@ -28,23 +25,12 @@ const telegram_signed_out_refusal =
 const telegram_no_model_refusal =
     "Select a model with /model in the terminal before you send a message.";
 
-const shorten_note_text = "Drinky asked the model to shorten the last answer.";
-const shorten_request_text =
-    \\Shorten your last answer for a phone screen.
-    \\- Line 1 states the result. A reader who stops there knows it.
-    \\- One line states each point that the user needs for the next decision. Leave out every other point.
-    \\- Write Simplified Technical English. Use a plain word, never a metaphor.
-;
-
 const fetch_wait_text = "Drinky fetches the model list.";
 
-const prompt_history_turn_notice = "Prompt history cannot open while a turn runs.";
-const prompt_history_empty_notice = "Prompt history is empty.";
 const turn_cancel_notice = "Press Esc again to cancel the turn. The draft stays.";
-const prompt_history_oversized_notice = std.fmt.comptimePrint(
-    "Drinky did not add the prompt to history because it exceeds {d} KiB.",
-    .{@divExact(PromptHistory.entry_bytes_max, 1024)},
-);
+const turn_message_notice = "Drinky sends no message while a turn runs. The draft stays.";
+const telegram_turn_refusal =
+    "A turn runs, so Drinky did not send the message. Send it again after the turn ends.";
 
 const test_anthropic_model = ai.testing.model("claude-opus-5");
 const test_openai_model = ai.testing.model("gpt-5.6-sol");
@@ -52,7 +38,6 @@ const test_openai_model = ai.testing.model("gpt-5.6-sol");
 const intro_keys = [_][]const u8{
     "Enter: Send",
     "Shift+Enter: New line",
-    "Tab: Prompt history",
     "Esc: Cancel",
     "Ctrl+C: Clear",
     "Ctrl+D: Quit",
@@ -81,8 +66,6 @@ tty: terminal.Tty,
 resize: terminal.Resize,
 accounts: ai.Accounts,
 state: State,
-prompt_history: PromptHistory,
-config_path: []const u8,
 directory_label: []const u8,
 working_directory: []const u8,
 home_directory: []const u8,
@@ -111,21 +94,15 @@ fetch: ?Fetch,
 fetch_generation: u64,
 login: ?Login,
 login_generation: u64,
-retry: ?Retry,
-turn_retry: bool,
-revision: ?Revision,
 tick_future: ?std.Io.Future(void),
 tick_pending: bool,
 frame_grid: FrameGrid,
 herdr: Herdr,
 controller: remote.Controller,
 mirror: remote.Mirror,
-chat_picker: remote.Picker,
 remote_title: []const u8,
 pairing_wait_text: []const u8,
 pairing_wait_link: []const u8,
-prompt_marked: bool,
-steering_marked_count: usize,
 
 pub const Options = struct {
     environ: std.process.Environ = .empty,
@@ -264,12 +241,6 @@ const TurnHandler = struct {
             .skill = skill_copy,
             .source = source_copy,
         } });
-    }
-
-    pub fn onSteering(self: *TurnHandler, text: []const u8, count: usize) !void {
-        const copy = try self.app.gpa.dupe(u8, text);
-        errdefer self.app.gpa.free(copy);
-        try self.enqueue(.{ .steering_consumed = .{ .text = copy, .count = count } });
     }
 
     pub fn onError(self: *TurnHandler, text: []const u8) !void {
@@ -523,7 +494,6 @@ pub fn run(
     var serial_seed: [8]u8 = undefined;
     io.random(&serial_seed);
     self.mirror.seedSerials(std.mem.readInt(u64, &serial_seed, .little));
-    self.chat_picker.seedSerials(std.mem.readInt(u64, &serial_seed, .little));
 
     const home_directory = try homeDirectory(gpa, io, cwd, home);
     defer gpa.free(home_directory);
@@ -540,13 +510,6 @@ pub fn run(
         .project = self.project_instructions.projectRoot() orelse cwd,
     });
     defer self.state.deinit();
-    self.prompt_history = try PromptHistory.open(gpa, io, &.{
-        .working_directory = cwd,
-        .home = home,
-        .enabled = config.prompt_history_enabled,
-    });
-    defer self.prompt_history.deinit();
-    self.config_path = config.path;
 
     const user_skills = try std.fs.path.resolve(gpa, &.{ cwd, home, ".agents", "skills" });
     defer gpa.free(user_skills);
@@ -719,8 +682,6 @@ fn initFields(self: *App, gpa: std.mem.Allocator, io: std.Io) void {
         .agent = undefined,
         .session = undefined,
         .state = .inert(gpa, io),
-        .prompt_history = .inert(gpa, io),
-        .config_path = "",
         .directory_label = "",
         .working_directory = "",
         .home_directory = "",
@@ -747,9 +708,6 @@ fn initFields(self: *App, gpa: std.mem.Allocator, io: std.Io) void {
         .fetch_generation = 0,
         .login = null,
         .login_generation = 0,
-        .retry = null,
-        .turn_retry = false,
-        .revision = null,
         .tick_future = null,
         .tick_pending = false,
         .frame_grid = .reset(0),
@@ -761,12 +719,9 @@ fn initFields(self: *App, gpa: std.mem.Allocator, io: std.Io) void {
             .pairing_sink = .{ .context = self, .emit = emitPairingEvent },
         }),
         .mirror = .init(gpa),
-        .chat_picker = .init(gpa),
         .remote_title = "",
         .pairing_wait_text = "",
         .pairing_wait_link = "",
-        .prompt_marked = false,
-        .steering_marked_count = 0,
     };
     self.queue = std.Io.Queue(UiEvent).init(&self.queue_buffer);
 }
@@ -779,10 +734,7 @@ fn prepareTerminalExit(self: *App) void {
 fn shutdownTasks(self: *App) void {
     self.queue.close(self.io);
     self.controller.shutdown();
-    self.chat_picker.deinit();
     self.freeRemoteStrings();
-    self.dropRetry();
-    self.dropRevision();
     if (self.cancelTurnFuture()) |result| self.freeWorkerResult(&result);
     if (self.pending_turn_result) |result| {
         self.freeWorkerResult(&result);
@@ -844,21 +796,10 @@ fn freeWorkerResult(self: *App, result: *const WorkerResult) void {
 fn finishWorkerResult(self: *App, result: *const WorkerResult) !void {
     self.session.stats_shown = self.agent.stats;
     self.refreshBranch();
-    try self.settleChatMessages(&result.outcome.receipt);
     switch (result.outcome.disposition) {
         .completed => {
-            _ = self.takeTurnRetry();
             try self.session.endTurnWithReceipt(&result.outcome.receipt);
             try self.endMirrorTurn(.completed);
-            if (self.session.hasSteering()) try self.returnLateSteering();
-        },
-        .credential_replaced => {
-            const account = self.activeAccount() orelse
-                return error.UnexpectedCredentialReplacement;
-            if (!account.hasRefreshCredential())
-                return error.UnexpectedCredentialReplacement;
-            try self.finishFailedWorker(result);
-            try self.acceptCredentialReplacement(account);
         },
         .credential_rejected => {
             const account = self.activeAccount() orelse
@@ -875,69 +816,9 @@ fn finishWorkerResult(self: *App, result: *const WorkerResult) !void {
 }
 
 fn finishFailedWorker(self: *App, result: *const WorkerResult) !void {
-    const attempt = self.takeTurnRetry();
     try self.session.reserveFailureRestore(&result.outcome.receipt);
-    defer self.agent.steering.clear();
     try self.session.failTurnWithReceipt(&result.outcome.receipt, result.error_text);
-    try self.armRetry(result, attempt);
     try self.endMirrorTurn(.failed);
-}
-
-fn armRetry(self: *App, result: *const WorkerResult, attempt: bool) !void {
-    const receipt = &result.outcome.receipt;
-    const committed = receipt.history_end != receipt.history_base;
-    if (!committed and !attempt) return;
-    const failure = try self.gpa.dupe(
-        u8,
-        result.error_text orelse "Drinky could not complete the turn.",
-    );
-    self.setRetry(.{ .failure = failure });
-}
-
-fn setRetry(self: *App, retry: Retry) void {
-    self.dismissOffer();
-    self.retry = retry;
-    self.session.prompt_offer = .retry;
-    self.session.dirty = true;
-}
-
-fn setRevision(self: *App, revision: Revision) void {
-    self.dismissOffer();
-    self.revision = revision;
-    self.session.prompt_offer = .revision;
-    self.session.dirty = true;
-}
-
-fn dismissOffer(self: *App) void {
-    std.debug.assert(self.retry == null or self.revision == null);
-    if (self.retry != null) self.mirror.dismissRetry(&self.controller) catch {};
-    self.dropRetry();
-    self.dropRevision();
-    self.session.cancelConfirmation(.revision);
-    self.session.prompt_offer = .none;
-    self.session.dirty = true;
-}
-
-fn takeTurnRetry(self: *App) bool {
-    defer self.turn_retry = false;
-    return self.turn_retry;
-}
-
-fn dropRetry(self: *App) void {
-    const retry = self.retry orelse return;
-    retry.deinit(self.gpa);
-    self.retry = null;
-}
-
-fn dropRevision(self: *App) void {
-    const revision = if (self.revision) |*revision| revision else return;
-    revision.deinit(self.gpa);
-    self.revision = null;
-}
-
-fn clearRetry(self: *App) void {
-    if (self.retry == null) return;
-    self.dismissOffer();
 }
 
 fn cancelFuture(self: *App, maybe_future: *?std.Io.Future(void)) void {
@@ -1001,9 +882,7 @@ fn runLoop(self: *App) !void {
 }
 
 fn herdrState(self: *const App) Herdr.State {
-    std.debug.assert(self.retry == null or self.revision == null);
     if (self.session.mode == .turn) return .working;
-    if (self.retry != null or self.revision != null) return .blocked;
     return .idle;
 }
 
@@ -1025,7 +904,6 @@ fn applyBatch(self: *App, events: []const UiEvent) !bool {
             },
             .turn => |*turn_event| {
                 const turn_finished = try self.session.applyTurnEvent(turn_event);
-                try self.markCommittedChatMessages();
                 if (turn_finished) {
                     const result = self.takeTurnResult() orelse return error.MissingTurnWorker;
                     defer self.freeWorkerResult(&result);
@@ -1106,8 +984,6 @@ fn turnFailureText(err: anyerror) ?[]const u8 {
             .{ai.Agent.tool_calls_max},
         ),
         error.TooManyToolRounds => "The turn reached the limit for tool rounds.",
-        error.CredentialReplaced => "Drinky found a replacement credential for this account. " ++
-            "Drinky removed the prior account evidence.",
         error.TokenGrantRejected => "The provider rejected the refresh credential.",
         error.KeyRejected => "Google rejected the service account key.",
         error.TokenRequestFailed => "The provider did not accept the token request. " ++
@@ -1134,7 +1010,6 @@ fn runTurnWorker(self: *App, text: []const u8, generation: u64) WorkerResult {
             .terminal_queued = false,
         },
         .completed => null,
-        .credential_replaced => error.CredentialReplaced,
         .credential_rejected => error.TokenGrantRejected,
         .failed => |failure| failure,
     };
@@ -1229,15 +1104,12 @@ fn flushEscape(self: *App) !void {
 fn handleKey(self: *App, event: *const terminal.Input.Key) !void {
     const at_prompt = self.session.mode == .prompt;
     const editor_live = self.session.input.owner == .terminal and self.login == null;
-    const confirms_message = editor_live and (at_prompt or self.session.mode == .turn) and
-        event.* == .enter;
+    const confirms_message = editor_live and at_prompt and event.* == .enter;
     if (!confirms_message) self.session.cancelConfirmation(.message);
     const confirms_turn_cancel = editor_live and self.session.mode == .turn and event.* == .escape;
     if (!confirms_turn_cancel) self.session.cancelConfirmation(.turn_cancel);
     const confirms_quit = editor_live and at_prompt and event.* == .ctrl and event.ctrl == 'd';
     if (!confirms_quit) self.session.cancelConfirmation(.quit);
-    const confirms_revision = editor_live and at_prompt and event.* == .ctrl and event.ctrl == 'n';
-    if (!confirms_revision) self.session.cancelConfirmation(.revision);
     if (event.* == .escape and self.session.mode == .turn and editor_live) {
         if (self.session.notice != null and !self.session.confirmations.contains(.turn_cancel)) {
             self.session.clearNotice();
@@ -1258,8 +1130,6 @@ fn handleKey(self: *App, event: *const terminal.Input.Key) !void {
     if (try self.editKey(event)) return;
     switch (event.*) {
         .enter => try self.submit(),
-        .tab => try self.openPromptHistory(),
-        .escape => self.dismissOffer(),
         .ctrl => |letter| switch (letter) {
             'c' => {
                 self.clearOrQuit();
@@ -1276,11 +1146,6 @@ fn handleKey(self: *App, event: *const terminal.Input.Key) !void {
                     "Press Ctrl+D again to quit. The quit discards the draft.",
                     .{},
                 );
-            },
-            'n' => switch (self.session.prompt_offer) {
-                .none => {},
-                .retry => try self.retryTurn(),
-                .revision => try self.reviseTurn(),
             },
             else => {},
         },
@@ -1377,13 +1242,11 @@ fn submitLoginLine(self: *App) !void {
 fn handleTurnKey(self: *App, event: *const terminal.Input.Key) !void {
     if (try self.editKey(event)) return;
     switch (event.*) {
-        .enter => try self.submitSteering(),
-        .tab => try self.reportNotice(.information, prompt_history_turn_notice, .{}),
+        .enter => try self.submitDuringTurn(),
         .escape => try self.warnOrCancel(),
         .ctrl => |letter| switch (letter) {
             'c' => try self.clearOrCancel(),
             'd' => try self.cancelTurn(),
-            'p' => try self.pullSteering(),
             else => {},
         },
         else => {},
@@ -1406,94 +1269,47 @@ fn clearOrCancel(self: *App) !void {
     try self.cancelTurn();
 }
 
-fn submitSteering(self: *App) !void {
-    if (self.session.editor.blank()) {
-        self.session.cancelConfirmation(.message);
-        return;
-    }
+fn submitDuringTurn(self: *App) !void {
+    if (self.session.editor.blank()) return;
     const text = try self.session.editor.expanded(.whole_prompt);
     defer self.gpa.free(text);
-    if (!self.session.takeConfirmation(.message)) {
-        if (ai.command.parse(text)) |name| {
-            if (try self.checkCommand(text)) |refusal|
-                return self.armMessageSend(refusal, "Queue as a message");
-            if (ai.command.runsDuringTurn(name)) {
-                if (try self.dispatchCommand(text)) |outcome|
-                    return self.applySubmittedCommand(outcome);
-            }
-            return self.refuseCommand(name, "while a turn runs");
-        }
+    if (ai.command.parse(text)) |name| {
+        if (try self.checkCommand(text)) |refusal|
+            return self.session.applyOutcome(.{ .refusal = refusal });
+        return self.refuseCommand(name, "while a turn runs");
     }
-    try self.session.reserveSteering();
-    try self.agent.steering.push(text);
-    var draft = self.session.editor.detachTrimmed();
-    self.session.commitSteeringDraft(&draft);
-    self.session.dirty = true;
-}
-
-fn pullSteering(self: *App) !void {
-    _ = try self.withdrawSteering();
-}
-
-fn returnLateSteering(self: *App) !void {
-    try self.session.reserveSteeringRecall();
-    const taken = try self.agent.steering.take();
-    defer {
-        for (taken) |message| self.gpa.free(message);
-        self.gpa.free(taken);
-    }
-    std.debug.assert(taken.len == self.session.steering.items.len);
-    if (self.session.recallLateSteering() == 0) return;
-    try self.reportNotice(.information, "Drinky returned every queued message to the editor.", .{});
+    try self.reportNotice(.information, turn_message_notice, .{});
 }
 
 fn cancelTurn(self: *App) !void {
-    try self.session.reserveSteeringRestore();
-    try self.session.reserveRevisionCapture();
+    try self.session.reservePromptRestore();
     const result = self.cancelTurnFuture() orelse return;
     switch (result.outcome.disposition) {
         .canceled => {
             defer self.freeWorkerResult(&result);
-            _ = self.takeTurnRetry();
             const receipt = &result.outcome.receipt;
             const committed = receipt.history_end != receipt.history_base;
             var maybe_progress_error = self.drainCanceledProgress(committed);
             self.session.stats_shown = self.agent.stats;
             self.refreshBranch();
-            try self.settleChatMessages(receipt);
-            var maybe_capture: ?Session.RevisionCapture = null;
-            if (committed and self.session.input.owner == .terminal)
-                maybe_capture = self.session.takeCanceledRevision(receipt);
             self.session.cancelReceipt(receipt, result.progress_sequence_committed);
-            self.agent.steering.clear();
             if (committed) {
-                const aborted = self.session.abortTurn();
-                if (maybe_capture) |capture| self.setRevision(.{
-                    .history = .{ .base = receipt.history_base, .end = receipt.history_end },
-                    .transcript_base = capture.transcript_base,
-                    .transcript_end = self.session.transcript.blocks().len,
-                    .prompt = capture.prompt,
-                    .steering = capture.steering,
-                    .mutated = capture.mutated,
-                });
-                aborted catch |err| {
+                self.session.abortTurn() catch |err| {
                     if (maybe_progress_error == null) maybe_progress_error = err;
                 };
             } else {
-                std.debug.assert(maybe_capture == null);
                 self.session.endTurn();
             }
             try self.endMirrorTurn(.canceled);
             if (maybe_progress_error) |progress_error| return progress_error;
         },
-        .completed, .credential_replaced, .credential_rejected, .failed => {
+        .completed, .credential_rejected, .failed => {
             std.debug.assert(self.pending_turn_result == null);
             self.pending_turn_result = result;
             self.enqueuePendingTurnFence();
         },
         .closed => {
             defer self.freeWorkerResult(&result);
-            _ = self.takeTurnRetry();
             try self.session.endTurnWithReceipt(&result.outcome.receipt);
             try self.endMirrorTurn(.canceled);
         },
@@ -1585,7 +1401,6 @@ fn submit(self: *App) !void {
     const base = try self.startUserTurn(text);
     var prompt = self.session.editor.detachTrimmed();
     self.session.retainTurnPrompt(&prompt, base);
-    try self.recordPromptHistory(text);
 }
 
 fn applySubmittedCommand(self: *App, outcome: ai.command.Outcome) !void {
@@ -1662,74 +1477,6 @@ fn startUserTurn(self: *App, text: []const u8) !usize {
     return base;
 }
 
-fn retryTurn(self: *App) !void {
-    if (self.retry == null) return;
-    if (!self.signedIn()) return self.reportNotice(
-        .failure,
-        "Sign in with /login before you try the turn again.",
-        .{},
-    );
-    if (self.agent.model == null) return self.reportNotice(.failure, no_model_refusal, .{});
-    return self.sendRetryTurn();
-}
-
-fn sendRetryTurn(self: *App) !void {
-    const base = try self.startRetryTurn();
-    self.session.markTurnBase(base);
-}
-
-fn startRetryTurn(self: *App) !usize {
-    std.debug.assert(self.retry != null);
-    const retry = &self.retry.?;
-    const text = try retry.compose(self.gpa);
-    defer self.gpa.free(text);
-    const base = self.session.transcript.blocks().len;
-    errdefer self.session.transcript.truncate(base);
-    try self.session.transcript.append(.user_note, .{}, Retry.note_text);
-    try self.runTurn(text);
-    self.turn_retry = true;
-    return base;
-}
-
-const revision_warning = "Press Ctrl+N again to remove the canceled turn. Tool changes stay.";
-
-fn reviseTurn(self: *App) !void {
-    std.debug.assert(self.session.mode == .prompt);
-    const revision = if (self.revision) |*revision| revision else return;
-    if (revision.mutated and !self.session.takeConfirmation(.revision)) {
-        try self.reportNotice(.warning, revision_warning, .{});
-        self.session.armConfirmation(.revision);
-        return;
-    }
-    try self.session.editor.reserveComposition(&revision.prompt, revision.steering.items);
-    std.debug.assert(revision.transcript_base <= revision.transcript_end);
-    std.debug.assert(revision.transcript_end <= self.session.transcript.blocks().len);
-    const cursor = self.mirror.transcriptCursor();
-    self.agent.rewindHistory(revision.history);
-
-    var taken = self.revision.?;
-    self.revision = null;
-    defer taken.deinit(self.gpa);
-    self.session.stats_shown = self.agent.stats;
-    const removal = self.session.removeTurn(.{
-        .range_base = taken.transcript_base,
-        .range_end = taken.transcript_end,
-        .mirror_cursor = cursor,
-    });
-    self.mirror.retreat(removal.removed_before_cursor_count);
-    self.session.editor.prependComposition(&taken.prompt, taken.steering.items);
-    self.session.markEdited();
-    self.dismissOffer();
-}
-
-fn sendShortenTurn(self: *App) !void {
-    const base = self.session.transcript.blocks().len;
-    errdefer self.session.transcript.truncate(base);
-    try self.session.transcript.append(.user_note, .{}, shorten_note_text);
-    try self.runTurn(shorten_request_text);
-    self.session.markTurnBase(base);
-}
-
 fn runTurn(self: *App, text: []const u8) !void {
     std.debug.assert(self.turn_future == null);
     std.debug.assert(self.pending_turn_result == null);
@@ -1739,10 +1486,6 @@ fn runTurn(self: *App, text: []const u8) !void {
     errdefer self.gpa.free(owned);
     self.turn_future = try self.io.concurrent(runTurnWorker, .{ self, owned, generation });
     self.session.beginTurn(generation);
-    self.prompt_marked = false;
-    self.steering_marked_count = 0;
-    self.dismissOffer();
-    self.chat_picker.close();
     self.mirror.beginTurn(&self.controller, self.nowMs()) catch {};
 }
 
@@ -1843,9 +1586,7 @@ fn applyOutcome(self: *App, outcome: ai.command.Outcome) !void {
             self.agent.resetConversation();
             self.session.clearConversation();
             self.mirror.restart();
-            self.chat_picker.close();
             try self.session.transcript.append(.intro, .{}, intro_text);
-            self.dismissOffer();
             if (self.controller.listens()) try self.recordEvent(
                 .information,
                 "You cleared the conversation while @{s} is attached.",
@@ -1853,10 +1594,7 @@ fn applyOutcome(self: *App, outcome: ai.command.Outcome) !void {
             );
         },
         .prompt => unreachable,
-        .login_picker => {
-            try self.rereadAccounts();
-            try self.openLoginPicker();
-        },
+        .login_picker => try self.openLoginPicker(),
         .login => |account| return self.startLogin(account),
         .logout => |account| try self.logoutAccount(account),
         .switch_account => |account| {
@@ -1871,9 +1609,7 @@ fn applyOutcome(self: *App, outcome: ai.command.Outcome) !void {
                 try self.reportModelStep(account, "Drinky now uses {s}. ", .{account.id()});
             }
         },
-        .credential_replaced => |account| return self.acceptFetchReplacement(account),
         .fetch => |account| return self.startFetch(account),
-        .show_status => return self.recordStatus(),
         .remote_attach => |index| return self.controller.attachSaved(index),
         .remote_add => {
             self.session.editor.clear();
@@ -2148,85 +1884,6 @@ fn reportModelStep(
     );
 }
 
-fn settleCredentialReplacement(self: *App, account: ai.llm.Account) void {
-    self.accounts.dropPrincipalMetadata(account);
-    self.settleReplacedPrincipal(account);
-}
-
-fn settleReplacedPrincipal(self: *App, account: ai.llm.Account) void {
-    self.dropAccountEvidence(account);
-    if (self.isActive(account)) self.adopt(account);
-}
-
-fn rereadAccounts(self: *App) !void {
-    const report = self.accounts.reread();
-    var maybe_left: ?ai.llm.Account = null;
-    for (std.enums.values(ai.llm.Account)) |account| switch (report.changes.get(account)) {
-        .unchanged, .signed_in => {},
-        .rotated => if (self.isActive(account)) self.rebindClient(account),
-        .replaced => {
-            self.settleReplacedPrincipal(account);
-            try self.reportModelStep(
-                account,
-                "Drinky found a replacement credential for {s}. " ++
-                    "Drinky removed the prior account evidence. ",
-                .{account.id()},
-            );
-        },
-        .signed_out => {
-            self.dropAccountEvidence(account);
-            if (self.isActive(account)) {
-                maybe_left = account;
-            } else try self.recordEvent(
-                .information,
-                "Another Drinky instance signed out of {s}.",
-                .{account.id()},
-            );
-        },
-    };
-    if (maybe_left) |account| try self.recordHandOff(
-        "Another Drinky instance signed out of {s}. ",
-        account,
-        self.handOff(),
-    );
-    if (report.read_error) |err| try self.recordEvent(
-        .failure,
-        "Drinky could not read the credential file {s} because of error {s}. " ++
-            "The account list shows the credentials from the last read.",
-        .{ self.accounts.storePath(), @errorName(err) },
-    );
-    for (std.enums.values(ai.llm.Account)) |account| {
-        const err = report.entry_errors.get(account) orelse continue;
-        try self.recordEvent(
-            .failure,
-            "Drinky could not read the credential of {s} in {s} because of error {s}. " ++
-                "The account stays as it was.",
-            .{ account.id(), self.accounts.storePath(), @errorName(err) },
-        );
-    }
-}
-
-fn rebindClient(self: *App, account: ai.llm.Account) void {
-    self.agent.switchTo(self.accounts.client(account).?, self.agent.model);
-}
-
-fn acceptCredentialReplacement(self: *App, account: ai.llm.Account) !void {
-    self.settleCredentialReplacement(account);
-    try self.reportCredentialStep(account, "");
-    try self.mirrorAgentState();
-}
-
-fn acceptFetchReplacement(self: *App, account: ai.llm.Account) !void {
-    self.settleCredentialReplacement(account);
-    try self.reportModelStep(
-        account,
-        "Drinky found a replacement credential for {s}. " ++
-            "Drinky removed the prior account evidence. ",
-        .{account.id()},
-    );
-    try self.mirrorAgentState();
-}
-
 fn rejectCredential(self: *App, account: ai.llm.Account) !void {
     const adopts = self.isActive(account);
     var maybe_removal_error: ?anyerror = null;
@@ -2317,12 +1974,6 @@ fn dropAccountEvidence(self: *App, account: ai.llm.Account) void {
     const transcript = &self.session.transcript;
     const cursor = @min(self.mirror.transcriptCursor(), transcript.blocks().len);
     const cursor_removed = transcript.producedBefore(account, cursor);
-    if (self.revision) |*revision| {
-        revision.history.base -= self.agent.producedBefore(account, revision.history.base);
-        revision.history.end -= self.agent.producedBefore(account, revision.history.end);
-        revision.transcript_base -= transcript.producedBefore(account, revision.transcript_base);
-        revision.transcript_end -= transcript.producedBefore(account, revision.transcript_end);
-    }
     self.agent.dropAccountEvidence(account);
     self.session.dropAccountReasoning(account);
     self.mirror.retreat(cursor_removed);
@@ -2445,7 +2096,7 @@ fn onRemoteAction(context: *anyopaque, action: remote.Controller.Action) anyerro
     const self: *App = @ptrCast(@alignCast(context));
     switch (action) {
         .chat_message => |message| try self.submitChatMessage(message.text, message.id),
-        .chat_tap => |tap| try self.handleChatTap(tap.query_id, tap.tap),
+        .cancel_tap => |tap| try self.handleCancelTap(tap.query_id, tap.serial),
         .report => |report| switch (report.kind) {
             .event => try self.recordAsyncEvent(report.severity, .{}, "{s}", .{report.text}),
             .terminal_event => try self.recordAsyncEvent(
@@ -2473,7 +2124,6 @@ fn syncRemoteState(self: *App) !void {
         },
         .detaching => {
             if (was_terminal) try self.takeRemoteTitle(self.controller.botUsername().?);
-            self.chat_picker.close();
             self.mirror.detached();
         },
         .idle, .checking_token, .token_prompt, .pairing => {},
@@ -2539,7 +2189,6 @@ fn mirrorView(self: *const App) remote.Mirror.View {
             .tool = tail.tool,
             .calls = tail.calls,
         } else null,
-        .retry_waits = self.retry != null,
     };
 }
 
@@ -2553,71 +2202,7 @@ fn endMirrorTurn(self: *App, outcome: remote.Mirror.End.Outcome) !void {
         .outcome = outcome,
         .status = &status,
         .now_ms = self.nowMs(),
-        .retry_armed = outcome == .failed and self.retry != null,
     });
-}
-
-fn markCommittedChatMessages(self: *App) !void {
-    if (!self.controller.listens()) return;
-    if (!self.prompt_marked and self.session.turnCommitted()) {
-        if (self.session.turn_prompt) |*prompt| switch (prompt.source) {
-            .external => |id| try self.controller.react(id, .committed),
-            .terminal => {},
-        };
-        self.prompt_marked = true;
-    }
-    const committed = self.session.steering_committed_count;
-    const messages = self.session.steering.items;
-    while (self.steering_marked_count < committed) : (self.steering_marked_count += 1) {
-        switch (messages[self.steering_marked_count].source) {
-            .external => |id| try self.controller.react(id, .committed),
-            .terminal => {},
-        }
-    }
-}
-
-fn settleChatMessages(self: *App, receipt: *const ai.Agent.Receipt) !void {
-    if (!self.controller.listens()) return;
-    const committed = receipt.history_end != receipt.history_base;
-    const prompt_settled = self.prompt_marked and committed;
-    if (!prompt_settled) {
-        if (self.session.turn_prompt) |*prompt| switch (prompt.source) {
-            .external => |id| try self.controller.react(id, if (committed) .committed else .dropped),
-            .terminal => {},
-        };
-    }
-    for (self.session.steering.items, 0..) |*message, index| {
-        const message_committed = index < receipt.steering_committed_count;
-        if (message_committed and index < self.steering_marked_count) continue;
-        switch (message.source) {
-            .external => |id| try self.controller.react(
-                id,
-                if (message_committed) .committed else .dropped,
-            ),
-            .terminal => {},
-        }
-    }
-}
-
-fn statusText(self: *App) ![]u8 {
-    var info = self.session.statusInfo();
-    info.directory = self.directory_label;
-    var maybe_head: ?ai.project.Head = null;
-    if (self.project_instructions.projectRoot()) |root|
-        maybe_head = ai.project.head(self.gpa, self.io, root);
-    info.branch = if (maybe_head) |*head| head.name() else null;
-    var out: std.Io.Writer.Allocating = .init(self.gpa);
-    defer out.deinit();
-    try ui.status.writeSummary(&out.writer, &info);
-    return out.toOwnedSlice();
-}
-
-fn recordStatus(self: *App) !void {
-    const text = try self.statusText();
-    try self.session.recordAsyncEvent(
-        .{ .content = text, .severity = .information },
-        .{ .mirrored = false, .repeats = false },
-    );
 }
 
 fn applyPairingChange(self: *App, change: remote.Controller.Action.PairingChange) !void {
@@ -2721,28 +2306,15 @@ fn submitChatMessage(self: *App, text: []const u8, message_id: i64) !void {
         "Drinky cannot take a message while a sign-in runs in the terminal.",
     );
     var context = self.chatContext();
-    const origin: ChatOrigin = .{ .message = .{ .id = message_id, .text = text } };
     switch (self.session.mode) {
         .turn => {
             if (ai.command.parse(text)) |name| {
-                if (try ai.command.check(&context, text)) |refusal| {
-                    defer self.gpa.free(refusal.content);
-                    return self.controller.reply(message_id, refusal.severity, refusal.content);
-                }
-                if (ai.command.runsDuringTurn(name)) {
-                    const outcome = (try ai.command.run(&context, text)).?;
-                    return self.applyChatOutcome(outcome, origin);
-                }
+                if (try ai.command.check(&context, text)) |refusal|
+                    return self.replyRefusal(message_id, refusal);
                 const refusal = try ai.command.refuse(self.gpa, name, "while a turn runs");
-                defer self.gpa.free(refusal.content);
-                return self.controller.reply(message_id, refusal.severity, refusal.content);
+                return self.replyRefusal(message_id, refusal);
             }
-            var draft = try ui.Editor.Draft.fromText(self.gpa, text);
-            errdefer draft.deinit(self.gpa);
-            try self.session.reserveSteering();
-            try self.agent.steering.push(text);
-            self.session.commitExternalSteering(&draft, message_id);
-            return self.controller.react(message_id, .queued);
+            return self.controller.reply(message_id, .warning, telegram_turn_refusal);
         },
         .prompt => {},
         .picking, .viewing => return self.controller.reply(
@@ -2752,12 +2324,10 @@ fn submitChatMessage(self: *App, text: []const u8, message_id: i64) !void {
         ),
     }
     if (ai.command.parse(text) != null) {
-        if (try ai.command.check(&context, text)) |refusal| {
-            defer self.gpa.free(refusal.content);
-            return self.controller.reply(message_id, refusal.severity, refusal.content);
-        }
+        if (try ai.command.check(&context, text)) |refusal|
+            return self.replyRefusal(message_id, refusal);
         const outcome = (try ai.command.run(&context, text)).?;
-        return self.applyChatOutcome(outcome, origin);
+        return self.applyOutcome(outcome);
     }
     if (!self.signedIn())
         return self.controller.reply(message_id, .failure, telegram_signed_out_refusal);
@@ -2767,236 +2337,16 @@ fn submitChatMessage(self: *App, text: []const u8, message_id: i64) !void {
     errdefer draft.deinit(self.gpa);
     const base = try self.startUserTurn(text);
     self.session.retainExternalTurnPrompt(&draft, base, message_id);
-    try self.controller.react(message_id, .queued);
 }
 
-const ChatOrigin = union(enum) {
-    message: Line,
-    tap: []const u8,
-
-    const Line = struct {
-        id: i64,
-        text: []const u8,
-    };
-};
-
-fn applyChatOutcome(self: *App, outcome: ai.command.Outcome, origin: ChatOrigin) !void {
-    switch (outcome) {
-        .pick => |*pick| {
-            if (pick.report) |message| self.session.applyOutcome(.{ .event = message }) catch |err| {
-                for (pick.options) |*option| option.deinit(self.gpa);
-                self.gpa.free(pick.options);
-                return err;
-            };
-            switch (origin) {
-                .message => try self.chat_picker.show(&self.controller, pick),
-                .tap => |query_id| {
-                    try self.chat_picker.step(&self.controller, pick);
-                    try self.controller.answer(query_id, null);
-                },
-            }
-        },
-        .notice, .refusal => |message| {
-            defer self.gpa.free(message.content);
-            try self.stateChatNotice(origin, message.severity, message.content);
-        },
-        .event => |message| {
-            self.stateChatResult(origin) catch |err| {
-                self.gpa.free(message.content);
-                return err;
-            };
-            try self.applyOutcome(outcome);
-        },
-        .new_conversation => {
-            try self.stateChatResult(origin);
-            try self.applyOutcome(outcome);
-        },
-        .show_status => {
-            const text = try self.statusText();
-            defer self.gpa.free(text);
-            try self.stateChatAnswer(origin, text);
-        },
-        .prompt => |prompt| {
-            defer prompt.deinit(self.gpa);
-            if (!self.signedIn())
-                return self.stateChatNotice(origin, .failure, telegram_signed_out_refusal);
-            if (self.agent.model == null)
-                return self.stateChatNotice(origin, .failure, telegram_no_model_refusal);
-            try self.startChatSkillTurn(&prompt, origin);
-        },
-        .editor_text => |text| {
-            defer self.gpa.free(text);
-            try self.stateChatNotice(origin, .warning, terminal_only_action);
-        },
-        else => try self.stateChatNotice(origin, .warning, terminal_only_action),
-    }
+fn replyRefusal(self: *App, message_id: i64, refusal: ai.command.Outcome.Message) !void {
+    defer self.gpa.free(refusal.content);
+    try self.controller.reply(message_id, refusal.severity, refusal.content);
 }
 
-const terminal_only_action = "This action runs in the terminal alone.";
-
-fn startChatSkillTurn(
-    self: *App,
-    prompt: *const ai.command.Outcome.Prompt,
-    origin: ChatOrigin,
-) !void {
-    switch (origin) {
-        .message => |line| {
-            var draft = try ui.Editor.Draft.fromText(self.gpa, line.text);
-            errdefer draft.deinit(self.gpa);
-            const base = try self.startSkillTurn(prompt);
-            self.session.retainExternalTurnPrompt(&draft, base, line.id);
-        },
-        .tap => |query_id| {
-            try self.chat_picker.dismiss(&self.controller);
-            try self.controller.answer(query_id, null);
-            const base = try self.startSkillTurn(prompt);
-            self.session.markTurnBase(base);
-        },
-    }
-}
-
-fn stateChatNotice(
-    self: *App,
-    origin: ChatOrigin,
-    severity: ai.command.Outcome.Severity,
-    text: []const u8,
-) !void {
-    switch (origin) {
-        .message => |line| try self.controller.reply(line.id, severity, text),
-        .tap => |query_id| {
-            try self.controller.answer(query_id, text);
-            try self.chat_picker.dismiss(&self.controller);
-        },
-    }
-}
-
-fn stateChatAnswer(self: *App, origin: ChatOrigin, text: []const u8) !void {
-    switch (origin) {
-        .message => |line| try self.controller.reply(line.id, .information, text),
-        .tap => |query_id| {
-            try self.controller.answer(query_id, null);
-            try self.chat_picker.dismiss(&self.controller);
-            try self.controller.sendEvent(.information, text);
-        },
-    }
-}
-
-fn stateChatResult(self: *App, origin: ChatOrigin) !void {
-    switch (origin) {
-        .message => {},
-        .tap => |query_id| {
-            try self.controller.answer(query_id, null);
-            try self.chat_picker.dismiss(&self.controller);
-        },
-    }
-}
-
-const turn_over_toast = "The turn is over.";
-const retry_over_toast = "The retry is over.";
-const list_closed_toast = "This list is closed.";
-const answer_stale_toast = "This answer is not the newest one.";
-
-const turn_runs_toast = "A turn runs. Wait for its end.";
-const session_busy_toast = "Drinky cannot act on a tap now.";
-const login_runs_toast = "A sign-in runs in the terminal. Wait for its end.";
-const shorten_signed_out_toast =
-    "Sign in with /login in the terminal before you shorten an answer.";
-const shorten_no_model_toast =
-    "Select a model with /model in the terminal before you shorten an answer.";
-
-fn handleChatTap(self: *App, query_id: []const u8, tap: remote.keyboard.Tap) !void {
-    if (self.login != null) return self.controller.answer(query_id, login_runs_toast);
-    switch (tap) {
-        .cancel_turn => |serial| {
-            if (!self.mirror.namesTurn(serial)) return self.controller.answer(query_id, turn_over_toast);
-            try self.controller.answer(query_id, null);
-            try self.cancelTurn();
-        },
-        .withdraw => |serial| {
-            if (!self.mirror.namesTurn(serial)) return self.controller.answer(query_id, turn_over_toast);
-            const count = try self.withdrawSteering();
-            try self.controller.answer(query_id, if (count == 0) "Nothing queued." else null);
-        },
-        .retry => |serial| {
-            if (!self.mirror.namesRetry(serial) or self.retry == null)
-                return self.controller.answer(query_id, retry_over_toast);
-            if (!self.signedIn()) return self.controller.answer(
-                query_id,
-                "Sign in with /login in the terminal before you try the turn again.",
-            );
-            if (self.agent.model == null) return self.controller.answer(query_id, telegram_no_model_refusal);
-            try self.controller.answer(query_id, null);
-            try self.sendRetryTurn();
-        },
-        .dismiss => |serial| {
-            if (!self.mirror.namesRetry(serial)) return self.controller.answer(query_id, retry_over_toast);
-            try self.controller.answer(query_id, null);
-            self.clearRetry();
-        },
-        .shorten => |serial| {
-            if (!self.mirror.namesAnswer(serial))
-                return self.controller.answer(query_id, answer_stale_toast);
-            switch (self.session.mode) {
-                .prompt => {},
-                .turn => return self.controller.answer(query_id, turn_runs_toast),
-                .picking, .viewing => return self.controller.answer(query_id, session_busy_toast),
-            }
-            if (!self.signedIn())
-                return self.controller.answer(query_id, shorten_signed_out_toast);
-            if (self.agent.model == null)
-                return self.controller.answer(query_id, shorten_no_model_toast);
-            try self.controller.answer(query_id, null);
-            try self.sendShortenTurn();
-        },
-        .row, .back, .close => try self.handlePickerTap(query_id, tap),
-    }
-}
-
-fn handlePickerTap(self: *App, query_id: []const u8, tap: remote.keyboard.Tap) !void {
-    const action = self.chat_picker.resolve(tap) orelse
-        return self.controller.answer(query_id, list_closed_toast);
-    var context = self.chatContext();
-    switch (action) {
-        .row => |index| {
-            const outcome = try self.chat_picker.select(&context, index);
-            try self.applyChatOutcome(outcome, .{ .tap = query_id });
-        },
-        .back => |opener| {
-            const outcome = try opener(&context);
-            switch (outcome) {
-                .pick => |*pick| {
-                    try self.chat_picker.replace(&self.controller, pick, self.chat_picker.openers());
-                    try self.controller.answer(query_id, null);
-                },
-                else => try self.applyChatOutcome(outcome, .{ .tap = query_id }),
-            }
-        },
-        .close => {
-            const message = self.chat_picker.cancellationMessage();
-            try self.controller.answer(query_id, message);
-            try self.chat_picker.dismiss(&self.controller);
-        },
-    }
-}
-
-fn withdrawSteering(self: *App) !usize {
-    try self.session.reserveSteeringRecall();
-    var dropped: std.ArrayList(i64) = .empty;
-    defer dropped.deinit(self.gpa);
-    try dropped.ensureTotalCapacity(self.gpa, self.session.steering.items.len);
-    const taken = try self.agent.steering.take();
-    defer {
-        for (taken) |message| self.gpa.free(message);
-        self.gpa.free(taken);
-    }
-    const messages = self.session.steering.items;
-    for (messages[messages.len - taken.len ..]) |*message| switch (message.source) {
-        .external => |id| dropped.appendAssumeCapacity(id),
-        .terminal => {},
-    };
-    self.session.recallSteering(taken.len);
-    for (dropped.items) |id| try self.controller.react(id, .dropped);
-    return taken.len;
+fn handleCancelTap(self: *App, query_id: []const u8, serial: u64) !void {
+    try self.controller.answer(query_id);
+    if (self.mirror.namesTurn(serial)) try self.cancelTurn();
 }
 
 fn handleTokenKey(self: *App, event: *const terminal.Input.Key) !void {
@@ -3102,88 +2452,10 @@ fn handleFetchKey(self: *App, event: *const terminal.Input.Key) !void {
 fn confirmPicker(self: *App) !void {
     const picking = &self.session.mode.picking;
     const cursor = picking.picker.cursor;
-    switch (picking.purpose) {
-        .command => |*command| {
-            var context = self.commandContext();
-            const outcome = try command.select(&context, cursor);
-            if (!keepsPicker(outcome)) self.session.closePicker();
-            try self.applyOutcome(outcome);
-        },
-        .prompt_history => try self.appendPromptHistory(cursor),
-    }
-}
-
-fn appendPromptHistory(self: *App, row: usize) !void {
-    var source = try ui.Editor.Draft.fromText(self.gpa, self.prompt_history.entries.items[row]);
-    defer source.deinit(self.gpa);
-    try self.session.appendPromptHistory(&source);
-}
-
-fn openPromptHistory(self: *App) !void {
-    std.debug.assert(self.session.mode == .prompt);
-    if (!self.prompt_history.enabled) return self.reportNotice(
-        .information,
-        "Prompt history is disabled. Set prompt_history.enabled to true in {s}.",
-        .{self.config_path},
-    );
-    self.prompt_history.load() catch |err| return self.reportNotice(
-        .failure,
-        "Drinky could not read prompt history from {s} because of error {s}.",
-        .{ self.prompt_history.path, @errorName(err) },
-    );
-    const entries = self.prompt_history.entries.items;
-    if (entries.len == 0) return self.reportNotice(.information, prompt_history_empty_notice, .{});
-    try self.session.openPromptHistory(try promptLabels(self.gpa, entries));
-}
-
-fn promptLabels(gpa: std.mem.Allocator, prompts: []const []const u8) ![]const []const u8 {
-    const labels = try gpa.alloc([]const u8, prompts.len);
-    var built: usize = 0;
-    errdefer {
-        for (labels[0..built]) |label| gpa.free(label);
-        gpa.free(labels);
-    }
-    for (prompts) |prompt| {
-        labels[built] = try promptLabel(gpa, prompt);
-        built += 1;
-    }
-    return labels;
-}
-
-fn promptLabel(gpa: std.mem.Allocator, prompt: []const u8) ![]u8 {
-    const label = try gpa.alloc(u8, prompt.len - std.mem.count(u8, prompt, "\r\n"));
-    var written: usize = 0;
-    var index: usize = 0;
-    while (index < prompt.len) : (index += 1) {
-        const byte = prompt[index];
-        if (byte == '\r' and index + 1 < prompt.len and prompt[index + 1] == '\n') index += 1;
-        label[written] = if (byte == '\r' or byte == '\n') ' ' else byte;
-        written += 1;
-    }
-    std.debug.assert(written == label.len);
-    return label;
-}
-
-fn recordPromptHistory(self: *App, text: []const u8) !void {
-    std.debug.assert(text.len > 0);
-    if (text[0] == '/') return;
-    self.prompt_history.record(text) catch |err| switch (err) {
-        error.PromptTooLarge => try self.reportNotice(
-            .warning,
-            prompt_history_oversized_notice,
-            .{},
-        ),
-        error.OutOfMemory => try self.reportNotice(
-            .failure,
-            "Drinky could not add the prompt to history because of error {s}.",
-            .{@errorName(err)},
-        ),
-        else => try self.reportNotice(
-            .failure,
-            "Drinky could not save prompt history to {s} because of error {s}.",
-            .{ self.prompt_history.path, @errorName(err) },
-        ),
-    };
+    var context = self.commandContext();
+    const outcome = try picking.select(&context, cursor);
+    if (!keepsPicker(outcome)) self.session.closePicker();
+    try self.applyOutcome(outcome);
 }
 
 fn keepsPicker(outcome: ai.command.Outcome) bool {
@@ -3220,580 +2492,13 @@ fn expectModel(self: *const App, expected: []const u8) !void {
 
 test "the intro line holds every key hint and closes on the command list" {
     try std.testing.expectEqualStrings(
-        "Enter: Send · Shift+Enter: New line · Tab: Prompt history · Esc: Cancel · " ++
-            "Ctrl+C: Clear · Ctrl+D: Quit · /help: Commands",
+        "Enter: Send · Shift+Enter: New line · Esc: Cancel · Ctrl+C: Clear · Ctrl+D: Quit · " ++
+            "/help: Commands",
         intro_text,
     );
-    try std.testing.expectEqual(@as(usize, 120), terminal.width.ofText(intro_text));
+    try std.testing.expectEqual(@as(usize, 98), terminal.width.ofText(intro_text));
     for (intro_keys) |hint|
         try std.testing.expect(std.mem.indexOf(u8, intro_text, hint) != null);
-}
-
-fn initHistoryTest(
-    self: *App,
-    gpa: std.mem.Allocator,
-    io: std.Io,
-    out: *std.Io.Writer.Allocating,
-    home: []const u8,
-    enabled: bool,
-) !void {
-    self.initForTest(gpa);
-    self.accounts = ai.testing.accounts(.{ .anthropic = "sk-ant" });
-    self.agent = ai.Agent.init(gpa, io, self.accounts.client(.anthropic_api_key), .{
-        .model = test_anthropic_model,
-        .system = "",
-        .retry = .{},
-        .environ = .empty,
-    });
-    self.agent.rounds_max = 0;
-    self.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
-    self.session.account_shown = .anthropic_api_key;
-    self.prompt_history = try PromptHistory.open(gpa, io, &.{
-        .working_directory = "/work",
-        .home = home,
-        .enabled = enabled,
-    });
-    self.config_path = "/home/.drinky/config.json";
-}
-
-fn deinitHistoryTest(self: *App) void {
-    self.dropRetry();
-    self.drainQueue();
-    self.input.deinit();
-    self.prompt_history.deinit();
-    self.session.deinit();
-    self.agent.deinit();
-}
-
-fn finishHistoryTurn(self: *App) !void {
-    const result = self.awaitTurnFuture() orelse return error.TestExpectedTurn;
-    defer self.freeWorkerResult(&result);
-    try self.finishWorkerResult(&result);
-}
-
-fn expectHistory(self: *App, expected: []const []const u8) !void {
-    try self.prompt_history.load();
-    const entries = self.prompt_history.entries.items;
-    try std.testing.expectEqual(expected.len, entries.len);
-    for (expected, entries) |want, got| try std.testing.expectEqualStrings(want, got);
-}
-
-fn expectNoHistoryFile(self: *const App) !void {
-    try std.testing.expectError(
-        error.FileNotFound,
-        std.Io.Dir.cwd().statFile(self.io, self.prompt_history.path, .{}),
-    );
-}
-
-test "Tab opens the prompt history over the idle prompt alone" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const home = try tmpPath(gpa, io, &tmp, "");
-    defer gpa.free(home);
-
-    var app: App = undefined;
-    try app.initHistoryTest(gpa, io, &out, home, true);
-    defer app.deinitHistoryTest();
-    defer app.controller.deinit();
-    try app.prompt_history.record("older");
-    try app.prompt_history.record("newer");
-
-    try app.session.editor.insert("typed");
-    try app.handleKeys("\t");
-    try std.testing.expect(app.session.mode == .picking);
-    const picker = &app.session.mode.picking.picker;
-    try std.testing.expectEqualStrings("Prompt history", picker.title);
-    try std.testing.expectEqual(@as(usize, 2), picker.options.len);
-    try std.testing.expectEqualStrings("newer", picker.options[0].name);
-    try std.testing.expectEqualStrings("older", picker.options[1].name);
-    try std.testing.expectEqual(@as(usize, 0), picker.cursor);
-    try std.testing.expect(picker.marked == null);
-    try std.testing.expect(app.session.mode.picking.purpose == .prompt_history);
-    try std.testing.expectEqualStrings("typed", app.session.editor.visible());
-    try app.handleKeys("\t");
-    try std.testing.expect(app.session.mode == .picking);
-    try std.testing.expectEqual(@as(usize, 0), app.session.mode.picking.picker.cursor);
-    try app.handleKey(&.escape);
-    try std.testing.expect(app.session.mode == .prompt);
-    try std.testing.expectEqualStrings(
-        "You canceled the prompt history selection.",
-        app.session.notice.?.content,
-    );
-    try std.testing.expectEqualStrings("typed", app.session.editor.visible());
-
-    try app.session.openPage(&.{ .title = "Test page", .content = "body" });
-    try app.handleKey(&.tab);
-    try std.testing.expect(app.session.mode == .viewing);
-    app.session.closePage();
-
-    try app.runCommand("/help");
-    try app.handleKey(&.tab);
-    try std.testing.expect(app.session.mode == .picking);
-    try std.testing.expectEqualStrings("Command", app.session.mode.picking.picker.title);
-    try app.session.cancelPicker();
-
-    app.session.input.owner = .external;
-    try app.handleKey(&.tab);
-    try std.testing.expect(app.session.mode == .prompt);
-    try std.testing.expect(app.session.notice == null);
-    app.session.input.owner = .terminal;
-
-    var signals: LoginTestSignals = .{};
-    try beginLoginForTest(&app, .xai_plan, null, &signals);
-    try app.handleKey(&.tab);
-    try std.testing.expect(app.session.mode == .prompt);
-    try std.testing.expect(app.login != null);
-    app.dropLogin();
-    app.syncInputState();
-
-    try app.runCommand("/remote");
-    try app.handleKeys("\r");
-    try std.testing.expectEqual(remote.Controller.State.token_prompt, app.controller.state());
-    try app.handleKey(&.tab);
-    try std.testing.expect(app.session.mode == .prompt);
-    try std.testing.expectEqual(remote.Controller.State.token_prompt, app.controller.state());
-    try std.testing.expect(app.session.notice == null);
-    try app.handleKey(&.escape);
-    try std.testing.expectEqual(remote.Controller.State.idle, app.controller.state());
-}
-
-test "Tab during a turn shows its notice and changes no draft or turn state" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const home = try tmpPath(gpa, io, &tmp, "");
-    defer gpa.free(home);
-
-    var app: App = undefined;
-    try app.initHistoryTest(gpa, io, &out, home, true);
-    defer app.deinitHistoryTest();
-    app.session.beginTurn(7);
-    try app.session.editor.insert("draft");
-
-    try app.handleKeys("\t");
-    try std.testing.expect(app.session.mode == .turn);
-    try std.testing.expectEqual(@as(u64, 7), app.session.mode.turn.generation);
-    const notice = app.session.notice.?;
-    try std.testing.expectEqual(ai.command.Outcome.Severity.information, notice.severity);
-    try std.testing.expectEqualStrings(
-        "Prompt history cannot open while a turn runs.",
-        notice.content,
-    );
-    try std.testing.expectEqualStrings("draft", app.session.editor.visible());
-    try app.expectNoHistoryFile();
-}
-
-test "a disabled history explains the setting on Tab and records nothing" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const home = try tmpPath(gpa, io, &tmp, "");
-    defer gpa.free(home);
-    var directory = try tmp.dir.createDirPathOpen(io, ".drinky", .{});
-    directory.close(io);
-    try tmp.dir.writeFile(io, .{
-        .sub_path = ".drinky/prompt_history.json",
-        .data = "{\"dmFsaWQ\":{}}",
-    });
-
-    var app: App = undefined;
-    try app.initHistoryTest(gpa, io, &out, home, false);
-    defer app.deinitHistoryTest();
-
-    try std.testing.expect(std.mem.indexOf(u8, intro_text, "Tab: Prompt history") != null);
-    try app.session.editor.insert("typed");
-    try app.handleKeys("\t");
-    try std.testing.expect(app.session.mode == .prompt);
-    const notice = app.session.notice.?;
-    try std.testing.expectEqual(ai.command.Outcome.Severity.information, notice.severity);
-    try std.testing.expectEqualStrings(
-        "Prompt history is disabled. Set prompt_history.enabled to true in " ++
-            "/home/.drinky/config.json.",
-        notice.content,
-    );
-    try std.testing.expectEqualStrings("typed", app.session.editor.visible());
-
-    try app.handleKey(&.enter);
-    try std.testing.expect(app.session.mode == .turn);
-    try std.testing.expect(app.session.notice == null);
-    try app.finishHistoryTurn();
-    const data = try tmp.dir.readFileAlloc(io, ".drinky/prompt_history.json", gpa, .unlimited);
-    defer gpa.free(data);
-    try std.testing.expectEqualStrings("{\"dmFsaWQ\":{}}", data);
-}
-
-test "an empty or unreadable history opens no picker and keeps the draft" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const home = try tmpPath(gpa, io, &tmp, "");
-    defer gpa.free(home);
-
-    var app: App = undefined;
-    try app.initHistoryTest(gpa, io, &out, home, true);
-    defer app.deinitHistoryTest();
-
-    try app.session.editor.insert("typed");
-    try app.handleKeys("\t");
-    try std.testing.expect(app.session.mode == .prompt);
-    try std.testing.expectEqual(
-        ai.command.Outcome.Severity.information,
-        app.session.notice.?.severity,
-    );
-    try std.testing.expectEqualStrings("Prompt history is empty.", app.session.notice.?.content);
-    try std.testing.expectEqualStrings("typed", app.session.editor.visible());
-
-    var directory = try tmp.dir.createDirPathOpen(io, ".drinky", .{});
-    directory.close(io);
-    try tmp.dir.writeFile(io, .{ .sub_path = ".drinky/prompt_history.json", .data = "{ not json" });
-    try app.handleKeys("\t");
-    try std.testing.expect(app.session.mode == .prompt);
-    const notice = app.session.notice.?;
-    try std.testing.expectEqual(ai.command.Outcome.Severity.failure, notice.severity);
-    const expected = try std.fmt.allocPrint(
-        gpa,
-        "Drinky could not read prompt history from {s} because of error CorruptStore.",
-        .{app.prompt_history.path},
-    );
-    defer gpa.free(expected);
-    try std.testing.expectEqualStrings(expected, notice.content);
-    try std.testing.expectEqualStrings("typed", app.session.editor.visible());
-}
-
-test "a history label folds its line breaks and cuts like every picker row" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const home = try tmpPath(gpa, io, &tmp, "");
-    defer gpa.free(home);
-
-    var app: App = undefined;
-    try app.initHistoryTest(gpa, io, &out, home, true);
-    defer app.deinitHistoryTest();
-    try app.prompt_history.record("one\r\ntwo\rthree\nfour");
-    const long = "start " ++ "x" ** 200 ++ " end";
-    try app.prompt_history.record(long);
-
-    try app.handleKeys("\t");
-    const picker = &app.session.mode.picking.picker;
-    try std.testing.expectEqualStrings(long, picker.options[0].name);
-    try std.testing.expectEqualStrings("one two three four", picker.options[1].name);
-    try std.testing.expectEqualStrings(long, app.prompt_history.entries.items[0]);
-    try std.testing.expectEqualStrings(
-        "one\r\ntwo\rthree\nfour",
-        app.prompt_history.entries.items[1],
-    );
-
-    try app.session.paint(.{ .columns = 40, .rows = 24 });
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, picker.content.items, "\n"));
-    try std.testing.expect(std.mem.indexOf(u8, picker.content.items, "…") != null);
-    try std.testing.expect(std.mem.indexOf(u8, picker.content.items, "\u{FFFD}") == null);
-    try std.testing.expect(std.mem.indexOf(u8, picker.content.items, "one two three four") != null);
-}
-
-test "a failed prompt history open frees its labels once" {
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
-    const gpa = failing.allocator();
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer out.deinit();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const home = try tmpPath(std.testing.allocator, io, &tmp, "");
-    defer std.testing.allocator.free(home);
-
-    var app: App = undefined;
-    try app.initHistoryTest(gpa, io, &out, home, true);
-    defer app.deinitHistoryTest();
-    try app.prompt_history.record("one\r\ntwo");
-    try app.prompt_history.record("three");
-
-    var step: usize = 0;
-    while (true) : (step += 1) {
-        failing.fail_index = failing.alloc_index + step;
-        const result = app.openPromptHistory();
-        failing.fail_index = std.math.maxInt(usize);
-        if (result) |_| {
-            if (app.session.mode == .picking) break;
-        } else |err| try std.testing.expectEqual(error.OutOfMemory, err);
-        try std.testing.expect(app.session.mode == .prompt);
-        if (step == 64) return error.TestSweepTooLong;
-    }
-    try std.testing.expectEqualStrings("three", app.session.mode.picking.picker.options[0].name);
-    try std.testing.expectEqualStrings("one two", app.session.mode.picking.picker.options[1].name);
-}
-
-test "a selection appends without a write, and the submitted draft records itself" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const home = try tmpPath(gpa, io, &tmp, "");
-    defer gpa.free(home);
-
-    var app: App = undefined;
-    try app.initHistoryTest(gpa, io, &out, home, true);
-    defer app.deinitHistoryTest();
-    try app.prompt_history.record("alpha\nbeta");
-    try app.prompt_history.record("gamma");
-    const before = try tmp.dir.readFileAlloc(io, ".drinky/prompt_history.json", gpa, .unlimited);
-    defer gpa.free(before);
-
-    try app.session.editor.insert("typed");
-    app.session.dirty = false;
-    try app.handleKeys("\t\x1b[B\r!");
-    try std.testing.expect(app.session.mode == .prompt);
-    try std.testing.expect(app.session.dirty);
-    try std.testing.expectEqualStrings("typed\n\nalpha\nbeta!", app.session.editor.visible());
-    try std.testing.expectEqual(@as(usize, 0), app.session.editor.draft.atoms.items.len);
-    const after = try tmp.dir.readFileAlloc(io, ".drinky/prompt_history.json", gpa, .unlimited);
-    defer gpa.free(after);
-    try std.testing.expectEqualStrings(before, after);
-    try app.expectHistory(&.{ "gamma", "alpha\nbeta" });
-
-    try app.submit();
-    try std.testing.expect(app.session.mode == .turn);
-    try app.expectHistory(&.{ "typed\n\nalpha\nbeta!", "gamma", "alpha\nbeta" });
-    try app.finishHistoryTurn();
-
-    app.session.editor.clear();
-    try app.handleKeys("\t\x1b[B\x1b[B\r");
-    try std.testing.expectEqualStrings("alpha\nbeta", app.session.editor.visible());
-    try app.submit();
-    try app.expectHistory(&.{ "alpha\nbeta", "typed\n\nalpha\nbeta!", "gamma" });
-    try app.finishHistoryTurn();
-}
-
-test "every cancel key of the history picker keeps the draft" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const home = try tmpPath(gpa, io, &tmp, "");
-    defer gpa.free(home);
-
-    var app: App = undefined;
-    try app.initHistoryTest(gpa, io, &out, home, true);
-    defer app.deinitHistoryTest();
-    try app.prompt_history.record("saved");
-    try app.session.editor.insert("typed");
-
-    for ([_]terminal.Input.Key{ .escape, .{ .ctrl = 'c' }, .{ .ctrl = 'd' } }) |key| {
-        try app.handleKeys("\t");
-        try std.testing.expect(app.session.mode == .picking);
-        try app.handleKey(&key);
-        try std.testing.expect(app.session.mode == .prompt);
-        try std.testing.expect(app.running);
-        try std.testing.expectEqualStrings(
-            "You canceled the prompt history selection.",
-            app.session.notice.?.content,
-        );
-        try std.testing.expectEqualStrings("typed", app.session.editor.visible());
-    }
-    try app.expectHistory(&.{"saved"});
-}
-
-test "a plain prompt enters the history at its successful start alone" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const home = try tmpPath(gpa, io, &tmp, "");
-    defer gpa.free(home);
-
-    var app: App = undefined;
-    try app.initHistoryTest(gpa, io, &out, home, true);
-    defer app.deinitHistoryTest();
-
-    try app.session.editor.insert("  hello\nworld  ");
-    app.turn_generation = std.math.maxInt(u64);
-    try std.testing.expectError(error.GenerationExhausted, app.submit());
-    try std.testing.expect(app.session.mode == .prompt);
-    try app.expectNoHistoryFile();
-
-    app.turn_generation = 0;
-    try app.submit();
-    try std.testing.expect(app.session.mode == .turn);
-    try std.testing.expect(app.session.notice == null);
-    try app.expectHistory(&.{"hello\nworld"});
-    try app.finishHistoryTurn();
-    try std.testing.expect(app.session.mode == .prompt);
-    try std.testing.expectEqualStrings("hello\nworld", app.session.editor.visible());
-    try app.expectHistory(&.{"hello\nworld"});
-}
-
-test "every outer-trimmed slash line stays out of the history" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const home = try tmpPath(gpa, io, &tmp, "");
-    defer gpa.free(home);
-    var skill = try tmp.dir.createDirPathOpen(io, "skills/demo", .{});
-    skill.close(io);
-    try tmp.dir.writeFile(io, .{
-        .sub_path = "skills/demo/SKILL.md",
-        .data = "---\nname: demo\ndescription: a test skill\n---\nbody\n",
-    });
-    const user_skills = try tmpPath(gpa, io, &tmp, "skills");
-    defer gpa.free(user_skills);
-
-    var app: App = undefined;
-    try app.initHistoryTest(gpa, io, &out, home, true);
-    defer app.deinitHistoryTest();
-    app.skills = try ai.skills.discover(gpa, io, &.{
-        .user_root = user_skills,
-        .project_start = home,
-        .project_root = null,
-    });
-    defer app.skills.deinit();
-
-    try app.session.editor.insert("/status");
-    try app.submit();
-    try std.testing.expect(app.session.mode == .prompt);
-    try app.expectNoHistoryFile();
-
-    try app.session.editor.insert("  /skill:demo apply it");
-    try app.submit();
-    try std.testing.expect(app.session.mode == .turn);
-    try app.expectNoHistoryFile();
-    try app.finishHistoryTurn();
-    app.session.editor.clear();
-
-    try app.session.editor.insert(" /nope tell me about this");
-    try app.handleKey(&.enter);
-    try std.testing.expect(app.session.confirmations.contains(.message));
-    try app.handleKey(&.enter);
-    try std.testing.expect(app.session.mode == .turn);
-    try app.expectNoHistoryFile();
-    try app.finishHistoryTurn();
-}
-
-test "no path but a submitted terminal prompt records history" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const home = try tmpPath(gpa, io, &tmp, "");
-    defer gpa.free(home);
-
-    var app: App = undefined;
-    try app.initHistoryTest(gpa, io, &out, home, true);
-    defer app.deinitHistoryTest();
-
-    try app.session.editor.insert("direct");
-    {
-        const base = try app.startUserTurn("direct");
-        var prompt = app.session.editor.detachTrimmed();
-        app.session.retainTurnPrompt(&prompt, base);
-    }
-    try app.expectNoHistoryFile();
-    try app.session.editor.insert("steer this");
-    try app.handleKey(&.enter);
-    try std.testing.expect(app.session.hasSteering());
-    try app.expectNoHistoryFile();
-    try app.finishHistoryTurn();
-    app.session.editor.clear();
-
-    app.setRetry(.{ .failure = try gpa.dupe(u8, "The provider is overloaded.") });
-    try app.sendRetryTurn();
-    try app.expectNoHistoryFile();
-    try app.finishHistoryTurn();
-    app.session.editor.clear();
-    try app.sendShortenTurn();
-    try app.expectNoHistoryFile();
-    try app.finishHistoryTurn();
-    app.session.editor.clear();
-
-    try app.session.editor.insert("cleared");
-    try app.handleKey(&.{ .ctrl = 'c' });
-    try std.testing.expectEqualStrings("", app.session.editor.visible());
-    try std.testing.expect(app.running);
-    try app.expectNoHistoryFile();
-    try app.handleKey(&.{ .ctrl = 'c' });
-    try std.testing.expect(!app.running);
-}
-
-test "a history failure warns and never touches the started turn" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const home = try tmpPath(gpa, io, &tmp, "");
-    defer gpa.free(home);
-
-    var app: App = undefined;
-    try app.initHistoryTest(gpa, io, &out, home, true);
-    defer app.deinitHistoryTest();
-
-    const oversized = try gpa.alloc(u8, PromptHistory.entry_bytes_max + 1);
-    defer gpa.free(oversized);
-    @memset(oversized, 'x');
-    try app.session.editor.insert(oversized);
-    try app.submit();
-    try std.testing.expect(app.session.mode == .turn);
-    try std.testing.expect(app.turn_future != null);
-    const warning = app.session.notice.?;
-    try std.testing.expectEqual(ai.command.Outcome.Severity.warning, warning.severity);
-    try std.testing.expectEqualStrings(
-        "Drinky did not add the prompt to history because it exceeds 8 KiB.",
-        warning.content,
-    );
-    try std.testing.expectEqualStrings(oversized, app.session.transcript.blocks()[0].content.user.items);
-    try app.expectNoHistoryFile();
-    try app.finishHistoryTurn();
-    app.session.editor.clear();
-
-    var directory = try tmp.dir.createDirPathOpen(io, ".drinky", .{});
-    directory.close(io);
-    try tmp.dir.writeFile(io, .{ .sub_path = ".drinky/prompt_history.json", .data = "{ not json" });
-    try app.session.editor.insert("hello");
-    try app.submit();
-    try std.testing.expect(app.session.mode == .turn);
-    try std.testing.expect(app.turn_future != null);
-    const failure = app.session.notice.?;
-    try std.testing.expectEqual(ai.command.Outcome.Severity.failure, failure.severity);
-    const expected = try std.fmt.allocPrint(
-        gpa,
-        "Drinky could not save prompt history to {s} because of error CorruptStore.",
-        .{app.prompt_history.path},
-    );
-    defer gpa.free(expected);
-    try std.testing.expectEqualStrings(expected, failure.content);
-    const blocks = app.session.transcript.blocks();
-    try std.testing.expectEqualStrings("hello", blocks[blocks.len - 1].content.user.items);
-    try app.finishHistoryTurn();
-    const data = try tmp.dir.readFileAlloc(io, ".drinky/prompt_history.json", gpa, .unlimited);
-    defer gpa.free(data);
-    try std.testing.expectEqualStrings("{ not json", data);
 }
 
 const LoginTestSignals = struct {
@@ -4294,7 +2999,6 @@ test "a turn failure the agent named itself reads as a sentence, not an error na
         error.UncorrelatedReply,
         error.TooManyToolCalls,
         error.TooManyToolRounds,
-        error.CredentialReplaced,
         error.TokenGrantRejected,
         error.KeyRejected,
         error.TokenRequestFailed,
@@ -4316,9 +3020,6 @@ test "a turn failure the agent named itself reads as a sentence, not an error na
         const text = turnFailureText(err).?;
         try std.testing.expect(std.mem.indexOf(u8, text, "Try the turn again.") != null);
     }
-    const replacement = turnFailureText(error.CredentialReplaced).?;
-    try std.testing.expect(std.mem.indexOf(u8, replacement, "Try the turn again.") == null);
-    try std.testing.expect(std.mem.indexOf(u8, replacement, "/model") == null);
     const credentials = turnFailureText(error.TokenGrantRejected).?;
     try std.testing.expect(std.mem.indexOf(u8, credentials, "signed out") == null);
     try std.testing.expect(std.mem.indexOf(u8, credentials, "/login") == null);
@@ -4517,7 +3218,6 @@ test "turn producers keep their captured generation" {
         .cause = .{ .response = "Overloaded" },
     };
     try handler.onStreamReset(&retry);
-    try handler.onSteering("steer", 1);
     try handler.onModelMismatch(.{ .requested = "claude-fable-5", .served = "claude-opus-5" });
     try handler.onModelMismatch(.{ .requested = "claude-fable-5", .served = "claude-opus-5" });
     try handler.onModelMismatch(.{ .requested = "claude-fable-5", .served = "claude-opus-4-8" });
@@ -4530,7 +3230,7 @@ test "turn producers keep their captured generation" {
         result.error_text.?,
     );
 
-    var events: [10]UiEvent = undefined;
+    var events: [9]UiEvent = undefined;
     const count = try app.queue.get(io, &events, events.len);
     defer for (events[0..count]) |event| event.deinit(gpa);
     try std.testing.expectEqual(events.len, count);
@@ -4545,27 +3245,19 @@ test "turn producers keep their captured generation" {
     const queued_retry = events[5].turn.payload.stream_reset;
     try std.testing.expectEqual(@as(u32, 2), queued_retry.attempt);
     try std.testing.expectEqualStrings("Overloaded", queued_retry.cause.response);
-    const mismatch = events[7].turn.payload.model_mismatch;
+    const mismatch = events[6].turn.payload.model_mismatch;
     try std.testing.expectEqualStrings("claude-fable-5", mismatch.requested);
     try std.testing.expectEqualStrings("claude-opus-5", mismatch.served);
     try std.testing.expectEqualStrings(
         "claude-opus-4-8",
-        events[8].turn.payload.model_mismatch.served,
+        events[7].turn.payload.model_mismatch.served,
     );
     try std.testing.expect(events[events.len - 1].turn.payload == .turn_ended);
-}
-
-fn seedSteering(app: *App, text: []const u8) !void {
-    try app.session.editor.insert(text);
-    try app.session.reserveSteering();
-    var draft = app.session.editor.detachTrimmed();
-    app.session.commitSteeringDraft(&draft);
 }
 
 const zero_receipt: ai.Agent.Receipt = .{
     .history_base = 0,
     .history_end = 0,
-    .steering_committed_count = 0,
 };
 
 fn fakeWorker(result: *const WorkerResult) WorkerResult {
@@ -4584,7 +3276,6 @@ fn committedCanceledWorker() WorkerResult {
         .outcome = .{ .receipt = .{
             .history_base = 0,
             .history_end = 1,
-            .steering_committed_count = 0,
         }, .disposition = .canceled },
         .error_text = null,
     };
@@ -4600,45 +3291,6 @@ fn spawnCanceledTurn(app: *App) !void {
 
 fn spawnCommittedCanceledTurn(app: *App) !void {
     app.turn_future = try app.io.concurrent(committedCanceledWorker, .{});
-}
-
-test "a late steering return restores a paste as a live placeholder atom" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-
-    var app: App = undefined;
-    app.initForTest(gpa);
-    app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = test_anthropic_model,
-        .system = "",
-        .retry = .{},
-        .environ = .empty,
-    });
-    defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
-    defer app.session.deinit();
-
-    const payload = "late\n" ** 15;
-    const delivered = std.mem.trim(u8, payload, " \t\r\n");
-    try app.agent.steering.push(delivered);
-    try app.session.editor.paste(payload, true);
-    try app.session.reserveSteering();
-    var draft = app.session.editor.detachTrimmed();
-    app.session.commitSteeringDraft(&draft);
-
-    try app.returnLateSteering();
-    try std.testing.expect(!app.session.hasSteering());
-    try std.testing.expectEqual(@as(usize, 1), app.session.editor.draft.atoms.items.len);
-    const restored = try app.session.editor.expanded(.none);
-    defer gpa.free(restored);
-    try std.testing.expectEqualStrings(payload, restored);
-    try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
-
-    const remaining = try app.agent.steering.take();
-    defer gpa.free(remaining);
-    try std.testing.expectEqual(@as(usize, 0), remaining.len);
 }
 
 test "ctrl+c during a turn clears the draft first and cancels only on an empty editor" {
@@ -4767,8 +3419,8 @@ test "Esc dismisses a notice and leaves the turn running" {
 
     app.session.beginTurn(1);
     try spawnCanceledTurn(&app);
-    try app.handleKey(&.tab);
-    try std.testing.expectEqualStrings(prompt_history_turn_notice, app.session.notice.?.content);
+    try app.reportNotice(.information, "A notice.", .{});
+    try std.testing.expectEqualStrings("A notice.", app.session.notice.?.content);
     try app.handleKey(&.escape);
     try std.testing.expect(app.session.mode == .turn);
     try std.testing.expect(app.session.notice == null);
@@ -4782,7 +3434,7 @@ test "Esc dismisses a notice and leaves the turn running" {
     app.session.beginTurn(1);
     try spawnCanceledTurn(&app);
     try app.session.editor.insert("draft");
-    try app.handleKey(&.tab);
+    try app.reportNotice(.information, "A notice.", .{});
     try app.handleKey(&.escape);
     try std.testing.expect(app.session.mode == .turn);
     try std.testing.expect(app.session.notice == null);
@@ -4881,126 +3533,7 @@ test "canceling a turn joins and clears its active worker" {
     try std.testing.expect(app.session.mode == .prompt);
 }
 
-test "canceling a turn restores in-flight steering and reads the usage again" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-
-    var app: App = undefined;
-    app.initForTest(gpa);
-    app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = test_anthropic_model,
-        .system = "",
-        .retry = .{},
-        .environ = .empty,
-    });
-    defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
-    defer app.session.deinit();
-    app.session.beginTurn(1);
-
-    const payload = "line\n" ** 10 ++ "line";
-    try app.session.editor.paste(payload, true);
-    try app.submitSteering();
-    const folded = try app.agent.steering.take();
-    for (folded) |message| gpa.free(message);
-    gpa.free(folded);
-
-    try app.session.editor.insert("and Y");
-    try app.submitSteering();
-    app.agent.stats.cost = 1.5;
-
-    try spawnCanceledTurn(&app);
-    try app.cancelTurn();
-    try std.testing.expectEqual(@as(usize, 1), app.session.editor.draft.atoms.items.len);
-    const expanded = try app.session.editor.expanded(.none);
-    defer gpa.free(expanded);
-    try std.testing.expectEqualStrings(payload ++ "\n\nand Y", expanded);
-    try std.testing.expectEqual(@as(usize, 0), app.session.steering.items.len);
-    try std.testing.expectEqual(@as(f64, 1.5), app.session.stats_shown.cost);
-    try std.testing.expect(app.session.mode == .prompt);
-}
-
-test "cancel preflight failure leaves the turn and steering untouched" {
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
-    const gpa = failing.allocator();
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-
-    var app: App = undefined;
-    app.initForTest(gpa);
-    app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = test_anthropic_model,
-        .system = "",
-        .retry = .{},
-        .environ = .empty,
-    });
-    defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
-    defer app.session.deinit();
-    app.session.beginTurn(1);
-
-    try app.session.editor.insert("restore me");
-    try app.submitSteering();
-    try spawnCanceledTurn(&app);
-    failing.fail_index = failing.alloc_index;
-    failing.resize_fail_index = failing.resize_index;
-
-    try std.testing.expectError(error.OutOfMemory, app.cancelTurn());
-    try std.testing.expect(app.session.mode == .turn);
-    try std.testing.expectEqual(@as(usize, 1), app.session.steering.items.len);
-    try std.testing.expectEqualStrings("", app.session.editor.visible());
-
-    failing.fail_index = std.math.maxInt(usize);
-    failing.resize_fail_index = std.math.maxInt(usize);
-    try app.cancelTurn();
-    try std.testing.expect(app.session.mode == .prompt);
-    try std.testing.expectEqualStrings("restore me", app.session.editor.visible());
-}
-
-test "cancel restores steering before event allocation failure" {
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
-    const gpa = failing.allocator();
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-
-    var app: App = undefined;
-    app.initForTest(gpa);
-    app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = test_anthropic_model,
-        .system = "",
-        .retry = .{},
-        .environ = .empty,
-    });
-    defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
-    defer app.session.deinit();
-    app.session.beginTurn(1);
-
-    try app.session.editor.insert("restore me");
-    try app.submitSteering();
-    try spawnCommittedCanceledTurn(&app);
-    try app.session.reserveSteeringRestore();
-    try app.session.reserveRevisionCapture();
-    failing.fail_index = failing.alloc_index;
-    failing.resize_fail_index = failing.resize_index;
-
-    try std.testing.expectError(error.OutOfMemory, app.cancelTurn());
-    try std.testing.expect(app.session.mode == .prompt);
-    try std.testing.expectEqualStrings("restore me", app.session.editor.visible());
-    try std.testing.expectEqual(@as(usize, 0), app.session.steering.items.len);
-
-    failing.fail_index = std.math.maxInt(usize);
-    failing.resize_fail_index = std.math.maxInt(usize);
-    const taken = try app.agent.steering.take();
-    defer gpa.free(taken);
-    try std.testing.expectEqual(@as(usize, 0), taken.len);
-}
-
-test "ctrl+p recalls the steering queue before in-progress editor text" {
+test "canceling a turn returns the prompt and reads the usage again" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -5020,19 +3553,21 @@ test "ctrl+p recalls the steering queue before in-progress editor text" {
     app.session.beginTurn(1);
 
     try app.session.editor.insert("fix it");
-    try app.submitSteering();
-    try app.session.editor.insert("and test");
-    try app.submitSteering();
-    try app.session.editor.insert("draft");
+    var prompt = app.session.editor.detachTrimmed();
+    app.session.retainTurnPrompt(&prompt, 0);
+    try app.session.editor.insert("and Y");
+    app.agent.stats.cost = 1.5;
 
-    try app.handleKey(&.{ .ctrl = 'p' });
-    try std.testing.expectEqualStrings("fix it\n\nand test\n\ndraft", app.session.editor.visible());
-    try std.testing.expectEqual(@as(usize, 0), app.session.steering.items.len);
-    try std.testing.expectEqual(app.session.editor.visible().len, app.session.editor.caret);
+    try spawnCanceledTurn(&app);
+    try app.cancelTurn();
+    try std.testing.expectEqualStrings("fix it\n\nand Y", app.session.editor.visible());
+    try std.testing.expectEqual(@as(f64, 1.5), app.session.stats_shown.cost);
+    try std.testing.expect(app.session.mode == .prompt);
 }
 
-test "ctrl+p restores a steered paste as a live placeholder atom" {
-    const gpa = std.testing.allocator;
+test "cancel preflight failure leaves the turn and the prompt untouched" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const gpa = failing.allocator();
     const io = std.testing.io;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
@@ -5050,180 +3585,23 @@ test "ctrl+p restores a steered paste as a live placeholder atom" {
     defer app.session.deinit();
     app.session.beginTurn(1);
 
-    const payload = "line\n" ** 15;
-    try app.session.editor.paste(payload, true);
-    try app.submitSteering();
-    try std.testing.expectEqual(@as(usize, 1), app.session.steering.items.len);
+    try app.session.editor.insert("restore me");
+    var prompt = app.session.editor.detachTrimmed();
+    app.session.retainTurnPrompt(&prompt, 0);
+    try spawnCanceledTurn(&app);
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+
+    try std.testing.expectError(error.OutOfMemory, app.cancelTurn());
+    try std.testing.expect(app.session.mode == .turn);
+    try std.testing.expectEqualStrings("restore me", app.session.turn_prompt.?.draft.visible.items);
     try std.testing.expectEqualStrings("", app.session.editor.visible());
 
-    try app.pullSteering();
-    try std.testing.expectEqual(@as(usize, 1), app.session.editor.draft.atoms.items.len);
-    try std.testing.expectEqual(@as(u64, 1), app.session.editor.draft.atoms.items[0].id);
-    try std.testing.expect(
-        std.mem.indexOf(u8, app.session.editor.visible(), "[Paste #1: 16 lines]") != null,
-    );
-    const expanded = try app.session.editor.expanded(.none);
-    defer gpa.free(expanded);
-    try std.testing.expectEqualStrings(payload, expanded);
-}
-
-test "cancel restores an in-flight steered paste as a live placeholder atom" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-
-    var app: App = undefined;
-    app.initForTest(gpa);
-    app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = test_anthropic_model,
-        .system = "",
-        .retry = .{},
-        .environ = .empty,
-    });
-    defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
-    defer app.session.deinit();
-    app.session.beginTurn(1);
-
-    const payload = "line\n" ** 15;
-    const delivered = std.mem.trim(u8, payload, " \t\r\n");
-    try app.session.editor.paste(payload, true);
-    try app.submitSteering();
-    try std.testing.expectEqualStrings("", app.session.editor.visible());
-    const folded = try app.agent.steering.take();
-    try std.testing.expectEqual(@as(usize, 1), folded.len);
-    try std.testing.expectEqualStrings(delivered, folded[0]);
-    for (folded) |message| gpa.free(message);
-    gpa.free(folded);
-
-    try spawnCanceledTurn(&app);
+    failing.fail_index = std.math.maxInt(usize);
+    failing.resize_fail_index = std.math.maxInt(usize);
     try app.cancelTurn();
-    try std.testing.expectEqual(@as(usize, 1), app.session.editor.draft.atoms.items.len);
-    try std.testing.expectEqual(@as(usize, 0), app.session.steering.items.len);
     try std.testing.expect(app.session.mode == .prompt);
-    _ = try app.session.applyTurnEvent(&.{
-        .generation = 1,
-        .payload = .{ .steering_consumed = .{
-            .text = try gpa.dupe(u8, delivered),
-            .count = 1,
-        } },
-    });
-    try std.testing.expectEqual(@as(usize, 1), app.session.editor.draft.atoms.items.len);
-    const expanded = try app.session.editor.expanded(.none);
-    defer gpa.free(expanded);
-    try std.testing.expectEqualStrings(payload, expanded);
-}
-
-test "cancel restores a steered paste even after its consumed event applied" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-
-    var app: App = undefined;
-    app.initForTest(gpa);
-    app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = test_anthropic_model,
-        .system = "",
-        .retry = .{},
-        .environ = .empty,
-    });
-    defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
-    defer app.session.deinit();
-    app.session.beginTurn(1);
-
-    const payload = "line\n" ** 15;
-    const delivered = std.mem.trim(u8, payload, " \t\r\n");
-    try app.session.editor.paste(payload, true);
-    try app.submitSteering();
-    const folded = try app.agent.steering.take();
-    try std.testing.expectEqual(@as(usize, 1), folded.len);
-    try std.testing.expectEqualStrings(delivered, folded[0]);
-    for (folded) |message| gpa.free(message);
-    gpa.free(folded);
-    _ = try app.session.applyTurnEvent(&.{
-        .generation = 1,
-        .payload = .{ .steering_consumed = .{
-            .text = try gpa.dupe(u8, delivered),
-            .count = 1,
-        } },
-    });
-
-    try std.testing.expectEqual(@as(usize, 1), app.session.steering.items.len);
-    try std.testing.expectEqual(@as(usize, 1), app.session.steering_retained_count);
-
-    try spawnCanceledTurn(&app);
-    try app.cancelTurn();
-    try std.testing.expectEqual(@as(usize, 1), app.session.editor.draft.atoms.items.len);
-    try std.testing.expectEqual(@as(usize, 0), app.session.steering.items.len);
-    const expanded = try app.session.editor.expanded(.none);
-    defer gpa.free(expanded);
-    try std.testing.expectEqualStrings(payload, expanded);
-    try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
-}
-
-test "ctrl+p recalls the pending suffix and retains the in-flight prefix" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-
-    var app: App = undefined;
-    app.initForTest(gpa);
-    app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = test_anthropic_model,
-        .system = "",
-        .retry = .{},
-        .environ = .empty,
-    });
-    defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
-    defer app.session.deinit();
-    app.session.beginTurn(1);
-
-    try seedSteering(&app, "folded");
-    try app.session.editor.insert("pending");
-    try app.submitSteering();
-    try std.testing.expectEqual(@as(usize, 2), app.session.steering.items.len);
-
-    try app.pullSteering();
-    try std.testing.expectEqualStrings("pending", app.session.editor.visible());
-    try std.testing.expectEqual(@as(usize, 1), app.session.steering.items.len);
-    try std.testing.expectEqual(@as(usize, 1), app.session.steering_retained_count);
-}
-
-test "cancel restores an in-flight prefix retained by ctrl+p" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-
-    var app: App = undefined;
-    app.initForTest(gpa);
-    app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = test_anthropic_model,
-        .system = "",
-        .retry = .{},
-        .environ = .empty,
-    });
-    defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
-    defer app.session.deinit();
-    app.session.beginTurn(1);
-
-    try seedSteering(&app, "folded");
-    try app.pullSteering();
-    try std.testing.expectEqual(@as(usize, 1), app.session.steering.items.len);
-    try std.testing.expectEqual(@as(usize, 1), app.session.steering_retained_count);
-
-    try spawnCanceledTurn(&app);
-    try app.cancelTurn();
-    try std.testing.expectEqualStrings("folded", app.session.editor.visible());
-    try std.testing.expectEqual(@as(usize, 0), app.session.steering.items.len);
-    try std.testing.expectEqual(@as(usize, 0), app.session.steering_retained_count);
-    try std.testing.expect(app.session.mode == .prompt);
+    try std.testing.expectEqualStrings("restore me", app.session.editor.visible());
 }
 
 test "a cancel that loses the race waits for the terminal fence" {
@@ -5244,9 +3622,6 @@ test "a cancel that loses the race waits for the terminal fence" {
     app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
     app.session.beginTurn(7);
-
-    try app.agent.steering.push("keep");
-    try seedSteering(&app, "keep");
 
     const worker_result: WorkerResult = .{
         .outcome = .{ .receipt = zero_receipt, .disposition = .completed },
@@ -5269,8 +3644,7 @@ test "a cancel that loses the race waits for the terminal fence" {
 
     try std.testing.expect(app.session.mode == .prompt);
     try std.testing.expect(app.pending_turn_result == null);
-    try std.testing.expectEqualStrings("keep", app.session.editor.visible());
-    try std.testing.expectEqual(@as(usize, 0), app.session.steering.items.len);
+    try std.testing.expectEqualStrings("", app.session.editor.visible());
     try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
 }
 
@@ -5309,7 +3683,6 @@ test "cancel does not commit stale text across a reset held in the current batch
         .outcome = .{ .receipt = .{
             .history_base = 0,
             .history_end = 1,
-            .steering_committed_count = 0,
         }, .disposition = .canceled },
         .error_text = null,
         .generation = 1,
@@ -5359,13 +3732,11 @@ test "cancel preserves progress before a queued terminal fence" {
     defer app.session.deinit();
     defer app.input.deinit();
     app.session.beginTurn(11);
-    try seedSteering(&app, "folded");
 
     const worker_result: WorkerResult = .{
         .outcome = .{ .receipt = .{
             .history_base = 0,
             .history_end = 0,
-            .steering_committed_count = 1,
         }, .disposition = .completed },
         .error_text = null,
         .terminal_queued = true,
@@ -5378,13 +3749,6 @@ test "cancel preserves progress before a queued terminal fence" {
             .generation = 11,
             .payload = .{ .text = try gpa.dupe(u8, "answer") },
         } },
-        .{ .turn = .{
-            .generation = 11,
-            .payload = .{ .steering_consumed = .{
-                .text = try gpa.dupe(u8, "folded"),
-                .count = 1,
-            } },
-        } },
         .{ .turn = .{ .generation = 11, .payload = endedPayload() } },
     };
     try std.testing.expect(!try app.applyBatch(&events));
@@ -5392,11 +3756,9 @@ test "cancel preserves progress before a queued terminal fence" {
     try std.testing.expect(app.session.mode == .prompt);
     try std.testing.expect(app.turn_future == null);
     try std.testing.expect(app.pending_turn_result == null);
-    try std.testing.expectEqual(@as(usize, 0), app.session.steering.items.len);
     const blocks = app.session.transcript.blocks();
-    try std.testing.expectEqual(@as(usize, 2), blocks.len);
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
     try std.testing.expectEqualStrings("answer", blocks[0].content.model.items);
-    try std.testing.expectEqualStrings("folded", blocks[1].content.user.items);
 }
 
 test "cancel replaces an interrupted terminal fence after queued progress" {
@@ -5419,13 +3781,11 @@ test "cancel replaces an interrupted terminal fence after queued progress" {
     defer app.session.deinit();
     defer app.input.deinit();
     app.session.beginTurn(12);
-    try seedSteering(&app, "folded");
 
     const worker_result: WorkerResult = .{
         .outcome = .{ .receipt = .{
             .history_base = 0,
             .history_end = 0,
-            .steering_committed_count = 1,
         }, .disposition = .completed },
         .error_text = null,
         .generation = 12,
@@ -5439,22 +3799,14 @@ test "cancel replaces an interrupted terminal fence after queued progress" {
             .generation = 12,
             .payload = .{ .text = try gpa.dupe(u8, "answer") },
         } },
-        .{ .turn = .{
-            .generation = 12,
-            .payload = .{ .steering_consumed = .{
-                .text = try gpa.dupe(u8, "folded"),
-                .count = 1,
-            } },
-        } },
     };
     try std.testing.expect(!try app.applyBatch(&events));
 
     try std.testing.expect(app.session.mode == .turn);
     try std.testing.expect(app.pending_turn_result.?.terminal_queued);
     const prefix = app.session.transcript.blocks();
-    try std.testing.expectEqual(@as(usize, 2), prefix.len);
+    try std.testing.expectEqual(@as(usize, 1), prefix.len);
     try std.testing.expectEqualStrings("answer", prefix[0].content.model.items);
-    try std.testing.expectEqualStrings("folded", prefix[1].content.user.items);
 
     var fence: [1]UiEvent = undefined;
     const count = try app.queue.get(io, &fence, 1);
@@ -5463,7 +3815,7 @@ test "cancel replaces an interrupted terminal fence after queued progress" {
 
     try std.testing.expect(app.session.mode == .prompt);
     try std.testing.expect(app.pending_turn_result == null);
-    try std.testing.expectEqual(@as(usize, 2), app.session.transcript.blocks().len);
+    try std.testing.expectEqual(@as(usize, 1), app.session.transcript.blocks().len);
 }
 
 test "an interrupted terminal fence retries after a full queue drain" {
@@ -5550,8 +3902,6 @@ test "a cancel that loses the race applies the failed joined result" {
     try app.session.transcript.append(.user, .{}, "prompt");
     var prompt = try ui.Editor.Draft.fromText(gpa, "prompt");
     app.session.retainTurnPrompt(&prompt, 0);
-    try seedSteering(&app, "steer");
-    try app.agent.steering.push("steer");
 
     const worker_result: WorkerResult = .{
         .outcome = .{ .receipt = zero_receipt, .disposition = .{ .failed = error.Boom } },
@@ -5568,69 +3918,12 @@ test "a cancel that loses the race applies the failed joined result" {
     try std.testing.expect(!try app.applyBatch(events[0..count]));
 
     try std.testing.expect(app.session.mode == .prompt);
-    try std.testing.expectEqualStrings("prompt\n\nsteer", app.session.editor.visible());
-    const remaining_steering = try app.agent.steering.take();
-    defer {
-        for (remaining_steering) |message| gpa.free(message);
-        gpa.free(remaining_steering);
-    }
-    try std.testing.expectEqual(@as(usize, 0), remaining_steering.len);
+    try std.testing.expectEqualStrings("prompt", app.session.editor.visible());
     const blocks = app.session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 1), blocks.len);
     try std.testing.expectEqualStrings("boom", blocks[0].content.event.text.items);
     try app.session.paint(.{ .columns = 80, .rows = 24 });
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "boom") != null);
-}
-
-test "a joined completion returns late steering to the editor" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-
-    var app: App = undefined;
-    app.initForTest(gpa);
-    app.turn_generation = 3;
-    defer app.drainQueue();
-    app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = test_anthropic_model,
-        .system = "",
-        .retry = .{},
-        .environ = .empty,
-    });
-    defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
-    defer app.session.deinit();
-    app.session.beginTurn(3);
-
-    try app.agent.steering.push("older");
-    try seedSteering(&app, "older");
-    try app.session.editor.insert("draft");
-    const worker_result: WorkerResult = .{
-        .outcome = .{ .receipt = zero_receipt, .disposition = .completed },
-        .error_text = null,
-        .generation = 3,
-    };
-    app.turn_future = try io.concurrent(fakeWorker, .{&worker_result});
-    try app.cancelTurn();
-    try std.testing.expect(app.session.mode == .turn);
-
-    var events: [1]UiEvent = undefined;
-    const count = try app.queue.get(io, &events, 1);
-    try std.testing.expectEqual(events.len, count);
-    try std.testing.expect(!try app.applyBatch(events[0..count]));
-
-    try std.testing.expect(app.session.mode == .prompt);
-    try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
-    try std.testing.expectEqualStrings("older\n\ndraft", app.session.editor.visible());
-    try std.testing.expect(!app.session.hasSteering());
-    try std.testing.expectEqualStrings(
-        "Drinky returned every queued message to the editor.",
-        app.session.notice.?.content,
-    );
-    const remaining = try app.agent.steering.take();
-    defer gpa.free(remaining);
-    try std.testing.expectEqual(@as(usize, 0), remaining.len);
 }
 
 test "shutdown frees the worker result without restoring or recording an event" {
@@ -5652,7 +3945,9 @@ test "shutdown frees the worker result without restoring or recording an event" 
     defer app.session.deinit();
     app.session.beginTurn(1);
 
-    try seedSteering(&app, "keep");
+    try app.session.editor.insert("keep");
+    var prompt = app.session.editor.detachTrimmed();
+    app.session.retainTurnPrompt(&prompt, 0);
     const worker_result: WorkerResult = .{
         .outcome = .{ .receipt = zero_receipt, .disposition = .{ .failed = error.Boom } },
         .error_text = try gpa.dupe(u8, "boom"),
@@ -5665,124 +3960,7 @@ test "shutdown frees the worker result without restoring or recording an event" 
     try std.testing.expect(app.turn_future == null);
 }
 
-test "a delayed consumed event after ctrl+p cannot remove newer steering" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-
-    var app: App = undefined;
-    app.initForTest(gpa);
-    app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = test_anthropic_model,
-        .system = "",
-        .retry = .{},
-        .environ = .empty,
-    });
-    defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
-    defer app.session.deinit();
-    app.session.beginTurn(1);
-
-    try app.session.editor.insert("old");
-    try app.submitSteering();
-    const folded = try app.agent.steering.take();
-    for (folded) |message| gpa.free(message);
-    gpa.free(folded);
-
-    try app.pullSteering();
-    try std.testing.expectEqual(@as(usize, 1), app.session.steering.items.len);
-    try std.testing.expectEqual(@as(usize, 1), app.session.steering_retained_count);
-    try app.session.editor.insert("new");
-    try app.submitSteering();
-
-    _ = try app.session.applyTurnEvent(&.{
-        .generation = 1,
-        .payload = .{ .steering_consumed = .{
-            .text = try gpa.dupe(u8, "old"),
-            .count = 1,
-        } },
-    });
-    try std.testing.expectEqual(@as(usize, 1), app.session.steering_retained_count);
-    try std.testing.expectEqual(@as(usize, 2), app.session.steering.items.len);
-    try std.testing.expectEqualStrings(
-        "new",
-        app.session.steering.items[app.session.steering_retained_count].draft.visible.items,
-    );
-
-    try app.pullSteering();
-    try std.testing.expectEqualStrings("new", app.session.editor.visible());
-}
-
-test "a delivery restored after ctrl+p recalls its retained rich drafts" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-
-    var app: App = undefined;
-    app.initForTest(gpa);
-    app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = test_anthropic_model,
-        .system = "",
-        .retry = .{},
-        .environ = .empty,
-    });
-    defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
-    defer app.session.deinit();
-    app.session.beginTurn(1);
-
-    try app.session.editor.insert("a");
-    try app.submitSteering();
-    try app.session.editor.insert("b");
-    try app.submitSteering();
-    var delivery = try app.agent.steering.take();
-    defer {
-        for (delivery) |message| gpa.free(message);
-        gpa.free(delivery);
-    }
-
-    try app.pullSteering();
-    try std.testing.expectEqual(@as(usize, 2), app.session.steering.items.len);
-    try std.testing.expectEqual(@as(usize, 2), app.session.steering_retained_count);
-    try std.testing.expectEqualStrings("", app.session.editor.visible());
-
-    app.agent.steering.restoreTaken(&delivery);
-    try app.pullSteering();
-    try std.testing.expectEqual(@as(usize, 0), app.session.steering.items.len);
-    try std.testing.expectEqual(@as(usize, 0), app.session.steering_retained_count);
-    try std.testing.expectEqualStrings("a\n\nb", app.session.editor.visible());
-}
-
-test "recall of literal-edge-trimmed steering rejoins without edge spaces" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-
-    var app: App = undefined;
-    app.initForTest(gpa);
-    app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = test_anthropic_model,
-        .system = "",
-        .retry = .{},
-        .environ = .empty,
-    });
-    defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
-    defer app.session.deinit();
-    app.session.beginTurn(1);
-
-    try app.session.editor.insert(" a ");
-    try app.submitSteering();
-    try app.session.editor.insert(" b ");
-    try app.submitSteering();
-    try app.pullSteering();
-    try std.testing.expectEqualStrings("a\n\nb", app.session.editor.visible());
-}
-
-test "mid-turn Enter queues a message but refuses a slash line or a blank line" {
+test "mid-turn Enter keeps the text, refuses a slash line, and ignores a blank line" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -5802,7 +3980,7 @@ test "mid-turn Enter queues a message but refuses a slash line or a blank line" 
     app.session.beginTurn(1);
 
     try app.session.editor.insert("/model");
-    try app.submitSteering();
+    try app.handleKey(&.enter);
     try std.testing.expectEqualStrings("/model", app.session.editor.visible());
     try std.testing.expectEqualStrings(
         "The command /model cannot run while a turn runs.",
@@ -5815,224 +3993,45 @@ test "mid-turn Enter queues a message but refuses a slash line or a blank line" 
 
     app.session.editor.clear();
     try app.session.editor.insert("   ");
-    try app.submitSteering();
+    try app.handleKey(&.enter);
     try std.testing.expectEqualStrings("   ", app.session.editor.visible());
+    try std.testing.expect(app.session.notice == null);
 
     app.session.editor.clear();
     try app.session.editor.insert("/model names the account too");
-    try app.submitSteering();
+    try app.handleKey(&.enter);
     try std.testing.expectEqualStrings(
         "/model names the account too",
         app.session.editor.visible(),
     );
     try std.testing.expectEqualStrings(
-        "Enter: Queue as a message · The command /model takes no argument.",
+        "The command /model takes no argument.",
         app.session.notice.?.content,
     );
-    try std.testing.expectEqual(
-        ai.command.Outcome.Severity.warning,
-        app.session.notice.?.severity,
-    );
 
-    app.session.cancelConfirmation(.message);
     app.session.editor.clear();
     try app.session.editor.insert("/nope");
-    try app.submitSteering();
+    try app.handleKey(&.enter);
     try std.testing.expectEqualStrings("/nope", app.session.editor.visible());
     try std.testing.expectEqualStrings(
-        "Enter: Queue as a message · Drinky does not recognize the command /nope.",
+        "Drinky does not recognize the command /nope.",
         app.session.notice.?.content,
     );
-
-    try std.testing.expectEqual(@as(usize, 0), app.session.steering.items.len);
-    const blocked = try app.agent.steering.take();
-    defer gpa.free(blocked);
-    try std.testing.expectEqual(@as(usize, 0), blocked.len);
-    app.session.cancelConfirmation(.message);
 
     app.session.editor.clear();
     try app.session.editor.insert("the account matters too");
-    try app.submitSteering();
-    try std.testing.expectEqualStrings("", app.session.editor.visible());
-    const taken = try app.agent.steering.take();
-    defer {
-        for (taken) |message| gpa.free(message);
-        gpa.free(taken);
-    }
-    try std.testing.expectEqual(@as(usize, 1), taken.len);
-    try std.testing.expectEqualStrings("the account matters too", taken[0]);
-}
-
-const test_status_line = "Context: 0% (0/1.0M) · Cost: ~$0.00 · " ++
-    "Model: anthropic-plan/claude-opus-5 · Effort: low";
-
-test "/status records one terminal event for each request, also during a turn" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-
-    var app: App = undefined;
-    app.initForTest(gpa);
-    defer app.input.deinit();
-    app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = test_anthropic_model,
-        .system = "",
-        .retry = .{},
-        .environ = .empty,
-    });
-    defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
-    defer app.session.deinit();
-
-    try app.handleKeys("/status\r");
-    try std.testing.expect(app.session.mode == .prompt);
-    try std.testing.expectEqualStrings("", app.session.editor.visible());
-    try std.testing.expectEqual(@as(usize, 1), app.session.transcript.blocks().len);
-    const first = &app.session.transcript.blocks()[0].content.event;
-    try std.testing.expectEqualStrings(test_status_line, first.text.items);
-    try std.testing.expect(!first.is_error);
-    try std.testing.expect(!first.mirrored);
-    try std.testing.expect(first.survives_rewind);
-
-    try app.handleKeys("/status\r");
-    try std.testing.expectEqual(@as(usize, 2), app.session.transcript.blocks().len);
-    try std.testing.expectEqualStrings(test_status_line, app.lastEventText());
-
-    app.session.beginTurn(1);
-    app.retry = .{ .failure = try gpa.dupe(u8, "an older failure") };
-    defer app.dropRetry();
-    try app.handleKeys("/effort\r");
-    try std.testing.expectEqualStrings("/effort", app.session.editor.visible());
-    try std.testing.expectEqualStrings(
-        "The command /effort cannot run while a turn runs.",
-        app.session.notice.?.content,
+    try app.handleKey(&.enter);
+    try std.testing.expectEqualStrings("the account matters too", app.session.editor.visible());
+    try std.testing.expectEqualStrings(turn_message_notice, app.session.notice.?.content);
+    try std.testing.expectEqual(
+        ai.command.Outcome.Severity.information,
+        app.session.notice.?.severity,
     );
-    app.session.editor.clear();
-    try app.handleKeys("/status\r");
     try std.testing.expect(app.session.mode == .turn);
-    try std.testing.expectEqualStrings("", app.session.editor.visible());
-    try std.testing.expectEqual(@as(usize, 3), app.session.transcript.blocks().len);
-    try std.testing.expectEqualStrings(test_status_line, app.lastEventText());
-    try std.testing.expect(!app.session.hasSteering());
-    try std.testing.expect(app.retry != null);
-    const queued = try app.agent.steering.take();
-    defer gpa.free(queued);
-    try std.testing.expectEqual(@as(usize, 0), queued.len);
-    try app.handleKeys("/status now\r");
-    try std.testing.expectEqualStrings("/status now", app.session.editor.visible());
-    try std.testing.expectEqualStrings(
-        "Enter: Queue as a message · The command /status takes no argument.",
-        app.session.notice.?.content,
-    );
-    try std.testing.expectEqual(@as(usize, 3), app.session.transcript.blocks().len);
-}
-
-test "a terminal status event neither splits a streamed reply nor disappears after a failed turn" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-
-    var app: App = undefined;
-    app.initForTest(gpa);
-    defer app.input.deinit();
-    app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = test_anthropic_model,
-        .system = "",
-        .retry = .{},
-        .environ = .empty,
-    });
-    defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
-    defer app.session.deinit();
-    app.session.beginTurn(1);
-
-    var opening = [_]UiEvent{.{ .turn = .{
-        .generation = 1,
-        .progress_sequence = 1,
-        .payload = .{ .text = try gpa.dupe(u8, "partial ") },
-    } }};
-    _ = try app.applyBatch(&opening);
-    try app.handleKeys("/status\r");
-    try std.testing.expectEqualStrings("", app.session.editor.visible());
-    try std.testing.expectEqual(@as(usize, 1), app.session.transcript.blocks().len);
-    var closing = [_]UiEvent{.{ .turn = .{
-        .generation = 1,
-        .progress_sequence = 2,
-        .payload = .{ .text = try gpa.dupe(u8, "answer") },
-    } }};
-    _ = try app.applyBatch(&closing);
-    try std.testing.expectEqual(@as(usize, 1), app.session.transcript.blocks().len);
-    try std.testing.expectEqualStrings(
-        "partial answer",
-        app.session.transcript.blocks()[0].content.model.items,
-    );
-
-    var result: WorkerResult = .{
-        .outcome = .{ .receipt = zero_receipt, .disposition = .{ .failed = error.ApiError } },
-        .error_text = try gpa.dupe(u8, "The provider refused the request."),
-    };
-    defer app.freeWorkerResult(&result);
-    try app.finishWorkerResult(&result);
-    try std.testing.expect(app.session.mode == .prompt);
-    const blocks = app.session.transcript.blocks();
-    try std.testing.expectEqual(@as(usize, 2), blocks.len);
-    try std.testing.expectEqualStrings(
-        "The provider refused the request.",
-        blocks[0].content.event.text.items,
-    );
-    try std.testing.expectEqualStrings(test_status_line, blocks[1].content.event.text.items);
-    try std.testing.expect(!blocks[1].content.event.mirrored);
-}
-
-test "late placeholder steering returns before a newer key in the same batch" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-
-    var app: App = undefined;
-    app.initForTest(gpa);
-    app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = test_anthropic_model,
-        .system = "",
-        .retry = .{},
-        .environ = .empty,
-    });
-    defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
-    defer app.session.deinit();
-    defer app.input.deinit();
-    defer app.drainQueue();
-    defer if (app.turn_future) |*future| {
-        const result = future.cancel(io);
-        app.freeWorkerResult(&result);
-    };
-    app.turn_generation = 1;
-    app.session.beginTurn(1);
-    const worker_result: WorkerResult = .{
-        .outcome = .{ .receipt = zero_receipt, .disposition = .completed },
-        .error_text = null,
-    };
-    app.turn_future = try io.concurrent(fakeWorker, .{&worker_result});
-
-    const payload = "line\n" ** 10 ++ "line";
-    try app.session.editor.paste(payload, true);
-    try app.submitSteering();
-    const events = [_]UiEvent{
-        .{ .turn = .{ .generation = 1, .payload = endedPayload() } },
-        .{ .keys = try gpa.dupe(u8, "new") },
-    };
-    try std.testing.expect(!try app.applyBatch(&events));
-
-    try std.testing.expect(app.session.mode == .prompt);
-    try std.testing.expectEqual(@as(usize, 0), app.session.steering.items.len);
-    try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
-    try std.testing.expectEqual(@as(usize, 1), app.session.editor.draft.atoms.items.len);
-    const expanded = try app.session.editor.expanded(.none);
-    defer gpa.free(expanded);
-    try std.testing.expectEqualStrings(payload ++ "new", expanded);
+    try std.testing.expect(!app.session.confirmations.contains(.message));
+    try app.handleKey(&.enter);
+    try std.testing.expectEqualStrings("the account matters too", app.session.editor.visible());
+    try std.testing.expect(app.session.mode == .turn);
 }
 
 test "a drained batch routes only the active turn generation" {
@@ -6379,10 +4378,8 @@ test "/new clears the conversation and the scrollback without a configuration ch
     } });
     const seeded: ai.Agent.Stats = .{ .cost = 2.5, .cache_usage = .{ .input = 10 } };
     app.agent.stats = seeded;
-    try app.agent.steering.push("old steering");
     try app.session.transcript.append(.user, .{}, "old prompt");
     app.session.stats_shown = seeded;
-    try seedSteering(&app, "old steering");
     try app.session.paint(.{ .columns = 80, .rows = 6 });
 
     try app.session.editor.insert("/new");
@@ -6397,16 +4394,12 @@ test "/new clears the conversation and the scrollback without a configuration ch
     try std.testing.expectEqual(@as(usize, 0), app.agent.items.items.len);
     try std.testing.expect(std.meta.eql(ai.Agent.Stats{}, app.agent.stats));
     try std.testing.expect(!std.mem.eql(u8, &cache_key, &app.agent.cache_key));
-    const steering = try app.agent.steering.take();
-    defer gpa.free(steering);
-    try std.testing.expectEqual(@as(usize, 0), steering.len);
     try std.testing.expectEqual(@as(usize, 1), app.session.transcript.blocks().len);
     try std.testing.expectEqualStrings(
         intro_text,
         app.session.transcript.blocks()[0].content.intro.items,
     );
     try std.testing.expect(std.meta.eql(ai.Agent.Stats{}, app.session.stats_shown));
-    try std.testing.expect(!app.session.hasSteering());
     try std.testing.expectEqualStrings("", app.session.editor.visible());
     try app.expectModel(test_anthropic_model.name());
     try std.testing.expectEqual(ai.llm.Effort.high, app.agent.effort);
@@ -7117,692 +5110,6 @@ test "the logout of the active account names the pick where the next list stands
     );
 }
 
-test "a principal replacement drops old evidence before the restored turn" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const home = try tmpPath(gpa, io, &tmp, "");
-    defer gpa.free(home);
-
-    var store = try tmp.dir.createDirPathOpen(io, ".drinky", .{});
-    store.close(io);
-    try tmp.dir.writeFile(io, .{
-        .sub_path = ".drinky/auth.json",
-        .data =
-        \\{ "anthropic-plan":
-        \\    { "access": "replacement", "refresh": "replacement",
-        \\      "expires_ms": 4102444800000,
-        \\      "account_uuid": "other", "organization_uuid": "other" } }
-        ,
-    });
-
-    var app: App = undefined;
-    app.initForTest(gpa);
-    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
-    defer app.accounts.deinit();
-    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_plan), .{
-        .model = test_anthropic_model,
-        .system = "",
-        .retry = .{},
-        .environ = .empty,
-    });
-    defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
-    defer app.session.deinit();
-    app.session.account_shown = .anthropic_plan;
-    app.session.beginTurn(1);
-
-    const replay: ai.llm.Item.Reasoning.Replay = .{ .anthropic_plan = .{
-        .signature = .{ .text = "thought", .signature = "proof" },
-    } };
-    try app.agent.items.append(gpa, .{ .reasoning = .{ .replay = try replay.dupe(gpa) } });
-    app.agent.stats.quota = .{ .primary = .{ .used_percent = 25, .window_minutes = 300 } };
-    app.agent.stats.credits = .{ .total = 10, .used = 2 };
-
-    var result: WorkerResult = .{
-        .outcome = .{
-            .receipt = zero_receipt,
-            .disposition = .credential_replaced,
-        },
-        .error_text = try gpa.dupe(u8, turnFailureText(error.CredentialReplaced).?),
-    };
-    defer app.freeWorkerResult(&result);
-    try app.finishWorkerResult(&result);
-
-    try std.testing.expectEqual(@as(usize, 0), app.agent.items.items.len);
-    try std.testing.expect(app.agent.stats.quota == null);
-    try std.testing.expect(app.agent.stats.credits == null);
-    try std.testing.expectEqual(ai.llm.Account.anthropic_plan, app.activeAccount().?);
-    try std.testing.expectEqual(ai.llm.Account.anthropic_plan, app.session.account_shown.?);
-    try std.testing.expect(app.session.mode == .prompt);
-    try std.testing.expect(app.agent.model == null);
-    const blocks = app.session.transcript.blocks();
-    try std.testing.expectEqual(@as(usize, 2), blocks.len);
-    try std.testing.expect(blocks[0].content.event.is_error);
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        blocks[0].content.event.text.items,
-        "Try the turn again.",
-    ) == null);
-    try std.testing.expectEqualStrings(
-        "Fetch the model list of anthropic-plan with /model.",
-        blocks[1].content.event.text.items,
-    );
-}
-
-test "a fetch that meets a replaced credential drops the evidence of the old principal" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const home = try tmpPath(gpa, io, &tmp, "");
-    defer gpa.free(home);
-
-    var store = try tmp.dir.createDirPathOpen(io, ".drinky", .{});
-    store.close(io);
-    try tmp.dir.writeFile(io, .{
-        .sub_path = ".drinky/auth.json",
-        .data =
-        \\{ "anthropic-plan":
-        \\    { "access": "replacement", "refresh": "replacement",
-        \\      "expires_ms": 4102444800000,
-        \\      "account_uuid": "other", "organization_uuid": "other" } }
-        ,
-    });
-
-    var app: App = undefined;
-    app.initForTest(gpa);
-    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
-    defer app.accounts.deinit();
-    try ai.testing.seedAccount(&app.accounts, .anthropic_plan, &.{"claude-opus-5"});
-    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_plan), .{
-        .model = test_anthropic_model,
-        .system = "",
-        .retry = .{},
-        .environ = .empty,
-    });
-    defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
-    defer app.session.deinit();
-    app.session.account_shown = .anthropic_plan;
-
-    const replay: ai.llm.Item.Reasoning.Replay = .{ .anthropic_plan = .{
-        .signature = .{ .text = "thought", .signature = "proof" },
-    } };
-    try app.agent.items.append(gpa, .{ .reasoning = .{ .replay = try replay.dupe(gpa) } });
-    try app.session.transcript.appendStream(.thinking, .anthropic_plan, "thought");
-
-    try app.applyOutcome(.{ .credential_replaced = .anthropic_plan });
-
-    try std.testing.expectEqual(@as(usize, 0), app.agent.items.items.len);
-    try std.testing.expect(app.accounts.catalog.isEmpty(.anthropic_plan));
-    try std.testing.expect(app.agent.model == null);
-    try std.testing.expectEqual(ai.llm.Account.anthropic_plan, app.activeAccount().?);
-
-    const blocks = app.session.transcript.blocks();
-    try std.testing.expectEqual(@as(usize, 1), blocks.len);
-    try std.testing.expectEqualStrings(
-        "Drinky found a replacement credential for anthropic-plan. " ++
-            "Drinky removed the prior account evidence. " ++
-            "Fetch the model list of anthropic-plan with /model.",
-        blocks[0].content.event.text.items,
-    );
-    try std.testing.expect(!blocks[0].content.event.is_error);
-}
-
-test "a fetch that meets a replaced credential on an idle account names that account" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const home = try tmpPath(gpa, io, &tmp, "");
-    defer gpa.free(home);
-
-    var store = try tmp.dir.createDirPathOpen(io, ".drinky", .{});
-    store.close(io);
-    try tmp.dir.writeFile(io, .{
-        .sub_path = ".drinky/auth.json",
-        .data =
-        \\{ "openai-plan":
-        \\    { "access": "a", "refresh": "r", "expires_ms": 4102444800000,
-        \\      "account_id": "account" } }
-        ,
-    });
-
-    var app: App = undefined;
-    app.initForTest(gpa);
-    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{ .anthropic = "sk-anthropic" });
-    defer app.accounts.deinit();
-    try ai.testing.seedAccount(&app.accounts, .openai_plan, &.{"gpt-5.6-sol"});
-    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_api_key), .{
-        .model = test_anthropic_model,
-        .system = "",
-        .retry = .{},
-        .environ = .empty,
-    });
-    defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
-    defer app.session.deinit();
-    app.session.account_shown = .anthropic_api_key;
-
-    try app.applyOutcome(.{ .credential_replaced = .openai_plan });
-
-    try std.testing.expectEqual(ai.llm.Account.anthropic_api_key, app.activeAccount().?);
-    try app.expectModel(test_anthropic_model.name());
-    try std.testing.expect(app.accounts.catalog.isEmpty(.openai_plan));
-
-    const blocks = app.session.transcript.blocks();
-    try std.testing.expectEqual(@as(usize, 1), blocks.len);
-    try std.testing.expectEqualStrings(
-        "Drinky found a replacement credential for openai-plan. " ++
-            "Drinky removed the prior account evidence. " ++
-            "Fetch the model list of openai-plan with /model.",
-        blocks[0].content.event.text.items,
-    );
-    try std.testing.expect(!blocks[0].content.event.is_error);
-}
-
-test "the login picker rereads the store and keeps the active Console key live" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const home = try tmpPath(gpa, io, &tmp, "");
-    defer gpa.free(home);
-
-    var store = try tmp.dir.createDirPathOpen(io, ".drinky", .{});
-    store.close(io);
-    try tmp.dir.writeFile(io, .{
-        .sub_path = ".drinky/auth.json",
-        .data =
-        \\{ "anthropic-api": { "api_key": "minted-first" } }
-        ,
-    });
-
-    var app: App = undefined;
-    app.initForTest(gpa);
-    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
-    defer app.accounts.deinit();
-    try ai.testing.seedAccount(&app.accounts, .anthropic_api, &.{"claude-opus-5"});
-    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_api), .{
-        .model = test_anthropic_model,
-        .system = "",
-        .retry = .{},
-        .environ = .empty,
-    });
-    defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
-    defer app.session.deinit();
-    app.session.account_shown = .anthropic_api;
-
-    const borrowed = app.agent.client.?.credentials.anthropic_api;
-    try app.applyOutcome(.login_picker);
-    try std.testing.expect(app.session.mode == .picking);
-    try std.testing.expectEqualStrings("Sign in", app.session.mode.picking.picker.title);
-    try std.testing.expectEqualStrings(
-        "anthropic-api",
-        app.session.mode.picking.picker.options[1].name,
-    );
-    try std.testing.expectEqual(borrowed.ptr, app.agent.client.?.credentials.anthropic_api.ptr);
-    try std.testing.expectEqual(
-        borrowed.ptr,
-        app.accounts.anthropic_console_auth.tokens.?.api_key.ptr,
-    );
-    try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
-    app.session.closePicker();
-
-    try tmp.dir.writeFile(io, .{
-        .sub_path = ".drinky/auth.json",
-        .data =
-        \\{ "anthropic-api": { "api_key": "minted-again" } }
-        ,
-    });
-    try app.applyOutcome(.login_picker);
-    try std.testing.expect(app.session.mode == .picking);
-    const replaced = app.agent.client.?.credentials.anthropic_api;
-    try std.testing.expectEqualStrings("minted-again", replaced);
-    try std.testing.expectEqual(
-        replaced.ptr,
-        app.accounts.anthropic_console_auth.tokens.?.api_key.ptr,
-    );
-    try std.testing.expect(app.accounts.catalog.isEmpty(.anthropic_api));
-    try std.testing.expect(app.agent.model == null);
-    const blocks = app.session.transcript.blocks();
-    try std.testing.expectEqual(@as(usize, 1), blocks.len);
-    try std.testing.expectEqualStrings(
-        "Drinky found a replacement credential for anthropic-api. " ++
-            "Drinky removed the prior account evidence. " ++
-            "Fetch the model list of anthropic-api with /model.",
-        blocks[0].content.event.text.items,
-    );
-}
-
-test "the login picker hands the session off an account another instance signed out" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const home = try tmpPath(gpa, io, &tmp, "");
-    defer gpa.free(home);
-
-    var store = try tmp.dir.createDirPathOpen(io, ".drinky", .{});
-    store.close(io);
-    try tmp.dir.writeFile(io, .{
-        .sub_path = ".drinky/auth.json",
-        .data =
-        \\{ "anthropic-plan":
-        \\    { "access": "a", "refresh": "r", "expires_ms": 4102444800000 } }
-        ,
-    });
-
-    var app: App = undefined;
-    app.initForTest(gpa);
-    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{ .anthropic = "key" });
-    defer app.accounts.deinit();
-    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_plan), .{
-        .model = test_anthropic_model,
-        .system = "",
-        .retry = .{},
-        .environ = .empty,
-    });
-    defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
-    defer app.session.deinit();
-    app.session.account_shown = .anthropic_plan;
-    try app.session.transcript.appendStream(.thinking, .anthropic_plan, "thought");
-
-    try tmp.dir.writeFile(io, .{ .sub_path = ".drinky/auth.json", .data = "{}" });
-    try app.applyOutcome(.login_picker);
-
-    try std.testing.expect(!app.accounts.isAuthenticated(.anthropic_plan));
-    try std.testing.expectEqual(ai.llm.Account.anthropic_api_key, app.activeAccount().?);
-    try std.testing.expectEqual(ai.llm.Account.anthropic_api_key, app.session.account_shown.?);
-    try std.testing.expect(app.agent.model == null);
-    const blocks = app.session.transcript.blocks();
-    try std.testing.expectEqual(@as(usize, 1), blocks.len);
-    try std.testing.expectEqualStrings(
-        "Another Drinky instance signed out of anthropic-plan. " ++
-            "Drinky now uses anthropic-api-key. " ++
-            "Fetch the model list of anthropic-api-key with /model.",
-        blocks[0].content.event.text.items,
-    );
-    try std.testing.expect(app.session.mode == .picking);
-    const picker = app.session.mode.picking.picker;
-    try std.testing.expectEqualStrings("anthropic-plan", picker.options[0].name);
-    try std.testing.expectEqualStrings("anthropic-api-key", picker.options[2].name);
-}
-
-test "the login picker signs out when another instance signed out the last account" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const home = try tmpPath(gpa, io, &tmp, "");
-    defer gpa.free(home);
-
-    var store = try tmp.dir.createDirPathOpen(io, ".drinky", .{});
-    store.close(io);
-    try tmp.dir.writeFile(io, .{
-        .sub_path = ".drinky/auth.json",
-        .data =
-        \\{ "openai-plan":
-        \\    { "access": "a", "refresh": "r", "expires_ms": 4102444800000,
-        \\      "account_id": "account" } }
-        ,
-    });
-
-    var app: App = undefined;
-    app.initForTest(gpa);
-    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
-    defer app.accounts.deinit();
-    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.openai_plan), .{
-        .model = test_anthropic_model,
-        .system = "",
-        .retry = .{},
-        .environ = .empty,
-    });
-    defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
-    defer app.session.deinit();
-    app.session.account_shown = .openai_plan;
-
-    try tmp.dir.writeFile(io, .{ .sub_path = ".drinky/auth.json", .data = "{}" });
-    try app.applyOutcome(.login_picker);
-
-    try std.testing.expect(app.agent.client == null);
-    try std.testing.expect(app.session.account_shown == null);
-    try std.testing.expectEqualStrings(
-        "Another Drinky instance signed out of openai-plan. Select an account to sign in.",
-        app.session.transcript.blocks()[0].content.event.text.items,
-    );
-    try std.testing.expect(app.session.mode == .picking);
-    try std.testing.expectEqual(@as(usize, 0), app.session.mode.picking.trail.len);
-    try std.testing.expectEqualStrings("openai-plan", app.session.mode.picking.picker.options[3].name);
-}
-
-test "the login picker shows a sign-in from another instance and keeps a rotated token" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const home = try tmpPath(gpa, io, &tmp, "");
-    defer gpa.free(home);
-
-    var store = try tmp.dir.createDirPathOpen(io, ".drinky", .{});
-    store.close(io);
-    try tmp.dir.writeFile(io, .{
-        .sub_path = ".drinky/auth.json",
-        .data =
-        \\{ "anthropic-plan":
-        \\    { "access": "a", "refresh": "r", "expires_ms": 4102444800000,
-        \\      "account_uuid": "user", "organization_uuid": "org" } }
-        ,
-    });
-
-    var app: App = undefined;
-    app.initForTest(gpa);
-    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
-    defer app.accounts.deinit();
-    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_plan), .{
-        .model = test_anthropic_model,
-        .system = "",
-        .retry = .{},
-        .environ = .empty,
-    });
-    defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
-    defer app.session.deinit();
-    app.session.account_shown = .anthropic_plan;
-    try app.session.transcript.appendStream(.thinking, .anthropic_plan, "thought");
-
-    try tmp.dir.writeFile(io, .{
-        .sub_path = ".drinky/auth.json",
-        .data =
-        \\{ "anthropic-plan":
-        \\    { "access": "a2", "refresh": "r2", "expires_ms": 4102444800000,
-        \\      "account_uuid": "user", "organization_uuid": "org" },
-        \\  "xai-plan":
-        \\    { "access": "x", "refresh": "xr", "expires_ms": 4102444800000 } }
-        ,
-    });
-    try app.applyOutcome(.login_picker);
-
-    try std.testing.expectEqual(ai.llm.Account.anthropic_plan, app.activeAccount().?);
-    try app.expectModel(test_anthropic_model.name());
-    try std.testing.expectEqualStrings("r2", app.accounts.anthropic_auth.tokens.?.refresh);
-    try std.testing.expectEqual(@as(usize, 1), app.session.transcript.blocks().len);
-    try std.testing.expect(app.session.transcript.blocks()[0].content == .thinking);
-    const picker = app.session.mode.picking.picker;
-    try std.testing.expectEqualStrings("anthropic-plan", picker.options[0].name);
-    try std.testing.expectEqualStrings("xai-plan", picker.options[5].name);
-    try std.testing.expectEqualStrings("Signed in", picker.options[5].tag.?);
-}
-
-test "the login picker settles every other account before the active one leaves" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const home = try tmpPath(gpa, io, &tmp, "");
-    defer gpa.free(home);
-
-    var store = try tmp.dir.createDirPathOpen(io, ".drinky", .{});
-    store.close(io);
-    try tmp.dir.writeFile(io, .{
-        .sub_path = ".drinky/auth.json",
-        .data =
-        \\{ "anthropic-plan":
-        \\    { "access": "a", "refresh": "r", "expires_ms": 4102444800000 },
-        \\  "openai-plan":
-        \\    { "access": "o", "refresh": "or", "expires_ms": 4102444800000,
-        \\      "account_id": "first" } }
-        ,
-    });
-
-    var app: App = undefined;
-    app.initForTest(gpa);
-    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
-    defer app.accounts.deinit();
-    try ai.testing.seedAccount(&app.accounts, .openai_plan, &.{"gpt-5.6-sol"});
-    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_plan), .{
-        .model = test_anthropic_model,
-        .system = "",
-        .retry = .{},
-        .environ = .empty,
-    });
-    defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
-    defer app.session.deinit();
-    app.session.account_shown = .anthropic_plan;
-
-    try tmp.dir.writeFile(io, .{
-        .sub_path = ".drinky/auth.json",
-        .data =
-        \\{ "openai-plan":
-        \\    { "access": "o2", "refresh": "or2", "expires_ms": 4102444800000,
-        \\      "account_id": "second" } }
-        ,
-    });
-    try app.applyOutcome(.login_picker);
-
-    try std.testing.expectEqual(ai.llm.Account.openai_plan, app.activeAccount().?);
-    try std.testing.expect(app.accounts.catalog.isEmpty(.openai_plan));
-    try std.testing.expect(app.agent.model == null);
-    const blocks = app.session.transcript.blocks();
-    try std.testing.expectEqual(@as(usize, 2), blocks.len);
-    try std.testing.expectEqualStrings(
-        "Drinky found a replacement credential for openai-plan. " ++
-            "Drinky removed the prior account evidence. " ++
-            "Fetch the model list of openai-plan with /model.",
-        blocks[0].content.event.text.items,
-    );
-    try std.testing.expectEqualStrings(
-        "Another Drinky instance signed out of anthropic-plan. " ++
-            "Drinky now uses openai-plan. " ++
-            "Fetch the model list of openai-plan with /model.",
-        blocks[1].content.event.text.items,
-    );
-}
-
-test "the login picker points the active client at a rotated credential" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const home = try tmpPath(gpa, io, &tmp, "");
-    defer gpa.free(home);
-
-    var store = try tmp.dir.createDirPathOpen(io, ".drinky", .{});
-    store.close(io);
-    try tmp.dir.writeFile(io, .{
-        .sub_path = ".drinky/auth.json",
-        .data =
-        \\{ "openai-plan":
-        \\    { "access": "o", "refresh": "or", "expires_ms": 4102444800000,
-        \\      "account_id": "account" } }
-        ,
-    });
-
-    var app: App = undefined;
-    app.initForTest(gpa);
-    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
-    defer app.accounts.deinit();
-    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.openai_plan), .{
-        .model = test_anthropic_model,
-        .system = "",
-        .retry = .{},
-        .environ = .empty,
-    });
-    defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
-    defer app.session.deinit();
-    app.session.account_shown = .openai_plan;
-
-    try tmp.dir.writeFile(io, .{
-        .sub_path = ".drinky/auth.json",
-        .data =
-        \\{ "openai-plan":
-        \\    { "access": "o2", "refresh": "or2", "expires_ms": 4102444800000,
-        \\      "account_id": "account" } }
-        ,
-    });
-    try app.applyOutcome(.login_picker);
-
-    try std.testing.expectEqual(
-        &app.accounts.openai_auth,
-        app.agent.client.?.credentials.openai_plan,
-    );
-    try std.testing.expectEqualStrings("or2", app.accounts.openai_auth.tokens.?.refresh);
-    try app.expectModel(test_anthropic_model.name());
-    try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
-}
-
-test "the login picker reports one entry it cannot read and settles the rest" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const home = try tmpPath(gpa, io, &tmp, "");
-    defer gpa.free(home);
-
-    var store = try tmp.dir.createDirPathOpen(io, ".drinky", .{});
-    store.close(io);
-    try tmp.dir.writeFile(io, .{
-        .sub_path = ".drinky/auth.json",
-        .data =
-        \\{ "anthropic-plan":
-        \\    { "access": "a", "refresh": "r", "expires_ms": 4102444800000 } }
-        ,
-    });
-
-    var app: App = undefined;
-    app.initForTest(gpa);
-    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
-    defer app.accounts.deinit();
-    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_plan), .{
-        .model = test_anthropic_model,
-        .system = "",
-        .retry = .{},
-        .environ = .empty,
-    });
-    defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
-    defer app.session.deinit();
-    app.session.account_shown = .anthropic_plan;
-
-    try tmp.dir.writeFile(io, .{
-        .sub_path = ".drinky/auth.json",
-        .data =
-        \\{ "anthropic-plan": { "access": 1 },
-        \\  "xai-plan":
-        \\    { "access": "x", "refresh": "xr", "expires_ms": 4102444800000 } }
-        ,
-    });
-    try app.applyOutcome(.login_picker);
-
-    try std.testing.expectEqual(ai.llm.Account.anthropic_plan, app.activeAccount().?);
-    try std.testing.expectEqualStrings("r", app.accounts.anthropic_auth.tokens.?.refresh);
-    const picker = app.session.mode.picking.picker;
-    try std.testing.expectEqualStrings("anthropic-plan", picker.options[0].name);
-    try std.testing.expectEqualStrings("xai-plan", picker.options[5].name);
-    try std.testing.expectEqualStrings("Signed in", picker.options[5].tag.?);
-    const blocks = app.session.transcript.blocks();
-    try std.testing.expectEqual(@as(usize, 1), blocks.len);
-    try std.testing.expect(blocks[0].content.event.is_error);
-    try std.testing.expect(std.mem.startsWith(
-        u8,
-        blocks[0].content.event.text.items,
-        "Drinky could not read the credential of anthropic-plan in ",
-    ));
-    try std.testing.expect(std.mem.endsWith(
-        u8,
-        blocks[0].content.event.text.items,
-        "because of error BadCredentials. The account stays as it was.",
-    ));
-}
-
-test "the login picker opens over an unreadable credential file and reports it" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const home = try tmpPath(gpa, io, &tmp, "");
-    defer gpa.free(home);
-
-    var store = try tmp.dir.createDirPathOpen(io, ".drinky", .{});
-    store.close(io);
-    try tmp.dir.writeFile(io, .{
-        .sub_path = ".drinky/auth.json",
-        .data =
-        \\{ "anthropic-plan":
-        \\    { "access": "a", "refresh": "r", "expires_ms": 4102444800000 } }
-        ,
-    });
-
-    var app: App = undefined;
-    app.initForTest(gpa);
-    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
-    defer app.accounts.deinit();
-    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_plan), .{
-        .model = test_anthropic_model,
-        .system = "",
-        .retry = .{},
-        .environ = .empty,
-    });
-    defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
-    defer app.session.deinit();
-    app.session.account_shown = .anthropic_plan;
-
-    try tmp.dir.writeFile(io, .{ .sub_path = ".drinky/auth.json", .data = "not json" });
-    try app.applyOutcome(.login_picker);
-
-    try std.testing.expectEqual(ai.llm.Account.anthropic_plan, app.activeAccount().?);
-    try std.testing.expect(app.accounts.isAuthenticated(.anthropic_plan));
-    try std.testing.expect(app.session.mode == .picking);
-    try std.testing.expectEqualStrings(
-        "anthropic-plan",
-        app.session.mode.picking.picker.options[0].name,
-    );
-    const blocks = app.session.transcript.blocks();
-    try std.testing.expectEqual(@as(usize, 1), blocks.len);
-    try std.testing.expect(blocks[0].content.event.is_error);
-    try std.testing.expect(std.mem.startsWith(
-        u8,
-        blocks[0].content.event.text.items,
-        "Drinky could not read the credential file ",
-    ));
-    try std.testing.expect(std.mem.endsWith(
-        u8,
-        blocks[0].content.event.text.items,
-        "because of error BadCredentials. " ++
-            "The account list shows the credentials from the last read.",
-    ));
-}
-
 test "token request failures keep the credential before a grant rejection removes it" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -8232,7 +5539,7 @@ test displayRoots {
     try std.testing.expectEqualStrings("/work/.agents/skills/demo/SKILL.md", bare);
 }
 
-test "a committed failure arms a retry that Esc dismisses" {
+test "a committed failure ends at the prompt with its error event" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -8249,7 +5556,6 @@ test "a committed failure arms a retry that Esc dismisses" {
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
-    defer app.dropRetry();
     app.session.beginTurn(1);
 
     var result: WorkerResult = .{
@@ -8257,7 +5563,6 @@ test "a committed failure arms a retry that Esc dismisses" {
             .receipt = .{
                 .history_base = 0,
                 .history_end = 2,
-                .steering_committed_count = 0,
             },
             .disposition = .{ .failed = error.ApiError },
         },
@@ -8267,29 +5572,23 @@ test "a committed failure arms a retry that Esc dismisses" {
     try app.finishWorkerResult(&result);
 
     try std.testing.expect(app.session.mode == .prompt);
-    try std.testing.expectEqualStrings("The provider is overloaded.", app.retry.?.failure);
-    try std.testing.expectEqual(Session.PromptOffer.retry, app.session.prompt_offer);
+    try std.testing.expectEqual(Herdr.State.idle, app.herdrState());
+    const blocks = app.session.transcript.blocks();
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    try std.testing.expect(blocks[0].content.event.is_error);
+    try std.testing.expectEqualStrings("The provider is overloaded.", blocks[0].content.event.text.items);
 
     try app.session.paint(.{ .columns = 80, .rows = 24 });
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "Failed turn") != null);
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        out.written(),
-        "Ctrl+N: Try again · Esc: Dismiss",
-    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "Failed turn") == null);
 
     try app.session.editor.insert("keep this text");
-    try app.handleKey(&.escape);
-    try std.testing.expect(app.retry == null);
-    try std.testing.expectEqual(Session.PromptOffer.none, app.session.prompt_offer);
-    try std.testing.expectEqualStrings("keep this text", app.session.editor.visible());
-
     try app.handleKey(&.{ .ctrl = 'n' });
     try std.testing.expect(app.session.mode == .prompt);
     try std.testing.expect(app.turn_future == null);
+    try std.testing.expectEqualStrings("keep this text", app.session.editor.visible());
 }
 
-test "Esc at the prompt dismisses a notice and a recovery offer together" {
+test "an uncommitted human failure returns the prompt to the editor" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -8306,50 +5605,6 @@ test "Esc at the prompt dismisses a notice and a recovery offer together" {
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
-    defer app.dropRetry();
-    app.session.beginTurn(1);
-
-    var result: WorkerResult = .{
-        .outcome = .{
-            .receipt = .{
-                .history_base = 0,
-                .history_end = 2,
-                .steering_committed_count = 0,
-            },
-            .disposition = .{ .failed = error.ApiError },
-        },
-        .error_text = try gpa.dupe(u8, "The provider is overloaded."),
-    };
-    defer app.freeWorkerResult(&result);
-    try app.finishWorkerResult(&result);
-
-    try app.session.applyOutcome(
-        try ai.command.Outcome.reportNotice(gpa, .information, "temporary", .{}),
-    );
-    try app.handleKey(&.escape);
-    try std.testing.expect(app.retry == null);
-    try std.testing.expectEqual(Session.PromptOffer.none, app.session.prompt_offer);
-    try std.testing.expect(app.session.notice == null);
-}
-
-test "an uncommitted human failure returns to the editor and arms no retry" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-
-    var app: App = undefined;
-    app.initForTest(gpa);
-    app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = test_anthropic_model,
-        .system = "",
-        .retry = .{},
-        .environ = .empty,
-    });
-    defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
-    defer app.session.deinit();
-    defer app.dropRetry();
 
     try app.session.transcript.append(.user, .{}, "write the docs");
     app.session.beginTurn(1);
@@ -8368,14 +5623,12 @@ test "an uncommitted human failure returns to the editor and arms no retry" {
     try app.finishWorkerResult(&result);
 
     try std.testing.expectEqualStrings("write the docs", app.session.editor.visible());
-    try std.testing.expect(app.retry == null);
-    try std.testing.expectEqual(Session.PromptOffer.none, app.session.prompt_offer);
     const blocks = app.session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 1), blocks.len);
     try std.testing.expect(blocks[0].content.event.is_error);
 }
 
-test "an uncommitted skill failure returns its line and arms no retry" {
+test "an uncommitted skill failure returns its line to the editor" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -8393,7 +5646,6 @@ test "an uncommitted skill failure returns its line and arms no retry" {
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
-    defer app.dropRetry();
 
     try app.session.editor.insert("/skill:demo apply it");
     const prompt: ai.command.Outcome.Prompt = .{
@@ -8405,7 +5657,6 @@ test "an uncommitted skill failure returns its line and arms no retry" {
     const base = try app.startSkillTurn(&prompt);
     var draft = app.session.editor.detachTrimmed();
     app.session.retainTurnPrompt(&draft, base);
-    try seedSteering(&app, "and keep the format");
 
     {
         const result = app.awaitTurnFuture().?;
@@ -8413,12 +5664,7 @@ test "an uncommitted skill failure returns its line and arms no retry" {
         try app.finishWorkerResult(&result);
     }
     try std.testing.expect(app.session.mode == .prompt);
-    try std.testing.expect(app.retry == null);
-    try std.testing.expectEqual(Session.PromptOffer.none, app.session.prompt_offer);
-    try std.testing.expectEqualStrings(
-        "/skill:demo apply it\n\nand keep the format",
-        app.session.editor.visible(),
-    );
+    try std.testing.expectEqualStrings("/skill:demo apply it", app.session.editor.visible());
     const blocks = app.session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 1), blocks.len);
     try std.testing.expect(blocks[0].content.event.is_error);
@@ -8428,164 +5674,11 @@ test "an uncommitted skill failure returns its line and arms no retry" {
     );
 }
 
-test "Ctrl+N sends the attempt and keeps the editor text" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-
-    var app: App = undefined;
-    app.initForTest(gpa);
-    defer app.drainQueue();
-    app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = test_anthropic_model,
-        .system = "",
-        .retry = .{},
-        .environ = .empty,
-    });
-    defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
-    defer app.session.deinit();
-    defer app.dropRetry();
-
-    app.setRetry(.{ .failure = try gpa.dupe(u8, "The provider is overloaded.") });
-    try app.session.editor.insert("a draft that stays");
-
-    try app.sendRetryTurn();
-
-    try std.testing.expect(app.session.mode == .turn);
-    try std.testing.expect(app.retry == null);
-    try std.testing.expectEqual(Session.PromptOffer.none, app.session.prompt_offer);
-    try std.testing.expectEqualStrings("a draft that stays", app.session.editor.visible());
-    try std.testing.expect(app.session.turn_prompt == null);
-    {
-        const blocks = app.session.transcript.blocks();
-        try std.testing.expectEqual(@as(usize, 1), blocks.len);
-        try std.testing.expectEqualStrings(Retry.note_text, blocks[0].content.user_note.items);
-    }
-
-    {
-        const result = app.awaitTurnFuture().?;
-        defer app.freeWorkerResult(&result);
-        try app.finishWorkerResult(&result);
-    }
-    try std.testing.expectEqual(Session.PromptOffer.retry, app.session.prompt_offer);
-    try std.testing.expect(std.mem.indexOf(u8, app.retry.?.failure, "SignedOut") != null);
-    try std.testing.expectEqualStrings("a draft that stays", app.session.editor.visible());
-    const blocks = app.session.transcript.blocks();
-    try std.testing.expectEqual(@as(usize, 1), blocks.len);
-    try std.testing.expect(blocks[0].content.event.is_error);
-}
-
-test "a shorten request records its line and keeps the editor text" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-
-    var app: App = undefined;
-    app.initForTest(gpa);
-    defer app.drainQueue();
-    app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = test_anthropic_model,
-        .system = "",
-        .retry = .{},
-        .environ = .empty,
-    });
-    defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
-    defer app.session.deinit();
-    defer app.dropRetry();
-
-    try app.session.editor.insert("a draft that stays");
-    try app.sendShortenTurn();
-
-    try std.testing.expect(app.session.mode == .turn);
-    try std.testing.expectEqualStrings("a draft that stays", app.session.editor.visible());
-    try std.testing.expect(app.session.turn_prompt == null);
-    {
-        const blocks = app.session.transcript.blocks();
-        try std.testing.expectEqual(@as(usize, 1), blocks.len);
-        try std.testing.expectEqualStrings(shorten_note_text, blocks[0].content.user_note.items);
-    }
-    {
-        const result = app.awaitTurnFuture().?;
-        defer app.freeWorkerResult(&result);
-        try app.finishWorkerResult(&result);
-    }
-    try std.testing.expect(app.session.mode == .prompt);
-    try std.testing.expectEqualStrings("a draft that stays", app.session.editor.visible());
-}
-
-test "a signed-out Ctrl+N names the sign-in and keeps the retry" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-
-    var app: App = undefined;
-    app.initForTest(gpa);
-    app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = test_anthropic_model,
-        .system = "",
-        .retry = .{},
-        .environ = .empty,
-    });
-    defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
-    defer app.session.deinit();
-    defer app.dropRetry();
-
-    try app.handleKey(&.{ .ctrl = 'n' });
-    try std.testing.expect(app.session.notice == null);
-    try std.testing.expect(app.turn_future == null);
-
-    app.setRetry(.{ .failure = try gpa.dupe(u8, "The provider is overloaded.") });
-    try app.handleKey(&.{ .ctrl = 'n' });
-    try std.testing.expect(app.retry != null);
-    try std.testing.expectEqual(Session.PromptOffer.retry, app.session.prompt_offer);
-    try std.testing.expect(app.turn_future == null);
-    try std.testing.expectEqualStrings(
-        "Sign in with /login before you try the turn again.",
-        app.session.notice.?.content,
-    );
-}
-
-test "Ctrl+N refuses while the account offers no model" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-
-    var app: App = undefined;
-    app.initForTest(gpa);
-    app.accounts = ai.testing.accounts(.{ .anthropic = "sk-ant" });
-    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_api_key), .{
-        .model = null,
-        .system = "",
-        .retry = .{},
-        .environ = .empty,
-    });
-    defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, null, .low);
-    defer app.session.deinit();
-    defer app.dropRetry();
-
-    app.setRetry(.{ .failure = try gpa.dupe(u8, "The provider is overloaded.") });
-    try app.handleKey(&.{ .ctrl = 'n' });
-
-    try std.testing.expect(app.turn_future == null);
-    try std.testing.expect(app.retry != null);
-    try std.testing.expectEqual(Session.PromptOffer.retry, app.session.prompt_offer);
-    try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
-    try std.testing.expectEqualStrings(no_model_refusal, app.session.notice.?.content);
-}
-
 test "a turn without a model reports a sentence and not the error name" {
     try std.testing.expectEqualStrings(no_model_refusal, turnFailureText(error.NoModel).?);
 }
 
-test "Enter sends a plain message and drops the waiting retry" {
+test "the Herdr state follows the turn" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -8603,60 +5696,6 @@ test "Enter sends a plain message and drops the waiting retry" {
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
-    defer app.dropRetry();
-
-    app.retry = .{ .failure = try gpa.dupe(u8, "The provider did not respond in time.") };
-    app.session.prompt_offer = .retry;
-
-    try app.session.editor.insert("also check the tests");
-    {
-        const base = try app.startUserTurn("also check the tests");
-        var prompt = app.session.editor.detachTrimmed();
-        app.session.retainTurnPrompt(&prompt, base);
-    }
-
-    try std.testing.expect(app.session.mode == .turn);
-    try std.testing.expect(app.retry == null);
-    try std.testing.expectEqual(Session.PromptOffer.none, app.session.prompt_offer);
-    try std.testing.expectEqualStrings("", app.session.editor.visible());
-    {
-        const blocks = app.session.transcript.blocks();
-        try std.testing.expectEqual(@as(usize, 1), blocks.len);
-        try std.testing.expectEqualStrings("also check the tests", blocks[0].content.user.items);
-    }
-
-    {
-        const result = app.awaitTurnFuture().?;
-        defer app.freeWorkerResult(&result);
-        try app.finishWorkerResult(&result);
-    }
-    try std.testing.expectEqualStrings("also check the tests", app.session.editor.visible());
-    try std.testing.expect(app.retry == null);
-    try std.testing.expectEqual(Session.PromptOffer.none, app.session.prompt_offer);
-    const blocks = app.session.transcript.blocks();
-    try std.testing.expectEqual(@as(usize, 1), blocks.len);
-    try std.testing.expect(blocks[0].content.event.is_error);
-}
-
-test "the Herdr state follows the turn and the waiting retry" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-
-    var app: App = undefined;
-    app.initForTest(gpa);
-    defer app.drainQueue();
-    app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = test_anthropic_model,
-        .system = "",
-        .retry = .{},
-        .environ = .empty,
-    });
-    defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
-    defer app.session.deinit();
-    defer app.dropRetry();
 
     try std.testing.expectEqual(Herdr.State.idle, app.herdrState());
     try app.session.openPage(&.{ .title = "Test page", .content = "body" });
@@ -8666,35 +5705,13 @@ test "the Herdr state follows the turn and the waiting retry" {
     app.session.beginTurn(1);
     try std.testing.expectEqual(Herdr.State.working, app.herdrState());
     app.session.endTurn();
-
-    app.setRetry(.{ .failure = try gpa.dupe(u8, "The provider is overloaded.") });
-    try std.testing.expectEqual(Herdr.State.blocked, app.herdrState());
-    app.session.beginTurn(2);
-    app.dismissOffer();
-    try std.testing.expectEqual(Herdr.State.working, app.herdrState());
-    app.session.endTurn();
-    try std.testing.expectEqual(Herdr.State.idle, app.herdrState());
-
-    app.setRevision(.{
-        .history = .{ .base = 0, .end = 0 },
-        .transcript_base = 0,
-        .transcript_end = 0,
-        .prompt = .empty,
-        .steering = .empty,
-        .mutated = false,
-    });
-    try std.testing.expectEqual(Herdr.State.blocked, app.herdrState());
-    app.session.beginTurn(3);
-    app.dismissOffer();
-    try std.testing.expectEqual(Herdr.State.working, app.herdrState());
-    app.session.endTurn();
     try std.testing.expectEqual(Herdr.State.idle, app.herdrState());
 
     app.herdr.sync(app.herdrState());
     try std.testing.expect(app.herdr.future == null);
 }
 
-test "canceling an attempt ends the recovery" {
+test "a committed cancel without a prompt ends at the prompt with its event" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -8711,38 +5728,23 @@ test "canceling an attempt ends the recovery" {
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
-    defer app.dropRetry();
 
     app.session.beginTurn(1);
-    app.turn_retry = true;
     try spawnCommittedCanceledTurn(&app);
     try app.cancelTurn();
 
     try std.testing.expect(app.session.mode == .prompt);
-    try std.testing.expect(app.retry == null);
-    try std.testing.expect(app.revision == null);
-    try std.testing.expectEqual(Session.PromptOffer.none, app.session.prompt_offer);
-    try std.testing.expect(!app.turn_retry);
     const blocks = app.session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 1), blocks.len);
     try std.testing.expectEqualStrings(
         "You canceled the turn.",
         blocks[0].content.event.text.items,
     );
-
-    try app.session.transcript.append(.user_note, .{}, shorten_note_text);
-    app.session.beginTurn(2);
-    app.session.markTurnBase(1);
-    try spawnCommittedCanceledTurn(&app);
-    try app.cancelTurn();
-    try std.testing.expect(app.revision == null);
-    try std.testing.expectEqual(Session.PromptOffer.none, app.session.prompt_offer);
-    try std.testing.expect(app.session.mode == .prompt);
 }
 
 const StagedTurn = struct {
     prompt: *ui.Editor.Draft,
-    source: Session.Message.Source = .terminal,
+    source: Session.TurnPrompt.Source = .terminal,
     tool: ?[]const u8 = null,
 };
 
@@ -8799,7 +5801,6 @@ fn stageCommittedPromptTurn(app: *App, result: *WorkerResult, staged: StagedTurn
         .outcome = .{ .receipt = .{
             .history_base = history_base,
             .history_end = app.agent.items.items.len,
-            .steering_committed_count = 0,
         }, .disposition = .canceled },
         .error_text = null,
         .generation = 1,
@@ -8833,7 +5834,7 @@ fn expectCanceledTurnStands(app: *const App, history_base: usize, transcript_bas
     try std.testing.expectEqualStrings("You canceled the turn.", last.content.event.text.items);
 }
 
-test "a committed cancellation offers the revision of the turn" {
+test "a committed cancellation keeps the turn and clears the editor" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -8851,7 +5852,6 @@ test "a committed cancellation offers the revision of the turn" {
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
-    defer app.dropRevision();
     try app.session.transcript.append(.intro, .{}, intro_text);
 
     for ([_]terminal.Input.Key{ .escape, .{ .ctrl = 'c' }, .{ .ctrl = 'd' } }) |key| {
@@ -8864,36 +5864,15 @@ test "a committed cancellation offers the revision of the turn" {
         try std.testing.expect(app.session.mode == .prompt);
         try std.testing.expect(app.turn_future == null);
         try std.testing.expectEqualStrings("", app.session.editor.visible());
-        try std.testing.expectEqual(Session.PromptOffer.revision, app.session.prompt_offer);
-        try std.testing.expect(app.retry == null);
-        try std.testing.expectEqual(Herdr.State.blocked, app.herdrState());
+        try std.testing.expectEqual(Herdr.State.idle, app.herdrState());
         try expectCanceledTurnStands(&app, 0, 1);
         try std.testing.expectEqual(@as(usize, 5), app.session.transcript.blocks().len);
-        const revision = app.revision.?;
-        try std.testing.expectEqual(@as(usize, 0), revision.history.base);
-        try std.testing.expectEqual(@as(usize, 2), revision.history.end);
-        try std.testing.expectEqual(@as(usize, 1), revision.transcript_base);
-        try std.testing.expectEqual(@as(usize, 5), revision.transcript_end);
-        try std.testing.expectEqualStrings("fix it", revision.prompt.visible.items);
-        try std.testing.expectEqual(@as(usize, 0), revision.steering.items.len);
-        try std.testing.expect(!revision.mutated);
-        app.dismissOffer();
+        try app.session.paint(.{ .columns = 80, .rows = 24 });
+        try std.testing.expect(std.mem.indexOf(u8, out.written(), "Canceled turn") == null);
     }
-
-    var result: WorkerResult = undefined;
-    try beginCommittedPromptTurn(&app, &result, "fix it", "read");
-    try app.cancelTurn();
-    try app.session.paint(.{ .columns = 80, .rows = 24 });
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "Canceled turn") != null);
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        out.written(),
-        "Ctrl+N: Remove and edit · Esc: Keep turn",
-    ) != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "Failed turn") == null);
 }
 
-test "an uncommitted cancellation restores the prompt and offers no revision" {
+test "an uncommitted cancellation restores the prompt" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -8911,7 +5890,6 @@ test "an uncommitted cancellation restores the prompt and offers no revision" {
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
-    defer app.dropRevision();
 
     const payload = "line\n" ** 15;
     try app.session.transcript.append(.user, .{}, payload);
@@ -8919,18 +5897,15 @@ test "an uncommitted cancellation restores the prompt and offers no revision" {
     try app.session.editor.paste(payload, true);
     var prompt = app.session.editor.detachTrimmed();
     app.session.retainTurnPrompt(&prompt, 0);
-    try seedSteering(&app, "and test");
     try app.session.editor.insert("draft");
     try spawnCanceledTurn(&app);
     try app.cancelTurn();
 
-    try std.testing.expect(app.revision == null);
-    try std.testing.expectEqual(Session.PromptOffer.none, app.session.prompt_offer);
     try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
     try std.testing.expectEqual(@as(usize, 1), app.session.editor.draft.atoms.items.len);
     const expanded = try app.session.editor.expanded(.none);
     defer gpa.free(expanded);
-    try std.testing.expectEqualStrings(payload ++ "\n\nand test\n\ndraft", expanded);
+    try std.testing.expectEqualStrings(payload ++ "\n\ndraft", expanded);
     app.session.editor.clear();
 
     var result: WorkerResult = undefined;
@@ -8941,7 +5916,6 @@ test "an uncommitted cancellation restores the prompt and offers no revision" {
     try spawnStagedTurn(&app, &result);
     try app.cancelTurn();
     try std.testing.expect(app.session.mode == .turn);
-    try std.testing.expect(app.revision == null);
     try app.queue.putOne(io, .{ .turn = .{
         .generation = 1,
         .progress_sequence = 2,
@@ -8952,968 +5926,9 @@ test "an uncommitted cancellation restores the prompt and offers no revision" {
     const count = try app.queue.get(io, &batch, 1);
     _ = try app.applyBatch(batch[0..count]);
     try std.testing.expect(app.session.mode == .prompt);
-    try std.testing.expect(app.revision == null);
-    try std.testing.expectEqual(Session.PromptOffer.none, app.session.prompt_offer);
 }
 
-test "a cancellation offers a revision only while the terminal holds the input" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-
-    var app: App = undefined;
-    app.initForTest(gpa);
-    defer app.drainQueue();
-    app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = test_anthropic_model,
-        .system = "",
-        .retry = .{},
-        .environ = .empty,
-    });
-    defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
-    defer app.session.deinit();
-    defer app.dropRevision();
-
-    var result: WorkerResult = undefined;
-    var external = try ui.Editor.Draft.fromText(gpa, "from the chat");
-    try stageCommittedPromptTurn(&app, &result, .{
-        .prompt = &external,
-        .source = .{ .external = 7 },
-    });
-    try spawnStagedTurn(&app, &result);
-    app.session.input.owner = .external;
-    try app.cancelTurn();
-    try std.testing.expect(app.revision == null);
-    try std.testing.expectEqual(Session.PromptOffer.none, app.session.prompt_offer);
-    try std.testing.expectEqualStrings("", app.session.editor.visible());
-    try expectCanceledTurnStands(&app, 0, 0);
-
-    app.agent.resetConversation();
-    app.session.transcript.truncate(0);
-    app.session.input.owner = .terminal;
-    external = try ui.Editor.Draft.fromText(gpa, "from the chat");
-    try stageCommittedPromptTurn(&app, &result, .{
-        .prompt = &external,
-        .source = .{ .external = 8 },
-    });
-    try spawnStagedTurn(&app, &result);
-    try app.cancelTurn();
-    try std.testing.expectEqual(Session.PromptOffer.revision, app.session.prompt_offer);
-    try std.testing.expectEqualStrings("from the chat", app.revision.?.prompt.visible.items);
-    try app.handleKey(&.{ .ctrl = 'n' });
-    try std.testing.expectEqualStrings("from the chat", app.session.editor.visible());
-    try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
-}
-
-test "Esc keeps the canceled turn while editing and a safe command keep the revision" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-
-    var app: App = undefined;
-    app.initForTest(gpa);
-    defer app.drainQueue();
-    app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = test_anthropic_model,
-        .system = "",
-        .retry = .{},
-        .environ = .empty,
-    });
-    defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
-    defer app.session.deinit();
-    defer app.dropRevision();
-
-    var result: WorkerResult = undefined;
-    try beginCommittedPromptTurn(&app, &result, "fix it", "write");
-    try app.cancelTurn();
-    try std.testing.expect(app.revision.?.mutated);
-
-    try app.handleKey(&.{ .ctrl = 'n' });
-    try std.testing.expectEqualStrings(revision_warning, app.session.notice.?.content);
-    try std.testing.expect(app.session.confirmations.contains(.revision));
-    try expectCanceledTurnStands(&app, 0, 0);
-    try app.handleKey(&.{ .char = 'x' });
-    try std.testing.expect(app.session.notice == null);
-    try std.testing.expect(!app.session.confirmations.contains(.revision));
-    try std.testing.expectEqual(Session.PromptOffer.revision, app.session.prompt_offer);
-    try app.handleKey(&.{ .ctrl = 'n' });
-    try std.testing.expectEqualStrings(revision_warning, app.session.notice.?.content);
-    try expectCanceledTurnStands(&app, 0, 0);
-
-    app.session.editor.clear();
-    try app.runCommand("/effort");
-    try std.testing.expect(app.session.mode == .picking);
-    try app.handleKey(&.escape);
-    try std.testing.expect(app.session.mode == .prompt);
-    try std.testing.expectEqual(Session.PromptOffer.revision, app.session.prompt_offer);
-    try app.runCommand("/effort");
-    try app.handleKey(&.down);
-    try app.handleKey(&.enter);
-    try std.testing.expect(app.session.mode == .prompt);
-    try std.testing.expectEqual(ai.llm.Effort.medium, app.agent.effort);
-    try std.testing.expectEqual(Session.PromptOffer.revision, app.session.prompt_offer);
-    try std.testing.expect(app.revision != null);
-    const blocks = app.session.transcript.blocks();
-    try std.testing.expectEqual(@as(usize, 5), blocks.len);
-    try std.testing.expect(blocks[4].content == .event);
-    try std.testing.expect(!blocks[4].content.event.turn_owned);
-
-    try app.session.editor.insert("keep this text");
-    try app.handleKey(&.escape);
-    try std.testing.expect(app.revision == null);
-    try std.testing.expectEqual(Session.PromptOffer.none, app.session.prompt_offer);
-    try std.testing.expectEqual(Herdr.State.idle, app.herdrState());
-    try std.testing.expectEqualStrings("keep this text", app.session.editor.visible());
-    try std.testing.expectEqual(@as(usize, 2), app.agent.items.items.len);
-    try std.testing.expectEqual(@as(usize, 5), app.session.transcript.blocks().len);
-    try app.handleKey(&.{ .ctrl = 'n' });
-    try std.testing.expect(app.session.mode == .prompt);
-    try std.testing.expect(app.session.notice == null);
-    try std.testing.expectEqual(@as(usize, 5), app.session.transcript.blocks().len);
-}
-
-test "a dismissal of the revision takes its armed confirmation" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-
-    var app: App = undefined;
-    app.initForTest(gpa);
-    defer app.drainQueue();
-    app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = test_anthropic_model,
-        .system = "",
-        .retry = .{},
-        .environ = .empty,
-    });
-    defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
-    defer app.session.deinit();
-    defer app.dropRevision();
-
-    var result: WorkerResult = undefined;
-    try beginCommittedPromptTurn(&app, &result, "fix it", "write");
-    try app.cancelTurn();
-    try app.handleKey(&.{ .ctrl = 'n' });
-    try std.testing.expect(app.session.confirmations.contains(.revision));
-
-    app.dismissOffer();
-    try std.testing.expect(!app.session.confirmations.contains(.revision));
-    try std.testing.expect(app.revision == null);
-    try std.testing.expectEqual(Session.PromptOffer.none, app.session.prompt_offer);
-}
-
-test "a prompt-history insertion appends after the draft and keeps the revision" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const home = try tmpPath(gpa, io, &tmp, "");
-    defer gpa.free(home);
-
-    var app: App = undefined;
-    try app.initHistoryTest(gpa, io, &out, home, true);
-    defer app.deinitHistoryTest();
-    defer app.controller.deinit();
-    defer app.dropRevision();
-    try app.prompt_history.record("older prompt");
-
-    var result: WorkerResult = undefined;
-    try beginCommittedPromptTurn(&app, &result, "fix it", null);
-    try app.cancelTurn();
-    try std.testing.expectEqual(Session.PromptOffer.revision, app.session.prompt_offer);
-
-    try app.session.editor.insert("typed");
-    try app.handleKeys("\t");
-    try std.testing.expect(app.session.mode == .picking);
-    try app.handleKey(&.enter);
-    try std.testing.expect(app.session.mode == .prompt);
-    try std.testing.expectEqualStrings("typed\n\nolder prompt", app.session.editor.visible());
-    try std.testing.expectEqual(Session.PromptOffer.revision, app.session.prompt_offer);
-    try std.testing.expect(app.revision != null);
-}
-
-test "a turn start and /new dismiss the revision and a failed start keeps it" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-
-    var app: App = undefined;
-    app.initForTest(gpa);
-    defer app.drainQueue();
-    app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = test_anthropic_model,
-        .system = "",
-        .retry = .{},
-        .environ = .empty,
-    });
-    defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
-    defer app.session.deinit();
-    defer app.dropRevision();
-
-    var result: WorkerResult = undefined;
-    try beginCommittedPromptTurn(&app, &result, "fix it", null);
-    try app.cancelTurn();
-    try std.testing.expect(app.revision != null);
-
-    app.turn_generation = std.math.maxInt(u64);
-    try std.testing.expectError(error.GenerationExhausted, app.startUserTurn("next"));
-    try std.testing.expect(app.revision != null);
-    try std.testing.expectEqual(Session.PromptOffer.revision, app.session.prompt_offer);
-    try std.testing.expectEqual(@as(usize, 3), app.session.transcript.blocks().len);
-    app.turn_generation = 1;
-
-    const base = try app.startUserTurn("next");
-    try std.testing.expect(app.revision == null);
-    try std.testing.expectEqual(Session.PromptOffer.none, app.session.prompt_offer);
-    try std.testing.expectEqual(@as(usize, 3), base);
-    try std.testing.expectEqual(@as(usize, 2), app.agent.items.items.len);
-    {
-        const finished = app.awaitTurnFuture().?;
-        defer app.freeWorkerResult(&finished);
-        try app.finishWorkerResult(&finished);
-    }
-    try std.testing.expect(app.session.mode == .prompt);
-
-    try beginCommittedPromptTurn(&app, &result, "fix it", null);
-    try app.cancelTurn();
-    try std.testing.expect(app.revision != null);
-    try app.applyOutcome(.new_conversation);
-    try std.testing.expect(app.revision == null);
-    try std.testing.expectEqual(Session.PromptOffer.none, app.session.prompt_offer);
-    try std.testing.expectEqual(@as(usize, 0), app.agent.items.items.len);
-    try std.testing.expectEqual(@as(usize, 1), app.session.transcript.blocks().len);
-}
-
-test "account evidence removal rebases the revision anchors and keeps the offer" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-
-    var app: App = undefined;
-    app.initForTest(gpa);
-    defer app.drainQueue();
-    app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = test_anthropic_model,
-        .system = "",
-        .retry = .{},
-        .environ = .empty,
-        .effort = .high,
-    });
-    defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .high);
-    defer app.session.deinit();
-    defer app.dropRevision();
-    app.session.showSetup(.anthropic_plan, test_anthropic_model, .high);
-
-    const replay: ai.llm.Item.Reasoning.Replay = .{ .anthropic_plan = .{
-        .signature = .{ .text = "earlier", .signature = "proof" },
-    } };
-    try app.agent.items.append(gpa, .{ .reasoning = .{ .replay = try replay.dupe(gpa) } });
-    try app.session.transcript.appendStream(.thinking, .anthropic_plan, "earlier");
-    try app.session.transcript.appendStream(.model, null, "earlier answer");
-    var result: WorkerResult = undefined;
-    var draft = try ui.Editor.Draft.fromText(gpa, "fix it");
-    try stageCommittedPromptTurn(&app, &result, .{ .prompt = &draft });
-    try app.agent.items.append(gpa, .{ .reasoning = .{ .replay = try replay.dupe(gpa) } });
-    result.outcome.receipt.history_end += 1;
-    _ = try app.session.applyTurnEvent(&.{
-        .generation = 1,
-        .progress_sequence = 2,
-        .progress_sequence_committed = 1,
-        .payload = .{ .thinking = try gpa.dupe(u8, "weigh it") },
-    });
-    result.progress_sequence = 2;
-    result.progress_sequence_committed = 2;
-    try spawnStagedTurn(&app, &result);
-    try app.cancelTurn();
-    {
-        const revision = app.revision.?;
-        try std.testing.expectEqual(@as(usize, 1), revision.history.base);
-        try std.testing.expectEqual(@as(usize, 4), revision.history.end);
-        try std.testing.expectEqual(@as(usize, 2), revision.transcript_base);
-        try std.testing.expectEqual(@as(usize, 6), revision.transcript_end);
-    }
-
-    app.dropAccountEvidence(.anthropic_plan);
-    try std.testing.expectEqual(Session.PromptOffer.revision, app.session.prompt_offer);
-    {
-        const revision = app.revision.?;
-        try std.testing.expectEqual(@as(usize, 0), revision.history.base);
-        try std.testing.expectEqual(@as(usize, 2), revision.history.end);
-        try std.testing.expectEqual(@as(usize, 1), revision.transcript_base);
-        try std.testing.expectEqual(@as(usize, 4), revision.transcript_end);
-    }
-
-    try app.handleKey(&.{ .ctrl = 'n' });
-    try std.testing.expect(app.revision == null);
-    try std.testing.expectEqual(@as(usize, 0), app.agent.items.items.len);
-    const blocks = app.session.transcript.blocks();
-    try std.testing.expectEqual(@as(usize, 1), blocks.len);
-    try std.testing.expectEqualStrings("earlier answer", blocks[0].content.model.items);
-    try std.testing.expectEqualStrings("fix it", app.session.editor.visible());
-}
-
-test "a credential replacement rebases both canonical ranges of the revision" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const home = try tmpPath(gpa, io, &tmp, "");
-    defer gpa.free(home);
-
-    var store = try tmp.dir.createDirPathOpen(io, ".drinky", .{});
-    store.close(io);
-    try tmp.dir.writeFile(io, .{
-        .sub_path = ".drinky/auth.json",
-        .data =
-        \\{ "anthropic-plan":
-        \\    { "access": "replacement", "refresh": "replacement",
-        \\      "expires_ms": 4102444800000,
-        \\      "account_uuid": "other", "organization_uuid": "other" } }
-        ,
-    });
-
-    var app: App = undefined;
-    app.initForTest(gpa);
-    defer app.drainQueue();
-    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{});
-    defer app.accounts.deinit();
-    try ai.testing.seedAccount(&app.accounts, .anthropic_plan, &.{"claude-opus-5"});
-    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_plan), .{
-        .model = test_anthropic_model,
-        .system = "",
-        .retry = .{},
-        .environ = .empty,
-        .effort = .high,
-    });
-    defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .high);
-    defer app.session.deinit();
-    defer app.dropRevision();
-    app.session.showSetup(.anthropic_plan, test_anthropic_model, .high);
-
-    const replay: ai.llm.Item.Reasoning.Replay = .{ .anthropic_plan = .{
-        .signature = .{ .text = "earlier", .signature = "proof" },
-    } };
-    try app.agent.items.append(gpa, .{ .reasoning = .{ .replay = try replay.dupe(gpa) } });
-    try app.session.transcript.appendStream(.thinking, .anthropic_plan, "earlier");
-    var result: WorkerResult = undefined;
-    try beginCommittedPromptTurn(&app, &result, "fix it", null);
-    try app.cancelTurn();
-
-    try app.applyOutcome(.{ .credential_replaced = .anthropic_plan });
-    try std.testing.expectEqual(Session.PromptOffer.revision, app.session.prompt_offer);
-    const revision = app.revision.?;
-    try std.testing.expectEqual(@as(usize, 0), revision.history.base);
-    try std.testing.expectEqual(@as(usize, 2), revision.history.end);
-    try std.testing.expectEqual(@as(usize, 0), revision.transcript_base);
-    try std.testing.expectEqual(@as(usize, 3), revision.transcript_end);
-    try std.testing.expectEqual(@as(usize, 4), app.session.transcript.blocks().len);
-
-    try app.handleKey(&.{ .ctrl = 'n' });
-    try std.testing.expectEqual(@as(usize, 0), app.agent.items.items.len);
-    const blocks = app.session.transcript.blocks();
-    try std.testing.expectEqual(@as(usize, 1), blocks.len);
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        blocks[0].content.event.text.items,
-        "replacement credential",
-    ) != null);
-}
-
-test "Ctrl+N after read-only calls removes the canceled turn on the first press" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-
-    var app: App = undefined;
-    app.initForTest(gpa);
-    defer app.drainQueue();
-    app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = test_anthropic_model,
-        .system = "",
-        .retry = .{},
-        .environ = .empty,
-    });
-    defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
-    defer app.session.deinit();
-    defer app.dropRevision();
-    try app.session.transcript.append(.intro, .{}, intro_text);
-    try app.session.transcript.append(.user, .{}, "earlier");
-    try app.agent.items.append(gpa, .{ .message = .{
-        .role = .user,
-        .text = try gpa.dupe(u8, "earlier"),
-    } });
-
-    var result: WorkerResult = undefined;
-    try beginCommittedPromptTurn(&app, &result, "fix it", "read");
-    app.agent.measured_context = .{
-        .tokens = 1200,
-        .model = test_anthropic_model,
-        .account = .anthropic_plan,
-        .reasoning = test_anthropic_model.reasoning(.low),
-    };
-    app.agent.stats.context_tokens = 1200;
-    app.agent.stats.cost = 0.75;
-    try app.session.editor.insert("draft");
-    try app.cancelTurn();
-    try std.testing.expectEqual(@as(?u64, 1200), app.session.stats_shown.context_tokens);
-    try app.session.paint(.{ .columns = 80, .rows = 24 });
-    app.mirror.cursor = app.session.transcript.blocks().len;
-    app.mirror.answer_serial = 5;
-
-    const removed_start = out.written().len;
-    try app.handleKey(&.{ .ctrl = 'n' });
-    try std.testing.expect(app.session.mode == .prompt);
-    try std.testing.expect(app.turn_future == null);
-    try std.testing.expect(app.revision == null);
-    try std.testing.expectEqual(Session.PromptOffer.none, app.session.prompt_offer);
-    try std.testing.expect(app.session.notice == null);
-    try std.testing.expectEqual(Herdr.State.idle, app.herdrState());
-    try std.testing.expectEqualStrings("fix it\n\ndraft", app.session.editor.visible());
-    try std.testing.expectEqual(app.session.editor.visible().len, app.session.editor.caret);
-
-    try std.testing.expectEqual(@as(usize, 1), app.agent.items.items.len);
-    try std.testing.expectEqualStrings("earlier", app.agent.items.items[0].message.text);
-    const blocks = app.session.transcript.blocks();
-    try std.testing.expectEqual(@as(usize, 2), blocks.len);
-    try std.testing.expect(blocks[0].content == .intro);
-    try std.testing.expectEqualStrings("earlier", blocks[1].content.user.items);
-
-    try std.testing.expect(app.agent.measured_context == null);
-    try std.testing.expect(app.agent.stats.context_tokens == null);
-    try std.testing.expect(app.session.stats_shown.context_tokens == null);
-    try std.testing.expectEqual(@as(f64, 0.75), app.agent.stats.cost);
-    try std.testing.expectEqual(@as(f64, 0.75), app.session.stats_shown.cost);
-
-    try std.testing.expectEqual(@as(usize, 2), app.mirror.cursor);
-    try std.testing.expect(app.mirror.namesAnswer(5));
-
-    try std.testing.expect(app.session.view.force_reset);
-    try app.session.paint(.{ .columns = 80, .rows = 24 });
-    const painted = try terminal.View.plainText(gpa, out.written()[removed_start..]);
-    defer gpa.free(painted);
-    try std.testing.expect(std.mem.indexOf(u8, out.written()[removed_start..], terminal.escape.screen_reset) != null);
-    try std.testing.expect(std.mem.indexOf(u8, painted, "the answer") == null);
-    try std.testing.expect(std.mem.indexOf(u8, painted, "You canceled the turn.") == null);
-
-    try app.handleKey(&.{ .ctrl = 'n' });
-    try std.testing.expectEqualStrings("fix it\n\ndraft", app.session.editor.visible());
-    try std.testing.expectEqual(@as(usize, 2), app.session.transcript.blocks().len);
-    try std.testing.expect(app.turn_future == null);
-}
-
-test "Ctrl+N after a mutating call warns first and removes on the second press" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-
-    var app: App = undefined;
-    app.initForTest(gpa);
-    defer app.drainQueue();
-    app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = test_anthropic_model,
-        .system = "",
-        .retry = .{},
-        .environ = .empty,
-    });
-    defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
-    defer app.session.deinit();
-    defer app.dropRevision();
-
-    for ([_][]const u8{ "write", "edit", "bash" }) |tool| {
-        var result: WorkerResult = undefined;
-        try beginCommittedPromptTurn(&app, &result, "fix it", tool);
-        try app.cancelTurn();
-        try std.testing.expect(app.revision.?.mutated);
-
-        try app.handleKey(&.{ .ctrl = 'n' });
-        try std.testing.expectEqualStrings(revision_warning, app.session.notice.?.content);
-        try std.testing.expectEqual(ai.command.Outcome.Severity.warning, app.session.notice.?.severity);
-        try expectCanceledTurnStands(&app, 0, 0);
-        try std.testing.expectEqual(@as(usize, 4), app.session.transcript.blocks().len);
-        try std.testing.expectEqualStrings("", app.session.editor.visible());
-        try std.testing.expectEqual(Session.PromptOffer.revision, app.session.prompt_offer);
-
-        try app.handleKey(&.{ .ctrl = 'n' });
-        try std.testing.expect(app.revision == null);
-        try std.testing.expect(app.session.notice == null);
-        try std.testing.expectEqual(@as(usize, 0), app.agent.items.items.len);
-        try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
-        try std.testing.expectEqualStrings("fix it", app.session.editor.visible());
-        app.session.editor.clear();
-    }
-
-    var result: WorkerResult = undefined;
-    var draft = try ui.Editor.Draft.fromText(gpa, "fix it");
-    try stageCommittedPromptTurn(&app, &result, .{ .prompt = &draft });
-    _ = try app.session.applyTurnEvent(&.{
-        .generation = 1,
-        .progress_sequence = 2,
-        .progress_sequence_committed = 1,
-        .payload = .{ .tool_start = .{
-            .name = try gpa.dupe(u8, "bash"),
-            .input_json = try gpa.dupe(u8, "{\"command\":\"ls\"}"),
-        } },
-    });
-    _ = try app.session.applyTurnEvent(&.{
-        .generation = 1,
-        .progress_sequence = 3,
-        .progress_sequence_committed = 1,
-        .payload = .{ .tool_result = .{
-            .name = try gpa.dupe(u8, "bash"),
-            .summary = .{ .text = try gpa.dupe(u8, "Time: 0ms · Exit code: 1") },
-            .is_error = true,
-        } },
-    });
-    result.progress_sequence = 3;
-    result.progress_sequence_committed = 3;
-    try spawnStagedTurn(&app, &result);
-    try app.cancelTurn();
-    try std.testing.expect(app.revision.?.mutated);
-    try app.handleKey(&.{ .ctrl = 'n' });
-    try std.testing.expectEqualStrings(revision_warning, app.session.notice.?.content);
-    try std.testing.expectEqual(@as(usize, 4), app.session.transcript.blocks().len);
-}
-
-test "Ctrl+N removes the retry event of the turn and keeps the events of the session" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-
-    var app: App = undefined;
-    app.initForTest(gpa);
-    defer app.drainQueue();
-    app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = test_anthropic_model,
-        .system = "",
-        .retry = .{},
-        .environ = .empty,
-    });
-    defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
-    defer app.session.deinit();
-    defer app.dropRevision();
-    try app.session.transcript.append(.event, .{}, "before the turn");
-
-    var result: WorkerResult = undefined;
-    var draft = try ui.Editor.Draft.fromText(gpa, "fix it");
-    try stageCommittedPromptTurn(&app, &result, .{ .prompt = &draft });
-    try app.recordAsyncEvent(.information, .{}, "You attached @bot.", .{});
-    _ = try app.session.applyTurnEvent(&.{
-        .generation = 1,
-        .progress_sequence = 2,
-        .progress_sequence_committed = 1,
-        .payload = .{ .stream_reset = .{ .attempt = 2, .cause = .{ .failure = error.Timeout } } },
-    });
-    _ = try app.session.applyTurnEvent(&.{
-        .generation = 1,
-        .progress_sequence = 3,
-        .progress_sequence_committed = 1,
-        .payload = .{ .text = try gpa.dupe(u8, "partial") },
-    });
-    result.progress_sequence = 3;
-    result.progress_sequence_committed = 1;
-    try spawnStagedTurn(&app, &result);
-    try app.cancelTurn();
-
-    const kept = app.session.transcript.blocks();
-    try std.testing.expectEqual(@as(usize, 6), kept.len);
-    try std.testing.expect(std.mem.indexOf(u8, kept[4].content.event.text.items, "retry attempt 2") != null);
-    try std.testing.expectEqualStrings("You canceled the turn.", kept[5].content.event.text.items);
-    try app.applyOutcome(try ai.command.Outcome.reportEvent(gpa, .information, "changed", .{}));
-    try std.testing.expectEqual(@as(usize, 7), app.session.transcript.blocks().len);
-    app.mirror.cursor = 5;
-
-    try app.handleKey(&.{ .ctrl = 'n' });
-    const blocks = app.session.transcript.blocks();
-    try std.testing.expectEqual(@as(usize, 3), blocks.len);
-    try std.testing.expectEqualStrings("before the turn", blocks[0].content.event.text.items);
-    try std.testing.expectEqualStrings("You attached @bot.", blocks[1].content.event.text.items);
-    try std.testing.expectEqualStrings("changed", blocks[2].content.event.text.items);
-    try std.testing.expectEqual(@as(usize, 2), app.mirror.cursor);
-}
-
-test "a revision restores the prompt and the committed steering above the editor text" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-
-    var app: App = undefined;
-    app.initForTest(gpa);
-    defer app.drainQueue();
-    app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = test_anthropic_model,
-        .system = "",
-        .retry = .{},
-        .environ = .empty,
-    });
-    defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
-    defer app.session.deinit();
-    defer app.dropRevision();
-
-    const payload = "line\n" ** 15;
-    var result: WorkerResult = undefined;
-    try app.session.editor.paste(payload, true);
-    var prompt = app.session.editor.detachTrimmed();
-    try stageCommittedPromptTurn(&app, &result, .{ .prompt = &prompt });
-    try seedSteering(&app, "and test");
-    _ = try app.session.applyTurnEvent(&.{
-        .generation = 1,
-        .progress_sequence = 2,
-        .progress_sequence_committed = 1,
-        .payload = .{ .steering_consumed = .{
-            .text = try gpa.dupe(u8, "and test"),
-            .count = 1,
-        } },
-    });
-    _ = try app.session.applyTurnEvent(&.{
-        .generation = 1,
-        .progress_sequence = 3,
-        .progress_sequence_committed = 2,
-        .payload = .{ .text = try gpa.dupe(u8, "second answer") },
-    });
-    try app.session.editor.insert("later");
-    try app.submitSteering();
-    try app.session.editor.insert("draft");
-    result.outcome.receipt.steering_committed_count = 1;
-    result.progress_sequence = 3;
-    result.progress_sequence_committed = 3;
-    try spawnStagedTurn(&app, &result);
-    try app.cancelTurn();
-
-    try std.testing.expectEqualStrings("later\n\ndraft", app.session.editor.visible());
-    try std.testing.expectEqual(@as(usize, 1), app.revision.?.steering.items.len);
-    try std.testing.expectEqualStrings("and test", app.revision.?.steering.items[0].visible.items);
-    try std.testing.expectEqual(@as(usize, 1), app.revision.?.prompt.atoms.items.len);
-
-    try app.handleKey(&.{ .ctrl = 'n' });
-    try std.testing.expectEqual(@as(usize, 1), app.session.editor.draft.atoms.items.len);
-    try std.testing.expectEqual(@as(u64, 1), app.session.editor.draft.atoms.items[0].id);
-    const expanded = try app.session.editor.expanded(.none);
-    defer gpa.free(expanded);
-    try std.testing.expectEqualStrings(payload ++ "\n\nand test\n\nlater\n\ndraft", expanded);
-    try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
-    try std.testing.expect(app.session.mode == .prompt);
-    try std.testing.expect(app.turn_future == null);
-}
-
-test "a revision keeps the prompt-history entry and a revised Enter records a new one" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const home = try tmpPath(gpa, io, &tmp, "");
-    defer gpa.free(home);
-
-    var app: App = undefined;
-    try app.initHistoryTest(gpa, io, &out, home, true);
-    defer app.deinitHistoryTest();
-    defer app.controller.deinit();
-    defer app.dropRevision();
-    try app.prompt_history.record("fix it");
-
-    var result: WorkerResult = undefined;
-    try beginCommittedPromptTurn(&app, &result, "fix it", null);
-    try app.cancelTurn();
-    try app.handleKey(&.{ .ctrl = 'n' });
-    try std.testing.expectEqualStrings("fix it", app.session.editor.visible());
-    try app.expectHistory(&.{"fix it"});
-
-    try app.handleKeys(" now");
-    try app.handleKey(&.enter);
-    try std.testing.expect(app.session.mode == .turn);
-    try app.expectHistory(&.{ "fix it now", "fix it" });
-    try app.finishHistoryTurn();
-}
-
-test "a failed revision changes nothing and keeps the offer" {
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
-    const gpa = failing.allocator();
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-
-    var app: App = undefined;
-    app.initForTest(gpa);
-    defer app.drainQueue();
-    app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = test_anthropic_model,
-        .system = "",
-        .retry = .{},
-        .environ = .empty,
-    });
-    defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
-    defer app.session.deinit();
-    defer app.dropRevision();
-
-    var result: WorkerResult = undefined;
-    try beginCommittedPromptTurn(&app, &result, "fix it", null);
-    try app.cancelTurn();
-
-    app.session.editor.deinit();
-    app.session.editor = ui.Editor.init(gpa);
-    failing.fail_index = failing.alloc_index;
-    failing.resize_fail_index = failing.resize_index;
-    try std.testing.expectError(error.OutOfMemory, app.handleKey(&.{ .ctrl = 'n' }));
-    failing.fail_index = std.math.maxInt(usize);
-    failing.resize_fail_index = std.math.maxInt(usize);
-    try std.testing.expect(app.revision != null);
-    try std.testing.expectEqual(Session.PromptOffer.revision, app.session.prompt_offer);
-    try std.testing.expectEqualStrings("fix it", app.revision.?.prompt.visible.items);
-    try std.testing.expectEqualStrings("", app.session.editor.visible());
-    try expectCanceledTurnStands(&app, 0, 0);
-
-    try app.handleKey(&.{ .ctrl = 'n' });
-    try std.testing.expect(app.revision == null);
-    try std.testing.expectEqualStrings("fix it", app.session.editor.visible());
-    try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
-}
-
-test "the revision survives an allocation failure around the cancellation" {
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
-    const gpa = failing.allocator();
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-
-    var app: App = undefined;
-    app.initForTest(gpa);
-    defer app.drainQueue();
-    app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = test_anthropic_model,
-        .system = "",
-        .retry = .{},
-        .environ = .empty,
-    });
-    defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
-    defer app.session.deinit();
-    defer app.dropRevision();
-
-    var result: WorkerResult = undefined;
-    var draft = try ui.Editor.Draft.fromText(gpa, "fix it");
-    try stageCommittedPromptTurn(&app, &result, .{ .prompt = &draft });
-    try seedSteering(&app, "and test");
-    _ = try app.session.applyTurnEvent(&.{
-        .generation = 1,
-        .progress_sequence = 2,
-        .progress_sequence_committed = 1,
-        .payload = .{ .steering_consumed = .{
-            .text = try gpa.dupe(u8, "and test"),
-            .count = 1,
-        } },
-    });
-    result.outcome.receipt.steering_committed_count = 1;
-    result.progress_sequence = 2;
-    result.progress_sequence_committed = 2;
-    try spawnStagedTurn(&app, &result);
-
-    try app.session.reserveSteeringRestore();
-    failing.fail_index = failing.alloc_index;
-    failing.resize_fail_index = failing.resize_index;
-    try std.testing.expectError(error.OutOfMemory, app.cancelTurn());
-    try std.testing.expect(app.session.mode == .turn);
-    try std.testing.expect(app.turn_future != null);
-    try std.testing.expect(app.revision == null);
-    try std.testing.expectEqual(@as(usize, 1), app.session.steering.items.len);
-    try std.testing.expectEqualStrings("and test", app.session.steering.items[0].draft.visible.items);
-    try std.testing.expectEqualStrings("fix it", app.session.turn_prompt.?.draft.visible.items);
-
-    failing.fail_index = std.math.maxInt(usize);
-    failing.resize_fail_index = std.math.maxInt(usize);
-    try app.session.reserveRevisionCapture();
-    failing.fail_index = failing.alloc_index;
-    failing.resize_fail_index = failing.resize_index;
-    try std.testing.expectError(error.OutOfMemory, app.cancelTurn());
-    failing.fail_index = std.math.maxInt(usize);
-    failing.resize_fail_index = std.math.maxInt(usize);
-    try std.testing.expect(app.session.mode == .prompt);
-    try std.testing.expectEqual(Session.PromptOffer.revision, app.session.prompt_offer);
-    const revision = app.revision.?;
-    try std.testing.expectEqualStrings("fix it", revision.prompt.visible.items);
-    try std.testing.expectEqual(@as(usize, 1), revision.steering.items.len);
-    try std.testing.expectEqualStrings("and test", revision.steering.items[0].visible.items);
-    try std.testing.expectEqual(@as(usize, 3), app.session.transcript.blocks().len);
-    try std.testing.expectEqual(@as(usize, 3), revision.transcript_end);
-
-    try app.handleKey(&.{ .ctrl = 'n' });
-    try std.testing.expectEqualStrings("fix it\n\nand test", app.session.editor.visible());
-    try std.testing.expectEqual(@as(usize, 0), app.session.transcript.blocks().len);
-    try std.testing.expectEqual(@as(usize, 0), app.agent.items.items.len);
-}
-
-test "a revision makes the skill guard search the shortened history again" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-
-    var app: App = undefined;
-    app.initForTest(gpa);
-    defer app.drainQueue();
-    app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = test_anthropic_model,
-        .system = "",
-        .retry = .{},
-        .environ = .empty,
-    });
-    defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
-    defer app.session.deinit();
-    defer app.dropRevision();
-    try app.skill_guard.add(.{ .glob = "**/*.zig", .skill = "zig-style", .source = "/skills/SKILL.md" });
-    app.agent.skill_guard = &app.skill_guard;
-
-    var result: WorkerResult = undefined;
-    try beginCommittedPromptTurn(&app, &result, "fix it", null);
-    try app.cancelTurn();
-    app.skill_guard.rule_items[0].loaded.store(true, .monotonic);
-
-    try app.handleKey(&.{ .ctrl = 'n' });
-    try std.testing.expect(!app.skill_guard.rules()[0].loaded.load(.monotonic));
-}
-
-test "a retry and a revision replace each other and Ctrl+N acts on the one that waits" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-
-    var app: App = undefined;
-    app.initForTest(gpa);
-    defer app.drainQueue();
-    app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = test_anthropic_model,
-        .system = "",
-        .retry = .{},
-        .environ = .empty,
-    });
-    defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
-    defer app.session.deinit();
-    defer app.dropRetry();
-    defer app.dropRevision();
-
-    app.setRetry(.{ .failure = try gpa.dupe(u8, "The provider is overloaded.") });
-    var result: WorkerResult = undefined;
-    try beginCommittedPromptTurn(&app, &result, "fix it", null);
-    try std.testing.expect(app.retry != null);
-    try app.cancelTurn();
-    try std.testing.expect(app.retry == null);
-    try std.testing.expect(app.revision != null);
-    try std.testing.expectEqual(Session.PromptOffer.revision, app.session.prompt_offer);
-
-    app.session.beginTurn(2);
-    var failed: WorkerResult = .{
-        .outcome = .{
-            .receipt = .{
-                .history_base = 2,
-                .history_end = 3,
-                .steering_committed_count = 0,
-            },
-            .disposition = .{ .failed = error.ApiError },
-        },
-        .error_text = try gpa.dupe(u8, "The provider is overloaded."),
-    };
-    defer app.freeWorkerResult(&failed);
-    try app.finishWorkerResult(&failed);
-    try std.testing.expect(app.revision == null);
-    try std.testing.expect(app.retry != null);
-    try std.testing.expectEqual(Session.PromptOffer.retry, app.session.prompt_offer);
-    try std.testing.expectEqual(Herdr.State.blocked, app.herdrState());
-
-    try app.session.editor.insert("keep");
-    try app.handleKey(&.{ .ctrl = 'n' });
-    try std.testing.expect(app.session.mode == .prompt);
-    try std.testing.expectEqualStrings(
-        "Sign in with /login before you try the turn again.",
-        app.session.notice.?.content,
-    );
-    try std.testing.expect(app.retry != null);
-    try std.testing.expectEqualStrings("keep", app.session.editor.visible());
-    try std.testing.expectEqual(@as(usize, 2), app.agent.items.items.len);
-}
-
-test "a retry survives an account switch and Ctrl+N routes to it" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const home = try tmpPath(gpa, io, &tmp, "");
-    defer gpa.free(home);
-
-    var app: App = undefined;
-    app.initForTest(gpa);
-    app.accounts = try ai.Accounts.init(gpa, io, home, .{}, .{
-        .anthropic = "sk-anthropic",
-        .openai = "sk-openai",
-    });
-    defer app.accounts.deinit();
-    try ai.testing.seedAccount(&app.accounts, .openai_api_key, &.{"gpt-5.6-sol"});
-    try app.state.record(.openai_api_key, test_openai_model, .low);
-    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_api_key), .{
-        .model = test_anthropic_model,
-        .system = "",
-        .retry = .{},
-        .environ = .empty,
-    });
-    defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
-    defer app.session.deinit();
-    app.session.account_shown = .anthropic_api_key;
-    defer app.dropRetry();
-
-    app.setRetry(.{ .failure = try gpa.dupe(u8, "The provider is overloaded.") });
-    try app.applyOutcome(.{ .switch_account = .openai_api_key });
-    try std.testing.expect(app.retry != null);
-    try std.testing.expectEqual(Session.PromptOffer.retry, app.session.prompt_offer);
-    try app.expectModel(test_openai_model.name());
-    try std.testing.expectEqual(@as(usize, 1), app.session.transcript.blocks().len);
-
-    app.turn_generation = std.math.maxInt(u64);
-    try std.testing.expectError(
-        error.GenerationExhausted,
-        app.handleKey(&.{ .ctrl = 'n' }),
-    );
-    try std.testing.expect(app.retry != null);
-    try std.testing.expectEqual(Session.PromptOffer.retry, app.session.prompt_offer);
-    try std.testing.expect(app.session.mode == .prompt);
-    try std.testing.expectEqual(@as(usize, 1), app.session.transcript.blocks().len);
-
-    try app.applyOutcome(.new_conversation);
-    try std.testing.expect(app.retry == null);
-    try std.testing.expectEqual(Session.PromptOffer.none, app.session.prompt_offer);
-    try std.testing.expectEqual(@as(usize, 1), app.session.transcript.blocks().len);
-    try std.testing.expect(app.session.transcript.blocks()[0].content == .intro);
-}
-
-test "a skill line runs while a retry waits and takes the context with it" {
+test "a skill line starts a turn with its note and its arguments" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -9943,7 +5958,6 @@ test "a skill line runs while a retry waits and takes the context with it" {
     defer app.agent.deinit();
     app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
     defer app.session.deinit();
-    defer app.dropRetry();
     app.skills = try ai.skills.discover(gpa, io, &.{
         .user_root = user_skills,
         .project_start = root,
@@ -9951,17 +5965,12 @@ test "a skill line runs while a retry waits and takes the context with it" {
     });
     defer app.skills.deinit();
 
-    app.retry = .{ .failure = try gpa.dupe(u8, "The provider is overloaded.") };
-    app.session.prompt_offer = .retry;
-
     try app.session.editor.insert("/skill:demo apply it");
     const prompt = (try app.dispatchCommand("/skill:demo apply it")).?.prompt;
     defer prompt.deinit(gpa);
     _ = try app.startSkillTurn(&prompt);
 
     try std.testing.expect(app.session.notice == null);
-    try std.testing.expect(app.retry == null);
-    try std.testing.expectEqual(Session.PromptOffer.none, app.session.prompt_offer);
     try std.testing.expect(app.turn_future != null);
     const blocks = app.session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 2), blocks.len);
@@ -10050,52 +6059,7 @@ test "a refused command line reaches the model on the next Enter" {
     try std.testing.expectEqualStrings("/nope tell me about this", app.session.editor.visible());
 }
 
-test "a refused command line queues as steering on the next Enter" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-
-    var app: App = undefined;
-    app.initForTest(gpa);
-    app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = test_anthropic_model,
-        .system = "",
-        .retry = .{},
-        .environ = .empty,
-    });
-    defer app.agent.deinit();
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
-    defer app.session.deinit();
-    app.session.beginTurn(1);
-
-    try app.session.editor.insert("/model");
-    try app.handleKey(&.enter);
-    try std.testing.expect(!app.session.confirmations.contains(.message));
-    try app.handleKey(&.enter);
-    try std.testing.expectEqualStrings("/model", app.session.editor.visible());
-
-    app.session.editor.clear();
-    try app.session.editor.insert("/nope steer with this");
-    try app.handleKey(&.enter);
-    try std.testing.expect(app.session.confirmations.contains(.message));
-    try std.testing.expectEqualStrings(
-        "Enter: Queue as a message · Drinky does not recognize the command /nope.",
-        app.session.notice.?.content,
-    );
-
-    try app.handleKey(&.enter);
-    try std.testing.expectEqualStrings("", app.session.editor.visible());
-    const taken = try app.agent.steering.take();
-    defer {
-        for (taken) |message| gpa.free(message);
-        gpa.free(taken);
-    }
-    try std.testing.expectEqual(@as(usize, 1), taken.len);
-    try std.testing.expectEqualStrings("/nope steer with this", taken[0]);
-}
-
-test "a turn that ends under the queue offer clears the row too" {
+test "a turn end clears the refusal of a slash line, and the prompt then offers the send" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -10117,14 +6081,14 @@ test "a turn that ends under the queue offer clears the row too" {
     try app.session.editor.insert("/nope tell me about this");
     try app.handleKey(&.enter);
     try std.testing.expectEqualStrings(
-        "Enter: Queue as a message · Drinky does not recognize the command /nope.",
+        "Drinky does not recognize the command /nope.",
         app.session.notice.?.content,
     );
+    try std.testing.expect(!app.session.confirmations.contains(.message));
 
     try app.session.endTurnWithReceipt(&.{
         .history_base = 0,
         .history_end = 0,
-        .steering_committed_count = 0,
     });
     try std.testing.expect(app.session.mode == .prompt);
     try std.testing.expect(!app.session.confirmations.contains(.message));
@@ -11022,41 +6986,6 @@ test showProject {
     try std.testing.expectEqualStrings("topic", app.session.branch().?);
 }
 
-test "the status answer states the branch inside a Herdr pane" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var marker = try tmp.dir.createDirPathOpen(io, ".git", .{});
-    marker.close(io);
-    try tmp.dir.writeFile(io, .{ .sub_path = ".git/HEAD", .data = "ref: refs/heads/topic\n" });
-    const root = try tmpPath(gpa, io, &tmp, "");
-    defer gpa.free(root);
-
-    var app: App = undefined;
-    app.initForTest(gpa);
-    app.session = Session.init(gpa, &out.writer, test_anthropic_model, .low);
-    defer app.session.deinit();
-    defer app.input.deinit();
-    defer app.controller.deinit();
-    app.directory_label = "~/project";
-    app.project_instructions = try ai.instructions.discover(gpa, io, root);
-    defer app.project_instructions.deinit();
-    app.showProject(true);
-    try std.testing.expectEqualStrings("", app.session.directory_shown);
-    try std.testing.expect(app.session.branch() == null);
-
-    const text = try app.statusText();
-    defer gpa.free(text);
-    try std.testing.expectEqualStrings(
-        "~/project (topic) · Context: 0% (0/1.0M) · Cost: ~$0.00 · " ++
-            "Model: anthropic-plan/claude-opus-5 · Effort: low",
-        text,
-    );
-}
-
 test "an input event re-reads the branch" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -11167,7 +7096,6 @@ test "progress allocation failure still finalizes a canceled turn" {
         .outcome = .{ .receipt = .{
             .history_base = 0,
             .history_end = 1,
-            .steering_committed_count = 0,
         }, .disposition = .canceled },
         .error_text = null,
         .generation = 1,
@@ -11285,7 +7213,6 @@ test "a committed cancel drains queued progress into the transcript before rewin
         .outcome = .{ .receipt = .{
             .history_base = 0,
             .history_end = 1,
-            .steering_committed_count = 0,
         }, .disposition = .canceled },
         .error_text = null,
         .generation = 5,
@@ -11310,11 +7237,6 @@ test "a committed cancel drains queued progress into the transcript before rewin
         blocks[3].content.event.text.items,
     );
     try std.testing.expectEqual(@as(f64, 2.5), app.session.stats_shown.cost);
-    defer app.dropRevision();
-    const revision = app.revision.?;
-    try std.testing.expectEqual(@as(usize, 0), revision.transcript_base);
-    try std.testing.expectEqual(@as(usize, 4), revision.transcript_end);
-    try std.testing.expectEqualStrings("prompt", revision.prompt.visible.items);
 }
 
 test "the frame grid holds a fixed period through a late wake and a slow paint" {
@@ -11381,8 +7303,6 @@ fn deinitRemoteTest(self: *App) void {
     self.controller.detach(.exit) catch {};
     self.controller.abortDetach() catch {};
     self.controller.deinit();
-    self.chat_picker.deinit();
-    self.dropRetry();
     self.freeRemoteStrings();
     self.drainQueue();
     self.input.deinit();
@@ -11676,7 +7596,7 @@ test "while a bot holds the input the terminal takes a detach alone, and Enter n
         app.session.notice.?.content,
     );
     const attached_blocks = app.session.transcript.blocks().len;
-    try app.handleKeys("/status\r");
+    try app.handleKeys("/effort\r");
     try std.testing.expectEqualStrings("", app.session.editor.visible());
     try std.testing.expectEqual(attached_blocks, app.session.transcript.blocks().len);
     try std.testing.expectEqualStrings("You attached @drinky_bot.", app.lastEventText());
@@ -11848,85 +7768,6 @@ test "a Telegram message runs as a prompt, and its refusals answer in the chat" 
     try std.testing.expect(std.mem.indexOf(u8, signed_out, "\"reply_parameters\":{\"message_id\":3}") != null);
 }
 
-test "a /status from Telegram gets one reply and no terminal event, also during a turn" {
-    const gpa = std.testing.allocator;
-    var threaded: std.Io.Threaded = .init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var server = try remote_testing.Server.init(gpa, io, &.{
-        .{ .method = "deleteWebhook", .replies = &.{.{ .body = remote_ok_true }} },
-        .{ .method = "setMyCommands", .replies = &.{.{ .body = remote_ok_true }} },
-        .{ .method = "getUpdates", .replies = &.{.{ .body = remote_ok_empty }} },
-        .{ .method = "sendMessage", .replies = &.{
-            .{ .body = remote_ok_sent },
-            .{ .body = remote_ok_sent },
-            .{ .body = "{\"ok\":true,\"result\":{\"message_id\":60}}" },
-            .{ .body = remote_ok_sent },
-            .{ .body = remote_ok_sent },
-            .{ .body = remote_ok_sent },
-        } },
-        .{ .method = "deleteMessage", .replies = &.{.{ .body = remote_ok_true }} },
-        .{ .method = "answerCallbackQuery", .replies = &.{.{ .body = remote_ok_true }} },
-    });
-    defer server.deinit();
-    try server.start();
-    var url_buffer: [64]u8 = undefined;
-
-    var app: App = undefined;
-    app.initRemoteTest(gpa, io, &out, &server, &url_buffer);
-    defer app.deinitRemoteTest();
-    app.session.showSetup(null, null, .low);
-    try app.controller.store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
-    try app.controller.attachSaved(0);
-    try server.waitForLongPoll();
-    const blocks_before = app.session.transcript.blocks().len;
-    const status_wrapped =
-        "ℹ ~/work/drinky · Context: 0 · Cost: ~$0.00 · Model: signed out · Effort: low";
-
-    try app.submitChatMessage("/status", 30);
-    const answer = try server.waitForSend(1);
-    try std.testing.expect(std.mem.indexOf(u8, answer, "\"text\":\"" ++ status_wrapped ++ "\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, answer, "\"reply_parameters\":{\"message_id\":30}") != null);
-    try std.testing.expectEqual(blocks_before, app.session.transcript.blocks().len);
-
-    try app.submitChatMessage("/help", 31);
-    _ = try server.waitForSend(2);
-    try app.handleChatTap("900", .{ .row = .{ .serial = 1, .index = 4 } });
-    try std.testing.expectEqualStrings(
-        "{\"callback_query_id\":\"900\"}",
-        try server.waitForRequest("/answerCallbackQuery", 0),
-    );
-    try std.testing.expectEqualStrings(
-        "{\"chat_id\":99,\"message_id\":60}",
-        try server.waitForRequest("/deleteMessage", 0),
-    );
-    const tapped = try server.waitForSend(3);
-    try std.testing.expect(std.mem.indexOf(u8, tapped, "\"text\":\"" ++ status_wrapped ++ "\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, tapped, "reply_parameters") == null);
-    try std.testing.expect(!app.chat_picker.isOpen());
-    try std.testing.expectEqual(blocks_before, app.session.transcript.blocks().len);
-
-    app.session.beginTurn(1);
-    try app.submitChatMessage("/effort", 32);
-    const refusal = try server.waitForSend(4);
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        refusal,
-        "\"text\":\"⚠ The command /effort cannot run while a turn runs.\"",
-    ) != null);
-    try app.submitChatMessage("/status", 33);
-    const during = try server.waitForSend(5);
-    try std.testing.expect(std.mem.indexOf(u8, during, "\"text\":\"" ++ status_wrapped ++ "\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, during, "\"reply_parameters\":{\"message_id\":33}") != null);
-    try std.testing.expect(app.session.mode == .turn);
-    try std.testing.expect(!app.session.hasSteering());
-    try std.testing.expectEqual(blocks_before, app.session.transcript.blocks().len);
-    try server.finish();
-    try std.testing.expectEqual(@as(usize, 6), server.sendCount());
-}
-
 test "a credential rejection returns the Telegram prompt to the editor" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -12039,7 +7880,7 @@ test "a pick after the detach wait attaches at once" {
     try server.finish();
 }
 
-test "a Telegram message during a turn queues as steering that drops while the bot holds the input" {
+test "a Telegram message during a turn gets a refusal and starts no turn" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
@@ -12056,7 +7897,6 @@ test "a Telegram message during a turn queues as steering that drops while the b
             .{ .body = remote_ok_sent },
             .{ .body = remote_ok_sent },
         } },
-        .{ .method = "setMessageReaction", .replies = &.{.{ .body = remote_ok_true }} },
     });
     defer server.deinit();
     try server.start();
@@ -12069,52 +7909,22 @@ test "a Telegram message during a turn queues as steering that drops while the b
     try app.controller.attachSaved(0);
     try server.waitForLongPoll();
     app.session.beginTurn(1);
+    const blocks_before = app.session.transcript.blocks().len;
 
-    try app.session.editor.insert("typed first");
-    try app.submitSteering();
     try app.submitChatMessage("from the chat", 12);
     try app.submitChatMessage("/new", 13);
     try app.submitChatMessage("/nope", 14);
-    try std.testing.expectEqual(@as(usize, 2), app.session.steering.items.len);
-    try std.testing.expectEqual(@as(i64, 12), app.session.steering.items[1].source.external);
-    const queued = try app.agent.steering.take();
-    defer {
-        for (queued) |message| gpa.free(message);
-        gpa.free(queued);
-    }
-    try std.testing.expectEqual(@as(usize, 2), queued.len);
-    try std.testing.expectEqualStrings("from the chat", queued[1]);
-    const refusal = try server.waitForSend(1);
+    const refused = try server.waitForSend(1);
+    try std.testing.expect(std.mem.indexOf(u8, refused, telegram_turn_refusal) != null);
+    try std.testing.expect(std.mem.indexOf(u8, refused, "\"reply_parameters\":{\"message_id\":12}") != null);
+    const refusal = try server.waitForSend(2);
     try std.testing.expect(std.mem.indexOf(u8, refusal, "The command /new cannot run while a turn runs.") != null);
-    const queued_mark = try server.waitForRequest("/setMessageReaction", 0);
-    try std.testing.expect(std.mem.indexOf(u8, queued_mark, "\"message_id\":12,\"reaction\":[{\"type\":\"emoji\",\"emoji\":\"👀\"}]") != null);
-    const unknown = try server.waitForSend(2);
+    const unknown = try server.waitForSend(3);
     try std.testing.expect(std.mem.indexOf(u8, unknown, "Drinky does not recognize the command /nope.") != null);
-
-    try app.session.endTurnWithReceipt(&.{
-        .history_base = 0,
-        .history_end = 0,
-        .steering_committed_count = 0,
-    });
-    try app.session.reserveSteeringRecall();
-    try std.testing.expectEqual(@as(usize, 1), app.session.recallLateSteering());
-    try std.testing.expectEqualStrings("typed first", app.session.editor.visible());
-    try std.testing.expectEqual(@as(usize, 0), app.session.steering.items.len);
-
-    app.session.editor.clear();
-    app.session.beginTurn(2);
-    try app.submitChatMessage("after the detach", 14);
-    try app.controller.detach(.user);
-    try std.testing.expect(app.session.input.owner == .none);
-    try app.session.endTurnWithReceipt(&.{
-        .history_base = 0,
-        .history_end = 0,
-        .steering_committed_count = 0,
-    });
-    try app.session.reserveSteeringRecall();
-    try std.testing.expectEqual(@as(usize, 1), app.session.recallLateSteering());
-    try std.testing.expectEqualStrings("after the detach", app.session.editor.visible());
-    app.agent.steering.clear();
+    try std.testing.expect(app.session.mode == .turn);
+    try std.testing.expectEqual(@as(u64, 1), app.session.mode.turn.generation);
+    try std.testing.expectEqual(blocks_before, app.session.transcript.blocks().len);
+    try std.testing.expect(app.session.turn_prompt == null);
     try server.finish();
 }
 
@@ -12137,7 +7947,6 @@ test "the chat mirrors a completed turn with its activity message, its answer, a
         } },
         .{ .method = "editMessageText", .replies = &.{.{ .body = remote_ok_true }} },
         .{ .method = "deleteMessage", .replies = &.{.{ .body = remote_ok_true }} },
-        .{ .method = "setMessageReaction", .replies = &.{.{ .body = remote_ok_true }} },
     });
     defer server.deinit();
     try server.start();
@@ -12169,7 +7978,6 @@ test "the chat mirrors a completed turn with its activity message, its answer, a
         .payload = .{ .usage = .{} },
     } }};
     _ = try app.applyBatch(&opening);
-    try std.testing.expectEqual(@as(usize, 0), server.countOf("/setMessageReaction"));
 
     var events = [_]UiEvent{.{ .turn = .{
         .generation = 1,
@@ -12178,21 +7986,18 @@ test "the chat mirrors a completed turn with its activity message, its answer, a
         .payload = .{ .text = try gpa.dupe(u8, "The **answer**.") },
     } }};
     _ = try app.applyBatch(&events);
-    const committed_mark = try server.waitForRequest("/setMessageReaction", 0);
-    try std.testing.expect(std.mem.indexOf(u8, committed_mark, "\"message_id\":7,\"reaction\":[{\"type\":\"emoji\",\"emoji\":\"👍\"}]") != null);
     const writing = try server.waitForRequest("/editMessageText", 0);
     try std.testing.expectEqualStrings(
         "{\"chat_id\":99,\"message_id\":50,\"text\":\"ℹ Writing\"," ++
             "\"parse_mode\":\"HTML\",\"reply_markup\":{\"inline_keyboard\":[" ++
-            "[{\"text\":\"Cancel turn\",\"callback_data\":\"cancel:1\"}]," ++
-            "[{\"text\":\"Withdraw\",\"callback_data\":\"withdraw:1\"}]]}}",
+            "[{\"text\":\"Cancel turn\",\"callback_data\":\"cancel:1\"}]]}}",
         writing,
     );
     try std.testing.expectEqual(@as(usize, 2), server.sendCount());
 
     var result: WorkerResult = .{
         .outcome = .{
-            .receipt = .{ .history_base = 0, .history_end = 2, .steering_committed_count = 0 },
+            .receipt = .{ .history_base = 0, .history_end = 2 },
             .disposition = .completed,
         },
         .error_text = null,
@@ -12202,7 +8007,7 @@ test "the chat mirrors a completed turn with its activity message, its answer, a
     try std.testing.expect(app.session.mode == .prompt);
     const answer = try server.waitForSend(2);
     try std.testing.expect(std.mem.indexOf(u8, answer, "\"text\":\"The <b>answer</b>.\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, answer, "\"reply_markup\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, answer, "reply_markup") == null);
     try std.testing.expect(std.mem.indexOf(u8, answer, "\"disable_notification\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, answer, "\"parse_mode\":\"HTML\"") != null);
     try std.testing.expectEqualStrings(
@@ -12222,10 +8027,9 @@ test "the chat mirrors a completed turn with its activity message, its answer, a
     ) != null);
     try std.testing.expect(std.mem.indexOf(u8, summary, "reply_markup") == null);
     try server.finish();
-    try std.testing.expectEqual(@as(usize, 1), server.countOf("/setMessageReaction"));
 }
 
-test "a failed turn marks its uncommitted messages and notifies its summary" {
+test "a failed turn sends its error and notifies its summary" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
@@ -12243,11 +8047,6 @@ test "a failed turn marks its uncommitted messages and notifies its summary" {
             .{ .body = remote_ok_sent },
         } },
         .{ .method = "deleteMessage", .replies = &.{.{ .body = remote_ok_true }} },
-        .{ .method = "setMessageReaction", .replies = &.{
-            .{ .body = remote_ok_true },
-            .{ .body = remote_ok_true },
-            .{ .body = remote_ok_true },
-        } },
     });
     defer server.deinit();
     try server.start();
@@ -12266,8 +8065,6 @@ test "a failed turn marks its uncommitted messages and notifies its summary" {
     var draft = try ui.Editor.Draft.fromText(gpa, "from Telegram");
     app.session.retainExternalTurnPrompt(&draft, base, 7);
     try app.mirror.beginTurn(&app.controller, app.nowMs());
-    try app.submitChatMessage("and this", 8);
-    try std.testing.expectEqual(@as(usize, 1), app.session.steering.items.len);
 
     var result: WorkerResult = .{
         .outcome = .{ .receipt = zero_receipt, .disposition = .{ .failed = error.ApiError } },
@@ -12275,7 +8072,6 @@ test "a failed turn marks its uncommitted messages and notifies its summary" {
     };
     defer app.freeWorkerResult(&result);
     try app.finishWorkerResult(&result);
-    app.agent.steering.clear();
     try std.testing.expect(app.session.mode == .prompt);
     try std.testing.expectEqualStrings("", app.session.editor.visible());
 
@@ -12293,89 +8089,10 @@ test "a failed turn marks its uncommitted messages and notifies its summary" {
         "\"text\":\"⚠ Failed · Tools: 0 calls · Time: ",
     ) != null);
     try std.testing.expect(std.mem.indexOf(u8, summary, "\"disable_notification\":false") != null);
-    const prompt = try server.waitForRequest("/setMessageReaction", 1);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "\"message_id\":7,\"reaction\":[{\"type\":\"emoji\",\"emoji\":\"👎\"}]") != null);
-    const dropped = try server.waitForRequest("/setMessageReaction", 2);
-    try std.testing.expect(std.mem.indexOf(u8, dropped, "\"message_id\":8,\"reaction\":[{\"type\":\"emoji\",\"emoji\":\"👎\"}]") != null);
-    try server.finish();
-    try std.testing.expectEqual(@as(usize, 3), server.countOf("/setMessageReaction"));
-}
-
-test "a Telegram command opens a keyboard, a tap picks a row, and a stale tap gets the toast" {
-    const gpa = std.testing.allocator;
-    var threaded: std.Io.Threaded = .init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var server = try remote_testing.Server.init(gpa, io, &.{
-        .{ .method = "deleteWebhook", .replies = &.{.{ .body = remote_ok_true }} },
-        .{ .method = "setMyCommands", .replies = &.{.{ .body = remote_ok_true }} },
-        .{ .method = "getUpdates", .replies = &.{.{ .body = remote_ok_empty }} },
-        .{ .method = "sendMessage", .replies = &.{
-            .{ .body = remote_ok_sent },
-            .{ .body = "{\"ok\":true,\"result\":{\"message_id\":60}}" },
-            .{ .body = remote_ok_sent },
-        } },
-        .{ .method = "deleteMessage", .replies = &.{.{ .body = remote_ok_true }} },
-        .{ .method = "answerCallbackQuery", .replies = &.{ .{ .body = remote_ok_true }, .{ .body = remote_ok_true } } },
-    });
-    defer server.deinit();
-    try server.start();
-    var url_buffer: [64]u8 = undefined;
-
-    var app: App = undefined;
-    app.initRemoteTest(gpa, io, &out, &server, &url_buffer);
-    defer app.deinitRemoteTest();
-    try app.controller.store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
-    try app.controller.attachSaved(0);
-    try server.waitForLongPoll();
-
-    try app.submitChatMessage("/effort", 20);
-    try std.testing.expect(app.chat_picker.isOpen());
-    const picker = try server.waitForSend(1);
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        picker,
-        "\"text\":\"ℹ Effort\"",
-    ) != null);
-    try std.testing.expect(std.mem.indexOf(u8, picker, "reply_parameters") == null);
-    try std.testing.expect(std.mem.indexOf(u8, picker, "[{\"text\":\"✓ low\",\"callback_data\":\"row:1:0\"}]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, picker, "[{\"text\":\"high\",\"callback_data\":\"row:1:2\"}]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, picker, "[{\"text\":\"Cancel\",\"callback_data\":\"close:1\"}]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, picker, "Back") == null);
-
-    try app.handleChatTap("900", .{ .row = .{ .serial = 1, .index = 2 } });
-    try std.testing.expect(app.agent.effort == .high);
-    try std.testing.expect(!app.chat_picker.isOpen());
-    try std.testing.expectEqualStrings("Drinky set the effort level to high.", app.lastEventText());
-    try std.testing.expectEqualStrings(
-        "{\"callback_query_id\":\"900\"}",
-        try server.waitForRequest("/answerCallbackQuery", 0),
-    );
-    try std.testing.expectEqualStrings(
-        "{\"chat_id\":99,\"message_id\":60}",
-        try server.waitForRequest("/deleteMessage", 0),
-    );
-    try app.syncMirror();
-    const event = try server.waitForSend(2);
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        event,
-        "\"text\":\"ℹ Drinky set the effort level to high.\"",
-    ) != null);
-    try std.testing.expectEqual(@as(usize, 0), server.countOf("/editMessageText"));
-
-    try app.handleChatTap("901", .{ .row = .{ .serial = 1, .index = 0 } });
-    try std.testing.expectEqualStrings(
-        "{\"callback_query_id\":\"901\",\"text\":\"This list is closed.\"}",
-        try server.waitForRequest("/answerCallbackQuery", 1),
-    );
-    try std.testing.expect(app.agent.effort == .high);
     try server.finish();
 }
 
-test "the activity keyboard cancels the turn on one tap and withdraws the queue" {
+test "the activity keyboard cancels the turn on one tap, and a stale tap gets its answer alone" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
@@ -12391,13 +8108,7 @@ test "the activity keyboard cancels the turn on one tap and withdraws the queue"
             .{ .body = "{\"ok\":true,\"result\":{\"message_id\":50}}" },
         } },
         .{ .method = "editMessageText", .replies = &.{.{ .body = remote_ok_true }} },
-        .{ .method = "setMessageReaction", .replies = &.{
-            .{ .body = remote_ok_true },
-            .{ .body = remote_ok_true },
-        } },
         .{ .method = "answerCallbackQuery", .replies = &.{
-            .{ .body = remote_ok_true },
-            .{ .body = remote_ok_true },
             .{ .body = remote_ok_true },
             .{ .body = remote_ok_true },
         } },
@@ -12416,36 +8127,23 @@ test "the activity keyboard cancels the turn on one tap and withdraws the queue"
     app.session.beginTurn(1);
     try app.mirror.beginTurn(&app.controller, app.nowMs());
     const activity = try server.waitForSend(1);
-    try std.testing.expect(std.mem.indexOf(u8, activity, "[{\"text\":\"Cancel turn\",\"callback_data\":\"cancel:1\"}]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, activity, "[{\"text\":\"Withdraw\",\"callback_data\":\"withdraw:1\"}]") != null);
-    try app.submitChatMessage("queued", 12);
-    const queued_mark = try server.waitForRequest("/setMessageReaction", 0);
-    try std.testing.expect(std.mem.indexOf(u8, queued_mark, "\"message_id\":12,\"reaction\":[{\"type\":\"emoji\",\"emoji\":\"👀\"}]") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        activity,
+        "\"reply_markup\":{\"inline_keyboard\":[[{\"text\":\"Cancel turn\",\"callback_data\":\"cancel:1\"}]]}",
+    ) != null);
 
-    try app.handleChatTap("900", .{ .cancel_turn = 7 });
+    try app.handleCancelTap("900", 7);
     try std.testing.expectEqualStrings(
-        "{\"callback_query_id\":\"900\",\"text\":\"The turn is over.\"}",
+        "{\"callback_query_id\":\"900\"}",
         try server.waitForRequest("/answerCallbackQuery", 0),
     );
     try std.testing.expect(app.session.mode == .turn);
-    try std.testing.expectEqual(@as(usize, 1), server.countOf("/setMessageReaction"));
-
-    try app.handleChatTap("901", .{ .withdraw = 1 });
-    try std.testing.expectEqualStrings("{\"callback_query_id\":\"901\"}", try server.waitForRequest("/answerCallbackQuery", 1));
-    const dropped = try server.waitForRequest("/setMessageReaction", 1);
-    try std.testing.expect(std.mem.indexOf(u8, dropped, "\"message_id\":12,\"reaction\":[{\"type\":\"emoji\",\"emoji\":\"👎\"}]") != null);
-    try std.testing.expectEqual(@as(usize, 0), app.session.steering.items.len);
-    try std.testing.expectEqualStrings("", app.session.editor.visible());
-    try app.handleChatTap("902", .{ .withdraw = 1 });
-    try std.testing.expectEqualStrings(
-        "{\"callback_query_id\":\"902\",\"text\":\"Nothing queued.\"}",
-        try server.waitForRequest("/answerCallbackQuery", 2),
-    );
 
     try spawnCanceledTurn(&app);
-    try app.handleChatTap("903", .{ .cancel_turn = 1 });
+    try app.handleCancelTap("901", 1);
     try std.testing.expect(app.session.mode == .prompt);
-    try std.testing.expectEqualStrings("{\"callback_query_id\":\"903\"}", try server.waitForRequest("/answerCallbackQuery", 3));
+    try std.testing.expectEqualStrings("{\"callback_query_id\":\"901\"}", try server.waitForRequest("/answerCallbackQuery", 1));
     const summary = try server.waitForRequest("/editMessageText", 0);
     try std.testing.expect(std.mem.indexOf(
         u8,
@@ -12455,281 +8153,6 @@ test "the activity keyboard cancels the turn on one tap and withdraws the queue"
     try std.testing.expect(std.mem.indexOf(u8, summary, "reply_markup") == null);
     try server.finish();
     try std.testing.expectEqual(@as(usize, 1), server.countOf("/editMessageText"));
-    try std.testing.expectEqual(@as(usize, 2), server.countOf("/setMessageReaction"));
-}
-
-test "the failed turn message dismisses the retry from the chat and stands at the attach" {
-    const gpa = std.testing.allocator;
-    var threaded: std.Io.Threaded = .init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var server = try remote_testing.Server.init(gpa, io, &.{
-        .{ .method = "deleteWebhook", .replies = &.{ .{ .body = remote_ok_true }, .{ .body = remote_ok_true } } },
-        .{ .method = "setMyCommands", .replies = &.{ .{ .body = remote_ok_true }, .{ .body = remote_ok_true } } },
-        .{ .method = "getUpdates", .replies = &.{ .{ .body = remote_ok_empty }, .{ .body = remote_ok_empty } } },
-        .{ .method = "sendMessage", .replies = &.{
-            .{ .body = remote_ok_sent },
-            .{ .body = remote_ok_sent },
-            .{ .body = remote_ok_sent },
-            .{ .body = remote_ok_sent },
-            .{ .body = "{\"ok\":true,\"result\":{\"message_id\":70}}" },
-            .{ .body = remote_ok_sent },
-            .{ .body = remote_ok_sent },
-            .{ .body = "{\"ok\":true,\"result\":{\"message_id\":80}}" },
-            .{ .body = remote_ok_sent },
-        } },
-        .{ .method = "editMessageText", .replies = &.{.{ .body = remote_ok_true }} },
-        .{ .method = "deleteMessage", .replies = &.{.{ .body = remote_ok_true }} },
-        .{ .method = "answerCallbackQuery", .replies = &.{ .{ .body = remote_ok_true }, .{ .body = remote_ok_true } } },
-    });
-    defer server.deinit();
-    try server.start();
-    var url_buffer: [64]u8 = undefined;
-
-    var app: App = undefined;
-    app.initRemoteTest(gpa, io, &out, &server, &url_buffer);
-    defer app.deinitRemoteTest();
-    try app.controller.store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
-    try app.controller.attachSaved(0);
-    try server.waitForLongPoll();
-
-    app.session.beginTurn(1);
-    try app.mirror.beginTurn(&app.controller, app.nowMs());
-    try app.session.transcript.append(.user, .{}, "from Telegram");
-    var result: WorkerResult = .{
-        .outcome = .{
-            .receipt = .{ .history_base = 0, .history_end = 2, .steering_committed_count = 0 },
-            .disposition = .{ .failed = error.ApiError },
-        },
-        .error_text = try gpa.dupe(u8, "The provider refused the request."),
-    };
-    defer app.freeWorkerResult(&result);
-    try app.finishWorkerResult(&result);
-    try std.testing.expect(app.retry != null);
-    const failed = try server.waitForSend(4);
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        failed,
-        "\"text\":\"⚠ Failed turn\"",
-    ) != null);
-    try std.testing.expect(std.mem.indexOf(u8, failed, "[{\"text\":\"Try again\",\"callback_data\":\"retry:2\"}]") != null);
-    try std.testing.expect(std.mem.indexOf(u8, failed, "[{\"text\":\"Dismiss\",\"callback_data\":\"dismiss:2\"}]") != null);
-
-    try app.handleChatTap("900", .{ .dismiss = 1 });
-    try std.testing.expectEqualStrings(
-        "{\"callback_query_id\":\"900\",\"text\":\"The retry is over.\"}",
-        try server.waitForRequest("/answerCallbackQuery", 0),
-    );
-    try std.testing.expect(app.retry != null);
-    try app.handleChatTap("901", .{ .dismiss = 2 });
-    try std.testing.expect(app.retry == null);
-    try std.testing.expectEqual(Session.PromptOffer.none, app.session.prompt_offer);
-    try std.testing.expectEqualStrings(
-        "{\"chat_id\":99,\"message_id\":70,\"text\":\"⚠ Failed turn\"," ++
-            "\"parse_mode\":\"HTML\"}",
-        try server.waitForRequest("/editMessageText", 0),
-    );
-
-    try app.armRetry(&result, false);
-    try app.handleKey(&.escape);
-    try std.testing.expect(app.session.input.owner == .none);
-    _ = try server.waitForSend(5);
-    try app.pumpRemoteEvents(1);
-    try std.testing.expect(app.session.input.owner == .terminal);
-    try app.controller.attachSaved(0);
-    const attached = try server.waitForSend(7);
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        attached,
-        "\"text\":\"⚠ Failed turn\"",
-    ) != null);
-    try std.testing.expect(std.mem.indexOf(u8, attached, "\"callback_data\":\"retry:3\"") != null);
-    try std.testing.expect(!app.mirror.namesRetry(2));
-    try app.handleKey(&.escape);
-    _ = try server.waitForSend(8);
-    try app.pumpRemoteEvents(1);
-    try server.finish();
-    try std.testing.expectEqual(@as(usize, 1), server.countOf("/editMessageText"));
-}
-
-test "the chat gives the answer its button when the commit lands before the receipt" {
-    const gpa = std.testing.allocator;
-    var threaded: std.Io.Threaded = .init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var server = try remote_testing.Server.init(gpa, io, &.{
-        .{ .method = "deleteWebhook", .replies = &.{.{ .body = remote_ok_true }} },
-        .{ .method = "setMyCommands", .replies = &.{.{ .body = remote_ok_true }} },
-        .{ .method = "getUpdates", .replies = &.{.{ .body = remote_ok_empty }} },
-        .{ .method = "sendMessage", .replies = &.{
-            .{ .body = remote_ok_sent },
-            .{ .body = "{\"ok\":true,\"result\":{\"message_id\":50}}" },
-            .{ .body = "{\"ok\":true,\"result\":{\"message_id\":51}}" },
-            .{ .body = remote_ok_sent },
-        } },
-        .{ .method = "editMessageText", .replies = &.{ .{ .body = remote_ok_true }, .{ .body = remote_ok_true } } },
-        .{ .method = "deleteMessage", .replies = &.{.{ .body = remote_ok_true }} },
-    });
-    defer server.deinit();
-    try server.start();
-    var url_buffer: [64]u8 = undefined;
-
-    var app: App = undefined;
-    app.initRemoteTest(gpa, io, &out, &server, &url_buffer);
-    defer app.deinitRemoteTest();
-    try app.controller.store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
-    try app.controller.attachSaved(0);
-    try server.waitForLongPoll();
-
-    app.session.beginTurn(1);
-    try app.mirror.beginTurn(&app.controller, app.nowMs());
-    _ = try server.waitForSend(1);
-    var events = [_]UiEvent{.{ .turn = .{
-        .generation = 1,
-        .progress_sequence = 1,
-        .payload = .{ .text = try gpa.dupe(u8, "The answer.") },
-    } }};
-    _ = try app.applyBatch(&events);
-    _ = try server.waitForRequest("/editMessageText", 0);
-    var committed = [_]UiEvent{.{ .turn = .{
-        .generation = 1,
-        .progress_sequence = 2,
-        .progress_sequence_committed = 1,
-        .payload = .{ .usage = .{} },
-    } }};
-    _ = try app.applyBatch(&committed);
-    _ = try server.waitForRequest("/editMessageText", 1);
-
-    var result: WorkerResult = .{
-        .outcome = .{
-            .receipt = .{ .history_base = 0, .history_end = 2, .steering_committed_count = 0 },
-            .disposition = .completed,
-        },
-        .error_text = null,
-    };
-    defer app.freeWorkerResult(&result);
-    try app.finishWorkerResult(&result);
-    const answer = try server.waitForSend(2);
-    try std.testing.expect(std.mem.indexOf(u8, answer, "\"text\":\"The answer.\"") != null);
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        answer,
-        "[{\"text\":\"Shorten\",\"callback_data\":\"shorten:2\"}]",
-    ) != null);
-    try std.testing.expect(app.mirror.namesAnswer(2));
-    _ = try server.waitForSend(3);
-    try server.finish();
-}
-
-test "the shorten button rides the last answer and its tap waits for the prompt" {
-    const gpa = std.testing.allocator;
-    var threaded: std.Io.Threaded = .init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var server = try remote_testing.Server.init(gpa, io, &.{
-        .{ .method = "deleteWebhook", .replies = &.{.{ .body = remote_ok_true }} },
-        .{ .method = "setMyCommands", .replies = &.{.{ .body = remote_ok_true }} },
-        .{ .method = "getUpdates", .replies = &.{.{ .body = remote_ok_empty }} },
-        .{ .method = "sendMessage", .replies = &.{
-            .{ .body = remote_ok_sent },
-            .{ .body = "{\"ok\":true,\"result\":{\"message_id\":50}}" },
-            .{ .body = remote_ok_sent },
-            .{ .body = remote_ok_sent },
-            .{ .body = "{\"ok\":true,\"result\":{\"message_id\":60}}" },
-        } },
-        .{ .method = "deleteMessage", .replies = &.{.{ .body = remote_ok_true }} },
-        .{ .method = "answerCallbackQuery", .replies = &.{
-            .{ .body = remote_ok_true },
-            .{ .body = remote_ok_true },
-            .{ .body = remote_ok_true },
-            .{ .body = remote_ok_true },
-            .{ .body = remote_ok_true },
-        } },
-    });
-    defer server.deinit();
-    try server.start();
-    var url_buffer: [64]u8 = undefined;
-
-    var app: App = undefined;
-    app.initRemoteTest(gpa, io, &out, &server, &url_buffer);
-    defer app.deinitRemoteTest();
-    try app.controller.store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
-    try app.controller.attachSaved(0);
-    try server.waitForLongPoll();
-
-    app.session.beginTurn(1);
-    try app.mirror.beginTurn(&app.controller, app.nowMs());
-    _ = try server.waitForSend(1);
-    try app.session.transcript.append(.model, .{}, "a long answer");
-    var result: WorkerResult = .{
-        .outcome = .{
-            .receipt = .{ .history_base = 0, .history_end = 2, .steering_committed_count = 0 },
-            .disposition = .completed,
-        },
-        .error_text = null,
-    };
-    defer app.freeWorkerResult(&result);
-    try app.finishWorkerResult(&result);
-    const answer = try server.waitForSend(2);
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        answer,
-        "[{\"text\":\"Shorten\",\"callback_data\":\"shorten:2\"}]",
-    ) != null);
-
-    try app.handleChatTap("900", .{ .shorten = 1 });
-    try std.testing.expectEqualStrings(
-        "{\"callback_query_id\":\"900\",\"text\":\"This answer is not the newest one.\"}",
-        try server.waitForRequest("/answerCallbackQuery", 0),
-    );
-    try std.testing.expect(app.session.mode == .prompt);
-
-    try app.handleChatTap("901", .{ .shorten = 2 });
-    try std.testing.expectEqualStrings(
-        "{\"callback_query_id\":\"901\",\"text\":\"Sign in with /login in the terminal " ++
-            "before you shorten an answer.\"}",
-        try server.waitForRequest("/answerCallbackQuery", 1),
-    );
-    try std.testing.expect(app.session.mode == .prompt);
-
-    app.agent.deinit();
-    app.accounts = ai.testing.accounts(.{ .anthropic = "sk-ant" });
-    app.agent = ai.Agent.init(gpa, io, app.accounts.client(.anthropic_api_key), .{
-        .model = null,
-        .system = "",
-        .retry = .{},
-        .environ = .empty,
-    });
-    try app.handleChatTap("902", .{ .shorten = 2 });
-    try std.testing.expectEqualStrings(
-        "{\"callback_query_id\":\"902\",\"text\":\"Select a model with /model in the terminal " ++
-            "before you shorten an answer.\"}",
-        try server.waitForRequest("/answerCallbackQuery", 2),
-    );
-
-    try app.session.openPage(&.{ .title = "Test page", .content = "body" });
-    try app.handleChatTap("903", .{ .shorten = 2 });
-    try std.testing.expectEqualStrings(
-        "{\"callback_query_id\":\"903\",\"text\":\"Drinky cannot act on a tap now.\"}",
-        try server.waitForRequest("/answerCallbackQuery", 3),
-    );
-    app.session.closePage();
-
-    app.session.beginTurn(2);
-    try app.mirror.beginTurn(&app.controller, app.nowMs());
-    try app.handleChatTap("904", .{ .shorten = 2 });
-    try std.testing.expectEqualStrings(
-        "{\"callback_query_id\":\"904\",\"text\":\"A turn runs. Wait for its end.\"}",
-        try server.waitForRequest("/answerCallbackQuery", 4),
-    );
-    try std.testing.expect(app.mirror.namesAnswer(2));
-    try server.finish();
 }
 
 test "a /new from Telegram records the remote bracket as the first event" {
@@ -12777,131 +8200,4 @@ test "a /new from Telegram records the remote bracket as the first event" {
     ) != null);
     try server.finish();
     try std.testing.expectEqual(@as(usize, 2), server.sendCount());
-}
-
-test "a skill loaded by a tap retains no prompt, so its failed turn fills no editor" {
-    const gpa = std.testing.allocator;
-    var threaded: std.Io.Threaded = .init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var skill = try tmp.dir.createDirPathOpen(io, ".agents/skills/demo", .{});
-    skill.close(io);
-    try tmp.dir.writeFile(io, .{
-        .sub_path = ".agents/skills/demo/SKILL.md",
-        .data = "---\nname: demo\ndescription: a test skill\n---\nbody\n",
-    });
-    const root = try tmpPath(gpa, io, &tmp, "");
-    defer gpa.free(root);
-    const user_skills = try std.fs.path.join(gpa, &.{ root, "home", ".agents", "skills" });
-    defer gpa.free(user_skills);
-    var server = try remote_testing.Server.init(gpa, io, &.{
-        .{ .method = "deleteWebhook", .replies = &.{.{ .body = remote_ok_true }} },
-        .{ .method = "setMyCommands", .replies = &.{.{ .body = remote_ok_true }} },
-        .{ .method = "getUpdates", .replies = &.{.{ .body = remote_ok_empty }} },
-        .{ .method = "sendMessage", .replies = &.{
-            .{ .body = remote_ok_sent },
-            .{ .body = remote_ok_sent },
-            .{ .body = remote_ok_sent },
-            .{ .body = remote_ok_sent },
-        } },
-        .{ .method = "deleteMessage", .replies = &.{.{ .body = remote_ok_true }} },
-        .{ .method = "answerCallbackQuery", .replies = &.{.{ .body = remote_ok_true }} },
-    });
-    defer server.deinit();
-    try server.start();
-    var url_buffer: [64]u8 = undefined;
-
-    var app: App = undefined;
-    app.initRemoteTest(gpa, io, &out, &server, &url_buffer);
-    defer app.deinitRemoteTest();
-    app.agent.deinit();
-    app.agent = ai.Agent.init(gpa, io, null, .{
-        .model = test_anthropic_model,
-        .system = "",
-        .retry = .{},
-        .environ = .empty,
-    });
-    app.skills.deinit();
-    app.skills = try ai.skills.discover(gpa, io, &.{
-        .user_root = user_skills,
-        .project_start = root,
-        .project_root = null,
-    });
-    defer app.skills.deinit();
-    try app.controller.store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
-    try app.controller.attachSaved(0);
-    try server.waitForLongPoll();
-
-    var context = app.chatContext();
-    const prompt = (try ai.command.run(&context, "/skill:demo")).?.prompt;
-    defer prompt.deinit(gpa);
-    try app.startChatSkillTurn(&prompt, .{ .tap = "900" });
-    try std.testing.expect(app.session.mode == .turn);
-    try std.testing.expect(app.session.turn_prompt == null);
-    try std.testing.expectEqualStrings("{\"callback_query_id\":\"900\"}", try server.waitForRequest("/answerCallbackQuery", 0));
-
-    const result = app.awaitTurnFuture().?;
-    defer app.freeWorkerResult(&result);
-    try std.testing.expect(result.outcome.disposition == .failed);
-    try app.finishWorkerResult(&result);
-    try std.testing.expect(app.session.mode == .prompt);
-    try std.testing.expectEqualStrings("", app.session.editor.visible());
-    try std.testing.expect(app.session.input.owner == .external);
-    try std.testing.expect(app.retry == null);
-    for (app.session.transcript.blocks()) |*block| try std.testing.expect(block.content != .user_note);
-    const failure = try server.waitForSend(2);
-    try std.testing.expect(std.mem.indexOf(u8, failure, "\"text\":\"⚠ ") != null);
-    try server.finish();
-}
-
-test "a withdraw whose mark fails after the take leaves the session and the queue in agreement" {
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
-    const gpa = failing.allocator();
-    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var server = try remote_testing.Server.init(std.testing.allocator, io, &.{
-        .{ .method = "deleteWebhook", .replies = &.{.{ .body = remote_ok_true }} },
-        .{ .method = "setMyCommands", .replies = &.{.{ .body = remote_ok_true }} },
-        .{ .method = "getUpdates", .replies = &.{.{ .body = remote_ok_empty }} },
-    });
-    defer server.deinit();
-    try server.start();
-    var url_buffer: [64]u8 = undefined;
-
-    var app: App = undefined;
-    app.initRemoteTest(gpa, io, &out, &server, &url_buffer);
-    defer app.deinitRemoteTest();
-    app.controller.gpa = std.testing.allocator;
-    defer app.controller.gpa = std.testing.allocator;
-    try app.controller.store.save(&.{ .token = "42:secret", .id = 42, .username = "drinky_bot", .chat_id = 99 });
-    try app.controller.attachSaved(0);
-    try server.waitForLongPoll();
-    app.controller.gpa = gpa;
-    app.session.beginTurn(1);
-    try app.submitChatMessage("queued", 12);
-    try std.testing.expectEqual(@as(usize, 1), app.agent.steering.messages.items.len);
-    app.controller.dropped_count = 1;
-
-    var step: usize = 0;
-    while (true) : (step += 1) {
-        failing.fail_index = failing.alloc_index + step;
-        const result = app.withdrawSteering();
-        failing.fail_index = std.math.maxInt(usize);
-        const pending = app.session.steering.items.len - app.session.steering_retained_count;
-        try std.testing.expectEqual(pending, app.agent.steering.messages.items.len);
-        if (result) |count| {
-            try std.testing.expectEqual(@as(usize, 0), count);
-            break;
-        } else |err| try std.testing.expectEqual(error.OutOfMemory, err);
-        if (step == 32) return error.TestSweepTooLong;
-    }
-    try std.testing.expectEqual(@as(usize, 0), app.session.steering.items.len);
-    try std.testing.expectEqualStrings("", app.session.editor.visible());
 }

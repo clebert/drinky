@@ -15,6 +15,7 @@ const cancellation_message = "You canceled the model selection.";
 
 const fetch_row = "Fetch the model list";
 const refresh_row = "Refresh the model list";
+const lead_rows = 1;
 
 const extra_output_limit = "The output limit is unknown.";
 
@@ -151,12 +152,6 @@ fn authorStep(context: *Context, account: llm.Account) !Context.Outcome {
     var list: std.ArrayList(Model) = .empty;
     defer list.deinit(gpa);
     try context.accounts.listModels(account, &list, gpa);
-    if (context.remote and list.items.len == 0) return Context.Outcome.reportNotice(
-        gpa,
-        .warning,
-        "Fetch the model list of {s} with /model in the terminal first.",
-        .{account.id()},
-    );
 
     const authors = try gpa.alloc(AuthorRow, @max(list.items.len, 1));
     defer gpa.free(authors);
@@ -166,15 +161,14 @@ fn authorStep(context: *Context, account: llm.Account) !Context.Outcome {
     errdefer options.deinit();
     var current: ?usize = null;
     var preselected: ?usize = null;
-    const lead = leadRows(context);
-    if (lead > 0) try options.print("{s}", .{firstRow(list.items.len)});
+    try options.print("{s}", .{firstRow(list.items.len)});
     for (grouped, 0..) |author, index| {
         try options.addExtra(false, author.name, "{d} model{s}", .{
             author.count,
             format.pluralSuffix(author.count),
         });
-        if (isActiveAuthor(context, account, list.items, author)) current = index + lead;
-        if (isPreferredAuthor(preferred_model, author.name)) preselected = index + lead;
+        if (isActiveAuthor(context, account, list.items, author)) current = index + lead_rows;
+        if (isPreferredAuthor(preferred_model, author.name)) preselected = index + lead_rows;
     }
     const step: ModelStep = switch (account) {
         inline else => |tag| authorStepOf(tag),
@@ -254,21 +248,20 @@ fn authorStepOf(comptime account: llm.Account) ModelStep {
                 selection: Context.Outcome.Pick.Selection,
             ) anyerror!Context.Outcome {
                 const gpa = context.gpa;
-                const lead = leadRows(context);
-                if (selection.row < lead) return .{ .fetch = account };
+                if (selection.row < lead_rows) return .{ .fetch = account };
                 var list: std.ArrayList(Model) = .empty;
                 defer list.deinit(gpa);
                 try context.accounts.listModels(account, &list, gpa);
                 const authors = try gpa.alloc(AuthorRow, @max(list.items.len, 1));
                 defer gpa.free(authors);
                 const grouped = authorsOf(list.items, authors);
-                if (selection.row - lead >= grouped.len) return Context.Outcome.reportNotice(
+                if (selection.row - lead_rows >= grouped.len) return Context.Outcome.reportNotice(
                     gpa,
                     .failure,
                     "Select a valid author.",
                     .{},
                 );
-                return authorModelsStep(context, account, grouped[selection.row - lead].first);
+                return authorModelsStep(context, account, grouped[selection.row - lead_rows].first);
             }
         }.select,
         .open = struct {
@@ -356,23 +349,16 @@ fn modelStep(context: *Context, account: llm.Account) !Context.Outcome {
     var list: std.ArrayList(Model) = .empty;
     defer list.deinit(gpa);
     try context.accounts.listModels(account, &list, gpa);
-    if (context.remote and list.items.len == 0) return Context.Outcome.reportNotice(
-        gpa,
-        .warning,
-        "Fetch the model list of {s} with /model in the terminal first.",
-        .{account.id()},
-    );
 
     var options: Context.Outcome.Options = .{ .gpa = gpa };
     errdefer options.deinit();
     var current: ?usize = null;
     var preselected: ?usize = null;
-    const lead = leadRows(context);
-    if (lead > 0) try options.print("{s}", .{firstRow(list.items.len)});
+    try options.print("{s}", .{firstRow(list.items.len)});
     for (list.items, 0..) |*model, index| {
         try row(&options, account, model);
-        if (isActive(context, account, model.name())) current = index + lead;
-        if (isPreferred(preferred_model, model)) preselected = index + lead;
+        if (isActive(context, account, model.name())) current = index + lead_rows;
+        if (isPreferred(preferred_model, model)) preselected = index + lead_rows;
     }
     const step: ModelStep = switch (account) {
         inline else => |tag| modelStepOf(tag),
@@ -390,10 +376,6 @@ fn modelStep(context: *Context, account: llm.Account) !Context.Outcome {
 
 fn firstRow(count: usize) []const u8 {
     return if (count == 0) fetch_row else refresh_row;
-}
-
-fn leadRows(context: *const Context) usize {
-    return if (context.remote) 0 else 1;
 }
 
 fn row(
@@ -417,18 +399,17 @@ fn modelStepOf(comptime account: llm.Account) ModelStep {
             ) anyerror!Context.Outcome {
                 const gpa = context.gpa;
                 const index = selection.row;
-                const lead = leadRows(context);
-                if (index < lead) return .{ .fetch = account };
+                if (index < lead_rows) return .{ .fetch = account };
                 var list: std.ArrayList(Model) = .empty;
                 defer list.deinit(gpa);
                 try context.accounts.listModels(account, &list, gpa);
-                if (index - lead >= list.items.len) return Context.Outcome.reportNotice(
+                if (index - lead_rows >= list.items.len) return Context.Outcome.reportNotice(
                     gpa,
                     .failure,
                     "Select a valid model.",
                     .{},
                 );
-                return apply(context, account, &list.items[index - lead]);
+                return apply(context, account, &list.items[index - lead_rows]);
             }
         }.select,
         .open = struct {
@@ -531,8 +512,6 @@ fn fetchFailure(
     models_failure: anyerror,
     metadata_save_failure: ?anyerror,
 ) !Context.Outcome {
-    if (models_failure == error.CredentialReplaced)
-        return .{ .credential_replaced = account };
     const cache_failure = metadata_save_failure orelse return Context.Outcome.reportEvent(
         gpa,
         .failure,
@@ -735,32 +714,6 @@ test "a failed fetch states the cache write that failed with it" {
         },
         else => return error.ExpectedEvent,
     }
-}
-
-test "a fetch that meets a replaced credential hands its account to the app" {
-    const gpa = std.testing.allocator;
-    var accounts = testing.accounts(.{}, .{ .anthropic = true });
-    defer testing.deinitAccounts(&accounts);
-    var agent = testing.agent(gpa, .{ .anthropic_plan = undefined });
-    defer agent.deinit();
-    var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = &accounts };
-
-    const outcome = try fetchOutcome(&context, .anthropic_plan, &.{
-        .models_error = error.CredentialReplaced,
-    });
-    try std.testing.expectEqual(
-        llm.Account.anthropic_plan,
-        outcome.credential_replaced,
-    );
-
-    const with_save_failure = try fetchOutcome(&context, .anthropic_plan, &.{
-        .models_error = error.CredentialReplaced,
-        .metadata_save_error = error.StoreBusy,
-    });
-    try std.testing.expectEqual(
-        llm.Account.anthropic_plan,
-        with_save_failure.credential_replaced,
-    );
 }
 
 test "the first step lists the providers with an authenticated account" {
@@ -987,112 +940,6 @@ test "a key that two author rows carry names no model" {
         authorModelIndex(rows[0..2], .{ .payload = key, .row = 1 }),
     );
     try std.testing.expect(authorModelIndex(rows[0..2], .{ .payload = key, .row = 2 }) == null);
-}
-
-test "a remote host lists the authors with no fetch row" {
-    const gpa = std.testing.allocator;
-    var accounts = testing.accounts(.{ .openrouter = "sk-or" }, .{});
-    defer testing.deinitAccounts(&accounts);
-    var openai_model = Model.init("openai/gpt-new") catch unreachable;
-    openai_model.context_window = 1;
-    openai_model.tools = .supported;
-    var qwen = Model.init("qwen/qwen-new") catch unreachable;
-    qwen.context_window = 1;
-    qwen.tools = .supported;
-    const entries = [_]Metadata.Entry{
-        .{ .provider = .openrouter, .model = openai_model },
-        .{ .provider = .openrouter, .model = qwen },
-    };
-    accounts.catalog.metadata = try gpa.dupe(Metadata.Entry, &entries);
-    defer gpa.free(accounts.catalog.metadata);
-    var agent = testing.agent(gpa, .{ .openrouter_api_key = "sk-or" });
-    defer agent.deinit();
-    var context: Context = .{
-        .gpa = gpa,
-        .io = undefined,
-        .agent = &agent,
-        .accounts = &accounts,
-        .remote = true,
-    };
-
-    const authors = try expectPick(try run(&context));
-    defer freePick(gpa, &authors);
-    try std.testing.expectEqual(@as(usize, 2), authors.options.len);
-    try std.testing.expectEqualStrings("openai", authors.options[0].name);
-    try std.testing.expectEqualStrings("1 model", authors.options[0].extra.?);
-    try std.testing.expectEqualStrings("qwen", authors.options[1].name);
-    try std.testing.expectEqualStrings("1 model", authors.options[1].extra.?);
-
-    const qwen_models = try expectPick(try selectRow(&authors, &context, 1));
-    defer freePick(gpa, &qwen_models);
-    try std.testing.expectEqual(authorKey("qwen"), qwen_models.payload);
-    try Context.Outcome.expectEvent(try selectRow(&qwen_models, &context, 0), .information);
-    try std.testing.expectEqualStrings("qwen/qwen-new", agent.model.?.name());
-
-    try Context.Outcome.expectNoticeContaining(
-        try selectRow(&authors, &context, 2),
-        .failure,
-        "valid author",
-    );
-}
-
-test "a remote host names the terminal when the OpenRouter list is empty" {
-    const gpa = std.testing.allocator;
-    var accounts = testing.accounts(.{ .openrouter = "sk-or" }, .{});
-    defer testing.deinitAccounts(&accounts);
-    var agent = testing.agent(gpa, .{ .openrouter_api_key = "sk-or" });
-    defer agent.deinit();
-    var context: Context = .{
-        .gpa = gpa,
-        .io = undefined,
-        .agent = &agent,
-        .accounts = &accounts,
-        .remote = true,
-    };
-
-    try Context.Outcome.expectNoticeContaining(
-        try run(&context),
-        .warning,
-        "Fetch the model list of openrouter-api-key with /model in the terminal first.",
-    );
-}
-
-test "a remote host lists the cached models with no fetch row" {
-    const gpa = std.testing.allocator;
-    var accounts = testing.accounts(.{ .anthropic = "sk-ant", .openai = "sk-openai" }, .{});
-    defer testing.deinitAccounts(&accounts);
-    try testing.seed(&accounts, .anthropic_api_key, &.{ "claude-fable-5", "claude-sonnet-4-6" });
-    var agent = testing.agent(gpa, .{ .anthropic_api_key = "sk-ant" });
-    defer agent.deinit();
-    var context: Context = .{
-        .gpa = gpa,
-        .io = undefined,
-        .agent = &agent,
-        .accounts = &accounts,
-        .remote = true,
-    };
-
-    const anthropic_models = try expectPick(try modelStep(&context, .anthropic_api_key));
-    defer freePick(gpa, &anthropic_models);
-    try std.testing.expectEqual(@as(usize, 2), anthropic_models.options.len);
-    try std.testing.expectEqualStrings("claude-fable-5", anthropic_models.options[0].name);
-    try std.testing.expectEqualStrings(
-        "claude-sonnet-4-6",
-        anthropic_models.options[anthropic_models.current.?].name,
-    );
-    try Context.Outcome.expectEvent(try selectRow(&anthropic_models, &context, 0), .information);
-    try std.testing.expectEqualStrings("claude-fable-5", agent.model.?.name());
-    try Context.Outcome.expectNoticeContaining(
-        try selectRow(&anthropic_models, &context, 2),
-        .failure,
-        "valid model",
-    );
-
-    try Context.Outcome.expectNoticeContaining(
-        try modelStep(&context, .openai_api_key),
-        .warning,
-        "Fetch the model list of openai-api-key with /model in the terminal first.",
-    );
 }
 
 test "the fetch row hands its account to the app" {

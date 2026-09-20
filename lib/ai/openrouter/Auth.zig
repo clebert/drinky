@@ -1,7 +1,6 @@
 const std = @import("std");
 
 const auth = @import("../auth.zig");
-const json_store = @import("../json_store.zig");
 const llm = @import("../llm.zig");
 const net = @import("../net.zig");
 const oauth_callback = @import("../oauth_callback.zig");
@@ -17,7 +16,7 @@ io: std.Io,
 timeouts: net.Timeouts,
 path: []const u8,
 tokens: ?oauth.Tokens,
-persistence: auth.Persistence = .saved,
+save_pending: bool = false,
 
 pub fn init(
     gpa: std.mem.Allocator,
@@ -36,10 +35,6 @@ pub fn deinit(self: *Auth) void {
 
 pub fn load(self: *Auth) !bool {
     return auth.load(self, account_key);
-}
-
-pub fn reread(self: *Auth, maybe_file: ?*const json_store.File) !auth.Change {
-    return auth.reread(self, account_key, maybe_file);
 }
 
 pub fn apiKey(self: *const Auth) ?[]const u8 {

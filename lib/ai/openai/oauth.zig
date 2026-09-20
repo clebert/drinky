@@ -28,11 +28,6 @@ pub const Tokens = struct {
         gpa.free(self.refresh);
         gpa.free(self.account_id);
     }
-
-    pub fn samePrincipal(self: *const Tokens, other: *const Tokens) bool {
-        return self.account_id.len != 0 and
-            std.mem.eql(u8, self.account_id, other.account_id);
-    }
 };
 
 pub fn authorizeUrl(gpa: std.mem.Allocator, code: *const oauth_wire.Pkce) ![]u8 {
@@ -201,11 +196,6 @@ test parseTokens {
     try std.testing.expectEqualStrings("rt", tokens.refresh);
     try std.testing.expectEqualStrings("acct_123", tokens.account_id);
     try std.testing.expectEqual(@as(i64, 2000000000 * 1000 - refresh_margin_ms), tokens.expires_ms);
-
-    var other = tokens;
-    try std.testing.expect(tokens.samePrincipal(&other));
-    other.account_id = "acct_other";
-    try std.testing.expect(!tokens.samePrincipal(&other));
 }
 
 test "parseTokens carries over refresh token and account id on a partial refresh" {

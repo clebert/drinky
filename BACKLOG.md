@@ -49,6 +49,63 @@ becomes an open item or when the user drops it.
 - Drinky needs a terminal. A headless mode answers one prompt with no terminal: text in, text out,
   with flags for the model and the effort. It is the base for any agent that Drinky drives itself.
   Trigger: the first agent that Drinky drives itself.
+- Drinky keeps no prompt history. Tab at the idle prompt opened the submitted terminal prompts of
+  every project, newest first, and Enter appended the selected prompt to the draft as editable text.
+  A submitted prompt without a leading slash entered the history, which kept the 100 most recent
+  prompts of at most 8 KiB each in the owner-only `~/.drinky/prompt_history.json` behind the
+  `prompt_history.enabled` config key. Trigger: the client runs on the session of `lib/core`.
+- A failed turn offers no retry. A turn that failed after it committed work left the caption
+  `Failed turn` above the editor, and Ctrl+N sent a `<retry_request>` that named the failure and
+  asked the model to continue from the last committed checkpoint, under the transcript note
+  `Drinky asked the model to continue from the committed work.` A failed retry attempt offered the
+  retry again. The Telegram chat showed a `Failed turn` message with `Try again` and `Dismiss`, Esc
+  or a new turn dismissed the offer, and Herdr read the wait as `blocked`. The user wants the offer
+  back when the core makes it cheap. Trigger: the client runs on the session of `lib/core`.
+- A canceled turn that committed work stays in the conversation as it is. Under the caption
+  `Canceled turn`, Ctrl+N removed the turn from the conversation and the transcript, kept the events
+  of the session, retreated the chat cursor over the removed blocks, and returned the prompt and the
+  committed steering messages to the editor as editable text. A turn that ran `write`, `edit`, or
+  `bash` warned first and removed on the second press. Esc kept the turn, and a new turn or `/new`
+  dropped the offer. The user wants the removal back when the core makes it cheap. Trigger: the
+  client runs on the session of `lib/core`.
+- Drinky takes no message during a turn. Enter queued the line as a steering message, the turn took
+  the queue at its next tool round as one combined user message, and Ctrl+P moved the queued
+  messages back into the editor above the draft. A Telegram message during a turn queued the same
+  way, with a reaction on the queue, the commit, and the drop, and a `Withdraw` button beside
+  `Cancel turn`. A cancel or a failure returned the uncommitted messages to the editor. A `steer`
+  command can return once the core and the design stand. Trigger: the client runs on the session of
+  `lib/core`.
+- The chat runs `/new` alone, and a tap gets no toast. `/effort`, `/model`, `/help`, `/skill`, and
+  `/status` ran from the chat too, and the bot registered them with `setMyCommands`. A command that
+  picks opened an inline keyboard with one button per row and a `✓` mark on the current row. A step
+  below the first added a `‹ Back` button, and every keyboard ended with a `Cancel` button. The
+  keyboard held the first 98 rows, a step edited the same message, and the back trail held eight
+  steps. A model step with no cached list named the terminal for the fetch. A tapped skill row
+  loaded its skill with no task. `/status` replied in the chat, wrote no terminal event, and ran
+  during a turn too. The last answer of a completed turn carried a `Shorten` button. Its tap sent a
+  fixed request for a phone-screen summary and kept the editor text. The transcript showed the note
+  `Drinky asked the model to shorten the last answer.` in place of a prompt. A stale, closed, or
+  busy tap got a toast that named the reason. A random seed per process kept a keyboard of an
+  earlier process stale. Trigger: the client runs on the session of `lib/core`.
+- Drinky has no `/status` command, and no command runs during a turn. `/status` recorded the status
+  line as one terminal event in full. The event named the directory, the branch, the context gauge
+  with its token counts, and the cost. It named the quota windows, the credit pool, and the cache
+  rate of a running turn, then the account, the model, and the effort. Inside a Herdr pane, it named
+  the directory and the branch that the status line leaves to the pane label. It ran during a turn
+  too, and its event waited for the message boundary and survived the rewind of a failed turn. Two
+  requests in a row wrote two events in place of a repeat count. Trigger: the client runs on the
+  session of `lib/core`.
+- Drinky keeps no principal marker and settles no session on a reread of the credential file. A
+  login saved the account and organization ids of the Anthropic OAuth profile and the user id of the
+  xAI id token. A stored token of the same principal counted as a rotation, and a token of another
+  or an unknown principal counted as a replacement. A replacement before a model request or a model
+  fetch ended the turn. It dropped the model list, the reasoning, and the usage evidence of the
+  account, and asked for a new model. `/login` reread the credential file first. A sign-in from
+  another instance showed in the picker, and a rotation moved the active client to the new token. A
+  replacement dropped the evidence, and a sign-out of the active account handed the session to the
+  next one. Drinky reported an unreadable file or entry, and the list kept the last read. A login
+  with a failed save did not follow the store. The reread before a refresh stays, and it takes any
+  newer stored token as it is. Trigger: the client runs on the session of `lib/core`.
 - `/prompt` opens the prompt history as an editable picker in the terminal and as an inline keyboard
   in Telegram, where a selection starts its saved prompt at once. Plain Telegram messages that start
   a turn enter the history, and steering messages and skill commands stay out. Trigger: the return

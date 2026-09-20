@@ -88,15 +88,14 @@ fn writeCommands(writer: *std.Io.Writer) !void {
             try writer.print(" The line `{s}` runs it too.", .{command.alias});
         if (command.tail.len > 0)
             try writer.print(" It takes {s} as trailing text.", .{command.tail});
-        if (!command.remote)
-            try writer.writeAll(" It runs in the terminal alone, never from an attached Telegram bot.");
-        if (command.during_turn)
-            try writer.writeAll(" It runs during a turn too.");
+        if (command.remote)
+            try writer.writeAll(" It runs from the Telegram chat too.");
         try writer.writeByte('\n');
     }
     try writer.writeAll(
-        "\nA command refuses text after its name unless its row names trailing text. A command " ++
-            "waits for the end of a turn unless its row says that it runs during a turn.\n",
+        "\nA command refuses text after its name unless its row names trailing text. Every command " ++
+            "waits for the end of a turn. A command runs in the terminal alone unless its row says " ++
+            "that it runs from the Telegram chat too.\n",
     );
 }
 
@@ -108,20 +107,9 @@ fn writeKeys(writer: *std.Io.Writer, options: *const Options) !void {
         \\The prompt takes these keys:
         \\
         \\- Enter sends the line.
-        \\- Tab opens the prompt history picker over the draft when `prompt_history.enabled` is `true`.
-        \\  Enter there appends the selected prompt to the draft as editable text.
-        \\  Esc closes the list and keeps the draft.
         \\- Ctrl+C clears the editor. A second press within {d} milliseconds quits Drinky.
         \\- Ctrl+D quits at an empty editor. Ctrl+D with a draft warns first and quits on the
         \\  second press.
-        \\- Ctrl+N acts on the recovery offer that the caption above the editor names. Under
-        \\  `Failed turn`, Ctrl+N asks the model to continue from the committed work. Under
-        \\  `Canceled turn`, Ctrl+N removes the canceled turn from the conversation and returns
-        \\  its prompt and steering messages to the editor as editable text. Tool changes stay.
-        \\  A turn that ran `write`, `edit`, or `bash` warns first and removes on the second
-        \\  press. The chat and the prompt history keep their records of the removed turn.
-        \\- Esc dismisses a waiting recovery offer. A dismissed canceled turn stays in the
-        \\  conversation.
         \\
         \\A sign-in takes these keys:
         \\
@@ -131,11 +119,8 @@ fn writeKeys(writer: *std.Io.Writer, options: *const Options) !void {
         \\
         \\A running turn takes these keys:
         \\
-        \\- Enter queues the line as a steering message.
-        \\- Tab opens no prompt history. Drinky shows the notice `Prompt history cannot open while
-        \\  a turn runs.` instead.
-        \\- Ctrl+P moves the queued steering messages back into the editor, above the draft and
-        \\  in the order the user sent them.
+        \\- Enter sends no message. Drinky shows the notice `Drinky sends no message while a turn
+        \\  runs. The draft stays.` and keeps the line. A slash command gets its refusal instead.
         \\- Esc cancels the turn. Esc first restores the status line. Esc with a draft warns first
         \\  and cancels on the second press.
         \\- Ctrl+D cancels the turn at once.
@@ -196,22 +181,22 @@ test "the document states every command, key, and discovery rule" {
     try std.testing.expect(std.mem.indexOf(
         u8,
         text,
-        "- `/login` \u{2014} Sign in or switch the account. It runs in the terminal alone",
+        "- `/login` \u{2014} Sign in or switch the account.\n",
     ) != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "- `/new` \u{2014} Clear the conversation.\n") != null);
     try std.testing.expect(std.mem.indexOf(
         u8,
         text,
-        "- `/status` \u{2014} State the session. It runs during a turn too.\n",
+        "- `/new` \u{2014} Clear the conversation. It runs from the Telegram chat too.\n",
     ) != null);
     try std.testing.expectEqual(
         @as(usize, 1),
-        std.mem.count(u8, text, " It runs during a turn too."),
+        std.mem.count(u8, text, " It runs from the Telegram chat too."),
     );
+    try std.testing.expect(std.mem.indexOf(u8, text, "Every command waits for the end of a turn.") != null);
     try std.testing.expect(std.mem.indexOf(
         u8,
         text,
-        "unless its row says that it runs during a turn",
+        "unless its row says that it runs from the Telegram chat too",
     ) != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "### Keys") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "`bash.timeout_ms`") != null);
@@ -227,33 +212,9 @@ test "the document states every command, key, and discovery rule" {
     try std.testing.expect(prompt < login);
     try std.testing.expect(login < turn);
     try std.testing.expect(std.mem.indexOf(u8, text[prompt..login], "within 500 milli") != null);
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        text[prompt..login],
-        "Under\n  `Failed turn`, Ctrl+N asks the model to continue",
-    ) != null);
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        text[prompt..login],
-        "`Canceled turn`, Ctrl+N removes the canceled turn",
-    ) != null);
-    try std.testing.expect(std.mem.indexOf(u8, text[prompt..login], "Tool changes stay.") != null);
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        text[prompt..login],
-        "- Tab opens the prompt history picker over the draft when " ++
-            "`prompt_history.enabled` is `true`.",
-    ) != null);
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        text[turn..],
-        "- Tab opens no prompt history. Drinky shows the notice " ++
-            "`Prompt history cannot open while\n  a turn runs.` instead.",
-    ) != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "`prompt_history.enabled`") != null);
     try std.testing.expect(std.mem.indexOf(u8, text[login..turn], "replays a callback URL") != null);
     try std.testing.expect(std.mem.indexOf(u8, text[login..turn], "cancels the sign-in") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text[turn..], "Ctrl+P moves") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text[turn..], "Enter sends no message.") != null);
     try std.testing.expect(std.mem.indexOf(
         u8,
         text[turn..],
@@ -264,7 +225,6 @@ test "the document states every command, key, and discovery rule" {
         text[turn..],
         "cancels the turn at once",
     ) != null);
-    try std.testing.expect(std.mem.indexOf(u8, text[turn..discovery_index], "Ctrl+N") == null);
     try std.testing.expect(std.mem.indexOf(
         u8,
         text[turn..discovery_index],

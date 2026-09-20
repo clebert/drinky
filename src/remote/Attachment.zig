@@ -41,8 +41,8 @@ send_client: Client,
 answer_client: Client,
 outbound_buffer: [outbound_capacity]Outbound,
 outbound: std.Io.Queue(Outbound),
-answers_buffer: [answers_capacity]Answer,
-answers: std.Io.Queue(Answer),
+answers_buffer: [answers_capacity][]u8,
+answers: std.Io.Queue([]u8),
 tracked: [tracked_capacity]Tracked,
 tracked_mutex: std.Io.Mutex,
 tracked_next: usize,
@@ -113,7 +113,7 @@ pub const Event = struct {
         kind: Kind,
         description: []u8,
 
-        pub const Kind = enum { message, edit, deletion, reaction };
+        pub const Kind = enum { message, edit, deletion };
     };
 
     pub const Side = enum { poll, send };
@@ -140,32 +140,12 @@ pub const Event = struct {
 
 pub const Handle = u64;
 
-pub const Reaction = struct {
-    message_id: i64,
-    mark: Mark,
-
-    pub const Mark = enum {
-        queued,
-        committed,
-        dropped,
-
-        fn emoji(self: Mark) []const u8 {
-            return switch (self) {
-                .queued => "👀",
-                .committed => "👍",
-                .dropped => "👎",
-            };
-        }
-    };
-};
-
 pub const SendError = error{ Closed, Canceled, QueueFull, OutOfMemory };
 
 const Outbound = union(enum) {
     send: Send,
     edit: Handle,
     delete: Handle,
-    react: Reaction,
 
     const Send = struct {
         text: []u8,
@@ -173,16 +153,6 @@ const Outbound = union(enum) {
         markup: ?[]u8,
         handle: ?Handle,
     };
-};
-
-const Answer = struct {
-    query_id: []u8,
-    text: ?[]u8,
-
-    fn deinit(self: *const Answer, gpa: std.mem.Allocator) void {
-        gpa.free(self.query_id);
-        if (self.text) |text| gpa.free(text);
-    }
 };
 
 const Pending = struct {
@@ -231,14 +201,12 @@ const Delivery = union(enum) {
     send: Outbound.Send,
     edit: Edit,
     delete: i64,
-    react: Reaction,
 
     fn kind(self: *const Delivery) Event.Rejected.Kind {
         return switch (self.*) {
             .send => .message,
             .edit => .edit,
             .delete => .deletion,
-            .react => .reaction,
         };
     }
 };
@@ -314,12 +282,10 @@ pub fn send(self: *Attachment, text: []const u8, options: *const Client.SendOpti
     try self.queueSend(text, options, null);
 }
 
-pub fn answer(self: *Attachment, query_id: []const u8, text: ?[]const u8) SendError!void {
+pub fn answer(self: *Attachment, query_id: []const u8) SendError!void {
     const id_copy = try self.gpa.dupe(u8, query_id);
     errdefer self.gpa.free(id_copy);
-    const text_copy: ?[]u8 = if (text) |toast| try self.gpa.dupe(u8, toast) else null;
-    errdefer if (text_copy) |copy| self.gpa.free(copy);
-    const items = [1]Answer{.{ .query_id = id_copy, .text = text_copy }};
+    const items = [1][]u8{id_copy};
     const count = self.answers.put(self.io, &items, 0) catch |err| switch (err) {
         error.Closed => return error.Closed,
         error.Canceled => return error.Canceled,
@@ -372,10 +338,6 @@ pub fn delete(self: *Attachment, handle: Handle) SendError!void {
         self.unmarkDeletion(handle);
         return err;
     };
-}
-
-pub fn react(self: *Attachment, message_id: i64, mark: Reaction.Mark) SendError!void {
-    try self.queueOne(.{ .react = .{ .message_id = message_id, .mark = mark } });
 }
 
 fn queueSend(
@@ -553,11 +515,11 @@ pub fn destroy(self: *Attachment) void {
         if (count == 0) break;
         for (batch[0..count]) |item| freeOutbound(self.gpa, &item);
     }
-    var answers: [answers_capacity]Answer = undefined;
+    var answers: [answers_capacity][]u8 = undefined;
     while (true) {
         const count = self.answers.get(self.io, &answers, 0) catch break;
         if (count == 0) break;
-        for (answers[0..count]) |item| item.deinit(self.gpa);
+        for (answers[0..count]) |query_id| self.gpa.free(query_id);
     }
     for (&self.tracked) |*slot| if (slot.edit) |pending| pending.deinit(self.gpa);
     if (self.final) |final| self.gpa.free(final.text);
@@ -572,7 +534,7 @@ fn freeOutbound(gpa: std.mem.Allocator, item: *const Outbound) void {
             gpa.free(send_item.text);
             if (send_item.markup) |markup| gpa.free(markup);
         },
-        .edit, .delete, .react => {},
+        .edit, .delete => {},
     }
 }
 
@@ -641,7 +603,7 @@ fn plainOf(self: *Attachment, delivery: *Delivery) ?[]u8 {
     const text: *[]u8, const parse_mode: *?[]const u8 = switch (delivery.*) {
         .send => |*send_item| .{ &send_item.text, &send_item.options.parse_mode },
         .edit => |*taken| .{ &taken.pending.text, &taken.pending.parse_mode },
-        .delete, .react => return null,
+        .delete => return null,
     };
     if (parse_mode.* == null) return null;
     const plain = html.plainAlloc(self.gpa, text.*) catch return null;
@@ -819,7 +781,6 @@ fn sendUntilClosed(
             .delete => |handle| if (self.takeDeletion(handle)) |message_id| {
                 try self.deliver(state, .{ .delete = message_id });
             },
-            .react => |reaction| try self.deliver(state, .{ .react = reaction }),
         }
     }
 }
@@ -831,15 +792,15 @@ fn runAnswerer(self: *Attachment) void {
 fn answerUntilClosed(self: *Attachment) error{ Closed, Canceled, Detached }!void {
     const client = &self.answer_client;
     while (true) {
-        var batch: [1]Answer = undefined;
+        var batch: [1][]u8 = undefined;
         const count = self.answers.get(self.io, &batch, 1) catch |err| switch (err) {
             error.Closed => return error.Closed,
             error.Canceled => return error.Canceled,
         };
         std.debug.assert(count == 1);
-        const item = batch[0];
-        defer item.deinit(self.gpa);
-        client.answerCallbackQuery(item.query_id, item.text) catch |err| switch (err) {
+        const query_id = batch[0];
+        defer self.gpa.free(query_id);
+        client.answerCallbackQuery(query_id) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
             error.Unauthorized => return self.detach(.unauthorized),
             error.Forbidden => return self.detach(.forbidden),
@@ -872,10 +833,6 @@ fn callChat(self: *Attachment, delivery: *const Delivery) Client.Error!void {
             .chat_id = self.chat_id,
             .message_id = message_id,
         }),
-        .react => |reaction| try client.setMessageReaction(
-            .{ .chat_id = self.chat_id, .message_id = reaction.message_id },
-            reaction.mark.emoji(),
-        ),
     }
 }
 
@@ -1227,7 +1184,7 @@ test "a message whose formatting fails to parse goes again as plain text" {
     defer attachment.destroy();
     try attachment.start();
 
-    const keyboard = "{\"inline_keyboard\":[[{\"text\":\"Dismiss\",\"callback_data\":\"dismiss:1\"}]]}";
+    const keyboard = "{\"inline_keyboard\":[[{\"text\":\"Cancel turn\",\"callback_data\":\"cancel:1\"}]]}";
     try attachment.send(formatted_text, &.{ .parse_mode = "HTML", .reply_to = 5, .markup = keyboard });
     try attachment.send("next", &.{});
     try server.waitForSends(3);
@@ -1302,7 +1259,7 @@ test "an edit waits behind its tracked send, and the newest text replaces a pend
     defer attachment.destroy();
     try attachment.start();
 
-    const keyboard = "{\"inline_keyboard\":[[{\"text\":\"Withdraw\",\"callback_data\":\"withdraw:1\"}]]}";
+    const keyboard = "{\"inline_keyboard\":[[{\"text\":\"Close\",\"callback_data\":\"close:1\"}]]}";
     const handle = try attachment.sendTracked("Thinking", &.{
         .disable_notification = true,
         .markup = keyboard,
@@ -1441,11 +1398,11 @@ test "an answer leaves ahead of the paced sends, and a failed one drops in silen
     try attachment.send("slow", &.{});
     try server.waitForSends(1);
     try attachment.send("behind", &.{});
-    try attachment.answer("900", "Nothing queued.");
-    try attachment.answer("901", null);
-    try attachment.answer("902", "This list is closed.");
+    try attachment.answer("900");
+    try attachment.answer("901");
+    try attachment.answer("902");
     try std.testing.expectEqualStrings(
-        "{\"callback_query_id\":\"900\",\"text\":\"Nothing queued.\"}",
+        "{\"callback_query_id\":\"900\"}",
         try server.waitForRequest("/answerCallbackQuery", 0),
     );
     try std.testing.expectEqualStrings(
@@ -1555,8 +1512,8 @@ test "an edit of a message that never went out drops" {
     var server = try testing.Server.init(gpa, io, &quiet_scripts ++ [_]testing.Script{
         .{ .method = "sendMessage", .replies = &.{
             .{ .status = 400, .body = "{\"ok\":false,\"error_code\":400,\"description\":\"Bad Request: message text is empty\"}" },
+            .{ .body = ok_sent },
         } },
-        .{ .method = "setMessageReaction", .replies = &.{.{ .body = ok_true }} },
     });
     defer server.deinit();
     try server.start();
@@ -1569,21 +1526,19 @@ test "an edit of a message that never went out drops" {
 
     const handle = try attachment.sendTracked("", &.{});
     try attachment.edit(handle, "Writing", &.{});
-    try attachment.react(7, .committed);
+    try attachment.send("next", &.{});
     try collector.waitFor(1);
+    try server.waitForSends(2);
     try server.finish();
     try std.testing.expectEqual(Event.Rejected.Kind.message, collector.events.items[0].payload.send_rejected.kind);
-    var reactions: usize = 0;
+    var sends: usize = 0;
     for (server.requests.items) |request| {
         try std.testing.expect(!std.mem.endsWith(u8, request.path, "/editMessageText"));
-        if (!std.mem.endsWith(u8, request.path, "/setMessageReaction")) continue;
-        reactions += 1;
-        try std.testing.expectEqualStrings(
-            "{\"chat_id\":99,\"message_id\":7,\"reaction\":[{\"type\":\"emoji\",\"emoji\":\"👍\"}]}",
-            request.body,
-        );
+        if (!std.mem.endsWith(u8, request.path, "/sendMessage")) continue;
+        sends += 1;
+        if (sends == 2) try std.testing.expect(std.mem.indexOf(u8, request.body, "\"text\":\"next\"") != null);
     }
-    try std.testing.expectEqual(@as(usize, 1), reactions);
+    try std.testing.expectEqual(@as(usize, 2), sends);
 }
 
 test "a 403 on a send detaches" {

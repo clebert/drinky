@@ -39,7 +39,6 @@ pub fn select(context: *Context, selection: Context.Outcome.Pick.Selection) !Con
     defer gpa.free(items);
     if (index >= items.len)
         return Context.Outcome.reportNotice(gpa, .failure, "Select a valid skill.", .{});
-    if (context.remote) return load(context, items[index], "");
     return .{ .editor_text = try std.fmt.allocPrint(
         gpa,
         "/{s}:{s} ",
@@ -156,30 +155,6 @@ test "a selection writes the skill line with a trailing blank" {
         .failure,
         "valid skill",
     );
-}
-
-test "a selection on a remote host loads the skill with no task" {
-    const gpa = std.testing.allocator;
-    var discovered: Discovered = try .init(gpa);
-    defer discovered.deinit();
-    var context: Context = .{
-        .gpa = gpa,
-        .io = std.testing.io,
-        .agent = undefined,
-        .accounts = undefined,
-        .skill_registry = &discovered.registry,
-        .remote = true,
-    };
-
-    switch (try select(&context, .ofRow(0))) {
-        .prompt => |prompt| {
-            defer prompt.deinit(gpa);
-            try std.testing.expectEqualStrings("alpha", prompt.name);
-            try std.testing.expectEqualStrings("", prompt.arguments);
-            try std.testing.expect(std.mem.indexOf(u8, prompt.content, "Follow this skill.") != null);
-        },
-        else => return error.ExpectedPrompt,
-    }
 }
 
 test "an empty registry reports that no skill exists" {

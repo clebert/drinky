@@ -13,27 +13,15 @@ const Mirror = @This();
 
 const activity_bytes_max = 96;
 
-const cancel_label = "Cancel turn";
-const withdraw_label = "Withdraw";
-
-const retry_text = "Failed turn";
-const retry_label = "Try again";
-const dismiss_label = "Dismiss";
-
-const shorten_label = "Shorten";
-
 gpa: std.mem.Allocator,
 cursor: usize,
 turn: ?Turn,
-retry: ?RetryMessage,
-answer_serial: ?u64,
 serial: u64,
 
 pub const View = struct {
     blocks: []const ui.block.Entry,
     committed: usize,
     tail: ?Tail,
-    retry_waits: bool = false,
 
     pub const Tail = struct {
         streaming: ?ui.block.Entry.Kind,
@@ -51,7 +39,6 @@ pub const End = struct {
     outcome: Outcome,
     status: *const ui.status.Info,
     now_ms: i64,
-    retry_armed: bool = false,
 
     pub const Outcome = enum { completed, canceled, failed };
 };
@@ -60,11 +47,6 @@ const Turn = struct {
     started_ms: i64,
     handle: ?Attachment.Handle,
     activity: Activity,
-    serial: u64,
-};
-
-const RetryMessage = struct {
-    handle: ?Attachment.Handle,
     serial: u64,
 };
 
@@ -126,18 +108,8 @@ const Activity = struct {
     }
 };
 
-const Close = struct {
-    shorten: bool = false,
+const Flush = struct {
     hold_answer: bool = false,
-};
-
-const Rendered = struct {
-    text: []u8,
-    answer: bool,
-};
-
-const Send = struct {
-    markup: ?[]const u8 = null,
 };
 
 pub fn init(gpa: std.mem.Allocator) Mirror {
@@ -145,8 +117,6 @@ pub fn init(gpa: std.mem.Allocator) Mirror {
         .gpa = gpa,
         .cursor = 0,
         .turn = null,
-        .retry = null,
-        .answer_serial = null,
         .serial = 0,
     };
 }
@@ -157,7 +127,6 @@ pub fn seedSerials(self: *Mirror, seed: u64) void {
 
 pub fn open(self: *Mirror, chat: anytype, view: *const View) !void {
     self.cursor = view.committed;
-    if (view.retry_waits) try self.sendRetry(chat);
     const turn = if (self.turn) |*turn| turn else return;
     turn.handle = null;
     if (view.tail) |*tail| turn.activity = Activity.of(tail);
@@ -214,31 +183,19 @@ fn editActivity(self: *Mirror, chat: anytype, turn: *const Turn) !void {
 }
 
 fn activityMarkup(self: *Mirror, turn: *const Turn) ![]u8 {
-    var cancel_data: [keyboard.data_bytes_max]u8 = undefined;
-    var withdraw_data: [keyboard.data_bytes_max]u8 = undefined;
-    return keyboard.markup(self.gpa, &.{
-        .{
-            .text = cancel_label,
-            .data = (keyboard.Tap{ .cancel_turn = turn.serial }).write(&cancel_data),
-        },
-        .{
-            .text = withdraw_label,
-            .data = (keyboard.Tap{ .withdraw = turn.serial }).write(&withdraw_data),
-        },
-    });
+    return keyboard.cancelMarkup(self.gpa, turn.serial);
 }
 
 pub fn endTurn(self: *Mirror, chat: anytype, view: *const View, end: *const End) !void {
     defer self.turn = null;
     if (!chat.listens()) return;
-    try self.flush(chat, view, .{ .shorten = end.outcome == .completed });
+    try self.flush(chat, view, .{});
     if (self.turn) |*turn| {
         if (end.outcome == .canceled)
             try self.editSummary(chat, turn, end)
         else
             try self.sendSummary(chat, turn, end);
     }
-    if (end.retry_armed) try self.sendRetry(chat);
 }
 
 fn editSummary(self: *Mirror, chat: anytype, turn: *const Turn, end: *const End) !void {
@@ -258,57 +215,12 @@ fn sendSummary(self: *Mirror, chat: anytype, turn: *const Turn, end: *const End)
     if (turn.handle) |handle| try chat.delete(handle);
 }
 
-fn sendRetry(self: *Mirror, chat: anytype) !void {
-    try self.dismissRetry(chat);
-    const serial = self.nextSerial();
-    var retry_data: [keyboard.data_bytes_max]u8 = undefined;
-    var dismiss_data: [keyboard.data_bytes_max]u8 = undefined;
-    const markup = try keyboard.markup(self.gpa, &.{
-        .{ .text = retry_label, .data = (keyboard.Tap{ .retry = serial }).write(&retry_data) },
-        .{ .text = dismiss_label, .data = (keyboard.Tap{ .dismiss = serial }).write(&dismiss_data) },
-    });
-    defer self.gpa.free(markup);
-    const text = try self.retryText();
-    defer self.gpa.free(text);
-    self.retry = .{ .serial = serial, .handle = null };
-    self.retry.?.handle = try chat.sendTracked(text, &.{
-        .disable_notification = true,
-        .parse_mode = html.parse_mode,
-        .markup = markup,
-    });
-}
-
-pub fn dismissRetry(self: *Mirror, chat: anytype) !void {
-    const retry = self.retry orelse return;
-    self.retry = null;
-    const handle = retry.handle orelse return;
-    const text = try self.retryText();
-    defer self.gpa.free(text);
-    try chat.edit(handle, text, &.{ .parse_mode = html.parse_mode });
-}
-
-fn retryText(self: *Mirror) ![]u8 {
-    return html.wrapAlloc(self.gpa, .failure, retry_text);
-}
-
 pub fn namesTurn(self: *const Mirror, serial: u64) bool {
     const turn = self.turn orelse return false;
     return turn.serial == serial;
 }
 
-pub fn namesRetry(self: *const Mirror, serial: u64) bool {
-    const retry = self.retry orelse return false;
-    return retry.serial == serial;
-}
-
-pub fn namesAnswer(self: *const Mirror, serial: u64) bool {
-    const live = self.answer_serial orelse return false;
-    return live == serial;
-}
-
 pub fn detached(self: *Mirror) void {
-    self.retry = null;
-    self.answer_serial = null;
     const turn = if (self.turn) |*turn| turn else return;
     turn.handle = null;
 }
@@ -328,56 +240,26 @@ pub fn retreat(self: *Mirror, count: usize) void {
 
 pub fn restart(self: *Mirror) void {
     self.cursor = 0;
-    self.answer_serial = null;
 }
 
-fn flush(self: *Mirror, chat: anytype, view: *const View, close: Close) !void {
+fn flush(self: *Mirror, chat: anytype, view: *const View, options: Flush) !void {
     self.cursor = @min(self.cursor, view.blocks.len);
     var end = view.committed;
-    while (close.hold_answer and end > self.cursor and view.blocks[end - 1].content == .model)
+    while (options.hold_answer and end > self.cursor and view.blocks[end - 1].content == .model)
         end -= 1;
     if (self.cursor >= end) return;
-    var rendered: std.ArrayList(Rendered) = .empty;
+    var rendered: std.ArrayList([]u8) = .empty;
     defer {
-        for (rendered.items) |item| self.gpa.free(item.text);
+        for (rendered.items) |text| self.gpa.free(text);
         rendered.deinit(self.gpa);
     }
     for (view.blocks[self.cursor..end]) |*block| {
         const text = try self.renderBlock(block) orelse continue;
         errdefer self.gpa.free(text);
-        try rendered.append(self.gpa, .{ .text = text, .answer = block.content == .model });
+        try rendered.append(self.gpa, text);
     }
-    const answer_index = lastAnswer(rendered.items);
-    const shorten_index = if (close.shorten) answer_index else null;
-    var markup: ?[]u8 = null;
-    defer if (markup) |json| self.gpa.free(json);
-    if (shorten_index != null) markup = try self.armShorten();
     self.cursor = end;
-    if (answer_index != null and shorten_index == null) self.answer_serial = null;
-    for (rendered.items, 0..) |item, index| {
-        try self.sendHtml(chat, item.text, .{
-            .markup = if (shorten_index == index) markup else null,
-        });
-    }
-}
-
-fn lastAnswer(items: []const Rendered) ?usize {
-    var index = items.len;
-    while (index > 0) {
-        index -= 1;
-        if (items[index].answer) return index;
-    }
-    return null;
-}
-
-fn armShorten(self: *Mirror) ![]u8 {
-    const serial = self.nextSerial();
-    var data: [keyboard.data_bytes_max]u8 = undefined;
-    const json = try keyboard.markup(self.gpa, &.{
-        .{ .text = shorten_label, .data = (keyboard.Tap{ .shorten = serial }).write(&data) },
-    });
-    self.answer_serial = serial;
-    return json;
+    for (rendered.items) |text| try self.sendHtml(chat, text);
 }
 
 fn renderBlock(self: *Mirror, block: *const ui.block.Entry) !?[]u8 {
@@ -400,15 +282,11 @@ fn renderBlock(self: *Mirror, block: *const ui.block.Entry) !?[]u8 {
     return try out.toOwnedSlice();
 }
 
-fn sendHtml(self: *Mirror, chat: anytype, text: []const u8, send: Send) !void {
+fn sendHtml(self: *Mirror, chat: anytype, text: []const u8) !void {
     var parts = html.Parts.init(text, html.message_units_max);
     while (try parts.next(self.gpa)) |part| {
-        defer self.gpa.free(part.text);
-        try chat.send(part.text, &.{
-            .parse_mode = html.parse_mode,
-            .disable_notification = true,
-            .markup = if (part.last) send.markup else null,
-        });
+        defer self.gpa.free(part);
+        try chat.send(part, &.{ .parse_mode = html.parse_mode, .disable_notification = true });
     }
 }
 
@@ -549,19 +427,7 @@ const Recorder = struct {
 
 fn activityKeyboard(comptime serial: []const u8) []const u8 {
     return "{\"inline_keyboard\":[[{\"text\":\"Cancel turn\",\"callback_data\":\"cancel:" ++
-        serial ++ "\"}],[{\"text\":\"Withdraw\",\"callback_data\":\"withdraw:" ++ serial ++ "\"}]]}";
-}
-
-const retry_wrapped = "⚠ " ++ retry_text;
-
-fn retryKeyboard(comptime serial: []const u8) []const u8 {
-    return "{\"inline_keyboard\":[[{\"text\":\"Try again\",\"callback_data\":\"retry:" ++ serial ++
-        "\"}],[{\"text\":\"Dismiss\",\"callback_data\":\"dismiss:" ++ serial ++ "\"}]]}";
-}
-
-fn shortenKeyboard(comptime serial: []const u8) []const u8 {
-    return "{\"inline_keyboard\":[[{\"text\":\"Shorten\",\"callback_data\":\"shorten:" ++ serial ++
-        "\"}]]}";
+        serial ++ "\"}]]}";
 }
 
 const Blocks = struct {
@@ -771,50 +637,6 @@ test "a tap names the running turn alone, and the next turn makes its serial sta
     try std.testing.expect(mirror.namesTurn(2));
 }
 
-test "a failed turn that armed a retry sends the failed turn message, which loses its buttons with the retry" {
-    const gpa = std.testing.allocator;
-    var chat: Recorder = .{ .gpa = gpa };
-    defer chat.deinit();
-    var blocks: Blocks = .{ .gpa = gpa };
-    defer blocks.deinit();
-    var mirror = Mirror.init(gpa);
-
-    try mirror.beginTurn(&chat, 0);
-    try mirror.endTurn(&chat, &blocks.idle(), &.{ .outcome = .failed, .status = &test_status, .now_ms = 0 });
-    try std.testing.expectEqual(@as(usize, 2), chat.sends.items.len);
-    try std.testing.expect(mirror.retry == null);
-
-    try mirror.beginTurn(&chat, 0);
-    try mirror.endTurn(&chat, &blocks.idle(), &.{
-        .outcome = .failed,
-        .status = &test_status,
-        .now_ms = 0,
-        .retry_armed = true,
-    });
-    try std.testing.expectEqualStrings(retry_wrapped, chat.lastSend().text);
-    try std.testing.expectEqualStrings(html.parse_mode, chat.lastSend().options.parse_mode.?);
-    try std.testing.expectEqualStrings(retryKeyboard("3"), chat.lastSend().markup.?);
-    try std.testing.expect(chat.lastSend().options.disable_notification);
-    const handle = chat.lastSend().handle.?;
-    try std.testing.expect(mirror.namesRetry(3));
-    try std.testing.expect(!mirror.namesRetry(2));
-
-    try mirror.dismissRetry(&chat);
-    try std.testing.expectEqual(handle, chat.lastEdit().handle);
-    try std.testing.expectEqualStrings(retry_wrapped, chat.lastEdit().text);
-    try std.testing.expectEqualStrings(html.parse_mode, chat.lastEdit().parse_mode.?);
-    try std.testing.expect(chat.lastEdit().markup == null);
-    try std.testing.expect(!mirror.namesRetry(3));
-    const edits = chat.edits.items.len;
-    try mirror.dismissRetry(&chat);
-    try std.testing.expectEqual(edits, chat.edits.items.len);
-
-    try mirror.open(&chat, &.{ .blocks = &.{}, .committed = 0, .tail = null, .retry_waits = true });
-    try std.testing.expectEqualStrings(retry_wrapped, chat.lastSend().text);
-    try std.testing.expectEqualStrings(retryKeyboard("4"), chat.lastSend().markup.?);
-    try std.testing.expect(mirror.namesRetry(4));
-}
-
 test "a seed moves the serials past the keyboards of an earlier process" {
     const gpa = std.testing.allocator;
     var chat: Recorder = .{ .gpa = gpa };
@@ -843,19 +665,18 @@ test "a detach forgets the messages of the chat and keeps the turn" {
     var blocks: Blocks = .{ .gpa = gpa };
     defer blocks.deinit();
     var mirror = Mirror.init(gpa);
-    try mirror.open(&chat, &.{ .blocks = &.{}, .committed = 0, .tail = null, .retry_waits = true });
     try mirror.beginTurn(&chat, 0);
+    const sends = chat.sends.items.len;
     const edits = chat.edits.items.len;
 
     mirror.detached();
     try std.testing.expectEqual(edits, chat.edits.items.len);
-    try std.testing.expect(mirror.retry == null);
-    try std.testing.expect(!mirror.namesRetry(1));
     try std.testing.expect(mirror.turn != null);
-    try std.testing.expect(mirror.namesTurn(2));
-    try mirror.open(&chat, &.{ .blocks = &.{}, .committed = 0, .tail = null, .retry_waits = true });
-    try std.testing.expectEqualStrings(retryKeyboard("3"), chat.sends.items[2].markup.?);
-    try std.testing.expectEqualStrings(activityKeyboard("2"), chat.lastSend().markup.?);
+    try std.testing.expect(mirror.turn.?.handle == null);
+    try std.testing.expect(mirror.namesTurn(1));
+    try mirror.open(&chat, &.{ .blocks = &.{}, .committed = 0, .tail = null });
+    try std.testing.expectEqual(sends + 1, chat.sends.items.len);
+    try std.testing.expectEqualStrings(activityKeyboard("1"), chat.lastSend().markup.?);
     try std.testing.expectEqual(edits, chat.edits.items.len);
 }
 
@@ -1045,14 +866,13 @@ test "a send that reports into the transcript cannot move the blocks under the f
     try std.testing.expectEqual(@as(usize, 3), chat.sends);
 }
 
-test "a completed turn gives its last answer the shorten button, and a newer answer stales it" {
+test "an answer waits for a tool run, an event, or the turn end before it goes out" {
     const gpa = std.testing.allocator;
     var chat: Recorder = .{ .gpa = gpa };
     defer chat.deinit();
     var blocks: Blocks = .{ .gpa = gpa };
     defer blocks.deinit();
     var mirror = Mirror.init(gpa);
-    try std.testing.expect(!mirror.namesAnswer(0));
 
     try mirror.beginTurn(&chat, 0);
     try blocks.append(.model, .{}, "first");
@@ -1063,7 +883,6 @@ test "a completed turn gives its last answer the shorten button, and a newer ans
     try std.testing.expectEqual(@as(usize, 2), chat.sends.items.len);
     try std.testing.expectEqualStrings("first", chat.sends.items[1].text);
     try std.testing.expect(chat.sends.items[1].markup == null);
-    try std.testing.expect(mirror.answer_serial == null);
 
     try blocks.append(.model, .{}, "second");
     try mirror.sync(&chat, &blocks.live(2, .{ .streaming = .model, .tool = null, .calls = 1 }));
@@ -1072,9 +891,7 @@ test "a completed turn gives its last answer the shorten button, and a newer ans
     try mirror.sync(&chat, &blocks.live(3, .{ .streaming = null, .tool = null, .calls = 1 }));
     try std.testing.expectEqual(@as(usize, 4), chat.sends.items.len);
     try std.testing.expectEqualStrings("second", chat.sends.items[2].text);
-    try std.testing.expect(chat.sends.items[2].markup == null);
-    try std.testing.expect(chat.sends.items[3].markup == null);
-    try std.testing.expect(mirror.answer_serial == null);
+    try std.testing.expectEqualStrings("ℹ Drinky changed the model.", chat.sends.items[3].text);
 
     try blocks.append(.model, .{}, "last");
     try mirror.endTurn(&chat, &blocks.idle(), &.{
@@ -1084,68 +901,12 @@ test "a completed turn gives its last answer the shorten button, and a newer ans
     });
     try std.testing.expectEqual(@as(usize, 6), chat.sends.items.len);
     try std.testing.expectEqualStrings("last", chat.sends.items[4].text);
-    try std.testing.expectEqualStrings(shortenKeyboard("2"), chat.sends.items[4].markup.?);
+    try std.testing.expect(chat.sends.items[4].markup == null);
     try std.testing.expect(chat.lastSend().markup == null);
     try std.testing.expect(!chat.lastSend().options.disable_notification);
-    try std.testing.expect(mirror.namesAnswer(2));
-    try std.testing.expect(!mirror.namesAnswer(1));
-
-    try mirror.beginTurn(&chat, 0);
-    try blocks.append(.model, .{}, "newer");
-    try mirror.endTurn(&chat, &blocks.idle(), &.{
-        .outcome = .completed,
-        .status = &test_status,
-        .now_ms = 0,
-    });
-    try std.testing.expectEqualStrings(shortenKeyboard("4"), chat.sends.items[chat.sends.items.len - 2].markup.?);
-    try std.testing.expect(mirror.namesAnswer(4));
-    try std.testing.expect(!mirror.namesAnswer(2));
-
-    mirror.restart();
-    try std.testing.expect(!mirror.namesAnswer(4));
 }
 
-test "a canceled turn and a failed turn give no shorten button and stale the live one" {
-    const gpa = std.testing.allocator;
-    var chat: Recorder = .{ .gpa = gpa };
-    defer chat.deinit();
-    var blocks: Blocks = .{ .gpa = gpa };
-    defer blocks.deinit();
-    var mirror = Mirror.init(gpa);
-
-    try mirror.beginTurn(&chat, 0);
-    try blocks.append(.model, .{}, "complete");
-    try mirror.endTurn(&chat, &blocks.idle(), &.{
-        .outcome = .completed,
-        .status = &test_status,
-        .now_ms = 0,
-    });
-    try std.testing.expect(mirror.namesAnswer(2));
-
-    try mirror.beginTurn(&chat, 0);
-    try blocks.append(.model, .{}, "canceled");
-    try mirror.endTurn(&chat, &blocks.idle(), &.{
-        .outcome = .canceled,
-        .status = &test_status,
-        .now_ms = 0,
-    });
-    try std.testing.expectEqualStrings("canceled", chat.lastSend().text);
-    try std.testing.expect(chat.lastSend().markup == null);
-    try std.testing.expect(mirror.answer_serial == null);
-
-    try mirror.beginTurn(&chat, 0);
-    try blocks.append(.model, .{}, "failed");
-    try mirror.endTurn(&chat, &blocks.idle(), &.{
-        .outcome = .failed,
-        .status = &test_status,
-        .now_ms = 0,
-    });
-    try std.testing.expectEqualStrings("failed", chat.sends.items[chat.sends.items.len - 2].text);
-    try std.testing.expect(chat.sends.items[chat.sends.items.len - 2].markup == null);
-    try std.testing.expect(mirror.answer_serial == null);
-}
-
-test "a long answer splits into several messages, and the last part takes the button" {
+test "a long answer splits into several messages" {
     const gpa = std.testing.allocator;
     var chat: Recorder = .{ .gpa = gpa };
     defer chat.deinit();
@@ -1163,6 +924,6 @@ test "a long answer splits into several messages, and the last part takes the bu
     try std.testing.expect(chat.sends.items[2].options.disable_notification);
     try std.testing.expect(!chat.lastSend().options.disable_notification);
     try std.testing.expect(chat.sends.items[1].markup == null);
-    try std.testing.expectEqualStrings(shortenKeyboard("2"), chat.sends.items[2].markup.?);
+    try std.testing.expect(chat.sends.items[2].markup == null);
     try std.testing.expect(chat.lastSend().markup == null);
 }

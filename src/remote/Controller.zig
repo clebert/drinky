@@ -11,8 +11,6 @@ const Store = @import("Store.zig");
 
 const Controller = @This();
 
-const toast_bytes_max = 200;
-
 const bot_commands = blk: {
     var count = 0;
     for (ai.command.summaries) |summary| {
@@ -71,7 +69,7 @@ pub const Sink = struct {
 
 pub const Action = union(enum) {
     chat_message: ChatMessage,
-    chat_tap: ChatTap,
+    cancel_tap: CancelTap,
     report: Report,
     state_changed,
     pairing_changed: PairingChange,
@@ -81,9 +79,9 @@ pub const Action = union(enum) {
         text: []const u8,
     };
 
-    pub const ChatTap = struct {
+    pub const CancelTap = struct {
         query_id: []const u8,
-        tap: keyboard.Tap,
+        serial: u64,
     };
 
     pub const Report = struct {
@@ -371,20 +369,9 @@ pub fn delete(self: *Controller, handle: Attachment.Handle) !void {
     try self.takeQueued(attachment, .state, attachment.delete(handle));
 }
 
-pub fn react(self: *Controller, message_id: i64, mark: Attachment.Reaction.Mark) !void {
+pub fn answer(self: *Controller, query_id: []const u8) !void {
     const attachment = self.attached() orelse return;
-    try self.takeQueued(attachment, .state, attachment.react(message_id, mark));
-}
-
-pub fn answer(self: *Controller, query_id: []const u8, text: ?[]const u8) !void {
-    const attachment = self.attached() orelse return;
-    var toast = text;
-    if (toast) |*whole| {
-        var length = @min(whole.len, toast_bytes_max);
-        while (length > 0 and length < whole.len and (whole.*[length] & 0xC0) == 0x80) length -= 1;
-        whole.* = whole.*[0..length];
-    }
-    try self.takeQueued(attachment, .state, attachment.answer(query_id, toast));
+    try self.takeQueued(attachment, .state, attachment.answer(query_id));
 }
 
 pub fn listens(self: *const Controller) bool {
@@ -453,10 +440,10 @@ pub fn applyAttachmentEvent(self: *Controller, event: *const Attachment.Event) !
             .id = message.id,
             .text = message.text,
         } }),
-        .callback => |callback| if (keyboard.Tap.parse(callback.data)) |tap| {
-            try self.emit(.{ .chat_tap = .{ .query_id = callback.query_id, .tap = tap } });
+        .callback => |callback| if (keyboard.parseCancel(callback.data)) |serial| {
+            try self.emit(.{ .cancel_tap = .{ .query_id = callback.query_id, .serial = serial } });
         } else {
-            try self.answer(callback.query_id, null);
+            try self.answer(callback.query_id);
         },
         .unreadable => |id| try self.reply(id, .warning, "Drinky reads text alone."),
         .failed => |failure| try self.recordTerminalEvent(
@@ -492,7 +479,6 @@ fn rejectedNoun(kind: Attachment.Event.Rejected.Kind) []const u8 {
         .message => "a message to",
         .edit => "an edit in the chat of",
         .deletion => "a deletion in the chat of",
-        .reaction => "a reaction in the chat of",
     };
 }
 
@@ -789,7 +775,7 @@ const Owner = struct {
 
     const Recorded = union(enum) {
         chat_message: struct { id: i64, text: []u8 },
-        chat_tap: struct { query_id: []u8, tap: keyboard.Tap },
+        cancel_tap: struct { query_id: []u8, serial: u64 },
         report: struct { kind: Action.Report.Kind, severity: ai.command.Outcome.Severity, text: []u8 },
         state_changed,
         pairing_changed: Action.PairingChange,
@@ -797,7 +783,7 @@ const Owner = struct {
         fn deinit(self: *const Recorded, gpa: std.mem.Allocator) void {
             switch (self.*) {
                 .chat_message => |message| gpa.free(message.text),
-                .chat_tap => |tap| gpa.free(tap.query_id),
+                .cancel_tap => |tap| gpa.free(tap.query_id),
                 .report => |report| gpa.free(report.text),
                 .state_changed, .pairing_changed => {},
             }
@@ -848,9 +834,9 @@ const Owner = struct {
                 .id = message.id,
                 .text = try self.gpa.dupe(u8, message.text),
             } },
-            .chat_tap => |tap| .{ .chat_tap = .{
+            .cancel_tap => |tap| .{ .cancel_tap = .{
                 .query_id = try self.gpa.dupe(u8, tap.query_id),
-                .tap = tap.tap,
+                .serial = tap.serial,
             } },
             .report => |report| .{ .report = .{
                 .kind = report.kind,
@@ -950,7 +936,7 @@ test "a saved bot attaches, its messages and taps reach the owner, and a detach 
             \\{"ok":true,"result":[
             \\{"update_id":1,"message":{"message_id":7,"date":0,"chat":{"id":99,"type":"private"},"text":"hello"}},
             \\{"update_id":2,"message":{"message_id":8,"date":0,"chat":{"id":99,"type":"private"},"sticker":{}}},
-            \\{"update_id":3,"callback_query":{"id":"900","from":{"id":5},"chat_instance":"c","message":{"message_id":50,"date":0,"chat":{"id":99,"type":"private"}},"data":"withdraw:2"}},
+            \\{"update_id":3,"callback_query":{"id":"900","from":{"id":5},"chat_instance":"c","message":{"message_id":50,"date":0,"chat":{"id":99,"type":"private"}},"data":"cancel:2"}},
             \\{"update_id":4,"callback_query":{"id":"901","from":{"id":5},"chat_instance":"c","message":{"message_id":50,"date":0,"chat":{"id":99,"type":"private"}},"data":"not:ours"}}
             \\]}
             },
@@ -976,12 +962,7 @@ test "a saved bot attaches, its messages and taps reach the owner, and a detach 
     try server.waitForLongPoll();
     const registered = try server.waitForRequest("/setMyCommands", 0);
     try std.testing.expectEqualStrings(
-        "{\"commands\":[{\"command\":\"effort\",\"description\":\"Set the reasoning effort\"}," ++
-            "{\"command\":\"help\",\"description\":\"List every command\"}," ++
-            "{\"command\":\"model\",\"description\":\"Switch the model\"}," ++
-            "{\"command\":\"new\",\"description\":\"Clear the conversation\"}," ++
-            "{\"command\":\"skill\",\"description\":\"Pick a skill\"}," ++
-            "{\"command\":\"status\",\"description\":\"State the session\"}]}",
+        "{\"commands\":[{\"command\":\"new\",\"description\":\"Clear the conversation\"}]}",
         registered,
     );
     try controller.sendEvent(.information, "You attached @drinky_bot.");
@@ -991,17 +972,17 @@ test "a saved bot attaches, its messages and taps reach the owner, and a detach 
     try std.testing.expectEqual(@as(i64, 7), message.id);
     try std.testing.expectEqualStrings("hello", message.text);
     try controller.reply(7, .warning, "The command /login runs in the terminal alone.");
-    const tap = owner.actions.items[2].chat_tap;
+    const tap = owner.actions.items[2].cancel_tap;
     try std.testing.expectEqualStrings("900", tap.query_id);
-    try std.testing.expectEqual(@as(u64, 2), tap.tap.withdraw);
+    try std.testing.expectEqual(@as(u64, 2), tap.serial);
     try std.testing.expectEqual(@as(usize, 3), owner.actions.items.len);
-    try controller.answer("900", "Nothing queued.");
+    try controller.answer("900");
     try std.testing.expectEqualStrings(
         "{\"callback_query_id\":\"901\"}",
         try server.waitForRequest("/answerCallbackQuery", 0),
     );
     try std.testing.expectEqualStrings(
-        "{\"callback_query_id\":\"900\",\"text\":\"Nothing queued.\"}",
+        "{\"callback_query_id\":\"900\"}",
         try server.waitForRequest("/answerCallbackQuery", 1),
     );
 
@@ -1076,7 +1057,6 @@ test "a run of dropped messages reports its count in the chat once the queue has
     try server.waitForSends(1);
     for (0..Attachment.outbound_capacity) |_| try controller.send("fill", &.{});
     for (0..3) |_| try controller.send("lost", &.{});
-    try controller.react(7, .committed);
     try std.testing.expectEqual(@as(usize, 0), owner.countReports("dropped"));
 
     try server.waitForSends(10);

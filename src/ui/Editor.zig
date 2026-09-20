@@ -160,79 +160,27 @@ pub fn detachTrimmed(self: *Editor) Draft {
     return draft;
 }
 
-pub fn reserveDrafts(self: *Editor, drafts: []const Draft) !void {
-    return self.reserveComposition(null, drafts);
-}
-
-pub fn reserveComposition(self: *Editor, lead: ?*const Draft, drafts: []const Draft) !void {
-    var visible_extra: usize = 0;
-    var atoms_extra: usize = 0;
-    if (lead) |source| {
-        visible_extra = try std.math.add(usize, visible_extra, source.visible.items.len);
-        visible_extra = try std.math.add(usize, visible_extra, draft_separator.len);
-        atoms_extra = try std.math.add(usize, atoms_extra, source.atoms.items.len);
-    }
-    for (drafts) |draft| {
-        visible_extra = try std.math.add(usize, visible_extra, draft.visible.items.len);
-        visible_extra = try std.math.add(usize, visible_extra, draft_separator.len);
-        atoms_extra = try std.math.add(usize, atoms_extra, draft.atoms.items.len);
-    }
+pub fn reserveDraft(self: *Editor, source: *const Draft) !void {
+    const visible_extra = try std.math.add(usize, source.visible.items.len, draft_separator.len);
     try self.draft.visible.ensureUnusedCapacity(self.gpa, visible_extra);
-    try self.draft.atoms.ensureUnusedCapacity(self.gpa, atoms_extra);
+    try self.draft.atoms.ensureUnusedCapacity(self.gpa, source.atoms.items.len);
 }
 
-pub fn appendDraft(self: *Editor, source: *Draft) void {
-    self.moveEnd();
-    if (self.draft.visible.items.len > 0) self.insert(draft_separator) catch unreachable;
+pub fn prependDraft(self: *Editor, source: *Draft) void {
+    const had_content = self.draft.visible.items.len > 0;
     self.splice(.{
-        .from = self.caret,
-        .to = self.caret,
+        .from = 0,
+        .to = 0,
         .bytes = source.visible.items,
         .new_atoms = source.atoms.items,
     }) catch unreachable;
+    const offset = source.visible.items.len;
     source.atoms.deinit(self.gpa);
     source.visible.deinit(self.gpa);
     source.* = .empty;
-}
-
-pub fn prependComposition(self: *Editor, lead: ?*Draft, drafts: []Draft) void {
-    const had_content = self.draft.visible.items.len > 0;
-    var offset: usize = 0;
-    var wrote = false;
-    if (lead) |source| {
-        offset = self.spliceDraftAt(offset, source, false);
-        wrote = true;
-    }
-    for (drafts) |*source| {
-        offset = self.spliceDraftAt(offset, source, wrote);
-        wrote = true;
-    }
-    if (wrote and had_content)
+    if (had_content)
         self.splice(.{ .from = offset, .to = offset, .bytes = draft_separator }) catch unreachable;
     self.moveEnd();
-}
-
-fn spliceDraftAt(self: *Editor, offset: usize, source: *Draft, separate: bool) usize {
-    var position = offset;
-    if (separate) {
-        self.splice(.{
-            .from = position,
-            .to = position,
-            .bytes = draft_separator,
-        }) catch unreachable;
-        position += draft_separator.len;
-    }
-    self.splice(.{
-        .from = position,
-        .to = position,
-        .bytes = source.visible.items,
-        .new_atoms = source.atoms.items,
-    }) catch unreachable;
-    position += source.visible.items.len;
-    source.atoms.deinit(self.gpa);
-    source.visible.deinit(self.gpa);
-    source.* = .empty;
-    return position;
 }
 
 pub fn paste(self: *Editor, bytes: []const u8, final: bool) !void {
@@ -1188,114 +1136,6 @@ test "detachTrimmed on literal text trims like the whole-prompt rule" {
     try std.testing.expectEqualStrings("", editor.visible());
 }
 
-test "appendDraft joins a detached draft after in-progress text, atom live" {
-    const gpa = std.testing.allocator;
-    var editor = Editor.init(gpa);
-    defer editor.deinit();
-    try pasteWhole(&editor, eleven_lines);
-    var recalled = editor.detachTrimmed();
-    defer recalled.deinit(gpa);
-
-    try editor.insert("draft");
-    try editor.reserveDrafts(&.{recalled});
-    editor.appendDraft(&recalled);
-    try std.testing.expectEqualStrings(
-        "draft\n\n\u{200B}[Paste #1: 11 lines]\u{200B}",
-        editor.visible(),
-    );
-    try std.testing.expectEqual(@as(usize, 1), editor.draft.atoms.items.len);
-    try std.testing.expectEqual(@as(u64, 1), editor.draft.atoms.items[0].id);
-    try expectExpanded(&editor, .none, "draft\n\n" ++ eleven_lines);
-}
-
-test "appendDraft onto an empty draft adds no separator" {
-    const gpa = std.testing.allocator;
-    var editor = Editor.init(gpa);
-    defer editor.deinit();
-    try pasteWhole(&editor, eleven_lines);
-    var recalled = editor.detachTrimmed();
-    defer recalled.deinit(gpa);
-
-    try editor.reserveDrafts(&.{recalled});
-    editor.appendDraft(&recalled);
-    try std.testing.expectEqualStrings("\u{200B}[Paste #1: 11 lines]\u{200B}", editor.visible());
-}
-
-test "paste IDs stay unique across detach and append with no reuse" {
-    const gpa = std.testing.allocator;
-    var editor = Editor.init(gpa);
-    defer editor.deinit();
-    try pasteWhole(&editor, eleven_lines);
-    var first = editor.detachTrimmed();
-    defer first.deinit(gpa);
-    try editor.paste("z" ** 1001, true);
-    var second = editor.detachTrimmed();
-    defer second.deinit(gpa);
-
-    try editor.reserveDrafts(&.{ first, second });
-    editor.appendDraft(&first);
-    editor.appendDraft(&second);
-    try std.testing.expectEqual(@as(u64, 1), editor.draft.atoms.items[0].id);
-    try std.testing.expectEqual(@as(u64, 2), editor.draft.atoms.items[1].id);
-    try pasteWhole(&editor, eleven_lines);
-    try std.testing.expectEqual(@as(usize, 3), editor.draft.atoms.items.len);
-    try std.testing.expectEqual(@as(u64, 3), editor.draft.atoms.items[2].id);
-}
-
-test "reserveDrafts covers appendDraft against allocation failure and leaks nothing" {
-    var fail_index: usize = 0;
-    while (fail_index < 30) : (fail_index += 1) {
-        var failing = std.testing.FailingAllocator.init(
-            std.testing.allocator,
-            .{ .fail_index = fail_index },
-        );
-        const gpa = failing.allocator();
-        var editor = Editor.init(gpa);
-        defer editor.deinit();
-        editor.insert("keep") catch continue;
-
-        var source = Editor.init(gpa);
-        source.paste(eleven_lines, true) catch {
-            source.deinit();
-            continue;
-        };
-        var recalled = source.detachTrimmed();
-        source.deinit();
-
-        editor.reserveDrafts(&.{recalled}) catch {
-            recalled.deinit(gpa);
-            try std.testing.expectEqualStrings("keep", editor.visible());
-            continue;
-        };
-        editor.appendDraft(&recalled);
-        try std.testing.expectEqual(@as(usize, 1), editor.draft.atoms.items.len);
-    }
-}
-
-test "reserveDrafts covers several drafts" {
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
-    const gpa = failing.allocator();
-    var editor = Editor.init(gpa);
-    defer editor.deinit();
-    try editor.insert("keep");
-
-    var source = Editor.init(gpa);
-    defer source.deinit();
-    try source.paste(eleven_lines, true);
-    var first = source.detachTrimmed();
-    defer first.deinit(gpa);
-    try source.paste(eleven_lines, true);
-    var second = source.detachTrimmed();
-    defer second.deinit(gpa);
-
-    try editor.reserveDrafts(&.{ first, second });
-    failing.fail_index = failing.alloc_index;
-    failing.resize_fail_index = failing.resize_index;
-    editor.appendDraft(&first);
-    editor.appendDraft(&second);
-    try std.testing.expectEqual(@as(usize, 2), editor.draft.atoms.items.len);
-}
-
 test render {
     const gpa = std.testing.allocator;
     var editor = Editor.init(gpa);
@@ -1644,7 +1484,7 @@ test "the separators report the rows scrolled out of view" {
     try std.testing.expect(std.mem.indexOf(u8, painted, "l9") == null);
 }
 
-test "prependComposition composes lead, drafts, then the current line" {
+test "prependDraft puts the draft before the current line with a blank line between" {
     const gpa = std.testing.allocator;
     var editor = Editor.init(gpa);
     defer editor.deinit();
@@ -1657,22 +1497,25 @@ test "prependComposition composes lead, drafts, then the current line" {
     var lead = builder.detachTrimmed();
     defer lead.deinit(gpa);
 
-    var drafts = [_]Draft{
-        try Draft.fromText(gpa, "steer one"),
-        try Draft.fromText(gpa, "steer two"),
-    };
-    defer for (&drafts) |*draft| draft.deinit(gpa);
-
-    try editor.reserveComposition(&lead, &drafts);
-    editor.prependComposition(&lead, &drafts);
+    try editor.reserveDraft(&lead);
+    editor.prependDraft(&lead);
 
     const shown = editor.visible();
-    try std.testing.expect(std.mem.indexOf(u8, shown, "[Paste #1: 16 lines]") != null);
-    try std.testing.expect(std.mem.endsWith(u8, shown, "\n\nsteer one\n\nsteer two\n\ntyping"));
+    try std.testing.expect(std.mem.startsWith(u8, shown, "\u{200B}[Paste #1: 16 lines]\u{200B}"));
+    try std.testing.expect(std.mem.endsWith(u8, shown, "\n\ntyping"));
     try std.testing.expectEqual(shown.len, editor.caret);
     try std.testing.expectEqual(@as(usize, 1), editor.draft.atoms.items.len);
+    try std.testing.expectEqual(@as(usize, 0), lead.visible.items.len);
     const text = try editor.expanded(.none);
     defer gpa.free(text);
     try std.testing.expect(std.mem.startsWith(u8, text, payload));
-    try std.testing.expect(std.mem.endsWith(u8, text, "\n\nsteer one\n\nsteer two\n\ntyping"));
+    try std.testing.expect(std.mem.endsWith(u8, text, "\n\ntyping"));
+
+    var empty = Editor.init(gpa);
+    defer empty.deinit();
+    var plain = try Draft.fromText(gpa, "alone");
+    defer plain.deinit(gpa);
+    try empty.reserveDraft(&plain);
+    empty.prependDraft(&plain);
+    try std.testing.expectEqualStrings("alone", empty.visible());
 }

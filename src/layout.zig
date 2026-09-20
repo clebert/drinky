@@ -454,7 +454,7 @@ test "a turn tail shows its steering caption above the editor" {
     try std.testing.expect(std.mem.indexOf(u8, painted, "fix the bug") == null);
 }
 
-test "a prompt tail shows its retry caption above the editor" {
+test "a prompt tail shows its input caption above the editor" {
     const gpa = std.testing.allocator;
     var editor = ui.Editor.init(gpa);
     defer editor.deinit();
@@ -477,8 +477,8 @@ test "a prompt tail shows its retry caption above the editor" {
         .transcript = shown.items,
         .tail = .{ .prompt = .{
             .caption = .{
-                .title = "Failed turn",
-                .controls = "Ctrl+N: Try again · Esc: Dismiss",
+                .title = "Sign in: anthropic-plan",
+                .controls = "Enter: Replay callback URL · Esc: Cancel",
             },
             .editor = &editor,
         } },
@@ -488,8 +488,8 @@ test "a prompt tail shows its retry caption above the editor" {
     defer gpa.free(painted);
 
     const failure = std.mem.indexOf(u8, painted, "the turn failed").?;
-    const title = std.mem.indexOf(u8, painted, "Failed turn").?;
-    const control = std.mem.indexOf(u8, painted, "Ctrl+N: Try again").?;
+    const title = std.mem.indexOf(u8, painted, "Sign in: anthropic-plan").?;
+    const control = std.mem.indexOf(u8, painted, "Enter: Replay callback URL").?;
     const draft = std.mem.indexOf(u8, painted, "draft text").?;
     const footer = std.mem.indexOf(u8, painted, "footerqq").?;
     try std.testing.expect(failure < title);
@@ -504,7 +504,7 @@ test "a prompt tail shows its retry caption above the editor" {
     } };
     const without = try projected(gpa, .{ .columns = 80, .rows = 24 }, &bare);
     defer gpa.free(without);
-    try std.testing.expect(std.mem.indexOf(u8, without, "Ctrl+N") == null);
+    try std.testing.expect(std.mem.indexOf(u8, without, "Sign in") == null);
     try std.testing.expectEqual(
         ui.block.paintedRows(painted),
         ui.block.paintedRows(without) + 1,

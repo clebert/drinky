@@ -14,12 +14,6 @@ pub const Login = union(enum) {
     },
 };
 
-pub const Persistence = enum {
-    saved,
-    save_pending,
-    memory_only,
-};
-
 fn isOptionalString(comptime T: type) bool {
     return switch (@typeInfo(T)) {
         .optional => |optional| optional.child == []const u8,
@@ -27,7 +21,7 @@ fn isOptionalString(comptime T: type) bool {
     };
 }
 
-pub fn openStore(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !?json_store.File {
+fn openStore(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !?json_store.File {
     return json_store.open(gpa, io, path) catch |err| switch (err) {
         error.CorruptStore => return error.BadCredentials,
         else => return err,
@@ -83,76 +77,8 @@ fn loadEntry(auth: anytype, comptime account_key: []const u8, file: *const json_
     }
     if (auth.tokens) |old| old.deinit(auth.gpa);
     auth.tokens = tokens;
-    auth.persistence = .saved;
+    auth.save_pending = false;
     return true;
-}
-
-pub const Change = enum {
-    unchanged,
-    signed_in,
-    signed_out,
-    rotated,
-    replaced,
-};
-
-pub fn reread(
-    auth: anytype,
-    comptime account_key: []const u8,
-    maybe_file: ?*const json_store.File,
-) !Change {
-    switch (auth.persistence) {
-        .saved => {},
-        .save_pending => {
-            save(auth, account_key) catch {};
-            return .unchanged;
-        },
-        .memory_only => return .unchanged,
-    }
-    var stored_auth = auth.*;
-    stored_auth.tokens = null;
-    defer clear(&stored_auth);
-    const loaded = if (maybe_file) |file| try loadEntry(&stored_auth, account_key, file) else false;
-    if (!loaded) {
-        if (auth.tokens == null) return .unchanged;
-        clear(auth);
-        return .signed_out;
-    }
-    if (auth.tokens == null) {
-        adopt(auth, &stored_auth);
-        return .signed_in;
-    }
-    const current = &auth.tokens.?;
-    const stored = &stored_auth.tokens.?;
-    if (sameTokens(current, stored)) return .unchanged;
-    const same_principal = samePrincipal(current, stored);
-    adopt(auth, &stored_auth);
-    return if (same_principal) .rotated else .replaced;
-}
-
-fn sameTokens(current: anytype, stored: @TypeOf(current)) bool {
-    inline for (@typeInfo(@TypeOf(current.*)).@"struct".fields) |field| {
-        const own = @field(current.*, field.name);
-        const other = @field(stored.*, field.name);
-        const same = if (comptime field.type == []const u8)
-            std.mem.eql(u8, own, other)
-        else if (comptime isOptionalString(field.type))
-            sameOptionalString(own, other)
-        else
-            own == other;
-        if (!same) return false;
-    }
-    return true;
-}
-
-fn sameOptionalString(own: ?[]const u8, other: ?[]const u8) bool {
-    const string_own = own orelse return other == null;
-    const string_other = other orelse return false;
-    return std.mem.eql(u8, string_own, string_other);
-}
-
-fn samePrincipal(current: anytype, stored: @TypeOf(current)) bool {
-    if (@hasDecl(@TypeOf(current.*), "samePrincipal")) return current.samePrincipal(stored);
-    return false;
 }
 
 pub fn accessToken(
@@ -160,7 +86,7 @@ pub fn accessToken(
     comptime account_key: []const u8,
     comptime refreshFn: anytype,
 ) ![]const u8 {
-    if (auth.persistence == .save_pending) {
+    if (auth.save_pending) {
         const protection = auth.io.swapCancelProtection(.blocked);
         defer _ = auth.io.swapCancelProtection(protection);
         try save(auth, account_key);
@@ -196,7 +122,7 @@ pub fn renew(
     comptime refreshFn: anytype,
 ) !bool {
     if (auth.tokens == null) return false;
-    if (try adoptStored(auth, account_key)) return true;
+    if (adoptStored(auth, account_key)) return true;
     const Tokens = @typeInfo(@TypeOf(auth.tokens)).optional.child;
     const maybe_fresh: ?Tokens = refreshFn(
         auth.gpa,
@@ -220,25 +146,19 @@ fn refreshFromStore(
     first_error: anyerror,
     comptime refreshFn: anytype,
 ) anyerror!?@typeInfo(@TypeOf(auth.tokens)).optional.child {
-    if (!try adoptStored(auth, account_key)) return first_error;
+    if (!adoptStored(auth, account_key)) return first_error;
     if (!expired(auth)) return null;
     return try refreshFn(auth.gpa, auth.io, auth.timeouts, auth.tokens.?);
 }
 
-fn adoptStored(auth: anytype, comptime account_key: []const u8) !bool {
+fn adoptStored(auth: anytype, comptime account_key: []const u8) bool {
     var stored_auth = auth.*;
     stored_auth.tokens = null;
     defer clear(&stored_auth);
     const loaded = load(&stored_auth, account_key) catch return false;
     if (!loaded) return false;
-
-    const current = &auth.tokens.?;
-    const stored = &stored_auth.tokens.?;
-    if (std.mem.eql(u8, current.refresh, stored.refresh)) return false;
-    const same_principal = current.samePrincipal(stored);
-
+    if (std.mem.eql(u8, auth.tokens.?.refresh, stored_auth.tokens.?.refresh)) return false;
     adopt(auth, &stored_auth);
-    if (!same_principal) return error.CredentialReplaced;
     return true;
 }
 
@@ -397,19 +317,19 @@ fn remove(auth: anytype, comptime account_key: []const u8) !void {
 fn clear(auth: anytype) void {
     if (auth.tokens) |tokens| tokens.deinit(auth.gpa);
     auth.tokens = null;
-    auth.persistence = .saved;
+    auth.save_pending = false;
 }
 
 pub fn save(auth: anytype, comptime account_key: []const u8) !void {
     const tokens = auth.tokens orelse return error.NotAuthenticated;
     json_store.save(auth.gpa, auth.io, auth.path, account_key, tokens, .{}) catch |err| {
-        auth.persistence = if (err == error.StoreBusy) .save_pending else .memory_only;
+        auth.save_pending = err == error.StoreBusy;
         return switch (err) {
             error.CorruptStore => error.BadCredentials,
             else => err,
         };
     };
-    auth.persistence = .saved;
+    auth.save_pending = false;
 }
 
 const CallbackSource = struct {
@@ -459,14 +379,8 @@ fn TestAuth(comptime Tokens: type) type {
         io: std.Io,
         path: []const u8,
         tokens: ?Tokens,
-        persistence: Persistence = .saved,
+        save_pending: bool = false,
     };
-}
-
-fn rereadStore(subject: anytype, comptime account_key: []const u8) !Change {
-    var maybe_file = try openStore(subject.gpa, subject.io, subject.path);
-    defer if (maybe_file) |*file| file.deinit();
-    return reread(subject, account_key, if (maybe_file) |*file| file else null);
 }
 
 test "a failed persist returns memory-only login and keeps credentials usable" {
@@ -508,198 +422,4 @@ test "a failed persist returns memory-only login and keeps credentials usable" {
     var file = (try json_store.open(gpa, io, subject.path)).?;
     defer file.deinit();
     try std.testing.expect(file.entry("test_account") != null);
-}
-
-test "reread settles the credential on the store and reports the change" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var path_buffer: [160]u8 = undefined;
-    var subject: TestAuth(KeyTokens) = .{ .gpa = gpa, .io = io, .path = undefined, .tokens = null };
-    defer if (subject.tokens) |tokens| tokens.deinit(gpa);
-    subject.path = try std.fmt.bufPrint(
-        &path_buffer,
-        ".zig-cache/tmp/{s}/auth.json",
-        .{tmp.sub_path},
-    );
-
-    try std.testing.expectEqual(Change.unchanged, try rereadStore(&subject, "test_account"));
-    try std.testing.expect(subject.tokens == null);
-
-    try json_store.save(gpa, io, subject.path, "test_account", .{
-        .access = "stored",
-        .expires_ms = 1,
-    }, .{});
-    try std.testing.expectEqual(Change.signed_in, try rereadStore(&subject, "test_account"));
-    try std.testing.expectEqualStrings("stored", subject.tokens.?.access);
-
-    const installed = subject.tokens.?.access;
-    try std.testing.expectEqual(Change.unchanged, try rereadStore(&subject, "test_account"));
-    try std.testing.expectEqual(installed.ptr, subject.tokens.?.access.ptr);
-
-    try json_store.save(gpa, io, subject.path, "test_account", .{
-        .access = "minted again",
-        .expires_ms = 2,
-    }, .{});
-    try std.testing.expectEqual(Change.replaced, try rereadStore(&subject, "test_account"));
-    try std.testing.expectEqualStrings("minted again", subject.tokens.?.access);
-
-    try json_store.remove(gpa, io, subject.path, "test_account");
-    try std.testing.expectEqual(Change.signed_out, try rereadStore(&subject, "test_account"));
-    try std.testing.expect(subject.tokens == null);
-}
-
-test "reread tells a rotation of one principal from a replacement" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const Tokens = struct {
-        access: []const u8,
-        account: ?[]const u8 = null,
-
-        fn deinit(self: @This(), allocator: std.mem.Allocator) void {
-            allocator.free(self.access);
-            if (self.account) |account| allocator.free(account);
-        }
-
-        pub fn samePrincipal(self: *const @This(), other: *const @This()) bool {
-            const own = self.account orelse return false;
-            const theirs = other.account orelse return false;
-            return std.mem.eql(u8, own, theirs);
-        }
-    };
-    var path_buffer: [160]u8 = undefined;
-    var subject: TestAuth(Tokens) = .{ .gpa = gpa, .io = io, .path = undefined, .tokens = null };
-    defer if (subject.tokens) |tokens| tokens.deinit(gpa);
-    subject.path = try std.fmt.bufPrint(
-        &path_buffer,
-        ".zig-cache/tmp/{s}/auth.json",
-        .{tmp.sub_path},
-    );
-    try json_store.save(gpa, io, subject.path, "test_account", .{
-        .access = "first",
-        .account = "user-1",
-    }, .{});
-    try std.testing.expectEqual(Change.signed_in, try rereadStore(&subject, "test_account"));
-
-    try json_store.save(gpa, io, subject.path, "test_account", .{
-        .access = "second",
-        .account = "user-1",
-    }, .{});
-    try std.testing.expectEqual(Change.rotated, try rereadStore(&subject, "test_account"));
-    try std.testing.expectEqualStrings("second", subject.tokens.?.access);
-
-    try json_store.save(gpa, io, subject.path, "test_account", .{
-        .access = "third",
-        .account = "user-2",
-    }, .{});
-    try std.testing.expectEqual(Change.replaced, try rereadStore(&subject, "test_account"));
-    try std.testing.expectEqualStrings("third", subject.tokens.?.access);
-
-    try json_store.save(gpa, io, subject.path, "test_account", .{
-        .access = "fourth",
-        .account = null,
-    }, .{});
-    try std.testing.expectEqual(Change.replaced, try rereadStore(&subject, "test_account"));
-    try std.testing.expect(subject.tokens.?.account == null);
-}
-
-test "a credential whose save failed survives a reread of the store" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var path_buffer: [160]u8 = undefined;
-    var subject: TestAuth(KeyTokens) = .{ .gpa = gpa, .io = io, .path = undefined, .tokens = null };
-    defer if (subject.tokens) |tokens| tokens.deinit(gpa);
-    subject.path = try std.fmt.bufPrint(
-        &path_buffer,
-        ".zig-cache/tmp/{s}/auth.json",
-        .{tmp.sub_path},
-    );
-
-    try tmp.dir.writeFile(io, .{ .sub_path = "auth.json", .data = "not json" });
-    switch (commit(&subject, "test_account", KeyTokens{
-        .access = try gpa.dupe(u8, "live"),
-        .expires_ms = 1,
-    })) {
-        .memory_only => {},
-        .saved => return error.UnexpectedLoginPersistence,
-    }
-
-    try tmp.dir.writeFile(io, .{ .sub_path = "auth.json", .data = "{}" });
-    try std.testing.expectEqual(Change.unchanged, try rereadStore(&subject, "test_account"));
-    try std.testing.expectEqualStrings("live", subject.tokens.?.access);
-
-    try json_store.save(gpa, io, subject.path, "test_account", .{
-        .access = "consumed",
-        .expires_ms = 0,
-    }, .{});
-    try std.testing.expectEqual(Change.unchanged, try rereadStore(&subject, "test_account"));
-    try std.testing.expectEqualStrings("live", subject.tokens.?.access);
-
-    try save(&subject, "test_account");
-    try std.testing.expectEqual(Change.unchanged, try rereadStore(&subject, "test_account"));
-    try json_store.remove(gpa, io, subject.path, "test_account");
-    try std.testing.expectEqual(Change.signed_out, try rereadStore(&subject, "test_account"));
-}
-
-test "a reread retries the save that a busy store refused" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var path_buffer: [160]u8 = undefined;
-    var subject: TestAuth(KeyTokens) = .{ .gpa = gpa, .io = io, .path = undefined, .tokens = null };
-    defer if (subject.tokens) |tokens| tokens.deinit(gpa);
-    subject.path = try std.fmt.bufPrint(
-        &path_buffer,
-        ".zig-cache/tmp/{s}/auth.json",
-        .{tmp.sub_path},
-    );
-    json_store.lock_policy = .{ .attempts_max = 2, .wait_ms = 0 };
-    defer json_store.lock_policy = .{};
-
-    const lock_path = try std.fmt.allocPrint(gpa, "{s}.lock", .{subject.path});
-    defer gpa.free(lock_path);
-    {
-        var held = try std.Io.Dir.cwd().createFile(io, lock_path, .{
-            .truncate = false,
-            .lock = .exclusive,
-            .permissions = @enumFromInt(0o600),
-        });
-        defer held.close(io);
-        switch (commit(&subject, "test_account", KeyTokens{
-            .access = try gpa.dupe(u8, "live"),
-            .expires_ms = 1,
-        })) {
-            .memory_only => |failure| try std.testing.expectEqual(
-                @as(anyerror, error.StoreBusy),
-                failure.save_error,
-            ),
-            .saved => return error.UnexpectedLoginPersistence,
-        }
-        try std.testing.expectEqual(Persistence.save_pending, subject.persistence);
-
-        try std.testing.expectEqual(Change.unchanged, try rereadStore(&subject, "test_account"));
-        try std.testing.expectEqual(Persistence.save_pending, subject.persistence);
-        try std.testing.expectEqualStrings("live", subject.tokens.?.access);
-    }
-
-    try std.testing.expectEqual(Change.unchanged, try rereadStore(&subject, "test_account"));
-    try std.testing.expectEqual(Persistence.saved, subject.persistence);
-    try std.testing.expectEqualStrings("live", subject.tokens.?.access);
-    var file = (try json_store.open(gpa, io, subject.path)).?;
-    defer file.deinit();
-    try std.testing.expectEqualStrings(
-        "live",
-        file.entry("test_account").?.get("access").?.string,
-    );
-
-    try json_store.remove(gpa, io, subject.path, "test_account");
-    try std.testing.expectEqual(Change.signed_out, try rereadStore(&subject, "test_account"));
-    try std.testing.expect(subject.tokens == null);
 }

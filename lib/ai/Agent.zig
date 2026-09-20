@@ -4,7 +4,6 @@ const llm = @import("llm.zig");
 const Model = @import("Model.zig");
 const net = @import("net.zig");
 const provider = @import("provider.zig");
-const Steering = @import("Steering.zig");
 const testing = @import("testing.zig");
 const tool = @import("tool/root.zig");
 
@@ -33,7 +32,6 @@ skill_guard: ?*tool.SkillGuard,
 items: std.ArrayList(llm.Item),
 stats: Stats,
 measured_context: ?MeasuredContext,
-steering: Steering,
 cache_key: [32]u8,
 
 pub const Stats = struct {
@@ -74,7 +72,6 @@ pub const RetryAttempt = struct {
 pub const Receipt = struct {
     history_base: usize,
     history_end: usize,
-    steering_committed_count: usize,
     truncated: bool = false,
 };
 
@@ -86,7 +83,6 @@ pub const Outcome = struct {
         completed,
         canceled,
         closed,
-        credential_replaced,
         credential_rejected,
         failed: anyerror,
     };
@@ -102,9 +98,7 @@ const MeasuredContext = struct {
 const TurnState = struct {
     base: usize,
     checkpoint: usize,
-    steering_committed_count: usize = 0,
     truncated: bool = false,
-    pending_steering: ?[][]u8 = null,
     pending_context: ?MeasuredContext = null,
     presentation_closed: bool = false,
 };
@@ -231,7 +225,6 @@ pub fn init(
         .items = .empty,
         .stats = .{},
         .measured_context = null,
-        .steering = Steering.init(gpa, io),
         .cache_key = generateCacheKey(io),
     };
 }
@@ -239,14 +232,12 @@ pub fn init(
 pub fn deinit(self: *Agent) void {
     for (self.items.items) |item| freeItem(self.gpa, item);
     self.items.deinit(self.gpa);
-    self.steering.deinit();
 }
 
 pub fn resetConversation(self: *Agent) void {
     self.rollback(0);
     self.stats = .{};
     self.measured_context = null;
-    self.steering.clear();
     self.cache_key = generateCacheKey(self.io);
 }
 
@@ -255,57 +246,22 @@ pub fn switchTo(self: *Agent, client: provider.Client, model: ?Model) void {
         active.account() != client.account()
     else
         true;
-    const model_changed = if (self.model) |active|
-        if (model) |next| !active.eql(&next) else true
-    else
-        model != null;
     self.client = client;
     self.model = model;
     if (account_changed) self.stats.forgetBilling();
-    if (account_changed or model_changed) self.stats.cache_usage = .{};
     self.refreshContext();
 }
 
 pub fn signOut(self: *Agent) void {
     self.client = null;
     self.stats.forgetBilling();
-    self.stats.cache_usage = .{};
     self.refreshContext();
 }
 
 pub fn dropAccountEvidence(self: *Agent, account: llm.Account) void {
     self.dropReasoning(account);
     const client = self.client orelse return;
-    if (client.account() == account) {
-        self.stats.forgetBilling();
-        self.stats.cache_usage = .{};
-    }
-}
-
-pub fn producedBefore(self: *const Agent, account: llm.Account, index: usize) usize {
-    std.debug.assert(index <= self.items.items.len);
-    var count: usize = 0;
-    for (self.items.items[0..index]) |item| {
-        const reasoning = switch (item) {
-            .reasoning => |value| value,
-            else => continue,
-        };
-        count += @intFromBool(std.meta.activeTag(reasoning.replay) == account);
-    }
-    return count;
-}
-
-pub const HistorySpan = struct {
-    base: usize,
-    end: usize,
-};
-
-pub fn rewindHistory(self: *Agent, span: HistorySpan) void {
-    std.debug.assert(span.base <= span.end);
-    std.debug.assert(span.end == self.items.items.len);
-    self.rollback(span.base);
-    self.measured_context = null;
-    self.refreshContext();
+    if (client.account() == account) self.stats.forgetBilling();
 }
 
 fn dropReasoning(self: *Agent, account: llm.Account) void {
@@ -331,11 +287,6 @@ fn dropReasoning(self: *Agent, account: llm.Account) void {
 }
 
 pub fn setEffort(self: *Agent, effort: llm.Effort) void {
-    if (self.model) |model| {
-        const rendered_before = model.reasoning(self.effort);
-        const rendered_after = model.reasoning(effort);
-        if (!rendered_before.eql(rendered_after)) self.stats.cache_usage = .{};
-    }
     self.effort = effort;
     self.refreshContext();
 }
@@ -376,7 +327,6 @@ pub fn run(self: *Agent, user_text: []const u8, handler: anytype) Outcome {
         .receipt = .{
             .history_base = base,
             .history_end = base,
-            .steering_committed_count = 0,
         },
         .disposition = .{ .failed = error.SignedOut },
     };
@@ -393,7 +343,6 @@ fn dispositionError(disposition: Outcome.Disposition) !void {
         .completed => {},
         .canceled => error.Canceled,
         .closed => error.Closed,
-        .credential_replaced => error.CredentialReplaced,
         .credential_rejected => error.TokenGrantRejected,
         .failed => |err| err,
     };
@@ -425,7 +374,6 @@ fn runTurnWith(
         .receipt = .{
             .history_base = turn.base,
             .history_end = self.items.items.len,
-            .steering_committed_count = turn.steering_committed_count,
             .truncated = turn.truncated,
         },
         .disposition = disposition,
@@ -436,7 +384,6 @@ fn classifyDisposition(turn: *const TurnState, err: anyerror) Outcome.Dispositio
     if (turn.presentation_closed) return .closed;
     return switch (err) {
         error.Canceled => .canceled,
-        error.CredentialReplaced => .credential_replaced,
         error.TokenGrantRejected => .credential_rejected,
         else => .{ .failed = err },
     };
@@ -467,18 +414,12 @@ fn runRounds(
         try self.refreshCredits(fetch, turn, handler);
         const loaded = try self.drainSkills(turn, handler);
         if (!ran_tools and !loaded) return;
-        try self.drainSteering(turn, handler);
     }
     return error.TooManyToolRounds;
 }
 
 fn rollbackTurn(self: *Agent, turn: *TurnState) void {
     self.rollback(turn.checkpoint);
-    if (turn.pending_steering) |steering| {
-        var batch = steering;
-        self.steering.restoreTaken(&batch);
-        turn.pending_steering = null;
-    }
 }
 
 fn commitRound(self: *Agent, turn: *TurnState, handler: anytype) !void {
@@ -495,21 +436,11 @@ fn advanceCheckpoint(self: *Agent, turn: *TurnState) bool {
         turn.pending_context = null;
         self.refreshContext();
     }
-    if (turn.pending_steering) |batch| {
-        turn.steering_committed_count += batch.len;
-        freeSteeringBatch(self.gpa, batch);
-        turn.pending_steering = null;
-    }
     return measured;
 }
 
 fn notifyCheckpoint(handler: anytype) void {
     if (comptime @hasDecl(@TypeOf(handler.*), "onCheckpoint")) handler.onCheckpoint();
-}
-
-fn freeSteeringBatch(gpa: std.mem.Allocator, batch: [][]u8) void {
-    for (batch) |message| gpa.free(message);
-    gpa.free(batch);
 }
 
 fn drainSkills(self: *Agent, turn: *TurnState, handler: anytype) !bool {
@@ -531,21 +462,6 @@ fn drainSkills(self: *Agent, turn: *TurnState, handler: anytype) !bool {
 fn notifySkill(handler: anytype, skill: []const u8, source: []const u8) !void {
     if (comptime @hasDecl(@TypeOf(handler.*), "onSkillLoaded"))
         try handler.onSkillLoaded(skill, source);
-}
-
-fn drainSteering(self: *Agent, turn: *TurnState, handler: anytype) !void {
-    var pending = try self.steering.take();
-    if (pending.len == 0) {
-        self.gpa.free(pending);
-        return;
-    }
-    errdefer if (turn.pending_steering == null) self.steering.restoreTaken(&pending);
-    const combined = try Steering.join(self.gpa, pending);
-    defer self.gpa.free(combined);
-    try self.appendUser(combined);
-    try presentation(&turn.presentation_closed, handler.onSteering(combined, pending.len));
-    std.debug.assert(turn.pending_steering == null);
-    turn.pending_steering = pending;
 }
 
 fn fetchReply(
@@ -1108,15 +1024,11 @@ test "resetConversation clears conversation state and preserves configuration" {
     const usage: llm.Usage = .{ .input = 1000, .output = 200, .cache_write = 500 };
     agent.recordUsage(&agent.model.?, &usage);
     seedContext(&agent, contextTokens(&usage));
-    try agent.steering.push("old steering");
 
     agent.resetConversation();
 
     try std.testing.expectEqual(@as(usize, 0), agent.items.items.len);
     try std.testing.expect(std.meta.eql(Stats{}, agent.stats));
-    const steering = try agent.steering.take();
-    defer gpa.free(steering);
-    try std.testing.expectEqual(@as(usize, 0), steering.len);
     try std.testing.expect(!std.mem.eql(u8, &cache_key, &agent.cache_key));
     try std.testing.expectEqual(@as(?u64, 0), agent.stats.context_tokens);
     try std.testing.expect(agent.measured_context == null);
@@ -1156,51 +1068,6 @@ test "an account change or sign-out clears the previous account's quota and pool
     agent.signOut();
     try std.testing.expect(agent.stats.quota == null);
     try std.testing.expect(agent.stats.credits == null);
-}
-
-test "the cache rate expires with the principal, the model, and the wire effort" {
-    const gpa = std.testing.allocator;
-    var agent = scriptedAgent(gpa);
-    defer agent.deinit();
-
-    const same_account = agent.client.?;
-    var sonnet = testing.model("claude-sonnet-4-6");
-    sonnet.efforts.remove(.xhigh);
-    const usage: llm.Usage = .{ .input = 100, .output = 20, .cache_read = 900 };
-    try agent.appendUser("committed context");
-
-    agent.stats.cache_usage = usage;
-    agent.setEffort(.high);
-    try std.testing.expectEqual(llm.Usage{}, agent.stats.cache_usage);
-
-    agent.switchTo(same_account, sonnet);
-    agent.setEffort(.high);
-    agent.stats.cache_usage = usage;
-    agent.setEffort(.xhigh);
-    try std.testing.expectEqual(usage, agent.stats.cache_usage);
-
-    const other_account = provider.Client.init(
-        gpa,
-        std.testing.io,
-        .{ .anthropic_api_key = "key" },
-        .{},
-    );
-    agent.switchTo(other_account, agent.model.?);
-    try std.testing.expectEqual(llm.Usage{}, agent.stats.cache_usage);
-
-    agent.stats.cache_usage = usage;
-    agent.switchTo(other_account, testing.model("claude-opus-4-8"));
-    try std.testing.expectEqual(llm.Usage{}, agent.stats.cache_usage);
-
-    agent.stats.cache_usage = usage;
-    var narrowed = testing.model("claude-opus-4-8");
-    narrowed.efforts.remove(.max);
-    agent.switchTo(other_account, narrowed);
-    try std.testing.expectEqual(llm.Usage{}, agent.stats.cache_usage);
-
-    agent.stats.cache_usage = usage;
-    agent.signOut();
-    try std.testing.expectEqual(llm.Usage{}, agent.stats.cache_usage);
 }
 
 test "the context gauge holds while the tokenizer and the replayed reasoning hold" {
@@ -1502,138 +1369,6 @@ const SleepLog = struct {
     }
 };
 
-const SteerHandler = struct {
-    gpa: std.mem.Allocator,
-    text: std.ArrayList(u8) = .empty,
-    count: usize = 0,
-
-    fn deinit(self: *SteerHandler) void {
-        self.text.deinit(self.gpa);
-    }
-
-    fn onSteering(self: *SteerHandler, text: []const u8, count: usize) !void {
-        try self.text.appendSlice(self.gpa, text);
-        self.count = count;
-    }
-};
-
-test "steering is delivered as one combined user message" {
-    const gpa = std.testing.allocator;
-    var agent = scriptedAgent(gpa);
-    defer agent.deinit();
-    var handler: SteerHandler = .{ .gpa = gpa };
-    defer handler.deinit();
-
-    var turn: TurnState = .{ .base = 0, .checkpoint = 0 };
-    defer if (turn.pending_steering) |batch| freeSteeringBatch(gpa, batch);
-    try agent.steering.push("a");
-    try agent.steering.push("b");
-    try agent.drainSteering(&turn, &handler);
-
-    try std.testing.expectEqual(@as(usize, 1), agent.items.items.len);
-    try std.testing.expectEqual(llm.Role.user, agent.items.items[0].message.role);
-    try std.testing.expectEqualStrings("a\n\nb", agent.items.items[0].message.text);
-    try std.testing.expectEqualStrings("a\n\nb", handler.text.items);
-    try std.testing.expectEqual(@as(usize, 2), handler.count);
-    try std.testing.expect(turn.pending_steering != null);
-    try std.testing.expectEqual(@as(usize, 0), turn.steering_committed_count);
-
-    try agent.drainSteering(&turn, &handler);
-    try std.testing.expectEqual(@as(usize, 1), agent.items.items.len);
-    try std.testing.expectEqual(@as(usize, 2), handler.count);
-}
-
-test "steering appends a separate user item, leaving grouping to the serializer" {
-    const gpa = std.testing.allocator;
-    var agent = scriptedAgent(gpa);
-    defer agent.deinit();
-    var handler: SteerHandler = .{ .gpa = gpa };
-    defer handler.deinit();
-
-    var turn: TurnState = .{ .base = 0, .checkpoint = 0 };
-    defer if (turn.pending_steering) |batch| freeSteeringBatch(gpa, batch);
-    try agent.appendUser("tool results");
-    try agent.steering.push("steer");
-    try agent.drainSteering(&turn, &handler);
-
-    try std.testing.expectEqual(@as(usize, 2), agent.items.items.len);
-    try std.testing.expectEqual(llm.Role.user, agent.items.items[0].message.role);
-    try std.testing.expectEqualStrings("tool results", agent.items.items[0].message.text);
-    try std.testing.expectEqual(llm.Role.user, agent.items.items[1].message.role);
-    try std.testing.expectEqualStrings("steer", agent.items.items[1].message.text);
-}
-
-test "a cancel during steering delivery returns the taken batch to the queue" {
-    const gpa = std.testing.allocator;
-    var agent = scriptedAgent(gpa);
-    defer agent.deinit();
-
-    const CancelHandler = struct {
-        fn onSteering(self: *@This(), text: []const u8, count: usize) !void {
-            _ = self;
-            _ = text;
-            _ = count;
-            return error.Canceled;
-        }
-    };
-    var handler: CancelHandler = .{};
-
-    var turn: TurnState = .{ .base = 0, .checkpoint = 0 };
-    try agent.steering.push("a");
-    try agent.steering.push("b");
-    try std.testing.expectError(error.Canceled, agent.drainSteering(&turn, &handler));
-    try std.testing.expect(turn.pending_steering == null);
-
-    const taken = try agent.steering.take();
-    defer {
-        for (taken) |message| gpa.free(message);
-        gpa.free(taken);
-    }
-    try std.testing.expectEqual(@as(usize, 2), taken.len);
-    try std.testing.expectEqualStrings("a", taken[0]);
-    try std.testing.expectEqualStrings("b", taken[1]);
-}
-
-test "a callback failure after recall restores the batch as a queue prefix" {
-    const gpa = std.testing.allocator;
-    var agent = scriptedAgent(gpa);
-    defer agent.deinit();
-
-    const RecallCancelHandler = struct {
-        gpa: std.mem.Allocator,
-        steering: *Steering,
-
-        fn onSteering(self: *@This(), text: []const u8, count: usize) !void {
-            _ = text;
-            _ = count;
-            try self.steering.push("newer");
-            const recalled = try self.steering.take();
-            defer {
-                for (recalled) |message| self.gpa.free(message);
-                self.gpa.free(recalled);
-            }
-            try std.testing.expectEqual(@as(usize, 1), recalled.len);
-            try std.testing.expectEqualStrings("newer", recalled[0]);
-            return error.Canceled;
-        }
-    };
-    var handler: RecallCancelHandler = .{ .gpa = gpa, .steering = &agent.steering };
-
-    var turn: TurnState = .{ .base = 0, .checkpoint = 0 };
-    try agent.steering.push("a");
-    try agent.steering.push("b");
-    try std.testing.expectError(error.Canceled, agent.drainSteering(&turn, &handler));
-
-    const restored = try agent.steering.take();
-    defer {
-        for (restored) |message| gpa.free(message);
-        gpa.free(restored);
-    }
-    try std.testing.expectEqual(@as(usize, 2), restored.len);
-    try std.testing.expectEqualStrings("a", restored[0]);
-    try std.testing.expectEqualStrings("b", restored[1]);
-}
-
 const CaptureHandler = struct {
     gpa: std.mem.Allocator,
     thinking: std.ArrayList(u8) = .empty,
@@ -1648,7 +1383,6 @@ const CaptureHandler = struct {
     tool_result_count: usize = 0,
     tool_summary_count: usize = 0,
     stream_reset_count: usize = 0,
-    steer_count: usize = 0,
     checkpoint_count: usize = 0,
     fail_usage: bool = false,
 
@@ -1680,11 +1414,6 @@ const CaptureHandler = struct {
 
     fn onError(self: *CaptureHandler, text: []const u8) !void {
         try self.errors.appendSlice(self.gpa, text);
-    }
-
-    fn onSteering(self: *CaptureHandler, text: []const u8, count: usize) !void {
-        _ = text;
-        self.steer_count += count;
     }
 
     fn onCheckpoint(self: *CaptureHandler) void {
@@ -2209,55 +1938,6 @@ test "rollback frees every item appended since the base" {
     agent.rollback(base);
     try std.testing.expectEqual(base, agent.items.items.len);
     try std.testing.expectEqualStrings("keep me", agent.items.items[base - 1].message.text);
-}
-
-test "rewindHistory removes a turn and keeps the billing evidence" {
-    const gpa = std.testing.allocator;
-    var agent = scriptedAgent(gpa);
-    defer agent.deinit();
-
-    try agent.appendUser("earlier");
-    const base = agent.items.items.len;
-    try agent.appendUser("fix it");
-    try appendProof(&agent, .anthropic_plan);
-    try agent.appendUser("and test");
-    const end = agent.items.items.len;
-    seedContext(&agent, 1200);
-    agent.stats.cost = 0.25;
-    agent.stats.quota = .{ .primary = .{ .used_percent = 25, .window_minutes = 300 } };
-    const cache_key = agent.cache_key;
-    try std.testing.expectEqual(@as(?u64, 1200), agent.stats.context_tokens);
-
-    agent.rewindHistory(.{ .base = base, .end = end });
-    try std.testing.expectEqual(base, agent.items.items.len);
-    try std.testing.expectEqualStrings("earlier", agent.items.items[0].message.text);
-    try std.testing.expect(agent.measured_context == null);
-    try std.testing.expect(agent.stats.context_tokens == null);
-    try std.testing.expectEqual(@as(f64, 0.25), agent.stats.cost);
-    try std.testing.expect(agent.stats.quota != null);
-    try std.testing.expectEqualSlices(u8, &cache_key, &agent.cache_key);
-
-    agent.rewindHistory(.{ .base = 0, .end = base });
-    try std.testing.expectEqual(@as(?u64, 0), agent.stats.context_tokens);
-}
-
-test "producedBefore counts the proofs of one account below an index" {
-    const gpa = std.testing.allocator;
-    var agent = scriptedAgent(gpa);
-    defer agent.deinit();
-
-    try appendProof(&agent, .anthropic_plan);
-    try agent.appendUser("fix it");
-    try appendProof(&agent, .openai_api_key);
-    try appendProof(&agent, .anthropic_plan);
-    try agent.appendUser("and test");
-
-    try std.testing.expectEqual(@as(usize, 0), agent.producedBefore(.anthropic_plan, 0));
-    try std.testing.expectEqual(@as(usize, 1), agent.producedBefore(.anthropic_plan, 2));
-    try std.testing.expectEqual(@as(usize, 1), agent.producedBefore(.anthropic_plan, 3));
-    try std.testing.expectEqual(@as(usize, 2), agent.producedBefore(.anthropic_plan, 5));
-    try std.testing.expectEqual(@as(usize, 1), agent.producedBefore(.openai_api_key, 5));
-    try std.testing.expectEqual(@as(usize, 0), agent.producedBefore(.xai_plan, 5));
 }
 
 fn readReplyUnderOom(allocator: std.mem.Allocator) !void {
@@ -2981,16 +2661,12 @@ test "dropped account evidence takes the allowance of the active account only" {
     defer agent.deinit();
     const quota: llm.Quota = .{ .primary = .{ .used_percent = 25, .window_minutes = 300 } };
 
-    const usage: llm.Usage = .{ .input = 100, .cache_read = 900 };
     agent.stats.quota = quota;
-    agent.stats.cache_usage = usage;
     agent.dropAccountEvidence(.openai_api_key);
     try std.testing.expect(agent.stats.quota != null);
-    try std.testing.expectEqual(usage, agent.stats.cache_usage);
 
     agent.dropAccountEvidence(.anthropic_plan);
     try std.testing.expect(agent.stats.quota == null);
-    try std.testing.expectEqual(llm.Usage{}, agent.stats.cache_usage);
 
     agent.signOut();
     agent.stats.quota = quota;
@@ -3785,25 +3461,19 @@ test "a committed truncation is reported in the receipt; a resampled one is not"
     }
 }
 
-test "credential changes and token endpoint errors do not retry a request" {
+test "a credential rejection and a token endpoint error do not retry a request" {
     const gpa = std.testing.allocator;
     var agent = scriptedAgent(gpa);
     defer agent.deinit();
     var handler: CaptureHandler = .{ .gpa = gpa };
     defer handler.deinit();
 
-    for ([_]struct { failure: anyerror, disposition: std.meta.Tag(Outcome.Disposition) }{
-        .{ .failure = error.CredentialReplaced, .disposition = .credential_replaced },
-        .{ .failure = error.TokenGrantRejected, .disposition = .credential_rejected },
-    }) |expected| {
+    {
         var fetch: ScriptedFetch = .{
-            .attempts = &.{.{ .fail = expected.failure }},
+            .attempts = &.{.{ .fail = error.TokenGrantRejected }},
         };
         const outcome = agent.runTurnWith(&fetch, fake_tools, "go", &handler);
-        try std.testing.expectEqual(
-            expected.disposition,
-            std.meta.activeTag(outcome.disposition),
-        );
+        try std.testing.expect(outcome.disposition == .credential_rejected);
         try std.testing.expectEqual(@as(usize, 1), fetch.sends);
     }
     for ([_]anyerror{
@@ -4002,18 +3672,15 @@ test "a credential that cannot renew reports the rejection at once" {
     try std.testing.expectEqual(@as(usize, 1), fetch.renewals);
     try std.testing.expectEqualStrings("401 Unauthorized: invalid x-api-key", handler.errors.items);
 
-    var replaced: ScriptedFetch = .{
+    var busy: ScriptedFetch = .{
         .attempts = &.{.{ .stream = .{
             .events = &.{},
             .head_ok = false,
             .head_unauthorized = true,
         } }},
-        .renewal_error = error.CredentialReplaced,
+        .renewal_error = error.StoreBusy,
     };
-    try std.testing.expectError(
-        error.CredentialReplaced,
-        agent.runWith(&replaced, "go", &handler),
-    );
+    try std.testing.expectError(error.StoreBusy, agent.runWith(&busy, "go", &handler));
 }
 
 test "a rejection that outlives its renewal is reported after one repeat" {
@@ -4353,58 +4020,6 @@ test "an out-of-memory credit read fails the turn and keeps the reply" {
     try std.testing.expectEqual(@as(usize, 2), agent.items.items.len);
 }
 
-test "steering queued during a final reply stays queued" {
-    const gpa = std.testing.allocator;
-    var agent = scriptedAgent(gpa);
-    defer agent.deinit();
-    var handler: CaptureHandler = .{ .gpa = gpa };
-    defer handler.deinit();
-
-    var fetch: ScriptedFetch = .{ .attempts = &.{
-        .{ .stream = .{ .events = &end_turn_events } },
-    } };
-    try agent.steering.push("steer");
-    try agent.runWith(&fetch, "go", &handler);
-    try std.testing.expectEqual(@as(usize, 1), fetch.sends);
-    try std.testing.expectEqual(@as(usize, 0), handler.steer_count);
-    try std.testing.expectEqual(@as(usize, 2), agent.items.items.len);
-
-    const queued = try agent.steering.take();
-    defer {
-        for (queued) |message| gpa.free(message);
-        gpa.free(queued);
-    }
-    try std.testing.expectEqual(@as(usize, 1), queued.len);
-    try std.testing.expectEqualStrings("steer", queued[0]);
-}
-
-test "steering folds into a turn that a tool round keeps alive" {
-    const gpa = std.testing.allocator;
-    var agent = scriptedAgent(gpa);
-    defer agent.deinit();
-    var handler: CaptureHandler = .{ .gpa = gpa };
-    defer handler.deinit();
-
-    var fetch: ScriptedFetch = .{ .attempts = &.{
-        .{ .stream = .{ .events = &tool_round_events } },
-        .{ .stream = .{ .events = &end_turn_events } },
-    } };
-    try agent.steering.push("steer");
-    const outcome = agent.runTurnWith(&fetch, fake_tools, "go", &handler);
-    try std.testing.expect(outcome.disposition == .completed);
-    try std.testing.expectEqual(@as(usize, 2), fetch.sends);
-    try std.testing.expectEqual(@as(usize, 1), handler.steer_count);
-    try std.testing.expectEqual(@as(usize, 1), outcome.receipt.steering_committed_count);
-    try std.testing.expectEqual(@as(usize, 5), agent.items.items.len);
-    try std.testing.expectEqual(llm.Role.user, agent.items.items[3].message.role);
-    try std.testing.expectEqualStrings("steer", agent.items.items[3].message.text);
-    try std.testing.expectEqualStrings("hi", agent.items.items[4].message.text);
-
-    const queued = try agent.steering.take();
-    defer gpa.free(queued);
-    try std.testing.expectEqual(@as(usize, 0), queued.len);
-}
-
 const fake_tools = struct {
     fn mutates(name: []const u8) bool {
         return std.mem.eql(u8, name, "write");
@@ -4705,14 +4320,13 @@ test "a cancel during the post-stop usage callback books terminal usage only onc
     try std.testing.expectEqual(@as(u64, 1000), agent.stats.cache_usage.input);
 }
 
-test "a completed round is retained when a later steered reply is canceled" {
+test "a completed round is retained when a later reply is canceled" {
     const gpa = std.testing.allocator;
     var agent = scriptedAgent(gpa);
     defer agent.deinit();
     var handler: CaptureHandler = .{ .gpa = gpa };
     defer handler.deinit();
 
-    try agent.steering.push("steer");
     var fetch: ScriptedFetch = .{ .attempts = &.{
         .{ .stream = .{ .events = &tool_round_events } },
         .{ .stream = .{ .events = &.{}, .terminal_error = error.Canceled } },
@@ -4723,31 +4337,22 @@ test "a completed round is retained when a later steered reply is canceled" {
     try std.testing.expectEqualStrings("go", agent.items.items[0].message.text);
     try std.testing.expectEqualStrings("t1", agent.items.items[1].tool_call.call_id);
     try std.testing.expectEqualStrings("t1", agent.items.items[2].tool_result.call_id);
-    try std.testing.expectEqual(@as(usize, 0), outcome.receipt.steering_committed_count);
-    const restored = try agent.steering.take();
-    defer {
-        for (restored) |message| gpa.free(message);
-        gpa.free(restored);
-    }
-    try std.testing.expectEqual(@as(usize, 1), restored.len);
-    try std.testing.expectEqualStrings("steer", restored[0]);
 }
 
-test "the receipt reports the committed steering count and history span" {
+test "the receipt reports the history span of the turn" {
     const gpa = std.testing.allocator;
     var agent = scriptedAgent(gpa);
     defer agent.deinit();
     var handler: CaptureHandler = .{ .gpa = gpa };
     defer handler.deinit();
 
-    try agent.steering.push("steer");
     var fetch: ScriptedFetch = .{ .attempts = &.{
         .{ .stream = .{ .events = &tool_round_events } },
         .{ .stream = .{ .events = &end_turn_events } },
     } };
     const outcome = agent.runTurnWith(&fetch, fake_tools, "go", &handler);
     try std.testing.expect(std.meta.activeTag(outcome.disposition) == .completed);
-    try std.testing.expectEqual(@as(usize, 1), outcome.receipt.steering_committed_count);
-    try std.testing.expectEqual(@as(usize, 5), outcome.receipt.history_end);
+    try std.testing.expectEqual(@as(usize, 0), outcome.receipt.history_base);
+    try std.testing.expectEqual(@as(usize, 4), outcome.receipt.history_end);
     try std.testing.expect(!outcome.receipt.truncated);
 }

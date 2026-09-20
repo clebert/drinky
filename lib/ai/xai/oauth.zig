@@ -1,7 +1,6 @@
 const std = @import("std");
 
 const json = @import("../json.zig");
-const jwt = @import("../jwt.zig");
 const net = @import("../net.zig");
 const oauth_login = @import("../oauth_login.zig");
 const oauth_wire = @import("../oauth_wire.zig");
@@ -20,18 +19,10 @@ pub const Tokens = struct {
     access: []const u8,
     refresh: []const u8,
     expires_ms: i64,
-    subject: ?[]const u8 = null,
 
     pub fn deinit(self: Tokens, gpa: std.mem.Allocator) void {
         gpa.free(self.access);
         gpa.free(self.refresh);
-        if (self.subject) |subject_owned| gpa.free(subject_owned);
-    }
-
-    pub fn samePrincipal(self: *const Tokens, other: *const Tokens) bool {
-        const subject_own = self.subject orelse return false;
-        const subject_other = other.subject orelse return false;
-        return std.mem.eql(u8, subject_own, subject_other);
     }
 };
 
@@ -112,10 +103,7 @@ pub fn refresh(gpa: std.mem.Allocator, io: std.Io, timeouts: net.Timeouts, token
         body,
     );
     defer gpa.free(response);
-    return parseTokens(gpa, io, response, .{
-        .refresh = tokens.refresh,
-        .subject = tokens.subject orelse "",
-    });
+    return parseTokens(gpa, io, response, .{ .refresh = tokens.refresh });
 }
 
 fn parseDevice(gpa: std.mem.Allocator, body: []const u8) !Device {
@@ -170,7 +158,7 @@ fn isHttps(uri: []const u8) bool {
     return std.mem.startsWith(u8, uri, "https://");
 }
 
-const Fallback = struct { refresh: []const u8 = "", subject: []const u8 = "" };
+const Fallback = struct { refresh: []const u8 = "" };
 
 fn parseTokens(gpa: std.mem.Allocator, io: std.Io, body: []const u8, fallback: Fallback) !Tokens {
     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, body, .{});
@@ -188,8 +176,6 @@ fn parseTokens(gpa: std.mem.Allocator, io: std.Io, body: []const u8, fallback: F
     const expires_ms = std.math.add(i64, now_ms, lifetime_ms - margin_ms) catch
         return error.MissingExpiry;
 
-    const subject_owned = try subject(gpa, json.string(object.get("id_token")), access, fallback);
-    errdefer if (subject_owned) |owned| gpa.free(owned);
     const access_owned = try gpa.dupe(u8, access);
     errdefer gpa.free(access_owned);
     const refresh_owned = try gpa.dupe(u8, refresh_token);
@@ -198,22 +184,7 @@ fn parseTokens(gpa: std.mem.Allocator, io: std.Io, body: []const u8, fallback: F
         .access = access_owned,
         .refresh = refresh_owned,
         .expires_ms = expires_ms,
-        .subject = subject_owned,
     };
-}
-
-fn subject(
-    gpa: std.mem.Allocator,
-    maybe_id_token: ?[]const u8,
-    access_token: []const u8,
-    fallback: Fallback,
-) error{OutOfMemory}!?[]const u8 {
-    if (maybe_id_token) |id_token| {
-        if (try jwt.stringClaim(gpa, id_token, "sub")) |found| return found;
-    }
-    if (try jwt.stringClaim(gpa, access_token, "sub")) |found| return found;
-    if (fallback.subject.len != 0) return try gpa.dupe(u8, fallback.subject);
-    return null;
 }
 
 test parseDevice {
@@ -268,69 +239,30 @@ test "parseDevice rejects a grant it cannot poll or open" {
 
 test parseTokens {
     const gpa = std.testing.allocator;
-    const id_token = try jwt.testToken(gpa, "{\"sub\":\"user-1\",\"email\":\"a@b.c\"}");
-    defer gpa.free(id_token);
-    const body = try std.fmt.allocPrint(
+    const tokens = try parseTokens(
         gpa,
-        "{{\"access_token\":\"at\",\"refresh_token\":\"rt\",\"expires_in\":3600," ++
-            "\"id_token\":\"{s}\"}}",
-        .{id_token},
+        std.testing.io,
+        "{\"access_token\":\"at\",\"refresh_token\":\"rt\",\"expires_in\":3600," ++
+            "\"id_token\":\"ignored\"}",
+        .{},
     );
-    defer gpa.free(body);
-
-    const tokens = try parseTokens(gpa, std.testing.io, body, .{});
     defer tokens.deinit(gpa);
     try std.testing.expectEqualStrings("at", tokens.access);
     try std.testing.expectEqualStrings("rt", tokens.refresh);
-    try std.testing.expectEqualStrings("user-1", tokens.subject.?);
     const now_ms = std.Io.Timestamp.now(std.testing.io, .real).toMilliseconds();
     try std.testing.expect(tokens.expires_ms > now_ms);
     try std.testing.expect(tokens.expires_ms <= now_ms + 3600 * 1000 - refresh_margin_ms);
-
-    var other = tokens;
-    try std.testing.expect(tokens.samePrincipal(&other));
-    other.subject = "user-2";
-    try std.testing.expect(!tokens.samePrincipal(&other));
-    other.subject = null;
-    try std.testing.expect(!tokens.samePrincipal(&other));
-    try std.testing.expect(!other.samePrincipal(&tokens));
 }
 
-test "parseTokens carries the refresh token and the user over a partial refresh" {
+test "parseTokens carries the refresh token over a partial refresh" {
     const gpa = std.testing.allocator;
     const tokens = try parseTokens(gpa, std.testing.io, "{\"access_token\":\"at2\"}", .{
         .refresh = "old_rt",
-        .subject = "user-1",
     });
     defer tokens.deinit(gpa);
     try std.testing.expectEqualStrings("old_rt", tokens.refresh);
-    try std.testing.expectEqualStrings("user-1", tokens.subject.?);
     const now_ms = std.Io.Timestamp.now(std.testing.io, .real).toMilliseconds();
     try std.testing.expect(tokens.expires_ms > now_ms + (lifetime_default_s - 600) * 1000);
-}
-
-test "parseTokens reads the user off a JWT access token and stays silent otherwise" {
-    const gpa = std.testing.allocator;
-    const access = try jwt.testToken(gpa, "{\"sub\":\"user-9\",\"exp\":2000000000}");
-    defer gpa.free(access);
-    const body = try std.fmt.allocPrint(
-        gpa,
-        "{{\"access_token\":\"{s}\",\"refresh_token\":\"rt\",\"expires_in\":3600}}",
-        .{access},
-    );
-    defer gpa.free(body);
-    const tokens = try parseTokens(gpa, std.testing.io, body, .{});
-    defer tokens.deinit(gpa);
-    try std.testing.expectEqualStrings("user-9", tokens.subject.?);
-
-    const bare = try parseTokens(
-        gpa,
-        std.testing.io,
-        "{\"access_token\":\"opaque\",\"refresh_token\":\"rt\",\"expires_in\":3600}",
-        .{},
-    );
-    defer bare.deinit(gpa);
-    try std.testing.expect(bare.subject == null);
 }
 
 test "a short token keeps half its lifetime before it counts as stale" {

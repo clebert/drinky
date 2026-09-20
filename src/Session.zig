@@ -11,16 +11,9 @@ const Session = @This();
 
 const truncated_event =
     "The response is incomplete. The model reached an output or context limit.";
-const turn_event_options: ui.block.Entry.Options = .{ .turn_owned = true };
-const turn_failure_options: ui.block.Entry.Options = .{ .is_error = true, .turn_owned = true };
+const turn_event_options: ui.block.Entry.Options = .{};
+const turn_failure_options: ui.block.Entry.Options = .{ .is_error = true };
 
-const retry_title = "Failed turn";
-const retry_controls = "Ctrl+N: Try again · Esc: Dismiss";
-const revision_title = "Canceled turn";
-const revision_controls = "Ctrl+N: Remove and edit · Esc: Keep turn";
-const steering_controls = "Ctrl+P: Edit all";
-const prompt_history_title = "Prompt history";
-const prompt_history_cancellation = "You canceled the prompt history selection.";
 pub const editor_caption_rows_max: usize = 3;
 
 const StreamedTool = struct {
@@ -73,16 +66,8 @@ directory_shown: []const u8,
 branch_root: ?[]const u8,
 branch_buffer: [ai.project.head_name_bytes_max]u8,
 branch_length: usize,
-steering: std.ArrayList(Message),
-restorable: std.ArrayList(ui.Editor.Draft),
-revision_steering: std.ArrayList(ui.Editor.Draft),
 pending_events: std.ArrayList(PendingEvent),
-steering_retained_count: usize,
-steering_consumed_count: usize,
-steering_committed_count: usize,
-steering_uncommitted: ?UncommittedSteering,
-turn_prompt: ?Message,
-prompt_offer: PromptOffer,
+turn_prompt: ?TurnPrompt,
 input: Input,
 clock_ms: i64,
 boot_clock_ms: i64,
@@ -102,9 +87,7 @@ const Turn = struct {
     generation: u64,
     progress_sequence_applied: u64,
     progress_sequence_checkpoint: u64,
-    transcript_base: usize,
     transcript_checkpoint: usize,
-    mutated: bool,
     activity_tick: u64,
     progress_tick_last: u64,
     caret_tick: u64,
@@ -191,32 +174,23 @@ const ActiveTool = struct {
 
 const Picking = struct {
     picker: ui.Picker,
-    purpose: Purpose,
+    selector: *const fn (
+        *ai.command.Context,
+        ai.command.Outcome.Pick.Selection,
+    ) anyerror!ai.command.Outcome,
+    payload: usize,
     cancellation_message: []const u8,
     reopen: ?ai.command.Outcome.Opener,
     trail: Trail,
     wait_tick: ?u64,
 
-    const Purpose = union(enum) {
-        command: Command,
-        prompt_history,
-
-        const Command = struct {
-            selector: *const fn (
-                *ai.command.Context,
-                ai.command.Outcome.Pick.Selection,
-            ) anyerror!ai.command.Outcome,
-            payload: usize,
-
-            pub fn select(
-                self: *const Command,
-                context: *ai.command.Context,
-                row: usize,
-            ) anyerror!ai.command.Outcome {
-                return self.selector(context, .{ .payload = self.payload, .row = row });
-            }
-        };
-    };
+    pub fn select(
+        self: *const Picking,
+        context: *ai.command.Context,
+        row: usize,
+    ) anyerror!ai.command.Outcome {
+        return self.selector(context, .{ .payload = self.payload, .row = row });
+    }
 
     fn activity(self: *const Picking) ?ui.paint.Activity {
         const tick = self.wait_tick orelse return null;
@@ -263,12 +237,6 @@ const Trail = struct {
     }
 };
 
-pub const PromptOffer = enum {
-    none,
-    retry,
-    revision,
-};
-
 pub const Input = struct {
     owner: Owner = .terminal,
     caption: ?ui.Caption = null,
@@ -287,12 +255,6 @@ const PendingEvent = struct {
 
 pub const AsyncEventOptions = struct {
     mirrored: bool = true,
-    repeats: bool = true,
-};
-
-pub const UncommittedSteering = struct {
-    sequence: u64,
-    consumed_count: usize,
 };
 
 pub const LiveTail = struct {
@@ -301,7 +263,7 @@ pub const LiveTail = struct {
     calls: usize,
 };
 
-pub const Message = struct {
+pub const TurnPrompt = struct {
     draft: ui.Editor.Draft,
     source: Source = .terminal,
 
@@ -310,7 +272,7 @@ pub const Message = struct {
         external: i64,
     };
 
-    fn deinit(self: *Message, gpa: std.mem.Allocator) void {
+    fn deinit(self: *TurnPrompt, gpa: std.mem.Allocator) void {
         self.draft.deinit(gpa);
     }
 };
@@ -319,7 +281,6 @@ pub const Confirmation = enum {
     message,
     turn_cancel,
     quit,
-    revision,
 };
 
 pub const TurnEvent = struct {
@@ -338,7 +299,6 @@ pub const TurnEvent = struct {
         usage: ai.Agent.Stats,
         stream_reset: ai.Agent.RetryAttempt,
         model_mismatch: ModelMismatch,
-        steering_consumed: SteeringConsumed,
         skill_loaded: SkillLoaded,
         turn_ended,
 
@@ -348,7 +308,6 @@ pub const TurnEvent = struct {
             summary: ?ai.tool.Result.Summary = null,
             is_error: bool,
         };
-        pub const SteeringConsumed = struct { text: []u8, count: usize };
         pub const SkillLoaded = struct { skill: []u8, source: []u8 };
         pub const ModelMismatch = struct { requested: []u8, served: []u8 };
     };
@@ -364,7 +323,6 @@ pub const TurnEvent = struct {
                 gpa.free(result.name);
                 if (result.summary) |summary| gpa.free(summary.text);
             },
-            .steering_consumed => |consumed| gpa.free(consumed.text),
             .skill_loaded => |loaded| {
                 gpa.free(loaded.skill);
                 gpa.free(loaded.source);
@@ -408,16 +366,8 @@ pub fn init(
         .branch_root = null,
         .branch_buffer = undefined,
         .branch_length = 0,
-        .steering = .empty,
-        .restorable = .empty,
-        .revision_steering = .empty,
         .pending_events = .empty,
-        .steering_retained_count = 0,
-        .steering_consumed_count = 0,
-        .steering_committed_count = 0,
-        .steering_uncommitted = null,
         .turn_prompt = null,
-        .prompt_offer = .none,
         .input = .{},
         .clock_ms = 0,
         .boot_clock_ms = 0,
@@ -433,10 +383,6 @@ pub fn init(
 pub fn deinit(self: *Session) void {
     self.deinitMode();
     self.clearNotice();
-    self.clearSteering();
-    self.steering.deinit(self.gpa);
-    self.restorable.deinit(self.gpa);
-    self.revision_steering.deinit(self.gpa);
     for (self.pending_events.items) |pending| self.gpa.free(pending.message.content);
     self.pending_events.deinit(self.gpa);
     self.transcript.deinit();
@@ -451,7 +397,6 @@ pub fn clearConversation(self: *Session) void {
     self.confirmations = .initEmpty();
     self.transcript.truncate(0);
     self.stats_shown = .{};
-    self.clearSteering();
     self.view.resetScreen();
     self.dirty = true;
 }
@@ -491,14 +436,6 @@ pub fn dropAccountReasoning(self: *Session, account: ai.llm.Account) void {
     self.dirty = true;
 }
 
-pub fn removeTurn(self: *Session, options: Transcript.Removal.Options) Transcript.Removal {
-    std.debug.assert(self.mode == .prompt);
-    const removal = self.transcript.removeTurn(options);
-    self.view.resetScreen();
-    self.dirty = true;
-    return removal;
-}
-
 pub fn clearNotice(self: *Session) void {
     if (self.notice) |notice| {
         self.gpa.free(notice.content);
@@ -509,8 +446,8 @@ pub fn clearNotice(self: *Session) void {
 
 pub fn armConfirmation(self: *Session, confirmation: Confirmation) void {
     switch (confirmation) {
-        .quit, .revision => std.debug.assert(self.mode == .prompt),
-        .message => std.debug.assert(self.mode == .prompt or self.mode == .turn),
+        .quit => std.debug.assert(self.mode == .prompt),
+        .message => std.debug.assert(self.mode == .prompt),
         .turn_cancel => std.debug.assert(self.mode == .turn),
     }
     self.confirmations.insert(confirmation);
@@ -598,7 +535,6 @@ pub fn applyTurnEvent(self: *Session, event: *const TurnEvent) !bool {
             self.transcript.endMessage();
             turn.transcript_checkpoint = self.transcript.blocks().len;
             turn.progress_sequence_checkpoint = event.progress_sequence_committed;
-            self.commitSteering(event.progress_sequence_committed);
         }
     }
     self.dirty = true;
@@ -622,7 +558,6 @@ pub fn applyTurnEvent(self: *Session, event: *const TurnEvent) !bool {
             try self.flushPendingEvents();
             try self.pushTool(turn, tool);
             turn.calls += 1;
-            if (ai.tool.mutates(tool.name)) turn.mutated = true;
             try self.dropStreamedTool(turn, tool.name);
         },
         .tool_result => |result| try self.applyToolResult(result),
@@ -635,7 +570,7 @@ pub fn applyTurnEvent(self: *Session, event: *const TurnEvent) !bool {
             defer self.gpa.free(text);
             try self.transcript.append(
                 .event,
-                .{ .survives_rewind = true, .turn_owned = true },
+                .{ .survives_rewind = true },
                 text,
             );
         },
@@ -647,18 +582,7 @@ pub fn applyTurnEvent(self: *Session, event: *const TurnEvent) !bool {
                 .{ mismatch.served, mismatch.requested },
             );
             defer self.gpa.free(text);
-            try self.transcript.append(.event, .{ .is_warning = true, .turn_owned = true }, text);
-        },
-        .steering_consumed => |consumed| {
-            try self.transcript.append(.user, .{}, consumed.text);
-            self.steering_consumed_count =
-                @min(self.steering_consumed_count + consumed.count, self.steering.items.len);
-            self.steering_retained_count =
-                @max(self.steering_retained_count, self.steering_consumed_count);
-            self.steering_uncommitted = .{
-                .sequence = event.progress_sequence,
-                .consumed_count = self.steering_consumed_count,
-            };
+            try self.transcript.append(.event, .{ .is_warning = true }, text);
         },
         .skill_loaded => |loaded| {
             const source = try ai.format.path(self.gpa, loaded.source, &self.display_roots);
@@ -771,8 +695,7 @@ fn appendAsyncEvent(self: *Session, pending: *const PendingEvent) !void {
     var options = eventFlags(pending.message.severity);
     options.survives_rewind = true;
     options.mirrored = pending.options.mirrored;
-    if (pending.options.repeats and
-        try self.transcript.repeatEvent(options, pending.message.content)) return;
+    if (try self.transcript.repeatEvent(options, pending.message.content)) return;
     try self.transcript.append(.event, options, pending.message.content);
 }
 
@@ -803,11 +726,9 @@ pub fn applyOutcome(self: *Session, outcome: ai.command.Outcome) !void {
         .login,
         .logout,
         .switch_account,
-        .credential_replaced,
         .fetch,
         .new_conversation,
         .show_sources,
-        .show_status,
         .show_system_prompt,
         .remote_attach,
         .remote_add,
@@ -872,7 +793,8 @@ fn enterPicker(
     self.deinitMode();
     self.mode = .{ .picking = .{
         .picker = picker,
-        .purpose = .{ .command = .{ .selector = pick.select, .payload = pick.payload } },
+        .selector = pick.select,
+        .payload = pick.payload,
         .cancellation_message = pick.cancellation_message,
         .reopen = pick.reopen,
         .trail = trail,
@@ -890,39 +812,6 @@ pub fn closePicker(self: *Session) void {
         },
         else => {},
     }
-}
-
-pub fn openPromptHistory(self: *Session, labels: []const []const u8) !void {
-    std.debug.assert(self.mode == .prompt);
-    const options = blk: {
-        errdefer {
-            for (labels) |label| self.gpa.free(label);
-            self.gpa.free(labels);
-        }
-        const options = try self.gpa.alloc(ui.Picker.Option, labels.len);
-        for (labels, options) |label, *option| option.* = .{ .name = label };
-        self.gpa.free(labels);
-        break :blk options;
-    };
-    errdefer freePickerOptions(self.gpa, options);
-    const picker = try ui.Picker.init(self.gpa, prompt_history_title, options, .{});
-    self.mode = .{ .picking = .{
-        .picker = picker,
-        .purpose = .prompt_history,
-        .cancellation_message = prompt_history_cancellation,
-        .reopen = null,
-        .trail = .{},
-        .wait_tick = null,
-    } };
-    self.dirty = true;
-}
-
-pub fn appendPromptHistory(self: *Session, source: *ui.Editor.Draft) !void {
-    std.debug.assert(self.mode == .picking and self.mode.picking.purpose == .prompt_history);
-    try self.editor.reserveDrafts(&.{source.*});
-    self.editor.appendDraft(source);
-    self.closePicker();
-    self.markEdited();
 }
 
 pub fn openWait(self: *Session, pick: *const ai.command.Outcome.Pick, text: []const u8) !void {
@@ -982,82 +871,15 @@ pub fn closePage(self: *Session) void {
     }
 }
 
-pub fn reserveSteering(self: *Session) !void {
-    try self.steering.ensureUnusedCapacity(self.gpa, 1);
-}
-
-pub fn commitSteeringDraft(self: *Session, draft: *ui.Editor.Draft) void {
-    self.steering.appendAssumeCapacity(.{ .draft = draft.* });
-    draft.* = .empty;
-    self.markEdited();
-}
-
-pub fn commitExternalSteering(self: *Session, draft: *ui.Editor.Draft, id: i64) void {
-    self.steering.appendAssumeCapacity(.{ .draft = draft.*, .source = .{ .external = id } });
-    draft.* = .empty;
-    self.dirty = true;
-}
-
-fn restores(self: *const Session, message: *const Message) bool {
-    return message.source == .terminal or self.input.owner != .external;
-}
-
 fn restorablePrompt(self: *Session) ?*ui.Editor.Draft {
-    if (self.turn_prompt) |*prompt| {
-        if (self.restores(prompt)) return &prompt.draft;
-    }
+    const prompt = if (self.turn_prompt) |*prompt| prompt else return null;
+    if (prompt.source == .terminal or self.input.owner != .external) return &prompt.draft;
     return null;
 }
 
-fn collectRestorable(self: *Session, messages: []const Message) ![]const ui.Editor.Draft {
-    try self.restorable.ensureTotalCapacity(self.gpa, self.steering.items.len);
-    self.restorable.clearRetainingCapacity();
-    for (messages) |*message| {
-        if (!self.restores(message)) continue;
-        self.restorable.appendAssumeCapacity(message.draft);
-    }
-    return self.restorable.items;
-}
-
-fn takeRestorable(self: *Session, messages: []Message) []ui.Editor.Draft {
-    self.restorable.clearRetainingCapacity();
-    for (messages) |*message| {
-        if (!self.restores(message)) continue;
-        self.restorable.appendAssumeCapacity(message.draft);
-        message.draft = .empty;
-    }
-    return self.restorable.items;
-}
-
-pub fn reserveSteeringRecall(self: *Session) !void {
-    try self.editor.reserveComposition(null, try self.collectRestorable(self.steering.items));
-}
-
-pub fn recallSteering(self: *Session, pending_count: usize) void {
-    std.debug.assert(pending_count <= self.steering.items.len);
-    const pending_start = self.steering.items.len - pending_count;
-    const pending = self.steering.items[pending_start..];
-    self.editor.prependComposition(null, self.takeRestorable(pending));
-    for (pending) |*message| message.deinit(self.gpa);
-    self.steering.shrinkRetainingCapacity(pending_start);
-    self.steering_retained_count = self.steering.items.len;
-    self.steering_consumed_count = @min(self.steering_consumed_count, self.steering.items.len);
-    self.steering_committed_count = @min(self.steering_committed_count, self.steering.items.len);
-    self.markEdited();
-}
-
-pub fn recallLateSteering(self: *Session) usize {
-    const drafts = self.takeRestorable(self.steering.items);
-    const count = drafts.len;
-    self.editor.prependComposition(null, drafts);
-    self.clearSteering();
-    return count;
-}
-
-pub fn markTurnBase(self: *Session, transcript_base: usize) void {
+fn markTurnBase(self: *Session, transcript_base: usize) void {
     const turn = self.activeTurn() orelse unreachable;
     std.debug.assert(transcript_base <= self.transcript.blocks().len);
-    turn.transcript_base = transcript_base;
     turn.transcript_checkpoint = transcript_base;
 }
 
@@ -1087,70 +909,15 @@ fn dropTurnPrompt(self: *Session) void {
     }
 }
 
-pub fn reserveSteeringRestore(self: *Session) !void {
-    const lead: ?*const ui.Editor.Draft = self.restorablePrompt();
-    try self.editor.reserveComposition(lead, try self.collectRestorable(self.steering.items));
-}
-
-pub fn reserveRevisionCapture(self: *Session) !void {
-    try self.revision_steering.ensureTotalCapacity(self.gpa, self.steering.items.len);
-}
-
-pub const RevisionCapture = struct {
-    transcript_base: usize,
-    mutated: bool,
-    prompt: ui.Editor.Draft,
-    steering: std.ArrayList(ui.Editor.Draft),
-};
-
-pub fn takeCanceledRevision(self: *Session, receipt: *const ai.Agent.Receipt) ?RevisionCapture {
-    const turn = self.activeTurn() orelse unreachable;
-    const prompt = self.restorablePrompt() orelse return null;
-    const committed_count = @min(receipt.steering_committed_count, self.steering.items.len);
-    self.revision_steering.clearRetainingCapacity();
-    for (self.steering.items[0..committed_count]) |*message| {
-        if (!self.restores(message)) continue;
-        self.revision_steering.appendAssumeCapacity(message.draft);
-        message.draft = .empty;
-    }
-    const capture: RevisionCapture = .{
-        .transcript_base = turn.transcript_base,
-        .mutated = turn.mutated,
-        .prompt = prompt.*,
-        .steering = self.revision_steering,
-    };
-    prompt.* = .empty;
-    self.revision_steering = .empty;
-    return capture;
+pub fn reservePromptRestore(self: *Session) !void {
+    const lead = self.restorablePrompt() orelse return;
+    try self.editor.reserveDraft(lead);
 }
 
 pub fn reserveFailureRestore(self: *Session, receipt: *const ai.Agent.Receipt) !void {
     const committed = receipt.history_end != receipt.history_base;
-    const lead: ?*const ui.Editor.Draft = if (committed) null else self.restorablePrompt();
-    const steering_start = @min(receipt.steering_committed_count, self.steering.items.len);
-    try self.editor.reserveComposition(
-        lead,
-        try self.collectRestorable(self.steering.items[steering_start..]),
-    );
-}
-
-pub fn hasSteering(self: *const Session) bool {
-    return self.steering.items.len > 0;
-}
-
-fn clearSteering(self: *Session) void {
-    for (self.steering.items) |*entry| entry.deinit(self.gpa);
-    self.steering.clearRetainingCapacity();
-    self.steering_retained_count = 0;
-    self.steering_consumed_count = 0;
-    self.steering_committed_count = 0;
-    self.steering_uncommitted = null;
-    self.dirty = true;
-}
-
-fn steeringPendingCount(self: *const Session) usize {
-    std.debug.assert(self.steering_retained_count <= self.steering.items.len);
-    return self.steering.items.len - self.steering_retained_count;
+    if (committed) return;
+    try self.reservePromptRestore();
 }
 
 pub fn beginTurn(self: *Session, generation: u64) void {
@@ -1161,9 +928,7 @@ pub fn beginTurn(self: *Session, generation: u64) void {
         .generation = generation,
         .progress_sequence_applied = 0,
         .progress_sequence_checkpoint = 0,
-        .transcript_base = self.transcript.blocks().len,
         .transcript_checkpoint = self.transcript.blocks().len,
-        .mutated = false,
         .activity_tick = 0,
         .progress_tick_last = 0,
         .caret_tick = 0,
@@ -1175,21 +940,6 @@ pub fn beginTurn(self: *Session, generation: u64) void {
         .box_tracks = .empty,
     } };
     self.dirty = true;
-}
-
-fn commitSteering(self: *Session, sequence: u64) void {
-    const uncommitted = self.steering_uncommitted orelse return;
-    if (uncommitted.sequence > sequence) return;
-    self.steering_uncommitted = null;
-    self.steering_committed_count = @min(uncommitted.consumed_count, self.steering.items.len);
-}
-
-pub fn turnCommitted(self: *const Session) bool {
-    const turn = switch (self.mode) {
-        .turn => |*turn| turn,
-        else => return false,
-    };
-    return turn.progress_sequence_checkpoint > 0;
 }
 
 pub fn committedCount(self: *const Session) usize {
@@ -1240,7 +990,6 @@ pub fn abortTurn(self: *Session) !void {
 }
 
 pub fn endTurnWithReceipt(self: *Session, receipt: *const ai.Agent.Receipt) !void {
-    self.applyReceiptNormal(receipt);
     self.dropTurnPrompt();
     if (receipt.truncated)
         try self.transcript.append(.event, turn_failure_options, truncated_event);
@@ -1263,15 +1012,6 @@ pub fn failTurnWithReceipt(
     if (maybe_flush_error) |flush_error| return flush_error;
 }
 
-fn applyReceiptNormal(self: *Session, receipt: *const ai.Agent.Receipt) void {
-    self.dropSteeringPrefix(receipt.steering_committed_count);
-    self.steering_retained_count = 0;
-    self.steering_consumed_count = 0;
-    self.steering_committed_count = 0;
-    self.steering_uncommitted = null;
-    self.dirty = true;
-}
-
 pub fn cancelReceipt(
     self: *Session,
     receipt: *const ai.Agent.Receipt,
@@ -1289,24 +1029,15 @@ pub fn cancelReceipt(
 }
 
 fn reconcileAbnormalReceipt(self: *Session, receipt: *const ai.Agent.Receipt) void {
-    self.dropSteeringPrefix(receipt.steering_committed_count);
     const turn = self.activeTurn() orelse unreachable;
     self.transcript.rewind(turn.transcript_checkpoint);
 
     const committed = receipt.history_end != receipt.history_base;
-    const lead: ?*ui.Editor.Draft = if (committed) null else self.restorablePrompt();
-    self.editor.prependComposition(lead, self.takeRestorable(self.steering.items));
-    self.clearSteering();
+    if (!committed) {
+        if (self.restorablePrompt()) |lead| self.editor.prependDraft(lead);
+    }
     self.dropTurnPrompt();
     self.dirty = true;
-}
-
-fn dropSteeringPrefix(self: *Session, count: usize) void {
-    var dropped: usize = 0;
-    while (dropped < count and self.steering.items.len > 0) : (dropped += 1) {
-        var entry = self.steering.orderedRemove(0);
-        entry.deinit(self.gpa);
-    }
 }
 
 pub fn setBranch(self: *Session, name: []const u8) void {
@@ -1347,21 +1078,18 @@ pub fn paint(self: *Session, size: terminal.View.Size) !void {
 
     const status = self.statusInfo();
 
-    var caption_title_buffer: [128]u8 = undefined;
     const tail: layout.Tail = switch (self.mode) {
         .prompt => prompt: {
             self.editor.reflow(size);
             break :prompt .{
                 .prompt = .{
-                    .caption = self.inputCaption(&caption_title_buffer, 0) orelse
-                        self.offerCaption(),
+                    .caption = self.input.caption,
                     .editor = &self.editor,
                 },
             };
         },
         .turn => |*turn| turn: {
             self.editor.reflow(size);
-            const steering_count = self.steeringPendingCount();
             const tools = try turn.boxes(self.gpa, self.clock_ms);
             const tracks = try turn.trackBoxes(self.gpa);
             break :turn .{
@@ -1369,16 +1097,7 @@ pub fn paint(self: *Session, size: terminal.View.Size) !void {
                     .tools = tools,
                     .tracks = tracks,
                     .activity = turn.activity(),
-                    .caption = self.inputCaption(&caption_title_buffer, steering_count) orelse
-                        if (steering_count > 0) .{
-                            .title = std.fmt.bufPrint(
-                                &caption_title_buffer,
-                                "Queued messages: {d}",
-                                .{steering_count},
-                            ) catch unreachable,
-                            .controls = steering_controls,
-                            .rows_max = editor_caption_rows_max,
-                        } else null,
+                    .caption = self.input.caption,
                     .editor = &self.editor,
                 },
             };
@@ -1399,34 +1118,6 @@ pub fn paint(self: *Session, size: terminal.View.Size) !void {
         .status = &status,
     } };
     try layout.project(self.gpa, &self.view, size, &scene);
-}
-
-fn offerCaption(self: *const Session) ?ui.Caption {
-    return switch (self.prompt_offer) {
-        .none => null,
-        .retry => .{
-            .title = retry_title,
-            .controls = retry_controls,
-            .rows_max = editor_caption_rows_max,
-        },
-        .revision => .{
-            .title = revision_title,
-            .controls = revision_controls,
-            .rows_max = editor_caption_rows_max,
-        },
-    };
-}
-
-fn inputCaption(self: *const Session, buffer: []u8, steering_count: usize) ?ui.Caption {
-    const caption = self.input.caption orelse return null;
-    if (steering_count == 0) return caption;
-    var counted = caption;
-    counted.title = std.fmt.bufPrint(
-        buffer,
-        "{s}{s}Queued messages: {d}",
-        .{ caption.title, ui.paint.separator, steering_count },
-    ) catch return caption;
-    return counted;
 }
 
 pub fn statusInfo(self: *const Session) ui.status.Info {
@@ -1654,21 +1345,8 @@ fn applyFinishedToolRound(session: *Session) !void {
     });
 }
 
-fn queueSteeringText(session: *Session, text: []const u8) !void {
-    var editor = ui.Editor.init(session.gpa);
-    defer editor.deinit();
-    try editor.insert(text);
-    try session.reserveSteering();
-    var draft = editor.detachTrimmed();
-    session.commitSteeringDraft(&draft);
-}
-
-fn finishTurn(session: *Session, committed: usize) !void {
-    try session.endTurnWithReceipt(&.{
-        .history_base = 0,
-        .history_end = 0,
-        .steering_committed_count = committed,
-    });
+fn finishTurn(session: *Session) !void {
+    try session.endTurnWithReceipt(&.{ .history_base = 0, .history_end = 0 });
 }
 
 test "a read chunk drives the editor and paints the result" {
@@ -1785,7 +1463,7 @@ test "a large bracketed paste collapses to a marker through the real pipeline" {
     try std.testing.expectEqualStrings(payload, expanded);
 }
 
-test "a turn end drops the send-as-a-message confirmation and the footer" {
+test "a turn end drops the notice of the turn" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
@@ -1796,24 +1474,12 @@ test "a turn end drops the send-as-a-message confirmation and the footer" {
     try session.applyOutcome(try ai.command.Outcome.reportNotice(
         gpa,
         .warning,
-        "Enter: Queue as a message · Drinky does not recognize the command /nope.",
-        .{},
-    ));
-    session.armConfirmation(.message);
-    try session.abortTurn();
-
-    try std.testing.expect(session.mode == .prompt);
-    try std.testing.expect(!session.takeConfirmation(.message));
-    try std.testing.expect(session.notice == null);
-
-    session.beginTurn(2);
-    try session.applyOutcome(try ai.command.Outcome.reportNotice(
-        gpa,
-        .warning,
         "The command /model cannot run while a turn runs.",
         .{},
     ));
     try session.abortTurn();
+
+    try std.testing.expect(session.mode == .prompt);
     try std.testing.expect(session.notice == null);
 }
 
@@ -2142,7 +1808,7 @@ test "scripted stream events drive the model and one coalesced paint" {
     try std.testing.expectEqual(@as(usize, 0), out.written().len);
     try std.testing.expectEqual(@as(f64, 1.5), session.stats_shown.cost);
 
-    try finishTurn(&session, 0);
+    try finishTurn(&session);
     try std.testing.expect(!session.animating());
 
     try session.paint(.{ .columns = 80, .rows = 24 });
@@ -2170,7 +1836,7 @@ test "a tool result box shows the line the tool decided" {
         .summary = .{ .text = try gpa.dupe(u8, "Lines: 3") },
         .is_error = false,
     } });
-    try finishTurn(&session, 0);
+    try finishTurn(&session);
     try session.paint(.{ .columns = 80, .rows = 24 });
 
     const painted = out.written();
@@ -2197,7 +1863,7 @@ test "a tool result without a box line keeps the call row alone" {
         .name = try gpa.dupe(u8, "describe_drinky"),
         .is_error = false,
     } });
-    try finishTurn(&session, 0);
+    try finishTurn(&session);
 
     const blocks = session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 1), blocks.len);
@@ -2230,7 +1896,7 @@ test "a failed tool result keeps its sentence below the call row" {
         .summary = .{ .text = try gpa.dupe(u8, sentence), .kind = .sentence },
         .is_error = true,
     } });
-    try finishTurn(&session, 0);
+    try finishTurn(&session);
 
     const blocks = session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 1), blocks.len);
@@ -2262,7 +1928,7 @@ test "a failed tool result that states measures takes no prefix" {
         },
         .is_error = true,
     } });
-    try finishTurn(&session, 0);
+    try finishTurn(&session);
 
     const blocks = session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 1), blocks.len);
@@ -2458,7 +2124,6 @@ test "response-head retries remain after an abnormal rewind" {
         &.{
             .history_base = 0,
             .history_end = 0,
-            .steering_committed_count = 0,
         },
         "The request failed.",
     );
@@ -2515,7 +2180,6 @@ test "a truncated receipt appends an event after the answer" {
     try session.endTurnWithReceipt(&.{
         .history_base = 0,
         .history_end = 2,
-        .steering_committed_count = 0,
         .truncated = true,
     });
 
@@ -2529,7 +2193,6 @@ test "a truncated receipt appends an event after the answer" {
     const receipt: ai.Agent.Receipt = .{
         .history_base = 2,
         .history_end = 2,
-        .steering_committed_count = 0,
         .truncated = true,
     };
     try session.reserveFailureRestore(&receipt);
@@ -2563,7 +2226,7 @@ test "streamed and tool text cannot emit terminal controls" {
         .summary = .{ .text = try gpa.dupe(u8, tool) },
         .is_error = false,
     } });
-    try finishTurn(&session, 0);
+    try finishTurn(&session);
     try session.paint(.{ .columns = 160, .rows = 24 });
 
     const painted = out.written();
@@ -2622,7 +2285,7 @@ test "a canceled turn's stale output and completion cannot affect its successor"
         .generation = 2,
         .payload = .turn_ended,
     }));
-    try finishTurn(&session, 0);
+    try finishTurn(&session);
     try std.testing.expect(!session.animating());
     try std.testing.expectEqual(@as(usize, 3), session.transcript.blocks().len);
     try std.testing.expectEqualStrings(
@@ -2631,131 +2294,7 @@ test "a canceled turn's stale output and completion cannot affect its successor"
     );
 }
 
-test "committing a steering draft empties the source" {
-    const gpa = std.testing.allocator;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
-    defer session.deinit();
-
-    var editor = ui.Editor.init(gpa);
-    defer editor.deinit();
-    try editor.insert("move me");
-    var draft = editor.detachTrimmed();
-    defer draft.deinit(gpa);
-
-    try session.reserveSteering();
-    session.commitSteeringDraft(&draft);
-    try std.testing.expectEqual(@as(usize, 0), draft.visible.items.len);
-    try std.testing.expectEqual(@as(usize, 0), draft.atoms.items.len);
-    try std.testing.expectEqualStrings("move me", session.steering.items[0].draft.visible.items);
-}
-
-test "steering counts, then a consumed event shows it and clears the count" {
-    const gpa = std.testing.allocator;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
-    defer session.deinit();
-    session.beginTurn(1);
-
-    try queueSteeringText(&session, "fix it");
-    try queueSteeringText(&session, "and test");
-    try std.testing.expectEqual(@as(usize, 2), session.steering.items.len);
-    try std.testing.expectEqualStrings("fix it", session.steering.items[0].draft.visible.items);
-
-    try applyEvent(&session, 1, .{ .steering_consumed = .{
-        .text = try gpa.dupe(u8, "fix it\n\nand test"),
-        .count = 2,
-    } });
-    try std.testing.expectEqual(@as(usize, 1), session.transcript.blocks().len);
-    try std.testing.expectEqualStrings(
-        "fix it\n\nand test",
-        session.transcript.blocks()[0].content.user.items,
-    );
-    try std.testing.expectEqual(@as(usize, 2), session.steering.items.len);
-    try std.testing.expectEqual(@as(usize, 2), session.steering_retained_count);
-    try std.testing.expectEqual(@as(usize, 0), session.steeringPendingCount());
-
-    try finishTurn(&session, 2);
-    try std.testing.expectEqual(@as(usize, 0), session.steering.items.len);
-}
-
-test "the committed steering frontier follows the checkpoint of the worker" {
-    const gpa = std.testing.allocator;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
-    defer session.deinit();
-    session.beginTurn(1);
-    try std.testing.expect(!session.turnCommitted());
-
-    try queueSteeringText(&session, "fix it");
-    try queueSteeringText(&session, "and test");
-    _ = try session.applyTurnEvent(&.{
-        .generation = 1,
-        .progress_sequence = 1,
-        .payload = .{ .steering_consumed = .{
-            .text = try gpa.dupe(u8, "fix it\n\nand test"),
-            .count = 2,
-        } },
-    });
-    try std.testing.expectEqual(@as(usize, 0), session.steering_committed_count);
-
-    _ = try session.applyTurnEvent(&.{
-        .generation = 1,
-        .progress_sequence = 2,
-        .progress_sequence_committed = 0,
-        .payload = .{ .text = try gpa.dupe(u8, "partial") },
-    });
-    try std.testing.expectEqual(@as(usize, 0), session.steering_committed_count);
-    try std.testing.expect(!session.turnCommitted());
-
-    _ = try session.applyTurnEvent(&.{
-        .generation = 1,
-        .progress_sequence = 3,
-        .progress_sequence_committed = 2,
-        .payload = .{ .text = try gpa.dupe(u8, " more") },
-    });
-    try std.testing.expectEqual(@as(usize, 2), session.steering_committed_count);
-    try std.testing.expect(session.turnCommitted());
-    try std.testing.expect(session.steering_uncommitted == null);
-
-    try finishTurn(&session, 2);
-    try std.testing.expectEqual(@as(usize, 0), session.steering_committed_count);
-    try std.testing.expect(!session.turnCommitted());
-}
-
-test "cancelReceipt drops the committed prefix and restores the uncommitted suffix" {
-    const gpa = std.testing.allocator;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
-    defer session.deinit();
-    session.beginTurn(1);
-
-    try queueSteeringText(&session, "committed");
-    try queueSteeringText(&session, "restore me");
-    try applyEvent(&session, 1, .{ .steering_consumed = .{
-        .text = try gpa.dupe(u8, "committed\n\nrestore me"),
-        .count = 2,
-    } });
-    try std.testing.expectEqual(@as(usize, 2), session.steering_retained_count);
-
-    try session.reserveSteeringRestore();
-    session.cancelReceipt(&.{
-        .history_base = 0,
-        .history_end = 0,
-        .steering_committed_count = 1,
-    }, 0);
-
-    try std.testing.expectEqual(@as(usize, 0), session.steering.items.len);
-    try std.testing.expectEqual(@as(usize, 0), session.steering_retained_count);
-    try std.testing.expectEqual(@as(usize, 0), session.steering_consumed_count);
-    try std.testing.expectEqualStrings("restore me", session.editor.visible());
-}
-
-test "takeCanceledRevision moves the committed drafts out and leaves empty shells" {
+test "markTurnBase moves the checkpoint to the base and a commit moves it forward" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
@@ -2763,122 +2302,10 @@ test "takeCanceledRevision moves the committed drafts out and leaves empty shell
     defer session.deinit();
     try session.transcript.append(.event, .{}, "before the turn");
     session.beginTurn(1);
-
-    const payload = "line\n" ** 15;
-    try session.editor.paste(payload, true);
-    var prompt = session.editor.detachTrimmed();
-    session.retainTurnPrompt(&prompt, 1);
-    try queueSteeringText(&session, "committed");
-    try queueSteeringText(&session, "restore me");
-    try applyEvent(&session, 1, .{ .steering_consumed = .{
-        .text = try gpa.dupe(u8, "committed\n\nrestore me"),
-        .count = 2,
-    } });
-    try applyFinishedToolRound(&session);
-
-    try session.reserveSteeringRestore();
-    try session.reserveRevisionCapture();
-    const receipt: ai.Agent.Receipt = .{
-        .history_base = 0,
-        .history_end = 3,
-        .steering_committed_count = 1,
-    };
-    var capture = session.takeCanceledRevision(&receipt).?;
-    defer {
-        capture.prompt.deinit(gpa);
-        for (capture.steering.items) |*draft| draft.deinit(gpa);
-        capture.steering.deinit(gpa);
-    }
-    try std.testing.expectEqual(@as(usize, 1), capture.transcript_base);
-    try std.testing.expect(capture.mutated);
-    try std.testing.expectEqual(@as(usize, 1), capture.prompt.atoms.items.len);
-    const expanded = try capture.prompt.expanded(gpa, .none);
-    defer gpa.free(expanded);
-    try std.testing.expectEqualStrings(payload, expanded);
-    try std.testing.expectEqual(@as(usize, 1), capture.steering.items.len);
-    try std.testing.expectEqualStrings("committed", capture.steering.items[0].visible.items);
-
-    try std.testing.expectEqual(@as(usize, 2), session.steering.items.len);
-    try std.testing.expectEqual(@as(usize, 0), session.steering.items[0].draft.visible.items.len);
-    try std.testing.expectEqual(@as(usize, 0), session.turn_prompt.?.draft.visible.items.len);
-    try std.testing.expectEqual(@as(usize, 0), session.turn_prompt.?.draft.atoms.items.len);
-
-    session.cancelReceipt(&receipt, 3);
-    try session.abortTurn();
-    try std.testing.expectEqualStrings("restore me", session.editor.visible());
-    try std.testing.expectEqual(@as(usize, 0), session.steering.items.len);
-    try std.testing.expect(session.turn_prompt == null);
-    try std.testing.expectEqualStrings("committed", capture.steering.items[0].visible.items);
-    try std.testing.expectEqual(@as(usize, 1), capture.prompt.atoms.items.len);
-}
-
-test "takeCanceledRevision captures nothing without a restorable prompt" {
-    const gpa = std.testing.allocator;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
-    defer session.deinit();
-    const receipt: ai.Agent.Receipt = .{
-        .history_base = 0,
-        .history_end = 1,
-        .steering_committed_count = 1,
-    };
-
-    session.beginTurn(1);
+    try std.testing.expectEqual(@as(usize, 1), session.mode.turn.transcript_checkpoint);
     session.markTurnBase(0);
-    try queueSteeringText(&session, "committed");
-    try session.reserveRevisionCapture();
-    try std.testing.expect(session.takeCanceledRevision(&receipt) == null);
-    try std.testing.expectEqualStrings("committed", session.steering.items[0].draft.visible.items);
-    try session.reserveSteeringRestore();
-    session.cancelReceipt(&receipt, 0);
-    session.endTurn();
-    try std.testing.expectEqual(@as(usize, 0), session.steering.items.len);
-
-    session.input.owner = .external;
-    session.beginTurn(2);
-    var external = try ui.Editor.Draft.fromText(gpa, "from the chat");
-    session.retainExternalTurnPrompt(&external, 0, 7);
-    try queueSteeringText(&session, "typed");
-    try session.reserveRevisionCapture();
-    try std.testing.expect(session.takeCanceledRevision(&receipt) == null);
-    try std.testing.expectEqualStrings("from the chat", session.turn_prompt.?.draft.visible.items);
-    try std.testing.expectEqualStrings("typed", session.steering.items[0].draft.visible.items);
-
-    session.input.owner = .terminal;
-    var capture = session.takeCanceledRevision(&receipt).?;
-    defer {
-        capture.prompt.deinit(gpa);
-        for (capture.steering.items) |*draft| draft.deinit(gpa);
-        capture.steering.deinit(gpa);
-    }
-    try std.testing.expectEqualStrings("from the chat", capture.prompt.visible.items);
-    try std.testing.expectEqual(@as(usize, 1), capture.steering.items.len);
-    try std.testing.expect(!capture.mutated);
-    session.endTurn();
-}
-
-test "a turn keeps its transcript base and records a mutating call" {
-    const gpa = std.testing.allocator;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
-    defer session.deinit();
-    try session.transcript.append(.event, .{}, "before the turn");
-    session.beginTurn(1);
-    try std.testing.expectEqual(@as(usize, 1), session.mode.turn.transcript_base);
-    session.markTurnBase(0);
-    try std.testing.expectEqual(@as(usize, 0), session.mode.turn.transcript_base);
     try std.testing.expectEqual(@as(usize, 0), session.mode.turn.transcript_checkpoint);
-    try std.testing.expect(!session.mode.turn.mutated);
 
-    for ([_][]const u8{ "read", "find", "grep", "describe_drinky" }) |name| {
-        try applyEvent(&session, 1, .{ .tool_start = .{
-            .name = try gpa.dupe(u8, name),
-            .input_json = try gpa.dupe(u8, "{}"),
-        } });
-        try std.testing.expect(!session.mode.turn.mutated);
-    }
     _ = try session.applyTurnEvent(&.{
         .generation = 1,
         .progress_sequence = 1,
@@ -2894,150 +2321,11 @@ test "a turn keeps its transcript base and records a mutating call" {
             .input_json = try gpa.dupe(u8, "{\"command\":\"ls\"}"),
         } },
     });
-    try std.testing.expect(session.mode.turn.mutated);
-    try std.testing.expectEqual(@as(usize, 0), session.mode.turn.transcript_base);
     try std.testing.expect(session.mode.turn.transcript_checkpoint > 0);
     session.endTurn();
-
-    for ([_][]const u8{ "write", "edit" }) |name| {
-        session.beginTurn(2);
-        try applyEvent(&session, 2, .{ .tool_start = .{
-            .name = try gpa.dupe(u8, name),
-            .input_json = try gpa.dupe(u8, "{}"),
-        } });
-        try std.testing.expect(session.mode.turn.mutated);
-        session.endTurn();
-    }
 }
 
-test "the events of a turn are turn-owned and the events of the session are not" {
-    const gpa = std.testing.allocator;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
-    defer session.deinit();
-
-    session.beginTurn(1);
-    _ = try session.applyTurnEvent(&.{
-        .generation = 1,
-        .progress_sequence = 1,
-        .payload = .{ .stream_reset = .{ .attempt = 2, .cause = .{ .failure = error.Timeout } } },
-    });
-    _ = try session.applyTurnEvent(&.{
-        .generation = 1,
-        .progress_sequence = 2,
-        .payload = .{ .model_mismatch = .{
-            .requested = try gpa.dupe(u8, "claude-opus-5"),
-            .served = try gpa.dupe(u8, "claude-sonnet-4-6"),
-        } },
-    });
-    try session.recordAsyncEvent(.{
-        .content = try gpa.dupe(u8, "You attached @bot."),
-        .severity = .information,
-    }, .{});
-    try session.applyOutcome(try ai.command.Outcome.reportEvent(gpa, .information, "changed", .{}));
-    _ = try session.applyTurnEvent(&.{
-        .generation = 1,
-        .progress_sequence = 3,
-        .progress_sequence_committed = 2,
-        .payload = .{ .text = try gpa.dupe(u8, "partial") },
-    });
-    try session.failTurnWithReceipt(&.{
-        .history_base = 0,
-        .history_end = 1,
-        .steering_committed_count = 0,
-        .truncated = true,
-    }, "The provider is overloaded.");
-    session.beginTurn(2);
-    try session.abortTurn();
-
-    const blocks = session.transcript.blocks();
-    try std.testing.expectEqual(@as(usize, 7), blocks.len);
-    const retry = blocks[0].content.event;
-    try std.testing.expect(retry.turn_owned and retry.survives_rewind);
-    try std.testing.expect(blocks[1].content.event.turn_owned);
-    try std.testing.expect(!blocks[2].content.event.turn_owned);
-    try std.testing.expect(blocks[2].content.event.survives_rewind);
-    try std.testing.expect(!blocks[3].content.event.turn_owned);
-    try std.testing.expectEqualStrings(truncated_event, blocks[4].content.event.text.items);
-    try std.testing.expect(blocks[4].content.event.turn_owned);
-    try std.testing.expect(blocks[5].content.event.turn_owned);
-    try std.testing.expectEqualStrings("You canceled the turn.", blocks[6].content.event.text.items);
-    try std.testing.expect(blocks[6].content.event.turn_owned);
-    for (blocks) |*block| try std.testing.expect(block.turnOwned() == block.content.event.turn_owned);
-}
-
-test "removeTurn resets the screen and marks the session dirty" {
-    const gpa = std.testing.allocator;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
-    defer session.deinit();
-    try session.transcript.append(.user, .{}, "fix it");
-    try session.transcript.append(.event, .{ .turn_owned = true }, "You canceled the turn.");
-    try session.paint(.{ .columns = 80, .rows = 24 });
-    session.dirty = false;
-
-    const removal = session.removeTurn(.{ .range_base = 0, .range_end = 2, .mirror_cursor = 2 });
-    try std.testing.expectEqual(@as(usize, 2), removal.removed_count);
-    try std.testing.expectEqual(@as(usize, 2), removal.removed_before_cursor_count);
-    try std.testing.expectEqual(@as(usize, 0), session.transcript.blocks().len);
-    try std.testing.expect(session.view.force_reset);
-    try std.testing.expect(session.dirty);
-    const removed_start = out.written().len;
-    try session.paint(.{ .columns = 80, .rows = 24 });
-    const painted = out.written()[removed_start..];
-    try std.testing.expect(std.mem.indexOf(u8, painted, terminal.escape.screen_reset) != null);
-    try std.testing.expect(std.mem.indexOf(u8, painted, "fix it") == null);
-}
-
-test "the prompt caption names the waiting recovery offer" {
-    const gpa = std.testing.allocator;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
-    defer session.deinit();
-
-    session.prompt_offer = .revision;
-    try session.paint(.{ .columns = 80, .rows = 24 });
-    try expectPainted(gpa, out.written(), "Canceled turn");
-    try expectPainted(gpa, out.written(), "Ctrl+N: Remove and edit · Esc: Keep turn");
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "Failed turn") == null);
-
-    const retry_start = out.written().len;
-    session.prompt_offer = .retry;
-    session.dirty = true;
-    try session.paint(.{ .columns = 80, .rows = 24 });
-    try expectPainted(gpa, out.written()[retry_start..], "Failed turn");
-    try expectPainted(gpa, out.written()[retry_start..], "Ctrl+N: Try again · Esc: Dismiss");
-
-    session.armConfirmation(.revision);
-    try std.testing.expect(session.takeConfirmation(.revision));
-    try std.testing.expect(!session.takeConfirmation(.revision));
-}
-
-test "the steering caption counts a paste without showing its content" {
-    const gpa = std.testing.allocator;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
-    defer session.deinit();
-    session.beginTurn(1);
-
-    const payload = "secret line\n" ** 15;
-    try session.editor.paste(payload, true);
-    try session.reserveSteering();
-    var draft = session.editor.detachTrimmed();
-    session.commitSteeringDraft(&draft);
-
-    try session.paint(.{ .columns = 80, .rows = 24 });
-    const painted = out.written();
-    try std.testing.expect(std.mem.indexOf(u8, painted, "Queued messages: 1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, painted, "[Paste #1: 16 lines]") == null);
-    try std.testing.expect(std.mem.indexOf(u8, painted, "secret line") == null);
-}
-
-test "the caption of an input state carries the queue count" {
+test "the caption of an input state paints above the editor during a turn" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
@@ -3052,20 +2340,7 @@ test "the caption of an input state carries the queue count" {
 
     try session.paint(.{ .columns = 80, .rows = 24 });
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "Remote: @drinky_bot") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "Queued") == null);
-
-    try queueSteeringText(&session, "fix it");
-    try queueSteeringText(&session, "and test");
-    out.clearRetainingCapacity();
-    try session.paint(.{ .columns = 80, .rows = 24 });
-    const painted = out.written();
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        painted,
-        "Remote: @drinky_bot" ++ ui.paint.separator ++ "Queued messages: 2",
-    ) != null);
-    try std.testing.expect(std.mem.indexOf(u8, painted, "Esc: Detach") != null);
-    try std.testing.expect(std.mem.indexOf(u8, painted, steering_controls) == null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "Esc: Detach") != null);
 }
 
 test "an external prompt returns after its source let go of the input" {
@@ -3077,7 +2352,6 @@ test "an external prompt returns after its source let go of the input" {
     const receipt: ai.Agent.Receipt = .{
         .history_base = 0,
         .history_end = 0,
-        .steering_committed_count = 0,
     };
 
     session.input = .{ .owner = .external, .caption = .{
@@ -3234,134 +2508,6 @@ test "a picked line replaces the draft in the editor" {
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "/skill:demo") != null);
 }
 
-fn labelsForTest(gpa: std.mem.Allocator, labels: []const []const u8) ![]const []const u8 {
-    const options = try gpa.alloc([]const u8, labels.len);
-    for (labels, 0..) |label, index| options[index] = try gpa.dupe(u8, label);
-    return options;
-}
-
-test "the prompt history picker opens over the draft with a purpose of its own" {
-    const gpa = std.testing.allocator;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
-    defer session.deinit();
-
-    const step = struct {
-        fn open(_: *ai.command.Context) anyerror!ai.command.Outcome {
-            unreachable;
-        }
-    }.open;
-    try session.applyOutcome(.{ .pick = try pickForTest(gpa, "Command", step) });
-    try std.testing.expect(session.mode.picking.purpose == .command);
-    try std.testing.expectEqual(@as(usize, 0), session.mode.picking.purpose.command.payload);
-    session.closePicker();
-
-    try session.editor.insert("draft");
-    try session.openPromptHistory(try labelsForTest(gpa, &.{ "newest", "older", "oldest" }));
-    const picking = &session.mode.picking;
-    try std.testing.expect(picking.purpose == .prompt_history);
-    try std.testing.expectEqualStrings("Prompt history", picking.picker.title);
-    try std.testing.expectEqualStrings("newest", picking.picker.options[0].name);
-    try std.testing.expectEqual(@as(usize, 0), picking.picker.cursor);
-    try std.testing.expect(picking.picker.marked == null);
-    try std.testing.expect(!picking.picker.can_step_back);
-    try std.testing.expect(picking.reopen == null);
-    try std.testing.expectEqual(@as(usize, 0), picking.trail.len);
-    try std.testing.expect(session.stepAbove() == null);
-    try std.testing.expectEqualStrings("draft", session.editor.visible());
-
-    try session.paint(.{ .columns = 80, .rows = 24 });
-    try expectPainted(gpa, out.written(), "Prompt history");
-    try expectPainted(gpa, out.written(), " > newest");
-    try expectPainted(gpa, out.written(), "Esc: Cancel");
-
-    try session.cancelPicker();
-    try std.testing.expect(session.mode == .prompt);
-    try std.testing.expectEqualStrings(
-        "You canceled the prompt history selection.",
-        session.notice.?.content,
-    );
-    try std.testing.expectEqualStrings("draft", session.editor.visible());
-}
-
-test "a selected prompt appends to the draft as literal text and marks the edit" {
-    const gpa = std.testing.allocator;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
-    defer session.deinit();
-
-    const entry = try gpa.alloc(u8, 8 * 1024);
-    defer gpa.free(entry);
-    @memset(entry, 'x');
-    for (0..entry.len / 64) |row| entry[row * 64] = '\n';
-    @memcpy(entry[0..5], "first");
-    @memcpy(entry[entry.len - 4 ..], "last");
-
-    try session.editor.insert("typed");
-    try session.openPromptHistory(try labelsForTest(gpa, &.{"first x…"}));
-    session.dirty = false;
-    var source = try ui.Editor.Draft.fromText(gpa, entry);
-    defer source.deinit(gpa);
-    try session.appendPromptHistory(&source);
-
-    try std.testing.expect(session.mode == .prompt);
-    try std.testing.expect(session.dirty);
-    try std.testing.expectEqual(@as(usize, 0), source.visible.items.len);
-    const expected = try std.mem.concat(gpa, u8, &.{ "typed\n\n", entry });
-    defer gpa.free(expected);
-    try std.testing.expectEqualStrings(expected, session.editor.visible());
-    try std.testing.expectEqual(@as(usize, 0), session.editor.draft.atoms.items.len);
-    try std.testing.expectEqual(expected.len, session.editor.caret);
-    const expanded = try session.editor.expanded(.none);
-    defer gpa.free(expanded);
-    try std.testing.expectEqualStrings(expected, expanded);
-
-    try session.paint(.{ .columns = 80, .rows = 24 });
-    try expectPainted(gpa, out.written(), "last");
-    try std.testing.expect(session.editor.scroll > 0);
-    try session.editor.insertCodepoint('!');
-    try std.testing.expect(std.mem.endsWith(u8, session.editor.visible(), "last!"));
-}
-
-test "a selected prompt into an empty draft takes no separator" {
-    const gpa = std.testing.allocator;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
-    defer session.deinit();
-
-    try session.openPromptHistory(try labelsForTest(gpa, &.{"one two"}));
-    var source = try ui.Editor.Draft.fromText(gpa, "one\r\ntwo");
-    defer source.deinit(gpa);
-    try session.appendPromptHistory(&source);
-    try std.testing.expectEqualStrings("one\r\ntwo", session.editor.visible());
-}
-
-test "a failed reserve keeps the prompt history picker open and the draft unchanged" {
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
-    const gpa = failing.allocator();
-    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
-    defer session.deinit();
-
-    try session.editor.insert("typed");
-    try session.openPromptHistory(try labelsForTest(gpa, &.{"row"}));
-    var source = try ui.Editor.Draft.fromText(std.testing.allocator, "x" ** 4096);
-    defer source.deinit(std.testing.allocator);
-    failing.fail_index = failing.alloc_index;
-    failing.resize_fail_index = failing.resize_index;
-    try std.testing.expectError(error.OutOfMemory, session.appendPromptHistory(&source));
-    failing.fail_index = std.math.maxInt(usize);
-    failing.resize_fail_index = std.math.maxInt(usize);
-
-    try std.testing.expect(session.mode == .picking);
-    try std.testing.expectEqualStrings("typed", session.editor.visible());
-    try std.testing.expectEqual(@as(usize, 4096), source.visible.items.len);
-}
-
 test "opening a picker over a turn releases its retained prompt" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
@@ -3504,13 +2650,11 @@ test "a failure with nothing committed rewinds the tail and returns the prompt" 
     try session.transcript.appendStream(.model, null, "partial reply");
     var prompt = try ui.Editor.Draft.fromText(gpa, "my prompt");
     session.retainTurnPrompt(&prompt, base);
-    try queueSteeringText(&session, "steer");
     try session.editor.insert("typing");
 
     const receipt: ai.Agent.Receipt = .{
         .history_base = 0,
         .history_end = 0,
-        .steering_committed_count = 0,
     };
     try session.reserveFailureRestore(&receipt);
     try session.failTurnWithReceipt(&receipt, "Overloaded");
@@ -3520,12 +2664,11 @@ test "a failure with nothing committed rewinds the tail and returns the prompt" 
     try std.testing.expectEqualStrings("earlier", blocks[0].content.event.text.items);
     try std.testing.expect(blocks[1].content.event.is_error);
     try std.testing.expectEqualStrings("Overloaded", blocks[1].content.event.text.items);
-    try std.testing.expectEqualStrings("my prompt\n\nsteer\n\ntyping", session.editor.visible());
+    try std.testing.expectEqualStrings("my prompt\n\ntyping", session.editor.visible());
     try std.testing.expect(session.turn_prompt == null);
-    try std.testing.expect(!session.hasSteering());
 }
 
-test "a failure after a committed round keeps it and restores only steering" {
+test "a failure after a committed round keeps it and returns no prompt" {
     const gpa = std.testing.allocator;
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
@@ -3557,13 +2700,8 @@ test "a failure after a committed round keeps it and restores only steering" {
         .progress_sequence_committed = 1,
         .payload = .{ .text = try gpa.dupe(u8, "round two partial") },
     });
-    try queueSteeringText(&session, "restore me");
 
-    const receipt: ai.Agent.Receipt = .{
-        .history_base = 0,
-        .history_end = 2,
-        .steering_committed_count = 0,
-    };
+    const receipt: ai.Agent.Receipt = .{ .history_base = 0, .history_end = 2 };
     try session.reserveFailureRestore(&receipt);
     try session.failTurnWithReceipt(&receipt, "boom");
 
@@ -3578,9 +2716,8 @@ test "a failure after a committed round keeps it and restores only steering" {
     );
     try std.testing.expect(blocks[3].content.event.is_error);
     try std.testing.expectEqualStrings("boom", blocks[3].content.event.text.items);
-    try std.testing.expectEqualStrings("restore me", session.editor.visible());
+    try std.testing.expectEqualStrings("", session.editor.visible());
     try std.testing.expect(session.turn_prompt == null);
-    try std.testing.expect(!session.hasSteering());
 }
 
 test "a cancel with nothing committed rewinds the tail and returns the prompt" {
@@ -3598,20 +2735,18 @@ test "a cancel with nothing committed rewinds the tail and returns the prompt" {
 
     var prompt = try ui.Editor.Draft.fromText(gpa, "my prompt");
     session.retainTurnPrompt(&prompt, base);
-    try queueSteeringText(&session, "steer");
     try session.editor.insert("typing");
 
-    try session.reserveSteeringRestore();
+    try session.reservePromptRestore();
     session.cancelReceipt(&.{
         .history_base = 0,
         .history_end = 0,
-        .steering_committed_count = 0,
     }, 0);
 
     const blocks = session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 1), blocks.len);
     try std.testing.expectEqualStrings("earlier", blocks[0].content.event.text.items);
-    try std.testing.expectEqualStrings("my prompt\n\nsteer\n\ntyping", session.editor.visible());
+    try std.testing.expectEqualStrings("my prompt\n\ntyping", session.editor.visible());
     try std.testing.expect(session.turn_prompt == null);
 }
 
@@ -3649,11 +2784,10 @@ test "a cancel with a committed round keeps it and drops the in-flight tail" {
         .payload = .{ .text = try gpa.dupe(u8, "round two partial") },
     });
 
-    try session.reserveSteeringRestore();
+    try session.reservePromptRestore();
     session.cancelReceipt(&.{
         .history_base = 0,
         .history_end = 2,
-        .steering_committed_count = 0,
     }, 1);
 
     const blocks = session.transcript.blocks();
@@ -3692,11 +2826,10 @@ test "a cancel during a tool call keeps the call and shows it as failed" {
         } },
     });
 
-    try session.reserveSteeringRestore();
+    try session.reservePromptRestore();
     session.cancelReceipt(&.{
         .history_base = 0,
         .history_end = 3,
-        .steering_committed_count = 0,
     }, 1);
     try session.abortTurn();
 
@@ -3775,11 +2908,10 @@ test "a finished tool block survives a cancel in the same round" {
     session.retainTurnPrompt(&prompt, base);
     try applyFinishedToolRound(&session);
 
-    try session.reserveSteeringRestore();
+    try session.reservePromptRestore();
     session.cancelReceipt(&.{
         .history_base = 0,
         .history_end = 3,
-        .steering_committed_count = 0,
     }, 3);
     try session.abortTurn();
 
@@ -3822,7 +2954,6 @@ test "a finished tool block survives a failure in the same round" {
     const receipt: ai.Agent.Receipt = .{
         .history_base = 0,
         .history_end = 3,
-        .steering_committed_count = 0,
     };
     try session.reserveFailureRestore(&receipt);
     try session.failTurnWithReceipt(&receipt, "boom");
@@ -3858,72 +2989,15 @@ test "a final commit frontier keeps an open reply when no later event carries it
         .payload = .{ .text = try gpa.dupe(u8, "committed answer") },
     });
 
-    try session.reserveSteeringRestore();
+    try session.reservePromptRestore();
     session.cancelReceipt(&.{
         .history_base = 0,
         .history_end = 2,
-        .steering_committed_count = 0,
     }, 1);
 
     const blocks = session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 2), blocks.len);
     try std.testing.expectEqualStrings("committed answer", blocks[1].content.model.items);
-}
-
-test "a partial cancel removes consumed steering beyond the commit frontier" {
-    const gpa = std.testing.allocator;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var session: Session = Session.init(gpa, &out.writer, test_model, .low);
-    defer session.deinit();
-    session.beginTurn(1);
-
-    const base = session.transcript.blocks().len;
-    try session.transcript.append(.user, .{}, "prompt");
-    var prompt = try ui.Editor.Draft.fromText(gpa, "prompt");
-    session.retainTurnPrompt(&prompt, base);
-    _ = try session.applyTurnEvent(&.{
-        .generation = 1,
-        .progress_sequence = 1,
-        .payload = .{ .text = try gpa.dupe(u8, "committed answer") },
-    });
-    _ = try session.applyTurnEvent(&.{
-        .generation = 1,
-        .progress_sequence = 2,
-        .progress_sequence_committed = 1,
-        .payload = .{ .tool_start = .{
-            .name = try gpa.dupe(u8, "read"),
-            .input_json = try gpa.dupe(u8, "{}"),
-        } },
-    });
-    try queueSteeringText(&session, "restore me");
-    _ = try session.applyTurnEvent(&.{
-        .generation = 1,
-        .progress_sequence = 3,
-        .progress_sequence_committed = 1,
-        .payload = .{ .steering_consumed = .{
-            .text = try gpa.dupe(u8, "restore me"),
-            .count = 1,
-        } },
-    });
-    _ = try session.applyTurnEvent(&.{
-        .generation = 1,
-        .progress_sequence = 4,
-        .progress_sequence_committed = 1,
-        .payload = .{ .text = try gpa.dupe(u8, "uncommitted reply") },
-    });
-
-    try session.reserveSteeringRestore();
-    session.cancelReceipt(&.{
-        .history_base = 0,
-        .history_end = 2,
-        .steering_committed_count = 0,
-    }, 1);
-
-    const blocks = session.transcript.blocks();
-    try std.testing.expectEqual(@as(usize, 2), blocks.len);
-    try std.testing.expectEqualStrings("committed answer", blocks[1].content.model.items);
-    try std.testing.expectEqualStrings("restore me", session.editor.visible());
 }
 
 test "a delivered skill shows as a head line, not as a user box" {
@@ -3968,7 +3042,7 @@ test "a normal completion frees the retained prompt" {
     var prompt = session.editor.detachTrimmed();
     session.retainTurnPrompt(&prompt, 0);
 
-    try finishTurn(&session, 0);
+    try finishTurn(&session);
     try std.testing.expect(session.turn_prompt == null);
 }
 
@@ -4256,7 +3330,7 @@ test "an account switch hides the reasoning of the other account" {
 
     try applyEvent(&session, 1, .{ .thinking = try gpa.dupe(u8, "weigh it") });
     try applyEvent(&session, 1, .{ .text = try gpa.dupe(u8, "the answer") });
-    try finishTurn(&session, 0);
+    try finishTurn(&session);
     try session.paint(.{ .columns = 80, .rows = 24 });
     try expectPainted(gpa, out.written(), "weigh it");
 
@@ -4289,7 +3363,7 @@ test "a model that replays no reasoning hides it" {
 
     try applyEvent(&session, 1, .{ .thinking = try gpa.dupe(u8, "weigh it") });
     try applyEvent(&session, 1, .{ .text = try gpa.dupe(u8, "the answer") });
-    try finishTurn(&session, 0);
+    try finishTurn(&session);
     try session.paint(.{ .columns = 80, .rows = 24 });
     try expectPainted(gpa, out.written(), "weigh it");
 
@@ -4322,7 +3396,7 @@ test "a setup change that hides no block keeps the scrollback" {
     session.beginTurn(1);
 
     try applyEvent(&session, 1, .{ .text = try gpa.dupe(u8, "the answer") });
-    try finishTurn(&session, 0);
+    try finishTurn(&session);
     try session.paint(.{ .columns = 80, .rows = 24 });
 
     session.showSetup(.openai_api_key, test_model_openai, .low);
@@ -4331,7 +3405,7 @@ test "a setup change that hides no block keeps the scrollback" {
 
     session.beginTurn(2);
     try applyEvent(&session, 2, .{ .thinking = try gpa.dupe(u8, "weigh it") });
-    try finishTurn(&session, 0);
+    try finishTurn(&session);
     try session.paint(.{ .columns = 80, .rows = 24 });
     const other_openai = ai.testing.model("gpt-5.6-luna");
     session.showSetup(.openai_api_key, other_openai, .low);
@@ -4352,7 +3426,7 @@ test "dropped account reasoning leaves the transcript for good" {
 
     try applyEvent(&session, 1, .{ .thinking = try gpa.dupe(u8, "weigh it") });
     try applyEvent(&session, 1, .{ .text = try gpa.dupe(u8, "the answer") });
-    try finishTurn(&session, 0);
+    try finishTurn(&session);
     try session.paint(.{ .columns = 80, .rows = 24 });
 
     session.dropAccountReasoning(.anthropic_plan);
@@ -4383,12 +3457,8 @@ test "a conversation clear drops every block and keeps the request setup" {
 
     try applyEvent(&session, 1, .{ .thinking = try gpa.dupe(u8, "weigh it") });
     try applyEvent(&session, 1, .{ .text = try gpa.dupe(u8, "the answer") });
-    try finishTurn(&session, 0);
+    try finishTurn(&session);
     session.stats_shown.cost = 1.5;
-    try session.editor.insert("later");
-    try session.reserveSteering();
-    var draft = session.editor.detachTrimmed();
-    session.commitSteeringDraft(&draft);
     try session.paint(.{ .columns = 80, .rows = 24 });
 
     session.view.force_reset = false;
@@ -4396,7 +3466,6 @@ test "a conversation clear drops every block and keeps the request setup" {
     try std.testing.expectEqual(@as(usize, 0), session.transcript.blocks().len);
     try std.testing.expect(session.view.force_reset);
     try std.testing.expectEqual(@as(f64, 0), session.stats_shown.cost);
-    try std.testing.expect(!session.hasSteering());
     try std.testing.expectEqual(@as(?ai.llm.Account, .anthropic_plan), session.account_shown);
     try std.testing.expectEqualStrings(test_model.name(), session.model_shown.?.name());
     try std.testing.expectEqual(replaying_effort, session.effort_shown);
@@ -4407,7 +3476,6 @@ test "a conversation clear drops every block and keeps the request setup" {
     defer gpa.free(cleared);
     try std.testing.expect(std.mem.indexOf(u8, cleared, "weigh it") == null);
     try std.testing.expect(std.mem.indexOf(u8, cleared, "the answer") == null);
-    try std.testing.expect(std.mem.indexOf(u8, cleared, "later") == null);
 }
 
 test "an async event that repeats states its count in the block it repeats" {
@@ -4440,23 +3508,6 @@ test "an async event that repeats states its count in the block it repeats" {
     );
     try std.testing.expectEqualStrings(text, blocks[1].content.event.text.items);
     try std.testing.expectEqualStrings(text, blocks[2].content.event.text.items);
-}
-
-test "an async event that states its own moment never counts in an earlier block" {
-    const gpa = std.testing.allocator;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var session = Session.init(gpa, &out.writer, test_model, .low);
-    defer session.deinit();
-
-    const text = "Context: 0% (0/1.0M) · Cost: ~$0.00";
-    for (0..2) |_| try session.recordAsyncEvent(
-        try ai.command.Outcome.Message.print(gpa, .information, text, .{}),
-        .{ .mirrored = false, .repeats = false },
-    );
-    const blocks = session.transcript.blocks();
-    try std.testing.expectEqual(@as(usize, 2), blocks.len);
-    for (blocks) |*block| try std.testing.expectEqualStrings(text, block.content.event.text.items);
 }
 
 test "an async event waits for the message boundary and survives a rewind" {
@@ -4508,12 +3559,10 @@ test "an async event waits for the message boundary and survives a rewind" {
     try session.reserveFailureRestore(&.{
         .history_base = 0,
         .history_end = 0,
-        .steering_committed_count = 0,
     });
     try session.failTurnWithReceipt(&.{
         .history_base = 0,
         .history_end = 0,
-        .steering_committed_count = 0,
     }, "the turn failed");
     const rewound = session.transcript.blocks();
     try std.testing.expectEqualStrings("idle report", rewound[0].content.event.text.items);
@@ -4533,7 +3582,7 @@ test "the end of a turn lands the deferred events" {
         try ai.command.Outcome.Message.print(gpa, .information, "late", .{}),
         .{},
     );
-    try finishTurn(&session, 0);
+    try finishTurn(&session);
     const blocks = session.transcript.blocks();
     try std.testing.expectEqual(@as(usize, 2), blocks.len);
     try std.testing.expectEqualStrings("answer", blocks[0].content.model.items);

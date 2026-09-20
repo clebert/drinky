@@ -6,9 +6,7 @@ pub const Attachment = @import("Attachment.zig");
 pub const Pairing = @import("Pairing.zig");
 pub const Controller = @import("Controller.zig");
 pub const Mirror = @import("Mirror.zig");
-pub const Picker = @import("Picker.zig");
 pub const html = @import("html.zig");
-pub const keyboard = @import("keyboard.zig");
 
 test {
     std.testing.refAllDecls(@This());

@@ -14,7 +14,6 @@ bash: ai.tool.Context.Bash = .{},
 window_pages: usize = layout.window_pages_default,
 gauge: ui.status.Gauge = .{},
 default_effort: ?ai.llm.Effort = null,
-prompt_history_enabled: bool = false,
 user_instructions: ai.instructions.Result,
 required_skills: []const RequiredSkill = &.{},
 dropped_effort: ?[]const u8 = null,
@@ -36,7 +35,6 @@ const File = struct {
     bash: Bash = .{},
     interface: Interface = .{},
     default_effort: ?JsonString = null,
-    prompt_history: PromptHistory = .{},
 
     const JsonString = struct {
         value: []const u8,
@@ -93,10 +91,6 @@ const File = struct {
         window_pages: usize = layout.window_pages_default,
         gauge_percent_warning: f64 = gauge_default.percent_warning,
         gauge_percent_error: f64 = gauge_default.percent_error,
-    };
-
-    const PromptHistory = struct {
-        enabled: bool = false,
     };
 };
 
@@ -276,11 +270,6 @@ const keys = [_]Key{
         .description = "The reasoning effort that a session starts on. Drinky folds a level " ++
             "that the model does not support onto the nearest one it does. Only a new " ++
             "project reads it.",
-    },
-    .{
-        .path = "prompt_history.enabled",
-        .description = "Whether Drinky records and opens the global prompt history. A false " ++
-            "value leaves the saved history unchanged.",
     },
 };
 
@@ -627,7 +616,6 @@ fn loadFromData(gpa: std.mem.Allocator, io: std.Io, options: *const DataOptions)
         .window_pages = window_pages,
         .gauge = gauge,
         .default_effort = default_effort,
-        .prompt_history_enabled = parsed.value.prompt_history.enabled,
         .user_instructions = user_instructions,
         .required_skills = required_skills,
         .dropped_effort = dropped_effort,
@@ -1049,37 +1037,6 @@ test "a stale default_models key reads as an unknown key" {
     defer config.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), config.unknown_keys.len);
     try std.testing.expectEqualStrings("default_models", config.unknown_keys[0]);
-}
-
-test "load reads prompt_history.enabled and documents it last" {
-    var absent = try loadDataForTest("{}");
-    defer absent.deinit(std.testing.allocator);
-    try std.testing.expect(!absent.prompt_history_enabled);
-
-    var enabled = try loadDataForTest(
-        \\{ "prompt_history": { "enabled": true } }
-    );
-    defer enabled.deinit(std.testing.allocator);
-    try std.testing.expect(enabled.prompt_history_enabled);
-
-    var disabled = try loadDataForTest(
-        \\{ "prompt_history": { "enabled": false } }
-    );
-    defer disabled.deinit(std.testing.allocator);
-    try std.testing.expect(!disabled.prompt_history_enabled);
-
-    const row = "- `prompt_history.enabled` — boolean, default: false.";
-    const row_index = std.mem.indexOf(u8, key_lines, row) orelse return error.MissingRow;
-    try std.testing.expect(std.mem.indexOfPos(u8, key_lines, row_index + row.len, "\n- `") == null);
-    try std.testing.expect(isLeafPath("prompt_history.enabled"));
-
-    var typo = try loadDataForTest(
-        \\{ "prompt_history": { "enabld": false } }
-    );
-    defer typo.deinit(std.testing.allocator);
-    try std.testing.expect(!typo.prompt_history_enabled);
-    try std.testing.expectEqual(@as(usize, 1), typo.unknown_keys.len);
-    try std.testing.expectEqualStrings("prompt_history.enabld", typo.unknown_keys[0]);
 }
 
 test "load resolves default_effort, dropping an unknown level" {

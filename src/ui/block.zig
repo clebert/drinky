@@ -43,7 +43,6 @@ pub const Entry = struct {
         is_warning: bool,
         fit: paint.Fit,
         survives_rewind: bool,
-        turn_owned: bool,
         mirrored: bool,
         repeats: usize = 1,
         base_len: usize,
@@ -76,7 +75,6 @@ pub const Entry = struct {
         fit: paint.Fit = .head,
         account: ?ai.llm.Account = null,
         survives_rewind: bool = false,
-        turn_owned: bool = false,
         mirrored: bool = true,
     };
 
@@ -131,7 +129,6 @@ pub const Entry = struct {
             .is_warning = options.is_warning,
             .fit = options.fit,
             .survives_rewind = options.survives_rewind,
-            .turn_owned = options.turn_owned,
             .mirrored = options.mirrored,
             .base_len = text.len,
         };
@@ -178,7 +175,6 @@ pub const Entry = struct {
         flagged.is_warning = options.is_warning;
         flagged.fit = options.fit;
         flagged.survives_rewind = options.survives_rewind;
-        flagged.turn_owned = options.turn_owned;
         flagged.mirrored = options.mirrored;
         flagged.repeats = 1;
         flagged.base_len = text.len;
@@ -213,7 +209,6 @@ pub const Entry = struct {
         if (flagged.is_error != options.is_error) return false;
         if (flagged.is_warning != options.is_warning) return false;
         if (flagged.survives_rewind != options.survives_rewind) return false;
-        if (flagged.turn_owned != options.turn_owned) return false;
         if (flagged.mirrored != options.mirrored) return false;
         return std.mem.eql(u8, eventText(flagged), text);
     }
@@ -239,14 +234,6 @@ pub const Entry = struct {
         return switch (self.content) {
             .event => |event| event.survives_rewind,
             .intro, .user, .user_note, .thinking, .model, .tool_result => false,
-        };
-    }
-
-    pub fn turnOwned(self: *const Entry) bool {
-        return switch (self.content) {
-            .event => |event| event.turn_owned,
-            .user, .user_note, .thinking, .model, .tool_result => true,
-            .intro => false,
         };
     }
 
@@ -758,7 +745,7 @@ test "a repeated event states one count and matches its own text" {
     try std.testing.expect(entry.statesEvent(.{ .is_error = true }, "no route to host"));
     try std.testing.expect(!entry.statesEvent(.{ .is_error = true, .mirrored = false }, "no route to host"));
     try std.testing.expect(!entry.statesEvent(.{ .is_error = true, .is_warning = true }, "no route to host"));
-    try std.testing.expect(!entry.statesEvent(.{ .is_error = true, .turn_owned = true }, "no route to host"));
+    try std.testing.expect(!entry.statesEvent(.{ .is_error = true, .survives_rewind = true }, "no route to host"));
     try std.testing.expect(!entry.statesEvent(.{}, "no route to host"));
     try std.testing.expect(!entry.statesEvent(.{ .is_error = true }, "other"));
 

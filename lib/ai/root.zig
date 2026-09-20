@@ -24,7 +24,6 @@ pub const openrouter = @import("openrouter/root.zig");
 pub const project = @import("project.zig");
 pub const provider = @import("provider.zig");
 pub const skills = @import("skills.zig");
-pub const Steering = @import("Steering.zig");
 pub const testing = @import("testing.zig");
 pub const tool = @import("tool/root.zig");
 pub const xai = @import("xai/root.zig");

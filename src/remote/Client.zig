@@ -302,26 +302,14 @@ pub fn deleteMessage(self: *Client, target: Target) Error!void {
     _ = try reply.result();
 }
 
-pub fn answerCallbackQuery(self: *Client, query_id: []const u8, text: ?[]const u8) Error!void {
-    const body = try std.json.Stringify.valueAlloc(self.gpa, .{
-        .callback_query_id = query_id,
-        .text = text,
-    }, .{ .emit_null_optional_fields = false });
+pub fn answerCallbackQuery(self: *Client, query_id: []const u8) Error!void {
+    const body = try std.json.Stringify.valueAlloc(
+        self.gpa,
+        .{ .callback_query_id = query_id },
+        .{},
+    );
     defer self.gpa.free(body);
     const reply = try self.call("answerCallbackQuery", body);
-    defer reply.deinit();
-    _ = try reply.result();
-}
-
-pub fn setMessageReaction(self: *Client, target: Target, emoji: []const u8) Error!void {
-    const ReactionType = struct { type: []const u8 = "emoji", emoji: []const u8 };
-    const body = try std.json.Stringify.valueAlloc(self.gpa, .{
-        .chat_id = target.chat_id,
-        .message_id = target.message_id,
-        .reaction = [_]ReactionType{.{ .emoji = emoji }},
-    }, .{});
-    defer self.gpa.free(body);
-    const reply = try self.call("setMessageReaction", body);
     defer reply.deinit();
     _ = try reply.result();
 }
@@ -724,13 +712,12 @@ test "deleteMessage names the message it takes out of the chat" {
     );
 }
 
-test "answerCallbackQuery names the query with or without a toast" {
+test "answerCallbackQuery names the query alone" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
     var server = try testing.Server.init(gpa, io, &.{.{ .method = "answerCallbackQuery", .replies = &.{
-        .{ .body = "{\"ok\":true,\"result\":true}" },
         .{ .body = "{\"ok\":true,\"result\":true}" },
     } }});
     defer server.deinit();
@@ -744,14 +731,9 @@ test "answerCallbackQuery names the query with or without a toast" {
         .connect_ms = 5_000,
     };
 
-    try client.answerCallbackQuery("4407", null);
-    try client.answerCallbackQuery("4408", "Nothing queued.");
+    try client.answerCallbackQuery("4407");
     try server.finish();
     try std.testing.expectEqualStrings("{\"callback_query_id\":\"4407\"}", server.requests.items[0].body);
-    try std.testing.expectEqualStrings(
-        "{\"callback_query_id\":\"4408\",\"text\":\"Nothing queued.\"}",
-        server.requests.items[1].body,
-    );
 }
 
 test "setMyCommands registers each command with its description" {
@@ -781,33 +763,6 @@ test "setMyCommands registers each command with its description" {
     try std.testing.expectEqualStrings(
         "{\"commands\":[{\"command\":\"effort\",\"description\":\"set the reasoning-effort level\"}," ++
             "{\"command\":\"new\",\"description\":\"start a new conversation\"}]}",
-        server.requests.items[0].body,
-    );
-}
-
-test "setMessageReaction sets one emoji" {
-    const gpa = std.testing.allocator;
-    var threaded: std.Io.Threaded = .init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    var server = try testing.Server.init(gpa, io, &.{.{ .method = "setMessageReaction", .replies = &.{
-        .{ .body = "{\"ok\":true,\"result\":true}" },
-    } }});
-    defer server.deinit();
-    try server.start();
-    var url_buffer: [64]u8 = undefined;
-    var client: Client = .{
-        .gpa = gpa,
-        .io = io,
-        .base_url = server.url(&url_buffer),
-        .token = "t",
-        .connect_ms = 5_000,
-    };
-
-    try client.setMessageReaction(.{ .chat_id = 99, .message_id = 7 }, "👍");
-    try server.finish();
-    try std.testing.expectEqualStrings(
-        "{\"chat_id\":99,\"message_id\":7,\"reaction\":[{\"type\":\"emoji\",\"emoji\":\"👍\"}]}",
         server.requests.items[0].body,
     );
 }

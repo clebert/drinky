@@ -241,15 +241,6 @@ pub fn render(placement: *const paint.Placement, info: *const Info) !void {
     placement.sink.end(.{ .id = placement.id, .line = placement.base });
 }
 
-pub fn writeSummary(out: *std.Io.Writer, info: *const Info) !void {
-    var scratch: [ai.project.head_name_bytes_max + 512 + separator.len + 192]u8 = undefined;
-    var line: Line = .init(&scratch);
-    try writeLeft(&line, info, &Parts.all);
-    try line.out.writeAll(separator);
-    try writeRight(&line, info, &Parts.all);
-    try out.writeAll(line.text());
-}
-
 pub fn writeNumbers(out: *std.Io.Writer, info: *const Info) !void {
     var scratch: [128]u8 = undefined;
     var line: Line = .init(&scratch);
@@ -523,57 +514,6 @@ const test_info: Info = .{
     .credits = null,
     .turn_active = true,
 };
-
-fn expectSummary(expected: []const u8, info: *const Info) !void {
-    var buffer: [512]u8 = undefined;
-    var out: std.Io.Writer = .fixed(&buffer);
-    try writeSummary(&out, info);
-    try std.testing.expectEqualStrings(expected, out.buffered());
-}
-
-test "the summary states every part of the line in full, in the order of the line" {
-    try expectSummary(
-        "~/github/clebert/drinky (main) · Context: 21% (206k/1.0M) · Cost: ~$0.39 · " ++
-            "5h: 12% (53m) · Week: 74% (6d) · Cache: 87% · " ++
-            "Model: anthropic-plan/claude-opus-4-8 · Effort: xhigh",
-        &test_info,
-    );
-
-    var idle = test_info;
-    idle.turn_active = false;
-    try expectSummary(
-        "~/github/clebert/drinky (main) · Context: 21% (206k/1.0M) · Cost: ~$0.39 · " ++
-            "Model: anthropic-plan/claude-opus-4-8 · Effort: xhigh",
-        &idle,
-    );
-
-    var signed_out = idle;
-    signed_out.account = null;
-    signed_out.context_tokens = null;
-    try expectSummary(
-        "~/github/clebert/drinky (main) · Context: Unknown · Cost: ~$0.39 · " ++
-            "Model: signed out · Effort: xhigh",
-        &signed_out,
-    );
-
-    var no_model = idle;
-    no_model.model = null;
-    no_model.context_window = null;
-    no_model.directory = "";
-    try expectSummary(
-        "Context: 206k · Cost: ~$0.39 · Model: anthropic-plan/none · Effort: xhigh",
-        &no_model,
-    );
-
-    var empty = idle;
-    empty.context_tokens = 0;
-    empty.branch = null;
-    try expectSummary(
-        "~/github/clebert/drinky · Context: 0% (0/1.0M) · Cost: ~$0.39 · " ++
-            "Model: anthropic-plan/claude-opus-4-8 · Effort: xhigh",
-        &empty,
-    );
-}
 
 test "the numbers state the gauge in its short form and the cost" {
     var buffer: [128]u8 = undefined;
@@ -1136,20 +1076,6 @@ test "the credit pool shows the remaining amount while a turn runs" {
     try expectHides(idle_out.written(), &.{"Credits:"});
 }
 
-test "the summary states the credit pool of a running turn" {
-    var info = test_info;
-    info.model = "openai/gpt-5.6-sol";
-    info.account = .openrouter_api_key;
-    info.quota = null;
-    info.credits = .{ .total = 10, .used = 2.864085024 };
-    try expectSummary(
-        "~/github/clebert/drinky (main) · Context: 21% (206k/1.0M) · Cost: ~$0.39 · " ++
-            "Credits: $7.14 · Cache: 87% · Model: openrouter-api-key/openai/gpt-5.6-sol · " ++
-            "Effort: xhigh",
-        &info,
-    );
-}
-
 test "a sub-cent credit pool never reads as an empty one" {
     const gpa = std.testing.allocator;
     var info = test_info;
@@ -1245,15 +1171,18 @@ test "the quota and the cache rate show while a turn runs alone" {
 }
 
 test "a running turn hides the cache, quota, and credits until this turn reports them" {
+    const gpa = std.testing.allocator;
     var info = test_info;
     info.cache_usage = .{};
     info.quota = null;
     info.credits = null;
-    try expectSummary(
-        "~/github/clebert/drinky (main) · Context: 21% (206k/1.0M) · Cost: ~$0.39 · " ++
-            "Model: anthropic-plan/claude-opus-4-8 · Effort: xhigh",
-        &info,
-    );
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try renderForTest(gpa, &info, 200, &out);
+
+    const painted = out.written();
+    try expectShows(painted, &.{"Context: 21% (206k/1.0M) · Cost: ~$0.39"});
+    try expectHides(painted, &.{ "5h:", "Week:", "Cache:", "Credits:" });
 }
 
 test "a countdown that runs out drops its bracket and keeps its share" {

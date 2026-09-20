@@ -15,7 +15,7 @@ io: std.Io,
 timeouts: net.Timeouts,
 path: []const u8,
 tokens: ?oauth.Tokens,
-persistence: auth.Persistence = .saved,
+save_pending: bool = false,
 
 pub fn init(gpa: std.mem.Allocator, io: std.Io, home: []const u8, timeouts: net.Timeouts) !Auth {
     const path = try std.fs.path.join(gpa, &.{ home, ".drinky", "auth.json" });
@@ -29,10 +29,6 @@ pub fn deinit(self: *Auth) void {
 
 pub fn load(self: *Auth) !bool {
     return auth.load(self, account_key);
-}
-
-pub fn reread(self: *Auth, maybe_file: ?*const json_store.File) !auth.Change {
-    return auth.reread(self, account_key, maybe_file);
 }
 
 pub fn accessToken(self: *Auth) ![]const u8 {
@@ -97,7 +93,6 @@ test "save and load round-trip credentials an unexpired token serves unchanged" 
         .access = try gpa.dupe(u8, "at"),
         .refresh = try gpa.dupe(u8, "rt"),
         .expires_ms = std.math.maxInt(i64),
-        .subject = try gpa.dupe(u8, "user-1"),
     };
     try auth.save(&subject, account_key);
 
@@ -106,32 +101,6 @@ test "save and load round-trip credentials an unexpired token serves unchanged" 
     try std.testing.expect(try loaded.load());
     try std.testing.expect(try loaded.load());
     try std.testing.expectEqualStrings("at", try loaded.accessToken());
-    try std.testing.expectEqualStrings("user-1", loaded.tokens.?.subject.?);
-}
-
-test "a credential without a user round-trips" {
-    const gpa = std.testing.allocator;
-    var threaded: std.Io.Threaded = .init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var home_buf: [128]u8 = undefined;
-    const home = try std.fmt.bufPrint(&home_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-
-    var subject = try init(gpa, io, home, .{});
-    defer subject.deinit();
-    subject.tokens = .{
-        .access = try gpa.dupe(u8, "at"),
-        .refresh = try gpa.dupe(u8, "rt"),
-        .expires_ms = std.math.maxInt(i64),
-    };
-    try auth.save(&subject, account_key);
-
-    var loaded = try init(gpa, io, home, .{});
-    defer loaded.deinit();
-    try std.testing.expect(try loaded.load());
-    try std.testing.expect(loaded.tokens.?.subject == null);
 }
 
 test "a signed-out account refuses a token" {

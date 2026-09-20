@@ -25,7 +25,6 @@ pub const Env = struct {
 pub const State = enum {
     idle,
     working,
-    blocked,
 };
 
 const Request = union(enum) {
@@ -326,10 +325,10 @@ test "the reporter announces idle, forwards each change once, and releases on ex
     defer gpa.free(working);
     try std.testing.expect(std.mem.indexOf(u8, working, "\"state\":\"working\"") != null);
 
-    herdr.sync(.blocked);
-    const blocked = try fake.take();
-    defer gpa.free(blocked);
-    try std.testing.expect(std.mem.indexOf(u8, blocked, "\"state\":\"blocked\"") != null);
+    herdr.sync(.idle);
+    const idle_again = try fake.take();
+    defer gpa.free(idle_again);
+    try std.testing.expect(std.mem.indexOf(u8, idle_again, "\"state\":\"idle\"") != null);
 
     herdr.deinit();
     const release = try fake.take();
@@ -339,8 +338,8 @@ test "the reporter announces idle, forwards each change once, and releases on ex
     try serving.await(io);
 
     try std.testing.expect(try recordedSequence(idle) < try recordedSequence(working));
-    try std.testing.expect(try recordedSequence(working) < try recordedSequence(blocked));
-    try std.testing.expect(try recordedSequence(blocked) < try recordedSequence(release));
+    try std.testing.expect(try recordedSequence(working) < try recordedSequence(idle_again));
+    try std.testing.expect(try recordedSequence(idle_again) < try recordedSequence(release));
     try std.testing.expect(herdr.future == null);
 }
 

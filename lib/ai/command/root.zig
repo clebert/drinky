@@ -13,7 +13,6 @@ const new = @import("new.zig");
 const remote = @import("remote.zig");
 const skill = @import("skill.zig");
 const sources = @import("sources.zig");
-const status = @import("status.zig");
 const system = @import("system.zig");
 const testing = @import("testing.zig");
 
@@ -22,7 +21,6 @@ const Entry = struct {
     summary: []const u8,
     run: *const fn (*Context) anyerror!Outcome,
     remote: bool,
-    during_turn: bool,
 };
 
 const help_name = "help";
@@ -35,78 +33,61 @@ const commands = [_]Entry{
         .name = effort.name,
         .summary = effort.summary,
         .run = effort.run,
-        .remote = true,
-        .during_turn = false,
+        .remote = false,
     },
     .{
         .name = help_name,
         .summary = help_summary,
         .run = runHelp,
-        .remote = true,
-        .during_turn = false,
+        .remote = false,
     },
     .{
         .name = login.name,
         .summary = login.summary,
         .run = login.run,
         .remote = false,
-        .during_turn = false,
     },
     .{
         .name = logout.name,
         .summary = logout.summary,
         .run = logout.run,
         .remote = false,
-        .during_turn = false,
     },
     .{
         .name = model.name,
         .summary = model.summary,
         .run = model.run,
-        .remote = true,
-        .during_turn = false,
+        .remote = false,
     },
     .{
         .name = new.name,
         .summary = new.summary,
         .run = new.run,
         .remote = true,
-        .during_turn = false,
     },
     .{
         .name = remote.name,
         .summary = remote.summary,
         .run = remote.run,
         .remote = false,
-        .during_turn = false,
     },
     .{
         .name = skill.name,
         .summary = skill.summary,
         .run = skill.run,
-        .remote = true,
-        .during_turn = false,
+        .remote = false,
     },
     .{
         .name = sources.name,
         .summary = sources.summary,
         .run = sources.run,
         .remote = false,
-        .during_turn = false,
-    },
-    .{
-        .name = status.name,
-        .summary = status.summary,
-        .run = status.run,
-        .remote = true,
-        .during_turn = true,
     },
     .{
         .name = system.name,
         .summary = system.summary,
         .run = system.run,
         .remote = false,
-        .during_turn = false,
     },
 };
 
@@ -123,7 +104,6 @@ pub const Summary = struct {
     alias: []const u8 = "",
     tail: []const u8 = "",
     remote: bool,
-    during_turn: bool,
 };
 
 pub const summaries = blk: {
@@ -133,14 +113,12 @@ pub const summaries = blk: {
         .summary = entry.summary,
         .alias = aliasOf(entry.name),
         .remote = entry.remote,
-        .during_turn = entry.during_turn,
     };
     list[commands.len] = .{
         .name = skill_prefix ++ "name",
         .summary = "load a skill",
         .tail = "the task of the skill",
-        .remote = true,
-        .during_turn = false,
+        .remote = false,
     };
     break :blk list;
 };
@@ -151,11 +129,10 @@ fn aliasOf(comptime name: []const u8) []const u8 {
     return "";
 }
 
-fn listed(context: *const Context, out: *[commands.len]Entry) []const Entry {
+fn listed(out: *[commands.len]Entry) []const Entry {
     var count: usize = 0;
     for (commands) |entry| {
         if (std.mem.eql(u8, entry.name, help_name)) continue;
-        if (context.remote and !entry.remote) continue;
         out[count] = entry;
         count += 1;
     }
@@ -167,11 +144,6 @@ pub fn parse(line: []const u8) ?[]const u8 {
     const body = line[1..];
     const end = std.mem.indexOfAny(u8, body, whitespace) orelse body.len;
     return body[0..end];
-}
-
-pub fn runsDuringTurn(name: []const u8) bool {
-    const entry = lookup(name) orelse return false;
-    return entry.during_turn;
 }
 
 fn loadsSkill(name: []const u8) bool {
@@ -200,7 +172,7 @@ fn runHelp(context: *Context) !Outcome {
     var options: Outcome.Options = .{ .gpa = context.gpa };
     errdefer options.deinit();
     var rows: [commands.len]Entry = undefined;
-    for (listed(context, &rows)) |entry| {
+    for (listed(&rows)) |entry| {
         try options.addExtraPrint(false, "/{s}", .{entry.name}, "{s}.", .{entry.summary});
     }
     return .{ .pick = .{
@@ -216,7 +188,7 @@ fn runHelp(context: *Context) !Outcome {
 fn selectCommand(context: *Context, selection: Outcome.Pick.Selection) !Outcome {
     const index = selection.row;
     var rows: [commands.len]Entry = undefined;
-    const entries = listed(context, &rows);
+    const entries = listed(&rows);
     if (index >= entries.len)
         return Outcome.reportNotice(context.gpa, .failure, "Select a valid command.", .{});
     return entries[index].run(context);
@@ -224,14 +196,12 @@ fn selectCommand(context: *Context, selection: Outcome.Pick.Selection) !Outcome 
 
 pub fn check(context: *Context, line: []const u8) !?Outcome.Message {
     const name = parse(line) orelse return null;
-    if (loadsSkill(name)) return try checkSkill(context, name);
+    if (loadsSkill(name)) {
+        if (try checkSkill(context, name)) |refusal| return refusal;
+        return if (context.remote) try terminalOnly(context.gpa, name) else null;
+    }
     const entry = lookup(name) orelse return try unknownCommand(context.gpa, name);
-    if (context.remote and !entry.remote) return try Outcome.Message.print(
-        context.gpa,
-        .warning,
-        "The command /{s} runs in the terminal alone.",
-        .{entry.name},
-    );
+    if (context.remote and !entry.remote) return try terminalOnly(context.gpa, entry.name);
     if (tail(line, name).len > 0) return try Outcome.Message.print(
         context.gpa,
         .warning,
@@ -269,6 +239,15 @@ fn checkSkill(context: *Context, command_name: []const u8) !?Outcome.Message {
     const registry = context.skill_registry orelse return try unknownSkill(context.gpa, name);
     if (registry.get(name) == null) return try unknownSkill(context.gpa, name);
     return null;
+}
+
+fn terminalOnly(gpa: std.mem.Allocator, name: []const u8) !Outcome.Message {
+    return Outcome.Message.print(
+        gpa,
+        .warning,
+        "The command /{s} runs in the terminal alone.",
+        .{name},
+    );
 }
 
 fn unknownCommand(gpa: std.mem.Allocator, name: []const u8) !Outcome.Message {
@@ -410,29 +389,6 @@ test "run routes sources" {
     try std.testing.expect((try run(&context, "/sources")).? == .show_sources);
 }
 
-test "run routes status" {
-    var context: Context = .{
-        .gpa = undefined,
-        .io = undefined,
-        .agent = undefined,
-        .accounts = undefined,
-    };
-    try std.testing.expect((try run(&context, "/status")).? == .show_status);
-}
-
-test "the registry names the command that runs during a turn" {
-    try std.testing.expect(runsDuringTurn("status"));
-    const waiting = [_][]const u8{
-        "effort", "help", "new", "skill", "", "skill:", "skill:demo", "nope",
-    };
-    for (waiting) |name| try std.testing.expect(!runsDuringTurn(name));
-    var hosted: usize = 0;
-    for (summaries) |command| {
-        if (command.during_turn) hosted += 1;
-    }
-    try std.testing.expectEqual(@as(usize, 1), hosted);
-}
-
 test "trailing whitespace does not hide an unknown command name" {
     const gpa = std.testing.allocator;
     var context: Context = .{
@@ -500,6 +456,13 @@ test "skill prefix dispatch loads instructions and preserves trailing arguments"
         },
         else => return error.ExpectedPrompt,
     }
+
+    context.remote = true;
+    try Outcome.expectRefusalContaining(
+        (try run(&context, "/skill:demo apply it")).?,
+        .warning,
+        "The command /skill:demo runs in the terminal alone.",
+    );
 }
 
 test "skill prefix reports an unknown name" {
@@ -571,7 +534,7 @@ test "a command row runs its command" {
     var context: Context = .{ .gpa = gpa, .io = undefined, .agent = &agent, .accounts = undefined };
 
     var buffer: [commands.len]Entry = undefined;
-    const rows = listed(&context, &buffer);
+    const rows = listed(&buffer);
     const system_index = for (rows, 0..) |entry, index| {
         if (std.mem.eql(u8, entry.name, system.name)) break index;
     } else return error.MissingSystemRow;
@@ -601,7 +564,7 @@ test "a command row runs its command" {
     );
 }
 
-test "a remote host runs the commands that need no terminal" {
+test "a remote host runs /new alone" {
     const gpa = std.testing.allocator;
     var agent = testing.agent(gpa, .{ .anthropic_plan = undefined });
     defer agent.deinit();
@@ -613,7 +576,11 @@ test "a remote host runs the commands that need no terminal" {
         .remote = true,
     };
 
-    for ([_][]const u8{ "/login", "/logout", "/remote", "/sources", "/system" }) |line| {
+    const terminal_lines = [_][]const u8{
+        "/effort", "/help",  "/login",   "/logout", "/model",
+        "/remote", "/skill", "/sources", "/system",
+    };
+    for (terminal_lines) |line| {
         const refusal = (try check(&context, line)).?;
         defer gpa.free(refusal.content);
         try std.testing.expectEqual(Outcome.Severity.warning, refusal.severity);
@@ -622,44 +589,22 @@ test "a remote host runs the commands that need no terminal" {
         try std.testing.expect(std.mem.indexOf(u8, refusal.content, line) != null);
     }
     try Outcome.expectRefusalContaining(
-        (try run(&context, "/system")).?,
+        (try run(&context, "/")).?,
         .warning,
-        "The command /system runs in the terminal alone.",
+        "The command /help runs in the terminal alone.",
     );
     try Outcome.expectRefusalContaining((try run(&context, "/nope")).?, .warning, "does not recognize");
-    try std.testing.expect((try check(&context, "/effort")) == null);
+    try Outcome.expectRefusalContaining(
+        (try run(&context, "/skill:nope")).?,
+        .warning,
+        "does not recognize the skill",
+    );
     try std.testing.expect((try check(&context, "/new")) == null);
-    try std.testing.expect((try check(&context, "/status")) == null);
     try std.testing.expect((try run(&context, "/new")).? == .new_conversation);
-    try std.testing.expect((try run(&context, "/status")).? == .show_status);
 
-    switch ((try run(&context, "/help")).?) {
-        .pick => |pick| {
-            defer {
-                for (pick.options) |*option| option.deinit(gpa);
-                gpa.free(pick.options);
-            }
-            try std.testing.expectEqual(@as(usize, 5), pick.options.len);
-            try std.testing.expectEqualStrings("/effort", pick.options[0].name);
-            try std.testing.expectEqualStrings("/model", pick.options[1].name);
-            try std.testing.expectEqualStrings("/new", pick.options[2].name);
-            try std.testing.expectEqualStrings("/skill", pick.options[3].name);
-            try std.testing.expectEqualStrings("/status", pick.options[4].name);
-            try std.testing.expect(
-                (try pick.select(&context, .ofRow(2))) == .new_conversation,
-            );
-            try std.testing.expect((try pick.select(&context, .ofRow(4))) == .show_status);
-            try Outcome.expectNoticeContaining(
-                try pick.select(&context, .ofRow(5)),
-                .failure,
-                "valid command",
-            );
-        },
-        else => return error.ExpectedPick,
-    }
     var registered: usize = 0;
     for (summaries) |command| {
         if (command.remote and command.tail.len == 0) registered += 1;
     }
-    try std.testing.expectEqual(@as(usize, 6), registered);
+    try std.testing.expectEqual(@as(usize, 1), registered);
 }

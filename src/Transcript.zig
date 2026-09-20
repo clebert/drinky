@@ -146,45 +146,6 @@ pub fn rewind(self: *Transcript, entry_count: usize) void {
     self.entries.shrinkRetainingCapacity(retained_count);
 }
 
-pub const Removal = struct {
-    removed_count: usize,
-    removed_before_cursor_count: usize,
-
-    pub const Options = struct {
-        range_base: usize,
-        range_end: usize,
-        mirror_cursor: usize,
-    };
-};
-
-pub fn removeTurn(self: *Transcript, options: Removal.Options) Removal {
-    std.debug.assert(options.range_base <= options.range_end);
-    std.debug.assert(options.range_end <= self.entries.items.len);
-    self.endMessage();
-    const cursor = @min(options.mirror_cursor, self.entries.items.len);
-    var removal: Removal = .{ .removed_count = 0, .removed_before_cursor_count = 0 };
-    var retained_count = options.range_base;
-    for (options.range_base..options.range_end) |index| {
-        const entry = &self.entries.items[index];
-        if (entry.turnOwned()) {
-            entry.deinit(self.gpa);
-            removal.removed_count += 1;
-            if (index < cursor) removal.removed_before_cursor_count += 1;
-            continue;
-        }
-        self.entries.items[retained_count] = entry.*;
-        retained_count += 1;
-    }
-    const tail = self.entries.items[options.range_end..];
-    std.mem.copyForwards(
-        ui.block.Entry,
-        self.entries.items[retained_count .. retained_count + tail.len],
-        tail,
-    );
-    self.entries.shrinkRetainingCapacity(retained_count + tail.len);
-    return removal;
-}
-
 pub fn blocks(self: *const Transcript) []const ui.block.Entry {
     return self.entries.items;
 }
@@ -371,50 +332,6 @@ test "rewind preserves only marked events after its checkpoint" {
         entries[0].content.event.text.items,
     );
     try std.testing.expectEqualStrings("keep retry", entries[1].content.event.text.items);
-}
-
-test "removeTurn takes the turn-owned blocks of its range and counts the cursor prefix" {
-    const gpa = std.testing.allocator;
-    var transcript = Transcript.init(gpa);
-    defer transcript.deinit();
-
-    try transcript.append(.intro, .{}, "legend");
-    try transcript.append(.user, .{}, "fix it");
-    try transcript.appendStream(.thinking, test_account, "weigh it");
-    try transcript.appendStream(.model, null, "answer");
-    try transcript.append(.event, .{ .survives_rewind = true, .turn_owned = true }, "retry");
-    try transcript.append(.event, .{ .survives_rewind = true }, "You attached @bot.");
-    try transcript.append(.tool_result, .{}, "Tool: read");
-    try transcript.append(.user_note, .{}, "Skill: demo");
-    try transcript.append(.event, .{ .turn_owned = true }, "You canceled the turn.");
-    try transcript.append(.event, .{}, "Drinky changed the model.");
-    try std.testing.expectEqual(@as(usize, 10), transcript.blocks().len);
-
-    const removal = transcript.removeTurn(.{ .range_base = 1, .range_end = 9, .mirror_cursor = 6 });
-    try std.testing.expectEqual(@as(usize, 7), removal.removed_count);
-    try std.testing.expectEqual(@as(usize, 4), removal.removed_before_cursor_count);
-    try std.testing.expect(!transcript.streaming());
-
-    const entries = transcript.blocks();
-    try std.testing.expectEqual(@as(usize, 3), entries.len);
-    try std.testing.expect(entries[0].content == .intro);
-    try std.testing.expectEqualStrings("You attached @bot.", entries[1].content.event.text.items);
-    try std.testing.expectEqualStrings(
-        "Drinky changed the model.",
-        entries[2].content.event.text.items,
-    );
-
-    try transcript.append(.user, .{}, "again");
-    const before = transcript.removeTurn(.{ .range_base = 3, .range_end = 4, .mirror_cursor = 1 });
-    try std.testing.expectEqual(@as(usize, 1), before.removed_count);
-    try std.testing.expectEqual(@as(usize, 0), before.removed_before_cursor_count);
-    try transcript.append(.user, .{}, "once more");
-    const after = transcript.removeTurn(.{ .range_base = 3, .range_end = 4, .mirror_cursor = 99 });
-    try std.testing.expectEqual(@as(usize, 1), after.removed_count);
-    try std.testing.expectEqual(@as(usize, 1), after.removed_before_cursor_count);
-    const empty = transcript.removeTurn(.{ .range_base = 3, .range_end = 3, .mirror_cursor = 3 });
-    try std.testing.expectEqual(@as(usize, 0), empty.removed_count);
-    try std.testing.expectEqual(@as(usize, 3), transcript.blocks().len);
 }
 
 test "reasoning collects into a thinking block that the answer run does not extend" {

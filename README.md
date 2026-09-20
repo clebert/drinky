@@ -97,31 +97,7 @@ complete command list.
 - `/skill` — pick a skill.
 - `/skill:name` — load a skill.
 - `/sources` — show the loaded instruction files and skills.
-- `/status` — state the session.
 - `/system` — show the complete system prompt.
-
-## Prompt history
-
-Set `prompt_history.enabled` to `true` in `~/.drinky/config.json` to enable the history. Tab at the
-idle prompt opens submitted prompts from every project, newest first. Enter appends the selected
-prompt to the draft as editable text. Only a submitted terminal prompt without a leading slash
-enters the history.
-
-Drinky keeps the 100 most recent prompts of at most 8 KiB each in the owner-only
-`~/.drinky/prompt_history.json`, so the file can contain sensitive text. Equivalent line endings,
-trailing spaces or tabs, and edge blank lines share one entry. The entry keeps the latest submitted
-text. Delete the file to clear the history. Disabling the history leaves the file unchanged.
-
-## Recover a turn
-
-A turn that failed or that you canceled after it committed work leaves a caption above the editor,
-and Ctrl+N acts on it. Under `Failed turn`, Ctrl+N asks the model to continue from the committed
-work. Under `Canceled turn`, Ctrl+N removes the turn from the conversation and returns your prompt
-and steering messages to the editor as editable text. Enter then sends the revised prompt.
-
-The removal undoes no file change and no billed usage. A turn that ran `write`, `edit`, or `bash`
-warns first and removes on the second Ctrl+N. Esc keeps the turn, and the next turn or `/new` drops
-the offer.
 
 ## Telegram remote control
 
@@ -129,10 +105,10 @@ Create a bot with BotFather, run `/remote`, and paste the token. Drinky shows a 
 the private chat that sends it binds to the bot. A saved bot attaches with one pick.
 
 While a bot is attached, the chat holds the input and the terminal shows the work. A message from
-the chat runs as a prompt, or queues as steering during a turn. The chat mirrors every answer and
-event, and one message per turn shows the state and holds a `Cancel turn` button. `/new`, `/effort`,
-`/model`, `/help`, `/skill`, and `/status` run from the chat, and the other commands run in the
-terminal alone. Every exit key in the terminal detaches the bot.
+the chat runs as a prompt, and a message during a turn gets a refusal. The chat mirrors every answer
+and event, and one message per turn shows the state and holds a `Cancel turn` button. `/new` runs
+from the chat, and the other commands run in the terminal alone. Every exit key in the terminal
+detaches the bot.
 
 > On macOS, run `caffeinate -is` so the Mac stays awake.
 
@@ -148,11 +124,11 @@ Herdr pane label. This needs no setup.
 ## Configuration
 
 The `~/.drinky/config.json` file is optional. It controls instruction files, request and bash
-limits, required skills, a default effort level, interface settings, and the prompt history switch.
-Drinky reads the file only at startup and never writes it. You can keep it in version control.
+limits, required skills, a default effort level, and interface settings. Drinky reads the file only
+at startup and never writes it. You can keep it in version control.
 
-The config file holds no secrets. Credentials, project state, the prompt history, and cached model
-information live in separate files under `~/.drinky/`.
+The config file holds no secrets. Credentials, project state, and cached model information live in
+separate files under `~/.drinky/`.
 
 ## Security
 

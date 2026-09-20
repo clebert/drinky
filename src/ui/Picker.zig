@@ -497,7 +497,7 @@ test "option text is not extra or occupancy chrome" {
     };
     const options = try gpa.alloc(Option, labels.len);
     for (labels, options) |label, *option| option.* = .{ .name = try gpa.dupe(u8, label) };
-    var picker = try Picker.init(gpa, "Prompt history", options, .{});
+    var picker = try Picker.init(gpa, "Skill", options, .{});
     defer picker.deinit();
 
     try std.testing.expectEqual(@as(usize, 0), picker.marks.items.len);
