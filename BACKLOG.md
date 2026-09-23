@@ -137,6 +137,20 @@ when the user drops it.
   test hits that panic. The panic handler then waits on the lock of the unwinder, and the test
   hangs. A Debug build of Drinky records stacks through the same allocator and can hang too.
   Trigger: a Zig release whose unwinder reads the unwind data of macOS 27.0.
+- Drinky sends no event to `moshi-hook`, so the Moshi inbox, its push notifications, and its Live
+  Activity show no Drinky turn. Drinky reports its state to Herdr alone, and `moshi-hook` does not
+  read the Herdr state. The daemon reads one JSON envelope per connection as one line on the Unix
+  socket `~/Library/Application Support/Moshi/moshi-hook.sock`. The client then half-closes the
+  connection and drains the acknowledgment. `moshi-hook install --target pi` writes a reference
+  client to `~/.pi/agent/extensions/moshi-hooks.ts`. An envelope holds `type`, `source`,
+  `sessionId`, `eventName`, `cwd`, `projectName`, `category`, `title`, and `message`. In a Herdr
+  pane, it also holds `terminalKind` `herdr` and the `herdrPane`, `herdrWorkspaceId`, and
+  `herdrTabId` values of the pane environment. The categories are `session_started`,
+  `approval_required`, `task_complete`, and `session_ended`. An envelope without a category updates
+  the state and sends no push notification. The server of Moshi receives the title and the message,
+  so the reference client clips the answer to 80 characters and the prompt to 200. A failed connect
+  must stay silent, because most hosts run no daemon. The known sources name no `drinky`, so the
+  answer of the daemon to an unknown `source` stays unverified.
 
 ## Ideas
 
