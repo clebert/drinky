@@ -21,6 +21,7 @@ const Screen = @import("Screen.zig");
 const sources = @import("sources.zig");
 const system_prompt = @import("system_prompt.zig");
 const testing = @import("testing.zig");
+const Transcript = @import("Transcript.zig");
 const ui = @import("ui/root.zig");
 
 const App = @This();
@@ -34,6 +35,22 @@ const fetch_wait_text = "Drinky fetches the model list.";
 
 const turn_cancel_notice = "Press Esc again to cancel the turn. The draft stays.";
 const turn_message_notice = "Drinky sends no message while a turn runs. The draft stays.";
+
+const retry_caption: ui.Caption = .{
+    .title = "Failed turn",
+    .controls = "Ctrl+N: Try again · Esc: Dismiss",
+    .rows_max = Screen.editor_caption_rows_max,
+};
+const retry_note = "Drinky asked the model to continue from the committed work.";
+const retry_request =
+    "<retry_request>\n{s}\nContinue from the last committed checkpoint.\n</retry_request>";
+
+const removal_caption: ui.Caption = .{
+    .title = "Canceled turn",
+    .controls = "Ctrl+N: Remove and edit · Esc: Keep turn",
+    .rows_max = Screen.editor_caption_rows_max,
+};
+const removal_warning = "Press Ctrl+N again to remove the canceled turn. Tool changes stay.";
 
 const intro_keys = [_][]const u8{
     "Enter: Send",
@@ -79,6 +96,7 @@ leases: std.ArrayList(Lease),
 configured: ?Choice,
 choice: Choice,
 mode: Mode,
+offer: ?Offer,
 directory_label: []const u8,
 working_directory: []const u8,
 home_directory: []const u8,
@@ -163,10 +181,13 @@ const Mode = union(enum) {
     const Prompt = struct {
         confirmation: ?Confirmation = null,
 
-        const Confirmation = enum { message, quit };
+        const Confirmation = enum { message, quit, removal };
     };
 
     const Turn = struct {
+        start: usize,
+        line: ?[]u8,
+        mutated: bool = false,
         cancel_armed: bool = false,
         cancel_sent: bool = false,
     };
@@ -184,6 +205,30 @@ const Mode = union(enum) {
         event_index: ?usize = null,
         cancel_sent: bool = false,
     };
+};
+
+const Offer = union(enum) {
+    retry: []u8,
+    removal: Removal,
+
+    const Removal = struct {
+        line: []u8,
+        range: Transcript.Range,
+        mutated: bool,
+    };
+
+    fn deinit(self: *const Offer, gpa: std.mem.Allocator) void {
+        switch (self.*) {
+            .retry => |request| gpa.free(request),
+            .removal => |removal| gpa.free(removal.line),
+        }
+    }
+};
+
+const TurnStart = struct {
+    text: []const u8,
+    start: usize,
+    line: ?[]const u8,
 };
 
 const session_sink_vtable: core.Session.Sink.VTable = .{ .emit = emitSessionEvent };
@@ -367,6 +412,11 @@ pub fn init(self: *App, gpa: std.mem.Allocator, io: std.Io, options: *const Opti
 pub fn deinit(self: *App) void {
     self.closeQueue();
     self.herdr.deinit();
+    self.dropOffer();
+    switch (self.mode) {
+        .turn => |turn| if (turn.line) |line| self.gpa.free(line),
+        .prompt, .picker, .fetch, .page, .sign_in => {},
+    }
     self.screen.deinit();
     self.session.deinit();
     self.freeClients();
@@ -491,6 +541,7 @@ fn initFields(self: *App, gpa: std.mem.Allocator, io: std.Io) void {
         .configured = null,
         .choice = .{ .effort = effort_default },
         .mode = .{ .prompt = .{} },
+        .offer = null,
         .directory_label = "",
         .working_directory = "",
         .home_directory = "",
@@ -642,14 +693,21 @@ fn caption(self: *const App) ?ui.Caption {
             .controls = if (sign_in.takes_paste) login_callback_controls else login_device_controls,
             .rows_max = Screen.editor_caption_rows_max,
         },
-        .prompt, .turn, .picker, .fetch, .page => null,
+        .prompt => if (self.offer) |offer| switch (offer) {
+            .retry => retry_caption,
+            .removal => removal_caption,
+        } else null,
+        .turn, .picker, .fetch, .page => null,
     };
 }
 
 fn herdrState(self: *const App) Herdr.State {
     return switch (self.mode) {
         .turn => .working,
-        .prompt, .picker, .fetch, .page, .sign_in => .idle,
+        .prompt, .picker, .fetch, .page, .sign_in => if (self.offer) |offer| switch (offer) {
+            .retry => .blocked,
+            .removal => .idle,
+        } else .idle,
     };
 }
 
@@ -878,6 +936,7 @@ fn disarm(self: *App, event: *const terminal.Input.Key) void {
             const confirms = switch (confirmation) {
                 .message => event.* == .enter,
                 .quit => event.* == .ctrl and event.ctrl == 'd',
+                .removal => event.* == .ctrl and event.ctrl == 'n',
             };
             if (!confirms) prompt.confirmation = null;
         },
@@ -892,16 +951,53 @@ fn handlePromptKey(self: *App, event: *const terminal.Input.Key) !void {
     if (try self.editKey(event)) return;
     switch (event.*) {
         .enter => try self.submit(),
+        .escape => self.dropOffer(),
         .ctrl => |letter| switch (letter) {
             'c' => {
                 self.clearOrQuit();
                 if (self.running) self.screen.dirty = true;
             },
             'd' => try self.quitOrWarn(),
+            'n' => try self.takeOffer(),
             else => {},
         },
         else => {},
     }
+}
+
+fn takeOffer(self: *App) !void {
+    const offer = if (self.offer) |*offer| offer else return;
+    switch (offer.*) {
+        .retry => |request| try self.retryTurn(request),
+        .removal => |*removal| try self.removeTurn(removal),
+    }
+}
+
+fn dropOffer(self: *App) void {
+    const offer = self.offer orelse return;
+    offer.deinit(self.gpa);
+    self.offer = null;
+    self.screen.dirty = true;
+}
+
+fn retryTurn(self: *App, request: []const u8) !void {
+    if (self.turnRefusal()) |refusal| return self.reportNotice(.failure, "{s}", .{refusal});
+    const start = self.screen.transcript.blocks().len;
+    try self.screen.appendNote(retry_note);
+    errdefer self.screen.transcript.truncate(start);
+    try self.runTurn(&.{ .text = request, .start = start, .line = null });
+}
+
+fn removeTurn(self: *App, removal: *const Offer.Removal) !void {
+    if (removal.mutated and self.mode.prompt.confirmation != .removal) {
+        try self.reportNotice(.warning, removal_warning, .{});
+        self.mode.prompt.confirmation = .removal;
+        return;
+    }
+    self.mode.prompt.confirmation = null;
+    try self.screen.removeTurn(removal.range, removal.line);
+    try self.session.send(&.remove_turn);
+    self.dropOffer();
 }
 
 fn quitOrWarn(self: *App) !void {
@@ -1053,7 +1149,7 @@ fn submit(self: *App) !void {
         if (try self.checkCommand(text)) |refusal|
             return self.armMessageSend(refusal);
         if (try self.dispatchCommand(text)) |outcome|
-            return self.applySubmittedCommand(&outcome);
+            return self.applySubmittedCommand(&outcome, text);
     }
     if (self.turnRefusal()) |refusal| return self.reportNotice(.failure, "{s}", .{refusal});
     try self.startUserTurn(text);
@@ -1066,12 +1162,28 @@ fn turnRefusal(self: *const App) ?[]const u8 {
     return null;
 }
 
-fn applySubmittedCommand(self: *App, outcome: *const command.Context.Outcome) !void {
+fn applySubmittedCommand(
+    self: *App,
+    outcome: *const command.Context.Outcome,
+    line: []const u8,
+) !void {
     switch (outcome.*) {
-        .prompt, .refusal => {},
+        .prompt => |*prompt| return self.submitSkill(prompt, line),
+        .refusal => {},
         else => self.screen.editor.clear(),
     }
     try self.applyOutcome(outcome);
+}
+
+fn submitSkill(
+    self: *App,
+    prompt: *const command.Context.Outcome.Prompt,
+    line: []const u8,
+) !void {
+    defer prompt.deinit(self.gpa);
+    if (self.turnRefusal()) |refusal| return self.reportNotice(.failure, "{s}", .{refusal});
+    try self.startSkillTurn(prompt, line);
+    self.screen.editor.clear();
 }
 
 fn armMessageSend(self: *App, refusal: Message) !void {
@@ -1080,60 +1192,80 @@ fn armMessageSend(self: *App, refusal: Message) !void {
     self.mode.prompt.confirmation = .message;
 }
 
-fn startSkillTurn(self: *App, prompt: *const command.Context.Outcome.Prompt) !void {
+fn startSkillTurn(
+    self: *App,
+    prompt: *const command.Context.Outcome.Prompt,
+    line: []const u8,
+) !void {
     const start = self.screen.transcript.blocks().len;
     errdefer self.screen.transcript.truncate(start);
     try self.screen.appendSkillNote(&.{ .name = prompt.name, .source = prompt.source });
     if (prompt.arguments.len > 0) try self.screen.appendUser(prompt.arguments);
-    try self.runTurn(prompt.content, start);
+    try self.runTurn(&.{ .text = prompt.content, .start = start, .line = line });
 }
 
 fn startUserTurn(self: *App, text: []const u8) !void {
     const start = self.screen.transcript.blocks().len;
     try self.screen.appendUser(text);
     errdefer self.screen.transcript.truncate(start);
-    try self.runTurn(text, start);
+    try self.runTurn(&.{ .text = text, .start = start, .line = text });
 }
 
-fn runTurn(self: *App, text: []const u8, start: usize) !void {
+fn runTurn(self: *App, turn: *const TurnStart) !void {
     std.debug.assert(self.mode == .prompt);
     self.refreshBranch();
-    try self.session.send(&.{ .prompt = text });
-    self.setMode(.{ .turn = .{} });
-    self.screen.beginTurn(start);
+    const maybe_line: ?[]u8 = if (turn.line) |line| try self.gpa.dupe(u8, line) else null;
+    errdefer if (maybe_line) |line| self.gpa.free(line);
+    try self.session.send(&.{ .prompt = turn.text });
+    self.setMode(.{ .turn = .{ .start = turn.start, .line = maybe_line } });
+    self.screen.beginTurn(turn.start);
 }
 
-fn leaveTurn(self: *App) void {
-    std.debug.assert(self.mode == .turn);
+fn leaveTurn(self: *App) Mode.Turn {
+    const turn = self.mode.turn;
     self.setMode(.{ .prompt = .{} });
+    return turn;
 }
 
 fn applySessionEvent(self: *App, event: *const core.Session.Event) !void {
     switch (event.*) {
-        .prompt_refused => |refusal| try self.refusePrompt(refusal),
-        .setup_dropped => |provider| self.releaseSetup(provider),
-        else => if (try self.screen.apply(event, self.screenTime())) |outcome| {
-            self.leaveTurn();
-            try self.endTurn(&outcome);
+        .setup_dropped => |provider| return self.releaseSetup(provider),
+        .tool_started => |*call| if (core.Tool.mutating(&tools.Registry.specs, call.name)) {
+            self.mode.turn.mutated = true;
+        },
+        else => {},
+    }
+    const outcome = (try self.screen.apply(event, self.screenTime())) orelse return;
+    const turn = self.leaveTurn();
+    try self.endTurn(&turn, &outcome);
+}
+
+fn endTurn(self: *App, turn: *const Mode.Turn, outcome: *const core.Session.Outcome) !void {
+    var maybe_line = turn.line;
+    defer if (maybe_line) |line| self.gpa.free(line);
+    self.dropOffer();
+    self.refreshBranch();
+    switch (outcome.*) {
+        .stopped, .exhausted => {},
+        .canceled => if (maybe_line) |line| {
+            self.offer = .{ .removal = .{
+                .line = line,
+                .range = .{ .start = turn.start, .end = self.screen.transcript.blocks().len },
+                .mutated = turn.mutated,
+            } };
+            maybe_line = null;
+        },
+        .failed => |*failure| {
+            try self.offerRetry(failure);
+            if (failure.reason == .unauthorized) try self.rejectCredential();
         },
     }
 }
 
-fn refusePrompt(self: *App, refusal: core.Session.Event.Refusal) !void {
-    try self.screen.withdrawTurn();
-    self.leaveTurn();
-    try self.reportNotice(.failure, "{s}", .{switch (refusal) {
-        .turn_running => turn_message_notice,
-        .unconfigured => no_model_refusal,
-    }});
-}
-
-fn endTurn(self: *App, outcome: *const core.Session.Outcome) !void {
-    self.refreshBranch();
-    switch (outcome.*) {
-        .stopped, .exhausted, .canceled => {},
-        .failed => |failure| if (failure.reason == .unauthorized) try self.rejectCredential(),
-    }
+fn offerRetry(self: *App, failure: *const core.Provider.Failure) !void {
+    const text = try Screen.failureText(self.gpa, failure);
+    defer self.gpa.free(text);
+    self.offer = .{ .retry = try std.fmt.allocPrint(self.gpa, retry_request, .{text}) };
 }
 
 fn rejectCredential(self: *App) !void {
@@ -1533,13 +1665,7 @@ fn applyOutcome(self: *App, outcome: *const command.Context.Outcome) !void {
         .notice, .refusal => |message| self.setNotice(message),
         .event => |message| try self.screen.appendEvent(message),
         .pick => |*pick| try self.openPicker(pick),
-        .prompt => |*prompt| {
-            defer prompt.deinit(self.gpa);
-            if (self.turnRefusal()) |refusal| return self.reportNotice(.failure, "{s}", .{refusal});
-            try self.startSkillTurn(prompt);
-            self.screen.editor.clear();
-            return;
-        },
+        .prompt => unreachable,
         .editor_text => |text| {
             defer self.gpa.free(text);
             try self.screen.setDraft(text);
@@ -1547,6 +1673,7 @@ fn applyOutcome(self: *App, outcome: *const command.Context.Outcome) !void {
         .page => |*page| try self.openPage(page),
         .new_conversation => {
             try self.session.send(&.clear);
+            self.dropOffer();
             self.screen.clearConversation();
             try self.screen.appendIntro(intro_text);
         },
@@ -2009,6 +2136,211 @@ test "a failed turn ends at the prompt with its event, and the message stays" {
     try std.testing.expectEqual(@as(usize, 2), rig.transport.requests.items.len);
 }
 
+const failed_reply: providers.testing.FakeTransport.Reply = .{
+    .status = .internal_server_error,
+    .body = "{\"error\":{\"message\":\"down\"}}",
+};
+
+test "a failed turn or retry offers a retry that Esc dismisses and Ctrl+N sends with the draft" {
+    var rig: Rig = undefined;
+    try rig.init(&.{
+        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .replies = &.{
+            failed_reply,
+            failed_reply,
+            failed_reply,
+            failed_reply,
+            failed_reply,
+            failed_reply,
+            .{ .body = providers.testing.reply_stream },
+        },
+        .model = "gpt-5.6-sol",
+    });
+    defer rig.deinit();
+
+    try rig.keys("hi\r");
+    try rig.settle();
+    try std.testing.expectEqualStrings("Failed turn", rig.app.caption().?.title);
+    try std.testing.expectEqual(Herdr.State.blocked, rig.app.herdrState());
+    try rig.keys("draft");
+    try rig.escape();
+    try std.testing.expect(rig.app.caption() == null);
+    try std.testing.expectEqual(Herdr.State.idle, rig.app.herdrState());
+    try std.testing.expectEqualStrings("draft", rig.app.screen.editor.visible());
+    try rig.keys("\x0e");
+    try std.testing.expect(rig.app.mode == .prompt);
+    try std.testing.expectEqual(@as(usize, 2), rig.transport.requests.items.len);
+
+    try rig.keys("\x03again\r");
+    try rig.settle();
+    try rig.keys("draft\x0e");
+    try std.testing.expect(rig.app.mode == .turn);
+    const blocks = rig.blocks();
+    try std.testing.expectEqualStrings(retry_note, blocks[blocks.len - 1].content.user_note.items);
+    try rig.settle();
+    try expectRequested(
+        &rig,
+        "\"text\":\"<retry_request>\\nThe provider is overloaded. Details: 500 Internal Server " ++
+            "Error: down\\nContinue from the last committed checkpoint.\\n</retry_request>\"",
+    );
+    try std.testing.expectEqualStrings("Failed turn", rig.app.caption().?.title);
+    try rig.keys("\x0e");
+    try rig.settle();
+    try std.testing.expectEqual(@as(usize, 7), rig.transport.requests.items.len);
+    try std.testing.expect(rig.app.mode == .prompt);
+    try std.testing.expect(rig.app.caption() == null);
+    try std.testing.expectEqualStrings("draft", rig.app.screen.editor.visible());
+}
+
+test "Ctrl+N removes a canceled turn, keeps the later events, and returns its line to the editor" {
+    var stall: providers.testing.FakeTransport.Stall = .{ .io = std.testing.io };
+    const replies = [_]providers.testing.FakeTransport.Reply{
+        .{ .stall = &stall },
+        .{ .body = providers.testing.reply_stream },
+    };
+    var rig: Rig = undefined;
+    try rig.init(&.{
+        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .replies = &replies,
+        .model = "gpt-5.6-sol",
+    });
+    defer rig.deinit();
+
+    try rig.keys("fix it\r");
+    try stall.reached.wait(std.testing.io);
+    try rig.keys("\x04");
+    try rig.settle();
+    try std.testing.expectEqualStrings("Canceled turn", rig.app.caption().?.title);
+    try std.testing.expectEqual(Herdr.State.idle, rig.app.herdrState());
+    try rig.keys("/effort\r\x1b[A\r");
+    try rig.settle();
+    try std.testing.expectEqualStrings("Canceled turn", rig.app.caption().?.title);
+    try std.testing.expectEqual(@as(usize, 4), rig.blocks().len);
+
+    try rig.keys("\x0e");
+    try std.testing.expect(rig.app.caption() == null);
+    try std.testing.expectEqualStrings("fix it", rig.app.screen.editor.visible());
+    const blocks = rig.blocks();
+    try std.testing.expectEqual(@as(usize, 2), blocks.len);
+    try std.testing.expect(blocks[0].content == .intro);
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        blocks[1].content.event.text.items,
+        "Drinky set the effort level to ",
+    ));
+    try rig.keys("\r");
+    try rig.settle();
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, rig.lastRequest(), "fix it"));
+}
+
+const write_call_stream =
+    "data: {\"type\":\"response.output_item.done\",\"item\":{\"id\":\"fc_1\"," ++
+    "\"type\":\"function_call\",\"status\":\"completed\",\"call_id\":\"call_1\"," ++
+    "\"name\":\"write\",\"arguments\":\"{}\"}}\n" ++
+    "\n" ++
+    "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n" ++
+    "\n";
+
+test "Ctrl+N warns before it removes a canceled turn that ran a mutating tool" {
+    var stall: providers.testing.FakeTransport.Stall = .{ .io = std.testing.io };
+    const replies = [_]providers.testing.FakeTransport.Reply{
+        .{ .body = write_call_stream },
+        .{ .stall = &stall },
+    };
+    var rig: Rig = undefined;
+    try rig.init(&.{
+        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .replies = &replies,
+        .model = "gpt-5.6-sol",
+    });
+    defer rig.deinit();
+
+    try rig.keys("fix it\r");
+    try stall.reached.wait(std.testing.io);
+    try rig.keys("\x04");
+    try rig.settle();
+    try std.testing.expectEqual(@as(usize, 4), rig.blocks().len);
+    try rig.keys("\x0e");
+    try expectNoticeHolds(&rig, removal_warning);
+    try rig.keys("x\x0e");
+    try expectNoticeHolds(&rig, removal_warning);
+    try std.testing.expectEqual(@as(usize, 4), rig.blocks().len);
+    try rig.keys("\x0e");
+    try std.testing.expectEqual(@as(usize, 1), rig.blocks().len);
+    try std.testing.expectEqualStrings("fix it\nx", rig.app.screen.editor.visible());
+}
+
+test "a canceled retry offers no removal, and a new turn and /new drop the offer" {
+    var stalls: [3]providers.testing.FakeTransport.Stall = @splat(.{ .io = std.testing.io });
+    const replies = [_]providers.testing.FakeTransport.Reply{
+        failed_reply,
+        failed_reply,
+        .{ .stall = &stalls[0] },
+        .{ .stall = &stalls[1] },
+        .{ .body = providers.testing.reply_stream },
+        .{ .stall = &stalls[2] },
+    };
+    var rig: Rig = undefined;
+    try rig.init(&.{
+        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .replies = &replies,
+        .model = "gpt-5.6-sol",
+    });
+    defer rig.deinit();
+
+    try rig.keys("a\r");
+    try rig.settle();
+    try rig.keys("\x0e");
+    try stalls[0].reached.wait(std.testing.io);
+    try rig.keys("\x04");
+    try rig.settle();
+    try expectLastEvent(&rig, "You canceled the turn.");
+    try std.testing.expect(rig.app.caption() == null);
+
+    try rig.keys("b\r");
+    try stalls[1].reached.wait(std.testing.io);
+    try rig.keys("\x04");
+    try rig.settle();
+    try std.testing.expectEqualStrings("Canceled turn", rig.app.caption().?.title);
+    try rig.keys("c\r");
+    try rig.settle();
+    try std.testing.expect(rig.app.caption() == null);
+
+    try rig.keys("d\r");
+    try stalls[2].reached.wait(std.testing.io);
+    try rig.keys("\x04");
+    try rig.settle();
+    try std.testing.expectEqualStrings("Canceled turn", rig.app.caption().?.title);
+    try rig.keys("/new\r");
+    try rig.settle();
+    try std.testing.expect(rig.app.caption() == null);
+}
+
+test "Ctrl+N returns the command line of a canceled skill turn" {
+    var stall: providers.testing.FakeTransport.Stall = .{ .io = std.testing.io };
+    const replies = [_]providers.testing.FakeTransport.Reply{.{ .stall = &stall }};
+    var rig: Rig = undefined;
+    try rig.init(&.{
+        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .files = &.{.{
+            ".agents/skills/demo/SKILL.md",
+            "---\nname: demo\ndescription: Demo.\n---\nBody.\n",
+        }},
+        .replies = &replies,
+        .model = "gpt-5.6-sol",
+    });
+    defer rig.deinit();
+
+    const before = rig.blocks().len;
+    try rig.keys("/skill:demo apply it\r");
+    try stall.reached.wait(std.testing.io);
+    try rig.keys("\x04");
+    try rig.settle();
+    try rig.keys("\x0e");
+    try std.testing.expectEqual(before, rig.blocks().len);
+    try std.testing.expectEqualStrings("/skill:demo apply it", rig.app.screen.editor.visible());
+}
+
 test "a signed-out submit and a submit without a model are refused with a notice" {
     var rig: Rig = undefined;
     try rig.init(&.{});
@@ -2459,48 +2791,7 @@ test "exit keys during a slow cancel cannot block the end of the turn" {
     try std.testing.expect(rig.app.mode == .prompt);
 }
 
-test "a refused prompt returns to a blank editor with its notice" {
-    var stall: providers.testing.FakeTransport.Stall = .{ .io = std.testing.io };
-    const replies = [_]providers.testing.FakeTransport.Reply{.{ .stall = &stall }};
-    var rig: Rig = undefined;
-    try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
-        .replies = &replies,
-        .model = "gpt-5.6-sol",
-    });
-    defer rig.deinit();
-
-    try rig.keys("hi\r");
-    try stall.reached.wait(std.testing.io);
-    emitSessionEvent(&rig.app, &.{ .prompt_refused = .turn_running });
-    try rig.settle();
-    try std.testing.expect(rig.app.mode == .prompt);
-    try std.testing.expectEqualStrings("hi", rig.app.screen.editor.visible());
-    try expectNoticeHolds(&rig, turn_message_notice);
-}
-
-test "a refused prompt returns before the draft in the editor" {
-    var stall: providers.testing.FakeTransport.Stall = .{ .io = std.testing.io };
-    const replies = [_]providers.testing.FakeTransport.Reply{.{ .stall = &stall }};
-    var rig: Rig = undefined;
-    try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
-        .replies = &replies,
-        .model = "gpt-5.6-sol",
-    });
-    defer rig.deinit();
-
-    try rig.keys("hi\r");
-    try stall.reached.wait(std.testing.io);
-    try rig.keys("draft");
-    emitSessionEvent(&rig.app, &.{ .prompt_refused = .turn_running });
-    try rig.settle();
-    try std.testing.expect(rig.app.mode == .prompt);
-    try std.testing.expectEqualStrings("hi\ndraft", rig.app.screen.editor.visible());
-    try expectNoticeHolds(&rig, turn_message_notice);
-}
-
-fn expectTurnEndAfterFailedAllocation(event: *const core.Session.Event, editor: []const u8) !void {
+test "a failed allocation at the sink still ends the turn" {
     var stall: providers.testing.FakeTransport.Stall = .{ .io = std.testing.io };
     const replies = [_]providers.testing.FakeTransport.Reply{.{ .stall = &stall }};
     var rig: Rig = undefined;
@@ -2515,21 +2806,15 @@ fn expectTurnEndAfterFailedAllocation(event: *const core.Session.Event, editor: 
     try stall.reached.wait(std.testing.io);
     var failing: std.testing.FailingAllocator = .init(std.testing.allocator, .{ .fail_index = 0 });
     rig.app.gpa = failing.allocator();
-    emitSessionEvent(&rig.app, event);
+    emitSessionEvent(&rig.app, &.{ .turn_ended = .{ .failed = .{
+        .reason = .network,
+        .message = "down",
+    } } });
     rig.app.gpa = std.testing.allocator;
     var batch: [queue_capacity]UiEvent = undefined;
     const count = try rig.app.queue.get(rig.app.io, &batch, 0);
     _ = try rig.app.applyBatch(batch[0..count]);
     try std.testing.expect(rig.app.mode == .prompt);
-    try std.testing.expectEqualStrings(editor, rig.app.screen.editor.visible());
-}
-
-test "a failed allocation at the sink ends the turn, and a refusal keeps its message" {
-    try expectTurnEndAfterFailedAllocation(&.{ .turn_ended = .{ .failed = .{
-        .reason = .network,
-        .message = "down",
-    } } }, "");
-    try expectTurnEndAfterFailedAllocation(&.{ .prompt_refused = .turn_running }, "hi");
 }
 
 const rejected_reply: providers.testing.FakeTransport.Reply = .{

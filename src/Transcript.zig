@@ -9,6 +9,11 @@ block_list: std.ArrayList(ui.Block),
 current: ?struct { kind: ui.Block.Kind, index: ?usize },
 held: std.ArrayList(u8),
 
+pub const Range = struct {
+    start: usize,
+    end: usize,
+};
+
 pub fn init(gpa: std.mem.Allocator) Transcript {
     return .{
         .gpa = gpa,
@@ -79,10 +84,15 @@ pub fn endMessage(self: *Transcript) void {
 }
 
 pub fn truncate(self: *Transcript, block_count: usize) void {
-    std.debug.assert(block_count <= self.block_list.items.len);
+    self.remove(.{ .start = block_count, .end = self.block_list.items.len });
+}
+
+pub fn remove(self: *Transcript, range: Range) void {
+    std.debug.assert(range.start <= range.end);
+    std.debug.assert(range.end <= self.block_list.items.len);
     self.endMessage();
-    for (self.block_list.items[block_count..]) |*block| block.deinit(self.gpa);
-    self.block_list.shrinkRetainingCapacity(block_count);
+    for (self.block_list.items[range.start..range.end]) |*block| block.deinit(self.gpa);
+    self.block_list.replaceRangeAssumeCapacity(range.start, range.end - range.start, &.{});
 }
 
 pub fn rewind(self: *Transcript, block_count: usize) void {
@@ -195,6 +205,24 @@ test "truncate removes optimistic tail blocks" {
     transcript.truncate(1);
     try std.testing.expectEqual(@as(usize, 1), transcript.blocks().len);
     try std.testing.expectEqualStrings("keep", transcript.blocks()[0].content.user.items);
+}
+
+test "remove drops the blocks of its range and keeps the blocks around it" {
+    const gpa = std.testing.allocator;
+    var transcript = Transcript.init(gpa);
+    defer transcript.deinit();
+
+    try transcript.append(&.{ .intro = "keep intro" });
+    try transcript.append(&.{ .user = "drop prompt" });
+    try transcript.appendStream(.model, "drop reply");
+    try transcript.append(&.{ .event = .{ .text = "drop retry", .survives_rewind = true } });
+    try transcript.append(&.{ .event = .{ .text = "keep later event" } });
+    transcript.remove(.{ .start = 1, .end = 4 });
+
+    const kept = transcript.blocks();
+    try std.testing.expectEqual(@as(usize, 2), kept.len);
+    try std.testing.expectEqualStrings("keep intro", kept[0].content.intro.items);
+    try std.testing.expectEqualStrings("keep later event", kept[1].content.event.text.items);
 }
 
 test "rewind preserves only marked events after its checkpoint" {

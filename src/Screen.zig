@@ -423,19 +423,12 @@ pub fn beginTurn(self: *Screen, start: usize) void {
     self.dirty = true;
 }
 
-pub fn withdrawTurn(self: *Screen) !void {
-    const turn = self.activeTurn() orelse return;
-    const start = turn.start;
-    for (self.transcript.blocks()[start..]) |*block| switch (block.content) {
-        .user => |*text| {
-            try self.editor.prependText(text.items);
-            break;
-        },
-        else => {},
-    };
-    self.endTurn();
-    self.transcript.rewind(start);
-    self.dirty = true;
+pub fn removeTurn(self: *Screen, range: Transcript.Range, line: []const u8) !void {
+    std.debug.assert(self.widget == .prompt);
+    try self.editor.prependText(line);
+    self.transcript.remove(range);
+    self.view.resetScreen();
+    self.markEdited();
 }
 
 pub fn apply(
@@ -446,7 +439,7 @@ pub fn apply(
     const turn = self.activeTurn() orelse return self.applyIdle(event, time);
     self.dirty = true;
     switch (event.*) {
-        .prompt_refused, .setup_dropped => unreachable,
+        .setup_dropped => unreachable,
         .text_started => try self.beginBlock(turn, .text),
         .text => |delta| {
             if (turn.lastBlock(.text) == null) try self.beginBlock(turn, .text);
@@ -687,7 +680,7 @@ fn failureSentence(reason: core.Provider.Failure.Reason) []const u8 {
     };
 }
 
-fn failureText(gpa: std.mem.Allocator, failure: *const core.Provider.Failure) ![]u8 {
+pub fn failureText(gpa: std.mem.Allocator, failure: *const core.Provider.Failure) ![]u8 {
     const sentence = failureSentence(failure.reason);
     if (failure.message.len == 0) return gpa.dupe(u8, sentence);
     return std.fmt.allocPrint(gpa, "{s} Details: {s}", .{ sentence, failure.message });
@@ -735,6 +728,10 @@ pub fn appendSkillNote(self: *Screen, skill: *const core.Session.Event.SkillLoad
     defer self.gpa.free(path);
     const text = try std.fmt.allocPrint(self.gpa, "Skill: {s} · File: {s}", .{ skill.name, path });
     defer self.gpa.free(text);
+    try self.appendNote(text);
+}
+
+pub fn appendNote(self: *Screen, text: []const u8) !void {
     try self.transcript.append(&.{ .user_note = text });
     self.dirty = true;
 }
@@ -1404,18 +1401,6 @@ test "a reply under the served name of the chosen model records no warning" {
     } });
     try rig.expectKinds(&.{ .user, .event });
     try rig.end(&.{ .stopped = .complete });
-}
-
-test "a withdrawn turn leaves the transcript and returns its message to the editor" {
-    var rig: Rig = undefined;
-    rig.init();
-    defer rig.deinit();
-    try rig.start("late");
-    try rig.expectKinds(&.{.user});
-    try rig.screen.withdrawTurn();
-    try std.testing.expect(rig.screen.widget == .prompt);
-    try rig.expectKinds(&.{});
-    try std.testing.expectEqualStrings("late", rig.screen.editor.visible());
 }
 
 test "the statistics forget the evidence of the last turn and report the new one" {

@@ -28,6 +28,7 @@ pub const Endpoint = struct {
 pub const State = enum {
     idle,
     working,
+    blocked,
 };
 
 const Request = union(enum) {
@@ -269,7 +270,7 @@ test "the reporter numbers its lines from the clock, forwards each change once, 
     var fake: FakeHerdr = undefined;
     try fake.init(gpa, io);
     defer fake.deinit();
-    var serving = try io.concurrent(FakeHerdr.serve, .{ &fake, 4 });
+    var serving = try io.concurrent(FakeHerdr.serve, .{ &fake, 5 });
     defer _ = serving.cancel(io) catch {};
 
     var herdr: Herdr = .init(io);
@@ -292,20 +293,27 @@ test "the reporter numbers its lines from the clock, forwards each change once, 
         std.mem.indexOf(u8, working, "\"state\":\"working\",\"seq\":1000001}") != null,
     );
 
+    herdr.sync(.blocked);
+    const blocked = try fake.take();
+    defer gpa.free(blocked);
+    try std.testing.expect(
+        std.mem.indexOf(u8, blocked, "\"state\":\"blocked\",\"seq\":1000002}") != null,
+    );
+
     herdr.sync(.idle);
     const idle_again = try fake.take();
     defer gpa.free(idle_again);
     try std.testing.expect(
-        std.mem.indexOf(u8, idle_again, "\"state\":\"idle\",\"seq\":1000002}") != null,
+        std.mem.indexOf(u8, idle_again, "\"state\":\"idle\",\"seq\":1000003}") != null,
     );
 
     herdr.deinit();
     const release = try fake.take();
     defer gpa.free(release);
     try std.testing.expectEqualStrings(
-        "{\"id\":\"drinky:1000003\",\"method\":\"pane.release_agent\"," ++
+        "{\"id\":\"drinky:1000004\",\"method\":\"pane.release_agent\"," ++
             "\"params\":{\"pane_id\":\"w1:p1\",\"source\":\"custom:drinky\"," ++
-            "\"agent\":\"drinky\",\"seq\":1000003}}",
+            "\"agent\":\"drinky\",\"seq\":1000004}}",
         release,
     );
     try serving.await(io);

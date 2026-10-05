@@ -17,6 +17,7 @@ gpa: std.mem.Allocator,
 io: std.Io,
 options: Options,
 conversation: Conversation,
+turn_start: ?usize,
 setup: ?Setup,
 next_setup: ?Setup,
 clear_pending: bool,
@@ -68,12 +69,13 @@ pub const Command = union(enum) {
     cancel,
     configure: Setup,
     clear,
+    remove_turn,
 
     fn dupe(self: *const Command, gpa: std.mem.Allocator) error{OutOfMemory}!Command {
         return switch (self.*) {
             .prompt => |text| .{ .prompt = try gpa.dupe(u8, text) },
             .configure => |*setup| .{ .configure = try setup.dupe(gpa) },
-            .cancel, .clear => self.*,
+            .cancel, .clear, .remove_turn => self.*,
         };
     }
 
@@ -81,13 +83,12 @@ pub const Command = union(enum) {
         switch (self.*) {
             .prompt => |text| gpa.free(text),
             .configure => |*setup| setup.deinit(gpa),
-            .cancel, .clear => {},
+            .cancel, .clear, .remove_turn => {},
         }
     }
 };
 
 pub const Event = union(enum) {
-    prompt_refused: Refusal,
     setup_dropped: Provider,
     text_started,
     text: []const u8,
@@ -107,8 +108,6 @@ pub const Event = union(enum) {
     attempt_failed: Attempt,
     skill_loaded: SkillLoaded,
     turn_ended: Outcome,
-
-    pub const Refusal = enum { turn_running, unconfigured };
 
     pub const ToolResult = struct {
         call: Tool.Call,
@@ -168,7 +167,6 @@ pub const Event = union(enum) {
                 .failed => |*failure| .{ .failed = failure.dupe(gpa) },
                 .stopped, .canceled, .exhausted => outcome.*,
             } },
-            .prompt_refused,
             .setup_dropped,
             .text_started,
             .reasoning_started,
@@ -200,7 +198,6 @@ pub const Event = union(enum) {
                 gpa.free(skill.source);
             },
             .turn_ended => |*outcome| outcome.deinit(gpa),
-            .prompt_refused,
             .setup_dropped,
             .text_started,
             .reasoning_started,
@@ -247,6 +244,7 @@ pub fn init(gpa: std.mem.Allocator, io: std.Io, options: *const Options) Session
         .io = io,
         .options = options.*,
         .conversation = .init(io),
+        .turn_start = null,
         .setup = null,
         .next_setup = null,
         .clear_pending = false,
@@ -298,26 +296,19 @@ fn handle(self: *Session, command: Command) void {
         .cancel => self.mailbox.cancel(self.io),
         .configure => |setup| self.configure(setup),
         .clear => self.requestClear(),
+        .remove_turn => self.removeTurn(),
     }
 }
 
 fn prompt(self: *Session, text: []const u8) void {
-    const maybe_refusal: ?Event.Refusal = if (self.mailbox.busy())
-        .turn_running
-    else if (self.setup == null)
-        .unconfigured
-    else
-        null;
-    if (maybe_refusal) |refusal| {
-        self.gpa.free(text);
-        self.emit(&.{ .prompt_refused = refusal });
-        return;
-    }
+    std.debug.assert(!self.mailbox.busy());
+    std.debug.assert(self.setup != null);
     self.conversation.append(self.gpa, .{ .message = .{ .role = .user, .text = text } }) catch {
         self.gpa.free(text);
         self.emit(&.{ .turn_ended = .{ .failed = .{ .reason = .out_of_memory } } });
         return;
     };
+    self.turn_start = self.conversation.items.items.len - 1;
     const turn: Turn = .{
         .gpa = self.gpa,
         .io = self.io,
@@ -361,10 +352,24 @@ fn drop(self: *Session, setup: *const Setup) void {
 
 fn clear(self: *Session) void {
     self.conversation.clear(self.gpa, self.io);
-    if (self.measured) |*measured| measured.deinit(self.gpa);
-    self.measured = null;
+    self.turn_start = null;
+    self.forgetMeasured();
     self.options.runner.reset();
     self.emit(&.{ .context = 0 });
+}
+
+fn removeTurn(self: *Session) void {
+    std.debug.assert(!self.mailbox.busy());
+    self.conversation.truncate(self.gpa, self.turn_start.?);
+    self.turn_start = null;
+    self.forgetMeasured();
+    self.options.runner.reset();
+    self.emit(&.{ .context = self.contextShown() });
+}
+
+fn forgetMeasured(self: *Session) void {
+    if (self.measured) |*measured| measured.deinit(self.gpa);
+    self.measured = null;
 }
 
 fn end(self: *Session, ended: Turn.End) void {
@@ -810,34 +815,6 @@ test "a cancel that arrives during the wait ends the turn as canceled" {
         "model-a|user:hi|user:next",
         harness.provider.requests.items[1],
     );
-}
-
-test "a prompt without a setup or during a turn is refused with its reason" {
-    var harness: testing.Harness = undefined;
-    try harness.init(std.testing.allocator, std.testing.io, &.{ .configured = false });
-    defer harness.deinit();
-
-    try harness.prompt("early");
-    try harness.expect("prompt_refused:unconfigured");
-    try harness.configure(&harness.provider, "model-a");
-    try harness.expect("context:0");
-
-    harness.provider.load(&.{
-        .{ .open = &.{.{ .text = "I read " }} },
-        .{ .done = &.{ fixture.message("ok"), fixture.stop_complete } },
-    });
-    try harness.prompt("first");
-    try harness.expect("text_started");
-    try harness.expect("text:I read ");
-    try harness.prompt("second");
-    try harness.expect("prompt_refused:turn_running");
-    try harness.session.send(&.cancel);
-    try std.testing.expectEqualStrings(
-        \\committed
-        \\turn_ended:canceled
-    , try harness.until("turn_ended"));
-    try std.testing.expectEqual(@as(u32, 1), harness.provider.canceled);
-    try std.testing.expectEqual(@as(usize, 1), harness.provider.requests.items.len);
 }
 
 test "a setup that arrives during a turn applies from the next turn on" {
@@ -1313,6 +1290,63 @@ test "a clear empties the conversation and resets the runner, also at the end of
     try std.testing.expectEqualStrings("model-a|user:c", harness.provider.requests.items[3]);
 }
 
+test "a turn removal drops the items of the last turn, its measurement, and the skill evidence" {
+    var harness: testing.Harness = undefined;
+    try harness.init(std.testing.allocator, std.testing.io, &.{});
+    defer harness.deinit();
+
+    harness.provider.load(&.{
+        .{ .done = &.{
+            fixture.message("one"),
+            .{ .usage = .{ .input = 10, .output = 2 } },
+            fixture.stop_complete,
+        } },
+        .{ .done = &.{
+            fixture.toolCall(fixture.call),
+            .{ .usage = .{ .input = 20, .output = 4 } },
+            fixture.stop_complete,
+        } },
+        .{ .open = &.{.{ .text = "I read " }} },
+        .{ .done = &.{ fixture.message("two"), fixture.stop_complete } },
+        .{ .open = &.{.{ .text = "I write " }} },
+        .{ .done = &.{ fixture.message("three"), fixture.stop_complete } },
+    });
+    _ = try harness.turn("a");
+    try harness.prompt("b");
+    try std.testing.expectEqualStrings(
+        \\tool_call_started:read
+        \\usage:20/4/0/0
+        \\context:24
+        \\tool_started:c1
+        \\tool_result:c1:done
+        \\committed
+        \\text_started
+        \\text:I read 
+    , try harness.until("text:I read "));
+    try harness.session.send(&.cancel);
+    _ = try harness.until("turn_ended:canceled");
+    try harness.session.send(&.remove_turn);
+    try harness.expect("context:none");
+    try std.testing.expectEqual(@as(u32, 1), harness.runner.resets);
+    _ = try harness.turn("c");
+    try std.testing.expectEqualStrings(
+        "model-a|user:a|assistant:one|user:c",
+        harness.provider.requests.items[3],
+    );
+
+    try harness.session.send(&.clear);
+    try harness.expect("context:0");
+    try harness.prompt("d");
+    _ = try harness.until("text:I write ");
+    try harness.session.send(&.cancel);
+    _ = try harness.until("turn_ended:canceled");
+    try harness.session.send(&.remove_turn);
+    try harness.expect("context:0");
+    try std.testing.expectEqual(@as(u32, 3), harness.runner.resets);
+    _ = try harness.turn("e");
+    try std.testing.expectEqualStrings("model-a|user:e", harness.provider.requests.items[5]);
+}
+
 test "the context gauge binds to the account, the model, and the effort of its request" {
     var harness: testing.Harness = undefined;
     try harness.init(std.testing.allocator, std.testing.io, &.{});
@@ -1571,7 +1605,6 @@ test "a deinit during a turn cancels its stream and frees every item" {
 test "a copy of each event owns its bytes, and a failed copy leaks nothing" {
     const call: Tool.Call = .{ .id = "c1", .name = "read", .arguments = "{}" };
     const events = [_]Event{
-        .{ .prompt_refused = .turn_running },
         .{ .text = "delta" },
         .{ .reasoning = "delta" },
         .{ .tool_call_started = "read" },

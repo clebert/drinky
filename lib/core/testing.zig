@@ -334,7 +334,6 @@ pub const Harness = struct {
             .attempts_max = 1,
             .backoff = .{ .delay_ms_initial = 0, .delay_ms_max = 0 },
         },
-        configured: bool = true,
     };
 
     pub fn init(self: *Harness, gpa: std.mem.Allocator, io: std.Io, options: *const Options) !void {
@@ -352,7 +351,6 @@ pub const Harness = struct {
         });
         try self.session.start();
         errdefer self.deinit();
-        if (!options.configured) return;
         try self.configure(&self.provider, "model-a");
         try self.expect("context:0");
     }
@@ -528,7 +526,6 @@ pub fn checkCopyAllocationFailures(comptime Event: type, events: []const Event) 
 
 fn writeEvent(writer: *std.Io.Writer, event: *const Session.Event) std.Io.Writer.Error!void {
     switch (event.*) {
-        .prompt_refused => |refusal| try writer.print("prompt_refused:{t}", .{refusal}),
         .setup_dropped => try writer.writeAll("setup_dropped"),
         .text_started => try writer.writeAll("text_started"),
         .text => |delta| try writer.print("text:{s}", .{delta}),

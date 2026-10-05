@@ -1,5 +1,7 @@
 const std = @import("std");
 
+const Tool = @This();
+
 name: []const u8,
 description: []const u8,
 parameters: []const Parameter,
@@ -136,6 +138,13 @@ pub const Measure = enum {
     duration_ms,
     exit_code,
 };
+
+pub fn mutating(tools: []const Tool, name: []const u8) bool {
+    for (tools) |tool| {
+        if (std.mem.eql(u8, tool.name, name)) return tool.mutates;
+    }
+    return false;
+}
 
 test "an output fails on a failure condition and not on a note" {
     var output: Output = .{};

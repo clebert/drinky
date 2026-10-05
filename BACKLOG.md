@@ -13,20 +13,6 @@ when the user drops it.
 
 ## Open items
 
-- A failed turn offers no retry. A turn that failed after it committed work left the caption
-  `Failed turn` above the editor. Ctrl+N then sent a `<retry_request>` that named the failure. The
-  request asked the model to continue from the last committed checkpoint. The transcript showed the
-  note `Drinky asked the model to continue from the committed work.` in place of the request. A
-  failed retry attempt offered the retry again. Esc or a new turn dismissed the offer, and Herdr
-  read the wait as `blocked`. The user wants the offer back when the core makes it cheap. A turn
-  that failed before its first commit keeps its user message in the conversation too. The session
-  appends the message before the turn starts, and the editor holds no copy of it.
-- A canceled turn that committed work stays in the conversation as it is. Under the caption
-  `Canceled turn`, Ctrl+N removed the turn from the conversation and the transcript. It kept the
-  events of the session. It returned the prompt and the committed steering messages to the editor as
-  editable text. A turn that ran `write`, `edit`, or `bash` warned first and removed on the second
-  press. Esc kept the turn, and a new turn or `/new` dropped the offer. The user wants the removal
-  back when the core makes it cheap.
 - Drinky needs a terminal. A headless mode answers one prompt with no terminal: text in, text out,
   with flags for the model and the effort. It is the base for any agent that Drinky drives itself.
   Trigger: the first agent that Drinky drives itself.

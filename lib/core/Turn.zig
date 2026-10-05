@@ -512,7 +512,7 @@ fn answer(self: *Turn, staging: *Staging) Runner.Error!void {
     while (position < calls.len) {
         try self.io.checkCancel();
         const pending = staging.pendingAt(calls[position]);
-        if (self.mutates(pending.call.name)) {
+        if (Tool.mutating(self.options.tools, pending.call.name)) {
             self.emit(&.{ .tool_started = pending.call });
             const output = try self.options.runner.run(self.gpa, &pending.call, self.history());
             self.settle(staging, calls[position], output);
@@ -521,7 +521,8 @@ fn answer(self: *Turn, staging: *Staging) Runner.Error!void {
         }
         var batch: Batch = .{ .start = position, .end = position + 1 };
         while (batch.end < calls.len and batch.end - batch.start < read_only_calls_max and
-            !self.mutates(staging.pendingAt(calls[batch.end]).call.name)) batch.end += 1;
+            !Tool.mutating(self.options.tools, staging.pendingAt(calls[batch.end]).call.name))
+            batch.end += 1;
         position += try self.answerBatch(staging, calls, batch);
     }
 }
@@ -571,13 +572,6 @@ fn settle(self: *Turn, staging: *Staging, index: usize, output: Tool.Output) voi
     const pending = staging.pendingAt(index);
     pending.output = output;
     self.emit(&.{ .tool_result = .{ .call = pending.call, .output = output } });
-}
-
-fn mutates(self: *const Turn, name: []const u8) bool {
-    for (self.options.tools) |tool| {
-        if (std.mem.eql(u8, tool.name, name)) return tool.mutates;
-    }
-    return false;
 }
 
 fn loadSkills(self: *Turn) Runner.Error!bool {

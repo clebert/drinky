@@ -67,6 +67,12 @@ pub fn append(self: *Conversation, gpa: std.mem.Allocator, item: Item) error{Out
     try self.items.append(gpa, item);
 }
 
+pub fn truncate(self: *Conversation, gpa: std.mem.Allocator, item_count: usize) void {
+    std.debug.assert(item_count <= self.items.items.len);
+    for (self.items.items[item_count..]) |item| item.deinit(gpa);
+    self.items.shrinkRetainingCapacity(item_count);
+}
+
 fn newCacheKey(io: std.Io) [cache_key_length]u8 {
     var seed: [@divExact(cache_key_length, 2)]u8 = undefined;
     io.random(&seed);

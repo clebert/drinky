@@ -122,6 +122,14 @@ fn writeKeys(writer: *std.Io.Writer, options: *const Options) !void {
         \\  second press.
         \\- Within {d} milliseconds after a Ctrl+D that ended a step, a page, a sign-in, or a turn,
         \\  Ctrl+D warns first.
+        \\- Ctrl+N acts on the offer that the caption above the editor names. Under `Failed turn`,
+        \\  Ctrl+N asks the model to continue from the committed work. The draft stays. Under
+        \\  `Canceled turn`, Ctrl+N removes the canceled turn from the conversation and returns its
+        \\  line to the editor as editable text. Tool changes stay. After a turn that ran
+        \\  `write`, `edit`, or `bash`, Ctrl+N warns first and removes the turn on the second
+        \\  press.
+        \\- Esc dismisses a waiting offer. A dismissed canceled turn stays in the conversation. A
+        \\  new turn and `/new` dismiss the offer too.
         \\
         \\A sign-in takes these keys:
         \\
