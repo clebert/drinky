@@ -8,7 +8,7 @@ const Model = @import("../Model.zig");
 const net = @import("../net.zig");
 const paging = @import("../paging.zig");
 
-const client_version = "0.0.0";
+const client_version = "0.160.0";
 const codex_endpoint = "https://chatgpt.com/backend-api/codex/models?client_version=" ++
     client_version;
 const body_bytes_max = 4 * 1024 * 1024;
@@ -143,6 +143,29 @@ const codex_sample =
     \\    "context_window": 272000, "max_context_window": 872000 }
     \\] }
 ;
+
+test "the Codex list asks as a client version that the newest models require" {
+    const gpa = std.testing.allocator;
+    var transport: providers.testing.FakeTransport = .{
+        .gpa = gpa,
+        .replies = &.{.{ .body = codex_sample }},
+    };
+    defer transport.deinit();
+
+    const models = try fetchSubscription(
+        gpa,
+        std.testing.io,
+        transport.transport(),
+        &.unbounded,
+        &.{ .token = "token", .account_id = "" },
+    );
+    defer gpa.free(models);
+    var lines = std.mem.splitScalar(u8, transport.requests.items[0], '\n');
+    try std.testing.expectEqualStrings(
+        "GET https://chatgpt.com/backend-api/codex/models?client_version=0.160.0",
+        lines.first(),
+    );
+}
 
 test "the Codex list sends the Codex identity and omits the account headers without one" {
     const gpa = std.testing.allocator;
