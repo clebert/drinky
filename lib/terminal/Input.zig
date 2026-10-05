@@ -14,7 +14,7 @@ pub const Key = union(enum) {
     ctrl: u8,
     paste: struct { bytes: []const u8, final: bool },
     enter,
-    newline,
+    shift_enter,
     tab,
     escape,
     backspace,
@@ -181,7 +181,7 @@ fn mapCsiU(parameters: []const u8) Key {
     const modifiers = (std.fmt.parseInt(u21, beforeColon(modifier_field), 10) catch 1) -| 1;
     const shift = modifiers & shift_bit != 0;
     const ctrl = modifiers & ctrl_bit != 0;
-    if (codepoint == enter_key and shift) return .newline;
+    if (codepoint == enter_key and shift) return .shift_enter;
     if (codepoint == escape_key) return .escape;
     if (codepoint == tab_key) return if (modifiers == 0) .tab else .unknown;
     if (ctrl) {
@@ -214,6 +214,15 @@ fn mapFinal(final: u8) Key {
     };
 }
 
+test "a printable byte decodes as a char, and a control byte as its key or as unknown" {
+    try expectKeys("hi", &.{ .{ .char = 'h' }, .{ .char = 'i' } });
+    try expectKeys("\r", &.{.enter});
+    try expectKeys("\x7f", &.{.backspace});
+    try expectKeys("\x03", &.{.{ .ctrl = 'c' }});
+    try expectKeys("\n", &.{.{ .ctrl = 'j' }});
+    try expectKeys("\x00\x1c", &.{ .unknown, .unknown });
+}
+
 fn expectKeys(bytes: []const u8, expected: []const Key) !void {
     var input = Input.init(std.testing.allocator);
     defer input.deinit();
@@ -225,16 +234,8 @@ fn expectKeys(bytes: []const u8, expected: []const Key) !void {
     try std.testing.expectEqual(@as(?Key, null), input.next());
 }
 
-test "printable and control" {
-    try expectKeys("hi", &.{ .{ .char = 'h' }, .{ .char = 'i' } });
-    try expectKeys("\r", &.{.enter});
-    try expectKeys("\x7f", &.{.backspace});
-    try expectKeys("\x03", &.{.{ .ctrl = 'c' }});
-    try expectKeys("\n", &.{.{ .ctrl = 'j' }});
-}
-
-test "kitty csi-u keys" {
-    try expectKeys("\x1b[13;2u", &.{.newline});
+test "a csi-u sequence decodes as shift+enter, escape, a ctrl letter, or unknown" {
+    try expectKeys("\x1b[13;2u", &.{.shift_enter});
     try expectKeys("\x1b[27u", &.{.escape});
     try expectKeys("\x1b[67;5u", &.{.{ .ctrl = 'c' }});
     try expectKeys("\x1b[106;5u", &.{.{ .ctrl = 'j' }});
@@ -250,12 +251,7 @@ test "tab decodes as its own key, and a modified tab stays unknown" {
     for (2..257) |modifier| {
         var sequence_buffer: [16]u8 = undefined;
         const sequence = try std.fmt.bufPrint(&sequence_buffer, "\x1b[9;{d}u", .{modifier});
-        var input = Input.init(std.testing.allocator);
-        defer input.deinit();
-        try input.feed(sequence);
-        const key = input.next() orelse return error.MissingKey;
-        try std.testing.expect(key != .tab);
-        try std.testing.expectEqual(@as(?Key, null), input.next());
+        try expectKeys(sequence, &.{.unknown});
     }
 }
 
@@ -270,10 +266,11 @@ test "malformed or truncated utf-8 decodes as unknown with forward progress" {
     try std.testing.expectEqualDeep(Key{ .char = '€' }, input.next().?);
 }
 
-test "arrows and navigation" {
+test "a csi or ss3 sequence decodes as an arrow key or a navigation key" {
     try expectKeys("\x1b[A\x1b[D", &.{ .up, .left });
     try expectKeys("\x1bOC", &.{.right});
-    try expectKeys("\x1b[H\x1b[4~", &.{ .home, .end });
+    try expectKeys("\x1b[H\x1b[1~\x1b[7~", &.{ .home, .home, .home });
+    try expectKeys("\x1b[F\x1b[4~\x1b[8~", &.{ .end, .end, .end });
     try expectKeys("\x1b[5~\x1b[6~", &.{ .page_up, .page_down });
 }
 

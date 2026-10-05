@@ -1,32 +1,44 @@
 const std = @import("std");
 
-const ai = @import("ai");
+const accounts = @import("accounts");
+const core = @import("core");
+const providers = @import("providers");
+const tools = @import("tools");
 
+const discovery = @import("discovery/root.zig");
 const layout = @import("layout.zig");
+const remote = @import("remote/root.zig");
+const testing = @import("testing.zig");
 const ui = @import("ui/root.zig");
 
 const Config = @This();
 
 path: []const u8,
-timeouts: ai.net.ProviderTimeouts = .{},
-retry: ai.net.Retry = .{},
-bash: ai.tool.Context.Bash = .{},
+connect_timeout_ms: u64 = transport_timeouts_default.connect_ms,
+timeouts: accounts.Registry.Timeouts = accounts.Registry.timeouts_default,
+retry: core.Retry = .{},
+bash: tools.Context.Bash = .{},
 window_pages: usize = layout.window_pages_default,
 gauge: ui.status.Gauge = .{},
-default_effort: ?ai.llm.Effort = null,
-user_instructions: ai.instructions.Result,
+effort_default: ?core.Provider.Effort = null,
+user_instructions: discovery.instructions.Result,
 required_skills: []const RequiredSkill = &.{},
-dropped_effort: ?[]const u8 = null,
-dropped_bash_timeout_ms: ?u64 = null,
-dropped_window_pages: ?usize = null,
-dropped_gauge: ?ui.status.Gauge = null,
+effort_dropped: ?[]const u8 = null,
+bash_timeout_ms_dropped: ?u64 = null,
+window_pages_dropped: ?usize = null,
+gauge_dropped: ?ui.status.Gauge = null,
 unknown_keys: []const []const u8 = &.{},
 unknown_keys_omitted: bool = false,
+load_error: ?LoadError = null,
 
 pub const RequiredSkill = struct {
     glob: []const u8,
     skill: []const u8,
 };
+
+const LoadError = std.Io.Dir.ReadFileAllocError || std.json.ParseError(std.json.Scanner) ||
+    @typeInfo(@typeInfo(@TypeOf(discovery.instructions.load)).@"fn".return_type.?)
+        .error_union.error_set;
 
 const File = struct {
     user_instructions: []const File.UserInstruction = &.{},
@@ -50,11 +62,6 @@ const File = struct {
                 else => error.UnexpectedToken,
             };
         }
-
-        fn get(maybe_string: ?JsonString) ?[]const u8 {
-            const string = maybe_string orelse return null;
-            return string.value;
-        }
     };
 
     const UserInstruction = struct {
@@ -66,20 +73,7 @@ const File = struct {
         skill: JsonString,
     };
 
-    const Request = struct {
-        connect_timeout_ms: u64 = timeouts_default.anthropic.connect_ms,
-        ds4_connect_timeout_ms: u64 = timeouts_default.ds4.connect_ms,
-        anthropic_idle_timeout_ms: u64 = timeouts_default.anthropic.idle_ms,
-        openai_idle_timeout_ms: u64 = timeouts_default.openai.idle_ms,
-        xai_idle_timeout_ms: u64 = timeouts_default.xai.idle_ms,
-        google_idle_timeout_ms: u64 = timeouts_default.google.idle_ms,
-        openrouter_idle_timeout_ms: u64 = timeouts_default.openrouter.idle_ms,
-        deepseek_idle_timeout_ms: u64 = timeouts_default.deepseek.idle_ms,
-        ds4_idle_timeout_ms: u64 = timeouts_default.ds4.idle_ms,
-        attempts_max: u32 = retry_default.attempts_max,
-        backoff_ms_initial: u64 = retry_default.backoff_ms_initial,
-        backoff_ms_max: u64 = retry_default.backoff_ms_max,
-    };
+    const Request = Section(request_fields);
 
     const Bash = struct {
         output_lines_max: usize = bash_default.lines_max,
@@ -94,27 +88,72 @@ const File = struct {
     };
 };
 
-pub const LoadOptions = struct {
-    working_directory: []const u8,
-    home: []const u8,
-};
-
 const DataOptions = struct {
     directory: []const u8,
     path: []const u8,
     data: []const u8,
 };
 
-const timeouts_default: ai.net.ProviderTimeouts = .{};
-const retry_default: ai.net.Retry = .{};
-const bash_default: ai.tool.Context.Bash = .{};
+const SectionField = struct {
+    name: [:0]const u8,
+    type: type,
+    default_value_ptr: *const anyopaque,
+};
+
+const transport_timeouts_default: providers.Transport.Timeouts = .{};
+const retry_default: core.Retry = .{};
+const bash_default: tools.Context.Bash = .{};
 const gauge_default: ui.status.Gauge = .{};
 
 const unknown_keys_max = 16;
 
+const vendors = std.enums.values(accounts.Account.Vendor);
+
+const request_fields: []const SectionField = fields: {
+    var list: []const SectionField = &.{
+        sectionField(u64, "connect_timeout_ms", transport_timeouts_default.connect_ms),
+    };
+    for (vendors) |vendor| {
+        const wait = accounts.Registry.waits.get(vendor);
+        if (wait.connect_note == null) continue;
+        list = list ++ [_]SectionField{
+            sectionField(u64, connectName(vendor), wait.timeouts.connect_ms),
+        };
+    }
+    for (vendors) |vendor| {
+        const wait = accounts.Registry.waits.get(vendor);
+        list = list ++ [_]SectionField{sectionField(u64, idleName(vendor), wait.timeouts.idle_ms)};
+    }
+    break :fields list ++ [_]SectionField{
+        sectionField(u32, "attempts_max", retry_default.attempts_max),
+        sectionField(u64, "delay_ms_initial", retry_default.backoff.delay_ms_initial),
+        sectionField(u64, "delay_ms_max", retry_default.backoff.delay_ms_max),
+    };
+};
+
 const Key = struct {
     path: []const u8,
     description: []const u8,
+};
+
+const vendor_keys: []const Key = keys: {
+    var list: []const Key = &.{};
+    for (vendors) |vendor| {
+        const note = accounts.Registry.waits.get(vendor).connect_note orelse continue;
+        list = list ++ [_]Key{.{
+            .path = "request." ++ connectName(vendor),
+            .description = "The time that Drinky waits for the head of each " ++
+                vendor.label() ++ " reply. " ++ note,
+        }};
+    }
+    for (vendors) |vendor| {
+        list = list ++ [_]Key{.{
+            .path = "request." ++ idleName(vendor),
+            .description = "The time that Drinky waits between two streamed " ++
+                vendor.label() ++ " events. " ++ accounts.Registry.waits.get(vendor).idle_note,
+        }};
+    }
+    break :keys list;
 };
 
 const keys = [_]Key{
@@ -124,9 +163,9 @@ const keys = [_]Key{
             "The instruction files that Drinky loads into every system prompt, in this order. " ++
                 "Drinky loads at most {d} files, {d} KiB in total, and {d} KiB from one file.",
             .{
-                ai.instructions.files_max,
-                ai.instructions.source_kibibytes_max,
-                ai.instructions.file_kibibytes_max,
+                discovery.instructions.files_max,
+                discovery.instructions.source_kibibytes_max,
+                discovery.instructions.file_kibibytes_max,
             },
         ),
     },
@@ -141,7 +180,7 @@ const keys = [_]Key{
             "The skills that a file requires. Before the write tool or the edit tool " ++
                 "changes a file that an entry matches, the whole skill file of that entry " ++
                 "must be in the conversation. Drinky applies at most {d} entries.",
-            .{ai.tool.SkillGuard.rules_max},
+            .{tools.SkillGuard.rules_max},
         ),
     },
     .{
@@ -157,64 +196,23 @@ const keys = [_]Key{
     },
     .{
         .path = "request.connect_timeout_ms",
-        .description = "The time that Drinky waits for the head of a remote provider response. " ++
-            "One window of this size also bounds a remote model fetch.",
-    },
-    .{
-        .path = "request.ds4_connect_timeout_ms",
-        .description = "The time that Drinky waits for a DwarfStar response head. One window " ++
-            "of this size also bounds its model fetch.",
-    },
-    .{
-        .path = "request.anthropic_idle_timeout_ms",
-        .description = "The time that Drinky waits between two streamed Anthropic events. A " ++
-            "keepalive ping is not an event and does not restart the wait.",
-    },
-    .{
-        .path = "request.openai_idle_timeout_ms",
-        .description = "The time that Drinky waits between two streamed OpenAI events. The " ++
-            "stream is silent while the model reasons privately, so the default matches " ++
-            "the wait of the official client.",
-    },
-    .{
-        .path = "request.xai_idle_timeout_ms",
-        .description = "The time that Drinky waits between two streamed xAI events. The " ++
-            "stream can stay silent while the model reasons, so the default matches the " ++
-            "OpenAI wait.",
-    },
-    .{
-        .path = "request.google_idle_timeout_ms",
-        .description = "The time that Drinky waits between two streamed Google events. " ++
-            "The stream can stay silent while the model thinks, so the default matches the " ++
-            "OpenAI wait.",
-    },
-    .{
-        .path = "request.openrouter_idle_timeout_ms",
-        .description = "The time that Drinky waits between two streamed OpenRouter events. " ++
-            "The stream can stay silent while the model reasons, so the default matches the " ++
-            "OpenAI wait.",
-    },
-    .{
-        .path = "request.deepseek_idle_timeout_ms",
-        .description = "The time that Drinky waits between two streamed DeepSeek events. " ++
-            "The first reasoning event can take a long time to arrive, so the default matches " ++
-            "the OpenAI wait.",
-    },
-    .{
-        .path = "request.ds4_idle_timeout_ms",
-        .description = "The time that Drinky waits between two streamed DwarfStar events. A " ++
-            "local prefill can take many minutes.",
+        .description = std.fmt.comptimePrint(
+            "The time that Drinky waits for the head of a remote provider reply. One " ++
+                "window of this size also bounds a remote model fetch and each Telegram " ++
+                "request. A Telegram poll waits at least {d} seconds.",
+            .{@divExact(remote.Client.poll_connect_ms_min, std.time.ms_per_s)},
+        ),
     },
     .{
         .path = "request.attempts_max",
         .description = "The number of times that Drinky sends one request before it fails.",
     },
     .{
-        .path = "request.backoff_ms_initial",
+        .path = "request.delay_ms_initial",
         .description = "The wait before the second attempt. Each further wait doubles it.",
     },
     .{
-        .path = "request.backoff_ms_max",
+        .path = "request.delay_ms_max",
         .description = "The upper bound on one wait between attempts. It caps the doubling " ++
             "above. Drinky does not retry when a retry-after header or an error body asks " ++
             "for a longer wait.",
@@ -233,7 +231,7 @@ const keys = [_]Key{
             "The time that a command runs before Drinky stops it. A per-call argument " ++
                 "overrides it. Every command runs under a limit, so the value must be from " ++
                 "{d} to {d}. Drinky reports a value it cannot use and keeps the default.",
-            .{ ai.tool.Context.Bash.timeout_ms_min, ai.tool.Context.Bash.timeout_ms_max },
+            .{ tools.Context.Bash.timeout_ms_min, tools.Context.Bash.timeout_ms_max },
         ),
     },
     .{
@@ -271,13 +269,37 @@ const keys = [_]Key{
             "that the model does not support onto the nearest one it does. Only a new " ++
             "project reads it.",
     },
-};
+} ++ vendor_keys;
 
 const Leaf = struct {
     path: []const u8,
     type_name: []const u8,
     default_text: ?[]const u8,
 };
+
+fn connectName(comptime vendor: accounts.Account.Vendor) [:0]const u8 {
+    return @tagName(vendor) ++ "_connect_timeout_ms";
+}
+
+fn idleName(comptime vendor: accounts.Account.Vendor) [:0]const u8 {
+    return @tagName(vendor) ++ "_idle_timeout_ms";
+}
+
+fn sectionField(comptime T: type, comptime name: [:0]const u8, comptime default: T) SectionField {
+    return .{ .name = name, .type = T, .default_value_ptr = &default };
+}
+
+fn Section(comptime fields: []const SectionField) type {
+    var names: [fields.len][]const u8 = undefined;
+    var types: [fields.len]type = undefined;
+    var attributes: [fields.len]std.builtin.Type.StructField.Attributes = undefined;
+    for (fields, &names, &types, &attributes) |field, *name, *field_type, *attribute| {
+        name.* = field.name;
+        field_type.* = field.type;
+        attribute.* = .{ .default_value_ptr = field.default_value_ptr };
+    }
+    return @Struct(.auto, null, &names, &types, &attributes);
+}
 
 fn isSection(comptime T: type) bool {
     return @typeInfo(T) == .@"struct" and T != File.JsonString;
@@ -362,7 +384,7 @@ const key_lines = blk: {
     var used = [_]bool{false} ** keys.len;
     for (leaves) |leaf| {
         var found = false;
-        for (&keys, 0..) |key, index| {
+        for (keys, 0..) |key, index| {
             if (!std.mem.eql(u8, key.path, leaf.path)) continue;
             if (used[index]) @compileError("the config document repeats the key " ++ key.path);
             used[index] = true;
@@ -397,17 +419,26 @@ fn joinNames(comptime list: []const []const u8) []const u8 {
 
 const effort_levels = blk: {
     var list: []const []const u8 = &.{};
-    for (@typeInfo(ai.llm.Effort).@"enum".fields) |field| {
+    for (@typeInfo(core.Provider.Effort).@"enum".fields) |field| {
         list = list ++ [_][]const u8{field.name};
     }
     break :blk joinNames(list);
+};
+
+const settings_lines = lines: {
+    var text: []const u8 = "";
+    for (&accounts.Account.table) |*row| {
+        const setting = row.setting() orelse continue;
+        text = text ++ "- `" ++ row.id ++ "`: " ++ setting ++ "\n";
+    }
+    break :lines text;
 };
 
 const example =
     \\{
     \\  "user_instructions": [{ "path": "instructions.md" }],
     \\  "required_skills": [{ "glob": "**/*.zig", "skill": "zig-style" }],
-    \\  "request": { "anthropic_idle_timeout_ms": 90000 },
+    \\  "request": { "attempts_max": 5 },
     \\  "bash": { "timeout_ms": 300000 },
     \\  "interface": { "window_pages": 12 },
     \\  "default_effort": "high"
@@ -419,10 +450,10 @@ const keys_section = "\n### Keys\n\n" ++ key_lines;
 pub fn document(
     self: *const Config,
     gpa: std.mem.Allocator,
-    effort_default: ai.llm.Effort,
+    effort_default: core.Provider.Effort,
 ) ![]u8 {
     return std.fmt.allocPrint(gpa,
-        \\## Configuration
+        \\## Config file
         \\
         \\Drinky reads {s} once, at startup. A change to that file applies at
         \\the next start of Drinky, and never to the session that runs now. Tell the user so.
@@ -430,15 +461,13 @@ pub fn document(
         \\The file is optional, so create it when it is absent. Any subset of the keys below is
         \\valid, and an absent key keeps its default. A dot shows a nested JSON object. Empty
         \\brackets show each array entry. Drinky ignores a key that it does not know, so a typo has
-        \\no effect. The next start still succeeds and shows a warning that names each ignored key.
-        \\The file holds no secret. An API key comes from the ANTHROPIC_API_KEY, the
-        \\OPENAI_API_KEY, the XAI_API_KEY, the OPENROUTER_API_KEY, or the
-        \\DEEPSEEK_API_KEY variable. The
-        \\google-cloud-key account reads the service account key file that
-        \\GOOGLE_APPLICATION_CREDENTIALS names.
-        \\GOOGLE_CLOUD_LOCATION is eu, us, or global. DS4_BASE_URL enables the
-        \\credential-free ds4 account and ends at /v1.
-        \\{s}
+        \\no effect. The next start still succeeds and records an event that names each ignored
+        \\key. A file that Drinky cannot parse also lets the start succeed. Drinky then uses the
+        \\default value of each key and records an event that names the error. The file holds no
+        \\secret.
+        \\Each account without a login reads its setting from the environment:
+        \\
+        \\{s}{s}
         \\### Models and effort
         \\
         \\- This file names no model. Drinky learns every model from the provider, and the user
@@ -457,6 +486,7 @@ pub fn document(
         \\
     , .{
         self.path,
+        settings_lines,
         keys_section,
         effort_levels,
         @tagName(effort_default),
@@ -472,29 +502,39 @@ pub fn deinit(self: *Config, gpa: std.mem.Allocator) void {
         gpa.free(required.skill);
     }
     gpa.free(self.required_skills);
-    if (self.dropped_effort) |name| gpa.free(name);
+    if (self.effort_dropped) |name| gpa.free(name);
     for (self.unknown_keys) |key| gpa.free(key);
     gpa.free(self.unknown_keys);
 }
 
-pub fn load(gpa: std.mem.Allocator, io: std.Io, options: *const LoadOptions) !Config {
-    const directory = try std.fs.path.resolve(
-        gpa,
-        &.{ options.working_directory, options.home, ".drinky" },
-    );
-    defer gpa.free(directory);
-    const path = try std.fs.path.join(gpa, &.{ directory, "config.json" });
+pub fn load(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    directories: *const accounts.json_store.Directories,
+) !Config {
+    const path = try accounts.json_store.locate(gpa, directories, "config.json");
     defer gpa.free(path);
+    const directory = std.fs.path.dirname(path).?;
     const cwd = std.Io.Dir.cwd();
     const data = cwd.readFileAlloc(io, path, gpa, .unlimited) catch |err| switch (err) {
-        error.FileNotFound => return .{
-            .path = try gpa.dupe(u8, path),
-            .user_instructions = .init(gpa, .user),
-        },
-        else => return err,
+        error.FileNotFound => return defaults(gpa, path, null),
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return defaults(gpa, path, err),
     };
     defer gpa.free(data);
-    return loadFromData(gpa, io, &.{ .directory = directory, .path = path, .data = data });
+    const data_options: DataOptions = .{ .directory = directory, .path = path, .data = data };
+    return loadFromData(gpa, io, &data_options) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return defaults(gpa, path, err),
+    };
+}
+
+fn defaults(gpa: std.mem.Allocator, path: []const u8, load_error: ?LoadError) !Config {
+    return .{
+        .path = try gpa.dupe(u8, path),
+        .user_instructions = .init(gpa, .user),
+        .load_error = load_error,
+    };
 }
 
 fn loadFromData(gpa: std.mem.Allocator, io: std.Io, options: *const DataOptions) !Config {
@@ -516,13 +556,13 @@ fn loadFromData(gpa: std.mem.Allocator, io: std.Io, options: *const DataOptions)
     const bash = parsed.value.bash;
     const interface = parsed.value.interface;
 
-    var path_buffer: [ai.instructions.files_max + 1][]const u8 = undefined;
+    var path_buffer: [discovery.instructions.files_max + 1][]const u8 = undefined;
     const path_count = @min(parsed.value.user_instructions.len, path_buffer.len);
     const configured_paths = parsed.value.user_instructions[0..path_count];
     for (path_buffer[0..path_count], configured_paths) |*path, configured| {
         path.* = configured.path.value;
     }
-    var user_instructions = try ai.instructions.load(gpa, io, &.{
+    var user_instructions = try discovery.instructions.load(gpa, io, &.{
         .directory = options.directory,
         .paths = path_buffer[0..path_count],
     });
@@ -544,19 +584,19 @@ fn loadFromData(gpa: std.mem.Allocator, io: std.Io, options: *const DataOptions)
         try required.append(gpa, .{ .glob = owned_glob, .skill = owned_skill });
     }
 
-    var dropped_effort: ?[]const u8 = null;
-    errdefer if (dropped_effort) |name| gpa.free(name);
-    const default_effort = try resolveEffort(
+    var effort_dropped: ?[]const u8 = null;
+    errdefer if (effort_dropped) |name| gpa.free(name);
+    const effort_default = try resolveEffort(
         gpa,
-        &dropped_effort,
-        File.JsonString.get(parsed.value.default_effort),
+        &effort_dropped,
+        if (parsed.value.default_effort) |name| name.value else null,
     );
-    var dropped_bash_timeout_ms: ?u64 = null;
-    const bash_timeout_ms = resolveBashTimeout(&dropped_bash_timeout_ms, bash.timeout_ms);
-    var dropped_window_pages: ?usize = null;
-    const window_pages = resolveWindowPages(&dropped_window_pages, interface.window_pages);
-    var dropped_gauge: ?ui.status.Gauge = null;
-    const gauge = resolveGauge(&dropped_gauge, &interface);
+    var bash_timeout_ms_dropped: ?u64 = null;
+    const bash_timeout_ms = resolveBashTimeout(&bash_timeout_ms_dropped, bash.timeout_ms);
+    var window_pages_dropped: ?usize = null;
+    const window_pages = resolveWindowPages(&window_pages_dropped, interface.window_pages);
+    var gauge_dropped: ?ui.status.Gauge = null;
+    const gauge = resolveGauge(&gauge_dropped, &interface);
     var unknown: std.ArrayList([]const u8) = .empty;
     errdefer {
         for (unknown.items) |key| gpa.free(key);
@@ -573,40 +613,14 @@ fn loadFromData(gpa: std.mem.Allocator, io: std.Io, options: *const DataOptions)
     const required_skills = try required.toOwnedSlice(gpa);
     return .{
         .path = owned_path,
-        .timeouts = .{
-            .anthropic = .{
-                .connect_ms = request.connect_timeout_ms,
-                .idle_ms = request.anthropic_idle_timeout_ms,
-            },
-            .openai = .{
-                .connect_ms = request.connect_timeout_ms,
-                .idle_ms = request.openai_idle_timeout_ms,
-            },
-            .xai = .{
-                .connect_ms = request.connect_timeout_ms,
-                .idle_ms = request.xai_idle_timeout_ms,
-            },
-            .google = .{
-                .connect_ms = request.connect_timeout_ms,
-                .idle_ms = request.google_idle_timeout_ms,
-            },
-            .openrouter = .{
-                .connect_ms = request.connect_timeout_ms,
-                .idle_ms = request.openrouter_idle_timeout_ms,
-            },
-            .deepseek = .{
-                .connect_ms = request.connect_timeout_ms,
-                .idle_ms = request.deepseek_idle_timeout_ms,
-            },
-            .ds4 = .{
-                .connect_ms = request.ds4_connect_timeout_ms,
-                .idle_ms = request.ds4_idle_timeout_ms,
-            },
-        },
+        .connect_timeout_ms = request.connect_timeout_ms,
+        .timeouts = timeoutsOf(&request),
         .retry = .{
             .attempts_max = request.attempts_max,
-            .backoff_ms_initial = request.backoff_ms_initial,
-            .backoff_ms_max = request.backoff_ms_max,
+            .backoff = .{
+                .delay_ms_initial = request.delay_ms_initial,
+                .delay_ms_max = request.delay_ms_max,
+            },
         },
         .bash = .{
             .lines_max = bash.output_lines_max,
@@ -615,16 +629,31 @@ fn loadFromData(gpa: std.mem.Allocator, io: std.Io, options: *const DataOptions)
         },
         .window_pages = window_pages,
         .gauge = gauge,
-        .default_effort = default_effort,
+        .effort_default = effort_default,
         .user_instructions = user_instructions,
         .required_skills = required_skills,
-        .dropped_effort = dropped_effort,
-        .dropped_bash_timeout_ms = dropped_bash_timeout_ms,
-        .dropped_window_pages = dropped_window_pages,
-        .dropped_gauge = dropped_gauge,
+        .effort_dropped = effort_dropped,
+        .bash_timeout_ms_dropped = bash_timeout_ms_dropped,
+        .window_pages_dropped = window_pages_dropped,
+        .gauge_dropped = gauge_dropped,
         .unknown_keys = unknown_keys,
         .unknown_keys_omitted = unknown_keys_omitted,
     };
+}
+
+fn timeoutsOf(request: *const File.Request) accounts.Registry.Timeouts {
+    var timeouts: accounts.Registry.Timeouts = undefined;
+    inline for (vendors) |vendor| {
+        const wait = comptime accounts.Registry.waits.get(vendor);
+        timeouts.set(vendor, .{
+            .connect_ms = if (wait.connect_note == null)
+                request.connect_timeout_ms
+            else
+                @field(request, connectName(vendor)),
+            .idle_ms = @field(request, idleName(vendor)),
+        });
+    }
+    return timeouts;
 }
 
 fn collectUnknownKeys(
@@ -713,16 +742,16 @@ fn resolveEffort(
     gpa: std.mem.Allocator,
     dropped: *?[]const u8,
     name: ?[]const u8,
-) !?ai.llm.Effort {
+) !?core.Provider.Effort {
     const level = name orelse return null;
-    if (std.meta.stringToEnum(ai.llm.Effort, level)) |resolved| return resolved;
+    if (std.meta.stringToEnum(core.Provider.Effort, level)) |resolved| return resolved;
     dropped.* = try gpa.dupe(u8, level);
     return null;
 }
 
 fn resolveBashTimeout(dropped: *?u64, configured: u64) u64 {
-    if (configured >= ai.tool.Context.Bash.timeout_ms_min and
-        configured <= ai.tool.Context.Bash.timeout_ms_max)
+    if (configured >= tools.Context.Bash.timeout_ms_min and
+        configured <= tools.Context.Bash.timeout_ms_max)
         return configured;
     dropped.* = configured;
     return bash_default.timeout_ms;
@@ -750,61 +779,57 @@ fn isShare(percent: f64) bool {
     return percent >= ui.status.Gauge.percent_min and percent <= ui.status.Gauge.percent_max;
 }
 
-fn isLeafPath(path: []const u8) bool {
-    for (leaves) |leaf| {
-        if (std.mem.eql(u8, leaf.path, path)) return true;
-    }
-    return false;
-}
-
-fn loadDataForTest(data: []const u8) !Config {
-    return loadFromData(std.testing.allocator, std.testing.io, &.{
-        .directory = "/unused",
-        .path = "/unused/config.json",
-        .data = data,
-    });
-}
-
-fn loadForTest(gpa: std.mem.Allocator, io: std.Io, home: []const u8) !Config {
-    const working_directory = try std.process.currentPathAlloc(io, gpa);
-    defer gpa.free(working_directory);
-    return load(gpa, io, &.{ .working_directory = working_directory, .home = home });
-}
-
-fn tmpPath(
-    gpa: std.mem.Allocator,
-    io: std.Io,
-    tmp: *const std.testing.TmpDir,
-    suffix: []const u8,
-) ![]u8 {
-    const cwd = try std.process.currentPathAlloc(io, gpa);
-    defer gpa.free(cwd);
-    return std.fs.path.join(gpa, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, suffix });
-}
-
 test "load reads the request section" {
     var config = try loadDataForTest(
         \\{ "request": { "connect_timeout_ms": 1000, "ds4_connect_timeout_ms": 1500,
         \\  "anthropic_idle_timeout_ms": 2000, "openai_idle_timeout_ms": 3000,
         \\  "google_idle_timeout_ms": 4000, "xai_idle_timeout_ms": 4500,
+        \\  "openrouter_idle_timeout_ms": 5500, "deepseek_idle_timeout_ms": 6000,
         \\  "ds4_idle_timeout_ms": 5000, "attempts_max": 5,
-        \\  "backoff_ms_initial": 100, "backoff_ms_max": 900 } }
+        \\  "delay_ms_initial": 100, "delay_ms_max": 900 } }
     );
     defer config.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u64, 1000), config.timeouts.anthropic.connect_ms);
-    try std.testing.expectEqual(@as(u64, 1000), config.timeouts.openai.connect_ms);
-    try std.testing.expectEqual(@as(u64, 1000), config.timeouts.xai.connect_ms);
-    try std.testing.expectEqual(@as(u64, 1000), config.timeouts.google.connect_ms);
-    try std.testing.expectEqual(@as(u64, 1000), config.timeouts.deepseek.connect_ms);
-    try std.testing.expectEqual(@as(u64, 1500), config.timeouts.ds4.connect_ms);
-    try std.testing.expectEqual(@as(u64, 2000), config.timeouts.anthropic.idle_ms);
-    try std.testing.expectEqual(@as(u64, 3000), config.timeouts.openai.idle_ms);
-    try std.testing.expectEqual(@as(u64, 4500), config.timeouts.xai.idle_ms);
-    try std.testing.expectEqual(@as(u64, 4000), config.timeouts.google.idle_ms);
-    try std.testing.expectEqual(@as(u64, 5000), config.timeouts.ds4.idle_ms);
+    try std.testing.expectEqual(@as(u64, 1000), config.connect_timeout_ms);
+    try std.testing.expectEqual(@as(u64, 1000), config.timeouts.get(.anthropic).connect_ms);
+    try std.testing.expectEqual(@as(u64, 1000), config.timeouts.get(.openai).connect_ms);
+    try std.testing.expectEqual(@as(u64, 1000), config.timeouts.get(.xai).connect_ms);
+    try std.testing.expectEqual(@as(u64, 1000), config.timeouts.get(.google).connect_ms);
+    try std.testing.expectEqual(@as(u64, 1000), config.timeouts.get(.deepseek).connect_ms);
+    try std.testing.expectEqual(@as(u64, 1500), config.timeouts.get(.ds4).connect_ms);
+    try std.testing.expectEqual(@as(u64, 2000), config.timeouts.get(.anthropic).idle_ms);
+    try std.testing.expectEqual(@as(u64, 3000), config.timeouts.get(.openai).idle_ms);
+    try std.testing.expectEqual(@as(u64, 4500), config.timeouts.get(.xai).idle_ms);
+    try std.testing.expectEqual(@as(u64, 4000), config.timeouts.get(.google).idle_ms);
+    try std.testing.expectEqual(@as(u64, 5500), config.timeouts.get(.openrouter).idle_ms);
+    try std.testing.expectEqual(@as(u64, 6000), config.timeouts.get(.deepseek).idle_ms);
+    try std.testing.expectEqual(@as(u64, 5000), config.timeouts.get(.ds4).idle_ms);
     try std.testing.expectEqual(@as(u32, 5), config.retry.attempts_max);
-    try std.testing.expectEqual(@as(u64, 100), config.retry.backoff_ms_initial);
-    try std.testing.expectEqual(@as(u64, 900), config.retry.backoff_ms_max);
+    try std.testing.expectEqual(@as(u64, 100), config.retry.backoff.delay_ms_initial);
+    try std.testing.expectEqual(@as(u64, 900), config.retry.backoff.delay_ms_max);
+}
+
+fn loadDataForTest(data: []const u8) !Config {
+    var config = try loadFileForTest(data);
+    errdefer config.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?LoadError, null), config.load_error);
+    return config;
+}
+
+fn expectLoadError(expected: LoadError, data: []const u8) !void {
+    var config = try loadFileForTest(data);
+    defer config.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?LoadError, expected), config.load_error);
+}
+
+fn loadFileForTest(data: []const u8) !Config {
+    var tree: testing.Tree = try .init();
+    defer tree.deinit();
+    try tree.write(".drinky/config.json", data);
+    return loadForTest(std.testing.allocator, std.testing.io, tree.root);
+}
+
+fn loadForTest(gpa: std.mem.Allocator, io: std.Io, home: []const u8) !Config {
+    return load(gpa, io, &.{ .working_directory = home, .home = home });
 }
 
 test "load reads the bash section" {
@@ -816,7 +841,7 @@ test "load reads the bash section" {
     try std.testing.expectEqual(@as(usize, 17), config.bash.lines_max);
     try std.testing.expectEqual(@as(usize, 4096), config.bash.bytes_max);
     try std.testing.expectEqual(@as(u64, 1500), config.bash.timeout_ms);
-    try std.testing.expect(config.dropped_bash_timeout_ms == null);
+    try std.testing.expect(config.bash_timeout_ms_dropped == null);
 }
 
 test "load reads the interface section" {
@@ -828,16 +853,16 @@ test "load reads the interface section" {
     try std.testing.expectEqual(@as(usize, 3), config.window_pages);
     try std.testing.expectEqual(@as(f64, 60), config.gauge.percent_warning);
     try std.testing.expectEqual(@as(f64, 80), config.gauge.percent_error);
-    try std.testing.expect(config.dropped_window_pages == null);
-    try std.testing.expect(config.dropped_gauge == null);
+    try std.testing.expect(config.window_pages_dropped == null);
+    try std.testing.expect(config.gauge_dropped == null);
 
     var empty = try loadDataForTest("{}");
     defer empty.deinit(std.testing.allocator);
     try std.testing.expectEqual(layout.window_pages_default, empty.window_pages);
     try std.testing.expectEqual(gauge_default.percent_warning, empty.gauge.percent_warning);
     try std.testing.expectEqual(gauge_default.percent_error, empty.gauge.percent_error);
-    try std.testing.expect(empty.dropped_window_pages == null);
-    try std.testing.expect(empty.dropped_gauge == null);
+    try std.testing.expect(empty.window_pages_dropped == null);
+    try std.testing.expect(empty.gauge_dropped == null);
 }
 
 test "a page count Drinky cannot use falls back to the default and is reported" {
@@ -852,7 +877,7 @@ test "a page count Drinky cannot use falls back to the default and is reported" 
         var config = try loadDataForTest(data);
         defer config.deinit(std.testing.allocator);
         try std.testing.expectEqual(layout.window_pages_default, config.window_pages);
-        try std.testing.expectEqual(@as(?usize, configured), config.dropped_window_pages);
+        try std.testing.expectEqual(@as(?usize, configured), config.window_pages_dropped);
     }
 
     const edges = [_]usize{ layout.window_pages_min, layout.window_pages_max };
@@ -866,7 +891,7 @@ test "a page count Drinky cannot use falls back to the default and is reported" 
         var config = try loadDataForTest(data);
         defer config.deinit(std.testing.allocator);
         try std.testing.expectEqual(configured, config.window_pages);
-        try std.testing.expect(config.dropped_window_pages == null);
+        try std.testing.expect(config.window_pages_dropped == null);
     }
 }
 
@@ -888,34 +913,34 @@ test "gauge shares Drinky cannot use fall back to the compiled pair and are repo
         defer config.deinit(std.testing.allocator);
         try std.testing.expectEqual(gauge_default.percent_warning, config.gauge.percent_warning);
         try std.testing.expectEqual(gauge_default.percent_error, config.gauge.percent_error);
-        try std.testing.expect(config.dropped_gauge != null);
+        try std.testing.expect(config.gauge_dropped != null);
     }
 
     var config = try loadDataForTest(
         \\{ "interface": { "gauge_percent_warning": 90, "gauge_percent_error": 40 } }
     );
     defer config.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(f64, 90), config.dropped_gauge.?.percent_warning);
-    try std.testing.expectEqual(@as(f64, 40), config.dropped_gauge.?.percent_error);
+    try std.testing.expectEqual(@as(f64, 90), config.gauge_dropped.?.percent_warning);
+    try std.testing.expectEqual(@as(f64, 40), config.gauge_dropped.?.percent_error);
 
     var edges = try loadDataForTest(
         \\{ "interface": { "gauge_percent_warning": 0, "gauge_percent_error": 100 } }
     );
     defer edges.deinit(std.testing.allocator);
-    try std.testing.expect(edges.dropped_gauge == null);
+    try std.testing.expect(edges.gauge_dropped == null);
     var equal = try loadDataForTest(
         \\{ "interface": { "gauge_percent_warning": 50, "gauge_percent_error": 50 } }
     );
     defer equal.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(f64, 50), equal.gauge.percent_warning);
-    try std.testing.expect(equal.dropped_gauge == null);
+    try std.testing.expect(equal.gauge_dropped == null);
 }
 
 test "a command timeout Drinky cannot use falls back to the default and is reported" {
     const cases = [_]u64{
         0,
-        ai.tool.Context.Bash.timeout_ms_min - 1,
-        ai.tool.Context.Bash.timeout_ms_max + 1,
+        tools.Context.Bash.timeout_ms_min - 1,
+        tools.Context.Bash.timeout_ms_max + 1,
     };
     for (cases) |configured| {
         const data = try std.fmt.allocPrint(
@@ -927,10 +952,10 @@ test "a command timeout Drinky cannot use falls back to the default and is repor
         var config = try loadDataForTest(data);
         defer config.deinit(std.testing.allocator);
         try std.testing.expectEqual(bash_default.timeout_ms, config.bash.timeout_ms);
-        try std.testing.expectEqual(@as(?u64, configured), config.dropped_bash_timeout_ms);
+        try std.testing.expectEqual(@as(?u64, configured), config.bash_timeout_ms_dropped);
     }
 
-    const edges = [_]u64{ ai.tool.Context.Bash.timeout_ms_min, ai.tool.Context.Bash.timeout_ms_max };
+    const edges = [_]u64{ tools.Context.Bash.timeout_ms_min, tools.Context.Bash.timeout_ms_max };
     for (edges) |configured| {
         const data = try std.fmt.allocPrint(
             std.testing.allocator,
@@ -941,31 +966,30 @@ test "a command timeout Drinky cannot use falls back to the default and is repor
         var config = try loadDataForTest(data);
         defer config.deinit(std.testing.allocator);
         try std.testing.expectEqual(configured, config.bash.timeout_ms);
-        try std.testing.expect(config.dropped_bash_timeout_ms == null);
+        try std.testing.expect(config.bash_timeout_ms_dropped == null);
     }
 }
 
-test "a configured number that no counter can hold fails the load" {
-    try std.testing.expectError(error.Overflow, loadDataForTest(
+test "a configured number that no counter can hold is a load error" {
+    try expectLoadError(error.Overflow,
         \\{ "bash": { "timeout_ms": -1 } }
-    ));
-    try std.testing.expectError(error.Overflow, loadDataForTest(
+    );
+    try expectLoadError(error.Overflow,
         \\{ "request": { "anthropic_idle_timeout_ms": 99999999999999999999 } }
-    ));
-
-    try std.testing.expectError(error.Overflow, loadDataForTest(
+    );
+    try expectLoadError(error.Overflow,
         \\{ "bash": { "timeout_ms": 1.8446744073709552e19 } }
-    ));
-    try std.testing.expectError(error.Overflow, loadDataForTest(
+    );
+    try expectLoadError(error.Overflow,
         \\{ "request": { "openai_idle_timeout_ms": 18446744073709551616.0 } }
-    ));
+    );
 
     var config = try loadDataForTest(
         \\{ "bash": { "timeout_ms": 3e5 } }
     );
     defer config.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u64, 300_000), config.bash.timeout_ms);
-    try std.testing.expect(config.dropped_bash_timeout_ms == null);
+    try std.testing.expect(config.bash_timeout_ms_dropped == null);
 }
 
 test "load fills missing fields and sections from defaults" {
@@ -975,33 +999,25 @@ test "load fills missing fields and sections from defaults" {
     defer partial.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u32, 7), partial.retry.attempts_max);
     try std.testing.expectEqual(
-        timeouts_default.anthropic.connect_ms,
-        partial.timeouts.anthropic.connect_ms,
+        accounts.Registry.timeouts_default.get(.anthropic).connect_ms,
+        partial.timeouts.get(.anthropic).connect_ms,
     );
-    try std.testing.expectEqual(retry_default.backoff_ms_initial, partial.retry.backoff_ms_initial);
+    try std.testing.expectEqual(
+        retry_default.backoff.delay_ms_initial,
+        partial.retry.backoff.delay_ms_initial,
+    );
     try std.testing.expectEqual(bash_default.lines_max, partial.bash.lines_max);
     try std.testing.expectEqual(bash_default.bytes_max, partial.bash.bytes_max);
     try std.testing.expectEqual(bash_default.timeout_ms, partial.bash.timeout_ms);
 
     var empty = try loadDataForTest("{}");
     defer empty.deinit(std.testing.allocator);
-    try std.testing.expectEqual(
-        timeouts_default.anthropic.idle_ms,
-        empty.timeouts.anthropic.idle_ms,
-    );
-    try std.testing.expectEqual(timeouts_default.openai.idle_ms, empty.timeouts.openai.idle_ms);
-    try std.testing.expectEqual(timeouts_default.xai.idle_ms, empty.timeouts.xai.idle_ms);
-    try std.testing.expectEqual(timeouts_default.google.idle_ms, empty.timeouts.google.idle_ms);
-    try std.testing.expectEqual(
-        timeouts_default.openrouter.idle_ms,
-        empty.timeouts.openrouter.idle_ms,
-    );
-    try std.testing.expectEqual(
-        timeouts_default.deepseek.idle_ms,
-        empty.timeouts.deepseek.idle_ms,
-    );
-    try std.testing.expectEqual(timeouts_default.ds4.connect_ms, empty.timeouts.ds4.connect_ms);
-    try std.testing.expectEqual(timeouts_default.ds4.idle_ms, empty.timeouts.ds4.idle_ms);
+    for (std.enums.values(accounts.Account.Vendor)) |vendor| {
+        try std.testing.expectEqual(
+            accounts.Registry.timeouts_default.get(vendor),
+            empty.timeouts.get(vendor),
+        );
+    }
     try std.testing.expectEqual(retry_default.attempts_max, empty.retry.attempts_max);
     try std.testing.expectEqual(@as(usize, 0), empty.user_instructions.files().len);
 }
@@ -1018,25 +1034,16 @@ test "load reads the required skills in file order" {
     try std.testing.expectEqualStrings("src/**/*.ts", config.required_skills[1].glob);
     try std.testing.expectEqualStrings("ts-style", config.required_skills[1].skill);
 
-    try std.testing.expectError(error.MissingField, loadDataForTest(
+    try expectLoadError(error.MissingField,
         \\{ "required_skills": [{ "glob": "**/*.zig" }] }
-    ));
-    try std.testing.expectError(error.UnexpectedToken, loadDataForTest(
+    );
+    try expectLoadError(error.UnexpectedToken,
         \\{ "required_skills": [{ "glob": "**/*.zig", "skill": ["zig-style"] }] }
-    ));
+    );
 
     var empty = try loadDataForTest("{}");
     defer empty.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 0), empty.required_skills.len);
-}
-
-test "a stale default_models key reads as an unknown key" {
-    var config = try loadDataForTest(
-        \\{ "default_models": { "anthropic-plan": "claude-sonnet-5" } }
-    );
-    defer config.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 1), config.unknown_keys.len);
-    try std.testing.expectEqualStrings("default_models", config.unknown_keys[0]);
 }
 
 test "load resolves default_effort, dropping an unknown level" {
@@ -1044,46 +1051,34 @@ test "load resolves default_effort, dropping an unknown level" {
         \\{ "default_effort": "max" }
     );
     defer config.deinit(std.testing.allocator);
-    try std.testing.expectEqual(ai.llm.Effort.max, config.default_effort.?);
-    try std.testing.expect(config.dropped_effort == null);
+    try std.testing.expectEqual(core.Provider.Effort.max, config.effort_default.?);
+    try std.testing.expect(config.effort_dropped == null);
 
     var dropped = try loadDataForTest(
         \\{ "default_effort": "enormous" }
     );
     defer dropped.deinit(std.testing.allocator);
-    try std.testing.expect(dropped.default_effort == null);
-    try std.testing.expectEqualStrings("enormous", dropped.dropped_effort.?);
+    try std.testing.expect(dropped.effort_default == null);
+    try std.testing.expectEqualStrings("enormous", dropped.effort_dropped.?);
 
     var empty = try loadDataForTest("{}");
     defer empty.deinit(std.testing.allocator);
-    try std.testing.expect(empty.default_effort == null);
-    try std.testing.expect(empty.dropped_effort == null);
+    try std.testing.expect(empty.effort_default == null);
+    try std.testing.expect(empty.effort_dropped == null);
 }
 
 test "a configured name must be a JSON string" {
-    try std.testing.expectError(
-        error.UnexpectedToken,
-        loadDataForTest(
-            \\{ "user_instructions": { "path": "instructions.md" } }
-        ),
+    try expectLoadError(error.UnexpectedToken,
+        \\{ "user_instructions": { "path": "instructions.md" } }
     );
-    try std.testing.expectError(
-        error.UnexpectedToken,
-        loadDataForTest(
-            \\{ "user_instructions": [{ "path": ["one.md", "two.md"] }] }
-        ),
+    try expectLoadError(error.UnexpectedToken,
+        \\{ "user_instructions": [{ "path": ["one.md", "two.md"] }] }
     );
-    try std.testing.expectError(
-        error.UnexpectedToken,
-        loadDataForTest(
-            \\{ "user_instructions": [{ "path": [105, 110, 115, 116, 114] }] }
-        ),
+    try expectLoadError(error.UnexpectedToken,
+        \\{ "user_instructions": [{ "path": [105, 110, 115, 116, 114] }] }
     );
-    try std.testing.expectError(
-        error.MissingField,
-        loadDataForTest(
-            \\{ "user_instructions": [{}] }
-        ),
+    try expectLoadError(error.MissingField,
+        \\{ "user_instructions": [{}] }
     );
 }
 
@@ -1094,7 +1089,7 @@ test "load applies the known keys and reports the unknown ones" {
         \\  "future": { "x": 1 }, "default_effot": "high" }
     );
     defer config.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u64, 42), config.timeouts.anthropic.connect_ms);
+    try std.testing.expectEqual(@as(u64, 42), config.timeouts.get(.anthropic).connect_ms);
     try std.testing.expectEqual(@as(usize, 4), config.unknown_keys.len);
     try std.testing.expectEqualStrings("request.connect_timeout", config.unknown_keys[0]);
     try std.testing.expectEqualStrings("user_instructions[0].pth", config.unknown_keys[1]);
@@ -1125,7 +1120,7 @@ test "the scan reaches an entry past the instruction-file cap" {
     try data.writer.writeAll(
         \\{ "user_instructions": [
     );
-    for (0..ai.instructions.files_max + 1) |index| {
+    for (0..discovery.instructions.files_max + 1) |index| {
         try data.writer.print("{{\"path\":\"f{d}.md\"}},", .{index});
     }
     try data.writer.writeAll(
@@ -1136,83 +1131,60 @@ test "the scan reaches an entry past the instruction-file cap" {
     defer config.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), config.unknown_keys.len);
     try std.testing.expectEqualStrings(
-        std.fmt.comptimePrint("user_instructions[{d}].typo", .{ai.instructions.files_max + 1}),
+        std.fmt.comptimePrint(
+            "user_instructions[{d}].typo",
+            .{discovery.instructions.files_max + 1},
+        ),
         config.unknown_keys[0],
     );
     try std.testing.expect(!config.unknown_keys_omitted);
 }
 
-test "the config document describes every key of the file, and only those" {
-    try std.testing.expectEqual(@as(usize, keys.len), leaves.len);
-    try std.testing.expect(isLeafPath("bash.timeout_ms"));
-    try std.testing.expect(isLeafPath("default_effort"));
-    try std.testing.expect(isLeafPath("user_instructions[].path"));
-    try std.testing.expect(!isLeafPath("bash"));
-    try std.testing.expect(!isLeafPath("nope"));
-    try std.testing.expect(hasField(File.Request, "attempts_max"));
-    try std.testing.expect(!hasField(File.Request, "nope"));
-
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        key_lines,
-        std.fmt.comptimePrint("integer, default: {d}", .{bash_default.timeout_ms}),
-    ) != null);
-}
-
-test "the config document names the file and its own example loads clean" {
+test "the config document names the file, each key, and each limit, and its example loads clean" {
     const gpa = std.testing.allocator;
     var config = try loadDataForTest("{}");
     defer config.deinit(gpa);
 
     const text = try config.document(gpa, .xhigh);
     defer gpa.free(text);
-    try std.testing.expect(std.mem.indexOf(u8, text, "/unused/config.json") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "`bash.timeout_ms`") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "low, medium, high, xhigh, max") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "This file names no model") != null);
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        text,
-        "`user_instructions[].path` — string, required.",
-    ) != null);
-
-    try std.testing.expect(std.mem.indexOf(u8, text, "`default_effort` — string, " ++
-        "default: unset.") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "default: none") == null);
-
-    try std.testing.expect(std.mem.indexOf(u8, text, "Without the key, Drinky uses " ++
-        "xhigh.") != null);
-
-    try std.testing.expect(std.mem.indexOf(u8, text, "still succeeds") != null);
-
-    try std.testing.expect(std.mem.indexOf(u8, text, "outranks this file") != null);
-    try std.testing.expectEqual(
-        @as(usize, 1),
-        std.mem.count(u8, text, "Only a new project reads it."),
-    );
-
-    try std.testing.expect(std.mem.indexOf(u8, text, "retry-after") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "keepalive") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "folds a level") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, config.path) != null);
+    for (leaves) |leaf| {
+        const line = try std.fmt.allocPrint(gpa, "- `{s}` — {s}", .{ leaf.path, leaf.type_name });
+        defer gpa.free(line);
+        try std.testing.expect(std.mem.indexOf(u8, text, line) != null);
+    }
+    const stated_keys = [_][]const u8{
+        std.fmt.comptimePrint(
+            "- `bash.timeout_ms` — integer, default: {d}.",
+            .{bash_default.timeout_ms},
+        ),
+        "- `default_effort` — string, default: unset.",
+        "- `user_instructions[].path` — string, required.",
+    };
+    for (stated_keys) |line| try std.testing.expect(std.mem.indexOf(u8, text, line) != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, effort_levels) != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "uses xhigh.") != null);
+    for (&accounts.Account.table) |*row| {
+        const setting = row.setting() orelse continue;
+        const line = try std.fmt.allocPrint(gpa, "- `{s}`: {s}\n", .{ row.id, setting });
+        defer gpa.free(line);
+        try std.testing.expect(std.mem.indexOf(u8, text, line) != null);
+    }
     try std.testing.expect(std.mem.indexOf(u8, text, std.fmt.comptimePrint(
         "count must be from {d} to {d}",
         .{ layout.window_pages_min, layout.window_pages_max },
     )) != null);
     try std.testing.expect(std.mem.indexOf(u8, text, std.fmt.comptimePrint(
         "at most {d} files",
-        .{ai.instructions.files_max},
+        .{discovery.instructions.files_max},
     )) != null);
 
     var from_example = try loadDataForTest(example);
     defer from_example.deinit(gpa);
     try std.testing.expectEqual(@as(usize, 0), from_example.unknown_keys.len);
-    try std.testing.expect(from_example.dropped_effort == null);
-    try std.testing.expectEqual(ai.llm.Effort.high, from_example.default_effort.?);
-    try std.testing.expectEqual(@as(u64, 90_000), from_example.timeouts.anthropic.idle_ms);
-    try std.testing.expectEqual(
-        timeouts_default.openai.idle_ms,
-        from_example.timeouts.openai.idle_ms,
-    );
+    try std.testing.expect(from_example.effort_dropped == null);
+    try std.testing.expectEqual(core.Provider.Effort.high, from_example.effort_default.?);
+    try std.testing.expectEqual(@as(u32, 5), from_example.retry.attempts_max);
     try std.testing.expectEqual(@as(u64, 300_000), from_example.bash.timeout_ms);
     try std.testing.expectEqual(@as(usize, 12), from_example.window_pages);
 }
@@ -1220,10 +1192,10 @@ test "the config document names the file and its own example loads clean" {
 test "load resolves user instruction paths against the config directory in order" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+    var tree: testing.Tree = try .init();
+    defer tree.deinit();
 
-    var drinky_directory = try tmp.dir.createDirPathOpen(io, ".drinky", .{});
+    var drinky_directory = try tree.tmp.dir.createDirPathOpen(io, ".drinky", .{});
     defer drinky_directory.close(io);
     try drinky_directory.writeFile(io, .{
         .sub_path = "config.json",
@@ -1237,8 +1209,7 @@ test "load resolves user instruction paths against the config directory in order
     });
     try drinky_directory.writeFile(io, .{ .sub_path = "first.md", .data = "First.\n" });
     try drinky_directory.writeFile(io, .{ .sub_path = "second.md", .data = "Second.\n" });
-    const home = try tmpPath(gpa, io, &tmp, "");
-    defer gpa.free(home);
+    const home = tree.root;
 
     var config = try loadForTest(gpa, io, home);
     defer config.deinit(gpa);
@@ -1252,10 +1223,10 @@ test "load resolves user instruction paths against the config directory in order
     try std.testing.expectEqualStrings("Second.\n", files[0].content);
     try std.testing.expectEqualStrings(first_path, files[1].path);
     try std.testing.expectEqualStrings("First.\n", files[1].content);
-    try std.testing.expectEqual(@as(usize, 1), config.user_instructions.notices().len);
+    try std.testing.expectEqual(@as(usize, 1), config.user_instructions.reports.messages().len);
     try std.testing.expect(std.mem.indexOf(
         u8,
-        config.user_instructions.notices()[0].text,
+        config.user_instructions.reports.messages()[0].content,
         "missing.md",
     ) != null);
 }
@@ -1263,24 +1234,19 @@ test "load resolves user instruction paths against the config directory in order
 test "load accepts an absolute path to user instructions" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+    var tree: testing.Tree = try .init();
+    defer tree.deinit();
 
-    var drinky_directory = try tmp.dir.createDirPathOpen(io, ".drinky", .{});
+    var drinky_directory = try tree.tmp.dir.createDirPathOpen(io, ".drinky", .{});
     defer drinky_directory.close(io);
-    try tmp.dir.writeFile(io, .{
-        .sub_path = "instructions.md",
-        .data = "Use the configured absolute path.",
-    });
-    const instructions_path = try tmpPath(gpa, io, &tmp, "instructions.md");
-    defer gpa.free(instructions_path);
+    try tree.write("instructions.md", "Use the configured absolute path.");
+    const instructions_path = try tree.path("instructions.md");
     const config_data = try std.json.Stringify.valueAlloc(gpa, .{
         .user_instructions = &.{.{ .path = instructions_path }},
     }, .{});
     defer gpa.free(config_data);
     try drinky_directory.writeFile(io, .{ .sub_path = "config.json", .data = config_data });
-    const home = try tmpPath(gpa, io, &tmp, "");
-    defer gpa.free(home);
+    const home = tree.root;
 
     var config = try loadForTest(gpa, io, home);
     defer config.deinit(gpa);
@@ -1292,27 +1258,50 @@ test "load accepts an absolute path to user instructions" {
 test "an absent config file loads the built-in defaults" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+    var tree: testing.Tree = try .init();
+    defer tree.deinit();
 
-    const home = try tmpPath(gpa, io, &tmp, "");
-    defer gpa.free(home);
+    const home = tree.root;
     var config = try loadForTest(gpa, io, home);
     defer config.deinit(gpa);
     try std.testing.expectEqual(
-        timeouts_default.anthropic.connect_ms,
-        config.timeouts.anthropic.connect_ms,
+        accounts.Registry.timeouts_default.get(.anthropic).connect_ms,
+        config.timeouts.get(.anthropic).connect_ms,
     );
     try std.testing.expectEqual(@as(usize, 0), config.user_instructions.files().len);
-    try std.testing.expectEqual(@as(usize, 0), config.user_instructions.notices().len);
+    try std.testing.expectEqual(@as(usize, 0), config.user_instructions.reports.messages().len);
+}
+
+test "a file that Drinky cannot parse keeps every default and its error" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tree: testing.Tree = try .init();
+    defer tree.deinit();
+    var drinky_directory = try tree.tmp.dir.createDirPathOpen(io, ".drinky", .{});
+    defer drinky_directory.close(io);
+    const home = tree.root;
+
+    const cases = [_]struct { data: []const u8, err: LoadError }{
+        .{ .data = "{ \"bash\": { \"timeout_ms\": 5000, } }", .err = error.SyntaxError },
+        .{ .data = "{ \"bash\": { \"timeout_ms\": true } }", .err = error.UnexpectedToken },
+        .{ .data = "{ \"bash\": { \"timeout_ms\": -1 } }", .err = error.Overflow },
+    };
+    for (cases) |case| {
+        try drinky_directory.writeFile(io, .{ .sub_path = "config.json", .data = case.data });
+        var config = try loadForTest(gpa, io, home);
+        defer config.deinit(gpa);
+        try std.testing.expectEqual(@as(?LoadError, case.err), config.load_error);
+        try std.testing.expectEqual(bash_default.timeout_ms, config.bash.timeout_ms);
+        try std.testing.expect(std.mem.endsWith(u8, config.path, "config.json"));
+    }
 }
 
 fn checkLoadAllocationFailure(gpa: std.mem.Allocator, io: std.Io, home: []const u8) !void {
     var config = try loadForTest(gpa, io, home);
     defer config.deinit(gpa);
     try std.testing.expectEqual(@as(usize, 1), config.user_instructions.files().len);
-    try std.testing.expectEqual(@as(usize, 1), config.user_instructions.notices().len);
-    try std.testing.expect(config.dropped_effort != null);
+    try std.testing.expectEqual(@as(usize, 1), config.user_instructions.reports.messages().len);
+    try std.testing.expect(config.effort_dropped != null);
     try std.testing.expectEqual(@as(usize, 2), config.unknown_keys.len);
     const text = try config.document(gpa, .xhigh);
     defer gpa.free(text);
@@ -1321,22 +1310,21 @@ fn checkLoadAllocationFailure(gpa: std.mem.Allocator, io: std.Io, home: []const 
 test "the config load frees every partial allocation" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+    var tree: testing.Tree = try .init();
+    defer tree.deinit();
 
-    var drinky_directory = try tmp.dir.createDirPathOpen(io, ".drinky", .{});
+    var drinky_directory = try tree.tmp.dir.createDirPathOpen(io, ".drinky", .{});
     defer drinky_directory.close(io);
     try drinky_directory.writeFile(io, .{ .sub_path = "first.md", .data = "First.\n" });
     try drinky_directory.writeFile(io, .{
         .sub_path = "config.json",
         .data =
         \\{ "user_instructions": [{ "path": "first.md" }, { "path": "missing.md" }],
-        \\  "default_models": { "openai-api-key": "nope" }, "default_effort": "nope",
+        \\  "future": { "openai-api-key": "nope" }, "default_effort": "nope",
         \\  "unknown": 1 }
         ,
     });
-    const home = try tmpPath(gpa, io, &tmp, "");
-    defer gpa.free(home);
+    const home = tree.root;
 
     try std.testing.checkAllAllocationFailures(gpa, checkLoadAllocationFailure, .{ io, home });
 }

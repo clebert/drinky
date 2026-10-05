@@ -9,22 +9,17 @@ pub const window_pages_default: usize = 8;
 pub const window_pages_min: usize = 1;
 pub const window_pages_max: usize = 64;
 
-const id_reserved = std.math.maxInt(usize) - 255;
-const id_status = id_reserved;
-const id_input = id_reserved + 1;
-const id_page = id_reserved + 2;
-
-fn idTool(index: usize) usize {
-    return id_reserved - 1 - index;
-}
+const id_page = std.math.maxInt(usize);
+const id_input = id_page - 1;
+const id_status = id_page - 2;
 
 pub const Scene = union(enum) {
     conversation: Conversation,
     page: *const ui.Page,
 
-    pub const Conversation = struct {
-        window_pages: usize = window_pages_default,
-        transcript: []const *ui.block.Entry,
+    const Conversation = struct {
+        window_pages: usize,
+        transcript: []ui.Block,
         tail: Tail,
         status: *const ui.status.Info,
     };
@@ -35,19 +30,19 @@ pub const Tail = union(enum) {
     turn: Turn,
     picking: Picking,
 
-    pub const Prompt = struct {
+    const Prompt = struct {
         caption: ?ui.Caption,
         editor: *const ui.Editor,
     };
 
-    pub const Picking = struct {
+    const Picking = struct {
         picker: *const ui.Picker,
         activity: ?ui.paint.Activity,
     };
 
-    pub const Turn = struct {
+    const Turn = struct {
         tools: []const ui.paint.Box,
-        tracks: []Track = &.{},
+        tracks: []Track,
         activity: ui.paint.Activity,
         caption: ?ui.Caption,
         editor: *const ui.Editor,
@@ -88,7 +83,7 @@ const EditorPresentation = struct {
 };
 
 const Component = union(enum) {
-    entry: *ui.block.Entry,
+    block: *ui.Block,
     tool_box: ui.paint.Box,
     editor: EditorPresentation,
     picker: Tail.Picking,
@@ -96,7 +91,7 @@ const Component = union(enum) {
 
     fn measure(self: *const Component, size: terminal.View.Size) usize {
         return switch (self.*) {
-            .entry => |entry| entry.rows(size.columns),
+            .block => |block| block.rows(size.columns),
             .tool_box => |box| ui.paint.boxRows(&box, size.columns),
             .editor => |presentation| presentation.rows(size),
             .status => 1,
@@ -111,7 +106,7 @@ const Component = union(enum) {
         viewport_rows: usize,
     ) !void {
         switch (self.*) {
-            .entry => |entry| try entry.render(gpa, placement),
+            .block => |block| try block.render(gpa, placement),
             .tool_box => |box| try ui.paint.box(placement, .tool_pending, &box),
             .status => |info| try ui.status.render(placement, info),
             .editor => |presentation| try presentation.render(placement, viewport_rows),
@@ -125,12 +120,17 @@ const Component = union(enum) {
 
 const Slot = struct { component: Component, id: usize, leading_blank: bool };
 
+fn idTool(index: usize) usize {
+    return id_status - 1 - index;
+}
+
 pub fn project(
     gpa: std.mem.Allocator,
     view: *terminal.View,
     size: terminal.View.Size,
     scene: *const Scene,
 ) !void {
+    std.debug.assert(size.columns > 0 and size.rows > 0);
     switch (scene.*) {
         .conversation => try projectConversation(gpa, view, size, &scene.conversation),
         .page => |page| try projectPage(view, size, page),
@@ -159,7 +159,7 @@ fn projectConversation(
     std.debug.assert(scene.window_pages >= window_pages_min);
     std.debug.assert(scene.window_pages <= window_pages_max);
     const total = scene.transcript.len + tailCount(&scene.tail) + 1;
-    const capacity = @max(size.rows, 1) * scene.window_pages;
+    const capacity = size.rows * scene.window_pages;
 
     var rows: usize = 0;
     var shown: usize = 0;
@@ -172,7 +172,7 @@ fn projectConversation(
     const epoch = view.resetEpoch();
     for (0..start) |index| if (slotRewritten(scene, index, epoch)) view.resetScreen();
     if (skip > 0 and slotRewritten(scene, start, epoch)) view.resetScreen();
-    for (scene.transcript[0..@min(start, scene.transcript.len)]) |entry| entry.release(gpa);
+    for (scene.transcript[0..@min(start, scene.transcript.len)]) |*block| block.release(gpa);
 
     const sink = try view.beginFrame(
         .{ .columns = size.columns, .rows = size.rows },
@@ -229,7 +229,7 @@ fn tailCount(tail: *const Tail) usize {
 
 fn slotAt(scene: *const Scene.Conversation, index: usize) Slot {
     if (index < scene.transcript.len) return .{
-        .component = .{ .entry = scene.transcript[index] },
+        .component = .{ .block = &scene.transcript[index] },
         .id = index,
         .leading_blank = index > 0,
     };
@@ -269,63 +269,16 @@ fn editorSlot(presentation: *const EditorPresentation) Slot {
     return .{ .component = .{ .editor = presentation.* }, .id = id_input, .leading_blank = true };
 }
 
-const test_status: ui.status.Info = .{
-    .directory = "~/work",
-    .branch = "main",
-    .context_tokens = 0,
-    .cache_usage = .{},
-    .cost = 0,
-    .context_window = 1000,
-    .model = "footerqq",
-    .effort = "high",
-    .account = .anthropic_plan,
-    .quota = null,
-    .quota_age_ms = 0,
-    .credits = null,
-    .turn_active = false,
-};
-
-fn shownEntries(
-    gpa: std.mem.Allocator,
-    entries: []ui.block.Entry,
-) !std.ArrayList(*ui.block.Entry) {
-    var shown: std.ArrayList(*ui.block.Entry) = .empty;
-    errdefer shown.deinit(gpa);
-    for (entries) |*entry| try shown.append(gpa, entry);
-    return shown;
-}
-
-fn projected(gpa: std.mem.Allocator, size: terminal.View.Size, scene: *const Scene) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var view = terminal.View.init(gpa, &out.writer);
-    defer view.deinit();
-    try project(gpa, &view, size, scene);
-    return gpa.dupe(u8, out.written());
-}
-
 test "projection stacks the transcript above the tail, newest at the bottom" {
     const gpa = std.testing.allocator;
-    var editor = ui.Editor.init(gpa);
-    defer editor.deinit();
+    var rig: Rig = .init();
+    defer rig.deinit();
 
-    var entries: std.ArrayList(ui.block.Entry) = .empty;
-    defer {
-        for (entries.items) |*entry| entry.deinit(gpa);
-        entries.deinit(gpa);
-    }
-    try entries.append(gpa, try ui.block.Entry.init(gpa, .intro, .{}, "introxx"));
-    try entries.append(gpa, try ui.block.Entry.init(gpa, .user, .{}, "useryy"));
-    try entries.append(gpa, try ui.block.Entry.init(gpa, .model, .{}, "replyzz"));
+    try rig.add(&.{ .intro = "introxx" });
+    try rig.add(&.{ .user = "useryy" });
+    try rig.add(&.{ .model = "replyzz" });
 
-    var shown = try shownEntries(gpa, entries.items);
-    defer shown.deinit(gpa);
-
-    const scene: Scene = .{ .conversation = .{
-        .transcript = shown.items,
-        .tail = .{ .prompt = .{ .caption = null, .editor = &editor } },
-        .status = &test_status,
-    } };
+    const scene = rig.prompt(&.{});
     const painted = try projected(gpa, .{ .columns = 40, .rows = 24 }, &scene);
     defer gpa.free(painted);
 
@@ -336,28 +289,108 @@ test "projection stacks the transcript above the tail, newest at the bottom" {
     try std.testing.expect(intro < user);
     try std.testing.expect(user < reply);
     try std.testing.expect(reply < footer);
-    try std.testing.expect(ui.block.paintedRows(painted) < 24);
+    try std.testing.expect(ui.testing.paintedRows(painted) < 24);
 }
+
+const test_status: ui.status.Info = .{
+    .directory = "~/work",
+    .branch = "main",
+    .context_tokens = 0,
+    .cache_usage = .{},
+    .cost = 0,
+    .context_window = 1000,
+    .model = "footerqq",
+    .effort = "high",
+    .account = "anthropic-plan",
+    .quota = null,
+    .quota_age_ms = 0,
+    .credits = null,
+    .turn_active = false,
+};
+
+fn projected(gpa: std.mem.Allocator, size: terminal.View.Size, scene: *const Scene) ![]u8 {
+    var screen: ui.testing.Rig = undefined;
+    screen.init(gpa);
+    defer screen.deinit();
+    try project(gpa, &screen.view, size, scene);
+    return gpa.dupe(u8, screen.out.written());
+}
+
+const Rig = struct {
+    editor: ui.Editor,
+    blocks: std.ArrayList(ui.Block),
+
+    const PromptOptions = struct {
+        window_pages: usize = window_pages_default,
+        caption: ?ui.Caption = null,
+    };
+
+    const TurnOptions = struct {
+        window_pages: usize = window_pages_default,
+        tools: []const ui.paint.Box = &.{},
+        tracks: []Track = &.{},
+        caption: ?ui.Caption = null,
+    };
+
+    fn init() Rig {
+        return .{ .editor = .init(std.testing.allocator), .blocks = .empty };
+    }
+
+    fn deinit(self: *Rig) void {
+        for (self.blocks.items) |*block| block.deinit(std.testing.allocator);
+        self.blocks.deinit(std.testing.allocator);
+        self.editor.deinit();
+    }
+
+    fn add(self: *Rig, source: *const ui.Block.Source) !void {
+        const gpa = std.testing.allocator;
+        var block: ui.Block = try .init(gpa, source);
+        errdefer block.deinit(gpa);
+        try self.blocks.append(gpa, block);
+    }
+
+    fn addModels(self: *Rig, first: usize, end: usize) !void {
+        for (first..end) |index| {
+            var buffer: [16]u8 = undefined;
+            try self.add(&.{ .model = try std.fmt.bufPrint(&buffer, "block{d}", .{index}) });
+        }
+    }
+
+    fn prompt(self: *Rig, options: *const PromptOptions) Scene {
+        return .{ .conversation = .{
+            .window_pages = options.window_pages,
+            .transcript = self.blocks.items,
+            .tail = .{ .prompt = .{ .caption = options.caption, .editor = &self.editor } },
+            .status = &test_status,
+        } };
+    }
+
+    fn turn(self: *Rig, options: *const TurnOptions) Scene {
+        return .{ .conversation = .{
+            .window_pages = options.window_pages,
+            .transcript = self.blocks.items,
+            .tail = .{ .turn = .{
+                .tools = options.tools,
+                .tracks = options.tracks,
+                .activity = .{ .motion_tick = 0, .progress_age_ticks = 0 },
+                .caption = options.caption,
+                .editor = &self.editor,
+            } },
+            .status = &test_status,
+        } };
+    }
+};
 
 test "a turn tail stacks tool boxes above the active editor" {
     const gpa = std.testing.allocator;
-    var editor = ui.Editor.init(gpa);
-    defer editor.deinit();
+    var rig: Rig = .init();
+    defer rig.deinit();
 
     const tools = [_]ui.paint.Box{
         .{ .text = "readbox" },
         .{ .text = "grepbox", .fit = .head },
     };
-    const scene: Scene = .{ .conversation = .{
-        .transcript = &.{},
-        .tail = .{ .turn = .{
-            .tools = &tools,
-            .activity = .{ .motion_tick = 0, .progress_age_ticks = 0 },
-            .caption = null,
-            .editor = &editor,
-        } },
-        .status = &test_status,
-    } };
+    const scene = rig.turn(&.{ .tools = &tools });
     const painted = try projected(gpa, .{ .columns = 40, .rows = 24 }, &scene);
     defer gpa.free(painted);
 
@@ -368,122 +401,63 @@ test "a turn tail stacks tool boxes above the active editor" {
     try std.testing.expect(first < second);
     try std.testing.expect(second < activity);
     try std.testing.expect(activity < footer);
-    try std.testing.expect(std.mem.indexOf(u8, painted, "Working…") == null);
+    try ui.testing.expectHides(painted, &.{"Working…"});
 }
 
-test "separator activity does not change the input tail height" {
+test "frame edge activity does not change the input tail height" {
     const gpa = std.testing.allocator;
-    var editor = ui.Editor.init(gpa);
-    defer editor.deinit();
+    var rig: Rig = .init();
+    defer rig.deinit();
 
-    const prompt: Scene = .{ .conversation = .{
-        .transcript = &.{},
-        .tail = .{ .prompt = .{ .caption = null, .editor = &editor } },
-        .status = &test_status,
-    } };
-    const turn: Scene = .{ .conversation = .{
-        .transcript = &.{},
-        .tail = .{ .turn = .{
-            .tools = &.{},
-            .activity = .{ .motion_tick = 0, .progress_age_ticks = 0 },
-            .caption = null,
-            .editor = &editor,
-        } },
-        .status = &test_status,
-    } };
+    const prompt = rig.prompt(&.{});
+    const turn = rig.turn(&.{});
     const prompt_painted = try projected(gpa, .{ .columns = 40, .rows = 24 }, &prompt);
     defer gpa.free(prompt_painted);
     const turn_painted = try projected(gpa, .{ .columns = 40, .rows = 24 }, &turn);
     defer gpa.free(turn_painted);
 
     try std.testing.expectEqual(
-        ui.block.paintedRows(prompt_painted),
-        ui.block.paintedRows(turn_painted),
+        ui.testing.paintedRows(prompt_painted),
+        ui.testing.paintedRows(turn_painted),
     );
 }
 
-test "a turn with 253 tool boxes keeps its anchor ids from wrapping" {
+test "a turn tail shows its input caption above the editor" {
     const gpa = std.testing.allocator;
-    var editor = ui.Editor.init(gpa);
-    defer editor.deinit();
+    var rig: Rig = .init();
+    defer rig.deinit();
 
-    const tools = [_]ui.paint.Box{.{ .text = "toolbox" }} ** 253;
-    const scene: Scene = .{ .conversation = .{
-        .transcript = &.{},
-        .tail = .{ .turn = .{
-            .tools = &tools,
-            .activity = .{ .motion_tick = 0, .progress_age_ticks = 0 },
-            .caption = null,
-            .editor = &editor,
-        } },
-        .status = &test_status,
-    } };
-    gpa.free(try projected(gpa, .{ .columns = 40, .rows = 24 }, &scene));
-
-    try std.testing.expect(idTool(252) < id_reserved);
-}
-
-test "a turn tail shows its steering caption above the editor" {
-    const gpa = std.testing.allocator;
-    var editor = ui.Editor.init(gpa);
-    defer editor.deinit();
-
-    const scene: Scene = .{ .conversation = .{
-        .transcript = &.{},
-        .tail = .{ .turn = .{
-            .tools = &.{},
-            .activity = .{ .motion_tick = 0, .progress_age_ticks = 0 },
-            .caption = .{
-                .title = "Queued messages: 2",
-                .controls = "Ctrl+P: Edit all",
-            },
-            .editor = &editor,
-        } },
-        .status = &test_status,
-    } };
+    const scene = rig.turn(&.{ .caption = .{
+        .title = "Remote: @drinky_bot",
+        .controls = "Esc: Detach",
+    } });
     const painted = try projected(gpa, .{ .columns = 40, .rows = 24 }, &scene);
     defer gpa.free(painted);
 
-    const title = std.mem.indexOf(u8, painted, "Queued messages: 2").?;
-    const control = std.mem.indexOf(u8, painted, "Ctrl+P: Edit all").?;
+    const title = std.mem.indexOf(u8, painted, "Remote: @drinky_bot").?;
+    const control = std.mem.indexOf(u8, painted, "Esc: Detach").?;
     const frame = std.mem.indexOf(u8, painted, "─").?;
     const footer = std.mem.indexOf(u8, painted, "footerqq").?;
     try std.testing.expect(title < control);
     try std.testing.expect(control < frame);
     try std.testing.expect(frame < footer);
-    try std.testing.expect(std.mem.indexOf(u8, painted, "fix the bug") == null);
 }
 
 test "a prompt tail shows its input caption above the editor" {
     const gpa = std.testing.allocator;
-    var editor = ui.Editor.init(gpa);
-    defer editor.deinit();
-    try editor.insert("draft text");
+    var rig: Rig = .init();
+    defer rig.deinit();
+    try rig.editor.insert("draft text");
 
-    var entries: std.ArrayList(ui.block.Entry) = .empty;
-    defer {
-        for (entries.items) |*entry| entry.deinit(gpa);
-        entries.deinit(gpa);
-    }
-    try entries.append(
-        gpa,
-        try ui.block.Entry.init(gpa, .event, .{ .is_error = true }, "the turn failed"),
-    );
+    try rig.add(&.{ .event = .{
+        .text = "the turn failed",
+        .severity = .failure,
+    } });
 
-    var shown = try shownEntries(gpa, entries.items);
-    defer shown.deinit(gpa);
-
-    const scene: Scene = .{ .conversation = .{
-        .transcript = shown.items,
-        .tail = .{ .prompt = .{
-            .caption = .{
-                .title = "Sign in: anthropic-plan",
-                .controls = "Enter: Replay callback URL · Esc: Cancel",
-            },
-            .editor = &editor,
-        } },
-        .status = &test_status,
-    } };
+    const scene = rig.prompt(&.{ .caption = .{
+        .title = "Sign in: anthropic-plan",
+        .controls = "Enter: Replay callback URL · Esc: Cancel",
+    } });
     const painted = try projected(gpa, .{ .columns = 80, .rows = 24 }, &scene);
     defer gpa.free(painted);
 
@@ -497,173 +471,114 @@ test "a prompt tail shows its input caption above the editor" {
     try std.testing.expect(control < draft);
     try std.testing.expect(draft < footer);
 
-    const bare: Scene = .{ .conversation = .{
-        .transcript = shown.items,
-        .tail = .{ .prompt = .{ .caption = null, .editor = &editor } },
-        .status = &test_status,
-    } };
+    const bare = rig.prompt(&.{});
     const without = try projected(gpa, .{ .columns = 80, .rows = 24 }, &bare);
     defer gpa.free(without);
-    try std.testing.expect(std.mem.indexOf(u8, without, "Sign in") == null);
+    try ui.testing.expectHides(without, &.{"Sign in"});
     try std.testing.expectEqual(
-        ui.block.paintedRows(painted),
-        ui.block.paintedRows(without) + 1,
+        ui.testing.paintedRows(painted),
+        ui.testing.paintedRows(without) + 1,
     );
 }
 
 test "a narrow editor caption keeps every row inside the window" {
     const gpa = std.testing.allocator;
-    var editor = ui.Editor.init(gpa);
-    defer editor.deinit();
+    var rig: Rig = .init();
+    defer rig.deinit();
 
-    const scene: Scene = .{ .conversation = .{
-        .transcript = &.{},
-        .tail = .{ .turn = .{
-            .tools = &.{},
-            .activity = .{ .motion_tick = 0, .progress_age_ticks = 0 },
-            .caption = .{
-                .title = "Queued messages: 1",
-                .controls = "Ctrl+P: Edit all",
-            },
-            .editor = &editor,
-        } },
-        .status = &test_status,
-    } };
+    const scene = rig.turn(&.{ .caption = .{
+        .title = "Remote: @drinky_bot",
+        .controls = "Esc: Detach",
+    } });
     const painted = try projected(gpa, .{ .columns = 8, .rows = 24 }, &scene);
     defer gpa.free(painted);
-    const plain = try terminal.View.plainText(gpa, painted);
+    const plain = try terminal.testing.plainText(gpa, painted);
     defer gpa.free(plain);
     var lines = std.mem.splitSequence(u8, plain, "\r\n");
     while (lines.next()) |row| {
         const line = std.mem.trimEnd(u8, row, "\r");
         try std.testing.expect(terminal.width.ofText(line) <= 8);
     }
-    try std.testing.expect(std.mem.indexOf(u8, plain, ui.paint.ellipsis) != null);
+    try ui.testing.expectShows(plain, &.{ui.paint.ellipsis});
 }
 
 test "projection clips the oldest block to fill the window exactly" {
     const gpa = std.testing.allocator;
-    var editor = ui.Editor.init(gpa);
-    defer editor.deinit();
+    var rig: Rig = .init();
+    defer rig.deinit();
 
-    var text = try ui.block.numberedLines(gpa, 60);
+    var text = try ui.testing.numberedLines(gpa, 60);
     defer text.deinit(gpa);
-    var entries: std.ArrayList(ui.block.Entry) = .empty;
-    defer {
-        for (entries.items) |*entry| entry.deinit(gpa);
-        entries.deinit(gpa);
-    }
-    try entries.append(gpa, try ui.block.Entry.init(gpa, .model, .{}, text.items));
+    try rig.add(&.{ .model = text.items });
 
-    var shown = try shownEntries(gpa, entries.items);
-    defer shown.deinit(gpa);
-
-    const scene: Scene = .{ .conversation = .{
-        .transcript = shown.items,
-        .tail = .{ .prompt = .{ .caption = null, .editor = &editor } },
-        .status = &test_status,
-    } };
+    const scene = rig.prompt(&.{});
     const rows: usize = 4;
     const painted = try projected(gpa, .{ .columns = 40, .rows = rows }, &scene);
     defer gpa.free(painted);
 
-    try std.testing.expectEqual(rows * window_pages_default, ui.block.paintedRows(painted));
-    try std.testing.expect(std.mem.indexOf(u8, painted, "L59") != null);
-    try std.testing.expect(std.mem.indexOf(u8, painted, "L0") == null);
-    try std.testing.expect(std.mem.indexOf(u8, painted, "footerqq") != null);
+    try std.testing.expectEqual(rows * window_pages_default, ui.testing.paintedRows(painted));
+    try ui.testing.expectShows(painted, &.{"L59"});
+    try ui.testing.expectHides(painted, &.{"L0"});
+    try ui.testing.expectShows(painted, &.{"footerqq"});
 }
 
 test "a repeated projection composes the rows of the first one" {
     const gpa = std.testing.allocator;
-    var editor = ui.Editor.init(gpa);
-    defer editor.deinit();
+    var rig: Rig = .init();
+    defer rig.deinit();
 
-    var entries: std.ArrayList(ui.block.Entry) = .empty;
-    defer {
-        for (entries.items) |*entry| entry.deinit(gpa);
-        entries.deinit(gpa);
-    }
-    try entries.append(gpa, try ui.block.Entry.init(gpa, .user, .{}, "useryy"));
-    try entries.append(gpa, try ui.block.Entry.init(gpa, .model, .{}, "## replyzz\n\nsome text"));
+    try rig.add(&.{ .user = "useryy" });
+    try rig.add(&.{ .model = "## replyzz\n\nsome text" });
 
-    var shown = try shownEntries(gpa, entries.items);
-    defer shown.deinit(gpa);
-
-    const scene: Scene = .{ .conversation = .{
-        .transcript = shown.items,
-        .tail = .{ .prompt = .{ .caption = null, .editor = &editor } },
-        .status = &test_status,
-    } };
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var view = terminal.View.init(gpa, &out.writer);
-    defer view.deinit();
+    const scene = rig.prompt(&.{});
+    var screen: ui.testing.Rig = undefined;
+    screen.init(gpa);
+    defer screen.deinit();
     const size: terminal.View.Size = .{ .columns = 40, .rows = 24 };
 
-    try project(gpa, &view, size, &scene);
-    const composed = out.written().len;
-    for (entries.items) |*entry| {
-        try std.testing.expectEqual(size.columns, entry.cache.columns);
-        try std.testing.expect(entry.cache.lines.count() > 0);
+    try project(gpa, &screen.view, size, &scene);
+    const composed = screen.out.written().len;
+    for (rig.blocks.items) |*block| {
+        try std.testing.expectEqual(size.columns, block.cache.columns);
+        try std.testing.expect(block.cache.lines.count() > 0);
     }
 
-    try project(gpa, &view, size, &scene);
-    const replayed = out.written()[composed..];
-    try std.testing.expect(std.mem.indexOf(u8, replayed, "useryy") == null);
-    try std.testing.expect(std.mem.indexOf(u8, replayed, "replyzz") == null);
+    try project(gpa, &screen.view, size, &scene);
+    const replayed = screen.out.written()[composed..];
+    try ui.testing.expectHides(replayed, &.{"useryy"});
+    try ui.testing.expectHides(replayed, &.{"replyzz"});
 
-    const streamed = out.written().len;
-    try entries.items[1].appendText(gpa, "\n\ngrownxx");
-    try project(gpa, &view, size, &scene);
-    const grown = out.written()[streamed..];
-    try std.testing.expect(std.mem.indexOf(u8, grown, "grownxx") != null);
-    try std.testing.expect(std.mem.indexOf(u8, grown, "useryy") == null);
+    const streamed = screen.out.written().len;
+    try rig.blocks.items[1].appendText(gpa, "\n\ngrownxx");
+    try project(gpa, &screen.view, size, &scene);
+    const grown = screen.out.written()[streamed..];
+    try ui.testing.expectShows(grown, &.{"grownxx"});
+    try ui.testing.expectHides(grown, &.{"useryy"});
 }
 
 test "a block outside the window releases the rows it retained" {
     const gpa = std.testing.allocator;
-    var editor = ui.Editor.init(gpa);
-    defer editor.deinit();
+    var rig: Rig = .init();
+    defer rig.deinit();
 
-    var entries: std.ArrayList(ui.block.Entry) = .empty;
-    defer {
-        for (entries.items) |*entry| entry.deinit(gpa);
-        entries.deinit(gpa);
-    }
-    for (0..6) |index| {
-        var buffer: [8]u8 = undefined;
-        const text = std.fmt.bufPrint(&buffer, "block{d}", .{index}) catch unreachable;
-        try entries.append(gpa, try ui.block.Entry.init(gpa, .model, .{}, text));
-    }
+    try rig.addModels(0, 6);
 
-    var shown = try shownEntries(gpa, entries.items);
-    defer shown.deinit(gpa);
-
-    const tall: Scene = .{ .conversation = .{
-        .transcript = shown.items,
-        .tail = .{ .prompt = .{ .caption = null, .editor = &editor } },
-        .status = &test_status,
-    } };
+    const tall = rig.prompt(&.{});
     gpa.free(try projected(gpa, .{ .columns = 40, .rows = 24 }, &tall));
-    for (entries.items) |*entry| try std.testing.expect(entry.cache.lines.count() > 0);
+    for (rig.blocks.items) |*block| try std.testing.expect(block.cache.lines.count() > 0);
 
-    const short: Scene = .{ .conversation = .{
-        .window_pages = window_pages_min,
-        .transcript = shown.items,
-        .tail = .{ .prompt = .{ .caption = null, .editor = &editor } },
-        .status = &test_status,
-    } };
+    const short = rig.prompt(&.{ .window_pages = window_pages_min });
     const painted = try projected(gpa, .{ .columns = 40, .rows = 8 }, &short);
     defer gpa.free(painted);
 
-    try std.testing.expect(std.mem.indexOf(u8, painted, "block0") == null);
-    try std.testing.expectEqual(@as(usize, 0), entries.items[0].cache.lines.count());
-    try std.testing.expect(entries.items[entries.items.len - 1].cache.lines.count() > 0);
-    for (entries.items, 0..) |*entry, index| {
-        var buffer: [8]u8 = undefined;
-        const text = std.fmt.bufPrint(&buffer, "block{d}", .{index}) catch unreachable;
+    try ui.testing.expectHides(painted, &.{"block0"});
+    try std.testing.expectEqual(@as(usize, 0), rig.blocks.items[0].cache.lines.count());
+    try std.testing.expect(rig.blocks.items[rig.blocks.items.len - 1].cache.lines.count() > 0);
+    for (rig.blocks.items, 0..) |*block, index| {
+        var buffer: [16]u8 = undefined;
+        const text = try std.fmt.bufPrint(&buffer, "block{d}", .{index});
         if (std.mem.indexOf(u8, painted, text) != null) continue;
-        try std.testing.expectEqual(@as(usize, 0), entry.cache.lines.count());
+        try std.testing.expectEqual(@as(usize, 0), block.cache.lines.count());
     }
 }
 
@@ -673,194 +588,135 @@ fn resetSince(written: []const u8, painted: usize) bool {
 
 test "a block that changes above the window forces a reset" {
     const gpa = std.testing.allocator;
-    var editor = ui.Editor.init(gpa);
-    defer editor.deinit();
+    var rig: Rig = .init();
+    defer rig.deinit();
     const size: terminal.View.Size = .{ .columns = 40, .rows = 12 };
 
-    var entries: std.ArrayList(ui.block.Entry) = .empty;
-    defer {
-        for (entries.items) |*entry| entry.deinit(gpa);
-        entries.deinit(gpa);
-    }
-    try entries.append(gpa, try ui.block.Entry.init(gpa, .event, .{}, "waiting"));
-    try entries.append(gpa, try ui.block.Entry.init(gpa, .model, .{}, "block0"));
-    var shown = try shownEntries(gpa, entries.items);
-    defer shown.deinit(gpa);
+    try rig.add(&.{ .event = .{ .text = "waiting" } });
+    try rig.add(&.{ .model = "block0" });
 
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var view = terminal.View.init(gpa, &out.writer);
-    defer view.deinit();
-    const scene: Scene = .{ .conversation = .{
-        .window_pages = window_pages_min,
-        .transcript = shown.items,
-        .tail = .{ .prompt = .{ .caption = null, .editor = &editor } },
-        .status = &test_status,
-    } };
-    try project(gpa, &view, size, &scene);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "waiting") != null);
+    var screen: ui.testing.Rig = undefined;
+    screen.init(gpa);
+    defer screen.deinit();
+    const scene = rig.prompt(&.{ .window_pages = window_pages_min });
+    try project(gpa, &screen.view, size, &scene);
+    try ui.testing.expectShows(screen.out.written(), &.{"waiting"});
 
-    for (1..7) |index| {
-        var buffer: [8]u8 = undefined;
-        const text = std.fmt.bufPrint(&buffer, "block{d}", .{index}) catch unreachable;
-        try entries.append(gpa, try ui.block.Entry.init(gpa, .model, .{}, text));
-    }
-    shown.deinit(gpa);
-    shown = try shownEntries(gpa, entries.items);
-    const slid: Scene = .{ .conversation = .{
-        .window_pages = window_pages_min,
-        .transcript = shown.items,
-        .tail = .{ .prompt = .{ .caption = null, .editor = &editor } },
-        .status = &test_status,
-    } };
-    var painted = out.written().len;
-    try project(gpa, &view, size, &slid);
-    try std.testing.expect(std.mem.indexOf(u8, out.written()[painted..], "block6") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.written()[painted..], "block0") == null);
-    try std.testing.expect(!resetSince(out.written(), painted));
+    try rig.addModels(1, 7);
+    const slid = rig.prompt(&.{ .window_pages = window_pages_min });
+    var painted = screen.out.written().len;
+    try project(gpa, &screen.view, size, &slid);
+    try ui.testing.expectShows(screen.out.written()[painted..], &.{"block6"});
+    try ui.testing.expectHides(screen.out.written()[painted..], &.{"block0"});
+    try std.testing.expect(!resetSince(screen.out.written(), painted));
 
-    try entries.items[0].replaceEvent(gpa, .{}, "changed above");
-    painted = out.written().len;
-    try project(gpa, &view, size, &slid);
-    try std.testing.expect(resetSince(out.written(), painted));
-    painted = out.written().len;
-    try project(gpa, &view, size, &slid);
-    try std.testing.expect(!resetSince(out.written(), painted));
+    try rig.blocks.items[0].replaceEvent(gpa, &.{ .text = "changed above" });
+    painted = screen.out.written().len;
+    try project(gpa, &screen.view, size, &slid);
+    try std.testing.expect(resetSince(screen.out.written(), painted));
+    painted = screen.out.written().len;
+    try project(gpa, &screen.view, size, &slid);
+    try std.testing.expect(!resetSince(screen.out.written(), painted));
 
-    try entries.items[0].replaceEvent(gpa, .{}, "changed again");
-    painted = out.written().len;
-    try project(gpa, &view, size, &slid);
-    try std.testing.expect(!resetSince(out.written(), painted));
+    try rig.blocks.items[0].replaceEvent(gpa, &.{ .text = "changed again" });
+    painted = screen.out.written().len;
+    try project(gpa, &screen.view, size, &slid);
+    try std.testing.expect(!resetSince(screen.out.written(), painted));
 
-    var reply = try ui.block.numberedLines(gpa, 20);
+    var reply = try ui.testing.numberedLines(gpa, 20);
     defer reply.deinit(gpa);
-    try entries.append(gpa, try ui.block.Entry.init(gpa, .model, .{}, reply.items));
-    shown.deinit(gpa);
-    shown = try shownEntries(gpa, entries.items);
-    const streaming: Scene = .{ .conversation = .{
-        .window_pages = window_pages_min,
-        .transcript = shown.items,
-        .tail = .{ .prompt = .{ .caption = null, .editor = &editor } },
-        .status = &test_status,
-    } };
-    try project(gpa, &view, size, &streaming);
+    try rig.add(&.{ .model = reply.items });
+    const streaming = rig.prompt(&.{ .window_pages = window_pages_min });
+    try project(gpa, &screen.view, size, &streaming);
     for (0..4) |_| {
-        try entries.items[entries.items.len - 1].appendText(gpa, "\nmore");
-        painted = out.written().len;
-        try project(gpa, &view, size, &streaming);
-        try std.testing.expect(std.mem.indexOf(u8, out.written()[painted..], "more") != null);
-        try std.testing.expect(!resetSince(out.written(), painted));
+        try rig.blocks.items[rig.blocks.items.len - 1].appendText(gpa, "\nmore");
+        painted = screen.out.written().len;
+        try project(gpa, &screen.view, size, &streaming);
+        try ui.testing.expectShows(screen.out.written()[painted..], &.{"more"});
+        try std.testing.expect(!resetSince(screen.out.written(), painted));
     }
 
-    var fresh_out: std.Io.Writer.Allocating = .init(gpa);
-    defer fresh_out.deinit();
-    var fresh_view = terminal.View.init(gpa, &fresh_out.writer);
-    defer fresh_view.deinit();
-    var unseen = try ui.block.Entry.init(gpa, .event, .{}, "unseen");
-    defer unseen.deinit(gpa);
-    var fresh: std.ArrayList(*ui.block.Entry) = .empty;
-    defer fresh.deinit(gpa);
-    try fresh.append(gpa, &unseen);
-    for (entries.items[1..]) |*entry| try fresh.append(gpa, entry);
-    const hidden: Scene = .{ .conversation = .{
-        .window_pages = window_pages_min,
-        .transcript = fresh.items,
-        .tail = .{ .prompt = .{ .caption = null, .editor = &editor } },
-        .status = &test_status,
-    } };
-    try project(gpa, &fresh_view, size, &hidden);
-    try std.testing.expect(std.mem.indexOf(u8, fresh_out.written(), "unseen") == null);
-    try unseen.replaceEvent(gpa, .{}, "changed unseen");
-    painted = fresh_out.written().len;
-    try project(gpa, &fresh_view, size, &hidden);
-    try std.testing.expect(!resetSince(fresh_out.written(), painted));
+    var fresh_screen: ui.testing.Rig = undefined;
+    fresh_screen.init(gpa);
+    defer fresh_screen.deinit();
+    var fresh_rig: Rig = .init();
+    defer fresh_rig.deinit();
+    try fresh_rig.add(&.{ .event = .{ .text = "unseen" } });
+    for (rig.blocks.items[1..]) |*block| {
+        const text = block.content.model.items;
+        try fresh_rig.add(&.{ .model = text });
+    }
+    const hidden = fresh_rig.prompt(&.{ .window_pages = window_pages_min });
+    try project(gpa, &fresh_screen.view, size, &hidden);
+    try ui.testing.expectHides(fresh_screen.out.written(), &.{"unseen"});
+    try fresh_rig.blocks.items[0].replaceEvent(gpa, &.{ .text = "changed unseen" });
+    painted = fresh_screen.out.written().len;
+    try project(gpa, &fresh_screen.view, size, &hidden);
+    try std.testing.expect(!resetSince(fresh_screen.out.written(), painted));
 }
 
 test "a tool box that changes above the window forces a reset" {
     const gpa = std.testing.allocator;
-    var editor = ui.Editor.init(gpa);
-    defer editor.deinit();
+    var rig: Rig = .init();
+    defer rig.deinit();
 
     var tools: [6]ui.paint.Box = undefined;
     for (&tools, 0..) |*box, index| {
-        var buffer: [8]u8 = undefined;
-        const text = std.fmt.bufPrint(&buffer, "tool{d}", .{index}) catch unreachable;
+        var buffer: [16]u8 = undefined;
+        const text = try std.fmt.bufPrint(&buffer, "tool{d}", .{index});
         box.* = .{ .text = try gpa.dupe(u8, text), .fit = .head };
     }
     defer for (tools) |box| gpa.free(box.text);
     var tracks = [_]Track{.{}} ** tools.len;
 
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var view = terminal.View.init(gpa, &out.writer);
-    defer view.deinit();
+    var screen: ui.testing.Rig = undefined;
+    screen.init(gpa);
+    defer screen.deinit();
     const size: terminal.View.Size = .{ .columns = 40, .rows = 12 };
-    const scene: Scene = .{ .conversation = .{
-        .window_pages = window_pages_min,
-        .transcript = &.{},
-        .tail = .{ .turn = .{
-            .tools = &tools,
-            .tracks = &tracks,
-            .activity = .{ .motion_tick = 0, .progress_age_ticks = 0 },
-            .caption = null,
-            .editor = &editor,
-        } },
-        .status = &test_status,
-    } };
-    for (&tracks) |*track| track.epoch = view.resetEpoch();
-    try project(gpa, &view, size, &scene);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "tool0") == null);
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), "tool5") != null);
+    const scene = rig.turn(
+        &.{ .window_pages = window_pages_min, .tools = &tools, .tracks = &tracks },
+    );
+    for (&tracks) |*track| track.epoch = screen.view.resetEpoch();
+    try project(gpa, &screen.view, size, &scene);
+    try ui.testing.expectHides(screen.out.written(), &.{"tool0"});
+    try ui.testing.expectShows(screen.out.written(), &.{"tool5"});
 
     tracks[tools.len - 1].changed = true;
-    var painted = out.written().len;
-    try project(gpa, &view, size, &scene);
-    try std.testing.expect(!resetSince(out.written(), painted));
+    var painted = screen.out.written().len;
+    try project(gpa, &screen.view, size, &scene);
+    try std.testing.expect(!resetSince(screen.out.written(), painted));
     tracks[tools.len - 1].changed = false;
 
     tracks[0].changed = true;
-    painted = out.written().len;
-    try project(gpa, &view, size, &scene);
-    try std.testing.expect(resetSince(out.written(), painted));
+    painted = screen.out.written().len;
+    try project(gpa, &screen.view, size, &scene);
+    try std.testing.expect(resetSince(screen.out.written(), painted));
     for (0..3) |_| {
-        painted = out.written().len;
-        try project(gpa, &view, size, &scene);
-        try std.testing.expect(!resetSince(out.written(), painted));
+        painted = screen.out.written().len;
+        try project(gpa, &screen.view, size, &scene);
+        try std.testing.expect(!resetSince(screen.out.written(), painted));
     }
 
     tracks[1] = .{ .changed = true };
-    painted = out.written().len;
-    try project(gpa, &view, size, &scene);
-    try std.testing.expect(!resetSince(out.written(), painted));
+    painted = screen.out.written().len;
+    try project(gpa, &screen.view, size, &scene);
+    try std.testing.expect(!resetSince(screen.out.written(), painted));
 }
 
 test "the retained window follows the configured page count" {
     const gpa = std.testing.allocator;
-    var editor = ui.Editor.init(gpa);
-    defer editor.deinit();
+    var rig: Rig = .init();
+    defer rig.deinit();
 
-    var text = try ui.block.numberedLines(gpa, 200);
+    var text = try ui.testing.numberedLines(gpa, 200);
     defer text.deinit(gpa);
-    var entries: std.ArrayList(ui.block.Entry) = .empty;
-    defer {
-        for (entries.items) |*entry| entry.deinit(gpa);
-        entries.deinit(gpa);
-    }
-    try entries.append(gpa, try ui.block.Entry.init(gpa, .model, .{}, text.items));
-
-    var shown = try shownEntries(gpa, entries.items);
-    defer shown.deinit(gpa);
+    try rig.add(&.{ .model = text.items });
 
     const rows: usize = 4;
     for ([_]usize{ window_pages_min, 3, 12 }) |pages| {
-        const scene: Scene = .{ .conversation = .{
-            .window_pages = pages,
-            .transcript = shown.items,
-            .tail = .{ .prompt = .{ .caption = null, .editor = &editor } },
-            .status = &test_status,
-        } };
+        const scene = rig.prompt(&.{ .window_pages = pages });
         const painted = try projected(gpa, .{ .columns = 40, .rows = rows }, &scene);
         defer gpa.free(painted);
-        try std.testing.expectEqual(rows * pages, ui.block.paintedRows(painted));
+        try std.testing.expectEqual(rows * pages, ui.testing.paintedRows(painted));
     }
 }

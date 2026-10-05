@@ -6,13 +6,13 @@ var handler_pipe: std.atomic.Value(std.posix.fd_t) = .init(-1);
 
 var shared_pipe: ?Pipe = null;
 
+read_handle: std.posix.fd_t,
+previous: std.posix.Sigaction,
+
 const Pipe = struct {
     read: std.posix.fd_t,
     write: std.posix.fd_t,
 };
-
-read_handle: std.posix.fd_t,
-previous: std.posix.Sigaction,
 
 fn handleWinch(_: std.posix.SIG) callconv(.c) void {
     const handle = handler_pipe.load(.seq_cst);
@@ -23,18 +23,18 @@ fn handleWinch(_: std.posix.SIG) callconv(.c) void {
 
 fn ensurePipe() !Pipe {
     if (shared_pipe) |pipe| return pipe;
-    const fds = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true });
+    const handles = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true });
     errdefer {
-        _ = std.posix.system.close(fds[0]);
-        _ = std.posix.system.close(fds[1]);
+        _ = std.posix.system.close(handles[0]);
+        _ = std.posix.system.close(handles[1]);
     }
     const nonblock: u32 = @bitCast(std.posix.O{ .NONBLOCK = true });
-    const result = std.posix.system.fcntl(fds[1], std.posix.F.SETFL, nonblock);
+    const result = std.posix.system.fcntl(handles[1], std.posix.F.SETFL, nonblock);
     switch (std.posix.errno(result)) {
         .SUCCESS => {},
         else => |err| return std.posix.unexpectedErrno(err),
     }
-    const pipe: Pipe = .{ .read = fds[0], .write = fds[1] };
+    const pipe: Pipe = .{ .read = handles[0], .write = handles[1] };
     shared_pipe = pipe;
     return pipe;
 }
@@ -55,20 +55,14 @@ pub fn deinit(self: *Resize) void {
     handler_pipe.store(-1, .seq_cst);
 }
 
-pub fn wait(self: *Resize, io: std.Io) !void {
+pub fn wait(self: *Resize, io: std.Io) std.Io.File.ReadStreamingError!void {
     var buffer: [64]u8 = undefined;
-    var chunk: [1][]u8 = .{buffer[0..]};
-    const result = try io.operateTimeout(.{ .file_read_streaming = .{
-        .file = .{ .handle = self.read_handle, .flags = .{ .nonblocking = false } },
-        .data = &chunk,
-    } }, .none);
-    _ = try result.file_read_streaming;
+    const file: std.Io.File = .{ .handle = self.read_handle, .flags = .{ .nonblocking = false } };
+    _ = try file.readStreaming(io, &.{&buffer});
 }
 
 test "a sigwinch wakes wait and deinit restores the prior disposition" {
-    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = std.testing.io;
     var before: std.posix.Sigaction = undefined;
     std.posix.sigaction(.WINCH, null, &before);
     var resize: Resize = undefined;

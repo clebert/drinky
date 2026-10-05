@@ -10,10 +10,38 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    const ai_module = b.addModule("ai", .{
-        .root_source_file = b.path("lib/ai/root.zig"),
+    const core_module = b.addModule("core", .{
+        .root_source_file = b.path("lib/core/root.zig"),
         .target = target,
         .optimize = optimize,
+    });
+
+    const providers_module = b.addModule("providers", .{
+        .root_source_file = b.path("lib/providers/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "core", .module = core_module },
+        },
+    });
+
+    const tools_module = b.addModule("tools", .{
+        .root_source_file = b.path("lib/tools/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "core", .module = core_module },
+        },
+    });
+
+    const accounts_module = b.addModule("accounts", .{
+        .root_source_file = b.path("lib/accounts/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "core", .module = core_module },
+            .{ .name = "providers", .module = providers_module },
+        },
     });
 
     const root_module = b.createModule(.{
@@ -22,7 +50,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "terminal", .module = terminal_module },
-            .{ .name = "ai", .module = ai_module },
+            .{ .name = "core", .module = core_module },
+            .{ .name = "providers", .module = providers_module },
+            .{ .name = "tools", .module = tools_module },
+            .{ .name = "accounts", .module = accounts_module },
         },
     });
 
@@ -47,17 +78,38 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const width_scan_module = b.createModule(.{
+        .root_source_file = b.path("scripts/width_scan.zig"),
+        .target = b.graph.host,
+        .optimize = optimize,
+    });
+
     const test_step = b.step("test", "Build and run all tests");
 
-    const tested_modules = [_]*std.Build.Module{
-        terminal_module,
-        ai_module,
-        root_module,
-        comment_scan_module,
+    const TestedModule = struct { name: []const u8, module: *std.Build.Module };
+
+    const tested_modules = [_]TestedModule{
+        .{ .name = "terminal", .module = terminal_module },
+        .{ .name = "core", .module = core_module },
+        .{ .name = "providers", .module = providers_module },
+        .{ .name = "tools", .module = tools_module },
+        .{ .name = "accounts", .module = accounts_module },
+        .{ .name = "src", .module = root_module },
+        .{ .name = "comment_scan", .module = comment_scan_module },
+        .{ .name = "width_scan", .module = width_scan_module },
     };
 
-    for (tested_modules) |module| {
-        const tests = b.addTest(.{ .root_module = module });
+    for (tested_modules) |tested| {
+        const module = tested.module;
+        const test_module = b.createModule(.{
+            .root_source_file = module.root_source_file,
+            .target = module.resolved_target,
+            .optimize = module.optimize,
+            .strip = true,
+        });
+        for (module.import_table.keys(), module.import_table.values()) |name, imported|
+            test_module.addImport(name, imported);
+        const tests = b.addTest(.{ .name = tested.name, .root_module = test_module });
         test_step.dependOn(&b.addRunArtifact(tests).step);
     }
 
@@ -76,7 +128,7 @@ pub fn build(b: *std.Build) void {
 
     const unicode_step = b.step(
         "unicode",
-        "Regenerate lib/terminal/unicode_data.zig from the Unicode Character Database",
+        "Regenerate the Unicode data, its test corpus, and its license notice",
     );
     unicode_step.dependOn(&run_unicode.step);
 

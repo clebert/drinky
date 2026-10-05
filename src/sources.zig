@@ -1,28 +1,39 @@
 const std = @import("std");
 
-const ai = @import("ai");
+const tools = @import("tools");
 
 const Config = @import("Config.zig");
+const discovery = @import("discovery/root.zig");
+const format = @import("format.zig");
+const testing = @import("testing.zig");
 
-pub const Options = struct {
-    user_instructions: []const ai.instructions.File,
-    project_instructions: []const ai.instructions.File,
-    skills: *const ai.skills.Registry,
-    required_skills: []const ai.tool.SkillGuard.Rule,
+const Options = struct {
+    user_instructions: []const discovery.instructions.File,
+    project_instructions: []const discovery.instructions.File,
+    skills: *const discovery.skills.Registry,
+    required_skills: []const tools.SkillGuard.Rule,
     required_missing: []const Config.RequiredSkill,
-    roots: ai.format.Roots,
+    roots: format.Roots,
 };
 
 const Section = struct {
     title: []const u8,
     empty: []const u8,
-    files: []const ai.instructions.File,
+    files: []const discovery.instructions.File,
 };
 
-pub fn compose(gpa: std.mem.Allocator, options: *const Options) ![]u8 {
+pub fn compose(gpa: std.mem.Allocator, options: *const Options) error{OutOfMemory}![]u8 {
     var output: std.Io.Writer.Allocating = .init(gpa);
     errdefer output.deinit();
-    const writer = &output.writer;
+    write(gpa, &output.writer, options) catch return error.OutOfMemory;
+    return output.toOwnedSlice();
+}
+
+fn write(
+    gpa: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    options: *const Options,
+) (std.Io.Writer.Error || error{OutOfMemory})!void {
     try writer.writeAll(
         "Drinky reads these sources at startup alone. A new file waits for the next start.\n",
     );
@@ -38,13 +49,12 @@ pub fn compose(gpa: std.mem.Allocator, options: *const Options) ![]u8 {
     });
     try writeSkills(gpa, writer, options);
     try writeRequiredSkills(gpa, writer, options);
-    return output.toOwnedSlice();
 }
 
 fn writeFiles(
     gpa: std.mem.Allocator,
     writer: *std.Io.Writer,
-    roots: *const ai.format.Roots,
+    roots: *const format.Roots,
     section: *const Section,
 ) !void {
     try writer.print("\n## {s}\n\n", .{section.title});
@@ -58,9 +68,9 @@ fn writeFiles(
 
 fn writeSkills(gpa: std.mem.Allocator, writer: *std.Io.Writer, options: *const Options) !void {
     try writer.writeAll("\n## Skills\n\n");
-    const skills = options.skills.items();
-    if (skills.len == 0) try writer.writeAll("Drinky found no skill.\n");
-    for (skills) |skill| {
+    const items = options.skills.items();
+    if (items.len == 0) try writer.writeAll("Drinky found no skill.\n");
+    for (items) |skill| {
         try writer.print("- `{s}` · Scope: {s}", .{ skill.name, @tagName(skill.scope) });
         if (skill.model_invocation_disabled) try writer.writeAll(" · Hidden from the model");
         try writer.writeAll(" · File: ");
@@ -95,89 +105,60 @@ fn writeRequiredSkills(
 fn writePath(
     gpa: std.mem.Allocator,
     writer: *std.Io.Writer,
-    roots: *const ai.format.Roots,
+    roots: *const format.Roots,
     path: []const u8,
 ) !void {
-    const shown = try ai.format.path(gpa, path, roots);
+    const shown = try format.path(gpa, path, roots);
     defer gpa.free(shown);
     try writer.print("`{s}`", .{shown});
-}
-
-fn tmpPath(
-    gpa: std.mem.Allocator,
-    io: std.Io,
-    tmp: *const std.testing.TmpDir,
-    suffix: []const u8,
-) ![]u8 {
-    const cwd = try std.process.currentPathAlloc(io, gpa);
-    defer gpa.free(cwd);
-    return std.fs.path.join(gpa, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, suffix });
 }
 
 test "the page names every file behind the startup counts" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+    var tree: testing.Tree = try .init();
+    defer tree.deinit();
 
-    var git = try tmp.dir.createDirPathOpen(io, "work/.git", .{});
-    git.close(io);
-    try tmp.dir.writeFile(io, .{ .sub_path = "work/AGENTS.md", .data = "Project.\n" });
-    var home_dir = try tmp.dir.createDirPathOpen(io, "home", .{});
-    home_dir.close(io);
-    try tmp.dir.writeFile(io, .{ .sub_path = "home/first.md", .data = "First.\n" });
-    var demo = try tmp.dir.createDirPathOpen(io, "work/.agents/skills/demo", .{});
-    demo.close(io);
-    try tmp.dir.writeFile(io, .{
-        .sub_path = "work/.agents/skills/demo/SKILL.md",
-        .data = "---\nname: demo\ndescription: a test skill\n---\nbody\n",
-    });
-    var hidden = try tmp.dir.createDirPathOpen(io, "work/.agents/skills/hidden", .{});
-    hidden.close(io);
-    try tmp.dir.writeFile(io, .{
-        .sub_path = "work/.agents/skills/hidden/SKILL.md",
-        .data = "---\nname: hidden\ndescription: a manual skill\n" ++
+    try tree.directory("work/.git");
+    try tree.write("work/AGENTS.md", "Project.\n");
+    try tree.write("home/first.md", "First.\n");
+    try tree.skill("work/.agents/skills/demo", &.{ .name = "demo", .description = "a test skill" });
+    try tree.write(
+        "work/.agents/skills/hidden/SKILL.md",
+        "---\nname: hidden\ndescription: a manual skill\n" ++
             "disable-model-invocation: true\n---\nbody\n",
+    );
+    try tree.skill("home/.agents/skills/demo", &.{
+        .name = "demo",
+        .description = "the user copy",
     });
-    var user_demo = try tmp.dir.createDirPathOpen(io, "home/.agents/skills/demo", .{});
-    user_demo.close(io);
-    try tmp.dir.writeFile(io, .{
-        .sub_path = "home/.agents/skills/demo/SKILL.md",
-        .data = "---\nname: demo\ndescription: the user copy\n---\nbody\n",
-    });
-    var user_other = try tmp.dir.createDirPathOpen(io, "home/.agents/skills/other", .{});
-    user_other.close(io);
-    try tmp.dir.writeFile(io, .{
-        .sub_path = "home/.agents/skills/other/SKILL.md",
-        .data = "---\nname: other\ndescription: a user skill\n---\nbody\n",
-    });
-    const home = try tmpPath(gpa, io, &tmp, "home");
-    defer gpa.free(home);
-    const work = try tmpPath(gpa, io, &tmp, "work");
-    defer gpa.free(work);
-    const user_skills = try std.fs.path.join(gpa, &.{ home, ".agents", "skills" });
-    defer gpa.free(user_skills);
+    try tree.skill(
+        "home/.agents/skills/other",
+        &.{ .name = "other", .description = "a user skill" },
+    );
+    const home = try tree.path("home");
+    const work = try tree.path("work");
+    const user_skills = try tree.path("home/.agents/skills");
 
-    var user_instructions = try ai.instructions.load(gpa, io, &.{
+    var user_instructions = try discovery.instructions.load(gpa, io, &.{
         .directory = home,
         .paths = &.{"first.md"},
     });
     defer user_instructions.deinit();
-    var project_instructions = try ai.instructions.discover(gpa, io, work);
+    var project_instructions = try discovery.instructions.discover(gpa, io, work);
     defer project_instructions.deinit();
-    var skills = try ai.skills.discover(gpa, io, &.{
+    var registry = try discovery.skills.discover(gpa, io, &.{
         .user_root = user_skills,
         .project_start = work,
         .project_root = project_instructions.projectRoot(),
     });
-    defer skills.deinit();
-    const demo_path = try std.fs.path.join(gpa, &.{ work, ".agents", "skills", "demo", "SKILL.md" });
-    defer gpa.free(demo_path);
+    defer registry.deinit();
+    const demo_path = try tree.path("work/.agents/skills/demo/SKILL.md");
 
     const page = try compose(gpa, &.{
         .user_instructions = user_instructions.files(),
         .project_instructions = project_instructions.files(),
-        .skills = &skills,
+        .skills = &registry,
         .required_skills = &.{
             .{ .glob = "**/*.zig", .skill = "demo", .source = demo_path },
         },
@@ -232,12 +213,12 @@ test "the page names every file behind the startup counts" {
 
 test "an empty source states its empty state" {
     const gpa = std.testing.allocator;
-    var skills = ai.skills.Registry.init(gpa);
-    defer skills.deinit();
+    var registry = discovery.skills.Registry.init(gpa);
+    defer registry.deinit();
     const page = try compose(gpa, &.{
         .user_instructions = &.{},
         .project_instructions = &.{},
-        .skills = &skills,
+        .skills = &registry,
         .required_skills = &.{},
         .required_missing = &.{},
         .roots = .{},

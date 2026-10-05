@@ -3,24 +3,53 @@
 Drinky is a dependency-free Zig coding agent that keeps the conversation in the terminal scrollback.
 A Telegram bot can drive the session from its chat while the terminal shows the work.
 
-## Reference
-
-The Swift implementation of Drinky is a reference for design alone: what a core owns, what crosses a
-layer, and how a client stays a client. Its names, its files, and its feature set carry no
-authority, because it serves fewer providers. Read it for a shape, and copy no code.
-
 ## Layers
 
 `build.zig` declares the module graph, and a module imports only what the build names. `src` imports
-`lib/terminal` and `lib/ai`. The two libraries import neither each other nor the app.
+every library. `lib/providers` and `lib/tools` import `lib/core`, and `lib/accounts` imports
+`lib/core` and `lib/providers`. No other library imports another, and no library imports the app.
 
 - `lib/terminal` reads the keyboard and paints the screen. It knows no model and no provider.
-- `lib/ai` runs the agent: the providers, the accounts, the tools, the skills, and the commands.
-- `src` is the client: the app loop, the screen model, the widgets, the Telegram remote, and Herdr.
-- The remote controller reports through its sink. It depends on neither `src/Session.zig` nor
-  `ai.Agent`, and the client translates what it reports.
+- `lib/core` imports `std` alone. It holds the neutral conversation, the provider seam, the tool
+  seam, the retry policy, and the session. It also holds the parts that the libraries share: the
+  actor shell, the timeout race over `std.Io`, the compile-time check of an error set, and the
+  plural suffix of a count. It names no vendor: an account is an opaque id, and a reasoning proof is
+  that id with opaque payload bytes. The session is an actor. One task runs its command loop and
+  owns its state. A client sends commands and receives events through a sink, and a turn runs as a
+  child task. The actor shell holds the generic sink and the mailbox that starts, cancels, and reaps
+  one child task.
+- `lib/providers` implements the provider seam of the core. It holds the transport seam with its
+  HTTP implementation, the SSE line engine, the JSON accessors, the credential seam, and one dialect
+  per wire: Responses, Messages, and Gemini. A dialect builds the request, classifies a failure, and
+  decodes the frames into the events of the core. A per-account switch is a dialect option.
+- `lib/tools` implements the tool seam of the core. Its registry runs `read`, `write`, `edit`,
+  `find`, `grep`, `bash`, and `describe_drinky`. It holds the skill guard that a call proves a skill
+  against. An output is content for the model with the conditions and the measures that the client
+  shows.
+- `lib/accounts` holds the account table with its twelve rows, the credentials behind the credential
+  seam, and the sign-in flows. It also holds the model catalog with the public metadata, the usage
+  sources, and the state store. `Client` builds the provider of one row and reports its usage source
+  before the stop of every reply. The account registry `Registry` runs a sign-in or a model fetch as
+  a child task behind a command loop and a sink, like the session. A row is an index into the table.
+- `src` is the client. `App.zig` holds the client loop, the input mode, and the key handling. A key
+  becomes a command to the session or the account registry. An event becomes a change of
+  `Screen.zig`, and `Screen.zig` paints the widgets that it holds. The client reads no session
+  state, and `Choice.zig` holds the account, the model, and the effort that the client chose. `src`
+  also holds the slash commands under `src/command/` and the instruction and skill discovery under
+  `src/discovery/`. It holds the widgets under `src/ui/`, the Telegram remote under `src/remote/`,
+  and Herdr too. `src` names no vendor, wire, or account row. It reads each such fact from
+  `lib/accounts`.
+- The remote controller reports an action through its sink, and the client translates it into a
+  command. The remote depends on neither the session nor the account registry. Its store uses the
+  JSON store of `lib/accounts`. Its HTTP client uses the timeout race of `lib/core` and the
+  transport of `lib/providers`. The store and the HTTP client read JSON through the accessors of
+  `lib/providers`.
 - `src/ui/role.zig` maps a role to terminal colors, and `src/remote/html.zig` maps a role to the
-  look of a Telegram message. A widget names a role and writes no color of its own.
+  look of a Telegram message. A widget names a role and writes no color of its own. `Message.zig`
+  holds the severity that a notice, an event, and a chat message share.
+
+A loop task lends state to its child task and touches none of it until the child ends. The child
+returns its result with its end. A lock guards state that the tasks of two actors share.
 
 ## Interface
 
@@ -37,11 +66,27 @@ These rules outrank existing behavior and repository precedent.
 ## Code
 
 - Drinky has no dependency but the Zig standard library. `build.zig.zon` names no package.
-- Write no comment. A `zig fmt` directive is the one exception. A name or a test carries the intent,
-  and a fact that matters goes into a test, a name, or the chat.
+- Write no comment. A name or a test carries the intent, and a fact that matters goes into a test, a
+  name, or the chat.
 - Less code is better. Delete code without a caller. Add a seam, a pointer with a vtable in the
   shape of `std.mem.Allocator`, only when a second implementation or a test fake exists. A control
   that a user sets is no such code.
+- Before you write a helper, search the modules that the build lets the module import. Move a second
+  copy to the lowest module that both callers import.
+- Production code holds no option, entry point, mode, or global that only a test uses. A test fakes
+  the clock through an `Io` and the network through a `Transport`. A size cap stays an option when
+  no test can reach its production value.
+- Do not pass the implementation of a contract as `anytype`. A seam or a generic type states the
+  contract.
+- A branch that no production path reaches is an assert or `unreachable`. It holds no text for the
+  user.
+- Write a rule for each vendor, wire, or sign-in flow as an exhaustive switch over its enum.
+- A seam, a callback, and a timed call declare their error set. Do not widen an error set to
+  `anyerror`.
+- The type that defines an event owns its `dupe` and its `deinit`. A sink takes `*const Event`,
+  returns nothing, and copies what it keeps.
+- A cancel must end every wait. Never run the work of a task in place of the task. When
+  `io.concurrent` fails, report the failure. A zero window starts the task without a timer.
 - The module graph is the architecture. A new module gets its row in `build.zig` and its line in the
   Layers section of this file.
 - The development tools of the Zig code are the Zig toolchain alone. `zig fmt` formats every Zig
@@ -55,8 +100,19 @@ These rules outrank existing behavior and repository precedent.
 - For a bug, write the regression test first and watch it fail. Then fix the bug.
 - Test through commands and events with a hand-written fake. Use no network and no sleep. A test
   that needs a clock hands in an `Io` that controls it.
+- A test takes `std.testing.io`. Build an `Io` only to set a limit or to control the clock.
+- A fake that waits for a cancel waits on an event that no task sets. The test checks that the
+  cancel ended the wait.
 - A test that changes with every implementation change tests the implementation. Delete it or move
   it to the boundary.
+- A test reaches a state through commands, events, keys, and options. It reads the state through
+  public functions.
+- A test calls a private pure function only when its input and its output are facts outside the
+  code. A vendor date and its epoch seconds are such facts. A model before the catalog merge is not
+  such a fact. Every other test calls the public function that gives the same fact.
+- A test name states the behavior that its body checks.
+- Put the shared test code of a module into its `testing.zig`. Put a private rig, fixture, or fake
+  after the first test of its file.
 - Zig runs a test only when an import chain from a module root reaches its file. The check counts
   the declared tests against the tests that ran, so an unreachable test fails the check.
 - Note the runtime of each test binary when you start a feature, and compare it when the feature is
@@ -67,7 +123,7 @@ These rules outrank existing behavior and repository precedent.
 
 - Report every decision that the code does not force. A cut, a sentinel, a default, a rename, and a
   deferral are decisions.
-- Name the trigger of every deferral, and write the deferral into `BACKLOG.md`.
+- Write every deferral into `BACKLOG.md`, and name its trigger when an event must come first.
 - A control that a user sets is never code without a caller. Never reduce its range.
 - A recommendation names its evidence. A claim about a provider names the field, the endpoint, or
   the document that proves it.
@@ -81,8 +137,8 @@ tool. Everything else is not a finding.
 
 `README.md`, `BACKLOG.md`, this file, and the skills under `.agents/skills/` are the documents.
 Prettier formats every document, and `.prettierrc.json` configures it. `README.md` states the stable
-product and stays concise. `BACKLOG.md` holds the open direction, and a line leaves it when its
-trigger fires. `TODO.md` is its inbox, and Git ignores it.
+product and stays concise. `BACKLOG.md` holds the open direction, and a line leaves it when its work
+lands. `TODO.md` is its inbox, and Git ignores it.
 
 Write the documents and every text that Drinky shows to the user in ASD-STE100 Simplified Technical
 English.
@@ -135,11 +191,11 @@ message from the user, because a bot message reads as a message that the bot wro
 An account identifier reads `vendor-product`, as in `anthropic-plan`. A `-key` suffix marks a
 credential that an environment variable holds or names, as in `anthropic-api-key`. An identifier
 without it signs in through an OAuth login. The local `ds4` account is the exception: it has no
-product tier and no `-key` suffix. `Account.id()` is the only spelling outside the enum tag. A model
-under an account reads `account/model`.
+product tier and no `-key` suffix. The `id` field of a table row is the only spelling of an
+identifier. A model under an account reads `account/model`.
 
-- **vendor**: The `Provider` tag: `anthropic`, `openai`, `xai`, `openrouter`, `deepseek`, `google`,
-  or `ds4`.
+- **vendor**: The `Account.Vendor` tag: `anthropic`, `openai`, `xai`, `openrouter`, `deepseek`,
+  `google`, or `ds4`.
 - **plan**: A consumer subscription, as in Claude Pro or Max, ChatGPT, and SuperGrok.
 - **api**: The developer API of the vendor, billed per token.
 - **cloud**: The cloud platform of the vendor, as in a Google Cloud project on the Agent Platform.
@@ -150,13 +206,17 @@ under an account reads `account/model`.
 ## Checks
 
 Run `sh scripts/check.sh` after a change. CI runs the same script and nothing else. The script
-builds the binary, checks the format of the Zig code and of the documents, fails on a code comment,
-and runs the tests with the reachability count. Its summary prints the runtime of each test binary.
-The document check needs `npx`, which fetches Prettier once into its cache.
+builds the binary and checks the format of the Zig code and of the documents. It fails on a code
+comment and on a Zig line over 100 columns. It runs the tests with the reachability count. Its
+summary prints the runtime of each test binary. The document check needs `npx`, which fetches
+Prettier once into its cache.
 
-`zig run scripts/comment_scan.zig -- --fix build.zig src lib scripts` removes every comment, and
-`zig fmt build.zig src lib scripts` formats the Zig code. `zig build unicode` regenerates the
-Unicode data and its license notice. It uses the network, so it never joins the default build.
+`zig run scripts/comment_scan.zig -- --fix build.zig build.zig.zon src lib scripts` removes every
+comment, and `zig fmt build.zig build.zig.zon src lib scripts` formats the Zig code.
+`zig run scripts/width_scan.zig -- build.zig build.zig.zon src lib scripts` lists every Zig line
+over 100 columns and wraps none, because `zig fmt` never wraps a line. `zig build unicode`
+regenerates the Unicode data, its test corpus, and its license notice. It uses the network, so it
+never joins the default build.
 
 A rule that a tool can check belongs in `scripts/check.sh`, because an editor setting enforces
 nothing. Add a mechanism for a problem that occurred. A risk without a case needs no machinery.

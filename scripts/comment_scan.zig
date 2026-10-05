@@ -1,6 +1,6 @@
 const std = @import("std");
 
-const entries_max = 10_000;
+const zig_files = @import("zig_files.zig");
 
 const Span = struct { start: usize, end: usize };
 
@@ -17,12 +17,10 @@ pub fn main(init: std.process.Init) !void {
     }
     if (roots.items.len == 0) std.process.fatal("usage: comment_scan [--fix] path...", .{});
 
-    var paths: std.ArrayList([]const u8) = .empty;
-    for (roots.items) |root| try collect(arena, io, root, &paths);
-    std.mem.sort([]const u8, paths.items, {}, pathLessThan);
-
     var total: usize = 0;
-    for (paths.items) |path| total += try scanFile(arena, io, path, fix);
+    for (try zig_files.collect(arena, io, roots.items)) |path| {
+        total += try scanFile(arena, io, path, fix);
+    }
     if (total == 0) return;
     if (fix) {
         std.debug.print("comment_scan: removed {d} comments.\n", .{total});
@@ -33,31 +31,6 @@ pub fn main(init: std.process.Init) !void {
         .{total},
     );
     std.process.exit(1);
-}
-
-fn collect(
-    arena: std.mem.Allocator,
-    io: std.Io,
-    root: []const u8,
-    paths: *std.ArrayList([]const u8),
-) !void {
-    const stat = try std.Io.Dir.cwd().statFile(io, root, .{});
-    if (stat.kind != .directory) return paths.append(arena, root);
-
-    var dir = try std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true });
-    defer dir.close(io);
-    var walker = try dir.walk(arena);
-    defer walker.deinit();
-    for (0..entries_max) |_| {
-        const entry = (try walker.next(io)) orelse return;
-        if (entry.kind != .file or !std.mem.endsWith(u8, entry.basename, ".zig")) continue;
-        try paths.append(arena, try std.fs.path.join(arena, &.{ root, entry.path }));
-    }
-    return error.TooManyEntries;
-}
-
-fn pathLessThan(_: void, a: []const u8, b: []const u8) bool {
-    return std.mem.lessThan(u8, a, b);
 }
 
 fn scanFile(arena: std.mem.Allocator, io: std.Io, path: []const u8, fix: bool) !usize {
@@ -106,16 +79,9 @@ fn lineComments(
     while (std.mem.indexOfPos(u8, text, index, "//")) |start| {
         const line_end = std.mem.indexOfScalarPos(u8, text, start, '\n') orelse gap.end;
         const comment = std.mem.trimEnd(u8, text[start..line_end], "\r");
-        if (!isDirective(comment)) {
-            try spans.append(arena, .{ .start = start, .end = start + comment.len });
-        }
+        try spans.append(arena, .{ .start = start, .end = start + comment.len });
         index = line_end;
     }
-}
-
-fn isDirective(comment: []const u8) bool {
-    const content = std.mem.trim(u8, comment["//".len..], &std.ascii.whitespace);
-    return std.mem.eql(u8, content, "zig fmt: off") or std.mem.eql(u8, content, "zig fmt: on");
 }
 
 fn strip(arena: std.mem.Allocator, source: []const u8, spans: []const Span) ![]u8 {
@@ -177,10 +143,10 @@ test "a container doc comment is a comment" {
     try expectStripped(source, "\nconst std = @import(\"std\");\n");
 }
 
-test "a zig fmt directive stays" {
-    const source = "// zig fmt: off\nconst a = .{1,2};\n//  zig fmt: on \n";
-    try expectComments(source, &.{});
-    try expectStripped(source, source);
+test "a zig fmt directive is a comment" {
+    const source = "// zig fmt: off\nconst a = .{1,2};\n// zig fmt: on\n";
+    try expectComments(source, &.{ "// zig fmt: off", "// zig fmt: on" });
+    try expectStripped(source, "const a = .{1,2};\n");
 }
 
 test "a line comment leaves with its line or with the space before it" {

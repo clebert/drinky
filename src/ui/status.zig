@@ -1,33 +1,33 @@
 const std = @import("std");
 
-const ai = @import("ai");
+const core = @import("core");
 const terminal = @import("terminal");
+
+const format = @import("../format.zig");
+const Message = @import("../Message.zig");
+const project = @import("../project.zig");
 
 const attribute = @import("attribute.zig");
 const paint = @import("paint.zig");
 const role = @import("role.zig");
+const testing = @import("testing.zig");
 
 pub const Info = struct {
     directory: []const u8,
     branch: ?[]const u8,
     context_tokens: ?u64,
-    cache_usage: ai.llm.Usage,
+    cache_usage: core.Provider.Usage,
     cost: f64,
     context_window: ?u64,
     model: ?[]const u8,
     effort: []const u8,
-    account: ?ai.llm.Account,
-    quota: ?ai.llm.Quota,
+    account: ?[]const u8,
+    quota: ?core.Provider.Quota,
     quota_age_ms: i64,
-    credits: ?ai.llm.Credits,
+    credits: ?core.Provider.Credits,
     turn_active: bool,
     gauge: Gauge = .{},
-    notice: ?Notice = null,
-
-    pub const Notice = struct {
-        text: []const u8,
-        severity: ai.command.Outcome.Severity,
-    };
+    notice: ?Message = null,
 };
 
 pub const Gauge = struct {
@@ -38,7 +38,12 @@ pub const Gauge = struct {
     pub const percent_max: f64 = 100;
 };
 
-pub const directory_bytes_max = 96;
+const Directory = struct {
+    path: []const u8,
+    home: []const u8,
+};
+
+const directory_bytes_max = 96;
 
 const context_label = "Context: ";
 
@@ -47,13 +52,11 @@ const no_model_value = "none";
 
 const account_model_separator = "/";
 
-const separator = " · ";
-
 const branch_prefix_columns_max = 16;
 
 const Parts = struct {
-    place: Place,
-    branch: Branch,
+    place: Form,
+    branch: Form,
     context: Context,
     quota_wait: bool,
     cost: bool,
@@ -64,9 +67,7 @@ const Parts = struct {
     account: bool,
     effort: bool,
 
-    const Place = enum { full, short, hidden };
-
-    const Branch = enum { full, short, hidden };
+    const Form = enum { full, short, hidden };
 
     const Context = enum { full, short };
 
@@ -85,21 +86,7 @@ const Parts = struct {
     };
 };
 
-const reductions = [_]Reduction{
-    .shorten_directory,
-    .shorten_branch,
-    .shorten_context,
-    .shorten_quota,
-    .drop_cache,
-    .drop_quota_long,
-    .drop_quota_short,
-    .drop_credits,
-    .drop_cost,
-    .drop_account,
-    .drop_branch,
-    .drop_place,
-    .drop_effort,
-};
+const reductions = std.enums.values(Reduction);
 
 const Reduction = enum {
     shorten_directory,
@@ -117,27 +104,7 @@ const Reduction = enum {
     drop_effort,
 };
 
-fn reduce(parts: *Parts, reduction: Reduction) void {
-    switch (reduction) {
-        .shorten_directory => parts.place = .short,
-        .shorten_branch => parts.branch = .short,
-        .shorten_context => parts.context = .short,
-        .shorten_quota => parts.quota_wait = false,
-        .drop_cache => parts.cache = false,
-        .drop_cost => parts.cost = false,
-        .drop_quota_long => parts.quota_long = false,
-        .drop_quota_short => parts.quota_short = false,
-        .drop_credits => parts.credits = false,
-        .drop_account => parts.account = false,
-        .drop_branch => parts.branch = .hidden,
-        .drop_place => parts.place = .hidden,
-        .drop_effort => parts.effort = false,
-    }
-}
-
 const Run = struct { start: usize, end: usize, name: role.Name };
-
-const runs_max = 3;
 
 const Line = struct {
     out: std.Io.Writer,
@@ -167,6 +134,26 @@ const Line = struct {
     }
 };
 
+fn reduce(parts: *Parts, reduction: Reduction) void {
+    switch (reduction) {
+        .shorten_directory => parts.place = .short,
+        .shorten_branch => parts.branch = .short,
+        .shorten_context => parts.context = .short,
+        .shorten_quota => parts.quota_wait = false,
+        .drop_cache => parts.cache = false,
+        .drop_cost => parts.cost = false,
+        .drop_quota_long => parts.quota_long = false,
+        .drop_quota_short => parts.quota_short = false,
+        .drop_credits => parts.credits = false,
+        .drop_account => parts.account = false,
+        .drop_branch => parts.branch = .hidden,
+        .drop_place => parts.place = .hidden,
+        .drop_effort => parts.effort = false,
+    }
+}
+
+const runs_max = 3;
+
 fn pressureRole(gauge: Gauge, used_percent: f64) role.Name {
     if (used_percent >= gauge.percent_error) return .@"error";
     if (used_percent >= gauge.percent_warning) return .warning;
@@ -188,26 +175,24 @@ fn paintRuns(sink: *terminal.View.Sink, line: *const Line, kept: []const u8) !vo
     try sink.text(kept[cursor..]);
 }
 
-pub fn render(placement: *const paint.Placement, info: *const Info) !void {
-    if (placement.base < placement.skip) return;
-    if (info.notice) |notice| {
-        const name: role.Name = switch (notice.severity) {
-            .information => .accent,
-            .warning => .warning,
-            .failure => .@"error",
-        };
-        const prefix = switch (notice.severity) {
-            .information => paint.information_prefix,
-            .warning, .failure => paint.warning_prefix,
-        };
-        return paint.notice(
-            placement,
-            &.{ .role = name, .prefix = prefix, .fit = .head },
-            notice.text,
-        );
-    }
+pub fn directoryLabel(gpa: std.mem.Allocator, directory: *const Directory) ![]const u8 {
+    const label = try format.path(gpa, directory.path, &.{ .home_directory = directory.home });
+    if (label.len <= directory_bytes_max) return label;
+    defer gpa.free(label);
+    const budget = directory_bytes_max - paint.ellipsis.len;
+    const start = terminal.width.boundaryAtOrAfter(label, label.len - budget);
+    return std.fmt.allocPrint(gpa, "{s}{s}", .{ paint.ellipsis, label[start..] });
+}
 
-    var left_scratch: [ai.project.head_name_bytes_max + 512]u8 = undefined;
+pub fn render(placement: *const paint.Placement, info: *const Info) !void {
+    if (info.notice) |notice| {
+        var style: paint.NoticeStyle = .of(notice.severity);
+        style.fit = .head;
+        return paint.notice(placement, &style, notice.content);
+    }
+    if (!placement.begin(placement.base)) return;
+
+    var left_scratch: [project.head_bytes_max + 512]u8 = undefined;
     var right_scratch: [192]u8 = undefined;
     var parts: Parts = .all;
     var left: Line = undefined;
@@ -226,7 +211,6 @@ pub fn render(placement: *const paint.Placement, info: *const Info) !void {
         reduce(&parts, reductions[index]);
     }
 
-    placement.sink.begin();
     try role.apply(placement.sink, .muted);
     if (left_columns + right_columns + 1 <= placement.columns) {
         try paintRuns(placement.sink, &left, left.text());
@@ -235,10 +219,10 @@ pub fn render(placement: *const paint.Placement, info: *const Info) !void {
     } else {
         const shown = paint.cut(left.text(), placement.columns);
         try paintRuns(placement.sink, &left, shown.kept);
-        if (shown.marked) try placement.sink.text(paint.ellipsis);
+        try shown.writeEllipsis(placement.sink);
     }
     try attribute.apply(placement.sink, .reset);
-    placement.sink.end(.{ .id = placement.id, .line = placement.base });
+    placement.end(placement.base);
 }
 
 pub fn writeNumbers(out: *std.Io.Writer, info: *const Info) !void {
@@ -258,7 +242,7 @@ fn writeRight(line: *Line, info: *const Info, parts: *const Parts) !void {
         return writeEffort(line, info, parts);
     };
     if (parts.account) {
-        try line.out.writeAll(account.id());
+        try line.out.writeAll(account);
         try line.out.writeAll(account_model_separator);
     }
     const model = info.model orelse {
@@ -273,7 +257,7 @@ fn writeRight(line: *Line, info: *const Info, parts: *const Parts) !void {
 
 fn writeEffort(line: *Line, info: *const Info, parts: *const Parts) !void {
     if (parts.effort) {
-        try line.out.writeAll(separator);
+        try line.out.writeAll(paint.separator);
         try line.out.writeAll("Effort: ");
         const effort_start = line.offset();
         try line.out.writeAll(info.effort);
@@ -284,7 +268,7 @@ fn writeEffort(line: *Line, info: *const Info, parts: *const Parts) !void {
 fn writeLeft(line: *Line, info: *const Info, parts: *const Parts) !void {
     if (parts.place != .hidden and info.directory.len > 0) {
         try writePlace(line, info, parts);
-        try line.out.writeAll(separator);
+        try line.out.writeAll(paint.separator);
     }
     try writeContext(line, info, parts.context);
     if (parts.cost) try writeCost(line, info);
@@ -300,32 +284,24 @@ fn writeLeft(line: *Line, info: *const Info, parts: *const Parts) !void {
 
 fn writeCredits(line: *Line, info: *const Info) !void {
     const credits = info.credits orelse return;
-    try line.out.print("{s}Credits: ", .{separator});
+    try line.out.print("{s}Credits: ", .{paint.separator});
     try writeUsd(&line.out, credits.remaining());
 }
 
-fn orderedWindows(quota: *const ai.llm.Quota) [2]?ai.llm.Quota.Window {
-    const maybe_first = labeledWindow(&quota.primary);
-    const maybe_second = labeledWindow(&quota.secondary);
-    const first = maybe_first orelse return .{ maybe_second, null };
-    const second = maybe_second orelse return .{ first, null };
-    if (windowMinutes(&second) < windowMinutes(&first)) return .{ second, first };
+fn orderedWindows(quota: *const core.Provider.Quota) [2]?core.Provider.Quota.Window {
+    const first = quota.primary orelse return .{ quota.secondary, null };
+    const second = quota.secondary orelse return .{ first, null };
+    if (sortMinutes(&second) < sortMinutes(&first)) return .{ second, first };
     return .{ first, second };
 }
 
-fn windowMinutes(window: *const ai.llm.Quota.Window) u32 {
-    return window.window_minutes orelse 0;
-}
-
-fn labeledWindow(maybe_window: *const ?ai.llm.Quota.Window) ?ai.llm.Quota.Window {
-    const window = maybe_window.* orelse return null;
-    if (quotaLabel(window.window_minutes) == null) return null;
-    return window;
+fn sortMinutes(window: *const core.Provider.Quota.Window) u32 {
+    return window.window_minutes orelse std.math.maxInt(u32);
 }
 
 fn writeQuotaPart(
     line: *Line,
-    maybe_window: *const ?ai.llm.Quota.Window,
+    maybe_window: *const ?core.Provider.Quota.Window,
     info: *const Info,
     parts: *const Parts,
 ) !void {
@@ -347,9 +323,9 @@ fn writePlace(line: *Line, info: *const Info, parts: *const Parts) !void {
     }
 }
 
-fn writeDirectory(out: *std.Io.Writer, directory: []const u8, place: Parts.Place) !void {
+fn writeDirectory(out: *std.Io.Writer, directory: []const u8, place: Parts.Form) !void {
     const home_prefix = if (std.mem.startsWith(u8, directory, "~/")) "~/" else "";
-    const mark = "…/";
+    const mark = paint.ellipsis ++ "/";
     const base = std.fs.path.basename(directory);
     const short_columns = terminal.width.ofText(home_prefix) + terminal.width.ofText(mark) +
         terminal.width.ofText(base);
@@ -361,16 +337,15 @@ fn writeDirectory(out: *std.Io.Writer, directory: []const u8, place: Parts.Place
     try out.writeAll(base);
 }
 
-fn writeBranch(out: *std.Io.Writer, branch: []const u8, form: Parts.Branch) !void {
+fn writeBranch(out: *std.Io.Writer, branch: []const u8, form: Parts.Form) !void {
     if (form != .short) return out.writeAll(branch);
     const prefix = terminal.width.truncate(branch, branch_prefix_columns_max);
-    const mark = "…";
-    const short_columns = terminal.width.ofText(prefix) + terminal.width.ofText(mark);
+    const short_columns = terminal.width.ofText(prefix) + terminal.width.ofText(paint.ellipsis);
     if (prefix.len == branch.len or short_columns >= terminal.width.ofText(branch)) {
         return out.writeAll(branch);
     }
     try out.writeAll(prefix);
-    try out.writeAll(mark);
+    try out.writeAll(paint.ellipsis);
 }
 
 fn writeContext(line: *Line, info: *const Info, form: Parts.Context) !void {
@@ -400,7 +375,7 @@ fn writeContext(line: *Line, info: *const Info, form: Parts.Context) !void {
 
 fn writeCost(line: *Line, info: *const Info) !void {
     const cost = if (info.cost > 0) @max(info.cost, 0.01) else info.cost;
-    try line.out.print("{s}Cost: ~${d:.2}", .{ separator, cost });
+    try line.out.print("{s}Cost: ~${d:.2}", .{ paint.separator, cost });
 }
 
 fn writeUsd(out: *std.Io.Writer, amount: f64) !void {
@@ -413,18 +388,19 @@ fn writeCache(line: *Line, info: *const Info) !void {
     const prompt = usage.prompt();
     if (prompt == 0) return;
     const hit = asFloat(usage.cache_read) / asFloat(prompt) * 100.0;
-    try line.out.print("{s}Cache: {d:.0}%", .{ separator, hit });
+    try line.out.print("{s}Cache: {d:.0}%", .{ paint.separator, hit });
 }
 
 fn writeQuotaWindow(
     line: *Line,
-    window: *const ai.llm.Quota.Window,
+    window: *const core.Provider.Quota.Window,
     gauge: Gauge,
     wait_seconds: ?u64,
 ) !void {
-    const label = quotaLabel(window.window_minutes) orelse return;
     const used = @round(@max(0.0, @min(100.0, window.used_percent)));
-    try line.out.print("{s}{s}: ", .{ separator, label });
+    try line.out.writeAll(paint.separator);
+    try writeQuotaLabel(&line.out, window.window_minutes);
+    try line.out.writeAll(": ");
     const value_start = line.offset();
     try line.out.print("{d:.0}%", .{used});
     if (wait_seconds) |seconds| {
@@ -451,16 +427,21 @@ fn writeWait(out: *std.Io.Writer, seconds: u64) !void {
     return out.print("{d}d", .{@divFloor(seconds, day)});
 }
 
-fn quotaLabel(maybe_minutes: ?u32) ?[]const u8 {
-    const minutes = maybe_minutes orelse return null;
-    if (approxWindow(minutes, 300)) return "5h";
-    if (approxWindow(minutes, 10080)) return "Week";
-    return null;
+fn writeQuotaLabel(out: *std.Io.Writer, maybe_minutes: ?u32) !void {
+    const minutes = maybe_minutes orelse return out.writeAll("Quota");
+    const seconds = @as(u64, minutes) * std.time.s_per_min;
+    const hours = roundedCount(&.{ .seconds = seconds, .unit_seconds = std.time.s_per_hour });
+    if (hours * std.time.s_per_hour < std.time.s_per_day) {
+        return out.print("{d}h", .{@max(1, hours)});
+    }
+    const days = roundedCount(&.{ .seconds = seconds, .unit_seconds = std.time.s_per_day });
+    if (days * std.time.s_per_day == std.time.s_per_week) return out.writeAll("Week");
+    return out.print("{d}d", .{days});
 }
 
-fn approxWindow(minutes: u32, target: u32) bool {
-    const tolerance = @divFloor(target, 20);
-    return minutes >= target - tolerance and minutes <= target + tolerance;
+fn roundedCount(duration: *const struct { seconds: u64, unit_seconds: u64 }) u64 {
+    const unit_seconds = duration.unit_seconds;
+    return @divFloor(duration.seconds + @divFloor(unit_seconds, 2), unit_seconds);
 }
 
 fn writeTokens(out: *std.Io.Writer, count: u64) !void {
@@ -477,18 +458,24 @@ fn asFloat(count: u64) f64 {
     return @floatFromInt(count);
 }
 
-fn expectTokens(expected: []const u8, count: u64) !void {
-    var buffer: [48]u8 = undefined;
-    var out: std.Io.Writer = .fixed(&buffer);
-    try writeTokens(&out, count);
-    try std.testing.expectEqualStrings(expected, out.buffered());
-}
-
-test writeTokens {
-    try expectTokens("22", 22);
-    try expectTokens("6.7k", 6700);
-    try expectTokens("160k", 160_000);
-    try expectTokens("1.0M", 1_000_000);
+test "a token count shows in thousands and millions" {
+    const gpa = std.testing.allocator;
+    const cases = [_]struct { tokens: u64, shown: []const u8 }{
+        .{ .tokens = 22, .shown = "Context: 22 · " },
+        .{ .tokens = 6700, .shown = "Context: 6.7k · " },
+        .{ .tokens = 160_000, .shown = "Context: 160k · " },
+        .{ .tokens = 1_000_000, .shown = "Context: 1.0M · " },
+    };
+    for (cases) |case| {
+        var info = test_info;
+        info.context_tokens = case.tokens;
+        info.context_window = null;
+        var rig: testing.Rig = undefined;
+        rig.init(gpa);
+        defer rig.deinit();
+        try renderForTest(&rig, &info, 200);
+        try testing.expectShows(try rig.plain(), &.{case.shown});
+    }
 }
 
 const test_info: Info = .{
@@ -505,7 +492,7 @@ const test_info: Info = .{
     .context_window = 1_000_000,
     .model = "claude-opus-4-8",
     .effort = "xhigh",
-    .account = .anthropic_plan,
+    .account = "anthropic-plan",
     .quota = .{
         .primary = .{ .used_percent = 11.6, .window_minutes = 300, .reset_seconds = 3180 },
         .secondary = .{ .used_percent = 73.6, .window_minutes = 10080, .reset_seconds = 580_769 },
@@ -542,48 +529,15 @@ test "a positive sub-cent cost never displays as zero" {
         var info = test_info;
         info.cost = case.cost;
         var buffer: [64]u8 = undefined;
-        var line: Line = .init(&buffer);
-        try writeCost(&line, &info);
-        try std.testing.expectEqualStrings(case.expected, line.text());
+        var out: std.Io.Writer = .fixed(&buffer);
+        try writeNumbers(&out, &info);
+        try std.testing.expectStringEndsWith(out.buffered(), case.expected);
     }
 }
 
-fn renderForTest(
-    gpa: std.mem.Allocator,
-    info: *const Info,
-    columns: usize,
-    out: *std.Io.Writer.Allocating,
-) !void {
-    var view = terminal.View.init(gpa, &out.writer);
-    defer view.deinit();
-    const sink = try view.beginFrame(.{ .columns = columns, .rows = 24 }, 4);
-    const placement: paint.Placement = .{
-        .sink = sink,
-        .id = 0,
-        .columns = columns,
-        .base = 0,
-        .skip = 0,
-    };
+fn renderForTest(rig: *testing.Rig, info: *const Info, columns: usize) !void {
+    const placement = try rig.begin(&.{ .columns = columns, .rows = 24, .pages = 4 });
     try render(&placement, info);
-    try view.render();
-}
-
-fn expectShows(painted: []const u8, texts: []const []const u8) !void {
-    for (texts) |text| {
-        if (std.mem.indexOf(u8, painted, text) == null) {
-            std.debug.print("the status line does not show \"{s}\"\n", .{text});
-            return error.TestExpectedShown;
-        }
-    }
-}
-
-fn expectHides(painted: []const u8, texts: []const []const u8) !void {
-    for (texts) |text| {
-        if (std.mem.indexOf(u8, painted, text) != null) {
-            std.debug.print("the status line still shows \"{s}\"\n", .{text});
-            return error.TestExpectedHidden;
-        }
-    }
 }
 
 fn expectNoColor(painted: []const u8) !void {
@@ -598,12 +552,13 @@ fn expectNoColor(painted: []const u8) !void {
 
 test render {
     const gpa = std.testing.allocator;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    try renderForTest(gpa, &test_info, 200, &out);
+    var rig: testing.Rig = undefined;
+    rig.init(gpa);
+    defer rig.deinit();
+    try renderForTest(&rig, &test_info, 200);
 
-    const painted = out.written();
-    try expectShows(painted, &.{
+    const painted = try rig.painted();
+    try testing.expectShows(painted, &.{
         "~/github/clebert/drinky (main)",
         "Context: 21% (206k/1.0M)",
         "Cost: ~$0.39",
@@ -626,23 +581,29 @@ test "an unmeasured context reads as unknown, and an unmeasured rate hides" {
     var unknown = test_info;
     unknown.context_tokens = null;
     unknown.cache_usage = .{};
-    var unknown_out: std.Io.Writer.Allocating = .init(gpa);
-    defer unknown_out.deinit();
-    try renderForTest(gpa, &unknown, 200, &unknown_out);
-    try expectShows(unknown_out.written(), &.{"Context: Unknown"});
-    try expectHides(unknown_out.written(), &.{ "Context: 21%", "(206k/1.0M)", "Cache:" });
+    var unknown_rig: testing.Rig = undefined;
+    unknown_rig.init(gpa);
+    defer unknown_rig.deinit();
+    try renderForTest(&unknown_rig, &unknown, 200);
+    try testing.expectShows(try unknown_rig.painted(), &.{"Context: Unknown"});
+    try testing.expectHides(
+        try unknown_rig.painted(),
+        &.{ "Context: 21%", "(206k/1.0M)", "Cache:" },
+    );
 
     var empty = test_info;
     empty.context_tokens = 0;
-    var empty_out: std.Io.Writer.Allocating = .init(gpa);
-    defer empty_out.deinit();
-    try renderForTest(gpa, &empty, 200, &empty_out);
-    try expectShows(empty_out.written(), &.{"Context: 0% (0/1.0M)"});
+    var empty_rig: testing.Rig = undefined;
+    empty_rig.init(gpa);
+    defer empty_rig.deinit();
+    try renderForTest(&empty_rig, &empty, 200);
+    try testing.expectShows(try empty_rig.painted(), &.{"Context: 0% (0/1.0M)"});
 
-    var narrow_out: std.Io.Writer.Allocating = .init(gpa);
-    defer narrow_out.deinit();
-    try renderForTest(gpa, &unknown, 20, &narrow_out);
-    try expectShows(narrow_out.written(), &.{"Context: Unknown"});
+    var narrow_rig: testing.Rig = undefined;
+    narrow_rig.init(gpa);
+    defer narrow_rig.deinit();
+    try renderForTest(&narrow_rig, &unknown, 20);
+    try testing.expectShows(try narrow_rig.painted(), &.{"Context: Unknown"});
 }
 
 test "a narrow window shortens fields before it gives up parts" {
@@ -652,7 +613,7 @@ test "a narrow window shortens fields before it gives up parts" {
         shows: []const []const u8,
         hides: []const []const u8,
         model: ?[]const u8 = test_info.model,
-        account: ?ai.llm.Account = test_info.account,
+        account: ?[]const u8 = test_info.account,
     }{
         .{
             .columns = 167,
@@ -714,15 +675,16 @@ test "a narrow window shortens fields before it gives up parts" {
     };
 
     for (steps) |step| {
-        var out: std.Io.Writer.Allocating = .init(gpa);
-        defer out.deinit();
+        var rig: testing.Rig = undefined;
+        rig.init(gpa);
+        defer rig.deinit();
         var info = test_info;
         info.model = step.model;
         info.account = step.account;
-        try renderForTest(gpa, &info, step.columns, &out);
-        const painted = out.written();
-        try expectShows(painted, step.shows);
-        try expectHides(painted, step.hides);
+        try renderForTest(&rig, &info, step.columns);
+        const painted = try rig.painted();
+        try testing.expectShows(painted, step.shows);
+        try testing.expectHides(painted, step.hides);
         try std.testing.expectEqual(
             std.mem.indexOf(u8, painted, "Effort:") != null,
             std.mem.indexOf(u8, painted, "xhigh") != null,
@@ -734,14 +696,18 @@ test "the context gauge survives every width" {
     const gpa = std.testing.allocator;
     var columns: usize = 8;
     while (columns <= 200) : (columns += 1) {
-        var out: std.Io.Writer.Allocating = .init(gpa);
-        defer out.deinit();
-        try renderForTest(gpa, &test_info, columns, &out);
+        var rig: testing.Rig = undefined;
+        rig.init(gpa);
+        defer rig.deinit();
+        try renderForTest(&rig, &test_info, columns);
         if (columns >= 12) {
-            try expectShows(out.written(), &.{"Context: 21%"});
+            try testing.expectShows(try rig.painted(), &.{"Context: 21%"});
             continue;
         }
-        try expectShows(out.written(), &.{ "Context: 21%"[0 .. columns - 1], paint.ellipsis });
+        try testing.expectShows(
+            try rig.painted(),
+            &.{ "Context: 21%"[0 .. columns - 1], paint.ellipsis },
+        );
     }
 }
 
@@ -753,18 +719,19 @@ test "a gauge takes a color when it fills past its threshold" {
         .primary = .{ .used_percent = 90, .window_minutes = 300 },
         .secondary = .{ .used_percent = 74, .window_minutes = 10080 },
     };
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    try renderForTest(gpa, &info, 200, &out);
+    var rig: testing.Rig = undefined;
+    rig.init(gpa);
+    defer rig.deinit();
+    try renderForTest(&rig, &info, 200);
 
-    const painted = out.written();
-    try expectShows(painted, &.{
+    const painted = try rig.painted();
+    try testing.expectShows(painted, &.{
         comptime "Context: " ++ attribute.sequence(.reset) ++ role.sequence(.warning) ++
             "75% (750k/1.0M)" ++ role.sequence(.muted),
         comptime "5h: " ++ attribute.sequence(.reset) ++ role.sequence(.@"error") ++
             "90%" ++ role.sequence(.muted),
     });
-    try expectHides(painted, &.{
+    try testing.expectHides(painted, &.{
         comptime attribute.sequence(.reset) ++ "Context:",
         comptime attribute.sequence(.reset) ++ "5h:",
         comptime attribute.sequence(.reset) ++ "74%",
@@ -779,16 +746,17 @@ test "a configured pair moves the shares at which a gauge takes a color" {
         .primary = .{ .used_percent = 50, .window_minutes = 300 },
         .secondary = .{ .used_percent = 19, .window_minutes = 10080 },
     };
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    try renderForTest(gpa, &info, 200, &out);
+    var rig: testing.Rig = undefined;
+    rig.init(gpa);
+    defer rig.deinit();
+    try renderForTest(&rig, &info, 200);
 
-    const painted = out.written();
-    try expectShows(painted, &.{
+    const painted = try rig.painted();
+    try testing.expectShows(painted, &.{
         comptime "Context: " ++ attribute.sequence(.reset) ++ role.sequence(.warning) ++ "21%",
         comptime "5h: " ++ attribute.sequence(.reset) ++ role.sequence(.@"error") ++ "50%",
     });
-    try expectHides(painted, &.{comptime attribute.sequence(.reset) ++ "19%"});
+    try testing.expectHides(painted, &.{comptime attribute.sequence(.reset) ++ "19%"});
 }
 
 test "the color follows the share that the line prints" {
@@ -799,12 +767,13 @@ test "the color follows the share that the line prints" {
         .primary = .{ .used_percent = 89.6, .window_minutes = 300 },
         .secondary = null,
     };
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    try renderForTest(gpa, &info, 200, &out);
+    var rig: testing.Rig = undefined;
+    rig.init(gpa);
+    defer rig.deinit();
+    try renderForTest(&rig, &info, 200);
 
-    const painted = out.written();
-    try expectShows(painted, &.{
+    const painted = try rig.painted();
+    try testing.expectShows(painted, &.{
         comptime "Context: " ++ attribute.sequence(.reset) ++ role.sequence(.warning) ++ "75%",
         comptime "5h: " ++ attribute.sequence(.reset) ++ role.sequence(.@"error") ++ "90%",
     });
@@ -812,18 +781,19 @@ test "the color follows the share that the line prints" {
 
 test "the model value and the effort level leave the faint intensity" {
     const gpa = std.testing.allocator;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    try renderForTest(gpa, &test_info, 200, &out);
+    var rig: testing.Rig = undefined;
+    rig.init(gpa);
+    defer rig.deinit();
+    try renderForTest(&rig, &test_info, 200);
 
-    const painted = out.written();
+    const painted = try rig.painted();
     const reset = comptime attribute.sequence(.reset);
     const muted = comptime role.sequence(.muted);
-    try expectShows(painted, &.{
+    try testing.expectShows(painted, &.{
         reset ++ "anthropic-plan/claude-opus-4-8" ++ muted,
         reset ++ "xhigh" ++ muted,
     });
-    try expectHides(painted, &.{
+    try testing.expectHides(painted, &.{
         reset ++ "Model",
         reset ++ "Effort",
         reset ++ "claude-opus-4-8",
@@ -835,55 +805,60 @@ test "a cut keeps the color it lands in and drops the color it takes away" {
     var info = test_info;
     info.context_tokens = 950_000;
     const label_columns = terminal.width.ofText(context_label);
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    try renderForTest(gpa, &info, label_columns + 2, &out);
+    var rig: testing.Rig = undefined;
+    rig.init(gpa);
+    defer rig.deinit();
+    try renderForTest(&rig, &info, label_columns + 2);
 
-    const painted = out.written();
-    try expectShows(painted, &.{
+    const painted = try rig.painted();
+    try testing.expectShows(painted, &.{
         comptime role.sequence(.muted) ++ context_label ++ attribute.sequence(.reset) ++
             role.sequence(.@"error") ++ "9",
         comptime role.sequence(.muted) ++ paint.ellipsis,
     });
 
-    var label_out: std.Io.Writer.Allocating = .init(gpa);
-    defer label_out.deinit();
-    try renderForTest(gpa, &info, label_columns + 1, &label_out);
-    try expectShows(label_out.written(), &.{context_label});
-    try expectNoColor(label_out.written());
+    var label_rig: testing.Rig = undefined;
+    label_rig.init(gpa);
+    defer label_rig.deinit();
+    try renderForTest(&label_rig, &info, label_columns + 1);
+    try testing.expectShows(try label_rig.painted(), &.{context_label});
+    try expectNoColor(try label_rig.painted());
 }
 
 test "shortening the directory never costs columns" {
     const gpa = std.testing.allocator;
     var info = test_info;
     info.directory = "~/a";
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    try renderForTest(gpa, &info, 80, &out);
+    var rig: testing.Rig = undefined;
+    rig.init(gpa);
+    defer rig.deinit();
+    try renderForTest(&rig, &info, 80);
 
-    const painted = out.written();
-    try expectShows(painted, &.{"~/a (main)"});
-    try expectHides(painted, &.{"…"});
+    const painted = try rig.painted();
+    try testing.expectShows(painted, &.{"~/a (main)"});
+    try testing.expectHides(painted, &.{"…"});
 
     var plain = test_info;
     plain.directory = "/work";
-    var plain_out: std.Io.Writer.Allocating = .init(gpa);
-    defer plain_out.deinit();
-    try renderForTest(gpa, &plain, 80, &plain_out);
-    try expectShows(plain_out.written(), &.{"/work (main)"});
-    try expectHides(plain_out.written(), &.{"…"});
+    var plain_rig: testing.Rig = undefined;
+    plain_rig.init(gpa);
+    defer plain_rig.deinit();
+    try renderForTest(&plain_rig, &plain, 80);
+    try testing.expectShows(try plain_rig.painted(), &.{"/work (main)"});
+    try testing.expectHides(try plain_rig.painted(), &.{"…"});
 }
 
 test "a long branch keeps 16 columns and a whole grapheme" {
     const gpa = std.testing.allocator;
     var info = test_info;
     info.branch = "feature/" ++ "🇩🇪" ** 8;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    try renderForTest(gpa, &info, 177, &out);
+    var rig: testing.Rig = undefined;
+    rig.init(gpa);
+    defer rig.deinit();
+    try renderForTest(&rig, &info, 177);
 
-    const painted = out.written();
-    try expectShows(painted, &.{
+    const painted = try rig.painted();
+    try testing.expectShows(painted, &.{
         "~/…/drinky (feature/" ++ "🇩🇪" ** 4 ++ "…)",
         "Context: 21% (206k/1.0M)",
         "Cost: ~$0.39",
@@ -891,63 +866,73 @@ test "a long branch keeps 16 columns and a whole grapheme" {
         "Week: 74% (6d)",
         "Cache: 87%",
     });
-    try expectHides(painted, &.{ "~/github", "🇩🇪" ** 5 });
+    try testing.expectHides(painted, &.{ "~/github", "🇩🇪" ** 5 });
 }
 
 test "a directory outside a repository shows without a branch" {
     const gpa = std.testing.allocator;
     var info = test_info;
     info.branch = null;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    try renderForTest(gpa, &info, 200, &out);
+    var rig: testing.Rig = undefined;
+    rig.init(gpa);
+    defer rig.deinit();
+    try renderForTest(&rig, &info, 200);
 
-    const painted = out.written();
-    try expectShows(painted, &.{"~/github/clebert/drinky · Context:"});
-    try expectHides(painted, &.{"(main)"});
+    const painted = try rig.painted();
+    try testing.expectShows(painted, &.{"~/github/clebert/drinky · Context:"});
+    try testing.expectHides(painted, &.{"(main)"});
 }
 
 test "a notice replaces the status for exactly one row" {
     const gpa = std.testing.allocator;
     var info = test_info;
     info.model = "hidden-model";
-    info.notice = .{ .text = "boom\nnot another row", .severity = .failure };
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    try renderForTest(gpa, &info, 40, &out);
+    info.notice = .{ .content = "boom\nnot another row", .severity = .failure };
+    var rig: testing.Rig = undefined;
+    rig.init(gpa);
+    defer rig.deinit();
+    try renderForTest(&rig, &info, 40);
 
-    const painted = out.written();
-    try expectShows(painted, &.{comptime role.sequence(.@"error") ++ "⚠ boom" ++ paint.ellipsis});
-    try expectHides(painted, &.{ "not another row", "hidden-model", "Error:" });
+    const painted = try rig.painted();
+    try testing.expectShows(
+        painted,
+        &.{comptime role.sequence(.@"error") ++ "⚠ boom" ++ paint.ellipsis},
+    );
+    try testing.expectHides(painted, &.{ "not another row", "hidden-model", "Error:" });
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, painted, "\r\n"));
 }
 
 test "a warning notice takes the warning symbol in the warning role" {
     const gpa = std.testing.allocator;
     var info = test_info;
-    info.notice = .{ .text = "Enter: Send anyway", .severity = .warning };
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    try renderForTest(gpa, &info, 40, &out);
+    info.notice = .{ .content = "Enter: Send anyway", .severity = .warning };
+    var rig: testing.Rig = undefined;
+    rig.init(gpa);
+    defer rig.deinit();
+    try renderForTest(&rig, &info, 40);
 
-    const painted = out.written();
-    try expectShows(painted, &.{comptime role.sequence(.warning) ++ "⚠ Enter: Send anyway"});
-    try expectHides(painted, &.{ "Error:", comptime role.sequence(.@"error") });
+    const painted = try rig.painted();
+    try testing.expectShows(
+        painted,
+        &.{comptime role.sequence(.warning) ++ "⚠ Enter: Send anyway"},
+    );
+    try testing.expectHides(painted, &.{ "Error:", comptime role.sequence(.@"error") });
 }
 
 test "an information notice takes the information symbol in the accent role" {
     const gpa = std.testing.allocator;
     var info = test_info;
-    info.notice = .{ .text = "Drinky loaded every queued message.", .severity = .information };
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    try renderForTest(gpa, &info, 40, &out);
+    info.notice = .{ .content = "You canceled the model fetch.", .severity = .information };
+    var rig: testing.Rig = undefined;
+    rig.init(gpa);
+    defer rig.deinit();
+    try renderForTest(&rig, &info, 40);
 
-    const painted = out.written();
-    try expectShows(painted, &.{
-        comptime role.sequence(.accent) ++ "ℹ Drinky loaded every queued message.",
+    const painted = try rig.painted();
+    try testing.expectShows(painted, &.{
+        comptime role.sequence(.accent) ++ "ℹ You canceled the model fetch.",
     });
-    try expectHides(painted, &.{ "Error:", "⚠" });
+    try testing.expectHides(painted, &.{ "Error:", "⚠" });
     try std.testing.expect(std.mem.indexOf(
         u8,
         painted,
@@ -960,19 +945,20 @@ test "a signed-out status names the state in the model value and keeps the effor
     var info = test_info;
     info.account = null;
     info.cache_usage = .{};
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    try renderForTest(gpa, &info, 120, &out);
+    var rig: testing.Rig = undefined;
+    rig.init(gpa);
+    defer rig.deinit();
+    try renderForTest(&rig, &info, 120);
 
-    const painted = out.written();
-    try expectShows(painted, &.{
+    const painted = try rig.painted();
+    try testing.expectShows(painted, &.{
         "Model: ",
         comptime attribute.sequence(.reset) ++ role.sequence(.warning) ++ "signed out" ++
             role.sequence(.muted),
         " · Effort: ",
         "xhigh",
     });
-    try expectHides(painted, &.{ "claude-opus-4-8", "Cache" });
+    try testing.expectHides(painted, &.{ "claude-opus-4-8", "Cache" });
 }
 
 test "an account with no model shows the value in the warning role" {
@@ -980,32 +966,34 @@ test "an account with no model shows the value in the warning role" {
     var info = test_info;
     info.model = null;
     info.context_window = null;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    try renderForTest(gpa, &info, 200, &out);
+    var rig: testing.Rig = undefined;
+    rig.init(gpa);
+    defer rig.deinit();
+    try renderForTest(&rig, &info, 200);
 
-    const painted = out.written();
-    try expectShows(painted, &.{
+    const painted = try rig.painted();
+    try testing.expectShows(painted, &.{
         "Model: ",
         comptime attribute.sequence(.reset) ++ role.sequence(.warning) ++
             "anthropic-plan/none" ++ role.sequence(.muted),
         " · Effort: ",
         "xhigh",
     });
-    try expectHides(painted, &.{ "claude-opus-4-8", "signed out" });
+    try testing.expectHides(painted, &.{ "claude-opus-4-8", "signed out" });
 }
 
 test "an unknown context window shows the tokens with no share" {
     const gpa = std.testing.allocator;
     var info = test_info;
     info.context_window = null;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    try renderForTest(gpa, &info, 200, &out);
+    var rig: testing.Rig = undefined;
+    rig.init(gpa);
+    defer rig.deinit();
+    try renderForTest(&rig, &info, 200);
 
-    const painted = out.written();
-    try expectShows(painted, &.{"Context: 206k"});
-    try expectHides(painted, &.{ "Context: 21%", "206k/1.0M" });
+    const painted = try rig.painted();
+    try testing.expectShows(painted, &.{"Context: 206k"});
+    try testing.expectHides(painted, &.{ "Context: 21%", "206k/1.0M" });
 }
 
 test "quota windows show the used share, labeled by length" {
@@ -1013,99 +1001,121 @@ test "quota windows show the used share, labeled by length" {
     var info = test_info;
     info.directory = "";
     info.model = "gpt-5.6-sol";
-    info.account = .openai_plan;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    try renderForTest(gpa, &info, 160, &out);
+    info.account = "openai-plan";
+    var rig: testing.Rig = undefined;
+    rig.init(gpa);
+    defer rig.deinit();
+    try renderForTest(&rig, &info, 160);
 
-    const painted = out.written();
-    try expectShows(painted, &.{ "5h: 12% (53m)", "Week: 74% (6d)" });
-    try expectHides(painted, &.{" · Context:"});
+    const painted = try rig.painted();
+    try testing.expectShows(painted, &.{ "5h: 12% (53m)", "Week: 74% (6d)" });
+    try testing.expectHides(painted, &.{" · Context:"});
 }
 
 test "the shortest window prints first, whatever slot carries it" {
-    var buffer: [512]u8 = undefined;
-    var line: Line = .init(&buffer);
     var info = test_info;
     info.quota = .{
         .primary = .{ .used_percent = 10, .window_minutes = 10080, .reset_seconds = 580_769 },
         .secondary = .{ .used_percent = 4, .window_minutes = 300, .reset_seconds = 8600 },
     };
-
-    try writeLeft(&line, &info, &Parts.all);
-    const written = line.text();
-    const short = std.mem.indexOf(u8, written, "5h: 4% (2h)").?;
-    const long = std.mem.indexOf(u8, written, "Week: 10% (6d)").?;
-    try std.testing.expect(short < long);
+    try expectPlainShows(&info, "· 5h: 4% (2h) · Week: 10% (6d) ·");
 }
 
-test "unidentified quota windows stay hidden beside a known window" {
-    var buffer: [512]u8 = undefined;
-    var line: Line = .init(&buffer);
+fn expectPlainShows(info: *const Info, shown: []const u8) !void {
+    var rig: testing.Rig = undefined;
+    rig.init(std.testing.allocator);
+    defer rig.deinit();
+    try renderForTest(&rig, info, 200);
+    try testing.expectShows(try rig.plain(), &.{shown});
+}
+
+test "a lone quota window of any length shows under the label of its length" {
+    const cases = [_]struct { minutes: ?u32, shown: []const u8 }{
+        .{ .minutes = 300, .shown = "· 5h: 12% ·" },
+        .{ .minutes = 10080, .shown = "· Week: 12% ·" },
+        .{ .minutes = 10079, .shown = "· Week: 12% ·" },
+        .{ .minutes = 20, .shown = "· 1h: 12% ·" },
+        .{ .minutes = 720, .shown = "· 12h: 12% ·" },
+        .{ .minutes = 1410, .shown = "· 1d: 12% ·" },
+        .{ .minutes = 1440, .shown = "· 1d: 12% ·" },
+        .{ .minutes = 43200, .shown = "· 30d: 12% ·" },
+        .{ .minutes = 44640, .shown = "· 31d: 12% ·" },
+        .{ .minutes = std.math.maxInt(u32), .shown = "· 2982616d: 12% ·" },
+        .{ .minutes = null, .shown = "· Quota: 12% ·" },
+    };
+    for (cases) |case| {
+        var info = test_info;
+        info.quota = .{ .primary = .{ .used_percent = 12, .window_minutes = case.minutes } };
+        try expectPlainShows(&info, case.shown);
+    }
+}
+
+test "a window without a length prints after a window with a length" {
     var info = test_info;
     info.quota = .{
-        .primary = .{ .used_percent = 77, .window_minutes = 10080 },
-        .secondary = .{ .used_percent = 0 },
+        .primary = .{ .used_percent = 0 },
+        .secondary = .{ .used_percent = 77, .window_minutes = 10080 },
     };
-
-    try writeLeft(&line, &info, &Parts.all);
-    const written = line.text();
-    try std.testing.expect(std.mem.indexOf(u8, written, "Week: 77% · Cache") != null);
-    try std.testing.expect(std.mem.indexOf(u8, written, "0%") == null);
-    try std.testing.expect(quotaLabel(null) == null);
-    try std.testing.expect(quotaLabel(600) == null);
+    try expectPlainShows(&info, "· Week: 77% · Quota: 0% · Cache");
 }
 
 test "the credit pool shows the remaining amount while a turn runs" {
     const gpa = std.testing.allocator;
     var info = test_info;
     info.model = "openai/gpt-5.6-sol";
-    info.account = .openrouter_api_key;
+    info.account = "openrouter-api-key";
     info.quota = null;
     info.credits = .{ .total = 10, .used = 2.864085024 };
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    try renderForTest(gpa, &info, 200, &out);
-    try expectShows(out.written(), &.{ "Cost: ~$0.39", "Credits: $7.14", "Cache: 87%" });
+    var rig: testing.Rig = undefined;
+    rig.init(gpa);
+    defer rig.deinit();
+    try renderForTest(&rig, &info, 200);
+    try testing.expectShows(
+        try rig.painted(),
+        &.{ "Cost: ~$0.39", "Credits: $7.14", "Cache: 87%" },
+    );
 
     var idle = info;
     idle.turn_active = false;
-    var idle_out: std.Io.Writer.Allocating = .init(gpa);
-    defer idle_out.deinit();
-    try renderForTest(gpa, &idle, 200, &idle_out);
-    try expectHides(idle_out.written(), &.{"Credits:"});
+    var idle_rig: testing.Rig = undefined;
+    idle_rig.init(gpa);
+    defer idle_rig.deinit();
+    try renderForTest(&idle_rig, &idle, 200);
+    try testing.expectHides(try idle_rig.painted(), &.{"Credits:"});
 }
 
 test "a sub-cent credit pool never reads as an empty one" {
     const gpa = std.testing.allocator;
     var info = test_info;
     info.model = "openai/gpt-5.6-sol";
-    info.account = .openrouter_api_key;
+    info.account = "openrouter-api-key";
     info.quota = null;
     info.credits = .{ .total = 0.02, .used = 0.015 };
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    try renderForTest(gpa, &info, 200, &out);
-    try expectShows(out.written(), &.{"Credits: <$0.01"});
+    var rig: testing.Rig = undefined;
+    rig.init(gpa);
+    defer rig.deinit();
+    try renderForTest(&rig, &info, 200);
+    try testing.expectShows(try rig.painted(), &.{"Credits: <$0.01"});
 }
 
 test "the credit pool takes no color at any used share" {
     const gpa = std.testing.allocator;
     var info = test_info;
     info.model = "openai/gpt-5.6-sol";
-    info.account = .openrouter_api_key;
+    info.account = "openrouter-api-key";
     info.quota = null;
-    for ([_]ai.llm.Credits{
+    for ([_]core.Provider.Credits{
         .{ .total = 10, .used = 9 },
         .{ .total = 1, .used = 2 },
         .{ .total = 0, .used = 0 },
     }) |credits| {
         info.credits = credits;
-        var out: std.Io.Writer.Allocating = .init(gpa);
-        defer out.deinit();
-        try renderForTest(gpa, &info, 200, &out);
-        try expectShows(out.written(), &.{"Credits: $"});
-        try expectNoColor(out.written());
+        var rig: testing.Rig = undefined;
+        rig.init(gpa);
+        defer rig.deinit();
+        try renderForTest(&rig, &info, 200);
+        try testing.expectShows(try rig.painted(), &.{"Credits: $"});
+        try expectNoColor(try rig.painted());
     }
 }
 
@@ -1113,91 +1123,107 @@ test "a narrow window drops the credit pool before the session cost" {
     const gpa = std.testing.allocator;
     var info = test_info;
     info.model = "openai/gpt-5.6-sol";
-    info.account = .openrouter_api_key;
+    info.account = "openrouter-api-key";
     info.quota = null;
     info.credits = .{ .total = 10, .used = 2.86 };
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    try renderForTest(gpa, &info, 127, &out);
-    try expectShows(out.written(), &.{ "Cost: ~$0.39", "Credits: $7.14" });
-    try expectHides(out.written(), &.{"Cache:"});
+    var rig: testing.Rig = undefined;
+    rig.init(gpa);
+    defer rig.deinit();
+    try renderForTest(&rig, &info, 127);
+    try testing.expectShows(try rig.painted(), &.{ "Cost: ~$0.39", "Credits: $7.14" });
+    try testing.expectHides(try rig.painted(), &.{"Cache:"});
 
-    var out2: std.Io.Writer.Allocating = .init(gpa);
-    defer out2.deinit();
-    try renderForTest(gpa, &info, 117, &out2);
-    try expectShows(out2.written(), &.{ "~/…/drinky (main)", "Context: 21%", "Cost: ~$0.39" });
-    try expectHides(out2.written(), &.{ "Credits:", "Cache:" });
+    var narrow_rig: testing.Rig = undefined;
+    narrow_rig.init(gpa);
+    defer narrow_rig.deinit();
+    try renderForTest(&narrow_rig, &info, 117);
+    try testing.expectShows(
+        try narrow_rig.painted(),
+        &.{ "~/…/drinky (main)", "Context: 21%", "Cost: ~$0.39" },
+    );
+    try testing.expectHides(try narrow_rig.painted(), &.{ "Credits:", "Cache:" });
 }
 
-test writeWait {
-    const cases = [_]struct { seconds: u64, shown: []const u8 }{
-        .{ .seconds = 0, .shown = "1m" },
-        .{ .seconds = 59, .shown = "1m" },
-        .{ .seconds = 60, .shown = "1m" },
-        .{ .seconds = 3599, .shown = "59m" },
-        .{ .seconds = 3600, .shown = "1h" },
-        .{ .seconds = 86_399, .shown = "23h" },
-        .{ .seconds = 86_400, .shown = "1d" },
-        .{ .seconds = 580_769, .shown = "6d" },
+test "a quota countdown shows the time left in its largest unit and drops at its end" {
+    const cases = [_]struct { reset_seconds: ?u64, age_ms: i64 = 0, shown: []const u8 }{
+        .{ .reset_seconds = 59, .shown = "5h: 12% (1m) · Cache" },
+        .{ .reset_seconds = 60, .shown = "5h: 12% (1m) · Cache" },
+        .{ .reset_seconds = 3599, .shown = "5h: 12% (59m) · Cache" },
+        .{ .reset_seconds = 3600, .shown = "5h: 12% (1h) · Cache" },
+        .{ .reset_seconds = 86_399, .shown = "5h: 12% (23h) · Cache" },
+        .{ .reset_seconds = 86_400, .shown = "5h: 12% (1d) · Cache" },
+        .{ .reset_seconds = 580_769, .shown = "5h: 12% (6d) · Cache" },
+        .{ .reset_seconds = 3180, .age_ms = 60_000, .shown = "5h: 12% (52m) · Cache" },
+        .{ .reset_seconds = 60, .age_ms = -600_000, .shown = "5h: 12% (1m) · Cache" },
+        .{ .reset_seconds = null, .shown = "5h: 12% · Cache" },
+        .{ .reset_seconds = 60, .age_ms = 60_000, .shown = "5h: 12% · Cache" },
+        .{ .reset_seconds = 60, .age_ms = 600_000, .shown = "5h: 12% · Cache" },
+        .{ .reset_seconds = 3180, .age_ms = 3_600_000, .shown = "5h: 12% · Cache" },
     };
     for (cases) |case| {
-        var buffer: [16]u8 = undefined;
-        var out: std.Io.Writer = .fixed(&buffer);
-        try writeWait(&out, case.seconds);
-        try std.testing.expectEqualStrings(case.shown, out.buffered());
+        var info = test_info;
+        info.quota = .{
+            .primary = .{
+                .used_percent = 12,
+                .window_minutes = 300,
+                .reset_seconds = case.reset_seconds,
+            },
+            .secondary = null,
+        };
+        info.quota_age_ms = case.age_ms;
+        try expectPlainShows(&info, case.shown);
     }
-}
-
-test waitSeconds {
-    try std.testing.expectEqual(@as(?u64, 3180), waitSeconds(3180, 0));
-    try std.testing.expectEqual(@as(?u64, 3120), waitSeconds(3180, 60_000));
-    try std.testing.expect(waitSeconds(null, 0) == null);
-    try std.testing.expect(waitSeconds(60, 60_000) == null);
-    try std.testing.expect(waitSeconds(60, 600_000) == null);
-    try std.testing.expectEqual(@as(?u64, 60), waitSeconds(60, -600_000));
 }
 
 test "the quota and the cache rate show while a turn runs alone" {
     const gpa = std.testing.allocator;
     var idle = test_info;
     idle.turn_active = false;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    try renderForTest(gpa, &idle, 200, &out);
+    var rig: testing.Rig = undefined;
+    rig.init(gpa);
+    defer rig.deinit();
+    try renderForTest(&rig, &idle, 200);
 
-    const painted = out.written();
-    try expectShows(painted, &.{ "~/github/clebert/drinky (main)", "Context: 21%", "Cost: ~$0.39" });
-    try expectHides(painted, &.{ "5h:", "Week:", "Cache:" });
+    const painted = try rig.painted();
+    try testing.expectShows(
+        painted,
+        &.{ "~/github/clebert/drinky (main)", "Context: 21%", "Cost: ~$0.39" },
+    );
+    try testing.expectHides(painted, &.{ "5h:", "Week:", "Cache:" });
 }
 
-test "a running turn hides the cache, quota, and credits until this turn reports them" {
+test "the status line hides a cache rate, a quota, and credits that it does not hold" {
     const gpa = std.testing.allocator;
     var info = test_info;
     info.cache_usage = .{};
     info.quota = null;
     info.credits = null;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    try renderForTest(gpa, &info, 200, &out);
+    var rig: testing.Rig = undefined;
+    rig.init(gpa);
+    defer rig.deinit();
+    try renderForTest(&rig, &info, 200);
 
-    const painted = out.written();
-    try expectShows(painted, &.{"Context: 21% (206k/1.0M) · Cost: ~$0.39"});
-    try expectHides(painted, &.{ "5h:", "Week:", "Cache:", "Credits:" });
+    const painted = try rig.painted();
+    try testing.expectShows(painted, &.{"Context: 21% (206k/1.0M) · Cost: ~$0.39"});
+    try testing.expectHides(painted, &.{ "5h:", "Week:", "Cache:", "Credits:" });
 }
 
-test "a countdown that runs out drops its bracket and keeps its share" {
+test "the directory label names the home with a tilde and keeps the tail of a long path" {
     const gpa = std.testing.allocator;
-    var info = test_info;
-    info.quota = .{
-        .primary = .{ .used_percent = 12, .window_minutes = 300, .reset_seconds = 3180 },
-        .secondary = null,
-    };
-    info.quota_age_ms = 3_600_000;
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    try renderForTest(gpa, &info, 200, &out);
+    const inside = try directoryLabel(gpa, &.{ .path = "/home/me/work", .home = "/home/me" });
+    defer gpa.free(inside);
+    try std.testing.expectEqualStrings("~/work", inside);
+    const home = try directoryLabel(gpa, &.{ .path = "/home/me", .home = "/home/me" });
+    defer gpa.free(home);
+    try std.testing.expectEqualStrings("~", home);
+    const outside = try directoryLabel(gpa, &.{ .path = "/srv/work", .home = "/home/me" });
+    defer gpa.free(outside);
+    try std.testing.expectEqualStrings("/srv/work", outside);
 
-    const painted = out.written();
-    try expectShows(painted, &.{"5h: 12% · Cache"});
-    try expectHides(painted, &.{"(53m)"});
+    const long_path = "/srv/" ++ "a" ** 100 ++ "/tail";
+    const cut = try directoryLabel(gpa, &.{ .path = long_path, .home = "/home/me" });
+    defer gpa.free(cut);
+    try std.testing.expect(cut.len <= directory_bytes_max);
+    try std.testing.expect(std.mem.startsWith(u8, cut, "…"));
+    try std.testing.expect(std.mem.endsWith(u8, cut, "/tail"));
 }

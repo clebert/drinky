@@ -2,107 +2,11 @@ const std = @import("std");
 
 const unicode_data = @import("unicode_data.zig");
 
-pub const Step = struct { bytes: usize, columns: usize };
+const Step = struct { bytes: usize, columns: usize };
 
-pub fn stepAt(text: []const u8) Step {
-    const first = decode(text);
-    var columns = cellWidth(first.codepoint);
-    var previous = classOf(first.codepoint);
-    var offset = first.bytes;
-
-    var state: State = .init(previous);
-    while (offset < text.len) {
-        const next = decode(text[offset..]);
-        const class = classOf(next.codepoint);
-        if (state.breaks(previous, class)) break;
-        columns = @max(columns, cellWidth(next.codepoint));
-        offset += next.bytes;
-        previous = class;
-        state.advance(class);
-    }
-    return .{ .bytes = offset, .columns = columns };
-}
-
-pub fn startsJoining(text: []const u8) bool {
-    if (text.len == 0) return false;
-    return switch (classOf(decode(text).codepoint)) {
-        .extend, .extend_incb, .linker, .zwj, .spacing_mark, .regional_indicator, .v, .t => true,
-        else => false,
-    };
-}
-
-pub fn endsJoining(text: []const u8) bool {
-    var tail = text;
-    while (decodeLast(tail)) |last| {
-        switch (classOf(last.codepoint)) {
-            .prepend, .zwj, .linker, .l => return true,
-            .extend_incb => tail = tail[0 .. tail.len - last.bytes],
-            else => return false,
-        }
-    }
-    return false;
-}
-
-const replacement = 0xFFFD;
+const malformed: Step = .{ .bytes = 1, .columns = 1 };
 
 const Decoded = struct { codepoint: u21, bytes: usize };
-
-fn decodeLast(text: []const u8) ?Decoded {
-    const limit = text.len -| 4;
-    var offset = text.len;
-    while (offset > limit) {
-        offset -= 1;
-        const lead = text[offset];
-        if (lead & 0xc0 == 0x80) continue;
-        const length = std.unicode.utf8ByteSequenceLength(lead) catch return null;
-        if (offset + length != text.len) return null;
-        const codepoint = std.unicode.utf8Decode(text[offset..]) catch return null;
-        return .{ .codepoint = codepoint, .bytes = length };
-    }
-    return null;
-}
-
-fn decode(text: []const u8) Decoded {
-    const lead = text[0];
-    if (lead < 0x80) return .{ .codepoint = lead, .bytes = 1 };
-    const length = std.unicode.utf8ByteSequenceLength(lead) catch
-        return .{ .codepoint = replacement, .bytes = 1 };
-    if (text.len < length) return .{ .codepoint = replacement, .bytes = text.len };
-    const codepoint = std.unicode.utf8Decode(text[0..length]) catch
-        return .{ .codepoint = replacement, .bytes = length };
-    return .{ .codepoint = codepoint, .bytes = length };
-}
-
-fn cellWidth(codepoint: u21) usize {
-    if (codepoint < 0x20 or codepoint == 0x7f) return 0;
-    if (codepoint == 0xFE0F) return 2;
-    if (codepoint < unicode_data.width_ranges[0].first) return 1;
-    const range = search(unicode_data.WidthRange, &unicode_data.width_ranges, codepoint) orelse
-        return 1;
-    return range.columns;
-}
-
-fn classOf(codepoint: u21) unicode_data.Class {
-    if (codepoint >= 0x20 and codepoint < 0x7f) return .other;
-    const range = search(unicode_data.ClassRange, &unicode_data.class_ranges, codepoint) orelse
-        return .other;
-    return range.class;
-}
-
-fn search(comptime Range: type, ranges: []const Range, codepoint: u21) ?Range {
-    const order = struct {
-        fn order(context: u21, range: Range) std.math.Order {
-            if (context < range.first) return .lt;
-            return if (context > range.last) .gt else .eq;
-        }
-    }.order;
-    const index = std.sort.binarySearch(Range, ranges, codepoint, order) orelse return null;
-    return ranges[index];
-}
-
-fn isExtend(class: unicode_data.Class) bool {
-    return class == .extend or class == .extend_incb or class == .linker;
-}
 
 const State = struct {
     regional_indicators: usize = 0,
@@ -167,6 +71,101 @@ const State = struct {
     }
 };
 
+pub fn stepAt(text: []const u8) Step {
+    const first = decode(text) orelse return malformed;
+    var columns = cellWidth(first.codepoint);
+    var previous = classOf(first.codepoint);
+    var offset = first.bytes;
+
+    var state: State = .init(previous);
+    while (offset < text.len) {
+        const next = decode(text[offset..]) orelse break;
+        const class = classOf(next.codepoint);
+        if (state.breaks(previous, class)) break;
+        columns = @max(columns, cellWidth(next.codepoint));
+        offset += next.bytes;
+        previous = class;
+        state.advance(class);
+    }
+    return .{ .bytes = offset, .columns = columns };
+}
+
+pub fn startsJoining(text: []const u8) bool {
+    if (text.len == 0) return false;
+    const first = decode(text) orelse return false;
+    return switch (classOf(first.codepoint)) {
+        .extend, .extend_incb, .linker, .zwj, .spacing_mark, .regional_indicator, .v, .t => true,
+        else => false,
+    };
+}
+
+pub fn endsJoining(text: []const u8) bool {
+    var tail = text;
+    while (decodeLast(tail)) |last| {
+        switch (classOf(last.codepoint)) {
+            .prepend, .zwj, .linker, .l => return true,
+            .extend_incb => tail = tail[0 .. tail.len - last.bytes],
+            else => return false,
+        }
+    }
+    return false;
+}
+
+fn decodeLast(text: []const u8) ?Decoded {
+    const limit = text.len -| 4;
+    var offset = text.len;
+    while (offset > limit) {
+        offset -= 1;
+        const lead = text[offset];
+        if (lead & 0xc0 == 0x80) continue;
+        const length = std.unicode.utf8ByteSequenceLength(lead) catch return null;
+        if (offset + length != text.len) return null;
+        const codepoint = std.unicode.utf8Decode(text[offset..]) catch return null;
+        return .{ .codepoint = codepoint, .bytes = length };
+    }
+    return null;
+}
+
+fn decode(text: []const u8) ?Decoded {
+    const lead = text[0];
+    if (lead < 0x80) return .{ .codepoint = lead, .bytes = 1 };
+    const length = std.unicode.utf8ByteSequenceLength(lead) catch return null;
+    if (text.len < length) return null;
+    const codepoint = std.unicode.utf8Decode(text[0..length]) catch return null;
+    return .{ .codepoint = codepoint, .bytes = length };
+}
+
+fn cellWidth(codepoint: u21) usize {
+    if (codepoint < 0x20 or codepoint == 0x7f) return 0;
+    if (codepoint == 0xFE0F) return 2;
+    if (codepoint < unicode_data.width_ranges[0].first) return 1;
+    const range = search(unicode_data.WidthRange, &unicode_data.width_ranges, codepoint) orelse
+        return 1;
+    return range.columns;
+}
+
+fn classOf(codepoint: u21) unicode_data.Class {
+    if (codepoint >= 0x20 and codepoint < 0x7f) return .other;
+    const range = search(unicode_data.ClassRange, &unicode_data.class_ranges, codepoint) orelse
+        return .other;
+    return range.class;
+}
+
+fn search(comptime Range: type, ranges: []const Range, codepoint: u21) ?Range {
+    const order = struct {
+        fn order(context: u21, range: Range) std.math.Order {
+            if (context < range.first) return .lt;
+            return if (context > range.last) .gt else .eq;
+        }
+    }.order;
+    const index = std.sort.binarySearch(Range, ranges, codepoint, order) orelse return null;
+    return ranges[index];
+}
+
+fn isExtend(class: unicode_data.Class) bool {
+    return class == .extend or class == .extend_incb or class == .linker;
+}
+
 test "stepAt measures single code points" {
     try std.testing.expectEqual(Step{ .bytes = 1, .columns = 1 }, stepAt("a"));
     try std.testing.expectEqual(Step{ .bytes = 2, .columns = 1 }, stepAt("é"));
@@ -174,6 +173,13 @@ test "stepAt measures single code points" {
     try std.testing.expectEqual(Step{ .bytes = 4, .columns = 2 }, stepAt("😀"));
     try std.testing.expectEqual(Step{ .bytes = 1, .columns = 0 }, stepAt("\t"));
     try std.testing.expectEqual(Step{ .bytes = 1, .columns = 0 }, stepAt("\x7f"));
+}
+
+test "a soft hyphen keeps one column, and a joining jamo or a zero-width space takes none" {
+    try std.testing.expectEqual(Step{ .bytes = 2, .columns = 1 }, stepAt("\u{00AD}"));
+    try std.testing.expectEqual(Step{ .bytes = 3, .columns = 0 }, stepAt("\u{1160}"));
+    try std.testing.expectEqual(Step{ .bytes = 3, .columns = 0 }, stepAt("\u{11FF}"));
+    try std.testing.expectEqual(Step{ .bytes = 3, .columns = 0 }, stepAt("\u{200B}"));
 }
 
 test "stepAt folds a multi-code-point cluster into one cell" {
@@ -193,10 +199,13 @@ test "stepAt pairs regional indicators" {
     try std.testing.expectEqual(@as(usize, 8), stepAt("🇯🇵🇺").bytes);
 }
 
-test "stepAt survives malformed utf-8 by advancing" {
-    try std.testing.expectEqual(Step{ .bytes = 1, .columns = 1 }, stepAt("\xff"));
-    try std.testing.expectEqual(Step{ .bytes = 2, .columns = 1 }, stepAt("\xf0\x9f"));
-    try std.testing.expectEqual(Step{ .bytes = 2, .columns = 1 }, stepAt("\xe4\xb8"));
+test "stepAt takes one byte for a malformed byte and ends a cluster before it" {
+    try std.testing.expectEqual(malformed, stepAt("\xff"));
+    try std.testing.expectEqual(malformed, stepAt("\xf0\x9f"));
+    try std.testing.expectEqual(malformed, stepAt("\xe4\xb8"));
+    try std.testing.expectEqual(malformed, stepAt("\xe4AB"));
+    try std.testing.expectEqual(stepAt("\u{0D4E}"), stepAt("\u{0D4E}\xff"));
+    try std.testing.expectEqual(@as(usize, 4), stepAt("\u{0D4E}a").bytes);
 }
 
 test startsJoining {
@@ -245,12 +254,12 @@ test "UAX #29 grapheme cluster boundaries match the conformance corpus" {
         var expected: [128]usize = undefined;
         var expected_len: usize = 0;
         var tokens = std.mem.tokenizeAny(u8, line, " \t");
-        while (tokens.next()) |tok| {
-            if (std.mem.eql(u8, tok, "÷")) {
+        while (tokens.next()) |token| {
+            if (std.mem.eql(u8, token, "÷")) {
                 expected[expected_len] = length;
                 expected_len += 1;
-            } else if (std.mem.eql(u8, tok, "×")) {} else {
-                const codepoint = try std.fmt.parseInt(u21, tok, 16);
+            } else if (std.mem.eql(u8, token, "×")) {} else {
+                const codepoint = try std.fmt.parseInt(u21, token, 16);
                 length += try std.unicode.utf8Encode(codepoint, text[length..]);
             }
         }

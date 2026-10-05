@@ -1,78 +1,70 @@
 const std = @import("std");
 
+const terminal = @import("terminal");
+
 const paint = @import("paint.zig");
 const role = @import("role.zig");
-const terminal = @import("terminal");
+const testing = @import("testing.zig");
 
 const Editor = @This();
 
 gpa: std.mem.Allocator,
 draft: Draft,
 caret: usize,
-scroll: usize,
+window: paint.Window,
 goal_column: ?usize,
 paste_id_next: u64,
 capture: std.ArrayList(u8),
 
-pub const Draft = struct {
+const Draft = struct {
     visible: std.ArrayList(u8),
     atoms: std.ArrayList(Atom),
 
-    pub const empty: Draft = .{ .visible = .empty, .atoms = .empty };
+    const empty: Draft = .{ .visible = .empty, .atoms = .empty };
 
-    pub const Atom = struct {
+    const Atom = struct {
         start: usize,
         end: usize,
-        id: u64,
         payload: []u8,
     };
 
-    pub fn deinit(self: *Draft, gpa: std.mem.Allocator) void {
+    fn deinit(self: *Draft, gpa: std.mem.Allocator) void {
         for (self.atoms.items) |atom| gpa.free(atom.payload);
         self.atoms.deinit(gpa);
         self.visible.deinit(gpa);
     }
 
-    pub fn clear(self: *Draft, gpa: std.mem.Allocator) void {
+    fn clear(self: *Draft, gpa: std.mem.Allocator) void {
         for (self.atoms.items) |atom| gpa.free(atom.payload);
         self.atoms.clearRetainingCapacity();
         self.visible.clearRetainingCapacity();
     }
 
-    pub fn fromText(gpa: std.mem.Allocator, text: []const u8) !Draft {
-        var buffer: std.ArrayList(u8) = .empty;
-        errdefer buffer.deinit(gpa);
-        try buffer.appendSlice(gpa, text);
-        return .{ .visible = buffer, .atoms = .empty };
-    }
-
-    pub fn expanded(self: *const Draft, gpa: std.mem.Allocator, trim: Trim) ![]u8 {
+    fn expanded(self: *const Draft, gpa: std.mem.Allocator) ![]u8 {
         var out: std.ArrayList(u8) = .empty;
         errdefer out.deinit(gpa);
         try out.ensureTotalCapacityPrecise(gpa, try self.expandedLen());
-        var pos: usize = 0;
+        var position: usize = 0;
         for (self.atoms.items) |atom| {
-            out.appendSliceAssumeCapacity(self.visible.items[pos..atom.start]);
+            out.appendSliceAssumeCapacity(self.visible.items[position..atom.start]);
             out.appendSliceAssumeCapacity(atom.payload);
-            pos = atom.end;
+            position = atom.end;
         }
-        out.appendSliceAssumeCapacity(self.visible.items[pos..]);
-        if (trim == .whole_prompt) {
-            const trimmed = std.mem.trim(u8, out.items, whitespace);
-            std.mem.copyForwards(u8, out.items, trimmed);
-            out.items.len = trimmed.len;
-        }
+        out.appendSliceAssumeCapacity(self.visible.items[position..]);
+        const trimmed = std.mem.trim(u8, out.items, paint.blank_bytes);
+        std.mem.copyForwards(u8, out.items, trimmed);
+        out.items.len = trimmed.len;
         return out.toOwnedSlice(gpa);
     }
 
-    pub fn blank(self: *const Draft) bool {
-        var pos: usize = 0;
+    fn blank(self: *const Draft) bool {
+        var position: usize = 0;
         for (self.atoms.items) |atom| {
-            if (hasContent(self.visible.items[pos..atom.start])) return false;
-            if (hasContent(atom.payload)) return false;
-            pos = atom.end;
+            if (!paint.isBlank(self.visible.items[position..atom.start])) return false;
+            if (!paint.isBlank(atom.payload)) return false;
+            position = atom.end;
         }
-        return !hasContent(self.visible.items[pos..]);
+        return paint.isBlank(self.visible.items[position..]);
     }
 
     fn expandedLen(self: *const Draft) !usize {
@@ -85,13 +77,6 @@ pub const Draft = struct {
     }
 };
 
-pub const Trim = enum { none, whole_prompt };
-
-pub const RenderOptions = struct {
-    viewport_rows: usize,
-    activity: ?paint.Activity = null,
-};
-
 const Splice = struct {
     from: usize,
     to: usize,
@@ -101,19 +86,21 @@ const Splice = struct {
 
 const line_count_max = 10;
 const byte_count_max = 1000;
-const marker_guard = "\u{200B}";
 const marker_role: role.Name = .accent;
-const label_len_max =
-    2 * marker_guard.len + "[Paste #".len + 20 + ": ".len + 20 + " lines]".len;
-const whitespace = " \t\r\n";
-const draft_separator = "\n\n";
+const digits_max = std.math.log10_int(@as(u64, std.math.maxInt(u64))) + 1;
+const label_len_max = 2 * terminal.width.grapheme_boundary.len + "[Paste #".len + digits_max +
+    ": ".len + digits_max + " lines]".len;
+
+const LogicalCaret = struct { row: usize, column: usize };
+
+const WrappedRow = struct { columns: usize, row: usize };
 
 pub fn init(gpa: std.mem.Allocator) Editor {
     return .{
         .gpa = gpa,
         .draft = .empty,
         .caret = 0,
-        .scroll = 0,
+        .window = .{},
         .goal_column = null,
         .paste_id_next = 1,
         .capture = .empty,
@@ -129,8 +116,8 @@ pub fn visible(self: *const Editor) []const u8 {
     return self.draft.visible.items;
 }
 
-pub fn expanded(self: *const Editor, trim: Trim) ![]u8 {
-    return self.draft.expanded(self.gpa, trim);
+pub fn expanded(self: *const Editor) ![]u8 {
+    return self.draft.expanded(self.gpa);
 }
 
 pub fn blank(self: *const Editor) bool {
@@ -141,46 +128,8 @@ pub fn clear(self: *Editor) void {
     self.draft.clear(self.gpa);
     self.capture.clearRetainingCapacity();
     self.caret = 0;
-    self.scroll = 0;
+    self.window = .{};
     self.goal_column = null;
-}
-
-pub fn detachTrimmed(self: *Editor) Draft {
-    const items = self.draft.visible.items;
-    const trimmed = std.mem.trim(u8, items, whitespace);
-    const lead = @intFromPtr(trimmed.ptr) - @intFromPtr(items.ptr);
-    const trail = items.len - lead - trimmed.len;
-    self.splice(.{ .from = items.len - trail, .to = items.len }) catch unreachable;
-    self.splice(.{ .from = 0, .to = lead }) catch unreachable;
-    const draft = self.draft;
-    self.draft = .empty;
-    self.caret = 0;
-    self.scroll = 0;
-    self.goal_column = null;
-    return draft;
-}
-
-pub fn reserveDraft(self: *Editor, source: *const Draft) !void {
-    const visible_extra = try std.math.add(usize, source.visible.items.len, draft_separator.len);
-    try self.draft.visible.ensureUnusedCapacity(self.gpa, visible_extra);
-    try self.draft.atoms.ensureUnusedCapacity(self.gpa, source.atoms.items.len);
-}
-
-pub fn prependDraft(self: *Editor, source: *Draft) void {
-    const had_content = self.draft.visible.items.len > 0;
-    self.splice(.{
-        .from = 0,
-        .to = 0,
-        .bytes = source.visible.items,
-        .new_atoms = source.atoms.items,
-    }) catch unreachable;
-    const offset = source.visible.items.len;
-    source.atoms.deinit(self.gpa);
-    source.visible.deinit(self.gpa);
-    source.* = .empty;
-    if (had_content)
-        self.splice(.{ .from = offset, .to = offset, .bytes = draft_separator }) catch unreachable;
-    self.moveEnd();
 }
 
 pub fn paste(self: *Editor, bytes: []const u8, final: bool) !void {
@@ -196,89 +145,109 @@ fn finalizePaste(self: *Editor) !void {
     if (bytes.len == 0) return;
     const line_count = 1 + std.mem.count(u8, bytes, "\n");
     if (line_count <= line_count_max and bytes.len <= byte_count_max) {
-        try self.splice(.{ .from = self.caret, .to = self.caret, .bytes = bytes });
+        try self.splice(&.{ .from = self.caret, .to = self.caret, .bytes = bytes });
         return;
     }
     if (self.paste_id_next == std.math.maxInt(u64)) return error.PasteIdExhausted;
     const id = self.paste_id_next;
     var buffer: [label_len_max]u8 = undefined;
-    const span = markerSpan(&buffer, id, line_count, bytes.len);
+    const span = markerSpan(&buffer, &.{
+        .id = id,
+        .line_count = line_count,
+        .byte_count = bytes.len,
+    });
     try self.draft.visible.ensureUnusedCapacity(self.gpa, span.len);
     try self.draft.atoms.ensureUnusedCapacity(self.gpa, 1);
     const payload = try self.capture.toOwnedSlice(self.gpa);
     errdefer self.gpa.free(payload);
-    try self.splice(.{
+    try self.splice(&.{
         .from = self.caret,
         .to = self.caret,
         .bytes = span,
-        .new_atoms = &.{.{ .start = 0, .end = span.len, .id = id, .payload = payload }},
+        .new_atoms = &.{.{ .start = 0, .end = span.len, .payload = payload }},
     });
     self.paste_id_next += 1;
 }
 
-fn markerSpan(buffer: []u8, id: u64, line_count: usize, byte_count: usize) []const u8 {
-    if (line_count > line_count_max) {
-        const form = marker_guard ++ "[Paste #{d}: {d} lines]" ++ marker_guard;
-        return std.fmt.bufPrint(buffer, form, .{ id, line_count }) catch unreachable;
+fn markerSpan(
+    buffer: []u8,
+    marker: *const struct { id: u64, line_count: usize, byte_count: usize },
+) []const u8 {
+    if (marker.line_count > line_count_max) {
+        const form = terminal.width.grapheme_boundary ++ "[Paste #{d}: {d} lines]" ++
+            terminal.width.grapheme_boundary;
+        return std.fmt.bufPrint(buffer, form, .{ marker.id, marker.line_count }) catch unreachable;
     }
-    const form = marker_guard ++ "[Paste #{d}: {d} bytes]" ++ marker_guard;
-    return std.fmt.bufPrint(buffer, form, .{ id, byte_count }) catch unreachable;
+    const form = terminal.width.grapheme_boundary ++ "[Paste #{d}: {d} bytes]" ++
+        terminal.width.grapheme_boundary;
+    return std.fmt.bufPrint(buffer, form, .{ marker.id, marker.byte_count }) catch unreachable;
 }
 
 pub fn insertCodepoint(self: *Editor, codepoint: u21) !void {
     var buffer: [4]u8 = undefined;
-    const length = std.unicode.utf8Encode(codepoint, &buffer) catch return;
+    const length = std.unicode.utf8Encode(codepoint, &buffer) catch unreachable;
     try self.insert(buffer[0..length]);
 }
 
 pub fn insert(self: *Editor, bytes: []const u8) !void {
-    try self.splice(.{ .from = self.caret, .to = self.caret, .bytes = bytes });
+    try self.splice(&.{ .from = self.caret, .to = self.caret, .bytes = bytes });
 }
 
-fn splice(self: *Editor, op: Splice) !void {
+pub fn prependText(self: *Editor, text: []const u8) !void {
+    if (text.len == 0) return;
+    if (self.blank()) {
+        self.clear();
+        return self.insert(text);
+    }
+    const extra = try std.math.add(usize, text.len, "\n".len);
+    try self.draft.visible.ensureUnusedCapacity(self.gpa, extra);
+    self.splice(&.{ .from = 0, .to = 0, .bytes = "\n" }) catch unreachable;
+    self.splice(&.{ .from = 0, .to = 0, .bytes = text }) catch unreachable;
+}
+
+fn splice(self: *Editor, edit: *const Splice) !void {
     const visible_list = &self.draft.visible;
     const atoms = &self.draft.atoms;
-    std.debug.assert(op.from <= op.to);
-    std.debug.assert(op.to <= visible_list.items.len);
+    std.debug.assert(edit.from <= edit.to);
+    std.debug.assert(edit.to <= visible_list.items.len);
 
     var remove_from: usize = atoms.items.len;
     var remove_to: usize = atoms.items.len;
     for (atoms.items, 0..) |atom, index| {
-        if (op.to <= atom.start or op.from >= atom.end) continue;
-        if (op.from > atom.start or atom.end > op.to) return error.PasteAtomSplit;
+        if (edit.to <= atom.start or edit.from >= atom.end) continue;
+        if (edit.from > atom.start or atom.end > edit.to) return error.PasteAtomSplit;
         remove_from = @min(remove_from, index);
         remove_to = index + 1;
     }
 
-    const removed = op.to - op.from;
-    const shifted_len = try std.math.add(usize, visible_list.items.len - removed, op.bytes.len);
+    const removed = edit.to - edit.from;
+    const shifted_len = try std.math.add(usize, visible_list.items.len - removed, edit.bytes.len);
     try visible_list.ensureTotalCapacity(self.gpa, shifted_len);
-    try atoms.ensureUnusedCapacity(self.gpa, op.new_atoms.len);
+    try atoms.ensureUnusedCapacity(self.gpa, edit.new_atoms.len);
 
     for (atoms.items[remove_from..remove_to]) |atom| self.gpa.free(atom.payload);
     atoms.replaceRangeAssumeCapacity(remove_from, remove_to - remove_from, &.{});
-    visible_list.replaceRangeAssumeCapacity(op.from, op.to - op.from, op.bytes);
+    visible_list.replaceRangeAssumeCapacity(edit.from, edit.to - edit.from, edit.bytes);
     for (atoms.items) |*atom| {
-        if (atom.start >= op.to) {
-            atom.start = atom.start - removed + op.bytes.len;
-            atom.end = atom.end - removed + op.bytes.len;
+        if (atom.start >= edit.to) {
+            atom.start = atom.start - removed + edit.bytes.len;
+            atom.end = atom.end - removed + edit.bytes.len;
         }
     }
-    var insert_index = atomIndexAfter(atoms.items, op.from);
-    for (op.new_atoms) |atom| {
+    var insert_index = atomIndexAfter(atoms.items, edit.from);
+    for (edit.new_atoms) |atom| {
         atoms.insertAssumeCapacity(insert_index, .{
-            .start = op.from + atom.start,
-            .end = op.from + atom.end,
-            .id = atom.id,
+            .start = edit.from + atom.start,
+            .end = edit.from + atom.end,
             .payload = atom.payload,
         });
         insert_index += 1;
     }
     self.goal_column = null;
-    if (self.caret >= op.to) {
-        self.caret = self.caret - removed + op.bytes.len;
-    } else if (self.caret > op.from) {
-        self.caret = op.from + op.bytes.len;
+    if (self.caret >= edit.to) {
+        self.caret = self.caret - removed + edit.bytes.len;
+    } else if (self.caret > edit.from) {
+        self.caret = edit.from + edit.bytes.len;
     }
     self.caret = terminal.width.boundaryAtOrAfter(visible_list.items, self.caret);
 }
@@ -302,11 +271,11 @@ fn atomIndexAfter(atoms: []const Draft.Atom, offset: usize) usize {
 pub fn backspace(self: *Editor) void {
     if (self.caret == 0) return;
     if (self.atomEndingAt(self.caret)) |atom| {
-        self.splice(.{ .from = atom.start, .to = atom.end }) catch unreachable;
+        self.splice(&.{ .from = atom.start, .to = atom.end }) catch unreachable;
         return;
     }
     const previous = terminal.width.boundaryBefore(self.draft.visible.items, self.caret);
-    self.splice(.{ .from = previous, .to = self.caret }) catch unreachable;
+    self.splice(&.{ .from = previous, .to = self.caret }) catch unreachable;
 }
 
 pub fn moveLeft(self: *Editor) void {
@@ -340,19 +309,18 @@ pub fn moveEnd(self: *Editor) void {
 }
 
 pub fn moveUp(self: *Editor, columns: usize) void {
-    const columns_max = paint.contentColumns(columns);
     const text = self.draft.visible.items;
     const row = terminal.width.caret(text, .{
         .offset = self.caret,
-        .columns_max = columns_max,
-    }).rows_before;
+        .columns_max = columns,
+    }).row;
     if (row == 0) {
         self.moveHome();
         return;
     }
-    const goal = self.goal_column orelse self.logicalColumn(columns_max, row);
+    const goal = self.goal_column orelse self.logicalColumn(.{ .columns = columns, .row = row });
     self.goal_column = goal;
-    var result = self.logicalOffset(columns_max, .{ .row = row - 1, .column = goal });
+    var result = self.logicalOffset(columns, .{ .row = row - 1, .column = goal });
     if (result >= self.caret) {
         if (self.atomEndingAt(self.caret)) |atom| result = atom.start;
     }
@@ -361,40 +329,33 @@ pub fn moveUp(self: *Editor, columns: usize) void {
 }
 
 pub fn moveDown(self: *Editor, columns: usize) void {
-    const columns_max = paint.contentColumns(columns);
     const text = self.draft.visible.items;
     const row = terminal.width.caret(text, .{
         .offset = self.caret,
-        .columns_max = columns_max,
-    }).rows_before;
-    if (row + 1 >= terminal.width.rows(text, columns_max)) {
+        .columns_max = columns,
+    }).row;
+    if (row + 1 >= terminal.width.rows(text, columns)) {
         self.moveEnd();
         return;
     }
-    const goal = self.goal_column orelse self.logicalColumn(columns_max, row);
+    const goal = self.goal_column orelse self.logicalColumn(.{ .columns = columns, .row = row });
     self.goal_column = goal;
-    self.caret = self.logicalOffset(columns_max, .{ .row = row + 1, .column = goal });
+    self.caret = self.logicalOffset(columns, .{ .row = row + 1, .column = goal });
     std.debug.assert(self.legalCaret(self.caret));
 }
 
-const LogicalCaret = struct { row: usize, column: usize };
-
-fn wrappedSpan(
-    self: *const Editor,
-    columns_max: usize,
-    row: usize,
-) ?terminal.width.Wrapper.Span {
-    var iterator = terminal.width.wrapper(self.draft.visible.items, columns_max);
+fn wrappedSpan(self: *const Editor, wrapped: WrappedRow) ?terminal.width.Wrapper.Span {
+    var iterator = terminal.width.wrapper(self.draft.visible.items, wrapped.columns);
     var current: usize = 0;
     while (iterator.nextSpan()) |span| : (current += 1) {
-        if (current == row) return span;
+        if (current == wrapped.row) return span;
     }
     return null;
 }
 
-fn logicalColumn(self: *const Editor, columns_max: usize, row: usize) usize {
+fn logicalColumn(self: *const Editor, wrapped: WrappedRow) usize {
     const text = self.draft.visible.items;
-    const span = self.wrappedSpan(columns_max, row) orelse return 0;
+    const span = self.wrappedSpan(wrapped) orelse return 0;
     var column: usize = 0;
     var index = self.legalAtOrAfter(span.start);
     while (index < self.caret) {
@@ -410,10 +371,13 @@ fn logicalColumn(self: *const Editor, columns_max: usize, row: usize) usize {
     return column;
 }
 
-fn logicalOffset(self: *const Editor, columns_max: usize, target: LogicalCaret) usize {
+fn logicalOffset(self: *const Editor, columns: usize, target: LogicalCaret) usize {
     const text = self.draft.visible.items;
-    const span = self.wrappedSpan(columns_max, target.row) orelse return text.len;
-    const end = terminal.width.caretEnd(text, span, columns_max);
+    const span = self.wrappedSpan(.{
+        .columns = columns,
+        .row = target.row,
+    }) orelse return text.len;
+    const end = terminal.width.caretEnd(text, span, columns);
     var index = self.legalAtOrAfter(span.start);
     var logical: usize = 0;
     while (index < end and logical < target.column) {
@@ -448,44 +412,38 @@ fn legalCaret(self: *const Editor, offset: usize) bool {
 }
 
 pub fn reflow(self: *Editor, size: terminal.View.Size) void {
-    const columns_max = paint.contentColumns(size.columns);
-    const text = self.draft.visible.items;
-    const total_body = self.bodyRows(columns_max);
-    const visible_rows = @min(total_body, paint.bodyLimit(size.rows));
-    const caret_row = terminal.width.caret(text, .{
+    const caret_row = terminal.width.caret(self.draft.visible.items, .{
         .offset = self.caret,
-        .columns_max = columns_max,
-    }).rows_before;
-    if (caret_row < self.scroll) self.scroll = caret_row;
-    if (caret_row >= self.scroll + visible_rows) self.scroll = caret_row - visible_rows + 1;
-    self.scroll = @min(self.scroll, total_body - visible_rows);
+        .columns_max = size.columns,
+    }).row;
+    self.window.follow(self.extent(size), caret_row);
 }
 
 pub fn rows(self: *const Editor, size: terminal.View.Size) usize {
-    const columns_max = paint.contentColumns(size.columns);
-    const total_body = self.bodyRows(columns_max);
-    return paint.framedRows(@min(total_body, paint.bodyLimit(size.rows)));
+    return self.extent(size).rows();
 }
 
-fn bodyRows(self: *const Editor, columns_max: usize) usize {
+fn extent(self: *const Editor, size: terminal.View.Size) paint.Window.Extent {
     const text = self.draft.visible.items;
-    const wrapped = terminal.width.rows(text, columns_max);
+    const wrapped = terminal.width.rows(text, size.columns);
     const caret_row = terminal.width.caret(text, .{
         .offset = self.caret,
-        .columns_max = columns_max,
-    }).rows_before;
-    return wrapped + @intFromBool(caret_row == wrapped);
+        .columns_max = size.columns,
+    }).row;
+    return .{
+        .body_rows = wrapped + @intFromBool(caret_row == wrapped),
+        .viewport_rows = size.rows,
+    };
 }
 
 pub fn render(
     self: *const Editor,
     placement: *const paint.Placement,
-    options: *const RenderOptions,
+    options: *const paint.RenderOptions,
 ) !void {
-    const columns_max = paint.contentColumns(placement.columns);
     const text = self.draft.visible.items;
-    const total_body = self.bodyRows(columns_max);
-    const visible_rows = @min(total_body, paint.bodyLimit(options.viewport_rows));
+    const body = self.extent(.{ .columns = placement.columns, .rows = options.viewport_rows });
+    const shown = self.window.shown(body);
     const atoms = self.draft.atoms.items;
     const marks = try self.gpa.alloc(paint.Mark, atoms.len);
     defer self.gpa.free(marks);
@@ -493,11 +451,11 @@ pub fn render(
         mark.* = .{ .start = atom.start, .end = atom.end, .role = marker_role };
     try paint.framed(placement, &.{
         .body = text,
-        .body_rows = visible_rows,
+        .body_rows = shown.body_rows,
         .caret = self.caretPosition(placement.columns),
-        .hidden_above = self.scroll,
-        .hidden_below = total_body - self.scroll - visible_rows,
-        .trailing_row = total_body > terminal.width.rows(text, columns_max),
+        .hidden_above = shown.hidden_above,
+        .hidden_below = shown.hidden_below,
+        .trailing_row = body.body_rows > terminal.width.rows(text, placement.columns),
         .marks = marks,
         .activity = options.activity,
     });
@@ -506,20 +464,12 @@ pub fn render(
 fn caretPosition(self: *const Editor, columns: usize) terminal.View.Caret {
     const position = terminal.width.caret(self.draft.visible.items, .{
         .offset = self.caret,
-        .columns_max = paint.contentColumns(columns),
+        .columns_max = columns,
     });
     return .{
-        .row = 1 + (position.rows_before - self.scroll),
+        .row = 1 + (position.row - self.window.scroll),
         .column = position.column,
     };
-}
-
-fn hasContent(bytes: []const u8) bool {
-    for (bytes) |byte| switch (byte) {
-        ' ', '\t', '\r', '\n' => {},
-        else => return true,
-    };
-    return false;
 }
 
 test "caret movement and backspace" {
@@ -535,6 +485,15 @@ test "caret movement and backspace" {
     try std.testing.expectEqual(@as(usize, 0), editor.caret);
     editor.moveEnd();
     try std.testing.expectEqual(@as(usize, 3), editor.caret);
+}
+
+fn moveCaretTo(editor: *Editor, offset: usize) !void {
+    for (0..editor.visible().len) |_| editor.moveLeft();
+    for (0..editor.visible().len) |_| {
+        if (editor.caret == offset) return;
+        editor.moveRight();
+    }
+    if (editor.caret != offset) return error.TestCaretUnreachable;
 }
 
 test "malformed bytes and controls move by displayed units" {
@@ -636,8 +595,8 @@ fn pasteWhole(editor: *Editor, payload: []const u8) !void {
     try editor.paste(payload, true);
 }
 
-fn expectExpanded(editor: *const Editor, trim: Trim, expected: []const u8) !void {
-    const text = try editor.expanded(trim);
+fn expectExpanded(editor: *const Editor, expected: []const u8) !void {
+    const text = try editor.expanded();
     defer std.testing.allocator.free(text);
     try std.testing.expectEqualStrings(expected, text);
 }
@@ -656,7 +615,7 @@ test "the line threshold collapses more than ten logical lines" {
     try pasteWhole(&editor, eleven_lines);
     try std.testing.expectEqual(@as(usize, 1), editor.draft.atoms.items.len);
     try std.testing.expectEqualStrings("\u{200B}[Paste #1: 11 lines]\u{200B}", editor.visible());
-    try expectExpanded(&editor, .none, eleven_lines);
+    try expectExpanded(&editor, eleven_lines);
 
     editor.clear();
     try pasteWhole(&editor, "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\n");
@@ -676,7 +635,7 @@ test "the byte threshold collapses more than a thousand bytes" {
     const longer = "x" ** 1001;
     try pasteWhole(&editor, longer);
     try std.testing.expectEqualStrings("\u{200B}[Paste #1: 1001 bytes]\u{200B}", editor.visible());
-    try expectExpanded(&editor, .none, longer);
+    try expectExpanded(&editor, longer);
 }
 
 test "the byte threshold counts bytes, not characters" {
@@ -685,13 +644,13 @@ test "the byte threshold counts bytes, not characters" {
     const multibyte = "é" ** 501;
     try pasteWhole(&editor, multibyte);
     try std.testing.expectEqualStrings("\u{200B}[Paste #1: 1002 bytes]\u{200B}", editor.visible());
-    try expectExpanded(&editor, .none, multibyte);
+    try expectExpanded(&editor, multibyte);
 
     editor.clear();
     const malformed = "\xff" ** 1001;
     try pasteWhole(&editor, malformed);
     try std.testing.expectEqualStrings("\u{200B}[Paste #2: 1001 bytes]\u{200B}", editor.visible());
-    try expectExpanded(&editor, .none, malformed);
+    try expectExpanded(&editor, malformed);
 }
 
 test "a lone CR is payload, and CRLF counts one line" {
@@ -704,7 +663,8 @@ test "a lone CR is payload, and CRLF counts one line" {
     const crlf = "x\r\n" ** 11;
     try pasteWhole(&editor, crlf);
     try std.testing.expectEqualStrings("\u{200B}[Paste #1: 12 lines]\u{200B}", editor.visible());
-    try expectExpanded(&editor, .none, crlf);
+    try editor.insert(">");
+    try expectExpanded(&editor, crlf ++ ">");
 }
 
 test "the line form wins when both thresholds are crossed" {
@@ -713,7 +673,7 @@ test "the line form wins when both thresholds are crossed" {
     const big = ("x" ** 100 ++ "\n") ** 10 ++ "x" ** 100;
     try pasteWhole(&editor, big);
     try std.testing.expectEqualStrings("\u{200B}[Paste #1: 11 lines]\u{200B}", editor.visible());
-    try expectExpanded(&editor, .none, big);
+    try expectExpanded(&editor, big);
 }
 
 test "an empty paste is a no-op" {
@@ -733,7 +693,7 @@ test "a paste split across chunks collapses to one atom" {
     try editor.paste("j\nk", true);
     try std.testing.expectEqual(@as(usize, 1), editor.draft.atoms.items.len);
     try std.testing.expectEqualStrings("\u{200B}[Paste #1: 11 lines]\u{200B}", editor.visible());
-    try expectExpanded(&editor, .none, eleven_lines);
+    try expectExpanded(&editor, eleven_lines);
 }
 
 test "multiple atoms mixed with ordinary text expand in document order" {
@@ -749,7 +709,7 @@ test "multiple atoms mixed with ordinary text expand in document order" {
         "A\u{200B}[Paste #1: 11 lines]\u{200B}B\u{200B}[Paste #2: 1001 bytes]\u{200B}C",
         editor.visible(),
     );
-    try expectExpanded(&editor, .none, "A" ++ eleven_lines ++ "B" ++ "z" ** 1001 ++ "C");
+    try expectExpanded(&editor, "A" ++ eleven_lines ++ "B" ++ "z" ** 1001 ++ "C");
 }
 
 test "arbitrary payload bytes round-trip through expansion exactly" {
@@ -759,7 +719,8 @@ test "arbitrary payload bytes round-trip through expansion exactly" {
         "tab\tesc\x1b bad\xff\xfe text [paste #99 +5 lines] literal\n" ** 40;
     try pasteWhole(&editor, payload);
     try std.testing.expectEqual(@as(usize, 1), editor.draft.atoms.items.len);
-    try expectExpanded(&editor, .none, payload);
+    try editor.insert(">");
+    try expectExpanded(&editor, payload ++ ">");
 }
 
 test "a typed marker-looking string stays literal and never expands" {
@@ -769,7 +730,7 @@ test "a typed marker-looking string stays literal and never expands" {
     try editor.insert(typed);
     try std.testing.expectEqual(@as(usize, 0), editor.draft.atoms.items.len);
     try std.testing.expectEqualStrings(typed, editor.visible());
-    try expectExpanded(&editor, .none, typed);
+    try expectExpanded(&editor, typed);
     editor.moveEnd();
     editor.backspace();
     try std.testing.expectEqualStrings("[paste #1 +11 lines", editor.visible());
@@ -781,23 +742,30 @@ test "paste IDs are stable across deletion and never reused" {
     try pasteWhole(&editor, eleven_lines);
     try editor.insert("mid");
     try pasteWhole(&editor, eleven_lines);
-    try std.testing.expectEqual(@as(u64, 1), editor.draft.atoms.items[0].id);
-    try std.testing.expectEqual(@as(u64, 2), editor.draft.atoms.items[1].id);
+    try std.testing.expectEqualStrings(
+        comptime elevenLinesMarker(1) ++ "mid" ++ elevenLinesMarker(2),
+        editor.visible(),
+    );
 
     editor.moveHome();
     editor.moveRight();
     editor.backspace();
-    try std.testing.expectEqual(@as(usize, 1), editor.draft.atoms.items.len);
-    try std.testing.expectEqual(@as(u64, 2), editor.draft.atoms.items[0].id);
+    try std.testing.expectEqualStrings(comptime "mid" ++ elevenLinesMarker(2), editor.visible());
 
     editor.moveEnd();
     try pasteWhole(&editor, eleven_lines);
-    try std.testing.expectEqual(@as(u64, 2), editor.draft.atoms.items[0].id);
-    try std.testing.expectEqual(@as(u64, 3), editor.draft.atoms.items[1].id);
+    try std.testing.expectEqualStrings(
+        comptime "mid" ++ elevenLinesMarker(2) ++ elevenLinesMarker(3),
+        editor.visible(),
+    );
 
     editor.clear();
     try pasteWhole(&editor, eleven_lines);
-    try std.testing.expectEqual(@as(u64, 4), editor.draft.atoms.items[0].id);
+    try std.testing.expectEqualStrings(elevenLinesMarker(4), editor.visible());
+}
+
+fn elevenLinesMarker(comptime id: u64) []const u8 {
+    return std.fmt.comptimePrint("\u{200B}[Paste #{d}: 11 lines]\u{200B}", .{id});
 }
 
 test "counter exhaustion leaves the draft unchanged" {
@@ -842,7 +810,7 @@ test "backspace deletes a whole marker and leaves neighbours intact" {
     editor.backspace();
     try std.testing.expectEqual(@as(usize, 0), editor.draft.atoms.items.len);
     try std.testing.expectEqualStrings("abcd", editor.visible());
-    try expectExpanded(&editor, .none, "abcd");
+    try expectExpanded(&editor, "abcd");
 }
 
 test "inserting on either edge of a marker shifts its range" {
@@ -860,7 +828,7 @@ test "inserting on either edge of a marker shifts its range" {
     try editor.insert(">");
     try std.testing.expectEqual(@as(usize, 1), editor.draft.atoms.items[0].start);
     try std.testing.expectEqual(span_len + 1, editor.draft.atoms.items[0].end);
-    try expectExpanded(&editor, .none, "<" ++ eleven_lines ++ ">");
+    try expectExpanded(&editor, "<" ++ eleven_lines ++ ">");
 }
 
 test "deleting a marker between combining text re-clamps the boundary" {
@@ -874,7 +842,7 @@ test "deleting a marker between combining text re-clamps the boundary" {
     editor.backspace();
     try std.testing.expectEqualStrings("e\u{0301}", editor.visible());
     try std.testing.expectEqual(editor.visible().len, editor.caret);
-    try expectExpanded(&editor, .none, "e\u{0301}");
+    try expectExpanded(&editor, "e\u{0301}");
 }
 
 test "marker guards keep both edges legal between combining marks" {
@@ -888,7 +856,7 @@ test "marker guards keep both edges legal between combining marks" {
     try std.testing.expectEqual(atom.end, editor.caret);
     editor.moveLeft();
     try std.testing.expectEqual(atom.start, editor.caret);
-    try expectExpanded(&editor, .none, "\u{0301}" ++ eleven_lines ++ "\u{0301}");
+    try expectExpanded(&editor, "\u{0301}" ++ eleven_lines ++ "\u{0301}");
 }
 
 test "vertical movement counts a marker as one logical column" {
@@ -899,13 +867,12 @@ test "vertical movement counts a marker as one logical column" {
     try editor.insert("\ndef");
     const atom = editor.draft.atoms.items[0];
 
-    editor.caret = 2;
+    try moveCaretTo(&editor, 2);
     editor.moveDown(80);
     try std.testing.expectEqual(atom.end, editor.caret);
     try std.testing.expectEqual(@as(?usize, 2), editor.goal_column);
 
-    editor.caret = editor.visible().len - 1;
-    editor.goal_column = null;
+    try moveCaretTo(&editor, editor.visible().len - 1);
     editor.moveUp(80);
     try std.testing.expectEqual(atom.end, editor.caret);
 }
@@ -918,7 +885,7 @@ test "vertical movement lands in the text after a leading marker" {
     try editor.insert(" foo");
     const atom = editor.draft.atoms.items[0];
 
-    editor.caret = 4;
+    try moveCaretTo(&editor, 4);
     editor.moveDown(80);
     try std.testing.expectEqual(atom.end + 3, editor.caret);
     try std.testing.expectEqualStrings(" fo", editor.visible()[atom.end .. atom.end + 3]);
@@ -932,13 +899,11 @@ test "vertical movement departs a row-leading marker as one column" {
     try editor.insert("cd");
     const atom = editor.draft.atoms.items[0];
 
-    editor.caret = atom.end;
-    editor.goal_column = null;
+    try moveCaretTo(&editor, atom.end);
     editor.moveUp(80);
     try std.testing.expectEqual(@as(usize, 1), editor.caret);
 
-    editor.caret = 1;
-    editor.goal_column = null;
+    try moveCaretTo(&editor, 1);
     editor.moveDown(80);
     try std.testing.expectEqual(atom.end, editor.caret);
 }
@@ -951,13 +916,12 @@ test "vertical movement treats a mid-line marker as one column" {
     try editor.insert("cd");
     const atom = editor.draft.atoms.items[0];
 
-    editor.caret = 3;
+    try moveCaretTo(&editor, 3);
     editor.moveDown(80);
     try std.testing.expectEqual(atom.end, editor.caret);
 
     editor.moveHome();
-    editor.caret = 4;
-    editor.goal_column = null;
+    try moveCaretTo(&editor, 4);
     editor.moveDown(80);
     try std.testing.expectEqual(atom.end + 1, editor.caret);
 }
@@ -970,7 +934,7 @@ test "repeated vertical steps cross a marker wider than the terminal" {
     try editor.insert("\ncd");
     const atom = editor.draft.atoms.items[0];
 
-    editor.caret = 1;
+    try moveCaretTo(&editor, 1);
     var reached_end = false;
     for (0..8) |_| {
         editor.moveDown(5);
@@ -998,11 +962,11 @@ test "repeated vertical steps climb above a marker wider than the terminal" {
     try std.testing.expect(reached_start);
 }
 
-test "vertical movement clamps before a wide grapheme as display columns did" {
+test "vertical movement stops before a wide grapheme that the goal column splits" {
     var editor = Editor.init(std.testing.allocator);
     defer editor.deinit();
     try editor.insert("ab\n\u{4F60}c");
-    editor.caret = 1;
+    try moveCaretTo(&editor, 1);
     editor.moveDown(80);
     try std.testing.expectEqual(@as(usize, 3), editor.caret);
 }
@@ -1019,22 +983,16 @@ test "a marker wider than the terminal wraps but stays one atom" {
     try std.testing.expectEqual(atom.end, editor.caret);
 }
 
-test "scrolling keeps the caret visible with markers above and below" {
+test "the caret between two markers shows on its row" {
     var editor = Editor.init(std.testing.allocator);
     defer editor.deinit();
     try pasteWhole(&editor, eleven_lines);
     try editor.insert("\nmiddle\n");
     try pasteWhole(&editor, eleven_lines);
-    editor.caret = editor.draft.atoms.items[0].end + 4;
-    editor.reflow(.{ .columns = 80, .rows = 20 });
-    const columns_max: usize = 80;
-    const caret_row = terminal.width.caret(editor.visible(), .{
-        .offset = editor.caret,
-        .columns_max = columns_max,
-    }).rows_before;
-    const window = @min(editor.bodyRows(columns_max), paint.bodyLimit(20));
-    try std.testing.expect(caret_row >= editor.scroll);
-    try std.testing.expect(caret_row < editor.scroll + window);
+    try moveCaretTo(&editor, editor.draft.atoms.items[0].end + 4);
+    const size: terminal.View.Size = .{ .columns = 80, .rows = 20 };
+    editor.reflow(size);
+    try expectCaretAt(&editor, size, .{ .row = 2, .column = 3 });
 }
 
 test "marker guards are zero-column and absent from expanded output" {
@@ -1042,9 +1000,9 @@ test "marker guards are zero-column and absent from expanded output" {
     defer editor.deinit();
     try pasteWhole(&editor, eleven_lines);
     try std.testing.expectEqual(@as(usize, 20), terminal.width.ofText(editor.visible()));
-    const text = try editor.expanded(.none);
+    const text = try editor.expanded();
     defer std.testing.allocator.free(text);
-    try std.testing.expect(std.mem.indexOf(u8, text, marker_guard) == null);
+    try testing.expectHides(text, &.{terminal.width.grapheme_boundary});
     try std.testing.expectEqualStrings(eleven_lines, text);
 }
 
@@ -1054,7 +1012,7 @@ test "expanded whole-prompt trimming matches literal trimming, guards aside" {
     try editor.insert("  ");
     try pasteWhole(&editor, "  " ++ "y" ** 1001 ++ "  ");
     try editor.insert("  ");
-    try expectExpanded(&editor, .whole_prompt, "y" ** 1001);
+    try expectExpanded(&editor, "y" ** 1001);
     try std.testing.expect(!editor.blank());
 }
 
@@ -1063,7 +1021,7 @@ test "a placeholder-only prompt is nonblank and sends its payload" {
     defer editor.deinit();
     try pasteWhole(&editor, eleven_lines);
     try std.testing.expect(!editor.blank());
-    const text = try editor.expanded(.whole_prompt);
+    const text = try editor.expanded();
     defer std.testing.allocator.free(text);
     try std.testing.expect(editor.blank() == (text.len == 0));
     try std.testing.expectEqualStrings(eleven_lines, text);
@@ -1079,7 +1037,7 @@ test "an expanded send copy is independent of clearing the editor" {
     try editor.insert("A");
     try pasteWhole(&editor, eleven_lines);
     try editor.insert("B");
-    const text = try editor.expanded(.whole_prompt);
+    const text = try editor.expanded();
     defer std.testing.allocator.free(text);
     editor.clear();
     try std.testing.expectEqual(@as(usize, 0), editor.draft.atoms.items.len);
@@ -1087,8 +1045,9 @@ test "an expanded send copy is independent of clearing the editor" {
 }
 
 test "large-paste allocation failures leave the editor usable and leak nothing" {
+    const fail_index_max = 40;
     var fail_index: usize = 0;
-    while (fail_index < 40) : (fail_index += 1) {
+    while (fail_index < fail_index_max) : (fail_index += 1) {
         var failing = std.testing.FailingAllocator.init(
             std.testing.allocator,
             .{ .fail_index = fail_index },
@@ -1103,37 +1062,9 @@ test "large-paste allocation failures leave the editor usable and leak nothing" 
             continue;
         };
         try std.testing.expectEqual(@as(usize, 1), editor.draft.atoms.items.len);
+        break;
     }
-}
-
-test "detachTrimmed strips literal edges but keeps a paste payload byte-exact" {
-    const gpa = std.testing.allocator;
-    var editor = Editor.init(gpa);
-    defer editor.deinit();
-    try editor.insert("  ");
-    try pasteWhole(&editor, "  " ++ eleven_lines ++ "  ");
-    try editor.insert("  ");
-    var draft = editor.detachTrimmed();
-    defer draft.deinit(gpa);
-
-    try std.testing.expectEqualStrings("", editor.visible());
-    try std.testing.expectEqual(@as(u64, 2), editor.paste_id_next);
-    try std.testing.expectEqual(@as(usize, 1), draft.atoms.items.len);
-    try std.testing.expectEqualStrings("\u{200B}[Paste #1: 11 lines]\u{200B}", draft.visible.items);
-    const payload = try draft.expanded(gpa, .none);
-    defer gpa.free(payload);
-    try std.testing.expectEqualStrings("  " ++ eleven_lines ++ "  ", payload);
-}
-
-test "detachTrimmed on literal text trims like the whole-prompt rule" {
-    const gpa = std.testing.allocator;
-    var editor = Editor.init(gpa);
-    defer editor.deinit();
-    try editor.insert("  hello world  ");
-    var draft = editor.detachTrimmed();
-    defer draft.deinit(gpa);
-    try std.testing.expectEqualStrings("hello world", draft.visible.items);
-    try std.testing.expectEqualStrings("", editor.visible());
+    try std.testing.expect(fail_index < fail_index_max);
 }
 
 test render {
@@ -1142,16 +1073,16 @@ test render {
     defer editor.deinit();
     try editor.insert("hi");
     try std.testing.expectEqual(@as(usize, 3), editor.rows(.{ .columns = 80, .rows = 24 }));
-    try expectCaretAt(&editor, 80, .{ .row = 1, .column = 2 });
+    try expectCaretAt(&editor, .{ .columns = 80, .rows = 24 }, .{ .row = 1, .column = 2 });
 
     const painted = try rendered(gpa, &editor, .{ .columns = 80, .rows = 24 });
     defer gpa.free(painted);
-    try std.testing.expect(std.mem.indexOf(u8, painted, "hi") != null);
-    try std.testing.expect(std.mem.indexOf(u8, painted, "─") != null);
+    try testing.expectShows(painted, &.{"hi"});
+    try testing.expectShows(painted, &.{"─"});
     for ([_][]const u8{ "┌", "┐", "│", "└", "┘" }) |glyph|
-        try std.testing.expect(std.mem.indexOf(u8, painted, glyph) == null);
-    try std.testing.expect(std.mem.indexOf(u8, painted, "━") == null);
-    try std.testing.expect(std.mem.indexOf(u8, painted, terminal.escape.cursor_show) != null);
+        try testing.expectHides(painted, &.{glyph});
+    try testing.expectHides(painted, &.{"━"});
+    try testing.expectShows(painted, &.{terminal.escape.cursor_show});
 }
 
 test "a marker renders its label into the input area" {
@@ -1161,7 +1092,7 @@ test "a marker renders its label into the input area" {
     try pasteWhole(&editor, eleven_lines);
     const painted = try rendered(gpa, &editor, .{ .columns = 80, .rows = 24 });
     defer gpa.free(painted);
-    try std.testing.expect(std.mem.indexOf(u8, painted, "[Paste #1: 11 lines]") != null);
+    try testing.expectShows(painted, &.{"[Paste #1: 11 lines]"});
 }
 
 test "a marker paints in the accent role between plain text" {
@@ -1175,7 +1106,7 @@ test "a marker paints in the accent role between plain text" {
     defer gpa.free(painted);
     const row = comptime "ab" ++ role.sequence(.accent) ++ "\u{200B}[Paste #1: 11 lines]\u{200B}" ++
         "\x1b[0mcd [Paste #2: 1 lines]\r\n";
-    try std.testing.expect(std.mem.indexOf(u8, painted, row) != null);
+    try testing.expectShows(painted, &.{row});
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, painted, role.sequence(.accent)));
 }
 
@@ -1187,13 +1118,13 @@ test "a full-width line reserves an empty trailing row for the wrapped caret" {
     editor.reflow(.{ .columns = 3, .rows = 24 });
 
     try std.testing.expectEqual(@as(usize, 4), editor.rows(.{ .columns = 3, .rows = 24 }));
-    try expectCaretAt(&editor, 3, .{ .row = 2, .column = 0 });
+    try expectCaretAt(&editor, .{ .columns = 3, .rows = 24 }, .{ .row = 2, .column = 0 });
     try std.testing.expectEqual(@as(usize, 4), try renderedRows(gpa, &editor, 3));
 
     editor.moveLeft();
     editor.reflow(.{ .columns = 3, .rows = 24 });
     try std.testing.expectEqual(@as(usize, 3), editor.rows(.{ .columns = 3, .rows = 24 }));
-    try expectCaretAt(&editor, 3, .{ .row = 1, .column = 2 });
+    try expectCaretAt(&editor, .{ .columns = 3, .rows = 24 }, .{ .row = 1, .column = 2 });
     try std.testing.expectEqual(@as(usize, 3), try renderedRows(gpa, &editor, 3));
 }
 
@@ -1206,12 +1137,12 @@ test "an open input preserves a wide grapheme without side glyphs" {
     const size: terminal.View.Size = .{ .columns = 3, .rows = 24 };
     editor.reflow(size);
     try std.testing.expectEqual(@as(usize, 3), editor.rows(size));
-    try expectCaretAt(&editor, size.columns, .{ .row = 1, .column = 2 });
+    try expectCaretAt(&editor, size, .{ .row = 1, .column = 2 });
     const painted = try rendered(gpa, &editor, size);
     defer gpa.free(painted);
-    try std.testing.expect(std.mem.indexOf(u8, painted, "你") != null);
+    try testing.expectShows(painted, &.{"你"});
     for ([_][]const u8{ "┌", "┐", "│", "└", "┘" }) |glyph|
-        try std.testing.expect(std.mem.indexOf(u8, painted, glyph) == null);
+        try testing.expectHides(painted, &.{glyph});
 }
 
 test "a wrapped input row paints no trailing blank" {
@@ -1224,10 +1155,10 @@ test "a wrapped input row paints no trailing blank" {
     editor.reflow(size);
     const painted = try rendered(gpa, &editor, size);
     defer gpa.free(painted);
-    try std.testing.expect(std.mem.indexOf(u8, painted, "\r\naaa\r\nbbbb\r\n") != null);
+    try testing.expectShows(painted, &.{"\r\naaa\r\nbbbb\r\n"});
 }
 
-test "activity crosses the separators without changing the editor height" {
+test "activity crosses the frame edges without changing the editor height" {
     const gpa = std.testing.allocator;
     var editor = Editor.init(gpa);
     defer editor.deinit();
@@ -1246,9 +1177,9 @@ test "activity crosses the separators without changing the editor height" {
     defer gpa.free(second);
 
     for ([_][]const u8{ "╼", "━", "╾" }) |glyph|
-        try std.testing.expect(std.mem.indexOf(u8, first, glyph) != null);
+        try testing.expectShows(first, &.{glyph});
     for ([_][]const u8{ "┌", "┐", "│", "└", "┘", "┃" }) |glyph|
-        try std.testing.expect(std.mem.indexOf(u8, first, glyph) == null);
+        try testing.expectHides(first, &.{glyph});
     try std.testing.expect(!std.mem.eql(u8, first, second));
     try std.testing.expectEqual(
         std.mem.count(u8, first, "\r\n"),
@@ -1264,33 +1195,38 @@ fn renderedWithOptions(
     gpa: std.mem.Allocator,
     editor: *const Editor,
     size: terminal.View.Size,
-    options: *const RenderOptions,
+    options: *const paint.RenderOptions,
 ) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var view = terminal.View.init(gpa, &out.writer);
-    defer view.deinit();
-    const sink = try view.beginFrame(size, 4);
-    const placement: paint.Placement = .{
-        .sink = sink,
-        .id = 0,
-        .columns = size.columns,
-        .base = 0,
-        .skip = 0,
-    };
+    var rig: testing.Rig = undefined;
+    rig.init(gpa);
+    defer rig.deinit();
+    const placement = try rig.begin(&.{ .columns = size.columns, .rows = size.rows, .pages = 4 });
     try editor.render(&placement, options);
-    try view.render();
-    return gpa.dupe(u8, out.written());
+    return gpa.dupe(u8, try rig.painted());
 }
 
 fn renderedRows(gpa: std.mem.Allocator, editor: *const Editor, columns: usize) !usize {
     const painted = try rendered(gpa, editor, .{ .columns = columns, .rows = 24 });
     defer gpa.free(painted);
-    return std.mem.count(u8, painted, "\r\n") + 1;
+    return testing.paintedRows(painted);
 }
 
-fn expectCaretAt(editor: *const Editor, columns: usize, expected: terminal.View.Caret) !void {
-    try std.testing.expectEqual(expected, editor.caretPosition(columns));
+fn expectCaretAt(
+    editor: *const Editor,
+    size: terminal.View.Size,
+    expected: terminal.View.Caret,
+) !void {
+    const gpa = std.testing.allocator;
+    const painted = try rendered(gpa, editor, size);
+    defer gpa.free(painted);
+    var emulator: terminal.testing.Emulator = try .init(gpa, size.columns);
+    defer emulator.deinit();
+    try emulator.feed(painted);
+    try emulator.expectCaret(&.{
+        .frame_len = editor.rows(size),
+        .row = expected.row,
+        .column = expected.column,
+    });
 }
 
 test "caret sits on the empty row after a trailing newline" {
@@ -1298,7 +1234,7 @@ test "caret sits on the empty row after a trailing newline" {
     defer editor.deinit();
     try editor.insert("a\n");
     try std.testing.expectEqual(@as(usize, 4), editor.rows(.{ .columns = 80, .rows = 24 }));
-    try expectCaretAt(&editor, 80, .{ .row = 2, .column = 0 });
+    try expectCaretAt(&editor, .{ .columns = 80, .rows = 24 }, .{ .row = 2, .column = 0 });
 }
 
 test "caret occupies a blank row between two newlines" {
@@ -1308,21 +1244,21 @@ test "caret occupies a blank row between two newlines" {
     editor.moveLeft();
     editor.moveLeft();
     try std.testing.expectEqual(@as(usize, 5), editor.rows(.{ .columns = 80, .rows = 24 }));
-    try expectCaretAt(&editor, 80, .{ .row = 2, .column = 0 });
+    try expectCaretAt(&editor, .{ .columns = 80, .rows = 24 }, .{ .row = 2, .column = 0 });
 }
 
 test "consecutive newlines each add an occupiable row" {
     var editor = Editor.init(std.testing.allocator);
     defer editor.deinit();
     try editor.insert("\n\n");
-    try expectCaretAt(&editor, 80, .{ .row = 3, .column = 0 });
+    try expectCaretAt(&editor, .{ .columns = 80, .rows = 24 }, .{ .row = 3, .column = 0 });
 }
 
 test "moveUp and moveDown across newline lines" {
     var editor = Editor.init(std.testing.allocator);
     defer editor.deinit();
     try editor.insert("hello\nworld");
-    editor.caret = 3;
+    try moveCaretTo(&editor, 3);
     editor.moveDown(80);
     try std.testing.expectEqual(@as(usize, 9), editor.caret);
     editor.moveUp(80);
@@ -1333,7 +1269,7 @@ test "moveUp and moveDown across wrapped continuation rows" {
     var editor = Editor.init(std.testing.allocator);
     defer editor.deinit();
     try editor.insert("abcdef");
-    editor.caret = 1;
+    try moveCaretTo(&editor, 1);
     editor.moveDown(3);
     try std.testing.expectEqual(@as(usize, 4), editor.caret);
     editor.moveUp(3);
@@ -1345,11 +1281,11 @@ test "the caret follows a word the wrap moves to the next row" {
     defer editor.deinit();
     try editor.insert("aaa bbbb");
     const columns = 5;
-    try std.testing.expectEqual(@as(usize, 2), editor.bodyRows(columns));
+    const size: terminal.View.Size = .{ .columns = columns, .rows = 24 };
+    try std.testing.expectEqual(@as(usize, 4), editor.rows(size));
 
-    editor.caret = 6;
-    const position: terminal.View.Caret = .{ .row = 2, .column = 2 };
-    try std.testing.expectEqual(position, editor.caretPosition(columns));
+    try moveCaretTo(&editor, 6);
+    try expectCaretAt(&editor, size, .{ .row = 2, .column = 2 });
     editor.moveUp(columns);
     try std.testing.expectEqual(@as(usize, 2), editor.caret);
     editor.moveDown(columns);
@@ -1361,12 +1297,12 @@ test "a step up onto a short wrapped row lands on that row" {
     defer editor.deinit();
     try editor.insert("aaa bbbb");
     const columns = 5;
-    editor.caret = 8;
+    try moveCaretTo(&editor, 8);
     try std.testing.expectEqual(@as(usize, 2), terminal.width.rows(editor.visible(), columns));
 
     editor.moveUp(columns);
     try std.testing.expectEqual(@as(usize, 3), editor.caret);
-    try expectCaretAt(&editor, columns, .{ .row = 1, .column = 3 });
+    try expectCaretAt(&editor, .{ .columns = columns, .rows = 24 }, .{ .row = 1, .column = 3 });
     editor.moveDown(columns);
     try std.testing.expectEqual(@as(usize, 8), editor.caret);
     editor.moveUp(columns);
@@ -1378,7 +1314,7 @@ test "moveUp off the top row jumps to the start and clears the goal" {
     var editor = Editor.init(std.testing.allocator);
     defer editor.deinit();
     try editor.insert("abcdef\nxyz\nghijkl");
-    editor.caret = 16;
+    try moveCaretTo(&editor, 16);
     editor.moveUp(80);
     editor.moveUp(80);
     try std.testing.expectEqual(@as(usize, 5), editor.caret);
@@ -1392,7 +1328,7 @@ test "moveDown off the bottom row jumps to the end and clears the goal" {
     var editor = Editor.init(std.testing.allocator);
     defer editor.deinit();
     try editor.insert("abcdef\nxyz\nghijkl");
-    editor.caret = 1;
+    try moveCaretTo(&editor, 1);
     editor.moveDown(80);
     editor.moveDown(80);
     try std.testing.expectEqual(@as(usize, 12), editor.caret);
@@ -1406,7 +1342,7 @@ test "vertical movement keeps a sticky goal column across a shorter row" {
     var editor = Editor.init(std.testing.allocator);
     defer editor.deinit();
     try editor.insert("abcdef\nxy\nghijkl");
-    editor.caret = 5;
+    try moveCaretTo(&editor, 5);
     editor.moveDown(80);
     try std.testing.expectEqual(@as(usize, 9), editor.caret);
     editor.moveDown(80);
@@ -1421,7 +1357,7 @@ test "a horizontal move resets the vertical goal column" {
     var editor = Editor.init(std.testing.allocator);
     defer editor.deinit();
     try editor.insert("abcdef\nxy\nghijkl");
-    editor.caret = 5;
+    try moveCaretTo(&editor, 5);
     editor.moveDown(80);
     editor.moveLeft();
     editor.moveDown(80);
@@ -1432,7 +1368,7 @@ test "an edit resets the vertical goal column" {
     var editor = Editor.init(std.testing.allocator);
     defer editor.deinit();
     try editor.insert("abcdef\nxy\nghijkl");
-    editor.caret = 5;
+    try moveCaretTo(&editor, 5);
     editor.moveDown(80);
     try editor.insert("z");
     editor.moveDown(80);
@@ -1444,78 +1380,78 @@ test "moving right across blank lines does not skip rows" {
     defer editor.deinit();
     try editor.insert("a\n\nb");
     editor.moveHome();
-    const expected_rows = [_]usize{ 1, 1, 2, 3, 3 };
-    for (expected_rows) |row| {
-        try std.testing.expectEqual(row, editor.caretPosition(80).row);
+    const expected = [_]terminal.View.Caret{
+        .{ .row = 1, .column = 0 },
+        .{ .row = 1, .column = 1 },
+        .{ .row = 2, .column = 0 },
+        .{ .row = 3, .column = 0 },
+        .{ .row = 3, .column = 1 },
+    };
+    for (expected) |caret| {
+        try expectCaretAt(&editor, .{ .columns = 80, .rows = 24 }, caret);
         editor.moveRight();
     }
 }
 
 test "a tall body caps its rows and scrolls the window to keep the caret in view" {
-    var editor = Editor.init(std.testing.allocator);
+    const gpa = std.testing.allocator;
+    var editor = Editor.init(gpa);
     defer editor.deinit();
     try editor.insert("l0\nl1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9");
-    editor.reflow(.{ .columns = 80, .rows = 20 });
-    try std.testing.expectEqual(@as(usize, 8), editor.rows(.{ .columns = 80, .rows = 20 }));
-    try std.testing.expectEqual(@as(usize, 4), editor.scroll);
-    try std.testing.expectEqual(@as(usize, 6), editor.caretPosition(80).row);
+    const size: terminal.View.Size = .{ .columns = 80, .rows = 20 };
+    editor.reflow(size);
+    try std.testing.expectEqual(@as(usize, 8), editor.rows(size));
+    const bottom = try rendered(gpa, &editor, size);
+    defer gpa.free(bottom);
+    try testing.expectShows(bottom, &.{"↑ Hidden: 4"});
+    try testing.expectHides(bottom, &.{"↓ Hidden"});
+    try expectCaretAt(&editor, size, .{ .row = 6, .column = 2 });
 
     for (0..9) |_| editor.moveUp(80);
-    editor.reflow(.{ .columns = 80, .rows = 20 });
-    try std.testing.expectEqual(@as(usize, 0), editor.scroll);
-    try std.testing.expectEqual(@as(usize, 1), editor.caretPosition(80).row);
+    editor.reflow(size);
+    const top = try rendered(gpa, &editor, size);
+    defer gpa.free(top);
+    try testing.expectHides(top, &.{"↑ Hidden"});
+    try testing.expectShows(top, &.{"↓ Hidden: 4"});
+    try expectCaretAt(&editor, size, .{ .row = 1, .column = 2 });
 }
 
-test "the separators report the rows scrolled out of view" {
+test "the frame edges report the rows scrolled out of view" {
     const gpa = std.testing.allocator;
     var editor = Editor.init(gpa);
     defer editor.deinit();
     try editor.insert("l0\nl1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9");
     for (0..3) |_| editor.moveUp(80);
     editor.reflow(.{ .columns = 80, .rows = 20 });
-    try std.testing.expectEqual(@as(usize, 1), editor.scroll);
 
     const painted = try rendered(gpa, &editor, .{ .columns = 40, .rows = 20 });
     defer gpa.free(painted);
-    try std.testing.expect(std.mem.indexOf(u8, painted, "↑ Hidden: 1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, painted, "↓ Hidden: 3") != null);
-    try std.testing.expect(std.mem.indexOf(u8, painted, "l6") != null);
-    try std.testing.expect(std.mem.indexOf(u8, painted, "l0") == null);
-    try std.testing.expect(std.mem.indexOf(u8, painted, "l9") == null);
+    try testing.expectShows(painted, &.{"↑ Hidden: 1"});
+    try testing.expectShows(painted, &.{"↓ Hidden: 3"});
+    try testing.expectShows(painted, &.{"l6"});
+    try testing.expectHides(painted, &.{"l0"});
+    try testing.expectHides(painted, &.{"l9"});
 }
 
-test "prependDraft puts the draft before the current line with a blank line between" {
+test "prependText puts the text and a line break before a draft and fills a blank editor" {
     const gpa = std.testing.allocator;
     var editor = Editor.init(gpa);
     defer editor.deinit();
-    try editor.insert("typing");
-
-    var builder = Editor.init(gpa);
-    defer builder.deinit();
     const payload = "line\n" ** 15;
-    try builder.paste(payload, true);
-    var lead = builder.detachTrimmed();
-    defer lead.deinit(gpa);
+    try editor.paste(payload, true);
+    try editor.insert("draft");
+    try editor.prependText("");
+    try std.testing.expect(std.mem.startsWith(u8, editor.visible(), "\u{200B}[Paste #1"));
 
-    try editor.reserveDraft(&lead);
-    editor.prependDraft(&lead);
-
-    const shown = editor.visible();
-    try std.testing.expect(std.mem.startsWith(u8, shown, "\u{200B}[Paste #1: 16 lines]\u{200B}"));
-    try std.testing.expect(std.mem.endsWith(u8, shown, "\n\ntyping"));
-    try std.testing.expectEqual(shown.len, editor.caret);
-    try std.testing.expectEqual(@as(usize, 1), editor.draft.atoms.items.len);
-    try std.testing.expectEqual(@as(usize, 0), lead.visible.items.len);
-    const text = try editor.expanded(.none);
+    try editor.prependText("refused");
+    const text = try editor.expanded();
     defer gpa.free(text);
-    try std.testing.expect(std.mem.startsWith(u8, text, payload));
-    try std.testing.expect(std.mem.endsWith(u8, text, "\n\ntyping"));
+    try std.testing.expectEqualStrings("refused\n" ++ payload ++ "draft", text);
+    try std.testing.expectEqual(editor.visible().len, editor.caret);
 
-    var empty = Editor.init(gpa);
-    defer empty.deinit();
-    var plain = try Draft.fromText(gpa, "alone");
-    defer plain.deinit(gpa);
-    try empty.reserveDraft(&plain);
-    empty.prependDraft(&plain);
-    try std.testing.expectEqualStrings("alone", empty.visible());
+    editor.clear();
+    try editor.insert(" \n");
+    try editor.prependText("refused");
+    try std.testing.expectEqualStrings("refused", editor.visible());
+    try std.testing.expectEqual(editor.visible().len, editor.caret);
 }

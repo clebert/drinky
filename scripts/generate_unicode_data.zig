@@ -10,6 +10,10 @@ const codepoint_max = 0x10FFFF;
 
 const WidthRange = struct { first: u21, last: u21, columns: u8 };
 const Bounds = struct { first: u21, last: u21 };
+const Record = struct { first: u21, last: u21, fields: [2][]const u8 };
+
+const soft_hyphen: u21 = 0x00AD;
+const joining_jamo: Bounds = .{ .first = 0x1160, .last = 0x11FF };
 
 const Class = enum {
     other,
@@ -33,14 +37,36 @@ const Class = enum {
 };
 const ClassRange = struct { first: u21, last: u21, class: Class };
 
-pub fn main() !void {
-    var arena_state: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
+const Records = struct {
+    lines: std.mem.SplitIterator(u8, .scalar),
 
-    var threaded: std.Io.Threaded = .init(arena, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    fn init(text: []const u8) Records {
+        return .{ .lines = std.mem.splitScalar(u8, text, '\n') };
+    }
+
+    fn next(self: *Records) ?Record {
+        while (self.lines.next()) |raw| {
+            const line = std.mem.trim(u8, before(raw, '#'), " \t\r");
+            var fields = std.mem.splitScalar(u8, line, ';');
+            const bounds = parseRange(fields.first()) orelse continue;
+            if (bounds.first > codepoint_max) continue;
+            var record: Record = .{
+                .first = bounds.first,
+                .last = @min(bounds.last, codepoint_max),
+                .fields = .{ "", "" },
+            };
+            for (&record.fields) |*field| {
+                field.* = std.mem.trim(u8, fields.next() orelse break, " \t");
+            }
+            return record;
+        }
+        return null;
+    }
+};
+
+pub fn main(init: std.process.Init) !void {
+    const arena = init.arena.allocator();
+    const io = init.io;
 
     var client: std.http.Client = .{ .allocator = arena, .io = io };
     defer client.deinit();
@@ -52,9 +78,8 @@ pub fn main() !void {
     const zero = try arena.alloc(bool, codepoint_max + 1);
     @memset(zero, false);
     mark(categories, &.{ "Mn", "Me", "Cf" }, zero);
-    zero[0x00AD] = false;
-    for (0x1160..0x1200) |codepoint| zero[codepoint] = true;
-    zero[0x200B] = true;
+    zero[soft_hyphen] = false;
+    for (joining_jamo.first..joining_jamo.last + 1) |codepoint| zero[codepoint] = true;
 
     const wide = try arena.alloc(bool, codepoint_max + 1);
     @memset(wide, false);
@@ -122,18 +147,10 @@ fn fetch(arena: std.mem.Allocator, client: *std.http.Client, url: []const u8) ![
 }
 
 fn mark(text: []const u8, wanted: []const []const u8, flags: []bool) void {
-    var lines = std.mem.splitScalar(u8, text, '\n');
-    while (lines.next()) |raw| {
-        const line = std.mem.trim(u8, before(raw, '#'), " \t\r");
-        if (line.len == 0) continue;
-        const semicolon = std.mem.indexOfScalar(u8, line, ';') orelse continue;
-        const field = std.mem.trim(u8, line[0..semicolon], " \t");
-        const value = token(std.mem.trim(u8, line[semicolon + 1 ..], " \t"));
-        if (!contains(wanted, value)) continue;
-        const bounds = parseRange(field) orelse continue;
-        if (bounds.first > codepoint_max) continue;
-        const last = @min(bounds.last, codepoint_max);
-        for (bounds.first..last + 1) |codepoint| flags[codepoint] = true;
+    var records: Records = .init(text);
+    while (records.next()) |record| {
+        if (!contains(wanted, record.fields[0])) continue;
+        for (record.first..record.last + 1) |codepoint| flags[codepoint] = true;
     }
 }
 
@@ -161,18 +178,10 @@ fn coalesce(arena: std.mem.Allocator, zero: []const bool, wide: []const bool) ![
 }
 
 fn assignGraphemeBreak(text: []const u8, classes: []Class) void {
-    var lines = std.mem.splitScalar(u8, text, '\n');
-    while (lines.next()) |raw| {
-        const line = std.mem.trim(u8, before(raw, '#'), " \t\r");
-        if (line.len == 0) continue;
-        const semicolon = std.mem.indexOfScalar(u8, line, ';') orelse continue;
-        const field = std.mem.trim(u8, line[0..semicolon], " \t");
-        const value = token(std.mem.trim(u8, line[semicolon + 1 ..], " \t"));
-        const class = graphemeBreakClass(value) orelse continue;
-        const bounds = parseRange(field) orelse continue;
-        if (bounds.first > codepoint_max) continue;
-        const last = @min(bounds.last, codepoint_max);
-        for (bounds.first..last + 1) |codepoint| classes[codepoint] = class;
+    var records: Records = .init(text);
+    while (records.next()) |record| {
+        const class = graphemeBreakClass(record.fields[0]) orelse continue;
+        for (record.first..record.last + 1) |codepoint| classes[codepoint] = class;
     }
 }
 
@@ -199,19 +208,11 @@ fn graphemeBreakClass(value: []const u8) ?Class {
 }
 
 fn assignIndicConjunct(text: []const u8, classes: []Class) void {
-    var lines = std.mem.splitScalar(u8, text, '\n');
-    while (lines.next()) |raw| {
-        const line = std.mem.trim(u8, before(raw, '#'), " \t\r");
-        if (line.len == 0) continue;
-        var fields = std.mem.splitScalar(u8, line, ';');
-        const field = std.mem.trim(u8, fields.next() orelse continue, " \t");
-        const property = std.mem.trim(u8, fields.next() orelse continue, " \t");
-        const value = std.mem.trim(u8, fields.next() orelse continue, " \t");
+    var records: Records = .init(text);
+    while (records.next()) |record| {
+        const property, const value = record.fields;
         if (!std.mem.eql(u8, property, "InCB")) continue;
-        const bounds = parseRange(field) orelse continue;
-        if (bounds.first > codepoint_max) continue;
-        const last = @min(bounds.last, codepoint_max);
-        for (bounds.first..last + 1) |codepoint| {
+        for (record.first..record.last + 1) |codepoint| {
             if (std.mem.eql(u8, value, "Linker")) {
                 if (classes[codepoint] == .extend) classes[codepoint] = .linker;
             } else if (std.mem.eql(u8, value, "Extend")) {
@@ -258,6 +259,8 @@ fn emit(
     );
     try writer.writeAll("};\n");
     try writer.writeAll(class_section);
+    for (std.enums.values(Class)) |class| try writer.print("    {s},\n", .{@tagName(class)});
+    try writer.writeAll(class_range_section);
     for (class_ranges) |range| try writer.print(
         "    .{{ .first = 0x{x:0>4}, .last = 0x{x:0>4}, .class = .{s} }},\n",
         .{ range.first, range.last, @tagName(range.class) },
@@ -267,10 +270,6 @@ fn emit(
 
 fn before(text: []const u8, byte: u8) []const u8 {
     return text[0 .. std.mem.indexOfScalar(u8, text, byte) orelse text.len];
-}
-
-fn token(text: []const u8) []const u8 {
-    return text[0 .. std.mem.indexOfAny(u8, text, " \t") orelse text.len];
 }
 
 fn contains(list: []const []const u8, value: []const u8) bool {
@@ -309,24 +308,10 @@ const width_section =
 const class_section =
     \\
     \\pub const Class = enum {
-    \\    other,
-    \\    cr,
-    \\    lf,
-    \\    control,
-    \\    extend,
-    \\    extend_incb,
-    \\    linker,
-    \\    zwj,
-    \\    regional_indicator,
-    \\    prepend,
-    \\    spacing_mark,
-    \\    l,
-    \\    v,
-    \\    t,
-    \\    lv,
-    \\    lvt,
-    \\    extended_pictographic,
-    \\    consonant,
+    \\
+;
+
+const class_range_section =
     \\};
     \\
     \\pub const ClassRange = struct { first: u21, last: u21, class: Class };

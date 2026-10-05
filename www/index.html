@@ -109,8 +109,6 @@
     text-decoration-color: var(--user);
   }
 
-  /* Motion */
-
   .bird {
     transform-box: view-box;
     transform-origin: 110px 150px;
@@ -158,7 +156,6 @@
     100% { transform: rotate(0deg); }
   }
 
-  /* This mirrors `rock`, so the surface in the bulb stays level on screen. */
   @keyframes level {
     0% { transform: rotate(0deg); animation-timing-function: linear; }
     18% { transform: rotate(0deg); animation-timing-function: cubic-bezier(0.9, 0, 0.95, 0.1); }
@@ -197,8 +194,6 @@
     57%, 59% { transform: translateY(4px); }
     61%, 100% { transform: translateY(0); }
   }
-
-  /* Drawing */
 
   .scene text {
     font: 700 14px ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono",

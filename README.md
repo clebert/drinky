@@ -23,12 +23,13 @@ the features your workflow needs.
    and Drinky saves no conversation to resume.
 2. **Telegram remote control:** Attach a bot and drive the session from its chat, while the terminal
    shows the work.
-3. **One job:** An agent loop and seven tools, with no sub-agents and no workflow mode.
+3. **One job:** An agent loop and a small set of tools, with no sub-agents and no workflow mode.
 4. **Small system prompt:** The compiled prompt states the mechanics. Your instruction files and
    skills carry every rule about how to work.
-5. **Self-describing:** The model can read every command, setting, and key binding of Drinky, so it
-   can maintain your config for you.
-6. **No compiled-in models:** Every model, limit, and price comes from the provider at runtime.
+5. **Self-describing:** The model can read every command, config key, and key binding of Drinky, so
+   it can maintain your config file for you.
+6. **No compiled-in models:** Every model comes from the provider at runtime, and every limit and
+   price from the provider or the public metadata.
 
 ## Build and run
 
@@ -76,10 +77,10 @@ Drinky is not affiliated with Anthropic, OpenAI, xAI, OpenRouter, DeepSeek, Goog
 ## Cost display
 
 The status line shows the session cost as an estimate, as in `~$0.42`, and the tilde marks it.
-Drinky prices the tokens of the session at the public rates of the model, or takes the charge that a
-reply states, as an OpenRouter reply does. The figure is informational, and it is not a bill. A
-subscription account pays no per-token price at all, and Drinky still prints the figure as an
-orientation about the weight of a session. Drinky never knows the real charge.
+Drinky prices the tokens of the session at the public rates of the model. When a reply states its
+charge, as an OpenRouter reply does, Drinky takes that charge. The figure is informational, and it
+is not a bill. A subscription account pays no per-token price at all, and Drinky still prints the
+figure as an orientation about the weight of a session. Drinky never sees the bill.
 
 The context gauge, the quota window, and the credit pool are different. Each one reports what the
 provider states.
@@ -87,17 +88,8 @@ provider states.
 ## Slash commands
 
 A line that starts with a slash runs in Drinky and reaches no model. Type `/` or `/help` to open the
-complete command list.
-
-- `/effort` — set the reasoning effort.
-- `/login` — sign in or switch the account.
-- `/model` — switch the model.
-- `/new` — clear the conversation.
-- `/remote` — attach a Telegram bot.
-- `/skill` — pick a skill.
-- `/skill:name` — load a skill.
-- `/sources` — show the loaded instruction files and skills.
-- `/system` — show the complete system prompt.
+complete command list. Drinky refuses an unknown command, an unknown skill, and a command with an
+argument. A second Enter then sends the refused line to the model as a message.
 
 ## Telegram remote control
 
@@ -118,14 +110,14 @@ API directly.
 ## Herdr
 
 Inside a [Herdr](https://herdr.dev) pane, Drinky reports its state over the Herdr socket, so Herdr
-can notify you when a turn ends or fails. The status line leaves the directory and the branch to the
-Herdr pane label. This needs no setup.
+can notify you when a turn ends. The status line leaves the directory and the branch to the Herdr
+pane label. This needs no setup.
 
-## Configuration
+## Config file
 
 The `~/.drinky/config.json` file is optional. It controls instruction files, request and bash
-limits, required skills, a default effort level, and interface settings. Drinky reads the file only
-at startup and never writes it. You can keep it in version control.
+limits, required skills, a default effort level, and the interface. Drinky reads the file only at
+startup and never writes it. You can keep it in version control.
 
 The config file holds no secrets. Credentials, project state, and cached model information live in
 separate files under `~/.drinky/`.

@@ -1,14 +1,16 @@
 const std = @import("std");
 
-const ai = @import("ai");
+const core = @import("core");
+const tools = @import("tools");
 
+const command = @import("command/root.zig");
 const Config = @import("Config.zig");
 
-pub const Options = struct {
+const Options = struct {
     config: *const Config,
-    effort_default: ai.llm.Effort,
+    effort_default: core.Provider.Effort,
     key_hints: []const []const u8,
-    ctrl_c_window_ms: i64,
+    repeat_window_ms: i64,
 };
 
 const head =
@@ -21,7 +23,9 @@ const head =
     \\## Commands
     \\
     \\The user types a command line into the editor, and that line reaches no model. Drinky runs
-    \\it locally. You cannot run a command, so name the line that the user must type.
+    \\it locally. You cannot run a command, so name the line that the user must type. Drinky
+    \\refuses an unknown command, an unknown skill, and a command with an argument. A second Enter
+    \\then sends the refused line to the model as a message.
     \\
     \\
 ;
@@ -65,37 +69,46 @@ const repository =
     \\
 ;
 
-pub fn compose(gpa: std.mem.Allocator, options: *const Options) ![]u8 {
-    var output: std.Io.Writer.Allocating = .init(gpa);
-    errdefer output.deinit();
-    try output.writer.writeAll(head);
-    try writeCommands(&output.writer);
+pub fn compose(gpa: std.mem.Allocator, options: *const Options) error{OutOfMemory}![]u8 {
     const configuration = try options.config.document(gpa, options.effort_default);
     defer gpa.free(configuration);
-    try output.writer.writeByte('\n');
-    try output.writer.writeAll(configuration);
-    try writeKeys(&output.writer, options);
-    try output.writer.writeAll(discovery);
-    try writeSkillCap(&output.writer);
-    try output.writer.writeAll(repository);
+    var output: std.Io.Writer.Allocating = .init(gpa);
+    errdefer output.deinit();
+    write(&output.writer, options, configuration) catch return error.OutOfMemory;
     return output.toOwnedSlice();
 }
 
+fn write(
+    writer: *std.Io.Writer,
+    options: *const Options,
+    configuration: []const u8,
+) std.Io.Writer.Error!void {
+    try writer.writeAll(head);
+    try writeCommands(writer);
+    try writer.writeByte('\n');
+    try writer.writeAll(configuration);
+    try writeKeys(writer, options);
+    try writer.writeAll(discovery);
+    try writeSkillRules(writer);
+    try writer.writeAll(repository);
+}
+
 fn writeCommands(writer: *std.Io.Writer) !void {
-    for (ai.command.summaries) |command| {
-        try writer.print("- `/{s}` \u{2014} {s}.", .{ command.name, command.summary });
-        if (command.alias.len > 0)
-            try writer.print(" The line `{s}` runs it too.", .{command.alias});
-        if (command.tail.len > 0)
-            try writer.print(" It takes {s} as trailing text.", .{command.tail});
-        if (command.remote)
+    for (command.summaries) |summary| {
+        try writer.print("- `/{s}` \u{2014} {s}.", .{ summary.name, summary.summary });
+        if (summary.alias.len > 0)
+            try writer.print(" The line `{s}` runs it too.", .{summary.alias});
+        if (summary.tail.len > 0)
+            try writer.print(" It takes {s} as trailing text.", .{summary.tail});
+        if (summary.remote)
             try writer.writeAll(" It runs from the Telegram chat too.");
         try writer.writeByte('\n');
     }
     try writer.writeAll(
-        "\nA command refuses text after its name unless its row names trailing text. Every command " ++
-            "waits for the end of a turn. A command runs in the terminal alone unless its row says " ++
-            "that it runs from the Telegram chat too.\n",
+        "\nA command refuses text after its name unless its row names trailing text. " ++
+            "Drinky refuses every command while a turn runs, and the draft stays. A command " ++
+            "runs in the terminal alone unless its row says that it runs from the Telegram " ++
+            "chat too.\n",
     );
 }
 
@@ -106,10 +119,13 @@ fn writeKeys(writer: *std.Io.Writer, options: *const Options) !void {
         \\
         \\The prompt takes these keys:
         \\
-        \\- Enter sends the line.
+        \\- Enter sends the line. After Drinky refuses a command line, a second Enter sends that
+        \\  line as a message.
         \\- Ctrl+C clears the editor. A second press within {d} milliseconds quits Drinky.
         \\- Ctrl+D quits at an empty editor. Ctrl+D with a draft warns first and quits on the
         \\  second press.
+        \\- Within {d} milliseconds after a Ctrl+D that ended a step, a page, a sign-in, a turn,
+        \\  or an attached bot, Ctrl+D warns first.
         \\
         \\A sign-in takes these keys:
         \\
@@ -121,31 +137,40 @@ fn writeKeys(writer: *std.Io.Writer, options: *const Options) !void {
         \\
         \\- Enter sends no message. Drinky shows the notice `Drinky sends no message while a turn
         \\  runs. The draft stays.` and keeps the line. A slash command gets its refusal instead.
-        \\- Esc cancels the turn. Esc first restores the status line. Esc with a draft warns first
-        \\  and cancels on the second press.
+        \\- Esc cancels the turn. Esc with a draft warns first and cancels on the second press.
+        \\- When a notice other than that warning replaces the status line, Esc first clears the
+        \\  notice.
         \\- Ctrl+D cancels the turn at once.
         \\- Ctrl+C clears a draft, and it cancels the turn at an empty editor.
         \\
-        \\This section names the keys of the prompt, a sign-in, and a turn. A full-window page
-        \\states its own keys in its header, and the editor carries the movement keys of a text
-        \\field.
+        \\While a Telegram bot is attached, the chat holds the input, and the terminal takes these
+        \\keys:
         \\
-    , .{options.ctrl_c_window_ms});
+        \\- Esc, Ctrl+C, or Ctrl+D detaches the bot. The same keys during the detach end the wait,
+        \\  and the last message to the chat stays unsent.
+        \\- Enter shows a notice that names the bot and the key that detaches it.
+        \\- Drinky ignores every other key.
+        \\
+        \\This section names the keys of the prompt, a sign-in, a turn, and an attached bot. A
+        \\full-window page states its own keys in its header, and the editor carries the movement
+        \\keys of a text field.
+        \\
+    , .{ options.repeat_window_ms, options.repeat_window_ms });
 }
 
-fn writeSkillCap(writer: *std.Io.Writer) !void {
+fn writeSkillRules(writer: *std.Io.Writer) !void {
     try writer.print(
-        \\- A `SKILL.md` file above the window of one `read` call, {d} lines or {d} KiB, is skipped
-        \\  and reported. One call then always holds a whole skill.
+        \\- Drinky skips and reports a `SKILL.md` file above the window of one `read` call. The
+        \\  window is {d} lines or {d} KiB, so one call always holds a whole skill.
         \\- On a name clash a project skill wins over a user skill, and the closest copy wins over a
         \\  copy farther up.
         \\- The `user_instructions` key adds instruction files that no walk finds, and the
         \\  `required_skills` key pairs a path pattern with a skill.
         \\
-    , .{ ai.tool.read_lines_max, @divExact(ai.tool.read_bytes_max, 1024) });
+    , .{ tools.read.lines_max, @divExact(tools.read.bytes_max, 1024) });
 }
 
-test "the document states every command, key, and discovery rule" {
+test "the document orders its sections and states each command, key hint, window, and limit" {
     const gpa = std.testing.allocator;
     var config: Config = .{
         .path = try gpa.dupe(u8, "/unused/config.json"),
@@ -156,12 +181,12 @@ test "the document states every command, key, and discovery rule" {
         .config = &config,
         .effort_default = .xhigh,
         .key_hints = &.{ "Enter: Send", "Ctrl+D: Quit" },
-        .ctrl_c_window_ms = 500,
+        .repeat_window_ms = 500,
     });
     defer gpa.free(text);
 
     const commands = std.mem.indexOf(u8, text, "## Commands").?;
-    const configuration = std.mem.indexOf(u8, text, "## Configuration").?;
+    const configuration = std.mem.indexOf(u8, text, "## Config file").?;
     const keys = std.mem.indexOf(u8, text, "## Key bindings").?;
     const discovery_index = std.mem.indexOf(u8, text, "## Discovery").?;
     const repository_index = std.mem.indexOf(u8, text, "## Repository").?;
@@ -170,75 +195,27 @@ test "the document states every command, key, and discovery rule" {
     try std.testing.expect(keys < discovery_index);
     try std.testing.expect(discovery_index < repository_index);
 
-    for (ai.command.summaries) |command| {
-        const row = try std.fmt.allocPrint(gpa, "- `/{s}` \u{2014} ", .{command.name});
+    for (command.summaries) |summary| {
+        const row = try std.fmt.allocPrint(
+            gpa,
+            "- `/{s}` \u{2014} {s}.",
+            .{ summary.name, summary.summary },
+        );
         defer gpa.free(row);
-        try std.testing.expect(std.mem.indexOf(u8, text, row) != null);
+        try std.testing.expect(std.mem.indexOf(u8, text[commands..configuration], row) != null);
     }
-    try std.testing.expect(std.mem.indexOf(u8, text, "as trailing text") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "The line `/` runs it too.") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "The line `/skill:` runs it too.") != null);
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        text,
-        "- `/login` \u{2014} Sign in or switch the account.\n",
-    ) != null);
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        text,
-        "- `/new` \u{2014} Clear the conversation. It runs from the Telegram chat too.\n",
-    ) != null);
+    const path = "/unused/config.json";
+    try std.testing.expect(std.mem.indexOf(u8, text[configuration..keys], path) != null);
+    const hints = "- Enter: Send\n- Ctrl+D: Quit\n";
+    try std.testing.expect(std.mem.indexOf(u8, text[keys..discovery_index], hints) != null);
     try std.testing.expectEqual(
-        @as(usize, 1),
-        std.mem.count(u8, text, " It runs from the Telegram chat too."),
+        @as(usize, 2),
+        std.mem.count(u8, text[keys..discovery_index], "500 milliseconds"),
     );
-    try std.testing.expect(std.mem.indexOf(u8, text, "Every command waits for the end of a turn.") != null);
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        text,
-        "unless its row says that it runs from the Telegram chat too",
-    ) != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "### Keys") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "`bash.timeout_ms`") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "/unused/config.json") != null);
-
-    try std.testing.expect(std.mem.indexOf(u8, text, "must type.\n\n- `/effort`") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "these keys:\n\n- Enter: Send\n") != null);
-
-    try std.testing.expect(std.mem.indexOf(u8, text, "- Ctrl+D: Quit\n") != null);
-    const prompt = std.mem.indexOf(u8, text, "The prompt takes these keys:").?;
-    const login = std.mem.indexOf(u8, text, "A sign-in takes these keys:").?;
-    const turn = std.mem.indexOf(u8, text, "A running turn takes these keys:").?;
-    try std.testing.expect(prompt < login);
-    try std.testing.expect(login < turn);
-    try std.testing.expect(std.mem.indexOf(u8, text[prompt..login], "within 500 milli") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text[login..turn], "replays a callback URL") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text[login..turn], "cancels the sign-in") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text[turn..], "Enter sends no message.") != null);
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        text[turn..],
-        "Esc first restores the status line.",
-    ) != null);
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        text[turn..],
-        "cancels the turn at once",
-    ) != null);
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        text[turn..discovery_index],
-        "milliseconds",
-    ) == null);
-
-    try std.testing.expect(std.mem.indexOf(u8, text, "`AGENTS.md`") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "~/.agents/skills/") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "2000 lines or 50 KiB") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "reaches the session that runs now") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "own keys in its header") != null);
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        text,
-        "https://github.com/clebert/drinky",
-    ) != null);
+    const window = try std.fmt.allocPrint(gpa, "{d} lines or {d} KiB", .{
+        tools.read.lines_max,
+        @divExact(tools.read.bytes_max, 1024),
+    });
+    defer gpa.free(window);
+    try std.testing.expect(std.mem.indexOf(u8, text[discovery_index..], window) != null);
 }

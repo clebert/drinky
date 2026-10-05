@@ -1,6 +1,7 @@
 const std = @import("std");
 
-const ai = @import("ai");
+const core = @import("core");
+const tools = @import("tools");
 
 const ui = @import("../ui/root.zig");
 
@@ -19,14 +20,14 @@ turn: ?Turn,
 serial: u64,
 
 pub const View = struct {
-    blocks: []const ui.block.Entry,
+    blocks: []const ui.Block,
     committed: usize,
     tail: ?Tail,
 
-    pub const Tail = struct {
-        streaming: ?ui.block.Entry.Kind,
+    const Tail = struct {
+        streaming: ?ui.Block.Kind,
         tool: ?[]const u8,
-        calls: usize,
+        call_count: usize,
     };
 
     fn toolRuns(self: *const View) bool {
@@ -43,6 +44,63 @@ pub const End = struct {
     pub const Outcome = enum { completed, canceled, failed };
 };
 
+pub const Chat = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        listens: *const fn (ptr: *anyopaque) bool,
+        send: *const fn (
+            ptr: *anyopaque,
+            text: []const u8,
+            options: *const Client.SendOptions,
+        ) Error!void,
+        sendTracked: *const fn (
+            ptr: *anyopaque,
+            text: []const u8,
+            options: *const Client.SendOptions,
+        ) Error!?Attachment.Handle,
+        edit: *const fn (
+            ptr: *anyopaque,
+            handle: Attachment.Handle,
+            text: []const u8,
+            options: *const Client.EditOptions,
+        ) Error!void,
+        delete: *const fn (ptr: *anyopaque, handle: Attachment.Handle) Error!void,
+    };
+
+    pub const Error = error{OutOfMemory};
+
+    fn listens(self: Chat) bool {
+        return self.vtable.listens(self.ptr);
+    }
+
+    fn send(self: Chat, text: []const u8, options: *const Client.SendOptions) Error!void {
+        return self.vtable.send(self.ptr, text, options);
+    }
+
+    fn sendTracked(
+        self: Chat,
+        text: []const u8,
+        options: *const Client.SendOptions,
+    ) Error!?Attachment.Handle {
+        return self.vtable.sendTracked(self.ptr, text, options);
+    }
+
+    fn edit(
+        self: Chat,
+        handle: Attachment.Handle,
+        text: []const u8,
+        options: *const Client.EditOptions,
+    ) Error!void {
+        return self.vtable.edit(self.ptr, handle, text, options);
+    }
+
+    fn delete(self: Chat, handle: Attachment.Handle) Error!void {
+        return self.vtable.delete(self.ptr, handle);
+    }
+};
+
 const Turn = struct {
     started_ms: i64,
     handle: ?Attachment.Handle,
@@ -52,7 +110,7 @@ const Turn = struct {
 
 const Activity = struct {
     phase: Phase,
-    calls: usize,
+    call_count: usize,
     tool_buffer: [tool_bytes_max]u8,
     tool_length: usize,
 
@@ -62,14 +120,14 @@ const Activity = struct {
 
     const idle: Activity = .{
         .phase = .thinking,
-        .calls = 0,
+        .call_count = 0,
         .tool_buffer = undefined,
         .tool_length = 0,
     };
 
     fn of(tail: *const View.Tail) Activity {
         var activity = idle;
-        activity.calls = tail.calls;
+        activity.call_count = tail.call_count;
         if (tail.tool) |name| {
             activity.phase = .running;
             const length = @min(name.len, tool_bytes_max);
@@ -86,7 +144,7 @@ const Activity = struct {
     }
 
     fn eql(self: *const Activity, other: *const Activity) bool {
-        return self.phase == other.phase and self.calls == other.calls and
+        return self.phase == other.phase and self.call_count == other.call_count and
             std.mem.eql(u8, self.tool(), other.tool());
     }
 
@@ -102,9 +160,9 @@ const Activity = struct {
             .writing => try out.writeAll("Writing"),
             .running => try out.print("Running: {s}", .{self.tool()}),
         }
-        if (self.calls == 0) return;
+        if (self.call_count == 0) return;
         try out.writeAll(ui.paint.separator);
-        try writeCalls(out, self.calls);
+        try writeCallCount(out, self.call_count);
     }
 };
 
@@ -125,7 +183,7 @@ pub fn seedSerials(self: *Mirror, seed: u64) void {
     self.serial = seed;
 }
 
-pub fn open(self: *Mirror, chat: anytype, view: *const View) !void {
+pub fn open(self: *Mirror, chat: Chat, view: *const View) !void {
     self.cursor = view.committed;
     const turn = if (self.turn) |*turn| turn else return;
     turn.handle = null;
@@ -133,7 +191,7 @@ pub fn open(self: *Mirror, chat: anytype, view: *const View) !void {
     try self.startActivity(chat);
 }
 
-pub fn beginTurn(self: *Mirror, chat: anytype, now_ms: i64) !void {
+pub fn beginTurn(self: *Mirror, chat: Chat, now_ms: i64) !void {
     self.turn = .{
         .started_ms = now_ms,
         .handle = null,
@@ -144,7 +202,7 @@ pub fn beginTurn(self: *Mirror, chat: anytype, now_ms: i64) !void {
     try self.startActivity(chat);
 }
 
-fn startActivity(self: *Mirror, chat: anytype) !void {
+fn startActivity(self: *Mirror, chat: Chat) !void {
     const turn = &self.turn.?;
     const markup = try self.activityMarkup(turn);
     defer self.gpa.free(markup);
@@ -159,10 +217,10 @@ fn startActivity(self: *Mirror, chat: anytype) !void {
 
 fn activityText(self: *Mirror, turn: *const Turn) ![]u8 {
     var buffer: [activity_bytes_max]u8 = undefined;
-    return html.wrapAlloc(self.gpa, .information, turn.activity.text(&buffer));
+    return html.noticeAlloc(self.gpa, .information, turn.activity.text(&buffer));
 }
 
-pub fn sync(self: *Mirror, chat: anytype, view: *const View) !void {
+pub fn sync(self: *Mirror, chat: Chat, view: *const View) !void {
     if (!chat.listens()) return;
     try self.flush(chat, view, .{ .hold_answer = self.turn != null and !view.toolRuns() });
     const turn = if (self.turn) |*turn| turn else return;
@@ -173,7 +231,7 @@ pub fn sync(self: *Mirror, chat: anytype, view: *const View) !void {
     try self.editActivity(chat, turn);
 }
 
-fn editActivity(self: *Mirror, chat: anytype, turn: *const Turn) !void {
+fn editActivity(self: *Mirror, chat: Chat, turn: *const Turn) !void {
     const handle = turn.handle orelse return;
     const markup = try self.activityMarkup(turn);
     defer self.gpa.free(markup);
@@ -183,10 +241,10 @@ fn editActivity(self: *Mirror, chat: anytype, turn: *const Turn) !void {
 }
 
 fn activityMarkup(self: *Mirror, turn: *const Turn) ![]u8 {
-    return keyboard.cancelMarkup(self.gpa, turn.serial);
+    return keyboard.markup(self.gpa, &.{&.{.{ .cancel = turn.serial }}});
 }
 
-pub fn endTurn(self: *Mirror, chat: anytype, view: *const View, end: *const End) !void {
+pub fn endTurn(self: *Mirror, chat: Chat, view: *const View, end: *const End) !void {
     defer self.turn = null;
     if (!chat.listens()) return;
     try self.flush(chat, view, .{});
@@ -198,14 +256,14 @@ pub fn endTurn(self: *Mirror, chat: anytype, view: *const View, end: *const End)
     }
 }
 
-fn editSummary(self: *Mirror, chat: anytype, turn: *const Turn, end: *const End) !void {
+fn editSummary(self: *Mirror, chat: Chat, turn: *const Turn, end: *const End) !void {
     const handle = turn.handle orelse return;
     const text = try self.summary(turn, end);
     defer self.gpa.free(text);
     try chat.edit(handle, text, &.{ .parse_mode = html.parse_mode });
 }
 
-fn sendSummary(self: *Mirror, chat: anytype, turn: *const Turn, end: *const End) !void {
+fn sendSummary(self: *Mirror, chat: Chat, turn: *const Turn, end: *const End) !void {
     const text = try self.summary(turn, end);
     defer self.gpa.free(text);
     if ((try chat.sendTracked(text, &.{
@@ -220,7 +278,7 @@ pub fn namesTurn(self: *const Mirror, serial: u64) bool {
     return turn.serial == serial;
 }
 
-pub fn detached(self: *Mirror) void {
+pub fn forgetActivity(self: *Mirror) void {
     const turn = if (self.turn) |*turn| turn else return;
     turn.handle = null;
 }
@@ -230,19 +288,11 @@ fn nextSerial(self: *Mirror) u64 {
     return self.serial;
 }
 
-pub fn transcriptCursor(self: *const Mirror) usize {
-    return self.cursor;
-}
-
-pub fn retreat(self: *Mirror, count: usize) void {
-    self.cursor -|= count;
-}
-
-pub fn restart(self: *Mirror) void {
+pub fn resetCursor(self: *Mirror) void {
     self.cursor = 0;
 }
 
-fn flush(self: *Mirror, chat: anytype, view: *const View, options: Flush) !void {
+fn flush(self: *Mirror, chat: Chat, view: *const View, options: Flush) !void {
     self.cursor = @min(self.cursor, view.blocks.len);
     var end = view.committed;
     while (options.hold_answer and end > self.cursor and view.blocks[end - 1].content == .model)
@@ -262,27 +312,26 @@ fn flush(self: *Mirror, chat: anytype, view: *const View, options: Flush) !void 
     for (rendered.items) |text| try self.sendHtml(chat, text);
 }
 
-fn renderBlock(self: *Mirror, block: *const ui.block.Entry) !?[]u8 {
+fn renderBlock(self: *Mirror, block: *const ui.Block) error{OutOfMemory}!?[]u8 {
     var out: std.Io.Writer.Allocating = .init(self.gpa);
     defer out.deinit();
-    switch (block.content) {
-        .model => |list| try html.render(&out.writer, std.mem.trimEnd(u8, list.items, " \t\r\n")),
-        .user_note => |list| try html.wrap(&out.writer, .note, list.items),
-        .event => |flagged| {
-            if (!flagged.mirrored) return null;
-            try html.wrap(
-                &out.writer,
-                if (flagged.is_error) .failure else if (flagged.is_warning) .warning else .information,
-                flagged.text.items,
-            );
-        },
-        .intro, .user, .thinking, .tool_result => return null,
-    }
+    writeBlock(&out.writer, block) catch return error.OutOfMemory;
     if (out.written().len == 0) return null;
     return try out.toOwnedSlice();
 }
 
-fn sendHtml(self: *Mirror, chat: anytype, text: []const u8) !void {
+fn writeBlock(out: *std.Io.Writer, block: *const ui.Block) std.Io.Writer.Error!void {
+    switch (block.content) {
+        .model => |list| try html.render(out, std.mem.trimEnd(u8, list.items, " \t\r\n")),
+        .user_note => |list| try html.notice(out, .note, list.items),
+        .event => |*event| if (event.mirrored) {
+            try html.notice(out, .of(event.severity), event.text.items);
+        },
+        .intro, .user, .thinking, .tool_result => {},
+    }
+}
+
+fn sendHtml(self: *Mirror, chat: Chat, text: []const u8) !void {
     var parts = html.Parts.init(text, html.message_units_max);
     while (try parts.next(self.gpa)) |part| {
         defer self.gpa.free(part);
@@ -290,28 +339,73 @@ fn sendHtml(self: *Mirror, chat: anytype, text: []const u8) !void {
     }
 }
 
-fn summary(self: *Mirror, turn: *const Turn, end: *const End) ![]u8 {
+fn summary(self: *Mirror, turn: *const Turn, end: *const End) error{OutOfMemory}![]u8 {
     var text: std.Io.Writer.Allocating = .init(self.gpa);
     defer text.deinit();
-    switch (end.outcome) {
-        .completed => {},
-        .canceled => try text.writer.print("Canceled{s}", .{ui.paint.separator}),
-        .failed => try text.writer.print("Failed{s}", .{ui.paint.separator}),
-    }
-    try writeCalls(&text.writer, turn.activity.calls);
-    var buffer: [24]u8 = undefined;
-    try text.writer.print("{s}Time: {s}{s}", .{
-        ui.paint.separator,
-        ai.format.duration(&buffer, end.now_ms - turn.started_ms),
-        ui.paint.separator,
-    });
-    try ui.status.writeNumbers(&text.writer, end.status);
+    writeSummary(&text.writer, turn, end) catch return error.OutOfMemory;
     const role: html.Role = if (end.outcome == .failed) .failure else .information;
-    return html.wrapAlloc(self.gpa, role, text.written());
+    return html.noticeAlloc(self.gpa, role, text.written());
 }
 
-fn writeCalls(out: *std.Io.Writer, calls: usize) !void {
-    try out.print("Tools: {d} {s}", .{ calls, if (calls == 1) "call" else "calls" });
+fn writeSummary(out: *std.Io.Writer, turn: *const Turn, end: *const End) std.Io.Writer.Error!void {
+    switch (end.outcome) {
+        .completed => {},
+        .canceled => try out.print("Canceled{s}", .{ui.paint.separator}),
+        .failed => try out.print("Failed{s}", .{ui.paint.separator}),
+    }
+    try writeCallCount(out, turn.activity.call_count);
+    var buffer: [24]u8 = undefined;
+    try out.print("{s}Time: {s}{s}", .{
+        ui.paint.separator,
+        tools.format.duration(&buffer, end.now_ms - turn.started_ms),
+        ui.paint.separator,
+    });
+    try ui.status.writeNumbers(out, end.status);
+}
+
+fn writeCallCount(out: *std.Io.Writer, count: usize) !void {
+    try out.print("Tools: {d} call{s}", .{ count, core.text.pluralSuffix(count) });
+}
+
+test "a step sends each committed answer, event, and note once, and skips the rest" {
+    const gpa = std.testing.allocator;
+    var recorder: Recorder = .{ .gpa = gpa };
+    defer recorder.deinit();
+    const chat = recorder.chat();
+    var blocks: Blocks = .{ .gpa = gpa };
+    defer blocks.deinit();
+    try blocks.append(&.{ .intro = "legend" });
+    try blocks.append(&.{ .user = "typed" });
+    try blocks.append(&.{ .thinking = "weigh it" });
+    try blocks.append(&.{ .model = "The **answer** & more.\n\n" });
+    try blocks.append(&.{ .tool_result = .{ .text = "Tool: bash" } });
+    try blocks.append(&.{ .event = .{ .text = "Drinky changed the model." } });
+    try blocks.append(&.{ .event = .{
+        .text = "Telegram rejected a message.",
+        .severity = .failure,
+        .mirrored = false,
+    } });
+    try blocks.append(&.{ .user_note = "Skill: zig-style · File: <skill>" });
+    var mirror = Mirror.init(gpa);
+
+    try mirror.sync(chat, &blocks.idle());
+    try std.testing.expectEqual(@as(usize, 3), recorder.sends.items.len);
+    try std.testing.expectEqualStrings(
+        "The <b>answer</b> &amp; more.",
+        recorder.sends.items[0].text,
+    );
+    try std.testing.expectEqualStrings("HTML", recorder.sends.items[0].options.parse_mode.?);
+    try std.testing.expect(recorder.sends.items[0].options.disable_notification);
+    try std.testing.expectEqualStrings(
+        "ℹ Drinky changed the model.",
+        recorder.sends.items[1].text,
+    );
+    try std.testing.expectEqualStrings(
+        "→ Skill: zig-style · File: &lt;skill&gt;",
+        recorder.sends.items[2].text,
+    );
+    try mirror.sync(chat, &blocks.idle());
+    try std.testing.expectEqual(@as(usize, 3), recorder.sends.items.len);
 }
 
 const Recorder = struct {
@@ -321,6 +415,12 @@ const Recorder = struct {
     deletions: std.ArrayList(Attachment.Handle) = .empty,
     handle_next: Attachment.Handle = 1,
     drop_tracked: bool = false,
+    send_hook: ?Hook = null,
+
+    const Hook = struct {
+        context: *anyopaque,
+        run: *const fn (context: *anyopaque) Chat.Error!void,
+    };
 
     const Sent = struct {
         text: []u8,
@@ -334,6 +434,14 @@ const Recorder = struct {
         text: []u8,
         parse_mode: ?[]const u8,
         markup: ?[]u8,
+    };
+
+    const vtable: Chat.VTable = .{
+        .listens = listens,
+        .send = send,
+        .sendTracked = sendTracked,
+        .edit = edit,
+        .delete = delete,
     };
 
     fn deinit(self: *Recorder) void {
@@ -350,19 +458,30 @@ const Recorder = struct {
         self.deletions.deinit(self.gpa);
     }
 
-    fn listens(_: *const Recorder) bool {
+    fn chat(self: *Recorder) Chat {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn listens(_: *anyopaque) bool {
         return true;
     }
 
-    fn send(self: *Recorder, text: []const u8, options: *const Client.SendOptions) !void {
+    fn send(
+        ptr: *anyopaque,
+        text: []const u8,
+        options: *const Client.SendOptions,
+    ) Chat.Error!void {
+        const self: *Recorder = @ptrCast(@alignCast(ptr));
         try self.record(text, options, null);
+        if (self.send_hook) |hook| try hook.run(hook.context);
     }
 
     fn sendTracked(
-        self: *Recorder,
+        ptr: *anyopaque,
         text: []const u8,
         options: *const Client.SendOptions,
-    ) !?Attachment.Handle {
+    ) Chat.Error!?Attachment.Handle {
+        const self: *Recorder = @ptrCast(@alignCast(ptr));
         if (self.drop_tracked) return null;
         const handle = self.handle_next;
         self.handle_next += 1;
@@ -375,7 +494,7 @@ const Recorder = struct {
         text: []const u8,
         options: *const Client.SendOptions,
         handle: ?Attachment.Handle,
-    ) !void {
+    ) Chat.Error!void {
         const text_copy = try self.gpa.dupe(u8, text);
         errdefer self.gpa.free(text_copy);
         const markup = try self.copyMarkup(options.markup);
@@ -390,16 +509,18 @@ const Recorder = struct {
         });
     }
 
-    fn delete(self: *Recorder, handle: Attachment.Handle) !void {
+    fn delete(ptr: *anyopaque, handle: Attachment.Handle) Chat.Error!void {
+        const self: *Recorder = @ptrCast(@alignCast(ptr));
         try self.deletions.append(self.gpa, handle);
     }
 
     fn edit(
-        self: *Recorder,
+        ptr: *anyopaque,
         handle: Attachment.Handle,
         text: []const u8,
         options: *const Client.EditOptions,
-    ) !void {
+    ) Chat.Error!void {
+        const self: *Recorder = @ptrCast(@alignCast(ptr));
         const text_copy = try self.gpa.dupe(u8, text);
         errdefer self.gpa.free(text_copy);
         const markup_copy = try self.copyMarkup(options.markup);
@@ -412,7 +533,7 @@ const Recorder = struct {
         });
     }
 
-    fn copyMarkup(self: *Recorder, markup: ?[]const u8) !?[]u8 {
+    fn copyMarkup(self: *Recorder, markup: ?[]const u8) Chat.Error!?[]u8 {
         return try self.gpa.dupe(u8, markup orelse return null);
     }
 
@@ -432,24 +553,19 @@ fn activityKeyboard(comptime serial: []const u8) []const u8 {
 
 const Blocks = struct {
     gpa: std.mem.Allocator,
-    items: std.ArrayList(ui.block.Entry) = .empty,
+    items: std.ArrayList(ui.Block) = .empty,
 
     fn deinit(self: *Blocks) void {
-        for (self.items.items) |*entry| entry.deinit(self.gpa);
+        for (self.items.items) |*block| block.deinit(self.gpa);
         self.items.deinit(self.gpa);
     }
 
-    fn append(
-        self: *Blocks,
-        kind: ui.block.Entry.Kind,
-        options: ui.block.Entry.Options,
-        text: []const u8,
-    ) !void {
-        try self.items.append(self.gpa, try ui.block.Entry.init(self.gpa, kind, options, text));
+    fn append(self: *Blocks, payload: *const ui.Block.Source) !void {
+        try self.items.append(self.gpa, try ui.Block.init(self.gpa, payload));
     }
 
     fn truncate(self: *Blocks, count: usize) void {
-        for (self.items.items[count..]) |*entry| entry.deinit(self.gpa);
+        for (self.items.items[count..]) |*block| block.deinit(self.gpa);
         self.items.shrinkRetainingCapacity(count);
     }
 
@@ -475,455 +591,446 @@ const test_status: ui.status.Info = .{
     .context_window = 100_000,
     .model = "claude-opus-4-8",
     .effort = "high",
-    .account = .anthropic_plan,
+    .account = "anthropic-plan",
     .quota = null,
     .quota_age_ms = 0,
     .credits = null,
     .turn_active = false,
 };
 
-test "a step sends each committed answer, event, and note once, and skips the rest" {
-    const gpa = std.testing.allocator;
-    var chat: Recorder = .{ .gpa = gpa };
-    defer chat.deinit();
-    var blocks: Blocks = .{ .gpa = gpa };
-    defer blocks.deinit();
-    try blocks.append(.intro, .{}, "legend");
-    try blocks.append(.user, .{}, "typed");
-    try blocks.append(.thinking, .{}, "weigh it");
-    try blocks.append(.model, .{}, "The **answer** & more.\n\n");
-    try blocks.append(.tool_result, .{}, "Tool: bash");
-    try blocks.append(.event, .{}, "Drinky changed the model.");
-    try blocks.append(.event, .{ .mirrored = false, .is_error = true }, "Telegram rejected a message.");
-    try blocks.append(.user_note, .{}, "Skill: zig-style · File: <skill>");
-    var mirror = Mirror.init(gpa);
-
-    try mirror.sync(&chat, &blocks.idle());
-    try std.testing.expectEqual(@as(usize, 3), chat.sends.items.len);
-    try std.testing.expectEqualStrings("The <b>answer</b> &amp; more.", chat.sends.items[0].text);
-    try std.testing.expectEqualStrings("HTML", chat.sends.items[0].options.parse_mode.?);
-    try std.testing.expect(chat.sends.items[0].options.disable_notification);
-    try std.testing.expectEqualStrings(
-        "ℹ Drinky changed the model.",
-        chat.sends.items[1].text,
-    );
-    try std.testing.expectEqualStrings(
-        "→ Skill: zig-style · File: &lt;skill&gt;",
-        chat.sends.items[2].text,
-    );
-    try mirror.sync(&chat, &blocks.idle());
-    try std.testing.expectEqual(@as(usize, 3), chat.sends.items.len);
-}
-
 test "a mirrored warning event opens with the warning symbol" {
     const gpa = std.testing.allocator;
-    var chat: Recorder = .{ .gpa = gpa };
-    defer chat.deinit();
+    var recorder: Recorder = .{ .gpa = gpa };
+    defer recorder.deinit();
+    const chat = recorder.chat();
     var blocks: Blocks = .{ .gpa = gpa };
     defer blocks.deinit();
-    try blocks.append(.event, .{ .is_warning = true }, "The account offers no model now.");
+    try blocks.append(&.{ .event = .{
+        .text = "The account offers no model now.",
+        .severity = .warning,
+    } });
     var mirror = Mirror.init(gpa);
 
-    try mirror.sync(&chat, &blocks.idle());
-    try std.testing.expectEqual(@as(usize, 1), chat.sends.items.len);
+    try mirror.sync(chat, &blocks.idle());
+    try std.testing.expectEqual(@as(usize, 1), recorder.sends.items.len);
     try std.testing.expectEqualStrings(
         "⚠ The account offers no model now.",
-        chat.sends.items[0].text,
+        recorder.sends.items[0].text,
     );
 }
 
 test "a block above the committed frontier waits, and a rewound tail costs nothing" {
     const gpa = std.testing.allocator;
-    var chat: Recorder = .{ .gpa = gpa };
-    defer chat.deinit();
+    var recorder: Recorder = .{ .gpa = gpa };
+    defer recorder.deinit();
+    const chat = recorder.chat();
     var blocks: Blocks = .{ .gpa = gpa };
     defer blocks.deinit();
-    try blocks.append(.user, .{}, "prompt");
-    try blocks.append(.model, .{}, "partial");
+    try blocks.append(&.{ .user = "prompt" });
+    try blocks.append(&.{ .model = "partial" });
     var mirror = Mirror.init(gpa);
-    const tail: View.Tail = .{ .streaming = .model, .tool = null, .calls = 0 };
+    const tail: View.Tail = .{ .streaming = .model, .tool = null, .call_count = 0 };
 
-    try mirror.sync(&chat, &blocks.live(1, tail));
-    try std.testing.expectEqual(@as(usize, 0), chat.sends.items.len);
+    try mirror.sync(chat, &blocks.live(1, tail));
+    try std.testing.expectEqual(@as(usize, 0), recorder.sends.items.len);
     blocks.truncate(1);
-    try blocks.append(.event, .{ .survives_rewind = true }, "Drinky started retry attempt 1.");
-    try blocks.append(.model, .{}, "whole");
-    try mirror.sync(&chat, &blocks.live(2, tail));
-    try std.testing.expectEqual(@as(usize, 1), chat.sends.items.len);
+    try blocks.append(&.{ .event = .{
+        .text = "Drinky started retry attempt 1.",
+        .survives_rewind = true,
+    } });
+    try blocks.append(&.{ .model = "whole" });
+    try mirror.sync(chat, &blocks.live(2, tail));
+    try std.testing.expectEqual(@as(usize, 1), recorder.sends.items.len);
     try std.testing.expectEqualStrings(
         "ℹ Drinky started retry attempt 1.",
-        chat.sends.items[0].text,
+        recorder.sends.items[0].text,
     );
-    try mirror.sync(&chat, &blocks.live(3, tail));
-    try std.testing.expectEqualStrings("whole", chat.lastSend().text);
+    try mirror.sync(chat, &blocks.live(3, tail));
+    try std.testing.expectEqualStrings("whole", recorder.lastSend().text);
 }
 
 test "the activity message edits on a state change alone, and the summary ends it" {
     const gpa = std.testing.allocator;
-    var chat: Recorder = .{ .gpa = gpa };
-    defer chat.deinit();
+    var recorder: Recorder = .{ .gpa = gpa };
+    defer recorder.deinit();
+    const chat = recorder.chat();
     var blocks: Blocks = .{ .gpa = gpa };
     defer blocks.deinit();
-    try blocks.append(.user, .{}, "prompt");
+    try blocks.append(&.{ .user = "prompt" });
     var mirror = Mirror.init(gpa);
 
-    try mirror.beginTurn(&chat, 1_000);
-    try std.testing.expectEqualStrings("ℹ Thinking", chat.sends.items[0].text);
-    try std.testing.expectEqualStrings(html.parse_mode, chat.sends.items[0].options.parse_mode.?);
-    try std.testing.expect(chat.sends.items[0].handle != null);
-    try std.testing.expect(chat.sends.items[0].options.disable_notification);
-    try std.testing.expectEqualStrings(activityKeyboard("1"), chat.sends.items[0].markup.?);
-    const handle = chat.sends.items[0].handle.?;
+    try mirror.beginTurn(chat, 1_000);
+    try std.testing.expectEqualStrings("ℹ Thinking", recorder.sends.items[0].text);
+    try std.testing.expectEqualStrings(
+        html.parse_mode,
+        recorder.sends.items[0].options.parse_mode.?,
+    );
+    try std.testing.expect(recorder.sends.items[0].handle != null);
+    try std.testing.expect(recorder.sends.items[0].options.disable_notification);
+    try std.testing.expectEqualStrings(activityKeyboard("1"), recorder.sends.items[0].markup.?);
+    const handle = recorder.sends.items[0].handle.?;
 
-    try mirror.sync(&chat, &blocks.live(1, .{ .streaming = null, .tool = null, .calls = 0 }));
-    try std.testing.expectEqual(@as(usize, 0), chat.edits.items.len);
-    try mirror.sync(&chat, &blocks.live(1, .{ .streaming = .model, .tool = null, .calls = 0 }));
-    try std.testing.expectEqualStrings("ℹ Writing", chat.lastEdit().text);
-    try std.testing.expectEqualStrings(html.parse_mode, chat.lastEdit().parse_mode.?);
-    try std.testing.expectEqual(handle, chat.lastEdit().handle);
-    try std.testing.expectEqualStrings(activityKeyboard("1"), chat.lastEdit().markup.?);
-    try mirror.sync(&chat, &blocks.live(1, .{ .streaming = null, .tool = "bash", .calls = 1 }));
-    try std.testing.expectEqualStrings("ℹ Running: bash · Tools: 1 call", chat.lastEdit().text);
-    try mirror.sync(&chat, &blocks.live(1, .{ .streaming = null, .tool = "bash", .calls = 1 }));
-    try std.testing.expectEqual(@as(usize, 2), chat.edits.items.len);
-    try mirror.sync(&chat, &blocks.live(1, .{ .streaming = .thinking, .tool = null, .calls = 2 }));
-    try std.testing.expectEqualStrings("ℹ Thinking · Tools: 2 calls", chat.lastEdit().text);
+    try mirror.sync(chat, &blocks.live(1, .{ .streaming = null, .tool = null, .call_count = 0 }));
+    try std.testing.expectEqual(@as(usize, 0), recorder.edits.items.len);
+    try mirror.sync(chat, &blocks.live(1, .{ .streaming = .model, .tool = null, .call_count = 0 }));
+    try std.testing.expectEqualStrings("ℹ Writing", recorder.lastEdit().text);
+    try std.testing.expectEqualStrings(html.parse_mode, recorder.lastEdit().parse_mode.?);
+    try std.testing.expectEqual(handle, recorder.lastEdit().handle);
+    try std.testing.expectEqualStrings(activityKeyboard("1"), recorder.lastEdit().markup.?);
+    try mirror.sync(chat, &blocks.live(1, .{ .streaming = null, .tool = "bash", .call_count = 1 }));
+    try std.testing.expectEqualStrings("ℹ Running: bash · Tools: 1 call", recorder.lastEdit().text);
+    try mirror.sync(chat, &blocks.live(1, .{ .streaming = null, .tool = "bash", .call_count = 1 }));
+    try std.testing.expectEqual(@as(usize, 2), recorder.edits.items.len);
+    try mirror.sync(
+        chat,
+        &blocks.live(1, .{ .streaming = .thinking, .tool = null, .call_count = 2 }),
+    );
+    try std.testing.expectEqualStrings("ℹ Thinking · Tools: 2 calls", recorder.lastEdit().text);
 
-    try blocks.append(.model, .{}, "first");
-    try blocks.append(.model, .{}, "last");
-    try mirror.endTurn(&chat, &blocks.idle(), &.{
+    try blocks.append(&.{ .model = "first" });
+    try blocks.append(&.{ .model = "last" });
+    try mirror.endTurn(chat, &blocks.idle(), &.{
         .outcome = .completed,
         .status = &test_status,
         .now_ms = 126_400,
     });
-    try std.testing.expectEqual(@as(usize, 4), chat.sends.items.len);
-    try std.testing.expect(chat.sends.items[1].options.disable_notification);
-    try std.testing.expectEqualStrings("last", chat.sends.items[2].text);
-    try std.testing.expect(chat.sends.items[2].options.disable_notification);
+    try std.testing.expectEqual(@as(usize, 4), recorder.sends.items.len);
+    try std.testing.expect(recorder.sends.items[1].options.disable_notification);
+    try std.testing.expectEqualStrings("last", recorder.sends.items[2].text);
+    try std.testing.expect(recorder.sends.items[2].options.disable_notification);
     try std.testing.expectEqualStrings(
         "ℹ Tools: 2 calls · Time: 2m 5s · Context: 45% · Cost: ~$0.42",
-        chat.lastSend().text,
+        recorder.lastSend().text,
     );
-    try std.testing.expect(!chat.lastSend().options.disable_notification);
-    try std.testing.expectEqualStrings(html.parse_mode, chat.lastSend().options.parse_mode.?);
-    try std.testing.expect(chat.lastSend().markup == null);
-    try std.testing.expectEqual(@as(usize, 1), chat.deletions.items.len);
-    try std.testing.expectEqual(handle, chat.deletions.items[0]);
-    try std.testing.expect(mirror.turn == null);
+    try std.testing.expect(!recorder.lastSend().options.disable_notification);
+    try std.testing.expectEqualStrings(html.parse_mode, recorder.lastSend().options.parse_mode.?);
+    try std.testing.expect(recorder.lastSend().markup == null);
+    try std.testing.expectEqual(@as(usize, 1), recorder.deletions.items.len);
+    try std.testing.expectEqual(handle, recorder.deletions.items[0]);
     try std.testing.expect(!mirror.namesTurn(1));
 }
 
 test "a tap names the running turn alone, and the next turn makes its serial stale" {
     const gpa = std.testing.allocator;
-    var chat: Recorder = .{ .gpa = gpa };
-    defer chat.deinit();
+    var recorder: Recorder = .{ .gpa = gpa };
+    defer recorder.deinit();
+    const chat = recorder.chat();
     var blocks: Blocks = .{ .gpa = gpa };
     defer blocks.deinit();
     var mirror = Mirror.init(gpa);
     try std.testing.expect(!mirror.namesTurn(1));
-    try mirror.beginTurn(&chat, 0);
+    try mirror.beginTurn(chat, 0);
 
     try std.testing.expect(!mirror.namesTurn(7));
     try std.testing.expect(mirror.namesTurn(1));
-    try mirror.sync(&chat, &blocks.live(0, .{ .streaming = .model, .tool = null, .calls = 0 }));
-    try std.testing.expectEqualStrings("ℹ Writing", chat.lastEdit().text);
-    try std.testing.expectEqualStrings(activityKeyboard("1"), chat.lastEdit().markup.?);
-    try std.testing.expectEqual(@as(usize, 1), chat.edits.items.len);
+    try mirror.sync(chat, &blocks.live(0, .{ .streaming = .model, .tool = null, .call_count = 0 }));
+    try std.testing.expectEqualStrings("ℹ Writing", recorder.lastEdit().text);
+    try std.testing.expectEqualStrings(activityKeyboard("1"), recorder.lastEdit().markup.?);
+    try std.testing.expectEqual(@as(usize, 1), recorder.edits.items.len);
 
-    try mirror.endTurn(&chat, &blocks.idle(), &.{ .outcome = .canceled, .status = &test_status, .now_ms = 0 });
-    try mirror.beginTurn(&chat, 0);
-    try std.testing.expectEqualStrings(activityKeyboard("2"), chat.lastSend().markup.?);
+    try mirror.endTurn(
+        chat,
+        &blocks.idle(),
+        &.{ .outcome = .canceled, .status = &test_status, .now_ms = 0 },
+    );
+    try mirror.beginTurn(chat, 0);
+    try std.testing.expectEqualStrings(activityKeyboard("2"), recorder.lastSend().markup.?);
     try std.testing.expect(!mirror.namesTurn(1));
     try std.testing.expect(mirror.namesTurn(2));
 }
 
 test "a seed moves the serials past the keyboards of an earlier process" {
     const gpa = std.testing.allocator;
-    var chat: Recorder = .{ .gpa = gpa };
-    defer chat.deinit();
+    var recorder: Recorder = .{ .gpa = gpa };
+    defer recorder.deinit();
+    const chat = recorder.chat();
     var blocks: Blocks = .{ .gpa = gpa };
     defer blocks.deinit();
     var mirror = Mirror.init(gpa);
 
     mirror.seedSerials(1_000);
-    try mirror.beginTurn(&chat, 0);
-    try std.testing.expectEqualStrings(activityKeyboard("1001"), chat.lastSend().markup.?);
+    try mirror.beginTurn(chat, 0);
+    try std.testing.expectEqualStrings(activityKeyboard("1001"), recorder.lastSend().markup.?);
     try std.testing.expect(!mirror.namesTurn(1));
     try std.testing.expect(mirror.namesTurn(1_001));
-    try mirror.endTurn(&chat, &blocks.idle(), &.{ .outcome = .canceled, .status = &test_status, .now_ms = 0 });
+    try mirror.endTurn(
+        chat,
+        &blocks.idle(),
+        &.{ .outcome = .canceled, .status = &test_status, .now_ms = 0 },
+    );
 
     mirror.seedSerials(std.math.maxInt(u64));
-    try mirror.beginTurn(&chat, 0);
-    try std.testing.expectEqualStrings(activityKeyboard("0"), chat.lastSend().markup.?);
+    try mirror.beginTurn(chat, 0);
+    try std.testing.expectEqualStrings(activityKeyboard("0"), recorder.lastSend().markup.?);
     try std.testing.expect(mirror.namesTurn(0));
 }
 
 test "a detach forgets the messages of the chat and keeps the turn" {
     const gpa = std.testing.allocator;
-    var chat: Recorder = .{ .gpa = gpa };
-    defer chat.deinit();
+    var recorder: Recorder = .{ .gpa = gpa };
+    defer recorder.deinit();
+    const chat = recorder.chat();
     var blocks: Blocks = .{ .gpa = gpa };
     defer blocks.deinit();
     var mirror = Mirror.init(gpa);
-    try mirror.beginTurn(&chat, 0);
-    const sends = chat.sends.items.len;
-    const edits = chat.edits.items.len;
+    try mirror.beginTurn(chat, 0);
+    const sends = recorder.sends.items.len;
+    const edits = recorder.edits.items.len;
 
-    mirror.detached();
-    try std.testing.expectEqual(edits, chat.edits.items.len);
-    try std.testing.expect(mirror.turn != null);
-    try std.testing.expect(mirror.turn.?.handle == null);
+    mirror.forgetActivity();
+    try std.testing.expectEqual(edits, recorder.edits.items.len);
     try std.testing.expect(mirror.namesTurn(1));
-    try mirror.open(&chat, &.{ .blocks = &.{}, .committed = 0, .tail = null });
-    try std.testing.expectEqual(sends + 1, chat.sends.items.len);
-    try std.testing.expectEqualStrings(activityKeyboard("1"), chat.lastSend().markup.?);
-    try std.testing.expectEqual(edits, chat.edits.items.len);
+    try mirror.open(chat, &.{ .blocks = &.{}, .committed = 0, .tail = null });
+    try std.testing.expectEqual(sends + 1, recorder.sends.items.len);
+    try std.testing.expectEqualStrings(activityKeyboard("1"), recorder.lastSend().markup.?);
+    try std.testing.expectEqual(edits, recorder.edits.items.len);
 }
 
 test "a canceled turn ends in silence, and a failed turn notifies its summary" {
     const gpa = std.testing.allocator;
-    var chat: Recorder = .{ .gpa = gpa };
-    defer chat.deinit();
+    var recorder: Recorder = .{ .gpa = gpa };
+    defer recorder.deinit();
+    const chat = recorder.chat();
     var blocks: Blocks = .{ .gpa = gpa };
     defer blocks.deinit();
     var mirror = Mirror.init(gpa);
 
-    try mirror.beginTurn(&chat, 0);
-    try blocks.append(.event, .{}, "You canceled the turn.");
-    try mirror.endTurn(&chat, &blocks.idle(), &.{ .outcome = .canceled, .status = &test_status, .now_ms = 500 });
-    try std.testing.expect(chat.lastSend().options.disable_notification);
+    try mirror.beginTurn(chat, 0);
+    try blocks.append(&.{ .event = .{ .text = "You canceled the turn." } });
+    try mirror.endTurn(
+        chat,
+        &blocks.idle(),
+        &.{ .outcome = .canceled, .status = &test_status, .now_ms = 500 },
+    );
+    try std.testing.expect(recorder.lastSend().options.disable_notification);
     try std.testing.expectEqualStrings(
         "ℹ Canceled · Tools: 0 calls · Time: 500ms · Context: 45% · Cost: ~$0.42",
-        chat.lastEdit().text,
+        recorder.lastEdit().text,
     );
-    try std.testing.expectEqual(@as(usize, 0), chat.deletions.items.len);
+    try std.testing.expectEqual(@as(usize, 0), recorder.deletions.items.len);
 
-    try mirror.beginTurn(&chat, 1_000);
-    try blocks.append(.event, .{ .is_error = true }, "The provider refused the request.");
-    const activity = chat.lastSend().handle.?;
-    try mirror.endTurn(&chat, &blocks.idle(), &.{ .outcome = .failed, .status = &test_status, .now_ms = 3_000 });
-    try std.testing.expectEqualStrings(
-        "⚠ The provider refused the request.",
-        chat.sends.items[chat.sends.items.len - 2].text,
+    try mirror.beginTurn(chat, 1_000);
+    try blocks.append(&.{ .event = .{
+        .text = "The provider refused the request.",
+        .severity = .failure,
+    } });
+    const activity = recorder.lastSend().handle.?;
+    try mirror.endTurn(
+        chat,
+        &blocks.idle(),
+        &.{ .outcome = .failed, .status = &test_status, .now_ms = 3_000 },
     );
-    try std.testing.expect(chat.sends.items[chat.sends.items.len - 2].options.disable_notification);
+    const failure = &recorder.sends.items[recorder.sends.items.len - 2];
+    try std.testing.expectEqualStrings("⚠ The provider refused the request.", failure.text);
+    try std.testing.expect(failure.options.disable_notification);
     try std.testing.expect(std.mem.startsWith(
         u8,
-        chat.lastSend().text,
+        recorder.lastSend().text,
         "⚠ Failed · Tools: 0 calls · Time: 2.0s",
     ));
-    try std.testing.expect(!chat.lastSend().options.disable_notification);
-    try std.testing.expectEqual(@as(usize, 1), chat.deletions.items.len);
-    try std.testing.expectEqual(activity, chat.deletions.items[0]);
+    try std.testing.expect(!recorder.lastSend().options.disable_notification);
+    try std.testing.expectEqual(@as(usize, 1), recorder.deletions.items.len);
+    try std.testing.expectEqual(activity, recorder.deletions.items[0]);
 }
 
 test "a completed turn notifies on its summary when the last answer already went out" {
     const gpa = std.testing.allocator;
-    var chat: Recorder = .{ .gpa = gpa };
-    defer chat.deinit();
+    var recorder: Recorder = .{ .gpa = gpa };
+    defer recorder.deinit();
+    const chat = recorder.chat();
     var blocks: Blocks = .{ .gpa = gpa };
     defer blocks.deinit();
     var mirror = Mirror.init(gpa);
 
-    try mirror.beginTurn(&chat, 0);
-    try blocks.append(.model, .{}, "answer");
-    try mirror.sync(&chat, &blocks.live(1, .{ .streaming = null, .tool = "bash", .calls = 1 }));
-    try std.testing.expectEqualStrings("answer", chat.lastSend().text);
-    try std.testing.expect(chat.lastSend().options.disable_notification);
-    const activity = chat.sends.items[0].handle.?;
+    try mirror.beginTurn(chat, 0);
+    try blocks.append(&.{ .model = "answer" });
+    try mirror.sync(chat, &blocks.live(1, .{ .streaming = null, .tool = "bash", .call_count = 1 }));
+    try std.testing.expectEqualStrings("answer", recorder.lastSend().text);
+    try std.testing.expect(recorder.lastSend().options.disable_notification);
+    const activity = recorder.sends.items[0].handle.?;
 
-    try mirror.endTurn(&chat, &blocks.idle(), &.{
+    try mirror.endTurn(chat, &blocks.idle(), &.{
         .outcome = .completed,
         .status = &test_status,
         .now_ms = 0,
     });
-    try std.testing.expectEqual(@as(usize, 3), chat.sends.items.len);
-    try std.testing.expect(!chat.lastSend().options.disable_notification);
-    try std.testing.expect(std.mem.startsWith(u8, chat.lastSend().text, "ℹ Tools: 1 call"));
-    try std.testing.expectEqual(@as(usize, 1), chat.deletions.items.len);
-    try std.testing.expectEqual(activity, chat.deletions.items[0]);
+    try std.testing.expectEqual(@as(usize, 3), recorder.sends.items.len);
+    try std.testing.expect(!recorder.lastSend().options.disable_notification);
+    try std.testing.expect(std.mem.startsWith(u8, recorder.lastSend().text, "ℹ Tools: 1 call"));
+    try std.testing.expectEqual(@as(usize, 1), recorder.deletions.items.len);
+    try std.testing.expectEqual(activity, recorder.deletions.items[0]);
 }
 
 test "a completed turn keeps the activity message when the summary cannot queue" {
     const gpa = std.testing.allocator;
-    var chat: Recorder = .{ .gpa = gpa };
-    defer chat.deinit();
+    var recorder: Recorder = .{ .gpa = gpa };
+    defer recorder.deinit();
+    const chat = recorder.chat();
     var blocks: Blocks = .{ .gpa = gpa };
     defer blocks.deinit();
     var mirror = Mirror.init(gpa);
 
-    try mirror.beginTurn(&chat, 0);
-    const activity = chat.sends.items[0].handle.?;
-    chat.drop_tracked = true;
-    try mirror.endTurn(&chat, &blocks.idle(), &.{
+    try mirror.beginTurn(chat, 0);
+    const activity = recorder.sends.items[0].handle.?;
+    recorder.drop_tracked = true;
+    try mirror.endTurn(chat, &blocks.idle(), &.{
         .outcome = .completed,
         .status = &test_status,
         .now_ms = 0,
     });
-    try std.testing.expectEqual(@as(usize, 1), chat.sends.items.len);
-    try std.testing.expectEqual(@as(usize, 0), chat.deletions.items.len);
-    try std.testing.expectEqual(activity, chat.sends.items[0].handle.?);
+    try std.testing.expectEqual(@as(usize, 1), recorder.sends.items.len);
+    try std.testing.expectEqual(@as(usize, 0), recorder.deletions.items.len);
+    try std.testing.expectEqual(activity, recorder.sends.items[0].handle.?);
 }
 
 test "an open starts at the committed frontier and gives a running turn its activity message" {
     const gpa = std.testing.allocator;
-    var chat: Recorder = .{ .gpa = gpa };
-    defer chat.deinit();
+    var recorder: Recorder = .{ .gpa = gpa };
+    defer recorder.deinit();
+    const chat = recorder.chat();
     var blocks: Blocks = .{ .gpa = gpa };
     defer blocks.deinit();
-    try blocks.append(.model, .{}, "before the attach");
-    try blocks.append(.event, .{ .mirrored = false }, "You attached @drinky_bot.");
+    try blocks.append(&.{ .model = "before the attach" });
+    try blocks.append(&.{ .event = .{ .text = "You attached @drinky_bot.", .mirrored = false } });
     var mirror = Mirror.init(gpa);
 
-    try mirror.open(&chat, &blocks.idle());
-    try mirror.sync(&chat, &blocks.idle());
-    try std.testing.expectEqual(@as(usize, 0), chat.sends.items.len);
+    try mirror.open(chat, &blocks.idle());
+    try mirror.sync(chat, &blocks.idle());
+    try std.testing.expectEqual(@as(usize, 0), recorder.sends.items.len);
 
-    try mirror.beginTurn(&chat, 0);
-    try std.testing.expectEqual(@as(usize, 1), chat.sends.items.len);
-    try mirror.open(&chat, &blocks.live(2, .{ .streaming = null, .tool = "read", .calls = 3 }));
+    try mirror.beginTurn(chat, 0);
+    try std.testing.expectEqual(@as(usize, 1), recorder.sends.items.len);
+    try mirror.open(chat, &blocks.live(2, .{ .streaming = null, .tool = "read", .call_count = 3 }));
     try std.testing.expectEqualStrings(
         "ℹ Running: read · Tools: 3 calls",
-        chat.lastSend().text,
+        recorder.lastSend().text,
     );
-    try std.testing.expectEqual(@as(?Attachment.Handle, 2), chat.lastSend().handle);
+    try std.testing.expectEqual(@as(?Attachment.Handle, 2), recorder.lastSend().handle);
 }
 
-test "the cursor follows a cleared transcript and moves back over dropped blocks" {
+test "the cursor follows a cleared transcript" {
     const gpa = std.testing.allocator;
-    var chat: Recorder = .{ .gpa = gpa };
-    defer chat.deinit();
+    var recorder: Recorder = .{ .gpa = gpa };
+    defer recorder.deinit();
+    const chat = recorder.chat();
     var blocks: Blocks = .{ .gpa = gpa };
     defer blocks.deinit();
-    try blocks.append(.thinking, .{ .account = .anthropic_plan }, "weigh it");
-    try blocks.append(.model, .{}, "answer");
+    try blocks.append(&.{ .thinking = "weigh it" });
+    try blocks.append(&.{ .model = "answer" });
     var mirror = Mirror.init(gpa);
-    try mirror.sync(&chat, &blocks.idle());
-    try std.testing.expectEqual(@as(usize, 1), chat.sends.items.len);
+    try mirror.sync(chat, &blocks.idle());
+    try std.testing.expectEqual(@as(usize, 1), recorder.sends.items.len);
 
-    blocks.truncate(0);
-    try blocks.append(.model, .{}, "answer");
-    try blocks.append(.event, .{}, "Drinky replaced the credential.");
-    mirror.retreat(1);
-    try mirror.sync(&chat, &blocks.idle());
-    try std.testing.expectEqual(@as(usize, 2), chat.sends.items.len);
+    try blocks.append(&.{ .event = .{ .text = "Drinky replaced the credential." } });
+    try mirror.sync(chat, &blocks.idle());
+    try std.testing.expectEqual(@as(usize, 2), recorder.sends.items.len);
     try std.testing.expectEqualStrings(
         "ℹ Drinky replaced the credential.",
-        chat.lastSend().text,
+        recorder.lastSend().text,
     );
 
     blocks.truncate(0);
-    try blocks.append(.intro, .{}, "legend");
-    try blocks.append(.event, .{}, "fresh");
-    mirror.restart();
-    try mirror.sync(&chat, &blocks.idle());
-    try std.testing.expectEqual(@as(usize, 3), chat.sends.items.len);
-    try std.testing.expectEqualStrings("ℹ fresh", chat.lastSend().text);
+    try blocks.append(&.{ .intro = "legend" });
+    try blocks.append(&.{ .event = .{ .text = "fresh" } });
+    mirror.resetCursor();
+    try mirror.sync(chat, &blocks.idle());
+    try std.testing.expectEqual(@as(usize, 3), recorder.sends.items.len);
+    try std.testing.expectEqualStrings("ℹ fresh", recorder.lastSend().text);
 }
 
-const Reporter = struct {
-    blocks: *Blocks,
-    sends: usize = 0,
-
-    fn listens(_: *const Reporter) bool {
-        return true;
-    }
-
-    fn send(self: *Reporter, text: []const u8, options: *const Client.SendOptions) !void {
-        _ = text;
-        _ = options;
-        self.sends += 1;
-        try self.blocks.append(.event, .{ .mirrored = false }, "Drinky dropped a message.");
-    }
-
-    fn sendTracked(
-        _: *Reporter,
-        _: []const u8,
-        _: *const Client.SendOptions,
-    ) !?Attachment.Handle {
-        return null;
-    }
-
-    fn edit(_: *Reporter, _: Attachment.Handle, _: []const u8, _: *const Client.EditOptions) !void {}
-};
+fn reportDrop(context: *anyopaque) Chat.Error!void {
+    const blocks: *Blocks = @ptrCast(@alignCast(context));
+    try blocks.append(&.{ .event = .{ .text = "Drinky dropped a message.", .mirrored = false } });
+}
 
 test "a send that reports into the transcript cannot move the blocks under the flush" {
     const gpa = std.testing.allocator;
     var blocks: Blocks = .{ .gpa = gpa };
     defer blocks.deinit();
-    try blocks.append(.model, .{}, "one");
-    try blocks.append(.model, .{}, "two");
-    try blocks.append(.model, .{}, "three");
+    try blocks.append(&.{ .model = "one" });
+    try blocks.append(&.{ .model = "two" });
+    try blocks.append(&.{ .model = "three" });
     blocks.compact();
-    var chat: Reporter = .{ .blocks = &blocks };
+    var recorder: Recorder = .{
+        .gpa = gpa,
+        .drop_tracked = true,
+        .send_hook = .{ .context = &blocks, .run = reportDrop },
+    };
+    defer recorder.deinit();
     var mirror = Mirror.init(gpa);
 
     const view = blocks.idle();
-    try mirror.sync(&chat, &view);
-    try std.testing.expectEqual(@as(usize, 3), chat.sends);
+    try mirror.sync(recorder.chat(), &view);
+    try std.testing.expectEqual(@as(usize, 3), recorder.sends.items.len);
     try std.testing.expectEqual(@as(usize, 6), blocks.items.items.len);
-    try mirror.sync(&chat, &blocks.idle());
-    try std.testing.expectEqual(@as(usize, 3), chat.sends);
+    try mirror.sync(recorder.chat(), &blocks.idle());
+    try std.testing.expectEqual(@as(usize, 3), recorder.sends.items.len);
 }
 
 test "an answer waits for a tool run, an event, or the turn end before it goes out" {
     const gpa = std.testing.allocator;
-    var chat: Recorder = .{ .gpa = gpa };
-    defer chat.deinit();
+    var recorder: Recorder = .{ .gpa = gpa };
+    defer recorder.deinit();
+    const chat = recorder.chat();
     var blocks: Blocks = .{ .gpa = gpa };
     defer blocks.deinit();
     var mirror = Mirror.init(gpa);
 
-    try mirror.beginTurn(&chat, 0);
-    try blocks.append(.model, .{}, "first");
-    try mirror.sync(&chat, &blocks.live(1, .{ .streaming = .model, .tool = null, .calls = 0 }));
-    try std.testing.expectEqual(@as(usize, 1), chat.sends.items.len);
+    try mirror.beginTurn(chat, 0);
+    try blocks.append(&.{ .model = "first" });
+    try mirror.sync(chat, &blocks.live(1, .{ .streaming = .model, .tool = null, .call_count = 0 }));
+    try std.testing.expectEqual(@as(usize, 1), recorder.sends.items.len);
 
-    try mirror.sync(&chat, &blocks.live(1, .{ .streaming = null, .tool = "bash", .calls = 1 }));
-    try std.testing.expectEqual(@as(usize, 2), chat.sends.items.len);
-    try std.testing.expectEqualStrings("first", chat.sends.items[1].text);
-    try std.testing.expect(chat.sends.items[1].markup == null);
+    try mirror.sync(chat, &blocks.live(1, .{ .streaming = null, .tool = "bash", .call_count = 1 }));
+    try std.testing.expectEqual(@as(usize, 2), recorder.sends.items.len);
+    try std.testing.expectEqualStrings("first", recorder.sends.items[1].text);
+    try std.testing.expect(recorder.sends.items[1].markup == null);
 
-    try blocks.append(.model, .{}, "second");
-    try mirror.sync(&chat, &blocks.live(2, .{ .streaming = .model, .tool = null, .calls = 1 }));
-    try std.testing.expectEqual(@as(usize, 2), chat.sends.items.len);
-    try blocks.append(.event, .{}, "Drinky changed the model.");
-    try mirror.sync(&chat, &blocks.live(3, .{ .streaming = null, .tool = null, .calls = 1 }));
-    try std.testing.expectEqual(@as(usize, 4), chat.sends.items.len);
-    try std.testing.expectEqualStrings("second", chat.sends.items[2].text);
-    try std.testing.expectEqualStrings("ℹ Drinky changed the model.", chat.sends.items[3].text);
+    try blocks.append(&.{ .model = "second" });
+    try mirror.sync(chat, &blocks.live(2, .{ .streaming = .model, .tool = null, .call_count = 1 }));
+    try std.testing.expectEqual(@as(usize, 2), recorder.sends.items.len);
+    try blocks.append(&.{ .event = .{ .text = "Drinky changed the model." } });
+    try mirror.sync(chat, &blocks.live(3, .{ .streaming = null, .tool = null, .call_count = 1 }));
+    try std.testing.expectEqual(@as(usize, 4), recorder.sends.items.len);
+    try std.testing.expectEqualStrings("second", recorder.sends.items[2].text);
+    try std.testing.expectEqualStrings("ℹ Drinky changed the model.", recorder.sends.items[3].text);
 
-    try blocks.append(.model, .{}, "last");
-    try mirror.endTurn(&chat, &blocks.idle(), &.{
+    try blocks.append(&.{ .model = "last" });
+    try mirror.endTurn(chat, &blocks.idle(), &.{
         .outcome = .completed,
         .status = &test_status,
         .now_ms = 0,
     });
-    try std.testing.expectEqual(@as(usize, 6), chat.sends.items.len);
-    try std.testing.expectEqualStrings("last", chat.sends.items[4].text);
-    try std.testing.expect(chat.sends.items[4].markup == null);
-    try std.testing.expect(chat.lastSend().markup == null);
-    try std.testing.expect(!chat.lastSend().options.disable_notification);
+    try std.testing.expectEqual(@as(usize, 6), recorder.sends.items.len);
+    try std.testing.expectEqualStrings("last", recorder.sends.items[4].text);
+    try std.testing.expect(recorder.sends.items[4].markup == null);
+    try std.testing.expect(recorder.lastSend().markup == null);
+    try std.testing.expect(!recorder.lastSend().options.disable_notification);
 }
 
 test "a long answer splits into several messages" {
     const gpa = std.testing.allocator;
-    var chat: Recorder = .{ .gpa = gpa };
-    defer chat.deinit();
+    var recorder: Recorder = .{ .gpa = gpa };
+    defer recorder.deinit();
+    const chat = recorder.chat();
     var blocks: Blocks = .{ .gpa = gpa };
     defer blocks.deinit();
     const line = "x" ** 100 ++ "\n";
-    try blocks.append(.model, .{}, line ** 50);
+    try blocks.append(&.{ .model = line ** 50 });
     var mirror = Mirror.init(gpa);
-    try mirror.beginTurn(&chat, 0);
+    try mirror.beginTurn(chat, 0);
 
-    try mirror.endTurn(&chat, &blocks.idle(), &.{ .outcome = .completed, .status = &test_status, .now_ms = 0 });
-    try std.testing.expectEqual(@as(usize, 4), chat.sends.items.len);
-    try std.testing.expect(chat.sends.items[1].text.len <= html.message_units_max);
-    try std.testing.expect(chat.sends.items[1].options.disable_notification);
-    try std.testing.expect(chat.sends.items[2].options.disable_notification);
-    try std.testing.expect(!chat.lastSend().options.disable_notification);
-    try std.testing.expect(chat.sends.items[1].markup == null);
-    try std.testing.expect(chat.sends.items[2].markup == null);
-    try std.testing.expect(chat.lastSend().markup == null);
+    try mirror.endTurn(
+        chat,
+        &blocks.idle(),
+        &.{ .outcome = .completed, .status = &test_status, .now_ms = 0 },
+    );
+    try std.testing.expectEqual(@as(usize, 4), recorder.sends.items.len);
+    try std.testing.expect(recorder.sends.items[1].text.len <= html.message_units_max);
+    try std.testing.expect(recorder.sends.items[1].options.disable_notification);
+    try std.testing.expect(recorder.sends.items[2].options.disable_notification);
+    try std.testing.expect(!recorder.lastSend().options.disable_notification);
+    try std.testing.expect(recorder.sends.items[1].markup == null);
+    try std.testing.expect(recorder.sends.items[2].markup == null);
+    try std.testing.expect(recorder.lastSend().markup == null);
 }

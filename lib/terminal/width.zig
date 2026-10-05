@@ -2,32 +2,6 @@ const std = @import("std");
 
 const grapheme = @import("grapheme.zig");
 
-pub fn ofText(text: []const u8) usize {
-    return fittedWidth(text, std.math.maxInt(usize));
-}
-
-pub fn truncate(text: []const u8, columns_max: usize) []const u8 {
-    var columns: usize = 0;
-    var index: usize = 0;
-    while (index < text.len) {
-        const unit = displayUnit(text[index..]);
-        const unit_columns = fittedColumns(&unit, columns_max);
-        if (unit.kind == .line_break or (unit.columns > 0 and unit_columns == 0) or
-            columns + unit_columns > columns_max) break;
-        columns += unit_columns;
-        index += unit.bytes;
-    }
-    return text[0..index];
-}
-
-pub fn writeText(writer: *std.Io.Writer, text: []const u8) !usize {
-    return writeCanonical(writer, text, std.math.maxInt(usize));
-}
-
-pub fn writeFitted(writer: *std.Io.Writer, text: []const u8, columns_max: usize) !usize {
-    return writeCanonical(writer, text, columns_max);
-}
-
 pub const Wrapper = struct {
     text: []const u8,
     columns_max: usize,
@@ -72,6 +46,69 @@ pub const Wrapper = struct {
     }
 };
 
+const Caret = struct {
+    row: usize,
+    column: usize,
+
+    const Options = struct { offset: usize, columns_max: usize };
+};
+
+const Word = struct { bytes: usize, columns: usize, blank_columns: usize };
+
+const UnitKind = enum { text, tab, replacement, line_break };
+
+const DisplayUnit = struct {
+    bytes: usize,
+    columns: usize,
+    kind: UnitKind,
+};
+
+pub const grapheme_boundary = "\u{200B}";
+
+const replacement = grapheme_boundary ++ "�" ++ grapheme_boundary;
+
+pub fn ofText(text: []const u8) usize {
+    return fittedWidth(text, std.math.maxInt(usize));
+}
+
+pub fn truncate(text: []const u8, columns_max: usize) []const u8 {
+    var columns: usize = 0;
+    var index: usize = 0;
+    while (index < text.len) {
+        const unit = displayUnit(text[index..]);
+        const unit_columns = fittedColumns(&unit, columns_max);
+        if (unit.kind == .line_break or (unit.columns > 0 and unit_columns == 0) or
+            columns + unit_columns > columns_max) break;
+        columns += unit_columns;
+        index += unit.bytes;
+    }
+    return text[0..index];
+}
+
+pub fn writeFitted(writer: *std.Io.Writer, text: []const u8, columns_max: usize) !usize {
+    var columns: usize = 0;
+    var index: usize = 0;
+    while (index < text.len) {
+        const unit = displayUnit(text[index..]);
+        const columns_available = columns_max -| columns;
+        const unit_columns = fittedColumns(&unit, columns_available);
+        switch (unit.kind) {
+            .text => if (unit.columns == 0 or unit.columns <= columns_available) {
+                try writer.writeAll(text[index..][0..unit.bytes]);
+            } else if (unit_columns > 0) {
+                try writer.writeAll(replacement);
+            },
+            .tab => if (unit_columns > 0)
+                try writer.writeAll(grapheme_boundary ++ " " ++ grapheme_boundary),
+            .replacement => if (unit_columns > 0) try writer.writeAll(replacement),
+            .line_break => try writer.writeAll(grapheme_boundary),
+        }
+        columns += unit_columns;
+        index += unit.bytes;
+    }
+    return columns;
+}
+
 pub fn wrapper(text: []const u8, columns_max: usize) Wrapper {
     return .{ .text = text, .columns_max = columns_max, .line_start = 0, .done = false };
 }
@@ -87,29 +124,22 @@ pub fn rows(text: []const u8, columns_max: usize) usize {
     return count;
 }
 
-pub const Caret = struct {
-    rows_before: usize,
-    column: usize,
-
-    pub const Options = struct { offset: usize, columns_max: usize };
-};
-
 pub fn caret(text: []const u8, options: Caret.Options) Caret {
     const columns_max = options.columns_max;
     const target = @min(options.offset, text.len);
     var iterator = wrapper(text, columns_max);
-    var result: Caret = .{ .rows_before = 0, .column = 0 };
+    var result: Caret = .{ .row = 0, .column = 0 };
     var row: usize = 0;
     while (iterator.nextSpan()) |span| : (row += 1) {
         if (span.start > target) break;
         const line = text[span.start..@min(span.end, target)];
         result = .{
-            .rows_before = row,
+            .row = row,
             .column = @min(fittedWidth(line, columns_max), columns_max),
         };
     }
     if (columns_max != 0 and result.column == columns_max) {
-        result.rows_before += 1;
+        result.row += 1;
         result.column = 0;
     }
     return result;
@@ -130,8 +160,6 @@ pub fn caretEnd(text: []const u8, span: Wrapper.Span, columns_max: usize) usize 
     }
     return result;
 }
-
-pub const Word = struct { bytes: usize, columns: usize, blank_columns: usize };
 
 pub fn nextWord(text: []const u8, columns_max: usize) Word {
     var result: Word = .{ .bytes = 0, .columns = 0, .blank_columns = 0 };
@@ -176,22 +204,11 @@ pub fn boundaryAtOrAfter(text: []const u8, offset: usize) usize {
     return index;
 }
 
-const grapheme_boundary = "\u{200B}";
-const replacement = grapheme_boundary ++ "�" ++ grapheme_boundary;
-
-const UnitKind = enum { text, space, replacement, line_break };
-
-const DisplayUnit = struct {
-    bytes: usize,
-    columns: usize,
-    kind: UnitKind,
-};
-
 fn displayUnit(text: []const u8) DisplayUnit {
     const lead = text[0];
     if (lead < 0x80) return switch (lead) {
         '\n' => .{ .bytes = 1, .columns = 0, .kind = .line_break },
-        '\t' => .{ .bytes = 1, .columns = 1, .kind = .space },
+        '\t' => .{ .bytes = 1, .columns = 1, .kind = .tab },
         0x00...0x08, 0x0b...0x1f, 0x7f => .{ .bytes = 1, .columns = 1, .kind = .replacement },
         else => printableUnit(text),
     };
@@ -207,26 +224,7 @@ fn displayUnit(text: []const u8) DisplayUnit {
 
 fn printableUnit(text: []const u8) DisplayUnit {
     const step = grapheme.stepAt(text);
-    var safe_len: usize = 0;
-    while (safe_len < step.bytes) {
-        const lead = text[safe_len];
-        if (lead < 0x80) {
-            if (lead < 0x20 or lead == 0x7f) break;
-            safe_len += 1;
-            continue;
-        }
-        const length = std.unicode.utf8ByteSequenceLength(lead) catch break;
-        if (step.bytes - safe_len < length) break;
-        const codepoint = std.unicode.utf8Decode(text[safe_len..][0..length]) catch break;
-        if (codepoint >= 0x80 and codepoint <= 0x9f) break;
-        safe_len += length;
-    }
-    if (safe_len == step.bytes) {
-        return .{ .bytes = step.bytes, .columns = step.columns, .kind = .text };
-    }
-    std.debug.assert(safe_len > 0);
-    const safe_step = grapheme.stepAt(text[0..safe_len]);
-    return .{ .bytes = safe_step.bytes, .columns = safe_step.columns, .kind = .text };
+    return .{ .bytes = step.bytes, .columns = step.columns, .kind = .text };
 }
 
 fn replacementUnit() DisplayUnit {
@@ -251,30 +249,6 @@ fn fittedWidth(text: []const u8, columns_max: usize) usize {
 fn fittedColumns(unit: *const DisplayUnit, columns_max: usize) usize {
     if (unit.columns == 0 or unit.columns <= columns_max) return unit.columns;
     return @intFromBool(columns_max > 0);
-}
-
-fn writeCanonical(writer: *std.Io.Writer, text: []const u8, columns_max: usize) !usize {
-    var columns: usize = 0;
-    var index: usize = 0;
-    while (index < text.len) {
-        const unit = displayUnit(text[index..]);
-        const columns_available = columns_max -| columns;
-        const unit_columns = fittedColumns(&unit, columns_available);
-        switch (unit.kind) {
-            .text => if (unit.columns == 0 or unit.columns <= columns_available) {
-                try writer.writeAll(text[index..][0..unit.bytes]);
-            } else if (unit_columns > 0) {
-                try writer.writeAll(replacement);
-            },
-            .space => if (unit_columns > 0)
-                try writer.writeAll(grapheme_boundary ++ " " ++ grapheme_boundary),
-            .replacement => if (unit_columns > 0) try writer.writeAll(replacement),
-            .line_break => try writer.writeAll(grapheme_boundary),
-        }
-        columns += unit_columns;
-        index += unit.bytes;
-    }
-    return columns;
 }
 
 test ofText {
@@ -304,12 +278,13 @@ test "ofText canonicalizes controls and malformed utf-8" {
     try std.testing.expectEqual(@as(usize, 2), ofText("\xe2A"));
 }
 
-test writeText {
+test "writeFitted without a column limit writes each unit in its canonical form" {
+    const unlimited = std.math.maxInt(usize);
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
 
     const input = "a\t\x07\x1b\xc2\x9b\x7f\xff\xf0\x9f\nb";
-    const columns = try writeText(&out.writer, input);
+    const columns = try writeFitted(&out.writer, input, unlimited);
     try std.testing.expectEqualStrings(
         "a" ++ grapheme_boundary ++ " " ++ grapheme_boundary ++ replacement ++ replacement ++
             replacement ++ replacement ++ replacement ++ replacement ++ replacement ++
@@ -320,17 +295,17 @@ test writeText {
     try std.testing.expectEqual(columns, ofText(out.written()));
 
     out.clearRetainingCapacity();
-    _ = try writeText(&out.writer, "\xd8\x80\xff");
+    _ = try writeFitted(&out.writer, "\xd8\x80\xff", unlimited);
     try std.testing.expectEqualStrings("\xd8\x80" ++ replacement, out.written());
 
     out.clearRetainingCapacity();
-    const separated_columns = try writeText(&out.writer, "\x1b\u{FE0F}");
+    const separated_columns = try writeFitted(&out.writer, "\x1b\u{FE0F}", unlimited);
     try std.testing.expectEqualStrings(replacement ++ "\u{FE0F}", out.written());
     try std.testing.expectEqual(@as(usize, 3), separated_columns);
     try std.testing.expectEqual(separated_columns, ofText(out.written()));
 
     out.clearRetainingCapacity();
-    const tab_columns = try writeText(&out.writer, "\t\u{FE0F}");
+    const tab_columns = try writeFitted(&out.writer, "\t\u{FE0F}", unlimited);
     try std.testing.expectEqualStrings(
         grapheme_boundary ++ " " ++ grapheme_boundary ++ "\u{FE0F}",
         out.written(),
@@ -339,7 +314,7 @@ test writeText {
     try std.testing.expectEqual(tab_columns, ofText(out.written()));
 
     out.clearRetainingCapacity();
-    const prepend_columns = try writeText(&out.writer, "\u{0D4E}\t\x1b");
+    const prepend_columns = try writeFitted(&out.writer, "\u{0D4E}\t\x1b", unlimited);
     try std.testing.expectEqualStrings(
         "\u{0D4E}" ++ grapheme_boundary ++ " " ++ grapheme_boundary ++ replacement,
         out.written(),
@@ -347,7 +322,7 @@ test writeText {
     try std.testing.expectEqual(prepend_columns, ofText(out.written()));
 
     out.clearRetainingCapacity();
-    const line_break_columns = try writeText(&out.writer, "\u{0D4E}\nA");
+    const line_break_columns = try writeFitted(&out.writer, "\u{0D4E}\nA", unlimited);
     try std.testing.expectEqualStrings("\u{0D4E}" ++ grapheme_boundary ++ "A", out.written());
     try std.testing.expectEqual(line_break_columns, ofText(out.written()));
 }
@@ -360,7 +335,7 @@ test "a grapheme wider than one column has a fitted replacement" {
     try std.testing.expectEqualStrings(replacement, out.written());
     try std.testing.expectEqual(@as(usize, 1), columns);
     try std.testing.expectEqual(@as(usize, 1), rows("你", 1));
-    try expectCaret(.{ .text = "你", .offset = 3, .columns_max = 1, .rows_before = 1 });
+    try expectCaret(&.{ .text = "你", .offset = 3, .columns_max = 1, .row = 1 });
 }
 
 test "grapheme clusters measure as one terminal cell" {
@@ -502,17 +477,17 @@ const CaretCase = struct {
     text: []const u8,
     offset: usize,
     columns_max: usize,
-    rows_before: usize = 0,
+    row: usize = 0,
     column: usize = 0,
 };
 
-fn expectCaret(case: CaretCase) !void {
+fn expectCaret(case: *const CaretCase) !void {
     errdefer std.debug.print("The caret case is \"{s}\" at offset {d} in {d} columns.\n", .{
         case.text,
         case.offset,
         case.columns_max,
     });
-    const expected: Caret = .{ .rows_before = case.rows_before, .column = case.column };
+    const expected: Caret = .{ .row = case.row, .column = case.column };
     const options: Caret.Options = .{ .offset = case.offset, .columns_max = case.columns_max };
     try std.testing.expectEqual(expected, caret(case.text, options));
 }
@@ -521,25 +496,25 @@ test caret {
     for ([_]CaretCase{
         .{ .text = "", .offset = 0, .columns_max = 3 },
         .{ .text = "he", .offset = 2, .columns_max = 3, .column = 2 },
-        .{ .text = "hel", .offset = 3, .columns_max = 3, .rows_before = 1 },
-        .{ .text = "你你", .offset = 6, .columns_max = 4, .rows_before = 1 },
-        .{ .text = "hello", .offset = 4, .columns_max = 3, .rows_before = 1, .column = 1 },
-        .{ .text = "你好", .offset = 6, .columns_max = 3, .rows_before = 1, .column = 2 },
-        .{ .text = "ab\ncd", .offset = 4, .columns_max = 10, .rows_before = 1, .column = 1 },
-        .{ .text = "a\n", .offset = 2, .columns_max = 10, .rows_before = 1 },
-        .{ .text = "a\n\n", .offset = 3, .columns_max = 10, .rows_before = 2 },
+        .{ .text = "hel", .offset = 3, .columns_max = 3, .row = 1 },
+        .{ .text = "你你", .offset = 6, .columns_max = 4, .row = 1 },
+        .{ .text = "hello", .offset = 4, .columns_max = 3, .row = 1, .column = 1 },
+        .{ .text = "你好", .offset = 6, .columns_max = 3, .row = 1, .column = 2 },
+        .{ .text = "ab\ncd", .offset = 4, .columns_max = 10, .row = 1, .column = 1 },
+        .{ .text = "a\n", .offset = 2, .columns_max = 10, .row = 1 },
+        .{ .text = "a\n\n", .offset = 3, .columns_max = 10, .row = 2 },
         .{ .text = "abcd", .offset = 1, .columns_max = 3, .column = 1 },
-        .{ .text = "abcd", .offset = 3, .columns_max = 3, .rows_before = 1 },
-    }) |case| try expectCaret(case);
+        .{ .text = "abcd", .offset = 3, .columns_max = 3, .row = 1 },
+    }) |case| try expectCaret(&case);
 }
 
 test "a caret reads the row the word wrap gives it" {
     for ([_]CaretCase{
-        .{ .text = "aaa bbbb", .offset = 6, .columns_max = 5, .rows_before = 1, .column = 2 },
-        .{ .text = "aaa bbbb", .offset = 4, .columns_max = 5, .rows_before = 1 },
-        .{ .text = "abcde  f", .offset = 6, .columns_max = 5, .rows_before = 1 },
-        .{ .text = "abcde  f", .offset = 7, .columns_max = 5, .rows_before = 1 },
-    }) |case| try expectCaret(case);
+        .{ .text = "aaa bbbb", .offset = 6, .columns_max = 5, .row = 1, .column = 2 },
+        .{ .text = "aaa bbbb", .offset = 4, .columns_max = 5, .row = 1 },
+        .{ .text = "abcde  f", .offset = 6, .columns_max = 5, .row = 1 },
+        .{ .text = "abcde  f", .offset = 7, .columns_max = 5, .row = 1 },
+    }) |case| try expectCaret(&case);
 }
 
 test caretEnd {
@@ -561,7 +536,7 @@ test caretEnd {
                 var offset = span.start;
                 while (offset <= end) {
                     const options: Caret.Options = .{ .offset = offset, .columns_max = columns };
-                    try std.testing.expectEqual(row, caret(text, options).rows_before);
+                    try std.testing.expectEqual(row, caret(text, options).row);
                     if (offset == text.len) break;
                     offset = boundaryAfter(text, offset);
                 }
@@ -570,7 +545,7 @@ test caretEnd {
                     .offset = boundaryAfter(text, end),
                     .columns_max = columns,
                 };
-                try std.testing.expect(caret(text, after).rows_before > row);
+                try std.testing.expect(caret(text, after).row > row);
             }
         }
     }

@@ -1,8 +1,12 @@
 const std = @import("std");
 
-const ai = @import("ai");
+const tools = @import("tools");
 
-pub const default_core =
+const discovery = @import("discovery/root.zig");
+const escape = @import("escape.zig");
+const testing = @import("testing.zig");
+
+const default_core =
     "# System prompt\n\n" ++
     "You are a coding assistant. You run inside Drinky, a terminal coding-agent harness.\n\n" ++
     "Complete the user's request.\n" ++
@@ -17,48 +21,55 @@ pub const default_core =
 const date_timestamp_nanoseconds_max: i96 =
     253_402_300_800 * std.time.ns_per_s - 1;
 
-pub const Options = struct {
-    core: []const u8,
+const Options = struct {
     current_time: std.Io.Timestamp,
     working_directory: []const u8,
-    user_instructions: []const ai.instructions.File,
-    project_instructions: *const ai.instructions.Result,
-    skills: ai.skills.Catalog,
-    required_skills: []const ai.tool.SkillGuard.Rule = &.{},
+    user_instructions: []const discovery.instructions.File,
+    project_instructions: *const discovery.instructions.Result,
+    skills: []const discovery.skills.Skill,
+    required_skills: []const tools.SkillGuard.Rule,
 };
 
 const InstructionsOptions = struct {
     title: []const u8,
     tag: []const u8,
-    files: []const ai.instructions.File,
+    files: []const discovery.instructions.File,
 };
 
-pub fn compose(gpa: std.mem.Allocator, options: *const Options) ![]u8 {
+pub fn compose(gpa: std.mem.Allocator, options: *const Options) error{OutOfMemory}![]u8 {
     var output: std.Io.Writer.Allocating = .init(gpa);
     errdefer output.deinit();
-    try output.writer.writeAll(options.core);
-    try writeEnvironment(gpa, &output.writer, options);
+    write(gpa, &output.writer, options) catch return error.OutOfMemory;
+    return output.toOwnedSlice();
+}
+
+fn write(
+    gpa: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    options: *const Options,
+) (std.Io.Writer.Error || error{OutOfMemory})!void {
+    try writer.writeAll(default_core);
+    try writeEnvironment(gpa, writer, options);
     const project_files = options.project_instructions.files();
-    try writePrecedence(&output.writer, options);
-    if (options.user_instructions.len > 0) try writeInstructions(gpa, &output.writer, &.{
+    try writePrecedence(writer, options);
+    if (options.user_instructions.len > 0) try writeInstructions(gpa, writer, &.{
         .title = "User instructions",
         .tag = "user_instructions",
         .files = options.user_instructions,
     });
-    if (project_files.len > 0) try writeInstructions(gpa, &output.writer, &.{
+    if (project_files.len > 0) try writeInstructions(gpa, writer, &.{
         .title = "Project instructions",
         .tag = "project_instructions",
         .files = project_files,
     });
-    if (options.skills.count() > 0) try writeSkills(gpa, &output.writer, &options.skills);
+    if (anyVisible(options.skills)) try writeSkills(gpa, writer, options.skills);
     if (options.required_skills.len > 0)
-        try writeRequiredSkills(gpa, &output.writer, options.required_skills);
-    return output.toOwnedSlice();
+        try writeRequiredSkills(gpa, writer, options.required_skills);
 }
 
 fn writePrecedence(writer: *std.Io.Writer, options: *const Options) !void {
     const project_files = options.project_instructions.files();
-    const has_skills = options.skills.count() > 0;
+    const has_skills = anyVisible(options.skills);
     if (options.user_instructions.len == 0 and project_files.len == 0 and !has_skills) return;
     try writer.writeAll("\n\n## Instruction precedence\n\n" ++
         "Drinky gives you instructions from the sources below. Where two conflict, obey this " ++
@@ -150,10 +161,17 @@ fn writeEnvironment(
     try writer.writeAll("</environment>");
 }
 
+fn anyVisible(items: []const discovery.skills.Skill) bool {
+    for (items) |skill| {
+        if (!skill.model_invocation_disabled) return true;
+    }
+    return false;
+}
+
 fn writeSkills(
     gpa: std.mem.Allocator,
     writer: *std.Io.Writer,
-    catalog: *const ai.skills.Catalog,
+    items: []const discovery.skills.Skill,
 ) !void {
     try writer.writeAll("\n\n## Skills\n\n");
     try writer.writeAll(
@@ -162,9 +180,8 @@ fn writeSkills(
             "skill file before you proceed.\n\n" ++
             "<skills>\n",
     );
-    var iterator = catalog.iterator();
-    for (0..catalog.count()) |_| {
-        const skill = iterator.next() orelse return error.InvalidSkillCatalog;
+    for (items) |skill| {
+        if (skill.model_invocation_disabled) continue;
         try writer.writeAll("  <skill_file path=\"");
         try writePath(gpa, writer, skill.path);
         try writer.writeAll("\">\n    <name>");
@@ -180,7 +197,7 @@ fn writeSkills(
 fn writeRequiredSkills(
     gpa: std.mem.Allocator,
     writer: *std.Io.Writer,
-    rules: []const ai.tool.SkillGuard.Rule,
+    rules: []const tools.SkillGuard.Rule,
 ) !void {
     try writer.writeAll("\n\n## Required skills\n\n");
     try writer.writeAll(
@@ -205,7 +222,7 @@ fn writeRequiredSkills(
 }
 
 fn writePath(gpa: std.mem.Allocator, writer: *std.Io.Writer, path: []const u8) !void {
-    const display = try ai.instructions.displayAlloc(gpa, path);
+    const display = try escape.display(gpa, path);
     defer gpa.free(display);
     try writeEscaped(writer, display);
 }
@@ -219,30 +236,6 @@ fn writeEscaped(writer: *std.Io.Writer, text: []const u8) !void {
         '\'' => try writer.writeAll("&apos;"),
         else => try writer.writeByte(byte),
     };
-}
-
-fn tmpPath(
-    gpa: std.mem.Allocator,
-    io: std.Io,
-    tmp: *const std.testing.TmpDir,
-    suffix: []const u8,
-) ![]u8 {
-    const cwd = try std.process.currentPathAlloc(io, gpa);
-    defer gpa.free(cwd);
-    return std.fs.path.join(gpa, &.{ cwd, ".zig-cache", "tmp", &tmp.sub_path, suffix });
-}
-
-const TestFileOptions = struct {
-    path: []const u8,
-    data: []const u8,
-};
-
-fn writeTestFile(io: std.Io, dir: std.Io.Dir, options: *const TestFileOptions) !void {
-    if (std.fs.path.dirname(options.path)) |parent| {
-        var directory = try dir.createDirPathOpen(io, parent, .{});
-        directory.close(io);
-    }
-    try dir.writeFile(io, .{ .sub_path = options.path, .data = options.data });
 }
 
 test "UTC date formatting handles bounds and a leap day" {
@@ -261,21 +254,45 @@ test "UTC date formatting handles bounds and a leap day" {
     );
 }
 
-test "a wall clock outside the supported years empties the date but composes" {
-    const gpa = std.testing.allocator;
-    var empty_instructions = ai.instructions.Result.init(gpa, .project);
-    defer empty_instructions.deinit();
-    const prompt = try compose(gpa, &.{
-        .core = "core",
-        .current_time = .fromNanoseconds(-1),
+const no_instructions: discovery.instructions.Result = .init(std.testing.allocator, .project);
+
+fn emptyOptions() Options {
+    return .{
+        .current_time = .zero,
         .working_directory = "/work",
         .user_instructions = &.{},
-        .project_instructions = &empty_instructions,
-        .skills = try ai.skills.Catalog.init(&.{}),
-    });
+        .project_instructions = &no_instructions,
+        .skills = &.{},
+        .required_skills = &.{},
+    };
+}
+
+fn testSkill(options: *const struct {
+    name: []const u8,
+    description: []const u8,
+    path: []const u8,
+    description_truncated: bool = false,
+    model_invocation_disabled: bool = false,
+    scope: discovery.skills.Skill.Scope = .user,
+}) discovery.skills.Skill {
+    return .{
+        .name = options.name,
+        .description = options.description,
+        .description_truncated = options.description_truncated,
+        .path = options.path,
+        .model_invocation_disabled = options.model_invocation_disabled,
+        .scope = options.scope,
+    };
+}
+
+test "a wall clock outside the supported years empties the date but composes" {
+    const gpa = std.testing.allocator;
+    var options = emptyOptions();
+    options.current_time = .fromNanoseconds(-1);
+    const prompt = try compose(gpa, &options);
     defer gpa.free(prompt);
     try std.testing.expectEqualStrings(
-        "core\n\n## Environment\n\n<environment>\n" ++
+        default_core ++ "\n\n## Environment\n\n<environment>\n" ++
             "  <current_date />\n" ++
             "  <working_directory>/work</working_directory>\n" ++
             "  <repository_root />\n</environment>",
@@ -283,80 +300,45 @@ test "a wall clock outside the supported years empties the date but composes" {
     );
 }
 
-test "the compiled core is stable" {
-    try std.testing.expectEqualStrings(
-        "# System prompt\n\n" ++
-            "You are a coding assistant. You run inside Drinky, a terminal coding-agent " ++
-            "harness.\n\n" ++
-            "Complete the user's request.\n" ++
-            "Use the available tools according to their schemas.\n" ++
-            "Use the find tool and the grep tool to search files.\n" ++
-            "Run a search in bash only when these tools cannot express it.\n" ++
-            "Read a file before you change it, because an edit must match the current bytes.\n" ++
-            "Answer a question about Drinky itself from the describe_drinky tool, and never " ++
-            "from memory.\n" ++
-            "Drinky renders your answer as Markdown in a terminal, so keep it short.",
-        default_core,
-    );
-}
-
 test "composition orders sections and preserves instruction Markdown" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+    var tree: testing.Tree = try .init();
+    defer tree.deinit();
 
     const broad = "# Broad\n\n```sh\nleft && printf '<tag>'\n```\n";
-    var git = try tmp.dir.createDirPathOpen(io, "repo&root/.git", .{});
-    git.close(io);
-    try writeTestFile(io, tmp.dir, &.{
-        .path = "repo&root/AGENTS.md",
-        .data = broad,
-    });
-    try writeTestFile(io, tmp.dir, &.{
-        .path = "repo&root/package/AGENTS.md",
-        .data = "specific",
-    });
-    const working_directory = try tmpPath(gpa, io, &tmp, "repo&root/package");
-    defer gpa.free(working_directory);
-    var instructions = try ai.instructions.discover(gpa, io, working_directory);
-    defer instructions.deinit();
+    try tree.directory("repo&root/.git");
+    try tree.write("repo&root/AGENTS.md", broad);
+    try tree.write("repo&root/package/AGENTS.md", "specific");
+    const working_directory = try tree.path("repo&root/package");
+    var discovered = try discovery.instructions.discover(gpa, io, working_directory);
+    defer discovered.deinit();
 
-    const skill_items = [_]ai.skills.Skill{
-        .{
+    const skill_items = [_]discovery.skills.Skill{
+        testSkill(&.{
             .name = "example",
             .description = "Use <this> & \"that\"",
-            .description_truncated = true,
             .path = "/skills/a'b/SKILL.md",
-            .model_invocation_disabled = false,
-            .scope = .user,
-        },
-        .{
+            .description_truncated = true,
+        }),
+        testSkill(&.{
             .name = "second",
             .description = "Use the second skill.",
-            .description_truncated = false,
             .path = "/skills/second/SKILL.md",
-            .model_invocation_disabled = false,
             .scope = .project,
-        },
-        .{
+        }),
+        testSkill(&.{
             .name = "hidden",
             .description = "not shown",
-            .description_truncated = false,
             .path = "/skills/hidden/SKILL.md",
             .model_invocation_disabled = true,
-            .scope = .user,
-        },
+        }),
     };
-    const catalog = try ai.skills.Catalog.init(&skill_items);
-    const prompt = try compose(gpa, &.{
-        .core = default_core,
-        .current_time = .zero,
-        .working_directory = working_directory,
-        .user_instructions = &.{},
-        .project_instructions = &instructions,
-        .skills = catalog,
-    });
+    var options = emptyOptions();
+    options.working_directory = working_directory;
+    options.project_instructions = &discovered;
+    options.skills = &skill_items;
+    const prompt = try compose(gpa, &options);
     defer gpa.free(prompt);
 
     try std.testing.expect(std.mem.startsWith(u8, prompt, default_core));
@@ -431,10 +413,7 @@ test "composition orders sections and preserves instruction Markdown" {
 
 test "configured user instructions have their own section" {
     const gpa = std.testing.allocator;
-    var empty_instructions = ai.instructions.Result.init(gpa, .project);
-    defer empty_instructions.deinit();
-    const empty_catalog = try ai.skills.Catalog.init(&.{});
-    const user_instructions = [_]ai.instructions.File{
+    const user_instructions = [_]discovery.instructions.File{
         .{
             .path = "/home/a&b/first.md",
             .content = "# Tone\n\nKeep <xml> && shell operators.",
@@ -446,18 +425,14 @@ test "configured user instructions have their own section" {
             .identity = "/home/second.md",
         },
     };
-    const prompt = try compose(gpa, &.{
-        .core = "core",
-        .current_time = .fromNanoseconds(1_785_628_800 * std.time.ns_per_s),
-        .working_directory = "/work",
-        .user_instructions = &user_instructions,
-        .project_instructions = &empty_instructions,
-        .skills = empty_catalog,
-    });
+    var options = emptyOptions();
+    options.current_time = .fromNanoseconds(1_785_628_800 * std.time.ns_per_s);
+    options.user_instructions = &user_instructions;
+    const prompt = try compose(gpa, &options);
     defer gpa.free(prompt);
 
     try std.testing.expectEqualStrings(
-        "core\n\n## Environment\n\n<environment>\n" ++
+        default_core ++ "\n\n## Environment\n\n<environment>\n" ++
             "  <current_date>2026-08-02</current_date>\n" ++
             "  <working_directory>/work</working_directory>\n" ++
             "  <repository_root />\n" ++
@@ -484,17 +459,15 @@ test "configured user instructions have their own section" {
 
 test "the required skills section names every rule and stays out without one" {
     const gpa = std.testing.allocator;
-    var empty_instructions = ai.instructions.Result.init(gpa, .project);
-    defer empty_instructions.deinit();
-    const skill_items = [_]ai.skills.Skill{.{
-        .name = "zig-style",
-        .description = "Zig conventions.",
-        .description_truncated = false,
-        .path = "/work/.agents/skills/zig-style/SKILL.md",
-        .model_invocation_disabled = false,
-        .scope = .project,
-    }};
-    const rules = [_]ai.tool.SkillGuard.Rule{
+    const skill_items = [_]discovery.skills.Skill{
+        testSkill(&.{
+            .name = "zig-style",
+            .description = "Zig conventions.",
+            .path = "/work/.agents/skills/zig-style/SKILL.md",
+            .scope = .project,
+        }),
+    };
+    const rules = [_]tools.SkillGuard.Rule{
         .{
             .glob = "**/*.zig",
             .skill = "zig-style",
@@ -502,15 +475,10 @@ test "the required skills section names every rule and stays out without one" {
         },
         .{ .glob = "src/<b>/*.ts", .skill = "ts-style", .source = "/work/skills/ts/SKILL.md" },
     };
-    const prompt = try compose(gpa, &.{
-        .core = "core",
-        .current_time = .zero,
-        .working_directory = "/work",
-        .user_instructions = &.{},
-        .project_instructions = &empty_instructions,
-        .skills = try ai.skills.Catalog.init(&skill_items),
-        .required_skills = &rules,
-    });
+    var options = emptyOptions();
+    options.skills = &skill_items;
+    options.required_skills = &rules;
+    const prompt = try compose(gpa, &options);
     defer gpa.free(prompt);
 
     const skills_index = std.mem.indexOf(u8, prompt, "## Skills").?;
@@ -529,14 +497,9 @@ test "the required skills section names every rule and stays out without one" {
             "</required_skills>",
     ) != null);
 
-    const plain = try compose(gpa, &.{
-        .core = "core",
-        .current_time = .zero,
-        .working_directory = "/work",
-        .user_instructions = &.{},
-        .project_instructions = &empty_instructions,
-        .skills = try ai.skills.Catalog.init(&skill_items),
-    });
+    var plain_options = emptyOptions();
+    plain_options.skills = &skill_items;
+    const plain = try compose(gpa, &plain_options);
     defer gpa.free(plain);
     try std.testing.expect(std.mem.indexOf(u8, plain, "## Skills") != null);
     try std.testing.expect(std.mem.indexOf(u8, plain, "## Required skills") == null);
@@ -544,85 +507,65 @@ test "the required skills section names every rule and stays out without one" {
 
 test "generated paths cannot add prompt lines or controls" {
     const gpa = std.testing.allocator;
-    var output: std.Io.Writer.Allocating = .init(gpa);
-    defer output.deinit();
+    var options = emptyOptions();
+    options.working_directory = "/work\n```\x1b\xe2\x80\xae&\"'";
+    const prompt = try compose(gpa, &options);
+    defer gpa.free(prompt);
 
-    try writePath(gpa, &output.writer, "/work\n```\x1b\xe2\x80\xae&\"'");
-
-    try std.testing.expectEqualStrings(
-        "/work\\x0a```\\x1b\\xe2\\x80\\xae&amp;&quot;&apos;",
-        output.written(),
-    );
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        prompt,
+        "  <working_directory>/work\\x0a```\\x1b\\xe2\\x80\\xae&amp;&quot;&apos;" ++
+            "</working_directory>\n",
+    ) != null);
 }
 
 test "empty project and skill sections are omitted independently" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    var empty_instructions = ai.instructions.Result.init(gpa, .project);
-    defer empty_instructions.deinit();
-    const hidden_items = [_]ai.skills.Skill{.{
-        .name = "hidden",
-        .description = "manual only",
-        .description_truncated = false,
-        .path = "/hidden/SKILL.md",
-        .model_invocation_disabled = true,
-        .scope = .user,
-    }};
-    const empty_catalog = try ai.skills.Catalog.init(&hidden_items);
-    const empty_prompt = try compose(gpa, &.{
-        .core = "core",
-        .current_time = .zero,
-        .working_directory = "/work&space",
-        .user_instructions = &.{},
-        .project_instructions = &empty_instructions,
-        .skills = empty_catalog,
-    });
+    const hidden_items = [_]discovery.skills.Skill{
+        testSkill(&.{
+            .name = "hidden",
+            .description = "manual only",
+            .path = "/hidden/SKILL.md",
+            .model_invocation_disabled = true,
+        }),
+    };
+    var empty_options = emptyOptions();
+    empty_options.working_directory = "/work&space";
+    empty_options.skills = &hidden_items;
+    const empty_prompt = try compose(gpa, &empty_options);
     defer gpa.free(empty_prompt);
     try std.testing.expectEqualStrings(
-        "core\n\n## Environment\n\n<environment>\n" ++
+        default_core ++ "\n\n## Environment\n\n<environment>\n" ++
             "  <current_date>1970-01-01</current_date>\n" ++
             "  <working_directory>/work&amp;space</working_directory>\n" ++
             "  <repository_root />\n</environment>",
         empty_prompt,
     );
 
-    const visible_items = [_]ai.skills.Skill{.{
-        .name = "visible",
-        .description = "shown",
-        .description_truncated = false,
-        .path = "/visible/SKILL.md",
-        .model_invocation_disabled = false,
-        .scope = .user,
-    }};
-    const skill_prompt = try compose(gpa, &.{
-        .core = "core",
-        .current_time = .zero,
-        .working_directory = "/work",
-        .user_instructions = &.{},
-        .project_instructions = &empty_instructions,
-        .skills = try ai.skills.Catalog.init(&visible_items),
-    });
+    const visible_items = [_]discovery.skills.Skill{
+        testSkill(&.{ .name = "visible", .description = "shown", .path = "/visible/SKILL.md" }),
+    };
+    var skill_options = emptyOptions();
+    skill_options.skills = &visible_items;
+    const skill_prompt = try compose(gpa, &skill_options);
     defer gpa.free(skill_prompt);
     try std.testing.expect(std.mem.indexOf(u8, skill_prompt, "## Project instructions") == null);
     try std.testing.expect(std.mem.indexOf(u8, skill_prompt, "## Skills") != null);
 
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var git = try tmp.dir.createDirPathOpen(io, "repo/.git", .{});
-    git.close(io);
-    try writeTestFile(io, tmp.dir, &.{ .path = "repo/AGENTS.md", .data = "project" });
-    const working_directory = try tmpPath(gpa, io, &tmp, "repo");
-    defer gpa.free(working_directory);
-    var project_instructions = try ai.instructions.discover(gpa, io, working_directory);
+    var tree: testing.Tree = try .init();
+    defer tree.deinit();
+    try tree.directory("repo/.git");
+    try tree.write("repo/AGENTS.md", "project");
+    const working_directory = try tree.path("repo");
+    var project_instructions = try discovery.instructions.discover(gpa, io, working_directory);
     defer project_instructions.deinit();
-    const project_prompt = try compose(gpa, &.{
-        .core = "core",
-        .current_time = .zero,
-        .working_directory = working_directory,
-        .user_instructions = &.{},
-        .project_instructions = &project_instructions,
-        .skills = empty_catalog,
-    });
+    var project_options = emptyOptions();
+    project_options.working_directory = working_directory;
+    project_options.project_instructions = &project_instructions;
+    project_options.skills = &hidden_items;
+    const project_prompt = try compose(gpa, &project_options);
     defer gpa.free(project_prompt);
     try std.testing.expect(std.mem.indexOf(u8, project_prompt, "## Project instructions") != null);
     try std.testing.expect(std.mem.indexOf(u8, project_prompt, "## Skills") == null);

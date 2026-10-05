@@ -1,109 +1,85 @@
 const std = @import("std");
 
-const ai = @import("ai");
-
 const ui = @import("ui/root.zig");
 
 const Transcript = @This();
 
 gpa: std.mem.Allocator,
-entries: std.ArrayList(ui.block.Entry),
-projected: std.ArrayList(*ui.block.Entry),
-current: ?struct { kind: ui.block.Entry.Kind, index: ?usize },
+block_list: std.ArrayList(ui.Block),
+current: ?struct { kind: ui.Block.Kind, index: ?usize },
 held: std.ArrayList(u8),
-message_start: ?usize,
-
-pub const Setup = struct {
-    account: ?ai.llm.Account,
-    replays_reasoning: bool,
-};
 
 pub fn init(gpa: std.mem.Allocator) Transcript {
     return .{
         .gpa = gpa,
-        .entries = .empty,
-        .projected = .empty,
+        .block_list = .empty,
         .current = null,
         .held = .empty,
-        .message_start = null,
     };
 }
 
 pub fn deinit(self: *Transcript) void {
-    for (self.entries.items) |*entry| entry.deinit(self.gpa);
-    self.entries.deinit(self.gpa);
-    self.projected.deinit(self.gpa);
+    for (self.block_list.items) |*block| block.deinit(self.gpa);
+    self.block_list.deinit(self.gpa);
     self.held.deinit(self.gpa);
 }
 
-pub fn append(
-    self: *Transcript,
-    kind: ui.block.Entry.Kind,
-    options: ui.block.Entry.Options,
-    text: []const u8,
-) !void {
+pub fn append(self: *Transcript, source: *const ui.Block.Source) !void {
     self.endMessage();
-    var entry = try ui.block.Entry.init(self.gpa, kind, options, text);
-    errdefer entry.deinit(self.gpa);
-    try self.entries.append(self.gpa, entry);
+    var block = try ui.Block.init(self.gpa, source);
+    errdefer block.deinit(self.gpa);
+    try self.block_list.append(self.gpa, block);
 }
 
 pub fn replaceEvent(
     self: *Transcript,
     index: usize,
-    options: ui.block.Entry.Options,
-    text: []const u8,
+    payload: *const ui.Block.Event.Payload,
 ) !void {
-    std.debug.assert(index < self.entries.items.len);
-    try self.entries.items[index].replaceEvent(self.gpa, options, text);
+    try self.block_list.items[index].replaceEvent(self.gpa, payload);
 }
 
-pub fn producedBefore(self: *const Transcript, account: ai.llm.Account, index: usize) usize {
-    std.debug.assert(index <= self.entries.items.len);
-    var count: usize = 0;
-    for (self.entries.items[0..index]) |*entry| count += @intFromBool(entry.account() == account);
-    return count;
-}
-
-pub fn repeatEvent(
-    self: *Transcript,
-    options: ui.block.Entry.Options,
-    text: []const u8,
-) !bool {
-    if (options.mirrored or self.streaming() or self.entries.items.len == 0) return false;
-    const last = &self.entries.items[self.entries.items.len - 1];
-    if (!last.statesEvent(options, text)) return false;
+pub fn repeatEvent(self: *Transcript, payload: *const ui.Block.Event.Payload) !bool {
+    std.debug.assert(!self.streaming());
+    if (payload.mirrored or self.block_list.items.len == 0) return false;
+    const last = &self.block_list.items[self.block_list.items.len - 1];
+    if (!last.statesEvent(payload)) return false;
     try last.repeatEvent(self.gpa);
     return true;
 }
 
-pub fn appendStream(
-    self: *Transcript,
-    kind: ui.block.Entry.Kind,
-    account: ?ai.llm.Account,
-    delta: []const u8,
-) !void {
-    if (delta.len == 0) return;
-    if (self.current == null or self.current.?.kind != kind) {
-        self.current = .{ .kind = kind, .index = null };
-        self.held.clearRetainingCapacity();
-    }
-    const run = &self.current.?;
-    if (run.index == null) {
-        if (ui.block.isBlank(delta)) return self.held.appendSlice(self.gpa, delta);
-        run.index = try self.openRun(kind, account);
-    }
-    try self.entries.items[run.index.?].appendText(self.gpa, delta);
+pub fn beginRun(self: *Transcript, kind: ui.Block.Kind) void {
+    self.current = .{ .kind = kind, .index = null };
+    self.held.clearRetainingCapacity();
 }
 
-fn openRun(self: *Transcript, kind: ui.block.Entry.Kind, account: ?ai.llm.Account) !usize {
-    var entry = try ui.block.Entry.init(self.gpa, kind, .{ .account = account }, self.held.items);
-    errdefer entry.deinit(self.gpa);
-    try self.entries.append(self.gpa, entry);
+pub fn runIndex(self: *const Transcript) ?usize {
+    const run = self.current orelse return null;
+    return run.index;
+}
+
+pub fn appendStream(self: *Transcript, kind: ui.Block.Kind, delta: []const u8) !void {
+    if (delta.len == 0) return;
+    if (self.current == null or self.current.?.kind != kind) self.beginRun(kind);
+    const run = &self.current.?;
+    if (run.index == null) {
+        if (ui.paint.isBlank(delta)) return self.held.appendSlice(self.gpa, delta);
+        run.index = try self.openRun(kind);
+    }
+    try self.block_list.items[run.index.?].appendText(self.gpa, delta);
+}
+
+fn openRun(self: *Transcript, kind: ui.Block.Kind) !usize {
+    const source: ui.Block.Source = switch (kind) {
+        .thinking => .{ .thinking = self.held.items },
+        .model => .{ .model = self.held.items },
+        .intro, .user, .user_note, .tool_result, .event => unreachable,
+    };
+    var block = try ui.Block.init(self.gpa, &source);
+    errdefer block.deinit(self.gpa);
+    try self.block_list.append(self.gpa, block);
     self.held.clearRetainingCapacity();
-    const index = self.entries.items.len - 1;
-    if (self.message_start == null) self.message_start = index;
-    return index;
+    return self.block_list.items.len - 1;
 }
 
 pub fn streaming(self: *const Transcript) bool {
@@ -113,94 +89,32 @@ pub fn streaming(self: *const Transcript) bool {
 pub fn endMessage(self: *Transcript) void {
     self.current = null;
     self.held.clearRetainingCapacity();
-    self.message_start = null;
 }
 
-pub fn discardMessage(self: *Transcript) void {
-    const maybe_start = self.message_start;
+pub fn truncate(self: *Transcript, block_count: usize) void {
+    std.debug.assert(block_count <= self.block_list.items.len);
     self.endMessage();
-    const start = maybe_start orelse return;
-    for (self.entries.items[start..]) |*entry| entry.deinit(self.gpa);
-    self.entries.shrinkRetainingCapacity(start);
+    for (self.block_list.items[block_count..]) |*block| block.deinit(self.gpa);
+    self.block_list.shrinkRetainingCapacity(block_count);
 }
 
-pub fn truncate(self: *Transcript, entry_count: usize) void {
-    std.debug.assert(entry_count <= self.entries.items.len);
+pub fn rewind(self: *Transcript, block_count: usize) void {
+    std.debug.assert(block_count <= self.block_list.items.len);
     self.endMessage();
-    for (self.entries.items[entry_count..]) |*entry| entry.deinit(self.gpa);
-    self.entries.shrinkRetainingCapacity(entry_count);
-}
-
-pub fn rewind(self: *Transcript, entry_count: usize) void {
-    std.debug.assert(entry_count <= self.entries.items.len);
-    self.endMessage();
-    var retained_count = entry_count;
-    for (self.entries.items[entry_count..]) |*entry| {
-        if (entry.survivesRewind()) {
-            self.entries.items[retained_count] = entry.*;
+    var retained_count = block_count;
+    for (self.block_list.items[block_count..]) |*block| {
+        if (block.survivesRewind()) {
+            self.block_list.items[retained_count] = block.*;
             retained_count += 1;
         } else {
-            entry.deinit(self.gpa);
+            block.deinit(self.gpa);
         }
     }
-    self.entries.shrinkRetainingCapacity(retained_count);
+    self.block_list.shrinkRetainingCapacity(retained_count);
 }
 
-pub fn blocks(self: *const Transcript) []const ui.block.Entry {
-    return self.entries.items;
-}
-
-pub fn shows(producer: ?ai.llm.Account, setup: Setup) bool {
-    const owner = producer orelse return true;
-    const account = setup.account orelse return true;
-    return owner == account and setup.replays_reasoning;
-}
-
-pub fn projection(self: *Transcript, setup: Setup) ![]const *ui.block.Entry {
-    self.projected.clearRetainingCapacity();
-    for (self.entries.items) |*entry| {
-        if (shows(entry.account(), setup)) {
-            try self.projected.append(self.gpa, entry);
-        } else {
-            entry.release(self.gpa);
-        }
-    }
-    return self.projected.items;
-}
-
-pub fn projectionChanges(self: *const Transcript, previous: Setup, next: Setup) bool {
-    for (self.entries.items) |*entry| {
-        const producer = entry.account();
-        if (shows(producer, previous) != shows(producer, next)) return true;
-    }
-    return false;
-}
-
-pub fn dropAccount(self: *Transcript, account: ai.llm.Account) usize {
-    self.endMessage();
-    var retained_count: usize = 0;
-    for (self.entries.items) |*entry| {
-        if (entry.account() == account) {
-            entry.deinit(self.gpa);
-            continue;
-        }
-        self.entries.items[retained_count] = entry.*;
-        retained_count += 1;
-    }
-    const removed = self.entries.items.len - retained_count;
-    self.entries.shrinkRetainingCapacity(retained_count);
-    return removed;
-}
-
-const test_account: ai.llm.Account = .anthropic_plan;
-const other_account: ai.llm.Account = .openai_api_key;
-
-fn replaying(account: ?ai.llm.Account) Setup {
-    return .{ .account = account, .replays_reasoning = true };
-}
-
-fn silent(account: ?ai.llm.Account) Setup {
-    return .{ .account = account, .replays_reasoning = false };
+pub fn blocks(self: *const Transcript) []const ui.Block {
+    return self.block_list.items;
 }
 
 test "streamed deltas collect into one block until a discrete block ends the run" {
@@ -208,15 +122,15 @@ test "streamed deltas collect into one block until a discrete block ends the run
     var transcript = Transcript.init(gpa);
     defer transcript.deinit();
 
-    try transcript.appendStream(.model, null, "hel");
-    try transcript.appendStream(.model, null, "lo");
-    try std.testing.expectEqual(@as(usize, 1), transcript.entries.items.len);
-    try std.testing.expectEqualStrings("hello", transcript.entries.items[0].content.model.items);
+    try transcript.appendStream(.model, "hel");
+    try transcript.appendStream(.model, "lo");
+    try std.testing.expectEqual(@as(usize, 1), transcript.blocks().len);
+    try std.testing.expectEqualStrings("hello", transcript.blocks()[0].content.model.items);
 
-    try transcript.append(.user, .{}, "hi");
-    try transcript.appendStream(.model, null, "more");
-    try std.testing.expectEqual(@as(usize, 3), transcript.entries.items.len);
-    try std.testing.expectEqualStrings("more", transcript.entries.items[2].content.model.items);
+    try transcript.append(&.{ .user = "hi" });
+    try transcript.appendStream(.model, "more");
+    try std.testing.expectEqual(@as(usize, 3), transcript.blocks().len);
+    try std.testing.expectEqualStrings("more", transcript.blocks()[2].content.model.items);
 }
 
 test "an empty delta opens no block and does not break a run" {
@@ -224,15 +138,15 @@ test "an empty delta opens no block and does not break a run" {
     var transcript = Transcript.init(gpa);
     defer transcript.deinit();
 
-    try transcript.appendStream(.thinking, test_account, "");
-    try transcript.appendStream(.model, null, "");
-    try std.testing.expectEqual(@as(usize, 0), transcript.entries.items.len);
+    try transcript.appendStream(.thinking, "");
+    try transcript.appendStream(.model, "");
+    try std.testing.expectEqual(@as(usize, 0), transcript.blocks().len);
 
-    try transcript.appendStream(.model, null, "he");
-    try transcript.appendStream(.model, null, "");
-    try transcript.appendStream(.model, null, "llo");
-    try std.testing.expectEqual(@as(usize, 1), transcript.entries.items.len);
-    try std.testing.expectEqualStrings("hello", transcript.entries.items[0].content.model.items);
+    try transcript.appendStream(.model, "he");
+    try transcript.appendStream(.model, "");
+    try transcript.appendStream(.model, "llo");
+    try std.testing.expectEqual(@as(usize, 1), transcript.blocks().len);
+    try std.testing.expectEqualStrings("hello", transcript.blocks()[0].content.model.items);
 }
 
 test "a run holds its whitespace until another byte opens the block" {
@@ -240,65 +154,51 @@ test "a run holds its whitespace until another byte opens the block" {
     var transcript = Transcript.init(gpa);
     defer transcript.deinit();
 
-    try transcript.appendStream(.thinking, test_account, "\n");
-    try transcript.appendStream(.thinking, test_account, " \t\r\n");
-    try std.testing.expectEqual(@as(usize, 0), transcript.entries.items.len);
+    try transcript.appendStream(.thinking, "\n");
+    try transcript.appendStream(.thinking, " \t\r\n");
+    try std.testing.expectEqual(@as(usize, 0), transcript.blocks().len);
     try std.testing.expect(transcript.streaming());
 
-    try transcript.appendStream(.model, null, "answer");
-    try std.testing.expectEqual(@as(usize, 1), transcript.entries.items.len);
-    try std.testing.expectEqualStrings("answer", transcript.entries.items[0].content.model.items);
+    try transcript.appendStream(.model, "answer");
+    try std.testing.expectEqual(@as(usize, 1), transcript.blocks().len);
+    try std.testing.expectEqualStrings("answer", transcript.blocks()[0].content.model.items);
 
     transcript.endMessage();
-    try transcript.appendStream(.thinking, test_account, "\n\n");
-    try transcript.appendStream(.thinking, test_account, "weigh it");
-    try std.testing.expectEqual(@as(usize, 2), transcript.entries.items.len);
-    const reasoning = transcript.entries.items[1].content.thinking;
-    try std.testing.expectEqualStrings("\n\nweigh it", reasoning.text.items);
+    try transcript.appendStream(.thinking, "\n\n");
+    try transcript.appendStream(.thinking, "weigh it");
+    try std.testing.expectEqual(@as(usize, 2), transcript.blocks().len);
+    const reasoning = transcript.blocks()[1].content.thinking;
+    try std.testing.expectEqualStrings("\n\nweigh it", reasoning.items);
 
     transcript.endMessage();
-    try transcript.appendStream(.model, null, " ");
-    transcript.discardMessage();
+    try transcript.appendStream(.model, " ");
+    transcript.endMessage();
     try std.testing.expect(!transcript.streaming());
-    try std.testing.expectEqual(@as(usize, 0), transcript.held.items.len);
-    try transcript.appendStream(.model, null, " ");
+    try transcript.appendStream(.model, " ");
     transcript.endMessage();
-    try std.testing.expectEqual(@as(usize, 0), transcript.held.items.len);
-    try transcript.appendStream(.model, null, "fresh");
-    try std.testing.expectEqual(@as(usize, 3), transcript.entries.items.len);
-    try std.testing.expectEqualStrings("fresh", transcript.entries.items[2].content.model.items);
+    try transcript.appendStream(.model, "fresh");
+    try std.testing.expectEqual(@as(usize, 3), transcript.blocks().len);
+    try std.testing.expectEqualStrings("fresh", transcript.blocks()[2].content.model.items);
 }
 
-test "endMessage forces the next delta into a new block" {
+test "endMessage and beginRun force the next delta into a new block" {
     const gpa = std.testing.allocator;
     var transcript = Transcript.init(gpa);
     defer transcript.deinit();
 
-    try transcript.appendStream(.model, null, "a");
+    try transcript.appendStream(.model, "a");
     transcript.endMessage();
-    try transcript.appendStream(.model, null, "b");
-    try std.testing.expectEqual(@as(usize, 2), transcript.entries.items.len);
-}
+    try transcript.appendStream(.model, "b");
+    try std.testing.expectEqual(@as(usize, 2), transcript.blocks().len);
+    try std.testing.expectEqual(@as(?usize, 1), transcript.runIndex());
 
-test "discardMessage drops the open run so a retry starts clean" {
-    const gpa = std.testing.allocator;
-    var transcript = Transcript.init(gpa);
-    defer transcript.deinit();
-
-    try transcript.append(.user, .{}, "hi");
-    try transcript.appendStream(.model, null, "partial");
-    try std.testing.expectEqual(@as(usize, 2), transcript.entries.items.len);
-
-    transcript.discardMessage();
-    try std.testing.expectEqual(@as(usize, 1), transcript.entries.items.len);
-
-    try transcript.appendStream(.model, null, "fresh");
-    try std.testing.expectEqual(@as(usize, 2), transcript.entries.items.len);
-    try std.testing.expectEqualStrings("fresh", transcript.entries.items[1].content.model.items);
-
-    transcript.endMessage();
-    transcript.discardMessage();
-    try std.testing.expectEqual(@as(usize, 2), transcript.entries.items.len);
+    transcript.beginRun(.model);
+    try std.testing.expect(transcript.streaming());
+    try std.testing.expect(transcript.runIndex() == null);
+    try transcript.appendStream(.model, "c");
+    try std.testing.expectEqual(@as(usize, 3), transcript.blocks().len);
+    try std.testing.expectEqual(@as(?usize, 2), transcript.runIndex());
+    try std.testing.expectEqualStrings("c", transcript.blocks()[2].content.model.items);
 }
 
 test "truncate removes optimistic tail blocks" {
@@ -306,8 +206,8 @@ test "truncate removes optimistic tail blocks" {
     var transcript = Transcript.init(gpa);
     defer transcript.deinit();
 
-    try transcript.append(.user, .{}, "keep");
-    try transcript.append(.user, .{}, "rollback");
+    try transcript.append(&.{ .user = "keep" });
+    try transcript.append(&.{ .user = "rollback" });
     transcript.truncate(1);
     try std.testing.expectEqual(@as(usize, 1), transcript.blocks().len);
     try std.testing.expectEqualStrings("keep", transcript.blocks()[0].content.user.items);
@@ -318,20 +218,20 @@ test "rewind preserves only marked events after its checkpoint" {
     var transcript = Transcript.init(gpa);
     defer transcript.deinit();
 
-    try transcript.append(.event, .{}, "keep before checkpoint");
-    try transcript.append(.user, .{}, "drop user prompt");
-    try transcript.append(.event, .{ .survives_rewind = true }, "keep retry");
-    try transcript.append(.event, .{}, "drop ordinary event");
-    try transcript.appendStream(.model, null, "drop partial reply");
+    try transcript.append(&.{ .event = .{ .text = "keep before checkpoint" } });
+    try transcript.append(&.{ .user = "drop user prompt" });
+    try transcript.append(&.{ .event = .{ .text = "keep retry", .survives_rewind = true } });
+    try transcript.append(&.{ .event = .{ .text = "drop ordinary event" } });
+    try transcript.appendStream(.model, "drop partial reply");
     transcript.rewind(1);
 
-    const entries = transcript.blocks();
-    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    const kept = transcript.blocks();
+    try std.testing.expectEqual(@as(usize, 2), kept.len);
     try std.testing.expectEqualStrings(
         "keep before checkpoint",
-        entries[0].content.event.text.items,
+        kept[0].content.event.text.items,
     );
-    try std.testing.expectEqualStrings("keep retry", entries[1].content.event.text.items);
+    try std.testing.expectEqualStrings("keep retry", kept[1].content.event.text.items);
 }
 
 test "reasoning collects into a thinking block that the answer run does not extend" {
@@ -339,114 +239,11 @@ test "reasoning collects into a thinking block that the answer run does not exte
     var transcript = Transcript.init(gpa);
     defer transcript.deinit();
 
-    try transcript.appendStream(.thinking, test_account, "weigh ");
-    try transcript.appendStream(.thinking, test_account, "it");
-    try transcript.appendStream(.model, null, "answer");
-    try std.testing.expectEqual(@as(usize, 2), transcript.entries.items.len);
-    const reasoning = transcript.entries.items[0].content.thinking;
-    try std.testing.expectEqualStrings("weigh it", reasoning.text.items);
-    try std.testing.expectEqualStrings("answer", transcript.entries.items[1].content.model.items);
-}
-
-test "discard drops a partial message's reasoning and answer together" {
-    const gpa = std.testing.allocator;
-    var transcript = Transcript.init(gpa);
-    defer transcript.deinit();
-
-    try transcript.append(.user, .{}, "hi");
-    try transcript.appendStream(.thinking, test_account, "thinking");
-    try transcript.appendStream(.model, null, "partial");
-    try std.testing.expectEqual(@as(usize, 3), transcript.entries.items.len);
-
-    transcript.discardMessage();
-    try std.testing.expectEqual(@as(usize, 1), transcript.entries.items.len);
-
-    try transcript.appendStream(.thinking, test_account, "fresh");
-    try std.testing.expectEqual(@as(usize, 2), transcript.entries.items.len);
-    const reasoning = transcript.entries.items[1].content.thinking;
-    try std.testing.expectEqualStrings("fresh", reasoning.text.items);
-}
-
-test "a projection holds the reasoning of its own account alone" {
-    const gpa = std.testing.allocator;
-    var transcript = Transcript.init(gpa);
-    defer transcript.deinit();
-
-    try transcript.append(.event, .{}, "Drinky changed the model.");
-    try transcript.appendStream(.thinking, test_account, "weigh it");
-    try transcript.appendStream(.model, null, "answer");
-
-    const own = try transcript.projection(replaying(test_account));
-    try std.testing.expectEqual(@as(usize, 3), own.len);
-    try std.testing.expectEqualStrings("weigh it", own[1].content.thinking.text.items);
-
-    const other = try transcript.projection(replaying(other_account));
-    try std.testing.expectEqual(@as(usize, 2), other.len);
-    try std.testing.expect(other[0].content == .event);
-    try std.testing.expectEqualStrings("answer", other[1].content.model.items);
-
-    try std.testing.expectEqual(@as(usize, 3), transcript.blocks().len);
-    const again = try transcript.projection(replaying(test_account));
-    try std.testing.expectEqual(@as(usize, 3), again.len);
-    const signed_out = try transcript.projection(replaying(null));
-    try std.testing.expectEqual(@as(usize, 3), signed_out.len);
-}
-
-test "a projection hides its own reasoning when the request replays none" {
-    const gpa = std.testing.allocator;
-    var transcript = Transcript.init(gpa);
-    defer transcript.deinit();
-
-    try transcript.appendStream(.thinking, test_account, "weigh it");
-    try transcript.appendStream(.model, null, "answer");
-
-    const shown_blocks = try transcript.projection(silent(test_account));
-    try std.testing.expectEqual(@as(usize, 1), shown_blocks.len);
-    try std.testing.expectEqualStrings("answer", shown_blocks[0].content.model.items);
+    try transcript.appendStream(.thinking, "weigh ");
+    try transcript.appendStream(.thinking, "it");
+    try transcript.appendStream(.model, "answer");
     try std.testing.expectEqual(@as(usize, 2), transcript.blocks().len);
-    const replayed = try transcript.projection(replaying(test_account));
-    try std.testing.expectEqual(@as(usize, 2), replayed.len);
-}
-
-test "projectionChanges reports only a switch that hides or restores a block" {
-    const gpa = std.testing.allocator;
-    var transcript = Transcript.init(gpa);
-    defer transcript.deinit();
-
-    const own = replaying(test_account);
-    const other = replaying(other_account);
-    const signed_out = replaying(null);
-
-    try transcript.appendStream(.model, null, "answer");
-    try std.testing.expect(!transcript.projectionChanges(own, other));
-    try std.testing.expect(!transcript.projectionChanges(own, silent(test_account)));
-
-    try transcript.appendStream(.thinking, test_account, "weigh it");
-    try std.testing.expect(transcript.projectionChanges(own, other));
-    try std.testing.expect(transcript.projectionChanges(other, own));
-    try std.testing.expect(!transcript.projectionChanges(own, own));
-    try std.testing.expect(transcript.projectionChanges(own, silent(test_account)));
-    try std.testing.expect(!transcript.projectionChanges(other, silent(test_account)));
-    try std.testing.expect(!transcript.projectionChanges(signed_out, own));
-    try std.testing.expect(transcript.projectionChanges(signed_out, other));
-}
-
-test "dropAccount removes the reasoning of one account for good" {
-    const gpa = std.testing.allocator;
-    var transcript = Transcript.init(gpa);
-    defer transcript.deinit();
-
-    try transcript.appendStream(.thinking, test_account, "weigh it");
-    try transcript.appendStream(.model, null, "answer");
-    try transcript.appendStream(.thinking, other_account, "another slot");
-
-    try std.testing.expectEqual(@as(usize, 1), transcript.dropAccount(test_account));
-    try std.testing.expectEqual(@as(usize, 2), transcript.blocks().len);
-    try std.testing.expectEqualStrings("answer", transcript.blocks()[0].content.model.items);
-    const reasoning = transcript.blocks()[1].content.thinking;
-    try std.testing.expectEqualStrings("another slot", reasoning.text.items);
-    const own = try transcript.projection(replaying(test_account));
-    try std.testing.expectEqual(@as(usize, 1), own.len);
-    try std.testing.expectEqual(@as(usize, 0), transcript.dropAccount(.anthropic_api));
-    try std.testing.expectEqual(@as(usize, 2), transcript.blocks().len);
+    const reasoning = transcript.blocks()[0].content.thinking;
+    try std.testing.expectEqualStrings("weigh it", reasoning.items);
+    try std.testing.expectEqualStrings("answer", transcript.blocks()[1].content.model.items);
 }

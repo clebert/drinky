@@ -1,10 +1,12 @@
 const std = @import("std");
 
-const ai = @import("ai");
+const core = @import("core");
+const providers = @import("providers");
+const tools = @import("tools");
 
 const Client = @This();
 
-pub const api_url = "https://api.telegram.org";
+const api_url = "https://api.telegram.org";
 
 const response_bytes_max = 4 << 20;
 
@@ -14,7 +16,7 @@ pub const poll_connect_ms_min = 30_000;
 
 gpa: std.mem.Allocator,
 io: std.Io,
-base_url: []const u8,
+transport: ?providers.Transport,
 token: []const u8,
 connect_ms: u64,
 retry_after_s: u64 = 0,
@@ -33,6 +35,28 @@ pub const Error = error{
     Canceled,
 };
 
+pub const Class = union(enum) {
+    canceled,
+    permanent: Permanent,
+    rate_limited,
+    rejected,
+    transient,
+
+    pub const Permanent = enum { unauthorized, forbidden, conflict };
+
+    pub fn of(err: Error) Class {
+        return switch (err) {
+            error.Canceled => .canceled,
+            error.Unauthorized => .{ .permanent = .unauthorized },
+            error.Forbidden => .{ .permanent = .forbidden },
+            error.Conflict => .{ .permanent = .conflict },
+            error.RateLimited => .rate_limited,
+            error.Rejected => .rejected,
+            error.Unavailable, error.MalformedReply, error.OutOfMemory => .transient,
+        };
+    }
+};
+
 pub const Me = struct {
     id: i64,
     username: []u8,
@@ -42,19 +66,19 @@ pub const Me = struct {
     }
 };
 
-pub const Update = struct {
+const Update = struct {
     update_id: i64,
     message: ?Message,
     callback: ?Callback,
 
-    pub const Message = struct {
+    const Message = struct {
         message_id: i64,
         chat_id: i64,
         chat_private: bool,
         text: ?[]u8,
     };
 
-    pub const Callback = struct {
+    const Callback = struct {
         id: []u8,
         message_id: i64,
         chat_id: i64,
@@ -62,24 +86,16 @@ pub const Update = struct {
     };
 };
 
-pub const Updates = struct {
+const Updates = struct {
     items: []Update,
+
+    const empty: Updates = .{ .items = &.{} };
 
     pub fn deinit(self: *const Updates, gpa: std.mem.Allocator) void {
         for (self.items) |update| freeUpdate(gpa, &update);
         gpa.free(self.items);
     }
 };
-
-fn freeUpdate(gpa: std.mem.Allocator, update: *const Update) void {
-    if (update.message) |message| {
-        if (message.text) |text| gpa.free(text);
-    }
-    if (update.callback) |callback| {
-        gpa.free(callback.id);
-        gpa.free(callback.data);
-    }
-}
 
 pub const SendOptions = struct {
     reply_to: ?i64 = null,
@@ -93,7 +109,7 @@ pub const EditOptions = struct {
     markup: ?[]const u8 = null,
 };
 
-pub const Target = struct {
+const Target = struct {
     chat_id: i64,
     message_id: i64,
 };
@@ -103,17 +119,45 @@ pub const Command = struct {
     description: []const u8,
 };
 
-const Raw = struct {
-    bytes: []const u8,
+pub const Poll = struct {
+    commands: ?[]const Command,
+    step: Step = .webhook,
+    offset: ?i64 = null,
 
-    pub fn jsonStringify(self: Raw, jws: anytype) !void {
-        try jws.print("{s}", .{self.bytes});
+    const Step = enum { webhook, commands, confirmation, updates };
+
+    pub fn next(self: *Poll, client: *Client, timeout_s: u64) Error!Updates {
+        switch (self.step) {
+            .webhook => {
+                try client.deleteWebhook();
+                self.step = if (self.commands == null) .confirmation else .commands;
+                return .empty;
+            },
+            .commands => {
+                try client.setMyCommands(self.commands.?);
+                self.step = .confirmation;
+                return .empty;
+            },
+            .confirmation => {
+                const newest = try client.getUpdates(-1, 0);
+                defer newest.deinit(client.gpa);
+                self.advance(&newest);
+                self.step = .updates;
+                return .empty;
+            },
+            .updates => {
+                const updates = try client.getUpdates(self.offset, timeout_s);
+                self.advance(&updates);
+                return updates;
+            },
+        }
+    }
+
+    fn advance(self: *Poll, updates: *const Updates) void {
+        if (updates.items.len == 0) return;
+        self.offset = updates.items[updates.items.len - 1].update_id + 1;
     }
 };
-
-fn raw(maybe_bytes: ?[]const u8) ?Raw {
-    return .{ .bytes = maybe_bytes orelse return null };
-}
 
 const Reply = struct {
     parsed: std.json.Parsed(std.json.Value),
@@ -122,14 +166,25 @@ const Reply = struct {
         self.parsed.deinit();
     }
 
-    fn result(self: *const Reply) Error!std.json.Value {
-        const object = switch (self.parsed.value) {
-            .object => |object| object,
-            else => return error.MalformedReply,
-        };
-        return object.get("result") orelse error.MalformedReply;
+    fn result(self: *const Reply) Error!*const std.json.Value {
+        const object = providers.json.object(&self.parsed.value) orelse return error.MalformedReply;
+        return object.getPtr("result") orelse error.MalformedReply;
     }
 };
+
+fn freeUpdate(gpa: std.mem.Allocator, update: *const Update) void {
+    if (update.message) |message| {
+        if (message.text) |text| gpa.free(text);
+    }
+    if (update.callback) |callback| {
+        gpa.free(callback.id);
+        gpa.free(callback.data);
+    }
+}
+
+fn raw(maybe_bytes: ?[]const u8) ?providers.json.Raw {
+    return .{ .bytes = maybe_bytes orelse return null };
+}
 
 pub fn pollConnectMs(connect_ms: u64) u64 {
     return @max(connect_ms, poll_connect_ms_min);
@@ -153,52 +208,57 @@ pub fn description(self: *const Client) []const u8 {
     return self.description_buffer[0..self.description_length];
 }
 
+pub fn retryAfterMs(self: *const Client, delay_ms_max: u64) u64 {
+    return @min(self.retry_after_s *| std.time.ms_per_s, delay_ms_max);
+}
+
 pub fn getMe(self: *Client) Error!Me {
-    const reply = try self.call("getMe", "{}");
+    const reply = try self.call(&.{ .method = "getMe", .body = "{}" });
     defer reply.deinit();
-    const result = objectOf(try reply.result()) orelse return error.MalformedReply;
-    const id = integerOf(result.get("id")) orelse return error.MalformedReply;
-    const username = stringOf(result.get("username")) orelse return error.MalformedReply;
+    const result = providers.json.object(try reply.result()) orelse return error.MalformedReply;
+    const id = providers.json.integer(result.getPtr("id")) orelse return error.MalformedReply;
+    const username = providers.json.string(result.getPtr("username")) orelse
+        return error.MalformedReply;
     return .{ .id = id, .username = try self.gpa.dupe(u8, username) };
 }
 
-pub fn deleteWebhook(self: *Client) Error!void {
-    const reply = try self.call("deleteWebhook", "{}");
+fn deleteWebhook(self: *Client) Error!void {
+    const reply = try self.call(&.{ .method = "deleteWebhook", .body = "{}" });
     defer reply.deinit();
     _ = try reply.result();
 }
 
-pub fn getUpdates(self: *Client, offset: ?i64, timeout_s: u64) Error!Updates {
+fn getUpdates(self: *Client, offset: ?i64, timeout_s: u64) Error!Updates {
     const body = try std.json.Stringify.valueAlloc(self.gpa, .{
         .offset = offset,
         .timeout = timeout_s,
         .allowed_updates = [_][]const u8{ "message", "callback_query" },
     }, .{ .emit_null_optional_fields = false });
     defer self.gpa.free(body);
-    const reply = try self.call("getUpdates", body);
+    const reply = try self.call(&.{ .method = "getUpdates", .body = body });
     defer reply.deinit();
-    const list = switch (try reply.result()) {
-        .array => |array| array,
-        else => return error.MalformedReply,
-    };
+    const list = providers.json.array(try reply.result()) orelse return error.MalformedReply;
     var updates: std.ArrayList(Update) = .empty;
     errdefer {
         for (updates.items) |*update| freeUpdate(self.gpa, update);
         updates.deinit(self.gpa);
     }
     try updates.ensureTotalCapacity(self.gpa, list.items.len);
-    for (list.items) |value| {
-        const update = objectOf(value) orelse return error.MalformedReply;
-        const update_id = integerOf(update.get("update_id")) orelse return error.MalformedReply;
+    for (list.items) |*value| {
+        const update = providers.json.object(value) orelse return error.MalformedReply;
+        const update_id = providers.json.integer(update.getPtr("update_id")) orelse
+            return error.MalformedReply;
         var message: ?Update.Message = null;
-        if (objectOf(update.get("message"))) |object| {
-            const chat = objectOf(object.get("chat")) orelse return error.MalformedReply;
-            const maybe_text = stringOf(object.get("text"));
+        if (providers.json.object(update.getPtr("message"))) |object| {
+            const chat = providers.json.object(object.getPtr("chat")) orelse
+                return error.MalformedReply;
+            const maybe_text = providers.json.string(object.getPtr("text"));
             message = .{
-                .message_id = integerOf(object.get("message_id")) orelse
+                .message_id = providers.json.integer(object.getPtr("message_id")) orelse
                     return error.MalformedReply,
-                .chat_id = integerOf(chat.get("id")) orelse return error.MalformedReply,
-                .chat_private = if (stringOf(chat.get("type"))) |kind|
+                .chat_id = providers.json.integer(chat.getPtr("id")) orelse
+                    return error.MalformedReply,
+                .chat_private = if (providers.json.string(chat.getPtr("type"))) |kind|
                     std.mem.eql(u8, kind, "private")
                 else
                     false,
@@ -207,7 +267,9 @@ pub fn getUpdates(self: *Client, offset: ?i64, timeout_s: u64) Error!Updates {
         }
         errdefer if (message) |found| if (found.text) |text| self.gpa.free(text);
         var callback: ?Update.Callback = null;
-        if (objectOf(update.get("callback_query"))) |object| callback = try self.parseCallback(object);
+        if (providers.json.object(update.getPtr("callback_query"))) |object| {
+            callback = try self.parseCallback(object);
+        }
         updates.appendAssumeCapacity(.{
             .update_id = update_id,
             .message = message,
@@ -217,25 +279,26 @@ pub fn getUpdates(self: *Client, offset: ?i64, timeout_s: u64) Error!Updates {
     return .{ .items = try updates.toOwnedSlice(self.gpa) };
 }
 
-fn parseCallback(self: *Client, object: std.json.ObjectMap) Error!?Update.Callback {
-    const id = stringOf(object.get("id")) orelse return error.MalformedReply;
-    const message = objectOf(object.get("message")) orelse return null;
-    const data = stringOf(object.get("data")) orelse return null;
-    const chat = objectOf(message.get("chat")) orelse return error.MalformedReply;
+fn parseCallback(self: *Client, object: *const std.json.ObjectMap) Error!?Update.Callback {
+    const id = providers.json.string(object.getPtr("id")) orelse return error.MalformedReply;
+    const message = providers.json.object(object.getPtr("message")) orelse return null;
+    const data = providers.json.string(object.getPtr("data")) orelse return null;
+    const chat = providers.json.object(message.getPtr("chat")) orelse return error.MalformedReply;
     const id_copy = try self.gpa.dupe(u8, id);
     errdefer self.gpa.free(id_copy);
     return .{
         .id = id_copy,
-        .message_id = integerOf(message.get("message_id")) orelse return error.MalformedReply,
-        .chat_id = integerOf(chat.get("id")) orelse return error.MalformedReply,
+        .message_id = providers.json.integer(message.getPtr("message_id")) orelse
+            return error.MalformedReply,
+        .chat_id = providers.json.integer(chat.getPtr("id")) orelse return error.MalformedReply,
         .data = try self.gpa.dupe(u8, data),
     };
 }
 
-pub fn setMyCommands(self: *Client, commands: []const Command) Error!void {
+fn setMyCommands(self: *Client, commands: []const Command) Error!void {
     const body = try std.json.Stringify.valueAlloc(self.gpa, .{ .commands = commands }, .{});
     defer self.gpa.free(body);
-    const reply = try self.call("setMyCommands", body);
+    const reply = try self.call(&.{ .method = "setMyCommands", .body = body });
     defer reply.deinit();
     _ = try reply.result();
 }
@@ -259,10 +322,10 @@ pub fn sendMessage(
         .reply_markup = raw(options.markup),
     }, .{ .emit_null_optional_fields = false });
     defer self.gpa.free(body);
-    const reply = try self.call("sendMessage", body);
+    const reply = try self.call(&.{ .method = "sendMessage", .body = body });
     defer reply.deinit();
-    const result = objectOf(try reply.result()) orelse return error.MalformedReply;
-    return integerOf(result.get("message_id")) orelse error.MalformedReply;
+    const result = providers.json.object(try reply.result()) orelse return error.MalformedReply;
+    return providers.json.integer(result.getPtr("message_id")) orelse error.MalformedReply;
 }
 
 pub fn editMessageText(
@@ -279,7 +342,10 @@ pub fn editMessageText(
         .reply_markup = raw(options.markup),
     }, .{ .emit_null_optional_fields = false });
     defer self.gpa.free(body);
-    const reply = self.call("editMessageText", body) catch |err| switch (err) {
+    const reply = self.call(&.{
+        .method = "editMessageText",
+        .body = body,
+    }) catch |err| switch (err) {
         error.Rejected => {
             if (std.mem.indexOf(u8, self.description(), "message is not modified") != null) return;
             return err;
@@ -297,7 +363,7 @@ pub fn deleteMessage(self: *Client, target: Target) Error!void {
         .{},
     );
     defer self.gpa.free(body);
-    const reply = try self.call("deleteMessage", body);
+    const reply = try self.call(&.{ .method = "deleteMessage", .body = body });
     defer reply.deinit();
     _ = try reply.result();
 }
@@ -309,78 +375,54 @@ pub fn answerCallbackQuery(self: *Client, query_id: []const u8) Error!void {
         .{},
     );
     defer self.gpa.free(body);
-    const reply = try self.call("answerCallbackQuery", body);
+    const reply = try self.call(&.{ .method = "answerCallbackQuery", .body = body });
     defer reply.deinit();
     _ = try reply.result();
 }
 
-fn call(self: *Client, method: []const u8, body: []const u8) Error!Reply {
+fn call(
+    self: *Client,
+    method_call: *const struct { method: []const u8, body: []const u8 },
+) Error!Reply {
     const url = try std.fmt.allocPrint(
         self.gpa,
-        "{s}/bot{s}/{s}",
-        .{ self.base_url, self.token, method },
+        api_url ++ "/bot{s}/{s}",
+        .{ self.token, method_call.method },
     );
     defer self.gpa.free(url);
-    var out: ?Response = null;
-    ai.net.withTimeout(
+    const request: providers.Transport.Request = .{ .url = url, .body = method_call.body };
+    const response = core.timeout.run(
         self.io,
         self.connect_ms,
         post,
-        .{ self.gpa, self.io, url, body, &out },
-    ) catch |err| {
-        if (out) |response| self.gpa.free(response.body);
-        return switch (err) {
-            error.OutOfMemory => error.OutOfMemory,
-            error.Canceled => error.Canceled,
-            else => error.Unavailable,
-        };
+        .{ self.gpa, self.io, self.transport, &request },
+        releaseResponse,
+    ) catch |err| return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.Canceled => error.Canceled,
+        else => error.Unavailable,
     };
-    const response = out orelse return error.Unavailable;
     defer self.gpa.free(response.body);
     return self.classify(&response);
 }
 
-const Response = struct {
-    status: std.http.Status,
-    body: []u8,
-};
-
 fn post(
     gpa: std.mem.Allocator,
     io: std.Io,
-    url: []const u8,
-    body: []const u8,
-    out: *?Response,
-) !void {
-    const uri = try std.Uri.parse(url);
-    var client: std.http.Client = .{ .allocator = gpa, .io = io };
-    defer client.deinit();
-
-    var request = try client.request(.POST, uri, .{
-        .keep_alive = false,
-        .headers = .{ .content_type = .{ .override = "application/json" } },
-    });
-    defer request.deinit();
-
-    request.transfer_encoding = .{ .content_length = body.len };
-    var send_body = try request.sendBodyUnflushed(&.{});
-    try send_body.writer.writeAll(body);
-    try send_body.end();
-    try request.connection.?.flush();
-
-    var redirect_buffer: [2048]u8 = undefined;
-    var response = try request.receiveHead(&redirect_buffer);
-
-    const decompress_buffer = try ai.net.decompressBuffer(gpa, response.head.content_encoding);
-    defer if (decompress_buffer.len != 0) gpa.free(decompress_buffer);
-    var decompress: std.http.Decompress = undefined;
-    var transfer_buffer: [4096]u8 = undefined;
-    const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
-    const bytes = try reader.allocRemaining(gpa, .limited(response_bytes_max));
-    out.* = .{ .status = response.head.status, .body = bytes };
+    transport: ?providers.Transport,
+    request: *const providers.Transport.Request,
+) !providers.Http.Response {
+    return providers.Http.fetch(gpa, io, transport, request, response_bytes_max);
 }
 
-fn classify(self: *Client, response: *const Response) Error!Reply {
+fn releaseResponse(
+    response: *const providers.Http.Response,
+    args: *const std.meta.ArgsTuple(@TypeOf(post)),
+) void {
+    args[0].free(response.body);
+}
+
+fn classify(self: *Client, response: *const providers.Http.Response) Error!Reply {
     const parsed = std.json.parseFromSlice(std.json.Value, self.gpa, response.body, .{}) catch |err|
         switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -389,22 +431,21 @@ fn classify(self: *Client, response: *const Response) Error!Reply {
     if (response.status == .ok) {
         const reply: Reply = .{ .parsed = parsed orelse return error.MalformedReply };
         errdefer reply.deinit();
-        const object = objectOf(reply.parsed.value) orelse return error.MalformedReply;
-        const ok = switch (object.get("ok") orelse return error.MalformedReply) {
-            .bool => |value| value,
-            else => return error.MalformedReply,
-        };
+        const object = providers.json.object(&reply.parsed.value) orelse
+            return error.MalformedReply;
+        const ok = providers.json.boolean(object.getPtr("ok")) orelse return error.MalformedReply;
         if (!ok) return error.MalformedReply;
         return reply;
     }
     defer if (parsed) |value| value.deinit();
-    self.keepDescription(parsed);
+    const value: ?*const std.json.Value = if (parsed) |*reply| &reply.value else null;
+    self.keepDescription(value);
     return switch (response.status) {
         .unauthorized => error.Unauthorized,
         .forbidden => error.Forbidden,
         .conflict => error.Conflict,
         .too_many_requests => {
-            self.retry_after_s = retryAfter(parsed) orelse 1;
+            self.retry_after_s = retryAfter(value) orelse 1;
             return error.RateLimited;
         },
         else => if (response.status.class() == .client_error)
@@ -414,45 +455,19 @@ fn classify(self: *Client, response: *const Response) Error!Reply {
     };
 }
 
-fn keepDescription(self: *Client, parsed: ?std.json.Parsed(std.json.Value)) void {
+fn keepDescription(self: *Client, value: ?*const std.json.Value) void {
     self.description_length = 0;
-    const reply = parsed orelse return;
-    const object = objectOf(reply.value) orelse return;
-    const text = stringOf(object.get("description")) orelse return;
-    var length = @min(text.len, self.description_buffer.len);
-    while (length > 0 and length < text.len and (text[length] & 0xC0) == 0x80) length -= 1;
-    @memcpy(self.description_buffer[0..length], text[0..length]);
-    self.description_length = length;
+    const object = providers.json.object(value) orelse return;
+    const text = providers.json.string(object.getPtr("description")) orelse return;
+    const kept = tools.format.truncate(text, self.description_buffer.len);
+    @memcpy(self.description_buffer[0..kept.len], kept);
+    self.description_length = kept.len;
 }
 
-fn retryAfter(parsed: ?std.json.Parsed(std.json.Value)) ?u64 {
-    const reply = parsed orelse return null;
-    const object = objectOf(reply.value) orelse return null;
-    const parameters = objectOf(object.get("parameters")) orelse return null;
-    const seconds = integerOf(parameters.get("retry_after")) orelse return null;
-    if (seconds < 0) return null;
-    return @intCast(seconds);
-}
-
-fn objectOf(maybe_value: ?std.json.Value) ?std.json.ObjectMap {
-    return switch (maybe_value orelse return null) {
-        .object => |object| object,
-        else => null,
-    };
-}
-
-fn integerOf(maybe_value: ?std.json.Value) ?i64 {
-    return switch (maybe_value orelse return null) {
-        .integer => |value| value,
-        else => null,
-    };
-}
-
-fn stringOf(maybe_value: ?std.json.Value) ?[]const u8 {
-    return switch (maybe_value orelse return null) {
-        .string => |value| value,
-        else => null,
-    };
+fn retryAfter(value: ?*const std.json.Value) ?u64 {
+    const object = providers.json.object(value) orelse return null;
+    const parameters = providers.json.object(object.getPtr("parameters")) orelse return null;
+    return providers.json.unsigned(parameters.getPtr("retry_after"));
 }
 
 const testing = @import("testing.zig");
@@ -468,6 +483,31 @@ test validToken {
     try std.testing.expect(!validToken("123:sec ret"));
     try std.testing.expect(!validToken("123:sec/ret"));
     try std.testing.expect(!validToken("123:sec\nret"));
+}
+
+fn testClient(telegram: *testing.Telegram) Client {
+    return .{
+        .gpa = telegram.gpa,
+        .io = telegram.io,
+        .transport = telegram.transport(),
+        .token = "42:secret",
+        .connect_ms = 5_000,
+    };
+}
+
+test "each request error falls into the class that its retry follows" {
+    const cases = [_]struct { err: Error, class: Class }{
+        .{ .err = error.Canceled, .class = .canceled },
+        .{ .err = error.Unauthorized, .class = .{ .permanent = .unauthorized } },
+        .{ .err = error.Forbidden, .class = .{ .permanent = .forbidden } },
+        .{ .err = error.Conflict, .class = .{ .permanent = .conflict } },
+        .{ .err = error.RateLimited, .class = .rate_limited },
+        .{ .err = error.Rejected, .class = .rejected },
+        .{ .err = error.Unavailable, .class = .transient },
+        .{ .err = error.MalformedReply, .class = .transient },
+        .{ .err = error.OutOfMemory, .class = .transient },
+    };
+    for (cases) |case| try std.testing.expectEqual(case.class, Class.of(case.err));
 }
 
 test pollTimeoutSeconds {
@@ -486,61 +526,57 @@ test pollConnectMs {
 
 test "getMe names the bot, and the request carries the token in the path alone" {
     const gpa = std.testing.allocator;
-    var threaded: std.Io.Threaded = .init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    var server = try testing.Server.init(gpa, io, &.{.{ .method = "getMe", .replies = &.{
-        .{ .body = "{\"ok\":true,\"result\":{\"id\":42,\"is_bot\":true,\"username\":\"drinky_bot\"}}" },
+    const io = std.testing.io;
+    var telegram = try testing.Telegram.init(gpa, io, &.{.{ .method = "getMe", .replies = &.{
+        .{
+            .body = "{\"ok\":true," ++
+                "\"result\":{\"id\":42,\"is_bot\":true,\"username\":\"drinky_bot\"}}",
+        },
     } }});
-    defer server.deinit();
-    try server.start();
-    var url_buffer: [64]u8 = undefined;
-    var client: Client = .{
-        .gpa = gpa,
-        .io = io,
-        .base_url = server.url(&url_buffer),
-        .token = "42:secret",
-        .connect_ms = 5_000,
-    };
+    defer telegram.deinit();
+    var client = testClient(&telegram);
 
     const me = try client.getMe();
     defer me.deinit(gpa);
     try std.testing.expectEqual(@as(i64, 42), me.id);
     try std.testing.expectEqualStrings("drinky_bot", me.username);
-    try server.finish();
-    try std.testing.expectEqualStrings("/bot42:secret/getMe", server.requests.items[0].path);
-    try std.testing.expectEqualStrings("{}", server.requests.items[0].body);
+    try telegram.finish();
+    try std.testing.expectEqualStrings("/bot42:secret/getMe", telegram.requests.items[0].path);
+    try std.testing.expectEqualStrings("{}", telegram.requests.items[0].body);
 }
 
-test "getUpdates reads a text message, a non-text message, a tap, and the chat type" {
+test "a poll reads a text message, a non-text message, a tap, and the chat type" {
     const gpa = std.testing.allocator;
-    var threaded: std.Io.Threaded = .init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    var server = try testing.Server.init(gpa, io, &.{.{ .method = "getUpdates", .replies = &.{
-        .{ .body =
+    const io = std.testing.io;
+    const reply_body =
         \\{"ok":true,"result":[
-        \\{"update_id":7,"message":{"message_id":1,"date":0,"chat":{"id":99,"type":"private"},"text":"hello"}},
-        \\{"update_id":8,"message":{"message_id":2,"date":0,"chat":{"id":99,"type":"private"},"sticker":{}}},
-        \\{"update_id":9,"message":{"message_id":3,"date":0,"chat":{"id":-5,"type":"group"},"text":"hi"}},
-        \\{"update_id":10,"edited_message":{"message_id":1,"date":0,"chat":{"id":99,"type":"private"},"text":"hello!"}},
-        \\{"update_id":11,"callback_query":{"id":"4407","from":{"id":5},"chat_instance":"c","message":{"message_id":50,"date":0,"chat":{"id":99,"type":"private"},"text":"Thinking"},"data":"cancel:3"}},
-        \\{"update_id":12,"callback_query":{"id":"4408","from":{"id":5},"chat_instance":"c","inline_message_id":"i"}}
+        \\{"update_id":7,"message":{"message_id":1,"date":0,"chat":{"id":99,"type":"private"},
+        \\"text":"hello"}},
+        \\{"update_id":8,"message":{"message_id":2,"date":0,"chat":{"id":99,"type":"private"},
+        \\"sticker":{}}},
+        \\{"update_id":9,"message":{"message_id":3,"date":0,"chat":{"id":-5,"type":"group"},
+        \\"text":"hi"}},
+        \\{"update_id":10,"edited_message":{"message_id":1,"date":0,"chat":{"id":99,
+        \\"type":"private"},"text":"hello!"}},
+        \\{"update_id":11,"callback_query":{"id":"4407","from":{"id":5},"chat_instance":"c",
+        \\"message":{"message_id":50,"date":0,"chat":{"id":99,"type":"private"},"text":"Thinking"},
+        \\"data":"cancel:3"}},
+        \\{"update_id":12,"callback_query":{"id":"4408","from":{"id":5},"chat_instance":"c",
+        \\"inline_message_id":"i"}}
         \\]}
+    ;
+    var telegram = try testing.Telegram.init(gpa, io, &.{ testing.webhook_deleted, .{
+        .method = "getUpdates",
+        .replies = &.{
+            .{ .body = "{\"ok\":true,\"result\":[{\"update_id\":6}]}" },
+            .{ .body = reply_body },
         },
-    } }});
-    defer server.deinit();
-    try server.start();
-    var url_buffer: [64]u8 = undefined;
-    var client: Client = .{
-        .gpa = gpa,
-        .io = io,
-        .base_url = server.url(&url_buffer),
-        .token = "t",
-        .connect_ms = 5_000,
-    };
+    } });
+    defer telegram.deinit();
+    var client = testClient(&telegram);
 
-    const updates = try client.getUpdates(7, 25);
+    var poll = try confirmedPoll(&client);
+    const updates = try poll.next(&client, 25);
     defer updates.deinit(gpa);
     try std.testing.expectEqual(@as(usize, 6), updates.items.len);
     try std.testing.expectEqual(@as(i64, 7), updates.items[0].update_id);
@@ -559,103 +595,99 @@ test "getUpdates reads a text message, a non-text message, a tap, and the chat t
     try std.testing.expectEqualStrings("cancel:3", tap.data);
     try std.testing.expect(updates.items[4].message == null);
     try std.testing.expect(updates.items[5].callback == null);
-    try server.finish();
+    try telegram.finish();
+    try std.testing.expectEqualStrings(
+        "{\"offset\":-1,\"timeout\":0,\"allowed_updates\":[\"message\",\"callback_query\"]}",
+        telegram.requests.items[1].body,
+    );
     try std.testing.expectEqualStrings(
         "{\"offset\":7,\"timeout\":25,\"allowed_updates\":[\"message\",\"callback_query\"]}",
-        server.requests.items[0].body,
+        telegram.requests.items[2].body,
     );
+}
+
+fn confirmedPoll(client: *Client) Error!Poll {
+    var poll: Poll = .{ .commands = null };
+    for (0..2) |_| (try poll.next(client, 1)).deinit(client.gpa);
+    return poll;
 }
 
 test "a malformed later update fails the poll without a leak" {
     const gpa = std.testing.allocator;
-    var threaded: std.Io.Threaded = .init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    var server = try testing.Server.init(gpa, io, &.{.{ .method = "getUpdates", .replies = &.{
-        .{ .body =
+    const io = std.testing.io;
+    const reply_body =
         \\{"ok":true,"result":[
-        \\{"update_id":7,"message":{"message_id":1,"date":0,"chat":{"id":99,"type":"private"},"text":"kept"}},
-        \\{"update_id":8,"message":{"message_id":2,"date":0,"chat":{"id":99,"type":"private"},"text":"kept too"}},
+        \\{"update_id":7,"message":{"message_id":1,"date":0,"chat":{"id":99,"type":"private"},
+        \\"text":"kept"}},
+        \\{"update_id":8,"message":{"message_id":2,"date":0,"chat":{"id":99,"type":"private"},
+        \\"text":"kept too"}},
         \\{"message":{"message_id":3,"date":0,"chat":{"id":99,"type":"private"},"text":"no id"}}
         \\]}
-        },
-    } }});
-    defer server.deinit();
-    try server.start();
-    var url_buffer: [64]u8 = undefined;
-    var client: Client = .{
-        .gpa = gpa,
-        .io = io,
-        .base_url = server.url(&url_buffer),
-        .token = "t",
-        .connect_ms = 5_000,
-    };
+    ;
+    var telegram = try testing.Telegram.init(gpa, io, &.{ testing.webhook_deleted, .{
+        .method = "getUpdates",
+        .replies = &.{ .{ .body = testing.ok_empty }, .{ .body = reply_body } },
+    } });
+    defer telegram.deinit();
+    var client = testClient(&telegram);
 
-    try std.testing.expectError(error.MalformedReply, client.getUpdates(null, 1));
-    try server.finish();
+    var poll = try confirmedPoll(&client);
+    try std.testing.expectError(error.MalformedReply, poll.next(&client, 1));
+    try telegram.finish();
 }
 
 test "sendMessage returns the message id and states its options" {
     const gpa = std.testing.allocator;
-    var threaded: std.Io.Threaded = .init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    var server = try testing.Server.init(gpa, io, &.{.{ .method = "sendMessage", .replies = &.{
+    const io = std.testing.io;
+    var telegram = try testing.Telegram.init(gpa, io, &.{.{ .method = "sendMessage", .replies = &.{
         .{ .body = "{\"ok\":true,\"result\":{\"message_id\":314}}" },
         .{ .body = "{\"ok\":true,\"result\":{\"message_id\":315}}" },
     } }});
-    defer server.deinit();
-    try server.start();
-    var url_buffer: [64]u8 = undefined;
-    var client: Client = .{
-        .gpa = gpa,
-        .io = io,
-        .base_url = server.url(&url_buffer),
-        .token = "t",
-        .connect_ms = 5_000,
-    };
+    defer telegram.deinit();
+    var client = testClient(&telegram);
 
-    try std.testing.expectEqual(@as(i64, 314), try client.sendMessage(99, "Event: hi", &.{}));
+    try std.testing.expectEqual(@as(i64, 314), try client.sendMessage(99, "hi", &.{}));
     try std.testing.expectEqual(@as(i64, 315), try client.sendMessage(99, "<b>x</b>", &.{
         .reply_to = 12,
         .disable_notification = true,
         .parse_mode = "HTML",
-        .markup = "{\"inline_keyboard\":[[{\"text\":\"Cancel\",\"callback_data\":\"close:1\"}]]}",
+        .markup = "{\"inline_keyboard\":[[{\"text\":\"Cancel turn\"," ++
+            "\"callback_data\":\"cancel:1\"}]]}",
     }));
-    try server.finish();
+    try telegram.finish();
     try std.testing.expectEqualStrings(
-        "{\"chat_id\":99,\"text\":\"Event: hi\",\"disable_notification\":false}",
-        server.requests.items[0].body,
+        "{\"chat_id\":99,\"text\":\"hi\",\"disable_notification\":false}",
+        telegram.requests.items[0].body,
     );
     try std.testing.expectEqualStrings(
         "{\"chat_id\":99,\"text\":\"<b>x</b>\",\"disable_notification\":true," ++
             "\"parse_mode\":\"HTML\",\"reply_parameters\":{\"message_id\":12}," ++
-            "\"reply_markup\":{\"inline_keyboard\":[[{\"text\":\"Cancel\",\"callback_data\":\"close:1\"}]]}}",
-        server.requests.items[1].body,
+            "\"reply_markup\":{\"inline_keyboard\":[[{\"text\":\"Cancel turn\"," ++
+            "\"callback_data\":\"cancel:1\"}]]}}",
+        telegram.requests.items[1].body,
     );
 }
 
 test "editMessageText states its target and keyboard, and an unchanged text counts as success" {
     const gpa = std.testing.allocator;
-    var threaded: std.Io.Threaded = .init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    var server = try testing.Server.init(gpa, io, &.{.{ .method = "editMessageText", .replies = &.{
+    const io = std.testing.io;
+    const scripts = [_]testing.Script{.{ .method = "editMessageText", .replies = &.{
         .{ .body = "{\"ok\":true,\"result\":{\"message_id\":314}}" },
         .{ .body = "{\"ok\":true,\"result\":{\"message_id\":314}}" },
-        .{ .status = 400, .body = "{\"ok\":false,\"error_code\":400,\"description\":\"Bad Request: message is not modified\"}" },
-        .{ .status = 400, .body = "{\"ok\":false,\"error_code\":400,\"description\":\"Bad Request: message to edit not found\"}" },
-    } }});
-    defer server.deinit();
-    try server.start();
-    var url_buffer: [64]u8 = undefined;
-    var client: Client = .{
-        .gpa = gpa,
-        .io = io,
-        .base_url = server.url(&url_buffer),
-        .token = "t",
-        .connect_ms = 5_000,
-    };
+        .{
+            .status = 400,
+            .body = "{\"ok\":false,\"error_code\":400," ++
+                "\"description\":\"Bad Request: message is not modified\"}",
+        },
+        .{
+            .status = 400,
+            .body = "{\"ok\":false,\"error_code\":400," ++
+                "\"description\":\"Bad Request: message to edit not found\"}",
+        },
+    } }};
+    var telegram = try testing.Telegram.init(gpa, io, &scripts);
+    defer telegram.deinit();
+    var client = testClient(&telegram);
 
     const target: Target = .{ .chat_id = 99, .message_id = 314 };
     try client.editMessageText(target, "Writing", &.{});
@@ -668,189 +700,176 @@ test "editMessageText states its target and keyboard, and an unchanged text coun
         error.Rejected,
         client.editMessageText(.{ .chat_id = 99, .message_id = 315 }, "Writing", &.{}),
     );
-    try server.finish();
+    try telegram.finish();
     try std.testing.expectEqualStrings(
         "{\"chat_id\":99,\"message_id\":314,\"text\":\"Writing\"}",
-        server.requests.items[0].body,
+        telegram.requests.items[0].body,
     );
     try std.testing.expectEqualStrings(
         "{\"chat_id\":99,\"message_id\":314,\"text\":\"<b>Writing</b>\",\"parse_mode\":\"HTML\"," ++
             "\"reply_markup\":{\"inline_keyboard\":[]}}",
-        server.requests.items[1].body,
+        telegram.requests.items[1].body,
     );
 }
 
 test "deleteMessage names the message it takes out of the chat" {
     const gpa = std.testing.allocator;
-    var threaded: std.Io.Threaded = .init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    var server = try testing.Server.init(gpa, io, &.{.{ .method = "deleteMessage", .replies = &.{
+    const io = std.testing.io;
+    const scripts = [_]testing.Script{.{ .method = "deleteMessage", .replies = &.{
         .{ .body = "{\"ok\":true,\"result\":true}" },
-        .{ .status = 400, .body = "{\"ok\":false,\"error_code\":400,\"description\":\"Bad Request: message to delete not found\"}" },
-    } }});
-    defer server.deinit();
-    try server.start();
-    var url_buffer: [64]u8 = undefined;
-    var client: Client = .{
-        .gpa = gpa,
-        .io = io,
-        .base_url = server.url(&url_buffer),
-        .token = "t",
-        .connect_ms = 5_000,
-    };
+        .{
+            .status = 400,
+            .body = "{\"ok\":false,\"error_code\":400," ++
+                "\"description\":\"Bad Request: message to delete not found\"}",
+        },
+    } }};
+    var telegram = try testing.Telegram.init(gpa, io, &scripts);
+    defer telegram.deinit();
+    var client = testClient(&telegram);
 
     try client.deleteMessage(.{ .chat_id = 99, .message_id = 314 });
     try std.testing.expectError(
         error.Rejected,
         client.deleteMessage(.{ .chat_id = 99, .message_id = 315 }),
     );
-    try server.finish();
+    try telegram.finish();
     try std.testing.expectEqualStrings(
         "{\"chat_id\":99,\"message_id\":314}",
-        server.requests.items[0].body,
+        telegram.requests.items[0].body,
     );
 }
 
 test "answerCallbackQuery names the query alone" {
     const gpa = std.testing.allocator;
-    var threaded: std.Io.Threaded = .init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    var server = try testing.Server.init(gpa, io, &.{.{ .method = "answerCallbackQuery", .replies = &.{
-        .{ .body = "{\"ok\":true,\"result\":true}" },
-    } }});
-    defer server.deinit();
-    try server.start();
-    var url_buffer: [64]u8 = undefined;
-    var client: Client = .{
-        .gpa = gpa,
-        .io = io,
-        .base_url = server.url(&url_buffer),
-        .token = "t",
-        .connect_ms = 5_000,
-    };
+    const io = std.testing.io;
+    var telegram = try testing.Telegram.init(gpa, io, &.{.{
+        .method = "answerCallbackQuery",
+        .replies = &.{.{ .body = "{\"ok\":true,\"result\":true}" }},
+    }});
+    defer telegram.deinit();
+    var client = testClient(&telegram);
 
     try client.answerCallbackQuery("4407");
-    try server.finish();
-    try std.testing.expectEqualStrings("{\"callback_query_id\":\"4407\"}", server.requests.items[0].body);
+    try telegram.finish();
+    try std.testing.expectEqualStrings(
+        "{\"callback_query_id\":\"4407\"}",
+        telegram.requests.items[0].body,
+    );
 }
 
-test "setMyCommands registers each command with its description" {
+test "a poll registers each command with its description after it deletes the webhook" {
     const gpa = std.testing.allocator;
-    var threaded: std.Io.Threaded = .init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    var server = try testing.Server.init(gpa, io, &.{.{ .method = "setMyCommands", .replies = &.{
-        .{ .body = "{\"ok\":true,\"result\":true}" },
-    } }});
-    defer server.deinit();
-    try server.start();
-    var url_buffer: [64]u8 = undefined;
-    var client: Client = .{
-        .gpa = gpa,
-        .io = io,
-        .base_url = server.url(&url_buffer),
-        .token = "t",
-        .connect_ms = 5_000,
-    };
+    const io = std.testing.io;
+    var telegram = try testing.Telegram.init(gpa, io, &.{
+        testing.webhook_deleted,
+        testing.commands_set,
+    });
+    defer telegram.deinit();
+    var client = testClient(&telegram);
 
-    try client.setMyCommands(&.{
+    var poll: Poll = .{ .commands = &.{
         .{ .command = "effort", .description = "set the reasoning-effort level" },
         .{ .command = "new", .description = "start a new conversation" },
-    });
-    try server.finish();
+    } };
+    for (0..2) |_| (try poll.next(&client, 1)).deinit(gpa);
+    try telegram.finish();
     try std.testing.expectEqualStrings(
-        "{\"commands\":[{\"command\":\"effort\",\"description\":\"set the reasoning-effort level\"}," ++
+        "/bot42:secret/deleteWebhook",
+        telegram.requests.items[0].path,
+    );
+    try std.testing.expectEqualStrings(
+        "{\"commands\":[{\"command\":\"effort\"," ++
+            "\"description\":\"set the reasoning-effort level\"}," ++
             "{\"command\":\"new\",\"description\":\"start a new conversation\"}]}",
-        server.requests.items[0].body,
+        telegram.requests.items[1].body,
     );
 }
 
 test "every status classifies, and a failure keeps its description and its wait" {
     const gpa = std.testing.allocator;
-    var threaded: std.Io.Threaded = .init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    var server = try testing.Server.init(gpa, io, &.{.{ .method = "deleteWebhook", .replies = &.{
-        .{ .status = 401, .body = "{\"ok\":false,\"error_code\":401,\"description\":\"Unauthorized\"}" },
-        .{ .status = 403, .body = "{\"ok\":false,\"error_code\":403,\"description\":\"Forbidden: bot was blocked by the user\"}" },
-        .{ .status = 409, .body = "{\"ok\":false,\"error_code\":409,\"description\":\"Conflict: terminated by other getUpdates request\"}" },
-        .{ .status = 429, .body = "{\"ok\":false,\"error_code\":429,\"description\":\"Too Many Requests: retry after 7\",\"parameters\":{\"retry_after\":7}}" },
-        .{ .status = 400, .body = "{\"ok\":false,\"error_code\":400,\"description\":\"Bad Request: can't parse entities\"}" },
+    const io = std.testing.io;
+    const scripts = [_]testing.Script{.{ .method = "deleteWebhook", .replies = &.{
+        .{
+            .status = 401,
+            .body = "{\"ok\":false,\"error_code\":401,\"description\":\"Unauthorized\"}",
+        },
+        .{
+            .status = 403,
+            .body = "{\"ok\":false,\"error_code\":403," ++
+                "\"description\":\"Forbidden: bot was blocked by the user\"}",
+        },
+        .{
+            .status = 409,
+            .body = "{\"ok\":false,\"error_code\":409," ++
+                "\"description\":\"Conflict: terminated by other getUpdates request\"}",
+        },
+        .{
+            .status = 429,
+            .body = "{\"ok\":false,\"error_code\":429," ++
+                "\"description\":\"Too Many Requests: retry after 7\"," ++
+                "\"parameters\":{\"retry_after\":7}}",
+        },
+        .{
+            .status = 400,
+            .body = "{\"ok\":false,\"error_code\":400," ++
+                "\"description\":\"Bad Request: can't parse entities\"}",
+        },
         .{ .status = 502, .body = "<html>bad gateway</html>" },
         .{ .status = 200, .body = "{\"ok\":true}" },
         .{ .status = 200, .body = "not json" },
-    } }});
-    defer server.deinit();
-    try server.start();
-    var url_buffer: [64]u8 = undefined;
-    var client: Client = .{
-        .gpa = gpa,
-        .io = io,
-        .base_url = server.url(&url_buffer),
-        .token = "t",
-        .connect_ms = 5_000,
-    };
+    } }};
+    var telegram = try testing.Telegram.init(gpa, io, &scripts);
+    defer telegram.deinit();
+    var client = testClient(&telegram);
+    var poll: Poll = .{ .commands = null };
 
-    try std.testing.expectError(error.Unauthorized, client.deleteWebhook());
+    try std.testing.expectError(error.Unauthorized, poll.next(&client, 1));
     try std.testing.expectEqualStrings("Unauthorized", client.description());
-    try std.testing.expectError(error.Forbidden, client.deleteWebhook());
-    try std.testing.expectEqualStrings("Forbidden: bot was blocked by the user", client.description());
-    try std.testing.expectError(error.Conflict, client.deleteWebhook());
-    try std.testing.expectError(error.RateLimited, client.deleteWebhook());
-    try std.testing.expectEqual(@as(u64, 7), client.retry_after_s);
-    try std.testing.expectError(error.Rejected, client.deleteWebhook());
+    try std.testing.expectError(error.Forbidden, poll.next(&client, 1));
+    try std.testing.expectEqualStrings(
+        "Forbidden: bot was blocked by the user",
+        client.description(),
+    );
+    try std.testing.expectError(error.Conflict, poll.next(&client, 1));
+    try std.testing.expectError(error.RateLimited, poll.next(&client, 1));
+    try std.testing.expectEqual(@as(u64, 7_000), client.retryAfterMs(std.math.maxInt(u64)));
+    try std.testing.expectError(error.Rejected, poll.next(&client, 1));
     try std.testing.expectEqualStrings("Bad Request: can't parse entities", client.description());
-    try std.testing.expectError(error.Unavailable, client.deleteWebhook());
+    try std.testing.expectError(error.Unavailable, poll.next(&client, 1));
     try std.testing.expectEqualStrings("", client.description());
-    try std.testing.expectError(error.MalformedReply, client.deleteWebhook());
-    try std.testing.expectError(error.MalformedReply, client.deleteWebhook());
-    try server.finish();
+    try std.testing.expectError(error.MalformedReply, poll.next(&client, 1));
+    try std.testing.expectError(error.MalformedReply, poll.next(&client, 1));
+    try telegram.finish();
 }
 
 test "a long description cuts before a UTF-8 sequence" {
     const gpa = std.testing.allocator;
-    var threaded: std.Io.Threaded = .init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
+    const io = std.testing.io;
     const body = "{\"ok\":false,\"error_code\":400,\"description\":\"" ++ "x" ** 198 ++ "€€\"}";
-    var server = try testing.Server.init(gpa, io, &.{.{ .method = "deleteWebhook", .replies = &.{
+    const scripts = [_]testing.Script{.{ .method = "deleteWebhook", .replies = &.{
         .{ .status = 400, .body = body },
-    } }});
-    defer server.deinit();
-    try server.start();
-    var url_buffer: [64]u8 = undefined;
-    var client: Client = .{
-        .gpa = gpa,
-        .io = io,
-        .base_url = server.url(&url_buffer),
-        .token = "t",
-        .connect_ms = 5_000,
-    };
+    } }};
+    var telegram = try testing.Telegram.init(gpa, io, &scripts);
+    defer telegram.deinit();
+    var client = testClient(&telegram);
+    var poll: Poll = .{ .commands = null };
 
-    try std.testing.expectError(error.Rejected, client.deleteWebhook());
+    try std.testing.expectError(error.Rejected, poll.next(&client, 1));
     try std.testing.expectEqual(@as(usize, 198), client.description().len);
     try std.testing.expect(std.unicode.utf8ValidateSlice(client.description()));
-    try server.finish();
+    try telegram.finish();
 }
 
-test "a server that does not answer is unavailable, not a hang" {
+test "a telegram that does not answer is unavailable, not a hang" {
     const gpa = std.testing.allocator;
-    var threaded: std.Io.Threaded = .init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    var server = try testing.Server.init(gpa, io, &.{});
-    defer server.deinit();
-    try server.start();
-    var url_buffer: [64]u8 = undefined;
-    var client: Client = .{
-        .gpa = gpa,
-        .io = io,
-        .base_url = server.url(&url_buffer),
-        .token = "t",
-        .connect_ms = 50,
-    };
+    var clock: core.testing.ClockIo = undefined;
+    clock.init(gpa);
+    defer clock.deinit();
+    const io = clock.io();
+    var telegram = try testing.Telegram.init(gpa, io, &.{});
+    defer telegram.deinit();
+    var client = testClient(&telegram);
     try std.testing.expectError(error.Unavailable, client.getMe());
-    try server.finish();
+    try telegram.finish();
+    try std.testing.expectEqualSlices(u64, &.{5_000}, clock.slept());
 }

@@ -1,8 +1,11 @@
 const std = @import("std");
 
 const escape = @import("escape.zig");
+const View = @import("View.zig");
 
 const Tty = @This();
+
+var active: std.atomic.Value(?*Tty) = .init(null);
 
 io: std.Io,
 in_handle: std.posix.fd_t,
@@ -12,31 +15,120 @@ raw_state: RawState,
 out_buffer: [16384]u8,
 out_stream: std.Io.File.Writer,
 
-pub const Size = struct { columns: u16, rows: u16 };
-
 const RawState = struct {
     raw_owned: bool = false,
-    paste_reset_pending: bool = false,
-    keyboard_reset_pending: bool = false,
-    grapheme_reset_pending: bool = false,
-    cursor_show_pending: bool = false,
-    screen_alternate_reset_pending: bool = false,
-    screen_alternate_scroll_reset_pending: bool = false,
-    screen_alternate_keyboard_reset_pending: bool = false,
+    resets_pending: std.EnumSet(Mode) = .initEmpty(),
     setup_complete: bool = false,
+
+    fn set(self: *RawState, output: *std.Io.Writer, mode: Mode) std.Io.Writer.Error!void {
+        self.resets_pending.insert(mode);
+        try output.writeAll(mode.setSequence());
+    }
+};
+
+const Mode = enum {
+    paste,
+    keyboard,
+    grapheme,
+    cursor,
+    screen_alternate,
+    scroll_alternate,
+    keyboard_alternate,
+
+    fn setSequence(self: Mode) []const u8 {
+        return switch (self) {
+            .paste => escape.paste_set,
+            .keyboard, .keyboard_alternate => escape.keyboard_set,
+            .grapheme => escape.grapheme_set,
+            .cursor => escape.cursor_hide,
+            .screen_alternate => escape.screen_alternate_set,
+            .scroll_alternate => escape.scroll_alternate_set,
+        };
+    }
+
+    fn resetSequence(self: Mode) []const u8 {
+        return switch (self) {
+            .paste => escape.paste_reset,
+            .keyboard, .keyboard_alternate => escape.keyboard_reset,
+            .grapheme => escape.grapheme_reset,
+            .cursor => escape.cursor_show,
+            .screen_alternate => escape.screen_alternate_reset,
+            .scroll_alternate => escape.scroll_alternate_reset,
+        };
+    }
+};
+
+const Termios = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    const VTable = struct {
+        setRaw: *const fn (ptr: *anyopaque) Error!void,
+        restore: *const fn (ptr: *anyopaque) Error!void,
+    };
+
+    const Error = std.posix.TermiosSetError;
+
+    fn setRaw(self: Termios) Error!void {
+        return self.vtable.setRaw(self.ptr);
+    }
+
+    fn restore(self: Termios) Error!void {
+        return self.vtable.restore(self.ptr);
+    }
 };
 
 const PosixSetup = struct {
     in_handle: std.posix.fd_t,
-    raw: *const std.posix.termios,
     original: *const std.posix.termios,
 
-    fn setRaw(self: *const PosixSetup) !void {
-        try std.posix.tcsetattr(self.in_handle, .FLUSH, self.raw.*);
+    const vtable: Termios.VTable = .{ .setRaw = setRaw, .restore = restoreOriginal };
+
+    fn termios(self: *PosixSetup) Termios {
+        return .{ .ptr = self, .vtable = &vtable };
     }
 
-    fn restore(self: *const PosixSetup) !void {
+    fn setRaw(ptr: *anyopaque) Termios.Error!void {
+        const self: *PosixSetup = @ptrCast(@alignCast(ptr));
+        var raw = self.original.*;
+        raw.lflag.ECHO = false;
+        raw.lflag.ICANON = false;
+        raw.lflag.ISIG = false;
+        raw.lflag.IEXTEN = false;
+        raw.iflag.IXON = false;
+        raw.iflag.ICRNL = false;
+        raw.iflag.BRKINT = false;
+        raw.iflag.INPCK = false;
+        raw.iflag.ISTRIP = false;
+        raw.oflag.OPOST = false;
+        raw.cc[@intFromEnum(std.posix.V.MIN)] = 1;
+        raw.cc[@intFromEnum(std.posix.V.TIME)] = 0;
+        try std.posix.tcsetattr(self.in_handle, .FLUSH, raw);
+    }
+
+    fn restoreOriginal(ptr: *anyopaque) Termios.Error!void {
+        const self: *PosixSetup = @ptrCast(@alignCast(ptr));
         try std.posix.tcsetattr(self.in_handle, .NOW, self.original.*);
+    }
+};
+
+const RestoreSetup = struct {
+    in_handle: std.posix.fd_t,
+    original: *const std.posix.termios,
+
+    const vtable: Termios.VTable = .{ .setRaw = setRaw, .restore = restoreOriginal };
+
+    fn termios(self: *RestoreSetup) Termios {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn setRaw(_: *anyopaque) Termios.Error!void {
+        unreachable;
+    }
+
+    fn restoreOriginal(ptr: *anyopaque) Termios.Error!void {
+        const self: *RestoreSetup = @ptrCast(@alignCast(ptr));
+        std.posix.tcsetattr(self.in_handle, .NOW, self.original.*) catch {};
     }
 };
 
@@ -49,42 +141,24 @@ pub fn init(self: *Tty, io: std.Io) !void {
     self.raw_state = .{};
     self.original = try std.posix.tcgetattr(self.in_handle);
     self.out_stream = stdout.writerStreaming(io, &self.out_buffer);
-    try self.enterRaw();
+    var setup: PosixSetup = .{ .in_handle = self.in_handle, .original = &self.original };
+    try enterWith(&self.raw_state, &self.out_stream.interface, setup.termios());
+    active.store(self, .release);
 }
 
 pub fn deinit(self: *Tty) void {
-    self.leaveRaw();
+    active.store(null, .release);
+    var setup: PosixSetup = .{ .in_handle = self.in_handle, .original = &self.original };
+    cleanupWith(&self.raw_state, &self.out_stream.interface, setup.termios());
 }
 
-pub fn enterRaw(self: *Tty) !void {
-    var raw = self.original;
-    raw.lflag.ECHO = false;
-    raw.lflag.ICANON = false;
-    raw.lflag.ISIG = false;
-    raw.lflag.IEXTEN = false;
-    raw.iflag.IXON = false;
-    raw.iflag.ICRNL = false;
-    raw.iflag.BRKINT = false;
-    raw.iflag.INPCK = false;
-    raw.iflag.ISTRIP = false;
-    raw.oflag.OPOST = false;
-    raw.cc[@intFromEnum(std.posix.V.MIN)] = 1;
-    raw.cc[@intFromEnum(std.posix.V.TIME)] = 0;
-    var control: PosixSetup = .{
-        .in_handle = self.in_handle,
-        .raw = &raw,
-        .original = &self.original,
-    };
-    try enterWith(&self.raw_state, &self.out_stream.interface, &control);
-}
-
-pub fn leaveRaw(self: *Tty) void {
-    var control: PosixSetup = .{
-        .in_handle = self.in_handle,
-        .raw = &self.original,
-        .original = &self.original,
-    };
-    cleanupWith(&self.raw_state, &self.out_stream.interface, &control, true);
+pub fn restore() void {
+    const tty = active.swap(null, .acq_rel) orelse return;
+    var buffer: [256]u8 = undefined;
+    var output: std.Io.Writer = .fixed(&buffer);
+    var setup: RestoreSetup = .{ .in_handle = tty.in_handle, .original = &tty.original };
+    cleanupWith(&tty.raw_state, &output, setup.termios());
+    writeHandle(tty.out_handle, output.buffered());
 }
 
 pub fn writer(self: *Tty) *std.Io.Writer {
@@ -95,124 +169,91 @@ pub fn setAlternateScreen(self: *Tty, enabled: bool) !void {
     try setAlternateScreenWith(&self.raw_state, &self.out_stream.interface, enabled);
 }
 
-pub fn read(self: *Tty, buffer: []u8, timeout: std.Io.Timeout) !?usize {
-    var chunk: [1][]u8 = .{buffer};
-    const result = self.io.operateTimeout(.{ .file_read_streaming = .{
-        .file = .{ .handle = self.in_handle, .flags = .{ .nonblocking = false } },
-        .data = &chunk,
-    } }, timeout) catch |err| switch (err) {
-        error.Timeout => return null,
-        else => |other| return other,
-    };
-    return try result.file_read_streaming;
+pub fn read(self: *Tty, buffer: []u8) std.Io.File.ReadStreamingError!usize {
+    const file: std.Io.File = .{ .handle = self.in_handle, .flags = .{ .nonblocking = false } };
+    return file.readStreaming(self.io, &.{buffer});
 }
 
-pub fn size(self: *Tty) ?Size {
+pub fn size(self: *Tty) ?View.Size {
     var window: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
-    const rc = std.posix.system.ioctl(self.out_handle, std.posix.T.IOCGWINSZ, @intFromPtr(&window));
-    if (std.posix.errno(rc) != .SUCCESS or window.col == 0) return null;
+    const result =
+        std.posix.system.ioctl(self.out_handle, std.posix.T.IOCGWINSZ, @intFromPtr(&window));
+    if (std.posix.errno(result) != .SUCCESS or window.col == 0) return null;
     return .{ .columns = window.col, .rows = window.row };
 }
 
-fn enterWith(state: *RawState, output: *std.Io.Writer, control: anytype) !void {
-    try control.setRaw();
+fn enterWith(state: *RawState, output: *std.Io.Writer, termios: Termios) !void {
+    try termios.setRaw();
     state.raw_owned = true;
-    errdefer cleanupWith(state, output, control, false);
+    errdefer cleanupWith(state, output, termios);
 
-    state.paste_reset_pending = true;
-    try output.writeAll(escape.paste_set);
-    state.keyboard_reset_pending = true;
-    try output.writeAll(escape.keyboard_set);
-    state.grapheme_reset_pending = true;
-    try output.writeAll(escape.grapheme_set);
-    state.cursor_show_pending = true;
-    try output.writeAll(escape.cursor_hide);
+    for ([_]Mode{ .paste, .keyboard, .grapheme, .cursor }) |mode| try state.set(output, mode);
     try output.flush();
     state.setup_complete = true;
 }
 
 fn setAlternateScreenWith(state: *RawState, output: *std.Io.Writer, enabled: bool) !void {
     if (enabled) {
-        if (state.screen_alternate_reset_pending) return;
-        state.screen_alternate_reset_pending = true;
-        try output.writeAll(escape.screen_alternate_set);
-        state.screen_alternate_scroll_reset_pending = true;
-        try output.writeAll(escape.scroll_alternate_set);
-        state.screen_alternate_keyboard_reset_pending = true;
-        try output.writeAll(escape.keyboard_set);
+        if (state.resets_pending.contains(.screen_alternate)) return;
+        for ([_]Mode{ .screen_alternate, .scroll_alternate, .keyboard_alternate }) |mode| {
+            try state.set(output, mode);
+        }
         try output.writeAll(escape.cursor_hide);
         try output.flush();
         return;
     }
-    if (!state.screen_alternate_reset_pending) return;
-    if (state.screen_alternate_keyboard_reset_pending) {
-        try output.writeAll(escape.keyboard_reset);
-        state.screen_alternate_keyboard_reset_pending = false;
+    if (!state.resets_pending.contains(.screen_alternate)) return;
+    for ([_]Mode{ .keyboard_alternate, .scroll_alternate }) |mode| {
+        if (!state.resets_pending.contains(mode)) continue;
+        try output.writeAll(mode.resetSequence());
+        state.resets_pending.remove(mode);
     }
-    if (state.screen_alternate_scroll_reset_pending) {
-        try output.writeAll(escape.scroll_alternate_reset);
-        state.screen_alternate_scroll_reset_pending = false;
-    }
-    try output.writeAll(escape.screen_alternate_reset);
+    try output.writeAll(Mode.screen_alternate.resetSequence());
     try output.writeAll(escape.cursor_show);
     try output.flush();
-    state.screen_alternate_reset_pending = false;
+    state.resets_pending.remove(.screen_alternate);
 }
 
-fn cleanupWith(
-    state: *RawState,
-    output: *std.Io.Writer,
-    control: anytype,
-    write_newline: bool,
-) void {
+fn cleanupWith(state: *RawState, output: *std.Io.Writer, termios: Termios) void {
     if (state.raw_owned) {
-        control.restore() catch return;
+        termios.restore() catch return;
         state.raw_owned = false;
     }
-    var flush_needed = false;
-    if (state.screen_alternate_keyboard_reset_pending) {
-        state.screen_alternate_keyboard_reset_pending = false;
-        flush_needed = true;
-        output.writeAll(escape.keyboard_reset) catch {};
-    }
-    if (state.screen_alternate_scroll_reset_pending) {
-        state.screen_alternate_scroll_reset_pending = false;
-        flush_needed = true;
-        output.writeAll(escape.scroll_alternate_reset) catch {};
-    }
-    if (state.screen_alternate_reset_pending) {
-        state.screen_alternate_reset_pending = false;
-        flush_needed = true;
-        output.writeAll(escape.screen_alternate_reset) catch {};
-    }
-    if (state.cursor_show_pending) {
-        state.cursor_show_pending = false;
-        flush_needed = true;
-        output.writeAll(escape.cursor_show) catch {};
-    }
-    if (state.grapheme_reset_pending) {
-        state.grapheme_reset_pending = false;
-        flush_needed = true;
-        output.writeAll(escape.grapheme_reset) catch {};
-    }
-    if (state.keyboard_reset_pending) {
-        state.keyboard_reset_pending = false;
-        flush_needed = true;
-        output.writeAll(escape.keyboard_reset) catch {};
-    }
-    if (state.paste_reset_pending) {
-        state.paste_reset_pending = false;
-        flush_needed = true;
-        output.writeAll(escape.paste_reset) catch {};
+    const flush_needed = state.setup_complete or state.resets_pending.count() > 0;
+    var modes = std.mem.reverseIterator(std.enums.values(Mode));
+    while (modes.next()) |mode| {
+        if (!state.resets_pending.contains(mode)) continue;
+        state.resets_pending.remove(mode);
+        output.writeAll(mode.resetSequence()) catch {};
     }
     if (state.setup_complete) {
         state.setup_complete = false;
-        if (write_newline) {
-            flush_needed = true;
-            output.writeAll("\r\n") catch {};
-        }
+        output.writeAll("\r\n") catch {};
     }
     if (flush_needed) output.flush() catch {};
+}
+
+fn writeHandle(handle: std.posix.fd_t, bytes: []const u8) void {
+    var rest = bytes;
+    while (rest.len > 0) {
+        const result = std.posix.system.write(handle, rest.ptr, rest.len);
+        if (std.posix.errno(result) != .SUCCESS or result == 0) return;
+        rest = rest[@intCast(result)..];
+    }
+}
+
+test "read returns the waiting bytes, and a closed input ends the stream" {
+    var tty: Tty = undefined;
+    tty.io = std.testing.io;
+    const handles = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true });
+    defer _ = std.posix.system.close(handles[0]);
+    tty.in_handle = handles[0];
+    var buffer: [8]u8 = undefined;
+    _ = std.posix.system.write(handles[1], "xy", 2);
+    try std.testing.expectEqual(@as(usize, 2), try tty.read(&buffer));
+    try std.testing.expectEqualStrings("xy", buffer[0..2]);
+    _ = std.posix.system.close(handles[1]);
+    try std.testing.expectError(error.EndOfStream, tty.read(&buffer));
 }
 
 const TestControl = struct {
@@ -222,15 +263,23 @@ const TestControl = struct {
     restore_fails: bool = false,
     log: ?*TestWriter = null,
 
-    fn setRaw(self: *TestControl) !void {
+    const vtable: Termios.VTable = .{ .setRaw = setRaw, .restore = restoreOriginal };
+
+    fn termios(self: *TestControl) Termios {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn setRaw(ptr: *anyopaque) Termios.Error!void {
+        const self: *TestControl = @ptrCast(@alignCast(ptr));
         self.set_count += 1;
         self.raw = true;
     }
 
-    fn restore(self: *TestControl) !void {
+    fn restoreOriginal(ptr: *anyopaque) Termios.Error!void {
+        const self: *TestControl = @ptrCast(@alignCast(ptr));
         self.restore_count += 1;
         if (self.log) |recorder| recorder.record(.restore);
-        if (self.restore_fails) return error.RestoreFailed;
+        if (self.restore_fails) return error.NotATerminal;
         self.raw = false;
     }
 };
@@ -342,9 +391,9 @@ fn expectSetupFailure(
 
     try std.testing.expectError(
         error.WriteFailed,
-        enterWith(&state, &output.interface, &control),
+        enterWith(&state, &output.interface, control.termios()),
     );
-    cleanupWith(&state, &output.interface, &control, false);
+    cleanupWith(&state, &output.interface, control.termios());
 
     try std.testing.expect(!control.raw);
     try std.testing.expectEqual(@as(usize, 1), control.set_count);
@@ -357,32 +406,51 @@ fn expectSetupFailure(
     );
 }
 
-test "read maps a timeout to null and a closed input to end of stream" {
-    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
-    defer threaded.deinit();
-    var tty: Tty = undefined;
-    tty.io = threaded.io();
-    const fds = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true });
-    defer _ = std.posix.system.close(fds[0]);
-    tty.in_handle = fds[0];
-    var buffer: [8]u8 = undefined;
-    const timeout: std.Io.Timeout =
-        .{ .duration = .{ .raw = .fromMilliseconds(5), .clock = .awake } };
-    try std.testing.expectEqual(@as(?usize, null), try tty.read(&buffer, timeout));
-    _ = std.posix.system.write(fds[1], "x", 1);
-    try std.testing.expectEqual(@as(?usize, 1), try tty.read(&buffer, .none));
-    _ = std.posix.system.close(fds[1]);
-    try std.testing.expectError(error.EndOfStream, tty.read(&buffer, .none));
-}
-
-test "size reports absence on a handle that is not a terminal" {
-    const fds = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true });
-    defer for (fds) |handle| {
+test "a restore reverses each pending mode once, and a restore after deinit writes nothing" {
+    const handles = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true });
+    defer for (handles) |handle| {
         _ = std.posix.system.close(handle);
     };
     var tty: Tty = undefined;
-    tty.out_handle = fds[1];
-    try std.testing.expectEqual(@as(?Size, null), tty.size());
+    tty.in_handle = handles[0];
+    tty.out_handle = handles[1];
+    tty.original = std.mem.zeroes(std.posix.termios);
+    tty.raw_state = .{
+        .raw_owned = true,
+        .resets_pending = .initMany(&.{ .paste, .keyboard, .grapheme, .cursor, .screen_alternate }),
+        .setup_complete = true,
+    };
+    active.store(&tty, .release);
+    restore();
+    restore();
+    _ = std.posix.system.write(handles[1], "x", 1);
+
+    try std.testing.expectEqual(RawState{}, tty.raw_state);
+    var buffer: [256]u8 = undefined;
+    const count = std.posix.system.read(handles[0], &buffer, buffer.len);
+    try std.testing.expectEqualStrings(
+        escape.screen_alternate_reset ++ escape.cursor_show ++ escape.grapheme_reset ++
+            escape.keyboard_reset ++ escape.paste_reset ++ "\r\nx",
+        buffer[0..@intCast(count)],
+    );
+
+    tty.raw_state = .{ .raw_owned = true, .resets_pending = .initOne(.cursor) };
+    active.store(&tty, .release);
+    tty.deinit();
+    restore();
+    _ = std.posix.system.write(handles[1], "y", 1);
+    const rest = std.posix.system.read(handles[0], &buffer, buffer.len);
+    try std.testing.expectEqualStrings("y", buffer[0..@intCast(rest)]);
+}
+
+test "size reports absence on a handle that is not a terminal" {
+    const handles = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true });
+    defer for (handles) |handle| {
+        _ = std.posix.system.close(handle);
+    };
+    var tty: Tty = undefined;
+    tty.out_handle = handles[1];
+    try std.testing.expectEqual(@as(?View.Size, null), tty.size());
 }
 
 test "each alternate screen transition pairs its own keyboard and scroll modes" {
@@ -413,13 +481,10 @@ test "each alternate screen transition pairs its own keyboard and scroll modes" 
     {
         var output: TestWriter = .{};
         var control: TestControl = .{};
-        var state: RawState = .{
-            .keyboard_reset_pending = true,
-            .cursor_show_pending = true,
-        };
+        var state: RawState = .{ .resets_pending = .initMany(&.{ .keyboard, .cursor }) };
         try setAlternateScreenWith(&state, &output.interface, true);
-        cleanupWith(&state, &output.interface, &control, false);
-        cleanupWith(&state, &output.interface, &control, false);
+        cleanupWith(&state, &output.interface, control.termios());
+        cleanupWith(&state, &output.interface, control.termios());
         try std.testing.expectEqual(RawState{}, state);
         try std.testing.expectEqualSlices(
             TestWriter.Operation,
@@ -442,16 +507,13 @@ test "each alternate screen transition pairs its own keyboard and scroll modes" 
     {
         var output: TestWriter = .{ .drain_fail_at = 2 };
         var control: TestControl = .{};
-        var state: RawState = .{
-            .keyboard_reset_pending = true,
-            .cursor_show_pending = true,
-        };
+        var state: RawState = .{ .resets_pending = .initMany(&.{ .keyboard, .cursor }) };
         try std.testing.expectError(
             error.WriteFailed,
             setAlternateScreenWith(&state, &output.interface, true),
         );
-        cleanupWith(&state, &output.interface, &control, false);
-        cleanupWith(&state, &output.interface, &control, false);
+        cleanupWith(&state, &output.interface, control.termios());
+        cleanupWith(&state, &output.interface, control.termios());
         try std.testing.expectEqual(RawState{}, state);
         try std.testing.expectEqualSlices(
             TestWriter.Operation,
@@ -528,15 +590,15 @@ test "setup rollback preserves the setup error when termios restoration fails" {
 
     try std.testing.expectError(
         error.WriteFailed,
-        enterWith(&state, &output.interface, &control),
+        enterWith(&state, &output.interface, control.termios()),
     );
     try std.testing.expect(control.raw);
     try std.testing.expect(state.raw_owned);
     try std.testing.expectEqual(@as(usize, 1), control.restore_count);
 
     control.restore_fails = false;
-    cleanupWith(&state, &output.interface, &control, false);
-    cleanupWith(&state, &output.interface, &control, false);
+    cleanupWith(&state, &output.interface, control.termios());
+    cleanupWith(&state, &output.interface, control.termios());
     try std.testing.expect(!control.raw);
     try std.testing.expectEqual(@as(usize, 2), control.restore_count);
     try std.testing.expectEqual(RawState{}, state);
@@ -552,7 +614,7 @@ test "successful setup and repeated cleanup manage every terminal mode once" {
     var control: TestControl = .{};
     var state: RawState = .{};
 
-    try enterWith(&state, &output.interface, &control);
+    try enterWith(&state, &output.interface, control.termios());
 
     try std.testing.expect(control.raw);
     try std.testing.expectEqual(@as(usize, 1), control.set_count);
@@ -563,8 +625,8 @@ test "successful setup and repeated cleanup manage every terminal mode once" {
         output.operations[0..output.operations_len],
     );
 
-    cleanupWith(&state, &output.interface, &control, true);
-    cleanupWith(&state, &output.interface, &control, true);
+    cleanupWith(&state, &output.interface, control.termios());
+    cleanupWith(&state, &output.interface, control.termios());
     try std.testing.expect(!control.raw);
     try std.testing.expectEqual(@as(usize, 1), control.restore_count);
     try std.testing.expectEqual(RawState{}, state);
@@ -592,8 +654,8 @@ test "shutdown restores cooked mode before the potentially blocking presentation
     var control: TestControl = .{ .log = &output };
     var state: RawState = .{};
 
-    try enterWith(&state, &output.interface, &control);
-    cleanupWith(&state, &output.interface, &control, true);
+    try enterWith(&state, &output.interface, control.termios());
+    cleanupWith(&state, &output.interface, control.termios());
 
     try std.testing.expect(!control.raw);
     try std.testing.expectEqual(RawState{}, state);
@@ -622,8 +684,8 @@ test "shutdown restores cooked mode even when presentation output fails" {
     var control: TestControl = .{ .log = &output };
     var state: RawState = .{};
 
-    try enterWith(&state, &output.interface, &control);
-    cleanupWith(&state, &output.interface, &control, true);
+    try enterWith(&state, &output.interface, control.termios());
+    cleanupWith(&state, &output.interface, control.termios());
 
     try std.testing.expect(!control.raw);
     try std.testing.expectEqual(@as(usize, 1), control.restore_count);

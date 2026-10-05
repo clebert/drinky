@@ -1,8 +1,8 @@
 const std = @import("std");
 
-const ai = @import("ai");
 const terminal = @import("terminal");
 
+const Message = @import("../Message.zig");
 const ui = @import("../ui/root.zig");
 
 pub const parse_mode = "HTML";
@@ -15,92 +15,13 @@ const list_indent = "  ";
 
 const bullet = "• ";
 
-pub fn render(out: *std.Io.Writer, text: []const u8) !void {
-    var lines = std.mem.splitScalar(u8, text, '\n');
-    var breaks: Breaks = .{};
-    var maybe_fence: ?ui.markdown.Fence = null;
-    var quoting = false;
-    while (lines.next()) |raw| {
-        const line = std.mem.trimEnd(u8, raw, "\r");
-        const indentation = ui.markdown.leading(line);
-        const rest = line[indentation..];
-        if (maybe_fence) |fence| {
-            if (indentation <= 3 and fence.closes(rest)) {
-                maybe_fence = null;
-                try out.writeAll("</pre>");
-            } else {
-                try breaks.next(out);
-                try escape(out, line);
-            }
-            continue;
-        }
-        const quote = rest.len > 0 and rest[0] == '>';
-        if (quoting and !quote) {
-            quoting = false;
-            try out.writeAll("</blockquote>");
-        }
-        const maybe_open_fence = if (indentation <= 3) ui.markdown.Fence.open(rest) else null;
-        if (maybe_open_fence) |fence| {
-            maybe_fence = fence;
-            try breaks.open(out, "<pre>");
-        } else if (ui.markdown.isBlank(rest)) {
-            try breaks.next(out);
-        } else if (ui.markdown.isRule(rest)) {
-            try breaks.next(out);
-            try out.writeAll(rule_text);
-        } else if (Table.detect(rest, lines.peek())) |detected| {
-            var table = detected;
-            try breaks.open(out, "<pre>");
-            try table.render(out, &breaks, rest, &lines);
-            try out.writeAll("</pre>");
-        } else if (ui.markdown.headingLevel(rest)) |level| {
-            try breaks.next(out);
-            try out.writeAll("<b>");
-            try inlines(out, std.mem.trimStart(u8, rest[level..], " "));
-            try out.writeAll("</b>");
-        } else if (quote) {
-            if (!quoting) {
-                quoting = true;
-                try breaks.open(out, "<blockquote>");
-            }
-            var body = rest;
-            while (body.len > 0 and body[0] == '>') {
-                body = body[1..];
-                if (body.len > 0 and body[0] == ' ') body = body[1..];
-            }
-            try breaks.next(out);
-            try inlines(out, body);
-        } else if (ui.markdown.listMarker(rest)) |marker| {
-            try breaks.next(out);
-            const depth: usize = @min(@divFloor(indentation, 2), 4);
-            for (0..depth) |_| try out.writeAll(list_indent);
-            if (marker.shown[0] == '-') {
-                try out.writeAll(bullet);
-            } else {
-                try escape(out, marker.shown);
-            }
-            var body = rest[marker.source..];
-            if (ui.markdown.taskBox(body)) |box| {
-                try escape(out, box);
-                body = body[box.len..];
-            }
-            try inlines(out, body);
-        } else {
-            try breaks.next(out);
-            try inlines(out, line);
-        }
-    }
-    if (maybe_fence != null) try out.writeAll("</pre>");
-    if (quoting) try out.writeAll("</blockquote>");
-}
-
 pub const Role = enum {
     information,
     warning,
     failure,
     note,
 
-    pub fn of(severity: ai.command.Outcome.Severity) Role {
+    pub fn of(severity: Message.Severity) Role {
         return switch (severity) {
             .information => .information,
             .warning => .warning,
@@ -108,56 +29,15 @@ pub const Role = enum {
         };
     }
 
-    fn symbol(self: Role) []const u8 {
+    fn prefix(self: Role) []const u8 {
         return switch (self) {
-            .information => "ℹ",
-            .warning, .failure => "⚠",
-            .note => "→",
+            .information => ui.paint.NoticeStyle.of(.information).prefix,
+            .warning => ui.paint.NoticeStyle.of(.warning).prefix,
+            .failure => ui.paint.NoticeStyle.of(.failure).prefix,
+            .note => ui.paint.NoticeStyle.note.prefix,
         };
     }
 };
-
-pub fn wrap(out: *std.Io.Writer, role: Role, text: []const u8) !void {
-    try out.print("{s} ", .{role.symbol()});
-    try escape(out, text);
-}
-
-pub fn wrapAlloc(gpa: std.mem.Allocator, role: Role, text: []const u8) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    errdefer out.deinit();
-    try wrap(&out.writer, role, text);
-    return out.toOwnedSlice();
-}
-
-pub fn plain(out: *std.Io.Writer, source: []const u8) !void {
-    var rest = source;
-    while (rest.len > 0) {
-        const link = Link.find(rest) orelse {
-            try plainText(out, rest);
-            break;
-        };
-        try plainText(out, rest[0..link.start]);
-        try plainText(out, link.label);
-        if (!link.bare()) {
-            try out.writeAll(" (");
-            try plainText(out, link.url);
-            try out.writeAll(")");
-        }
-        rest = rest[link.end..];
-    }
-}
-
-pub fn plainAlloc(gpa: std.mem.Allocator, source: []const u8) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    errdefer out.deinit();
-    try plain(&out.writer, source);
-    return out.toOwnedSlice();
-}
-
-fn plainText(out: *std.Io.Writer, source: []const u8) !void {
-    var decoder: Decoder = .{ .source = source };
-    while (decoder.next()) |byte| try out.writeByte(byte);
-}
 
 const Decoder = struct {
     source: []const u8,
@@ -228,37 +108,6 @@ const Link = struct {
     }
 };
 
-const references = [_]struct { name: []const u8, text: []const u8 }{
-    .{ .name = "&amp;", .text = "&" },
-    .{ .name = "&lt;", .text = "<" },
-    .{ .name = "&gt;", .text = ">" },
-    .{ .name = "&quot;", .text = "\"" },
-};
-
-fn decodeReference(reference: []const u8) ?[]const u8 {
-    for (references) |entry| if (std.mem.eql(u8, entry.name, reference)) return entry.text;
-    return null;
-}
-
-pub fn escape(out: *std.Io.Writer, text: []const u8) !void {
-    for (text) |byte| switch (byte) {
-        '&' => try out.writeAll("&amp;"),
-        '<' => try out.writeAll("&lt;"),
-        '>' => try out.writeAll("&gt;"),
-        else => try out.writeByte(byte),
-    };
-}
-
-fn escapeAttribute(out: *std.Io.Writer, text: []const u8) !void {
-    for (text) |byte| switch (byte) {
-        '&' => try out.writeAll("&amp;"),
-        '<' => try out.writeAll("&lt;"),
-        '>' => try out.writeAll("&gt;"),
-        '"' => try out.writeAll("&quot;"),
-        else => try out.writeByte(byte),
-    };
-}
-
 const Breaks = struct {
     owed: bool = false,
 
@@ -273,17 +122,6 @@ const Breaks = struct {
         self.owed = false;
     }
 };
-
-fn inlines(out: *std.Io.Writer, text: []const u8) !void {
-    var scanner = ui.markdown.InlineScanner.init(.{}, text, .block);
-    var open: Tags = .{};
-    while (scanner.next()) |span| {
-        const wanted = Tags.of(&span.look);
-        try open.transition(out, &wanted);
-        try escape(out, span.bytes);
-    }
-    try open.transition(out, &.{});
-}
 
 const Tags = struct {
     url: []const u8 = "",
@@ -347,86 +185,6 @@ const Tags = struct {
     }
 };
 
-const Table = struct {
-    count: usize,
-    widths: [ui.markdown.Table.count_max]usize,
-
-    fn detect(header: []const u8, next_line: ?[]const u8) ?Table {
-        if (!ui.markdown.Table.isRow(header)) return null;
-        const delimiter = next_line orelse return null;
-        if (!ui.markdown.Table.isDelimiter(delimiter)) return null;
-        const count = ui.markdown.Table.cellCount(header);
-        if (count != ui.markdown.Table.cellCount(delimiter)) return null;
-        if (count > ui.markdown.Table.count_max) return null;
-        return .{ .count = count, .widths = @splat(1) };
-    }
-
-    fn render(
-        self: *Table,
-        out: *std.Io.Writer,
-        breaks: *Breaks,
-        header: []const u8,
-        lines: *std.mem.SplitIterator(u8, .scalar),
-    ) !void {
-        self.measure(header);
-        var ahead = lines.*;
-        _ = ahead.next();
-        while (ahead.peek()) |row| {
-            if (!ui.markdown.Table.isRow(row)) break;
-            _ = ahead.next();
-            self.measure(row);
-        }
-        try breaks.next(out);
-        try self.writeRow(out, header);
-        _ = lines.next();
-        try breaks.next(out);
-        try self.writeDelimiter(out);
-        while (lines.peek()) |row| {
-            if (!ui.markdown.Table.isRow(row)) break;
-            _ = lines.next();
-            try breaks.next(out);
-            try self.writeRow(out, row);
-        }
-    }
-
-    fn measure(self: *Table, row: []const u8) void {
-        var cells = ui.markdown.Table.Cells.init(row);
-        for (self.widths[0..self.count]) |*width| {
-            const cell = cells.next() orelse break;
-            var scanner = ui.markdown.InlineScanner.init(.{}, cell, .table);
-            var columns: usize = 0;
-            while (scanner.next()) |span| columns += terminal.width.ofText(span.bytes);
-            width.* = @max(width.*, columns);
-        }
-    }
-
-    fn writeRow(self: *const Table, out: *std.Io.Writer, row: []const u8) !void {
-        var cells = ui.markdown.Table.Cells.init(row);
-        try out.writeAll("|");
-        for (self.widths[0..self.count]) |width| {
-            const cell = cells.next() orelse "";
-            try out.writeAll(" ");
-            var scanner = ui.markdown.InlineScanner.init(.{}, cell, .table);
-            var columns: usize = 0;
-            while (scanner.next()) |span| {
-                try escape(out, span.bytes);
-                columns += terminal.width.ofText(span.bytes);
-            }
-            try out.splatByteAll(' ', width -| columns);
-            try out.writeAll(" |");
-        }
-    }
-
-    fn writeDelimiter(self: *const Table, out: *std.Io.Writer) !void {
-        try out.writeAll("|");
-        for (self.widths[0..self.count]) |width| {
-            try out.writeAll(" ");
-            try out.splatByteAll('-', width);
-            try out.writeAll(" |");
-        }
-    }
-};
-
 pub const Parts = struct {
     html: []const u8,
     limit: usize,
@@ -469,11 +227,30 @@ pub const Parts = struct {
         const Kind = enum { open_tag, close_tag, entity, newline, text };
     };
 
+    const Part = struct {
+        opening: *const Stack,
+        body: []const u8,
+        closing: *const Stack,
+
+        fn alloc(self: *const Part, gpa: std.mem.Allocator) error{OutOfMemory}![]u8 {
+            var out: std.Io.Writer.Allocating = .init(gpa);
+            errdefer out.deinit();
+            self.write(&out.writer) catch return error.OutOfMemory;
+            return out.toOwnedSlice();
+        }
+
+        fn write(self: *const Part, out: *std.Io.Writer) std.Io.Writer.Error!void {
+            for (self.opening.open()) |tag| try out.writeAll(tag);
+            try out.writeAll(self.body);
+            try writeClosers(out, self.closing);
+        }
+    };
+
     pub fn init(html: []const u8, limit: usize) Parts {
         return .{ .html = html, .limit = limit };
     }
 
-    pub fn next(self: *Parts, gpa: std.mem.Allocator) !?[]u8 {
+    pub fn next(self: *Parts, gpa: std.mem.Allocator) error{OutOfMemory}!?[]u8 {
         if (self.done) return null;
         while (self.open.len == 0 and self.position < self.html.len and
             self.html[self.position] == '\n') self.position += 1;
@@ -505,28 +282,33 @@ pub const Parts = struct {
                     const cut: Cut = .{ .end = index, .resume_at = token_end, .open = stack };
                     if (stack.len == 0) element = cut else line = cut;
                 },
-                .entity, .text => character = .{ .end = token_end, .resume_at = token_end, .open = stack },
+                .entity, .text => character = .{
+                    .end = token_end,
+                    .resume_at = token_end,
+                    .open = stack,
+                },
             }
             index = token_end;
         }
-        var out: std.Io.Writer.Allocating = .init(gpa);
-        errdefer out.deinit();
-        for (self.open.open()) |tag| try out.writer.writeAll(tag);
         const cut = maybe_cut orelse {
-            try out.writer.writeAll(self.html[start..]);
-            try writeClosers(&out.writer, &stack);
+            const whole: Part = .{
+                .opening = &self.open,
+                .body = self.html[start..],
+                .closing = &stack,
+            };
+            const text = try whole.alloc(gpa);
             self.position = self.html.len;
             self.done = true;
-            return try out.toOwnedSlice();
+            return text;
         };
         const settled = self.settle(&cut);
         var body = self.html[start..settled.end];
         if (settled.open.len == 0) body = std.mem.trimEnd(u8, body, "\n");
-        try out.writer.writeAll(body);
-        try writeClosers(&out.writer, &settled.open);
+        const part: Part = .{ .opening = &self.open, .body = body, .closing = &settled.open };
+        const text = try part.alloc(gpa);
         self.position = settled.resume_at;
         self.open = settled.open;
-        return try out.toOwnedSlice();
+        return text;
     }
 
     fn settle(self: *const Parts, cut: *const Cut) Cut {
@@ -578,6 +360,219 @@ pub const Parts = struct {
     }
 };
 
+pub fn render(out: *std.Io.Writer, text: []const u8) !void {
+    var blocks: ui.markdown.Blocks = .init(text);
+    var breaks: Breaks = .{};
+    var quoting = false;
+    while (blocks.next()) |block| {
+        if (quoting and closesQuote(&block.kind)) {
+            quoting = false;
+            try out.writeAll("</blockquote>");
+        }
+        switch (block.kind) {
+            .fence_open => try breaks.open(out, "<pre>"),
+            .fence_line => {
+                try breaks.next(out);
+                try escape(out, block.line);
+            },
+            .fence_close => try out.writeAll("</pre>"),
+            .blank => try breaks.next(out),
+            .rule => {
+                try breaks.next(out);
+                try out.writeAll(rule_text);
+            },
+            .table => |*rows| {
+                try breaks.open(out, "<pre>");
+                try writeTable(out, &breaks, block.line, rows);
+                try out.writeAll("</pre>");
+            },
+            .heading => |heading| {
+                try breaks.next(out);
+                try out.writeAll("<b>");
+                try inlines(out, heading.body);
+                try out.writeAll("</b>");
+            },
+            .quote => |body| {
+                if (!quoting) {
+                    quoting = true;
+                    try breaks.open(out, "<blockquote>");
+                }
+                try breaks.next(out);
+                try inlines(out, body);
+            },
+            .list_item => |item| {
+                try breaks.next(out);
+                for (0..item.depth) |_| try out.writeAll(list_indent);
+                if (item.marker.shown[0] == '-') {
+                    try out.writeAll(bullet);
+                } else {
+                    try escape(out, item.marker.shown);
+                }
+                if (item.task_box) |box| try escape(out, box);
+                try inlines(out, item.body);
+            },
+            .paragraph => {
+                try breaks.next(out);
+                try inlines(out, block.line);
+            },
+        }
+    }
+    if (blocks.fenced()) try out.writeAll("</pre>");
+    if (quoting) try out.writeAll("</blockquote>");
+}
+
+fn closesQuote(kind: *const ui.markdown.Block.Kind) bool {
+    return switch (kind.*) {
+        .quote, .fence_line, .fence_close => false,
+        .fence_open, .blank, .rule, .table, .heading, .list_item, .paragraph => true,
+    };
+}
+
+pub fn notice(out: *std.Io.Writer, role: Role, text: []const u8) !void {
+    try out.writeAll(role.prefix());
+    try escape(out, text);
+}
+
+pub fn noticeAlloc(gpa: std.mem.Allocator, role: Role, text: []const u8) error{OutOfMemory}![]u8 {
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    errdefer out.deinit();
+    notice(&out.writer, role, text) catch return error.OutOfMemory;
+    return out.toOwnedSlice();
+}
+
+fn plain(out: *std.Io.Writer, source: []const u8) !void {
+    var rest = source;
+    while (rest.len > 0) {
+        const link = Link.find(rest) orelse {
+            try plainText(out, rest);
+            break;
+        };
+        try plainText(out, rest[0..link.start]);
+        try plainText(out, link.label);
+        if (!link.bare()) {
+            try out.writeAll(" (");
+            try plainText(out, link.url);
+            try out.writeAll(")");
+        }
+        rest = rest[link.end..];
+    }
+}
+
+pub fn plainAlloc(gpa: std.mem.Allocator, source: []const u8) error{OutOfMemory}![]u8 {
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    errdefer out.deinit();
+    plain(&out.writer, source) catch return error.OutOfMemory;
+    return out.toOwnedSlice();
+}
+
+fn plainText(out: *std.Io.Writer, source: []const u8) !void {
+    var decoder: Decoder = .{ .source = source };
+    while (decoder.next()) |byte| try out.writeByte(byte);
+}
+
+const references = [_]struct { name: []const u8, text: []const u8 }{
+    .{ .name = "&amp;", .text = "&" },
+    .{ .name = "&lt;", .text = "<" },
+    .{ .name = "&gt;", .text = ">" },
+    .{ .name = "&quot;", .text = "\"" },
+};
+
+fn decodeReference(reference: []const u8) ?[]const u8 {
+    for (references) |entry| if (std.mem.eql(u8, entry.name, reference)) return entry.text;
+    return null;
+}
+
+fn escape(out: *std.Io.Writer, text: []const u8) !void {
+    for (text) |byte| switch (byte) {
+        '&' => try out.writeAll("&amp;"),
+        '<' => try out.writeAll("&lt;"),
+        '>' => try out.writeAll("&gt;"),
+        else => try out.writeByte(byte),
+    };
+}
+
+fn escapeAttribute(out: *std.Io.Writer, text: []const u8) !void {
+    for (text) |byte| switch (byte) {
+        '&' => try out.writeAll("&amp;"),
+        '<' => try out.writeAll("&lt;"),
+        '>' => try out.writeAll("&gt;"),
+        '"' => try out.writeAll("&quot;"),
+        else => try out.writeByte(byte),
+    };
+}
+
+fn inlines(out: *std.Io.Writer, text: []const u8) !void {
+    var scanner = ui.markdown.InlineScanner.init(.{}, text, .block);
+    var open: Tags = .{};
+    while (scanner.next()) |span| {
+        const wanted = Tags.of(&span.look);
+        try open.transition(out, &wanted);
+        try escape(out, span.bytes);
+    }
+    try open.transition(out, &.{});
+}
+
+fn writeTable(
+    out: *std.Io.Writer,
+    breaks: *Breaks,
+    header: []const u8,
+    rows: *const ui.markdown.Block.TableRows,
+) !void {
+    var buffer: [ui.markdown.Table.count_max]usize = @splat(1);
+    const widths = buffer[0..rows.count];
+    ui.markdown.Table.measureRow(widths, header);
+    var measured = rows.rows();
+    while (measured.next()) |row| ui.markdown.Table.measureRow(widths, row);
+    try breaks.next(out);
+    try writeTableRow(out, widths, header);
+    try breaks.next(out);
+    try out.writeAll("|");
+    for (widths) |width| {
+        try out.writeAll(" ");
+        try out.splatByteAll('-', width);
+        try out.writeAll(" |");
+    }
+    var written = rows.rows();
+    while (written.next()) |row| {
+        try breaks.next(out);
+        try writeTableRow(out, widths, row);
+    }
+}
+
+fn writeTableRow(out: *std.Io.Writer, widths: []const usize, row: []const u8) !void {
+    var cells = ui.markdown.Table.Cells.init(row);
+    try out.writeAll("|");
+    for (widths) |width| {
+        const cell = cells.next() orelse "";
+        try out.writeAll(" ");
+        var scanner = ui.markdown.InlineScanner.init(.{}, cell, .table);
+        var columns: usize = 0;
+        while (scanner.next()) |span| {
+            try escape(out, span.bytes);
+            columns += terminal.width.ofText(span.bytes);
+        }
+        try out.splatByteAll(' ', width -| columns);
+        try out.writeAll(" |");
+    }
+}
+
+test "a message of Drinky takes the symbol of its role before its text" {
+    const gpa = std.testing.allocator;
+    const information = try noticeAlloc(gpa, .information, "Drinky now uses claude-opus-5.");
+    defer gpa.free(information);
+    try std.testing.expectEqualStrings("ℹ Drinky now uses claude-opus-5.", information);
+    const warning_text = "The command /login runs in the terminal alone.";
+    const warning = try noticeAlloc(gpa, .warning, warning_text);
+    defer gpa.free(warning);
+    try std.testing.expectEqualStrings("⚠ The command /login runs in the terminal alone.", warning);
+    const failure = try noticeAlloc(gpa, .failure, "Telegram rejected <a> & more.");
+    defer gpa.free(failure);
+    try std.testing.expectEqualStrings("⚠ Telegram rejected &lt;a&gt; &amp; more.", failure);
+    const note = try noticeAlloc(gpa, .note, "Skill: zig-style");
+    defer gpa.free(note);
+    try std.testing.expectEqualStrings("→ Skill: zig-style", note);
+}
+
 fn expectRender(expected: []const u8, source: []const u8) !void {
     var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer out.deinit();
@@ -585,30 +580,11 @@ fn expectRender(expected: []const u8, source: []const u8) !void {
     try std.testing.expectEqualStrings(expected, out.written());
 }
 
-test "a message of Drinky takes the symbol of its role before its text" {
-    const gpa = std.testing.allocator;
-    const information = try wrapAlloc(gpa, .information, "Drinky now uses claude-opus-5.");
-    defer gpa.free(information);
-    try std.testing.expectEqualStrings("ℹ Drinky now uses claude-opus-5.", information);
-    const warning = try wrapAlloc(gpa, .warning, "The command /login runs in the terminal alone.");
-    defer gpa.free(warning);
-    try std.testing.expectEqualStrings("⚠ The command /login runs in the terminal alone.", warning);
-    const failure = try wrapAlloc(gpa, .failure, "Telegram rejected <a> & more.");
-    defer gpa.free(failure);
-    try std.testing.expectEqualStrings("⚠ Telegram rejected &lt;a&gt; &amp; more.", failure);
-    const note = try wrapAlloc(gpa, .note, "Skill: zig-style");
-    defer gpa.free(note);
-    try std.testing.expectEqualStrings("→ Skill: zig-style", note);
-    try std.testing.expectEqual(Role.information, Role.of(.information));
-    try std.testing.expectEqual(Role.warning, Role.of(.warning));
-    try std.testing.expectEqual(Role.failure, Role.of(.failure));
-}
-
 test "a split message of Drinky carries its symbol on the first part alone" {
     const gpa = std.testing.allocator;
-    const wrapped = try wrapAlloc(gpa, .information, "one two three four five six seven eight");
-    defer gpa.free(wrapped);
-    var list = try collectParts(gpa, wrapped, 20);
+    const message = try noticeAlloc(gpa, .information, "one two three four five six seven eight");
+    defer gpa.free(message);
+    var list = try collectParts(gpa, message, 20);
     defer {
         for (list.items) |part| gpa.free(part);
         list.deinit(gpa);
@@ -658,7 +634,8 @@ test "the plain text of a message keeps its symbol and its literal text" {
 
 test "a heading becomes a bold line, and the inline markers become tags" {
     try expectRender(
-        "<b>Title</b>\nPlain <b>bold</b>, <i>italic</i>, <s>struck</s>, and <code>a &lt;b&gt;</code>.",
+        "<b>Title</b>\nPlain <b>bold</b>, <i>italic</i>, <s>struck</s>, " ++
+            "and <code>a &lt;b&gt;</code>.",
         "# Title\nPlain **bold**, *italic*, ~~struck~~, and `a <b>`.",
     );
     try expectRender(

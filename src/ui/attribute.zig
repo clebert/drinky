@@ -3,21 +3,24 @@ const std = @import("std");
 const terminal = @import("terminal");
 
 const role = @import("role.zig");
+const testing = @import("testing.zig");
 
-pub const Name = enum {
+const Name = enum {
     reset,
+    bold,
     italic,
     underline,
+    double_underline,
     strikethrough,
 };
-
-const Emphasis = enum { bold, underline, double_underline };
 
 pub fn sequence(comptime name: Name) []const u8 {
     return switch (name) {
         .reset => "\x1b[0m",
+        .bold => "\x1b[1m",
         .italic => "\x1b[3m",
         .underline => "\x1b[4m",
+        .double_underline => "\x1b[21m",
         .strikethrough => "\x1b[9m",
     };
 }
@@ -29,36 +32,40 @@ pub fn apply(sink: *terminal.View.Sink, name: Name) !void {
 }
 
 pub fn emphasize(sink: *terminal.View.Sink, name: role.Name, underlined: bool) !void {
-    switch (emphasis(name, underlined)) {
-        .bold => try sink.sgr("\x1b[1m"),
-        .underline => try sink.sgr("\x1b[4m"),
-        .double_underline => try sink.sgr("\x1b[21m"),
-    }
+    try apply(sink, emphasis(name, underlined));
 }
 
-fn emphasis(name: role.Name, underlined: bool) Emphasis {
+fn emphasis(name: role.Name, underlined: bool) Name {
     if (name != .muted) return .bold;
     return if (underlined) .double_underline else .underline;
 }
 
-test "the attribute map pins the SGR sequence for each attribute" {
-    inline for (std.enums.values(Name)) |name| {
-        const pinned = switch (name) {
-            .reset => "\x1b[0m",
-            .italic => "\x1b[3m",
-            .underline => "\x1b[4m",
-            .strikethrough => "\x1b[9m",
-        };
-        try std.testing.expectEqualStrings(pinned, sequence(name));
-    }
-}
-
 test "muted emphasis stays distinct from an existing underline" {
-    try std.testing.expectEqual(Emphasis.underline, emphasis(.muted, false));
-    try std.testing.expectEqual(Emphasis.double_underline, emphasis(.muted, true));
-    inline for (std.enums.values(role.Name)) |name| {
+    const gpa = std.testing.allocator;
+    var rig: testing.Rig = undefined;
+    rig.init(gpa);
+    defer rig.deinit();
+    const names = comptime std.enums.values(role.Name);
+    const sink = (try rig.begin(&.{ .columns = 40, .rows = 2 * names.len })).sink;
+    var line: usize = 0;
+    inline for (names) |name| {
+        for ([_]bool{ false, true }) |underlined| {
+            sink.begin();
+            try emphasize(sink, name, underlined);
+            try sink.text(@tagName(name) ++ ".");
+            sink.end(.{ .id = 0, .line = line });
+            line += 1;
+        }
+    }
+
+    const painted = try rig.painted();
+    try testing.expectShows(painted, &.{
+        comptime sequence(.underline) ++ "muted.",
+        comptime sequence(.double_underline) ++ "muted.",
+    });
+    inline for (names) |name| {
         if (name == .muted) continue;
-        try std.testing.expectEqual(Emphasis.bold, emphasis(name, false));
-        try std.testing.expectEqual(Emphasis.bold, emphasis(name, true));
+        const bold = comptime sequence(.bold) ++ @tagName(name) ++ ".";
+        try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, painted, bold));
     }
 }

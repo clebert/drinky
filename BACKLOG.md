@@ -1,14 +1,15 @@
 # Backlog
 
-This file holds the open direction of Drinky. An open item states what Drinky lacks, holds the facts
-that an implementer cannot re-derive from the code, and names the trigger that makes the work due. A
-line leaves this file when its trigger fires.
+This file holds the open direction of Drinky. An open item states what Drinky lacks and holds the
+facts that an implementer cannot re-derive from the code. A request of the user starts its work. An
+item names a trigger when an event must come first, such as a trace that the work needs. A line
+leaves this file when its work lands.
 
 `TODO.md` is the inbox. It is git-ignored, and the user writes loose notes into it. Shape a note
 into an item only when the user asks for it. Interview the user first with the `interview` skill,
 and never invent a priority or a trigger. Delete the note from `TODO.md` once its item stands here.
-An idea is one line without a trigger. It is a placeholder against loss, and it leaves when it
-becomes an open item or when the user drops it.
+An idea is one line. It is a placeholder against loss, and it leaves when it becomes an open item or
+when the user drops it.
 
 ## Open items
 
@@ -21,80 +22,80 @@ becomes an open item or when the user drops it.
   invisible Unicode byte. Trigger: a capture of the raw SSE frames of such a passage.
 - A model that no source describes leaves the picker with no row, because `Catalog.merge` returns
   null and the caller drops the model. A disabled row that names what the model lacks needs a third
-  row role beside selection and muted, and its hint names the config key of the model metadata.
-  Trigger: the model metadata in the config.
-- The config describes no model. A `models` entry describes a model that no provider and no
-  OpenRouter entry describes, so the user can unblock any model. The provider wins every field it
-  states, the config wins over OpenRouter, and OpenRouter fills the rest. The `provider` field of an
-  entry names a provider or a configured server, so one flat array serves both, and the other fields
-  take the names of the `models.json` shape. A later step can let Drinky write the entry for the
-  user. Trigger: a model of daily use that no source describes.
-- The config names no server. A `servers` entry names a server that speaks Chat Completions, so
-  Drinky talks to a model on llama.cpp, Ollama, vLLM, or a cloud endpoint with a key. One account
-  with the label "OpenAI Compatible" covers every server, and the server name prefixes the model
-  name, as in `ollama/qwen3:32b`. A metadata entry of a server model holds the server name in
-  `provider` and the bare id in `name`. A `servers` entry holds a name, a base URL up to `/v1`, and
-  an optional `api_key_env`, so the file holds no secret. The load refuses a server that has the
-  name of a provider. The fetch reads `/v1/models` for the id alone, visits every server in parallel
-  inside one window, keeps every list that arrived, and names each server that did not. The stream
+  row role beside selection and muted. Its hint names the config key of the model metadata. Trigger:
+  the model metadata in the config.
+- The config describes no model. A `models` entry describes a model that no provider and no entry of
+  the public metadata describes, so the user can unblock any model. The provider wins every field it
+  states. The config wins over the public metadata, and the public metadata fills the rest. The
+  `provider` field of an entry names a provider or a configured server, so one flat array serves
+  both. The other fields take the names of the `models.json` shape. A later step can let Drinky
+  write the entry for the user. Trigger: a model of daily use that no source describes.
+- The config names no server. A `servers` entry names a server that speaks Chat Completions. Drinky
+  then talks to a model on llama.cpp, Ollama, vLLM, or a cloud endpoint with a key. One account with
+  the label "OpenAI Compatible" covers every server, and the server name prefixes the model name, as
+  in `ollama/qwen3:32b`. A metadata entry of a server model holds the server name in `provider` and
+  the bare id in `name`. A `servers` entry holds a name, a base URL up to `/v1`, and an optional
+  `api_key_env`, so the file holds no secret. The load refuses a server that has the name of a
+  provider. The fetch reads `/v1/models` for the id alone and visits every server in parallel inside
+  one window. It keeps every list that arrived and names each server that did not. The stream
   carries reasoning as `reasoning_content` on llama.cpp, vLLM, and DeepSeek, as `reasoning` on
-  Ollama, or as inline `<think>` tags, and the decoder reads all three. The replay sends the text
-  back under the field name of the stream, and it covers only the messages after the latest user
-  message, because the vendors that document interleaved thinking ask for that scope. A tag stream
-  goes back inside `content` with its tags. The replay keys on the server and not on the account,
-  because one account spans every server. The wire sends `reasoning_effort` only when the request
-  names a level. The account goes first among the accounts without a login. A server states no
-  window, so this item needs the model metadata in the config. Trigger: an account row that the
-  config supplies.
+  Ollama, or as inline `<think>` tags. The decoder reads all three. The replay sends the text back
+  under the field name of the stream. It covers only the messages after the latest user message,
+  because the vendors that document interleaved thinking ask for that scope. A tag stream goes back
+  inside `content` with its tags. The replay keys on the server and not on the account, because one
+  account spans every server. The wire sends `reasoning_effort` only when the request names a level.
+  The account goes first among the accounts without a login. A server states no window, so this item
+  needs the model metadata in the config. Trigger: an account row that the config supplies.
 - Drinky needs a terminal. A headless mode answers one prompt with no terminal: text in, text out,
   with flags for the model and the effort. It is the base for any agent that Drinky drives itself.
   Trigger: the first agent that Drinky drives itself.
 - Drinky keeps no prompt history. Tab at the idle prompt opened the submitted terminal prompts of
-  every project, newest first, and Enter appended the selected prompt to the draft as editable text.
-  A submitted prompt without a leading slash entered the history, which kept the 100 most recent
-  prompts of at most 8 KiB each in the owner-only `~/.drinky/prompt_history.json` behind the
-  `prompt_history.enabled` config key. Trigger: the client runs on the session of `lib/core`.
+  every project, newest first. Enter appended the selected prompt to the draft as editable text. A
+  submitted prompt without a leading slash entered the history. The history kept the 100 most recent
+  prompts of at most 8 KiB each in the owner-only `~/.drinky/prompt_history.json`. The
+  `prompt_history.enabled` config key controlled the history.
 - A failed turn offers no retry. A turn that failed after it committed work left the caption
-  `Failed turn` above the editor, and Ctrl+N sent a `<retry_request>` that named the failure and
-  asked the model to continue from the last committed checkpoint, under the transcript note
-  `Drinky asked the model to continue from the committed work.` A failed retry attempt offered the
-  retry again. The Telegram chat showed a `Failed turn` message with `Try again` and `Dismiss`, Esc
-  or a new turn dismissed the offer, and Herdr read the wait as `blocked`. The user wants the offer
-  back when the core makes it cheap. Trigger: the client runs on the session of `lib/core`.
+  `Failed turn` above the editor. Ctrl+N then sent a `<retry_request>` that named the failure. The
+  request asked the model to continue from the last committed checkpoint. The transcript showed the
+  note `Drinky asked the model to continue from the committed work.` in place of the request. A
+  failed retry attempt offered the retry again. The Telegram chat showed a `Failed turn` message
+  with `Try again` and `Dismiss`. Esc or a new turn dismissed the offer, and Herdr read the wait as
+  `blocked`. The user wants the offer back when the core makes it cheap. A turn that failed before
+  its first commit keeps its user message in the conversation too. The session appends the message
+  before the turn starts, and the editor holds no copy of it.
 - A canceled turn that committed work stays in the conversation as it is. Under the caption
-  `Canceled turn`, Ctrl+N removed the turn from the conversation and the transcript, kept the events
-  of the session, retreated the chat cursor over the removed blocks, and returned the prompt and the
-  committed steering messages to the editor as editable text. A turn that ran `write`, `edit`, or
-  `bash` warned first and removed on the second press. Esc kept the turn, and a new turn or `/new`
-  dropped the offer. The user wants the removal back when the core makes it cheap. Trigger: the
-  client runs on the session of `lib/core`.
-- Drinky takes no message during a turn. Enter queued the line as a steering message, the turn took
-  the queue at its next tool round as one combined user message, and Ctrl+P moved the queued
-  messages back into the editor above the draft. A Telegram message during a turn queued the same
-  way, with a reaction on the queue, the commit, and the drop, and a `Withdraw` button beside
-  `Cancel turn`. A cancel or a failure returned the uncommitted messages to the editor. A `steer`
-  command can return once the core and the design stand. Trigger: the client runs on the session of
-  `lib/core`.
+  `Canceled turn`, Ctrl+N removed the turn from the conversation and the transcript. It kept the
+  events of the session and retreated the chat cursor over the removed blocks. It returned the
+  prompt and the committed steering messages to the editor as editable text. A turn that ran
+  `write`, `edit`, or `bash` warned first and removed on the second press. Esc kept the turn, and a
+  new turn or `/new` dropped the offer. The user wants the removal back when the core makes it
+  cheap.
+- Drinky takes no message during a turn. Enter queued the line as a steering message. The turn took
+  the queue at its next tool round as one combined user message. Ctrl+P moved the queued messages
+  back into the editor above the draft. A Telegram message during a turn queued the same way, with a
+  reaction on the queue, the commit, and the drop. A `Withdraw` button stood beside `Cancel turn`. A
+  cancel or a failure returned the uncommitted messages to the editor. A `steer` command can return
+  once the core and the design stand.
 - The chat runs `/new` alone, and a tap gets no toast. `/effort`, `/model`, `/help`, `/skill`, and
   `/status` ran from the chat too, and the bot registered them with `setMyCommands`. A command that
   picks opened an inline keyboard with one button per row and a `✓` mark on the current row. A step
   below the first added a `‹ Back` button, and every keyboard ended with a `Cancel` button. The
-  keyboard held the first 98 rows, a step edited the same message, and the back trail held eight
-  steps. A model step with no cached list named the terminal for the fetch. A tapped skill row
-  loaded its skill with no task. `/status` replied in the chat, wrote no terminal event, and ran
-  during a turn too. The last answer of a completed turn carried a `Shorten` button. Its tap sent a
-  fixed request for a phone-screen summary and kept the editor text. The transcript showed the note
-  `Drinky asked the model to shorten the last answer.` in place of a prompt. A stale, closed, or
-  busy tap got a toast that named the reason. A random seed per process kept a keyboard of an
-  earlier process stale. Trigger: the client runs on the session of `lib/core`.
+  keyboard held the first 98 rows and named no dropped row. A step edited the same message, and the
+  back trail held eight steps. A return can state the dropped rows. A model step with no cached list
+  named the terminal for the fetch. A tapped skill row loaded its skill with no task. A return can
+  let the user add optional task text after the selection. `/status` replied in the chat, wrote no
+  terminal event, and ran during a turn too. The last answer of a completed turn carried a `Shorten`
+  button. Its tap sent a fixed request for a phone-screen summary and kept the editor text. The
+  transcript showed the note `Drinky asked the model to shorten the last answer.` in place of a
+  prompt. A stale, closed, or busy tap got a toast that named the reason. A random seed per process
+  kept a keyboard of an earlier process stale.
 - Drinky has no `/status` command, and no command runs during a turn. `/status` recorded the status
   line as one terminal event in full. The event named the directory, the branch, the context gauge
   with its token counts, and the cost. It named the quota windows, the credit pool, and the cache
   rate of a running turn, then the account, the model, and the effort. Inside a Herdr pane, it named
   the directory and the branch that the status line leaves to the pane label. It ran during a turn
   too, and its event waited for the message boundary and survived the rewind of a failed turn. Two
-  requests in a row wrote two events in place of a repeat count. Trigger: the client runs on the
-  session of `lib/core`.
+  requests in a row wrote two events in place of a repeat count.
 - Drinky keeps no principal marker and settles no session on a reread of the credential file. A
   login saved the account and organization ids of the Anthropic OAuth profile and the user id of the
   xAI id token. A stored token of the same principal counted as a rotation, and a token of another
@@ -105,11 +106,16 @@ becomes an open item or when the user drops it.
   replacement dropped the evidence, and a sign-out of the active account handed the session to the
   next one. Drinky reported an unreadable file or entry, and the list kept the last read. A login
   with a failed save did not follow the store. The reread before a refresh stays, and it takes any
-  newer stored token as it is. Trigger: the client runs on the session of `lib/core`.
+  newer stored token as it is.
+- Drinky shows no notice when it cannot save a refreshed credential. The fresh token serves the
+  session, and the next token request tries the save again. After a restart, a refresh token that
+  the server rotated away forces a new sign-in, and no text names the cause. A notice needs a path
+  from the credential to the client. Trigger: a sign-in that a lost refresh token forces after a
+  restart.
 - `/prompt` opens the prompt history as an editable picker in the terminal and as an inline keyboard
-  in Telegram, where a selection starts its saved prompt at once. Plain Telegram messages that start
-  a turn enter the history, and steering messages and skill commands stay out. Trigger: the return
-  of the prompt history.
+  in Telegram. A selection in Telegram starts its saved prompt at once. Plain Telegram messages that
+  start a turn enter the history, and steering messages and skill commands stay out. Trigger: the
+  return of the prompt history.
 - A canceled turn in Telegram offers `Revise`, which removes that turn from the conversation and
   waits for the next Telegram message. The offer has no `Keep` button, so a new message or `/new`
   keeps the canceled turn and dismisses the offer. The chat keeps the original messages and
@@ -117,10 +123,20 @@ becomes an open item or when the user drops it.
   the revision is unavailable. After `write`, `edit`, or `bash`, the first tap warns that tool
   changes stay, and the second tap removes the turn. Trigger: the return of the removal of a
   canceled turn.
+- No test covers the paint of the client when its frame task cannot start. `App.armTick` then paints
+  at once, and `App.refresh` reads the size and switches the screen through the terminal. A test
+  needs a terminal that it can fake. Trigger: a second need for a seam of the terminal, such as a
+  test that drives the client loop.
 - The retry adds no jitter, so two sessions that fail together repeat together. Trigger: an account
   that limits the rate of a burst.
 - The transport reads the seconds form of `Retry-After` alone, so a date form falls back to the
   backoff. Trigger: a reply that states a date.
+- A failed test shows no stack trace, because `build.zig` sets `strip = true` for each test module.
+  On macOS 27.0, the MachO unwinder of Zig 0.16.0 panics with `switch on corrupt value` at
+  `std/debug/SelfInfo/MachO.zig:390`. The test allocator records a stack at each allocation, so a
+  test hits that panic. The panic handler then waits on the lock of the unwinder, and the test
+  hangs. A Debug build of Drinky records stacks through the same allocator and can hang too.
+  Trigger: a Zig release whose unwinder reads the unwind data of macOS 27.0.
 
 ## Ideas
 
@@ -129,7 +145,5 @@ becomes an open item or when the user drops it.
 - Keep the request prefix byte-stable, so a local server reuses its prompt cache.
 - Read the window of a server model from the native endpoint of its server.
 - Run the FrontierHarness Eval tasks through a Harbor agent adapter.
-- Let the user add optional task text after a skill selection in Telegram.
 - Name an OpenRouter preset as a model.
 - Send the OpenRouter app attribution headers behind an opt-in.
-- State the dropped rows when a chat keyboard cannot hold a whole picker.

@@ -3,8 +3,9 @@ set -eu
 cd "$(dirname "$0")/.."
 
 zig build
-zig fmt --check build.zig src lib scripts
-zig run scripts/comment_scan.zig -- build.zig src lib scripts
+zig fmt --check build.zig build.zig.zon src lib scripts
+zig run scripts/comment_scan.zig -- build.zig build.zig.zon src lib scripts
+zig run scripts/width_scan.zig -- build.zig build.zig.zon src lib scripts
 npx --yes prettier@3 --check --log-level warn '**/*.md'
 
 summary=$(zig build test --summary all 2>&1) || {
@@ -13,7 +14,7 @@ summary=$(zig build test --summary all 2>&1) || {
 }
 printf '%s\n' "$summary"
 
-ran=$(printf '%s\n' "$summary" | grep -oE '[0-9]+/[0-9]+ tests passed' | grep -oE '^[0-9]+')
+ran=$(printf '%s\n' "$summary" | grep -oE '/[0-9]+ tests passed' | grep -oE '[0-9]+')
 declared=$(grep -rhE '^test ' src lib scripts --include='*.zig' | wc -l | tr -d ' ')
 
 if [ "${ran:-0}" != "$declared" ]; then
