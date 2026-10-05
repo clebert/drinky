@@ -591,7 +591,7 @@ const golden_level = testing.oneLine(
     \\"parts":[{"functionResponse":{"name":"write","response":{"error":"done"}}}]}],
     \\"tools":[{"functionDeclarations":[{"name":"read","description":"Read a file.",
     \\"parametersJsonSchema":{"type":"object","properties":{"path":{"type":"string",
-    \\"description":"The path."}},"required":["path"]}}]}],
+    \\"description":"The path."}},"required":["path"],"additionalProperties":false}}]}],
     \\"generationConfig":{"thinkingConfig":{"includeThoughts":true,"thinkingLevel":"high"}}}
 );
 

@@ -806,6 +806,7 @@ test "the body names the model, the cap, the system header, the tools, and the m
         "path",
         input_schema.get("required").?.array.items[0].string,
     );
+    try std.testing.expectEqual(false, input_schema.get("additionalProperties").?.bool);
     try std.testing.expect(tool.get("cache_control") != null);
 }
 

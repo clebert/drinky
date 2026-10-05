@@ -103,6 +103,8 @@ pub fn writeParametersSchema(
         if (parameter.required) try stringify.write(parameter.name);
     }
     try stringify.endArray();
+    try stringify.objectField("additionalProperties");
+    try stringify.write(false);
     try stringify.endObject();
 }
 

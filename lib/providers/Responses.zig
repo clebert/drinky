@@ -1115,18 +1115,18 @@ const golden = testing.oneLine(
     \\{"model":"gpt-5.6-sol","instructions":"be terse","reasoning":{"effort":"xhigh",
     \\"summary":"auto"},"tools":[{"type":"function","name":"read","description":"read a file",
     \\"strict":false,"parameters":{"type":"object","properties":{"path":{"type":"string",
-    \\"description":"the path"}},"required":["path"]}}],"tool_choice":"auto",
-    \\"parallel_tool_calls":true,"store":false,"include":["reasoning.encrypted_content"],
-    \\"input":[{"type":"message","role":"user","content":[{"type":"input_text",
-    \\"text":"first"}]},{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text",
-    \\"text":"think"}],"encrypted_content":"enc1"},{"type":"function_call","call_id":"call_1",
-    \\"name":"read","arguments":"{\"path\":\"a.zig\"}"},{"type":"message","role":"assistant",
-    \\"content":[{"type":"output_text","text":"checking"}]},{"type":"function_call_output",
-    \\"call_id":"call_1","output":"contents"},{"type":"reasoning","id":"rs_2","summary":[],
-    \\"encrypted_content":"enc2"},{"type":"function_call","call_id":"call_2","name":"write",
-    \\"arguments":"{\"path\":\"b\"}"},{"type":"function_call_output","call_id":"call_2",
-    \\"output":"Error: denied"},{"type":"message","role":"assistant",
-    \\"content":[{"type":"output_text","text":"all set"}]}],"stream":true}
+    \\"description":"the path"}},"required":["path"],"additionalProperties":false}}],
+    \\"tool_choice":"auto","parallel_tool_calls":true,"store":false,
+    \\"include":["reasoning.encrypted_content"],"input":[{"type":"message","role":"user",
+    \\"content":[{"type":"input_text","text":"first"}]},{"type":"reasoning","id":"rs_1",
+    \\"summary":[{"type":"summary_text","text":"think"}],"encrypted_content":"enc1"},
+    \\{"type":"function_call","call_id":"call_1","name":"read","arguments":"{\"path\":\"a.zig\"}"},
+    \\{"type":"message","role":"assistant","content":[{"type":"output_text","text":"checking"}]},
+    \\{"type":"function_call_output","call_id":"call_1","output":"contents"},{"type":"reasoning",
+    \\"id":"rs_2","summary":[],"encrypted_content":"enc2"},{"type":"function_call",
+    \\"call_id":"call_2","name":"write","arguments":"{\"path\":\"b\"}"},
+    \\{"type":"function_call_output","call_id":"call_2","output":"Error: denied"},{"type":"message",
+    \\"role":"assistant","content":[{"type":"output_text","text":"all set"}]}],"stream":true}
 );
 
 test "the golden bytes keep the Responses wire shape stable" {
