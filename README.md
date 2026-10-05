@@ -103,10 +103,10 @@ EOF
 
 `drinky models` lists the `account/model` values of each signed-in account with a saved model list.
 Fetch a list with `/model` first. A run uses the config file, the instruction files, the skills, and
-the tools of a session. It saves no choice and signs in to no account. An incomplete reply still
-reaches stdout. A failure of the run goes to stderr, and the exit code is then 1. A run drops the
-start reports of a session, such as an unknown config key or an instruction file that Drinky cannot
-read.
+the tools of a session. It saves no choice and signs in to no account. A failure of the run goes to
+stderr, and the exit code is then 1. A run that stops at a limit also fails, but its last reply text
+still reaches stdout. A run drops the start reports of a session, such as an unknown config key or
+an instruction file that Drinky cannot read.
 
 A run sets `DRINKY_RUN` for its commands, and Drinky refuses to start a run where that variable is
 set. An agent can start a reviewer, but the reviewer cannot start another agent.

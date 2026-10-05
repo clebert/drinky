@@ -469,6 +469,13 @@ pub fn document(
     });
 }
 
+pub fn keyPath(comptime path: []const u8) []const u8 {
+    comptime for (leaves) |leaf| {
+        if (std.mem.eql(u8, leaf.path, path)) break;
+    } else @compileError("the config has no key " ++ path);
+    return path;
+}
+
 pub fn deinit(self: *Config, gpa: std.mem.Allocator) void {
     gpa.free(self.path);
     self.user_instructions.deinit();

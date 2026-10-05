@@ -4,9 +4,11 @@ const core = @import("core");
 
 const escape = @import("escape.zig");
 
+pub const nested_variable = "DRINKY_RUN";
+
 const usage = "Use drinky, drinky models, or drinky run --model account/model --effort level.";
 
-const effort_levels = levels: {
+pub const effort_levels = levels: {
     const names = std.meta.fieldNames(core.Provider.Effort);
     var text: []const u8 = "";
     for (names, 0..) |name, index| {

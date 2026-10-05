@@ -11,8 +11,6 @@ const project = @import("project.zig");
 const Screen = @import("Screen.zig");
 const testing = @import("testing.zig");
 
-const nested_variable = "DRINKY_RUN";
-
 const nested_refusal = "Drinky cannot start drinky run inside another drinky run process.";
 const prompt_missing = "Drinky received no prompt on stdin.";
 const prompt_not_utf8 = "Drinky cannot use the prompt because it is not valid UTF-8.";
@@ -152,14 +150,15 @@ pub fn run(
     request: *const Request,
 ) !bool {
     const stderr = options.stderr;
-    if (options.environment.get(nested_variable) != null) return refuse(stderr, nested_refusal);
+    if (options.environment.get(command_line.nested_variable) != null)
+        return refuse(stderr, nested_refusal);
     if (!std.unicode.utf8ValidateSlice(request.prompt)) return refuse(stderr, prompt_not_utf8);
     if (std.mem.trim(u8, request.prompt, &std.ascii.whitespace).len == 0)
         return refuse(stderr, prompt_missing);
 
     var environment = try options.environment.clone(gpa);
     defer environment.deinit();
-    try environment.put(nested_variable, "1");
+    try environment.put(command_line.nested_variable, "1");
     const block = try environment.createPosixBlock(gpa, .{});
     defer block.deinit(gpa);
 
@@ -470,7 +469,10 @@ test "a run refuses a nested start, a blank prompt, and a prompt that is not UTF
     };
     const cases = [_]Case{
         .{
-            .variables = &.{ .{ "OPENAI_API_KEY", "sk-openai" }, .{ nested_variable, "1" } },
+            .variables = &.{
+                .{ "OPENAI_API_KEY", "sk-openai" },
+                .{ command_line.nested_variable, "1" },
+            },
             .prompt = "review",
             .refusal = nested_refusal,
         },

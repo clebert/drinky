@@ -4,6 +4,7 @@ const core = @import("core");
 const tools = @import("tools");
 
 const command = @import("command/root.zig");
+const command_line = @import("command_line.zig");
 const Config = @import("Config.zig");
 
 const Options = struct {
@@ -17,15 +18,15 @@ const head =
     \\# Drinky
     \\
     \\Drinky is a terminal coding agent. This document holds the facts of the harness: its
-    \\commands, its config file, its keys, and the files that it discovers. Answer a question
-    \\about Drinky from this document.
+    \\commands, its config file, its keys, the files that it discovers, and its headless mode.
+    \\Answer a question about Drinky from this document.
     \\
     \\## Commands
     \\
     \\The user types a command line into the editor, and that line reaches no model. Drinky runs
-    \\it locally. You cannot run a command, so name the line that the user must type. Drinky
-    \\refuses an unknown command, an unknown skill, and a command with an argument. A second Enter
-    \\then sends the refused line to the model as a message.
+    \\it locally. You cannot run a slash command, so name the line that the user must type.
+    \\Drinky refuses an unknown command, an unknown skill, and a command with an argument. A
+    \\second Enter then sends the refused line to the model as a message.
     \\
     \\
 ;
@@ -90,6 +91,7 @@ fn write(
     try writeKeys(writer, options);
     try writer.writeAll(discovery);
     try writeSkillRules(writer);
+    try writeHeadless(writer);
     try writer.writeAll(repository);
 }
 
@@ -166,7 +168,50 @@ fn writeSkillRules(writer: *std.Io.Writer) !void {
     , .{ tools.read.lines_max, @divExact(tools.read.bytes_max, 1024) });
 }
 
-test "the document orders its sections and states each command, key hint, window, and limit" {
+fn writeHeadless(writer: *std.Io.Writer) !void {
+    try writer.print(
+        \\
+        \\## Headless mode
+        \\
+        \\`drinky run` answers one prompt without a terminal. It is not a slash command, so you
+        \\can start it through the `bash` tool. A run can review your work as a second agent.
+        \\
+        \\- A run reads the prompt from stdin and writes the text of its final reply to stdout.
+        \\- The `--model` flag and the `--effort` flag are required.
+        \\- The `--model` flag takes an `account/model` value. The command `drinky models` lists
+        \\  the values of each signed-in account with a saved model list. The user fetches a list
+        \\  with `/model`.
+        \\- The `--effort` flag takes {[levels]s}. Drinky uses the nearest
+        \\  level that the model takes.
+        \\- A run starts with an empty conversation. It sees no part of this conversation, so the
+        \\  prompt must hold the whole task.
+        \\- A run uses the config file, the instruction files, the skills, and the tools of a
+        \\  session. It saves no choice and signs in to no account.
+        \\- A run drops the start reports of a session, such as an unknown config key or an
+        \\  instruction file that Drinky cannot read.
+        \\- A failure of the run goes to stderr, and the exit code is then 1. A run that stops at
+        \\  a limit also fails, but its last reply text still reaches stdout.
+        \\- A run can take longer than the `{[timeout_key]s}` limit. Give the `bash` call a
+        \\  `timeout_seconds` value that covers the run.
+        \\- A run sets `{[nested_variable]s}` for its commands. Drinky refuses to start a run where
+        \\  that variable is set, so a run cannot start another run.
+        \\
+        \\Quote the delimiter of the heredoc, so that the shell does not change the prompt:
+        \\
+        \\```sh
+        \\drinky run --model account/model --effort high <<'EOF'
+        \\Review the uncommitted changes.
+        \\EOF
+        \\```
+        \\
+    , .{
+        .levels = command_line.effort_levels,
+        .timeout_key = Config.keyPath("bash.timeout_ms"),
+        .nested_variable = command_line.nested_variable,
+    });
+}
+
+test "the document orders sections and states each command, key hint, window, limit, and effort" {
     const gpa = std.testing.allocator;
     var config: Config = .{
         .path = try gpa.dupe(u8, "/unused/config.json"),
@@ -185,11 +230,13 @@ test "the document orders its sections and states each command, key hint, window
     const configuration = std.mem.indexOf(u8, text, "## Config file").?;
     const keys = std.mem.indexOf(u8, text, "## Key bindings").?;
     const discovery_index = std.mem.indexOf(u8, text, "## Discovery").?;
+    const headless_index = std.mem.indexOf(u8, text, "## Headless mode").?;
     const repository_index = std.mem.indexOf(u8, text, "## Repository").?;
     try std.testing.expect(commands < configuration);
     try std.testing.expect(configuration < keys);
     try std.testing.expect(keys < discovery_index);
-    try std.testing.expect(discovery_index < repository_index);
+    try std.testing.expect(discovery_index < headless_index);
+    try std.testing.expect(headless_index < repository_index);
 
     for (command.summaries) |summary| {
         const row = try std.fmt.allocPrint(
@@ -213,5 +260,9 @@ test "the document orders its sections and states each command, key hint, window
         @divExact(tools.read.bytes_max, 1024),
     });
     defer gpa.free(window);
-    try std.testing.expect(std.mem.indexOf(u8, text[discovery_index..], window) != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, text[discovery_index..headless_index], window) != null,
+    );
+    const headless = text[headless_index..repository_index];
+    try std.testing.expect(std.mem.indexOf(u8, headless, command_line.effort_levels) != null);
 }
