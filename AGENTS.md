@@ -132,7 +132,8 @@ tool. Everything else is not a finding.
 `README.md`, `BACKLOG.md`, this file, and the skills under `.agents/skills/` are the documents.
 Prettier formats every document, and `.prettierrc.json` configures it. `README.md` states the stable
 product and stays concise. `BACKLOG.md` holds the open direction, and a line leaves it when its work
-lands. `TODO.md` is its inbox, and Git ignores it.
+lands. `TODO.md` is its inbox, and Git ignores it. When a change alters a fact, update every
+document and every text in the code that states the fact.
 
 Write the documents and every text that Drinky shows to the user in ASD-STE100 Simplified Technical
 English.
@@ -201,4 +202,4 @@ regenerates the Unicode data, its test corpus, and its license notice. It uses t
 never joins the default build.
 
 A rule that a tool can check belongs in `scripts/check.sh`, because an editor setting enforces
-nothing. Add a mechanism for a problem that occurred. A risk without a case needs no machinery.
+nothing. Add a check to `scripts/check.sh` for a problem that occurred.
