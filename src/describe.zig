@@ -6,6 +6,7 @@ const tools = @import("tools");
 const command = @import("command/root.zig");
 const command_line = @import("command_line.zig");
 const Config = @import("Config.zig");
+const tool_environment = @import("tool_environment.zig");
 
 const Options = struct {
     config: *const Config,
@@ -183,6 +184,9 @@ fn writeHeadless(writer: *std.Io.Writer) !void {
         \\  with `/model`.
         \\- The `--effort` flag takes {[levels]s}. Drinky uses the nearest
         \\  level that the model takes.
+        \\- Each `bash` command gets `{[model_variable]s}` with the `account/model` value of this
+        \\  session. It also gets `{[effort_variable]s}` with the effort level that the user chose.
+        \\  Both follow `/model` and `/effort`.
         \\- A run starts with an empty conversation. It sees no part of this conversation, so the
         \\  prompt must hold the whole task.
         \\- A run uses the config file, the instruction files, the skills, and the tools of a
@@ -199,7 +203,7 @@ fn writeHeadless(writer: *std.Io.Writer) !void {
         \\Quote the delimiter of the heredoc, so that the shell does not change the prompt:
         \\
         \\```sh
-        \\drinky run --model account/model --effort high <<'EOF'
+        \\drinky run --model "${[model_variable]s}" --effort "${[effort_variable]s}" <<'EOF'
         \\Review the uncommitted changes.
         \\EOF
         \\```
@@ -207,7 +211,9 @@ fn writeHeadless(writer: *std.Io.Writer) !void {
     , .{
         .levels = command_line.effort_levels,
         .timeout_key = Config.keyPath("bash.timeout_ms"),
-        .nested_variable = command_line.nested_variable,
+        .model_variable = tool_environment.model,
+        .effort_variable = tool_environment.effort,
+        .nested_variable = tool_environment.nested,
     });
 }
 

@@ -1,7 +1,10 @@
 const std = @import("std");
 
+const core = @import("core");
+
 gpa: std.mem.Allocator,
 host: Host,
+variables: []const core.Runner.Variable = &.{},
 
 pub const Error = error{ Canceled, OutOfMemory, WriteFailed, InvalidArguments };
 

@@ -107,6 +107,7 @@ fn run(
     gpa: std.mem.Allocator,
     call: *const core.Tool.Call,
     items: []const core.Conversation.Item,
+    variables: []const core.Runner.Variable,
 ) core.Runner.Error!core.Tool.Output {
     const self: *Registry = @ptrCast(@alignCast(ptr));
     const entry = entryNamed(call.name) orelse return output.failure(
@@ -115,11 +116,12 @@ fn run(
         "Drinky does not recognize the tool {s}.",
         .{call.name},
     );
-    const guard = self.skill_guard orelse return self.runEntry(gpa, entry, call);
+    const context: Context = .{ .gpa = gpa, .host = self.host, .variables = variables };
+    const guard = self.skill_guard orelse return runEntry(&context, entry, call);
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     const path = (try guardedPath(arena.allocator(), entry, call.arguments)) orelse
-        return self.runEntry(gpa, entry, call);
+        return runEntry(&context, entry, call);
     const check: SkillGuard.CheckOptions = .{
         .gpa = gpa,
         .io = self.host.io,
@@ -128,26 +130,24 @@ fn run(
     };
     if (entry.tool.mutates) {
         if (try guard.refusal(&check)) |refused| return refused;
-        return self.runEntry(gpa, entry, call);
+        return runEntry(&context, entry, call);
     }
-    const result = try self.runEntry(gpa, entry, call);
+    const result = try runEntry(&context, entry, call);
     errdefer result.deinit(gpa);
     if (!result.hasFailure()) try guard.queue(&check);
     return result;
 }
 
 fn runEntry(
-    self: *const Registry,
-    gpa: std.mem.Allocator,
+    context: *const Context,
     entry: *const Entry,
     call: *const core.Tool.Call,
 ) core.Runner.Error!core.Tool.Output {
-    const context: Context = .{ .gpa = gpa, .host = self.host };
-    return entry.run(&context, call.arguments) catch |err| switch (err) {
+    return entry.run(context, call.arguments) catch |err| switch (err) {
         error.Canceled, error.OutOfMemory => |known| known,
         error.WriteFailed => error.OutOfMemory,
         error.InvalidArguments => output.failure(
-            gpa,
+            context.gpa,
             .invalid_arguments,
             "Drinky received invalid arguments for the {s} tool.",
             .{call.name},
@@ -279,12 +279,22 @@ test "an unknown tool and invalid arguments come back as failed outputs" {
     var registry: Registry = .{ .host = .{ .io = std.testing.io } };
     const tools = registry.runner();
 
-    const unknown = try tools.run(gpa, &.{ .id = "1", .name = "nope", .arguments = "{}" }, &.{});
+    const unknown = try tools.run(
+        gpa,
+        &.{ .id = "1", .name = "nope", .arguments = "{}" },
+        &.{},
+        &.{},
+    );
     defer unknown.deinit(gpa);
     try testing.expectConditions(&unknown, &.{.unknown_tool});
     try std.testing.expectEqualStrings("Drinky does not recognize the tool nope.", unknown.content);
 
-    const invalid = try tools.run(gpa, &.{ .id = "2", .name = "read", .arguments = "{}" }, &.{});
+    const invalid = try tools.run(
+        gpa,
+        &.{ .id = "2", .name = "read", .arguments = "{}" },
+        &.{},
+        &.{},
+    );
     defer invalid.deinit(gpa);
     try testing.expectConditions(&invalid, &.{.invalid_arguments});
     try testing.expectMeasures(&invalid, &.{});
@@ -299,7 +309,7 @@ test "the runner hands a call to its tool with the state of the host" {
         .id = "1",
         .name = "describe_drinky",
         .arguments = "{}",
-    }, &.{});
+    }, &.{}, &.{});
     defer described.deinit(gpa);
     try std.testing.expectEqualStrings("# Drinky\n", described.content);
 
@@ -310,7 +320,12 @@ test "the runner hands a call to its tool with the state of the host" {
     const arguments = try std.fmt.bufPrint(&arguments_buffer,
         \\{{"path":".zig-cache/tmp/{s}/f.txt"}}
     , .{tmp.sub_path});
-    const shown = try tools.run(gpa, &.{ .id = "2", .name = "read", .arguments = arguments }, &.{});
+    const shown = try tools.run(
+        gpa,
+        &.{ .id = "2", .name = "read", .arguments = arguments },
+        &.{},
+        &.{},
+    );
     defer shown.deinit(gpa);
     try std.testing.expectEqualStrings("one\ntwo\n", shown.content);
     try testing.expectMeasures(&shown, &.{
@@ -318,6 +333,32 @@ test "the runner hands a call to its tool with the state of the host" {
         .{ .line_first, 1 },
         .{ .lines_total, 2 },
     });
+}
+
+test "a command gets the variables of its call in place of the same names of the host" {
+    const gpa = std.testing.allocator;
+    const host_entries = [_:null]?[*:0]const u8{
+        "PATH=/usr/local/bin:/bin:/usr/bin",
+        "SHARED=host",
+        "KEPT=host",
+    };
+    var registry: Registry = .{
+        .host = .{ .io = std.testing.io, .environ = .{ .block = .{ .slice = &host_entries } } },
+    };
+    const variables = [_]core.Runner.Variable{
+        .{ .name = "SHARED", .value = "call" },
+        .{ .name = "ADDED", .value = "call" },
+    };
+    const result = try registry.runner().run(gpa, &.{
+        .id = "1",
+        .name = "bash",
+        .arguments =
+        \\{"command":"env | grep -E '^(SHARED|ADDED|KEPT)=' | sort"}
+        ,
+    }, &.{}, &variables);
+    defer result.deinit(gpa);
+    try std.testing.expect(!result.hasFailure());
+    try std.testing.expectEqualStrings("ADDED=call\nKEPT=host\nSHARED=call\n", result.content);
 }
 
 test "a guarded change waits for its skill, which a round boundary delivers and a reset forgets" {
@@ -346,7 +387,7 @@ test "a guarded change waits for its skill, which a round boundary delivers and 
         .{ .id = "2", .name = "edit", .arguments = edit_arguments },
     };
     for (&calls) |*call| {
-        const refused = try tools.run(gpa, call, &.{});
+        const refused = try tools.run(gpa, call, &.{}, &.{});
         defer refused.deinit(gpa);
         try testing.expectConditions(&refused, &.{.skill_required});
     }
@@ -369,7 +410,7 @@ test "a guarded change waits for its skill, which a round boundary delivers and 
     };
     try std.testing.expect((try tools.takeSkill(gpa, &history)) == null);
     for (&calls) |*call| {
-        const changed = try tools.run(gpa, call, &history);
+        const changed = try tools.run(gpa, call, &history, &.{});
         defer changed.deinit(gpa);
         try std.testing.expect(!changed.hasFailure());
     }
@@ -380,11 +421,11 @@ test "a guarded change waits for its skill, which a round boundary delivers and 
     defer gpa.free(edited);
     try std.testing.expectEqualStrings("const x = 2;\n", edited);
 
-    const proven = try tools.run(gpa, &calls[0], &.{});
+    const proven = try tools.run(gpa, &calls[0], &.{}, &.{});
     defer proven.deinit(gpa);
     try std.testing.expect(!proven.hasFailure());
     tools.reset();
-    const forgotten = try tools.run(gpa, &calls[0], &.{});
+    const forgotten = try tools.run(gpa, &calls[0], &.{}, &.{});
     defer forgotten.deinit(gpa);
     try testing.expectConditions(&forgotten, &.{.skill_required});
 }
@@ -408,14 +449,19 @@ test "a read of a guarded file queues its skill, and a failed read queues none" 
         .id = "1",
         .name = "read",
         .arguments = missing_arguments,
-    }, &.{});
+    }, &.{}, &.{});
     defer missing.deinit(gpa);
     try testing.expectConditions(&missing, &.{.path_missing});
     try std.testing.expect((try tools.takeSkill(gpa, &.{})) == null);
 
     const arguments = try std.fmt.allocPrint(gpa, "{{\"path\":\"{s}/a.zig\"}}", .{fixture.root});
     defer gpa.free(arguments);
-    const shown = try tools.run(gpa, &.{ .id = "2", .name = "read", .arguments = arguments }, &.{});
+    const shown = try tools.run(
+        gpa,
+        &.{ .id = "2", .name = "read", .arguments = arguments },
+        &.{},
+        &.{},
+    );
     defer shown.deinit(gpa);
     try std.testing.expectEqualStrings("const x = 1;\n", shown.content);
     const skill = (try tools.takeSkill(gpa, &.{})).?;

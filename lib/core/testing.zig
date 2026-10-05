@@ -145,9 +145,10 @@ const FakeRunner = struct {
         gpa: std.mem.Allocator,
         call: *const Tool.Call,
         items: []const Conversation.Item,
+        variables: []const Runner.Variable,
     ) Runner.Error!Tool.Output {
         const self: *FakeRunner = @ptrCast(@alignCast(ptr));
-        const recorded = try self.record(call, items.len);
+        const recorded = try self.record(call, items.len, variables);
         if (recorded.fired) |hook| {
             if (hook.command == .cancel) try self.awaitCancel(hook.after_cancel);
         }
@@ -164,16 +165,22 @@ const FakeRunner = struct {
         self: *FakeRunner,
         call: *const Tool.Call,
         history_items: usize,
+        variables: []const Runner.Variable,
     ) error{OutOfMemory}!Recorded {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         self.history_items = history_items;
-        const rendered = try std.fmt.allocPrint(self.gpa, "{s}:{s}", .{
-            call.name,
-            call.arguments,
-        });
-        errdefer self.gpa.free(rendered);
-        try self.calls.append(self.gpa, rendered);
+        var rendered: std.Io.Writer.Allocating = .init(self.gpa);
+        errdefer rendered.deinit();
+        const writer = &rendered.writer;
+        writer.print("{s}:{s}", .{ call.name, call.arguments }) catch return error.OutOfMemory;
+        for (variables) |variable| {
+            writer.print("|{s}={s}", .{ variable.name, variable.value }) catch
+                return error.OutOfMemory;
+        }
+        const text = try rendered.toOwnedSlice();
+        errdefer self.gpa.free(text);
+        try self.calls.append(self.gpa, text);
         const fired = self.hook;
         if (fired) |hook| {
             self.hook = null;
@@ -372,6 +379,7 @@ pub const Harness = struct {
             .effort = .high,
             .tokens_max = 4096,
             .system = "You are Drinky.",
+            .variables = &.{},
         };
     }
 

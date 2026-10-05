@@ -10,6 +10,7 @@ const Harness = @import("Harness.zig");
 const project = @import("project.zig");
 const Screen = @import("Screen.zig");
 const testing = @import("testing.zig");
+const tool_environment = @import("tool_environment.zig");
 
 const nested_refusal = "Drinky cannot start drinky run inside another drinky run process.";
 const prompt_missing = "Drinky received no prompt on stdin.";
@@ -150,7 +151,7 @@ pub fn run(
     request: *const Request,
 ) !bool {
     const stderr = options.stderr;
-    if (options.environment.get(command_line.nested_variable) != null)
+    if (options.environment.get(tool_environment.nested) != null)
         return refuse(stderr, nested_refusal);
     if (!std.unicode.utf8ValidateSlice(request.prompt)) return refuse(stderr, prompt_not_utf8);
     if (std.mem.trim(u8, request.prompt, &std.ascii.whitespace).len == 0)
@@ -158,7 +159,7 @@ pub fn run(
 
     var environment = try options.environment.clone(gpa);
     defer environment.deinit();
-    try environment.put(command_line.nested_variable, "1");
+    try environment.put(tool_environment.nested, "1");
     const block = try environment.createPosixBlock(gpa, .{});
     defer block.deinit(gpa);
 
@@ -189,6 +190,7 @@ pub fn run(
     var session = harness.session(gpa, io, listener.sink());
     defer session.deinit();
     try session.start();
+    const variables = tool_environment.variables(request.run.model, request.run.effort);
     try session.send(&.{ .configure = .{
         .provider = client.provider(),
         .account = accounts.Account.table[target.account].id,
@@ -196,6 +198,7 @@ pub fn run(
         .effort = target.model.fold(request.run.effort),
         .tokens_max = target.model.tokens_max,
         .system = harness.system,
+        .variables = &variables,
     } });
     try session.send(&.{ .prompt = request.prompt });
     listener.ended.waitUncancelable(io);
@@ -306,7 +309,7 @@ fn refuseAccount(
     return false;
 }
 
-test "a run gives its tools the run marker and writes the final reply alone to stdout" {
+test "a run gives its tools its three variables and writes only the final reply to stdout" {
     var rig: Rig = undefined;
     try rig.init(&.{ .replies = &.{
         .{ .body = marker_call_stream },
@@ -314,12 +317,12 @@ test "a run gives its tools the run marker and writes the final reply alone to s
     } });
     defer rig.deinit();
 
-    try std.testing.expect(try rig.ask(.high, "openai-api-key/gpt-5.6-sol", "check"));
+    try std.testing.expect(try rig.ask(.max, "openai-api-key/gpt-5.6-sol", "check"));
     try std.testing.expectEqualStrings("done\n", rig.stdout.written());
     try std.testing.expectEqualStrings("", rig.stderr.written());
     const requests = rig.transport.requests.items;
     try std.testing.expectEqual(@as(usize, 2), requests.len);
-    try testing.expectContains(requests[1], "marker:1");
+    try testing.expectContains(requests[1], "marker:1:openai-api-key/gpt-5.6-sol:max");
 }
 
 const Rig = struct {
@@ -413,7 +416,7 @@ const marker_call_stream = frame(
 ) ++ frame(
     \\{"type":"response.output_item.done","item":{"id":"fc_1","type":"function_call",
     \\"status":"completed","call_id":"call_1","name":"bash",
-    \\"arguments":"{\"command\":\"echo marker:$DRINKY_RUN\"}"}}
+    \\"arguments":"{\"command\":\"echo marker:$DRINKY_RUN:$DRINKY_MODEL:$DRINKY_EFFORT\"}"}}
 ) ++ frame(
     \\{"type":"response.completed","response":{"status":"completed"}}
 );
@@ -471,7 +474,7 @@ test "a run refuses a nested start, a blank prompt, and a prompt that is not UTF
         .{
             .variables = &.{
                 .{ "OPENAI_API_KEY", "sk-openai" },
-                .{ command_line.nested_variable, "1" },
+                .{ tool_environment.nested, "1" },
             },
             .prompt = "review",
             .refusal = nested_refusal,

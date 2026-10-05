@@ -514,7 +514,12 @@ fn answer(self: *Turn, staging: *Staging) Runner.Error!void {
         const pending = staging.pendingAt(calls[position]);
         if (Tool.mutating(self.options.tools, pending.call.name)) {
             self.emit(&.{ .tool_started = pending.call });
-            const output = try self.options.runner.run(self.gpa, &pending.call, self.history());
+            const output = try self.options.runner.run(
+                self.gpa,
+                &pending.call,
+                self.history(),
+                self.setup.variables,
+            );
             self.settle(staging, calls[position], output);
             position += 1;
             continue;
@@ -538,7 +543,7 @@ fn answerBatch(
     const items = self.history();
     for (calls[batch.start..batch.end]) |index| {
         const call = &staging.pendingAt(index).call;
-        const arguments = .{ self.options.runner, self.gpa, call, items };
+        const arguments = .{ self.options.runner, self.gpa, call, items, self.setup.variables };
         futures[spawned] = self.io.concurrent(runCall, arguments) catch break;
         spawned += 1;
         self.emit(&.{ .tool_started = call.* });
@@ -560,8 +565,9 @@ fn runCall(
     gpa: std.mem.Allocator,
     call: *const Tool.Call,
     items: []const Conversation.Item,
+    variables: []const Runner.Variable,
 ) Runner.Error!Tool.Output {
-    return runner.run(gpa, call, items);
+    return runner.run(gpa, call, items, variables);
 }
 
 fn history(self: *const Turn) []const Conversation.Item {

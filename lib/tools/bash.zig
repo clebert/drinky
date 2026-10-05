@@ -175,9 +175,11 @@ fn spawnCommand(
     const io = context.host.io;
     var dev_null = try std.Io.Dir.openFileAbsolute(io, "/dev/null", .{ .mode = .read_write });
     defer dev_null.close(io);
-    const command_z = try context.gpa.dupeZ(u8, command);
-    defer context.gpa.free(command_z);
+    var arena: std.heap.ArenaAllocator = .init(context.gpa);
+    defer arena.deinit();
+    const command_z = try arena.allocator().dupeZ(u8, command);
     const argv = [_:null]?[*:0]const u8{ "bash", "-c", command_z.ptr };
+    const environ = try commandEnviron(arena.allocator(), context);
     const path = context.host.environ.getPosix("PATH") orelse std.Io.Threaded.default_PATH;
 
     const error_handles = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true });
@@ -193,7 +195,7 @@ fn spawnCommand(
         .out_handle = output_file.handle,
         .error_handle = error_files[1].handle,
         .argv = &argv,
-        .environ = context.host.environ.block.slice.ptr,
+        .environ = environ.ptr,
         .path = path,
     };
 
@@ -227,6 +229,32 @@ fn spawnCommand(
         .stderr = null,
         .request_resource_usage_statistics = false,
     };
+}
+
+fn commandEnviron(
+    arena: std.mem.Allocator,
+    context: *const Context,
+) error{OutOfMemory}![:null]const ?[*:0]const u8 {
+    const inherited = context.host.environ.block.slice;
+    const variables = context.variables;
+    var entries: std.ArrayList(?[*:0]const u8) =
+        try .initCapacity(arena, variables.len + inherited.len + 1);
+    for (variables) |variable| {
+        const entry = try std.fmt.allocPrintSentinel(arena, "{s}={s}", .{
+            variable.name,
+            variable.value,
+        }, 0);
+        entries.appendAssumeCapacity(entry.ptr);
+    }
+    for (inherited) |maybe_entry| {
+        const entry = maybe_entry.?;
+        const name = std.mem.sliceTo(entry, '=');
+        const replaced = for (variables) |variable| {
+            if (std.mem.eql(u8, variable.name, name)) break true;
+        } else false;
+        if (!replaced) entries.appendAssumeCapacity(entry);
+    }
+    return entries.toOwnedSliceSentinel(arena, null);
 }
 
 fn runCommandChild(setup: *const ChildSetup) noreturn {

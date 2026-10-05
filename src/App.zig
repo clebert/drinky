@@ -18,6 +18,7 @@ const Reports = @import("Reports.zig");
 const Screen = @import("Screen.zig");
 const sources = @import("sources.zig");
 const testing = @import("testing.zig");
+const tool_environment = @import("tool_environment.zig");
 const Transcript = @import("Transcript.zig");
 const ui = @import("ui/root.zig");
 
@@ -752,13 +753,18 @@ fn configure(self: *App) !void {
         if (configured.eql(&self.choice)) return;
     }
     self.configured = self.choice;
+    const account_id = accounts.Account.table[account].id;
+    const model_value = try std.fmt.allocPrint(self.gpa, "{s}/{s}", .{ account_id, model.name() });
+    defer self.gpa.free(model_value);
+    const variables = tool_environment.variables(model_value, self.choice.effort);
     try self.session.send(&.{ .configure = .{
         .provider = client.provider(),
-        .account = accounts.Account.table[account].id,
+        .account = account_id,
         .model = model.name(),
         .effort = self.choice.fold(),
         .tokens_max = model.tokens_max,
         .system = self.harness.system,
+        .variables = &variables,
     } });
     for (self.leases.items) |*lease| {
         if (lease.client == client) lease.setups += 1;
@@ -2146,6 +2152,45 @@ const write_call_stream =
     "\n" ++
     "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n" ++
     "\n";
+
+const choice_call_stream =
+    "data: {\"type\":\"response.output_item.done\",\"item\":{\"id\":\"fc_1\"," ++
+    "\"type\":\"function_call\",\"status\":\"completed\",\"call_id\":\"call_1\"," ++
+    "\"name\":\"bash\",\"arguments\":" ++
+    "\"{\\\"command\\\":\\\"echo choice:$DRINKY_MODEL:$DRINKY_EFFORT\\\"}\"}}\n" ++
+    "\n" ++
+    "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n" ++
+    "\n";
+
+test "a command sees the chosen model and effort, and an effort change reaches the next turn" {
+    const replies = [_]providers.testing.FakeTransport.Reply{
+        .{ .body = choice_call_stream },
+        .{ .body = providers.testing.reply_stream },
+        .{ .body = choice_call_stream },
+        .{ .body = providers.testing.reply_stream },
+    };
+    var rig: Rig = undefined;
+    try rig.init(&.{
+        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .replies = &replies,
+        .model = "gpt-5.6-sol",
+    });
+    defer rig.deinit();
+
+    try rig.keys("check\r");
+    try rig.settle();
+    try rig.keys("/effort\r\x1b[B\r");
+    try std.testing.expectEqual(core.Provider.Effort.max, rig.app.choice.effort);
+    try rig.settle();
+    try rig.keys("again\r");
+    try rig.settle();
+
+    const requests = rig.transport.requests.items;
+    try std.testing.expectEqual(@as(usize, 4), requests.len);
+    try testing.expectContains(requests[0], "\"effort\":\"high\"");
+    try testing.expectContains(requests[1], "choice:openai-api-key/gpt-5.6-sol:xhigh");
+    try testing.expectContains(requests[3], "choice:openai-api-key/gpt-5.6-sol:max");
+}
 
 test "Ctrl+N warns before it removes a canceled turn that ran a mutating tool" {
     var stall: providers.testing.FakeTransport.Stall = .{ .io = std.testing.io };

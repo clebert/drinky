@@ -108,6 +108,10 @@ stderr, and the exit code is then 1. A run that stops at a limit also fails, but
 still reaches stdout. A run drops the start reports of a session, such as an unknown config key or
 an instruction file that Drinky cannot read.
 
+Each command of the `bash` tool gets `DRINKY_MODEL` with the `account/model` value of the session.
+It also gets `DRINKY_EFFORT` with the effort level that you chose. Both follow `/model` and
+`/effort`, so an agent can start a run with its own model and effort.
+
 A run sets `DRINKY_RUN` for its commands, and Drinky refuses to start a run where that variable is
 set. An agent can start a reviewer, but the reviewer cannot start another agent.
 

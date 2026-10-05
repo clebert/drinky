@@ -41,19 +41,23 @@ pub const Setup = struct {
     effort: ?Provider.Effort,
     tokens_max: ?u32,
     system: []const u8,
+    variables: []const Runner.Variable,
 
     fn dupe(self: *const Setup, gpa: std.mem.Allocator) error{OutOfMemory}!Setup {
         const account = try gpa.dupe(u8, self.account);
         errdefer gpa.free(account);
         const model = try gpa.dupe(u8, self.model);
         errdefer gpa.free(model);
+        const system = try gpa.dupe(u8, self.system);
+        errdefer gpa.free(system);
         return .{
             .provider = self.provider,
             .account = account,
             .model = model,
             .effort = self.effort,
             .tokens_max = self.tokens_max,
-            .system = try gpa.dupe(u8, self.system),
+            .system = system,
+            .variables = try Runner.Variable.dupeAll(gpa, self.variables),
         };
     }
 
@@ -61,6 +65,7 @@ pub const Setup = struct {
         gpa.free(self.account);
         gpa.free(self.model);
         gpa.free(self.system);
+        Runner.Variable.freeAll(gpa, self.variables);
     }
 };
 
@@ -855,6 +860,36 @@ test "a setup that arrives during a turn applies from the next turn on" {
         "model-c|user:a|call:c1:read:{\"path\":\"a.txt\"}|result:c1:done|assistant:one|user:b",
         harness.other.requests.items[0],
     );
+}
+
+test "a tool call gets the variables of the setup that runs its turn" {
+    var harness: testing.Harness = undefined;
+    try harness.init(std.testing.allocator, std.testing.io, &.{});
+    defer harness.deinit();
+
+    harness.provider.load(&.{
+        .{ .done = &.{ fixture.toolCall(fixture.call), fixture.stop_complete } },
+        .{ .done = &.{ fixture.toolCall(fixture.call), fixture.stop_complete } },
+        .{ .done = &.{ fixture.message("one"), fixture.stop_complete } },
+    });
+    harness.other.load(&.{
+        .{ .done = &.{ fixture.toolCall(fixture.call), fixture.stop_complete } },
+        .{ .done = &.{ fixture.message("two"), fixture.stop_complete } },
+    });
+    var first = testing.Harness.setup(&harness.provider, "model-a");
+    first.variables = &.{.{ .name = "MODEL", .value = "a" }};
+    try harness.session.send(&.{ .configure = first });
+    var second = testing.Harness.setup(&harness.other, "model-b");
+    second.variables = &.{.{ .name = "MODEL", .value = "b" }};
+    harness.runner.hook = .{ .session = &harness.session, .command = .{ .configure = second } };
+    _ = try harness.turn("a");
+    _ = try harness.turn("b");
+
+    const calls = harness.runner.calls.items;
+    try std.testing.expectEqual(@as(usize, 3), calls.len);
+    try std.testing.expectEqualStrings("read:{\"path\":\"a.txt\"}|MODEL=a", calls[0]);
+    try std.testing.expectEqualStrings("read:{\"path\":\"a.txt\"}|MODEL=a", calls[1]);
+    try std.testing.expectEqualStrings("read:{\"path\":\"a.txt\"}|MODEL=b", calls[2]);
 }
 
 test "a newer setup drops a deferred one at once, and the setup of the turn drops at its end" {

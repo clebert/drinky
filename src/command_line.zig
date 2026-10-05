@@ -4,8 +4,6 @@ const core = @import("core");
 
 const escape = @import("escape.zig");
 
-pub const nested_variable = "DRINKY_RUN";
-
 const usage = "Use drinky, drinky models, or drinky run --model account/model --effort level.";
 
 pub const effort_levels = levels: {
