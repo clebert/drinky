@@ -16,22 +16,6 @@ when the user drops it.
 - Drinky needs a terminal. A headless mode answers one prompt with no terminal: text in, text out,
   with flags for the model and the effort. It is the base for any agent that Drinky drives itself.
   Trigger: the first agent that Drinky drives itself.
-- Drinky keeps no principal marker and settles no session on a reread of the credential file. A
-  login saved the account and organization ids of the Anthropic OAuth profile and the user id of the
-  xAI id token. A stored token of the same principal counted as a rotation, and a token of another
-  or an unknown principal counted as a replacement. A replacement before a model request or a model
-  fetch ended the turn. It dropped the model list, the reasoning, and the usage evidence of the
-  account, and asked for a new model. `/login` reread the credential file first. A sign-in from
-  another instance showed in the picker, and a rotation moved the active client to the new token. A
-  replacement dropped the evidence, and a sign-out of the active account handed the session to the
-  next one. Drinky reported an unreadable file or entry, and the list kept the last read. A login
-  with a failed save did not follow the store. The reread before a refresh stays, and it takes any
-  newer stored token as it is.
-- Drinky shows no notice when it cannot save a refreshed credential. The fresh token serves the
-  session, and the next token request tries the save again. After a restart, a refresh token that
-  the server rotated away forces a new sign-in, and no text names the cause. A notice needs a path
-  from the credential to the client. Trigger: a sign-in that a lost refresh token forces after a
-  restart.
 - A failed test shows no stack trace, because `build.zig` sets `strip = true` for each test module.
   On macOS 27.0, the MachO unwinder of Zig 0.16.0 panics with `switch on corrupt value` at
   `std/debug/SelfInfo/MachO.zig:390`. The test allocator records a stack at each allocation, so a
