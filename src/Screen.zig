@@ -11,15 +11,16 @@ const format = @import("format.zig");
 const layout = @import("layout.zig");
 const Message = @import("Message.zig");
 const project = @import("project.zig");
+const testing = @import("testing.zig");
 const tool_line = @import("tool_line.zig");
 const Transcript = @import("Transcript.zig");
 const ui = @import("ui/root.zig");
 
 const Screen = @This();
 
-const truncated_event =
+pub const truncated_event =
     "The reply is incomplete. The model reached an output or context limit.";
-const exhausted_event = "The turn reached the limit for tool rounds.";
+pub const exhausted_event = "The turn reached the limit for tool rounds.";
 const canceled_event = "You canceled the turn.";
 
 pub const editor_caption_rows_max: usize = 3;
@@ -1046,8 +1047,8 @@ test "a turn streams reasoning and text into blocks, commits them, and ends at t
     try rig.expectKinds(&.{ .user, .thinking, .model });
     const painted = try rig.paintPlain(80);
     defer std.testing.allocator.free(painted);
-    try expectContains(painted, "hello");
-    try expectContains(painted, "weigh it");
+    try testing.expectContains(painted, "hello");
+    try testing.expectContains(painted, "weigh it");
 }
 
 fn testModel() accounts.Model {
@@ -1122,12 +1123,6 @@ const Rig = struct {
     }
 };
 
-fn expectContains(text: []const u8, needle: []const u8) !void {
-    if (std.mem.indexOf(u8, text, needle) != null) return;
-    std.debug.print("the text holds no \"{s}\":\n{s}\n", .{ needle, text });
-    return error.TestExpectedNeedle;
-}
-
 const no_caption: ?ui.Caption = null;
 
 test "a tool call streams as a row, runs with its subject and timer, and ends as a block" {
@@ -1143,7 +1138,7 @@ test "a tool call streams as a row, runs with its subject and timer, and ends as
     try rig.apply(&.{ .tool_call_arguments = "\"zig build\"}" });
     const streamed = try rig.paintPlain(80);
     defer gpa.free(streamed);
-    try expectContains(streamed, "Tool: bash · Received: 23 B · Status: Streaming");
+    try testing.expectContains(streamed, "Tool: bash · Received: 23 B · Status: Streaming");
 
     rig.time.awake_ms = 1_000;
     try rig.apply(&.{ .tool_started = .{
@@ -1154,8 +1149,8 @@ test "a tool call streams as a row, runs with its subject and timer, and ends as
     rig.time.awake_ms = 13_400;
     const running = try rig.paintPlain(80);
     defer gpa.free(running);
-    try expectContains(running, "Tool: bash · Command: zig build");
-    try expectContains(running, "Time: 12s · Timeout: 2m 0s");
+    try testing.expectContains(running, "Tool: bash · Command: zig build");
+    try testing.expectContains(running, "Time: 12s · Timeout: 2m 0s");
 
     var output: core.Tool.Output = .{ .content = "ok\n" };
     output.measures.put(.duration_ms, 1500);
@@ -1227,15 +1222,15 @@ test "queued calls read as queued until each one runs" {
     try rig.apply(&.{ .tool_call_started = "write" });
     const two = try rig.paintPlain(80);
     defer gpa.free(two);
-    try expectContains(two, "Tool: read · Received: 2 B · Status: Queued");
-    try expectContains(two, "Tool: write · Received: 0 B · Status: Streaming");
+    try testing.expectContains(two, "Tool: read · Received: 2 B · Status: Queued");
+    try testing.expectContains(two, "Tool: write · Received: 0 B · Status: Streaming");
 
     try rig.apply(&.{ .tool_started = .{ .id = "c1", .name = "read", .arguments = "{}" } });
     const one = try rig.paintPlain(80);
     defer gpa.free(one);
-    try expectContains(one, "Tool: read ");
+    try testing.expectContains(one, "Tool: read ");
     try std.testing.expect(std.mem.indexOf(u8, one, "Tool: read ·") == null);
-    try expectContains(one, "Tool: write · Received: 0 B · Status: Queued");
+    try testing.expectContains(one, "Tool: write · Received: 0 B · Status: Queued");
     try rig.apply(&.{ .tool_result = .{
         .call = .{ .id = "c1", .name = "read", .arguments = "{}" },
         .output = .{ .content = "x" },
@@ -1482,7 +1477,7 @@ test "an account switch keeps every block and the scrollback" {
 
     const own = try rig.paintPlain(80);
     defer gpa.free(own);
-    try expectContains(own, "weigh it");
+    try testing.expectContains(own, "weigh it");
 
     rig.screen.showChoice(&.{ .account = accounts.testing.openai_api_key, .effort = .high });
     const switched = try rig.paintPlain(80);
@@ -1492,8 +1487,8 @@ test "an account switch keeps every block and the scrollback" {
     );
     const wider = try rig.paintPlain(100);
     defer gpa.free(wider);
-    try expectContains(wider, "weigh it");
-    try expectContains(wider, "answer");
+    try testing.expectContains(wider, "weigh it");
+    try testing.expectContains(wider, "answer");
 }
 
 test "a notice replaces its predecessor, and a turn end drops it" {
@@ -1578,7 +1573,7 @@ test "a picker keeps its trail, waits with animation, and a repeat of a step sta
     try std.testing.expect(rig.screen.animating());
     const painted = try rig.paintPlain(80);
     defer gpa.free(painted);
-    try expectContains(painted, "Drinky fetches");
+    try testing.expectContains(painted, "Drinky fetches");
     try std.testing.expect(std.mem.indexOf(u8, painted, "> row") == null);
 
     try rig.screen.openPicker(&try pickForTest(gpa, &.{"row"}, model_step));
@@ -1607,7 +1602,7 @@ test "the picker trail restores a position, bounds its depth, and ends at a step
     try std.testing.expect(rig.screen.stepAbove() == null);
     const restored = try rig.paintPlain(80);
     defer gpa.free(restored);
-    try expectContains(restored, "> third");
+    try testing.expectContains(restored, "> third");
 
     for (1..depth_max + 2) |payload| {
         const step: command.Context.Outcome.Opener = .{
@@ -1645,7 +1640,7 @@ test "a picked line replaces the draft, and a page opens over the prompt" {
     try std.testing.expect(rig.screen.widget == .page);
     const painted = try rig.paintPlain(80);
     defer gpa.free(painted);
-    try expectContains(painted, "body");
+    try testing.expectContains(painted, "body");
     rig.screen.closePage();
     try std.testing.expect(rig.screen.widget == .prompt);
 }

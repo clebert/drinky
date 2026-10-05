@@ -35,8 +35,10 @@ every library. `lib/providers` and `lib/tools` import `lib/core`, and `lib/accou
   `Screen.zig`, and `Screen.zig` paints the widgets that it holds. The client reads no session
   state, and `Choice.zig` holds the account, the model, and the effort that the client chose. `src`
   also holds the slash commands under `src/command/` and the instruction and skill discovery under
-  `src/discovery/`. It holds the widgets under `src/ui/` and Herdr too. `src` names no vendor, wire,
-  or account row. It reads each such fact from `lib/accounts`.
+  `src/discovery/`. It holds the widgets under `src/ui/` and Herdr too. `headless.zig` answers
+  `drinky run` and `drinky models` without a terminal. `Harness.zig` holds the setup that the client
+  and the headless mode share: the config, the discovery, the system prompt, and the tools. `src`
+  names no vendor, wire, or account row. It reads each such fact from `lib/accounts`.
 - `src/ui/role.zig` maps a role to terminal colors. A widget names a role and writes no color of its
   own. `Message.zig` holds the severity that a notice and an event share.
 

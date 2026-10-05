@@ -66,6 +66,12 @@ pub const Clock = struct {
     }
 };
 
+pub fn expectContains(text: []const u8, needle: []const u8) !void {
+    if (std.mem.indexOf(u8, text, needle) != null) return;
+    std.debug.print("the text holds no \"{s}\":\n{s}\n", .{ needle, text });
+    return error.TestExpectedNeedle;
+}
+
 pub const Tree = struct {
     tmp: std.testing.TmpDir,
     root: [:0]u8,

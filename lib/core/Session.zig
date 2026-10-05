@@ -163,10 +163,7 @@ pub const Event = union(enum) {
                     .source = try gpa.dupe(u8, skill.source),
                 } };
             },
-            .turn_ended => |*outcome| .{ .turn_ended = switch (outcome.*) {
-                .failed => |*failure| .{ .failed = failure.dupe(gpa) },
-                .stopped, .canceled, .exhausted => outcome.*,
-            } },
+            .turn_ended => |*outcome| .{ .turn_ended = outcome.dupe(gpa) },
             .setup_dropped,
             .text_started,
             .reasoning_started,
@@ -217,6 +214,13 @@ pub const Outcome = union(enum) {
     canceled,
     exhausted,
     failed: Provider.Failure,
+
+    pub fn dupe(self: *const Outcome, gpa: std.mem.Allocator) Outcome {
+        return switch (self.*) {
+            .failed => |*failure| .{ .failed = failure.dupe(gpa) },
+            .stopped, .canceled, .exhausted => self.*,
+        };
+    }
 
     pub fn deinit(self: *const Outcome, gpa: std.mem.Allocator) void {
         switch (self.*) {

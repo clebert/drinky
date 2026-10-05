@@ -20,11 +20,12 @@ the features your workflow needs.
 
 1. **Terminal-native:** The conversation stays in the normal scrollback. A session is the process,
    and Drinky saves no conversation to resume.
-2. **One job:** An agent loop and a small set of tools, with no sub-agents and no workflow mode.
+2. **One job:** An agent loop and a small set of tools, with no workflow mode. A skill or an
+   instruction file can tell an agent to start another agent with `drinky run`.
 3. **Small system prompt:** The compiled prompt states the mechanics. Your instruction files and
    skills carry every rule about how to work.
-4. **Self-describing:** The model can read every command, config key, and key binding of Drinky, so
-   it can maintain your config file for you.
+4. **Self-describing:** The model can read every slash command, config key, and key binding of
+   Drinky, so it can maintain your config file for you.
 5. **No compiled-in models:** Every model comes from the provider at runtime, and every limit and
    price from the provider or the public metadata.
 
@@ -86,6 +87,29 @@ provider states.
 A line that starts with a slash runs in Drinky and reaches no model. Type `/` or `/help` to open the
 complete command list. Drinky refuses an unknown command, an unknown skill, and a command with an
 argument. A second Enter then sends the refused line to the model as a message.
+
+## Headless mode
+
+`drinky run` answers one prompt without a terminal. It reads the prompt from stdin and writes the
+text of the final reply to stdout. The `--model` flag takes an `account/model` value. The `--effort`
+flag takes `low`, `medium`, `high`, `xhigh`, or `max`, and Drinky uses the nearest level that the
+model takes.
+
+```sh
+drinky run --model openai-plan/gpt-5.5 --effort high <<'EOF'
+Review the uncommitted changes.
+EOF
+```
+
+`drinky models` lists the `account/model` values of each signed-in account with a saved model list.
+Fetch a list with `/model` first. A run uses the config file, the instruction files, the skills, and
+the tools of a session. It saves no choice and signs in to no account. An incomplete reply still
+reaches stdout. A failure of the run goes to stderr, and the exit code is then 1. A run drops the
+start reports of a session, such as an unknown config key or an instruction file that Drinky cannot
+read.
+
+A run sets `DRINKY_RUN` for its commands, and Drinky refuses to start a run where that variable is
+set. An agent can start a reviewer, but the reviewer cannot start another agent.
 
 ## Herdr
 

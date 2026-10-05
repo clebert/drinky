@@ -13,9 +13,8 @@ when the user drops it.
 
 ## Open items
 
-- Drinky needs a terminal. A headless mode answers one prompt with no terminal: text in, text out,
-  with flags for the model and the effort. It is the base for any agent that Drinky drives itself.
-  Trigger: the first agent that Drinky drives itself.
+- `drinky run` reports no usage. The parent agent and the user see neither the tokens nor the cost
+  of a run.
 - A failed test shows no stack trace, because `build.zig` sets `strip = true` for each test module.
   On macOS 27.0, the MachO unwinder of Zig 0.16.0 panics with `switch on corrupt value` at
   `std/debug/SelfInfo/MachO.zig:390`. The test allocator records a stack at each allocation, so a

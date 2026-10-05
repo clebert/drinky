@@ -8,10 +8,8 @@ const tools = @import("tools");
 
 const Choice = @import("Choice.zig");
 const command = @import("command/root.zig");
-const Config = @import("Config.zig");
-const describe = @import("describe.zig");
-const discovery = @import("discovery/root.zig");
 const escape = @import("escape.zig");
+const Harness = @import("Harness.zig");
 const Herdr = @import("Herdr.zig");
 const layout = @import("layout.zig");
 const Message = @import("Message.zig");
@@ -19,14 +17,11 @@ const project = @import("project.zig");
 const Reports = @import("Reports.zig");
 const Screen = @import("Screen.zig");
 const sources = @import("sources.zig");
-const system_prompt = @import("system_prompt.zig");
 const testing = @import("testing.zig");
 const Transcript = @import("Transcript.zig");
 const ui = @import("ui/root.zig");
 
 const App = @This();
-
-const effort_default: core.Provider.Effort = .xhigh;
 
 const no_model_refusal = "Select a model with /model before you send a message.";
 const signed_out_refusal = "Sign in with /login before you send a message.";
@@ -52,17 +47,9 @@ const removal_caption: ui.Caption = .{
 };
 const removal_warning = "Press Ctrl+N again to remove the canceled turn. Tool changes stay.";
 
-const intro_keys = [_][]const u8{
-    "Enter: Send",
-    "Shift+Enter: New line",
-    "Esc: Cancel",
-    "Ctrl+C: Clear",
-    "Ctrl+D: Quit",
-};
-
 const intro_text = blk: {
     var line: []const u8 = "";
-    for (intro_keys) |hint| line = line ++ hint ++ ui.paint.separator;
+    for (Harness.key_hints) |hint| line = line ++ hint ++ ui.paint.separator;
     break :blk line ++ "/help: Commands";
 };
 
@@ -75,8 +62,6 @@ const sign_in_titles = blk: {
     break :blk titles;
 };
 
-const repeat_window_ms = 500;
-
 const escape_wait_ms = 50;
 
 const queue_capacity = 256;
@@ -85,10 +70,9 @@ gpa: std.mem.Allocator,
 io: std.Io,
 tty: *terminal.Tty,
 resize: terminal.Resize,
-config: Config,
+harness: Harness,
 account_registry: accounts.Registry,
 state: accounts.State,
-tool_registry: tools.Registry,
 session: core.Session,
 client: ?*accounts.Client,
 client_account: ?usize,
@@ -101,12 +85,7 @@ directory_label: []const u8,
 working_directory: []const u8,
 home_directory: []const u8,
 branch_root: ?[]const u8,
-project_instructions: discovery.instructions.Result,
-skill_registry: discovery.skills.Registry,
-system: []const u8,
-document: []const u8,
 sources_page: []const u8,
-skill_guard: tools.SkillGuard,
 screen: Screen,
 input: terminal.Input,
 running: bool,
@@ -270,7 +249,7 @@ fn homeDirectory(
 fn showProject(self: *App, inside_herdr: bool) void {
     if (inside_herdr) return;
     self.screen.directory_shown = self.directory_label;
-    self.branch_root = self.project_instructions.projectRoot();
+    self.branch_root = self.harness.project_instructions.projectRoot();
     self.refreshBranch();
 }
 
@@ -289,14 +268,15 @@ pub fn init(self: *App, gpa: std.mem.Allocator, io: std.Io, options: *const Opti
     self.initFields(gpa, io);
     errdefer self.input.deinit();
 
-    self.config = try Config.load(gpa, io, &directories);
-    errdefer self.config.deinit(gpa);
+    try self.harness.init(gpa, io, &.{ .directories = directories, .environ = options.environ });
+    errdefer self.harness.deinit(gpa);
+    const harness = &self.harness;
 
     try self.account_registry.init(gpa, io, &.{
         .directories = directories,
         .environment = options.environment,
         .sink = .{ .ptr = self, .vtable = &accounts_sink_vtable },
-        .timeouts = self.config.timeouts,
+        .timeouts = harness.config.timeouts,
         .transport = options.transport,
         .browser = options.browser,
         .loopback = options.loopback,
@@ -312,75 +292,28 @@ pub fn init(self: *App, gpa: std.mem.Allocator, io: std.Io, options: *const Opti
     });
     errdefer gpa.free(self.directory_label);
 
-    self.project_instructions = try discovery.instructions.discover(gpa, io, cwd);
-    errdefer self.project_instructions.deinit();
     self.state = try accounts.State.open(gpa, io, &.{
         .directories = directories,
-        .project = self.project_instructions.projectRoot() orelse cwd,
+        .project = harness.project_instructions.projectRoot() orelse cwd,
     });
     errdefer self.state.deinit();
 
-    const user_skills = try std.fs.path.resolve(
-        gpa,
-        &.{ cwd, options.home, ".agents", "skills" },
-    );
-    defer gpa.free(user_skills);
-    self.skill_registry = try discovery.skills.discover(gpa, io, &.{
-        .user_root = user_skills,
-        .project_start = cwd,
-        .project_root = self.project_instructions.projectRoot(),
-    });
-    errdefer self.skill_registry.deinit();
-    self.skill_guard = .{ .working_directory = cwd };
-    var required_missing: std.ArrayList(Config.RequiredSkill) = .empty;
-    defer required_missing.deinit(gpa);
-    const required_capped = try self.resolveRequiredSkills(&required_missing);
-    self.system = try system_prompt.compose(gpa, &.{
-        .current_time = std.Io.Clock.real.now(io),
-        .working_directory = cwd,
-        .user_instructions = self.config.user_instructions.files(),
-        .project_instructions = &self.project_instructions,
-        .skills = self.skill_registry.items(),
-        .required_skills = self.skill_guard.rules(),
-    });
-    errdefer gpa.free(self.system);
     self.sources_page = try sources.compose(gpa, &.{
-        .user_instructions = self.config.user_instructions.files(),
-        .project_instructions = self.project_instructions.files(),
-        .skills = &self.skill_registry,
-        .required_skills = self.skill_guard.rules(),
-        .required_missing = required_missing.items,
+        .user_instructions = harness.config.user_instructions.files(),
+        .project_instructions = harness.project_instructions.files(),
+        .skills = &harness.skill_registry,
+        .required_skills = harness.skill_guard.rules(),
+        .required_missing = harness.required_missing.items,
         .roots = .{ .working_directory = cwd, .home_directory = self.home_directory },
     });
     errdefer gpa.free(self.sources_page);
-    self.document = try describe.compose(gpa, &.{
-        .config = &self.config,
-        .effort_default = effort_default,
-        .key_hints = &intro_keys,
-        .repeat_window_ms = repeat_window_ms,
-    });
-    errdefer gpa.free(self.document);
 
-    self.tool_registry = .{
-        .host = .{
-            .io = io,
-            .environ = options.environ,
-            .bash = self.config.bash,
-            .document = self.document,
-        },
-        .skill_guard = &self.skill_guard,
-    };
     errdefer self.freeClients();
-    self.session = .init(gpa, io, &.{
-        .sink = .{ .ptr = self, .vtable = &session_sink_vtable },
-        .runner = self.tool_registry.runner(),
-        .tools = &tools.Registry.specs,
-        .retry = self.config.retry,
-    });
+    self.session = harness.session(gpa, io, .{ .ptr = self, .vtable = &session_sink_vtable });
     errdefer self.session.deinit();
 
     self.choice.effort = self.state.start.effort orelse
-        self.config.effort_default orelse effort_default;
+        harness.config.effort_default orelse Harness.effort_default;
     if (self.startAccount()) |account| {
         self.adopt(account);
         try self.state.seed(account, self.choice.modelName(), self.choice.effort);
@@ -388,9 +321,9 @@ pub fn init(self: *App, gpa: std.mem.Allocator, io: std.Io, options: *const Opti
 
     self.screen = Screen.init(gpa, options.writer, self.choice.effort);
     errdefer self.screen.deinit();
-    self.screen.bash_timeout_ms = self.config.bash.timeout_ms;
-    self.screen.window_pages = self.config.window_pages;
-    self.screen.gauge = self.config.gauge;
+    self.screen.bash_timeout_ms = harness.config.bash.timeout_ms;
+    self.screen.window_pages = harness.config.window_pages;
+    self.screen.gauge = harness.config.gauge;
     self.screen.display_roots = .{
         .working_directory = cwd,
         .home_directory = self.home_directory,
@@ -401,7 +334,7 @@ pub fn init(self: *App, gpa: std.mem.Allocator, io: std.Io, options: *const Opti
     try self.session.start();
     try self.account_registry.start();
     try self.sync();
-    try self.reportStart(required_capped);
+    try self.reportStart();
     self.herdr.start(options.herdr) catch |err| try self.recordEvent(
         .failure,
         "Drinky could not start the state reports to Herdr because of error {s}.",
@@ -420,16 +353,12 @@ pub fn deinit(self: *App) void {
     self.screen.deinit();
     self.session.deinit();
     self.freeClients();
-    self.gpa.free(self.document);
     self.gpa.free(self.sources_page);
-    self.gpa.free(self.system);
-    self.skill_registry.deinit();
     self.state.deinit();
-    self.project_instructions.deinit();
     self.gpa.free(self.directory_label);
     self.gpa.free(self.home_directory);
     self.account_registry.deinit();
-    self.config.deinit(self.gpa);
+    self.harness.deinit(self.gpa);
     self.input.deinit();
 }
 
@@ -449,8 +378,8 @@ pub fn run(self: *App, tty: *terminal.Tty) !void {
     try self.runLoop();
 }
 
-fn reportStart(self: *App, required_capped: bool) !void {
-    const config = &self.config;
+fn reportStart(self: *App) !void {
+    const config = &self.harness.config;
     try self.screen.appendIntro(intro_text);
     if (config.effort_dropped) |dropped| try self.recordEvent(
         .failure,
@@ -494,7 +423,7 @@ fn reportStart(self: *App, required_capped: bool) !void {
             config.gauge.percent_error,
         },
     );
-    if (required_capped) try self.recordEvent(
+    if (self.harness.required_capped) try self.recordEvent(
         .failure,
         "Drinky used only the first {d} required skills in {s}.",
         .{ tools.SkillGuard.rules_max, config.path },
@@ -516,8 +445,8 @@ fn reportStart(self: *App, required_capped: bool) !void {
         .{config.path},
     );
     try self.recordReports(&config.user_instructions.reports);
-    try self.recordReports(&self.project_instructions.reports);
-    try self.recordReports(&self.skill_registry.reports);
+    try self.recordReports(&self.harness.project_instructions.reports);
+    try self.recordReports(&self.harness.skill_registry.reports);
     if (self.choice.account == null) {
         try self.reportNotice(.information, "Select an account to sign in.", .{});
         try self.runCommand("/login");
@@ -530,33 +459,27 @@ fn initFields(self: *App, gpa: std.mem.Allocator, io: std.Io) void {
         .io = io,
         .tty = undefined,
         .resize = undefined,
-        .config = undefined,
+        .harness = undefined,
         .account_registry = undefined,
         .state = undefined,
-        .tool_registry = .{ .host = .{ .io = io } },
         .session = undefined,
         .client = null,
         .client_account = null,
         .leases = .empty,
         .configured = null,
-        .choice = .{ .effort = effort_default },
+        .choice = .{ .effort = Harness.effort_default },
         .mode = .{ .prompt = .{} },
         .offer = null,
         .directory_label = "",
         .working_directory = "",
         .home_directory = "",
         .branch_root = null,
-        .project_instructions = undefined,
-        .skill_registry = undefined,
-        .system = "",
-        .document = "",
         .sources_page = "",
-        .skill_guard = .{},
         .screen = undefined,
         .input = .init(gpa),
         .running = false,
-        .ctrl_c_ms_last = -repeat_window_ms,
-        .ctrl_d_ms_last = -repeat_window_ms,
+        .ctrl_c_ms_last = -Harness.repeat_window_ms,
+        .ctrl_d_ms_last = -Harness.repeat_window_ms,
         .escape_deadline_ms = null,
         .queue = undefined,
         .queue_buffer = undefined,
@@ -835,7 +758,7 @@ fn configure(self: *App) !void {
         .model = model.name(),
         .effort = self.choice.fold(),
         .tokens_max = model.tokens_max,
-        .system = self.system,
+        .system = self.harness.system,
     } });
     for (self.leases.items) |*lease| {
         if (lease.client == client) lease.setups += 1;
@@ -1002,7 +925,7 @@ fn removeTurn(self: *App, removal: *const Offer.Removal) !void {
 
 fn quitOrWarn(self: *App) !void {
     const draft = self.screen.editor.visible().len != 0;
-    const recent_exit = self.nowMs() - self.ctrl_d_ms_last < repeat_window_ms;
+    const recent_exit = self.nowMs() - self.ctrl_d_ms_last < Harness.repeat_window_ms;
     if (self.mode.prompt.confirmation == .quit or (!draft and !recent_exit)) {
         self.running = false;
         return;
@@ -1105,7 +1028,7 @@ fn cancelTurn(self: *App) !void {
 
 fn clearOrQuit(self: *App) void {
     const now = self.nowMs();
-    if (now - self.ctrl_c_ms_last < repeat_window_ms) {
+    if (now - self.ctrl_c_ms_last < Harness.repeat_window_ms) {
         self.running = false;
     } else {
         self.screen.editor.clear();
@@ -1640,8 +1563,8 @@ fn commandContext(self: *App) command.Context {
         .choice = &self.choice,
         .account_registry = &self.account_registry,
         .remembered_model_names = &self.state.model_names,
-        .skill_registry = &self.skill_registry,
-        .system_prompt = self.system,
+        .skill_registry = &self.harness.skill_registry,
+        .system_prompt = self.harness.system,
         .sources_page = self.sources_page,
     };
 }
@@ -1749,23 +1672,6 @@ fn reportNotice(
     args: anytype,
 ) !void {
     self.setNotice(try Message.print(self.gpa, severity, format, args));
-}
-
-fn resolveRequiredSkills(self: *App, missing: *std.ArrayList(Config.RequiredSkill)) !bool {
-    for (self.config.required_skills) |required| {
-        const target = self.skill_registry.get(required.skill) orelse {
-            try missing.append(self.gpa, required);
-            continue;
-        };
-        self.skill_guard.add(.{
-            .glob = required.glob,
-            .skill = target.name,
-            .source = target.path,
-        }) catch |err| switch (err) {
-            error.TooManyRules => return true,
-        };
-    }
-    return false;
 }
 
 fn recordReports(self: *App, reports: *const Reports) !void {
