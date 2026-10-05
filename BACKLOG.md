@@ -13,43 +13,6 @@ when the user drops it.
 
 ## Open items
 
-- A reasoning passage of `anthropic-api/claude-fable-5-1` showed three blank rows where one
-  paragraph separator belongs. A transcript copy cannot tell doubled block-boundary newlines from an
-  invisible Unicode byte. Trigger: a capture of the raw SSE frames of such a passage.
-- A model that no source describes leaves the picker with no row, because `Catalog.merge` returns
-  null and the caller drops the model. A disabled row that names what the model lacks needs a third
-  row role beside selection and muted. Its hint names the config key of the model metadata. Trigger:
-  the model metadata in the config.
-- The config describes no model. A `models` entry describes a model that no provider and no entry of
-  the public metadata describes, so the user can unblock any model. The provider wins every field it
-  states. The config wins over the public metadata, and the public metadata fills the rest. The
-  `provider` field of an entry names a provider or a configured server, so one flat array serves
-  both. The other fields take the names of the `models.json` shape. A later step can let Drinky
-  write the entry for the user. Trigger: a model of daily use that no source describes.
-- The config names no server. A `servers` entry names a server that speaks Chat Completions. Drinky
-  then talks to a model on llama.cpp, Ollama, vLLM, or a cloud endpoint with a key. One account with
-  the label "OpenAI Compatible" covers every server, and the server name prefixes the model name, as
-  in `ollama/qwen3:32b`. A metadata entry of a server model holds the server name in `provider` and
-  the bare id in `name`. A `servers` entry holds a name, a base URL up to `/v1`, and an optional
-  `api_key_env`, so the file holds no secret. The load refuses a server that has the name of a
-  provider. The fetch reads `/v1/models` for the id alone and visits every server in parallel inside
-  one window. It keeps every list that arrived and names each server that did not. The stream
-  carries reasoning as `reasoning_content` on llama.cpp, vLLM, and DeepSeek, as `reasoning` on
-  Ollama, or as inline `<think>` tags. The decoder reads all three. The replay sends the text back
-  under the field name of the stream. It covers only the messages after the latest user message,
-  because the vendors that document interleaved thinking ask for that scope. A tag stream goes back
-  inside `content` with its tags. The replay keys on the server and not on the account, because one
-  account spans every server. The wire sends `reasoning_effort` only when the request names a level.
-  The account goes first among the accounts without a login. A server states no window, so this item
-  needs the model metadata in the config. Trigger: an account row that the config supplies.
-- Drinky needs a terminal. A headless mode answers one prompt with no terminal: text in, text out,
-  with flags for the model and the effort. It is the base for any agent that Drinky drives itself.
-  Trigger: the first agent that Drinky drives itself.
-- Drinky keeps no prompt history. Tab at the idle prompt opened the submitted terminal prompts of
-  every project, newest first. Enter appended the selected prompt to the draft as editable text. A
-  submitted prompt without a leading slash entered the history. The history kept the 100 most recent
-  prompts of at most 8 KiB each in the owner-only `~/.drinky/prompt_history.json`. The
-  `prompt_history.enabled` config key controlled the history.
 - A failed turn offers no retry. A turn that failed after it committed work left the caption
   `Failed turn` above the editor. Ctrl+N then sent a `<retry_request>` that named the failure. The
   request asked the model to continue from the last committed checkpoint. The transcript showed the
@@ -64,16 +27,9 @@ when the user drops it.
   editable text. A turn that ran `write`, `edit`, or `bash` warned first and removed on the second
   press. Esc kept the turn, and a new turn or `/new` dropped the offer. The user wants the removal
   back when the core makes it cheap.
-- Drinky takes no message during a turn. Enter queued the line as a steering message. The turn took
-  the queue at its next tool round as one combined user message. Ctrl+P moved the queued messages
-  back into the editor above the draft. A cancel or a failure returned the uncommitted messages to
-  the editor. A `steer` command can return once the core and the design stand.
-- Drinky has no `/status` command, and no command runs during a turn. `/status` recorded the status
-  line as one terminal event in full. The event named the directory, the branch, the context gauge
-  with its token counts, and the cost. It named the quota windows, the credit pool, and the cache
-  rate of a running turn, then the account, the model, and the effort. Inside a Herdr pane, it named
-  the directory and the branch that the status line leaves to the pane label. It ran during a turn
-  too, and its event waited for the message boundary and survived the rewind of a failed turn.
+- Drinky needs a terminal. A headless mode answers one prompt with no terminal: text in, text out,
+  with flags for the model and the effort. It is the base for any agent that Drinky drives itself.
+  Trigger: the first agent that Drinky drives itself.
 - Drinky keeps no principal marker and settles no session on a reread of the credential file. A
   login saved the account and organization ids of the Anthropic OAuth profile and the user id of the
   xAI id token. A stored token of the same principal counted as a rotation, and a token of another
@@ -90,43 +46,13 @@ when the user drops it.
   the server rotated away forces a new sign-in, and no text names the cause. A notice needs a path
   from the credential to the client. Trigger: a sign-in that a lost refresh token forces after a
   restart.
-- `/prompt` opens the prompt history as an editable picker. Steering messages and skill commands
-  stay out of the history. Trigger: the return of the prompt history.
-- No test covers the paint of the client when its frame task cannot start. `App.armTick` then paints
-  at once, and `App.refresh` reads the size and switches the screen through the terminal. A test
-  needs a terminal that it can fake. Trigger: a second need for a seam of the terminal, such as a
-  test that drives the client loop.
-- The retry adds no jitter, so two sessions that fail together repeat together. Trigger: an account
-  that limits the rate of a burst.
-- The transport reads the seconds form of `Retry-After` alone, so a date form falls back to the
-  backoff. Trigger: a reply that states a date.
 - A failed test shows no stack trace, because `build.zig` sets `strip = true` for each test module.
   On macOS 27.0, the MachO unwinder of Zig 0.16.0 panics with `switch on corrupt value` at
   `std/debug/SelfInfo/MachO.zig:390`. The test allocator records a stack at each allocation, so a
   test hits that panic. The panic handler then waits on the lock of the unwinder, and the test
   hangs. A Debug build of Drinky records stacks through the same allocator and can hang too.
   Trigger: a Zig release whose unwinder reads the unwind data of macOS 27.0.
-- Drinky sends no event to `moshi-hook`, so the Moshi inbox, its push notifications, and its Live
-  Activity show no Drinky turn. Drinky reports its state to Herdr alone, and `moshi-hook` does not
-  read the Herdr state. The daemon reads one JSON envelope per connection as one line on the Unix
-  socket `~/Library/Application Support/Moshi/moshi-hook.sock`. The client then half-closes the
-  connection and drains the acknowledgment. `moshi-hook install --target pi` writes a reference
-  client to `~/.pi/agent/extensions/moshi-hooks.ts`. An envelope holds `type`, `source`,
-  `sessionId`, `eventName`, `cwd`, `projectName`, `category`, `title`, and `message`. In a Herdr
-  pane, it also holds `terminalKind` `herdr` and the `herdrPane`, `herdrWorkspaceId`, and
-  `herdrTabId` values of the pane environment. The categories are `session_started`,
-  `approval_required`, `task_complete`, and `session_ended`. An envelope without a category updates
-  the state and sends no push notification. The server of Moshi receives the title and the message,
-  so the reference client clips the answer to 80 characters and the prompt to 200. A failed connect
-  must stay silent, because most hosts run no daemon. The known sources name no `drinky`, so the
-  answer of the daemon to an unknown `source` stays unverified.
 
 ## Ideas
 
 - Restart the same prompt in a new session.
-- Show tokens per second during a turn.
-- Keep the request prefix byte-stable, so a local server reuses its prompt cache.
-- Read the window of a server model from the native endpoint of its server.
-- Run the FrontierHarness Eval tasks through a Harbor agent adapter.
-- Name an OpenRouter preset as a model.
-- Send the OpenRouter app attribution headers behind an opt-in.
