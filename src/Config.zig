@@ -112,15 +112,8 @@ const request_fields: []const SectionField = fields: {
         sectionField(u64, "connect_timeout_ms", transport_timeouts_default.connect_ms),
     };
     for (vendors) |vendor| {
-        const wait = accounts.Registry.waits.get(vendor);
-        if (wait.connect_note == null) continue;
-        list = list ++ [_]SectionField{
-            sectionField(u64, connectName(vendor), wait.timeouts.connect_ms),
-        };
-    }
-    for (vendors) |vendor| {
-        const wait = accounts.Registry.waits.get(vendor);
-        list = list ++ [_]SectionField{sectionField(u64, idleName(vendor), wait.timeouts.idle_ms)};
+        const idle_ms = accounts.Registry.waits.get(vendor).idle_ms;
+        list = list ++ [_]SectionField{sectionField(u64, idleName(vendor), idle_ms)};
     }
     break :fields list ++ [_]SectionField{
         sectionField(u32, "attempts_max", retry_default.attempts_max),
@@ -136,14 +129,6 @@ const Key = struct {
 
 const vendor_keys: []const Key = keys: {
     var list: []const Key = &.{};
-    for (vendors) |vendor| {
-        const note = accounts.Registry.waits.get(vendor).connect_note orelse continue;
-        list = list ++ [_]Key{.{
-            .path = "request." ++ connectName(vendor),
-            .description = "The time that Drinky waits for the head of each " ++
-                vendor.label() ++ " reply. " ++ note,
-        }};
-    }
     for (vendors) |vendor| {
         list = list ++ [_]Key{.{
             .path = "request." ++ idleName(vendor),
@@ -194,8 +179,8 @@ const keys = [_]Key{
     },
     .{
         .path = "request.connect_timeout_ms",
-        .description = "The time that Drinky waits for the head of a remote provider reply. " ++
-            "One window of this size also bounds a remote model fetch.",
+        .description = "The time that Drinky waits for the head of a provider reply. " ++
+            "One window of this size also bounds a model fetch.",
     },
     .{
         .path = "request.attempts_max",
@@ -270,10 +255,6 @@ const Leaf = struct {
     type_name: []const u8,
     default_text: ?[]const u8,
 };
-
-fn connectName(comptime vendor: accounts.Account.Vendor) [:0]const u8 {
-    return @tagName(vendor) ++ "_connect_timeout_ms";
-}
 
 fn idleName(comptime vendor: accounts.Account.Vendor) [:0]const u8 {
     return @tagName(vendor) ++ "_idle_timeout_ms";
@@ -637,12 +618,8 @@ fn loadFromData(gpa: std.mem.Allocator, io: std.Io, options: *const DataOptions)
 fn timeoutsOf(request: *const File.Request) accounts.Registry.Timeouts {
     var timeouts: accounts.Registry.Timeouts = undefined;
     inline for (vendors) |vendor| {
-        const wait = comptime accounts.Registry.waits.get(vendor);
         timeouts.set(vendor, .{
-            .connect_ms = if (wait.connect_note == null)
-                request.connect_timeout_ms
-            else
-                @field(request, connectName(vendor)),
+            .connect_ms = request.connect_timeout_ms,
             .idle_ms = @field(request, idleName(vendor)),
         });
     }
@@ -774,12 +751,11 @@ fn isShare(percent: f64) bool {
 
 test "load reads the request section" {
     var config = try loadDataForTest(
-        \\{ "request": { "connect_timeout_ms": 1000, "ds4_connect_timeout_ms": 1500,
+        \\{ "request": { "connect_timeout_ms": 1000,
         \\  "anthropic_idle_timeout_ms": 2000, "openai_idle_timeout_ms": 3000,
         \\  "google_idle_timeout_ms": 4000, "xai_idle_timeout_ms": 4500,
         \\  "openrouter_idle_timeout_ms": 5500, "deepseek_idle_timeout_ms": 6000,
-        \\  "ds4_idle_timeout_ms": 5000, "attempts_max": 5,
-        \\  "delay_ms_initial": 100, "delay_ms_max": 900 } }
+        \\  "attempts_max": 5, "delay_ms_initial": 100, "delay_ms_max": 900 } }
     );
     defer config.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u64, 1000), config.timeouts.get(.anthropic).connect_ms);
@@ -787,14 +763,13 @@ test "load reads the request section" {
     try std.testing.expectEqual(@as(u64, 1000), config.timeouts.get(.xai).connect_ms);
     try std.testing.expectEqual(@as(u64, 1000), config.timeouts.get(.google).connect_ms);
     try std.testing.expectEqual(@as(u64, 1000), config.timeouts.get(.deepseek).connect_ms);
-    try std.testing.expectEqual(@as(u64, 1500), config.timeouts.get(.ds4).connect_ms);
+    try std.testing.expectEqual(@as(u64, 1000), config.timeouts.get(.openrouter).connect_ms);
     try std.testing.expectEqual(@as(u64, 2000), config.timeouts.get(.anthropic).idle_ms);
     try std.testing.expectEqual(@as(u64, 3000), config.timeouts.get(.openai).idle_ms);
     try std.testing.expectEqual(@as(u64, 4500), config.timeouts.get(.xai).idle_ms);
     try std.testing.expectEqual(@as(u64, 4000), config.timeouts.get(.google).idle_ms);
     try std.testing.expectEqual(@as(u64, 5500), config.timeouts.get(.openrouter).idle_ms);
     try std.testing.expectEqual(@as(u64, 6000), config.timeouts.get(.deepseek).idle_ms);
-    try std.testing.expectEqual(@as(u64, 5000), config.timeouts.get(.ds4).idle_ms);
     try std.testing.expectEqual(@as(u32, 5), config.retry.attempts_max);
     try std.testing.expectEqual(@as(u64, 100), config.retry.backoff.delay_ms_initial);
     try std.testing.expectEqual(@as(u64, 900), config.retry.backoff.delay_ms_max);

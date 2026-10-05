@@ -85,7 +85,8 @@ test "the picker lists every account, marking the active, the signed-in, and the
     try rig.init(&.{
         .variables = &.{
             .{ "ANTHROPIC_API_KEY", "sk-ant" },
-            .{ "DS4_BASE_URL", "not a url" },
+            .{ "GOOGLE_APPLICATION_CREDENTIALS", "key.json" },
+            .{ "GOOGLE_CLOUD_LOCATION", "europe-west4" },
         },
         .store =
         \\{ "anthropic-plan":
@@ -119,9 +120,10 @@ test "the picker lists every account, marking the active, the signed-in, and the
         pick.options[accounts.testing.anthropic_api_key].name,
     );
     try std.testing.expect(pick.options[accounts.testing.anthropic_api_key].tag == null);
-    try std.testing.expectEqualStrings("ds4", pick.options[accounts.testing.ds4].name);
-    try std.testing.expectEqualStrings("Not loaded", pick.options[accounts.testing.ds4].tag.?);
-    try std.testing.expect(pick.options[accounts.testing.ds4].tag_pressure);
+    const failed = pick.options[accounts.testing.google_cloud_key];
+    try std.testing.expectEqualStrings("google-cloud-key", failed.name);
+    try std.testing.expectEqualStrings("Not loaded", failed.tag.?);
+    try std.testing.expect(failed.tag_pressure);
 
     try testing.expectNotice(
         try testing.selectRow(&pick, &context, accounts.testing.anthropic_api_key),
@@ -129,9 +131,9 @@ test "the picker lists every account, marking the active, the signed-in, and the
         "active account",
     );
     try testing.expectNotice(
-        try testing.selectRow(&pick, &context, accounts.testing.ds4),
+        try testing.selectRow(&pick, &context, accounts.testing.google_cloud_key),
         .failure,
-        "because of error BadBaseUrl",
+        "because of error BadLocation",
     );
     switch (try testing.selectRow(&pick, &context, accounts.testing.anthropic_plan)) {
         .event => |event| {
@@ -151,25 +153,16 @@ test "the picker lists every account, marking the active, the signed-in, and the
 test "select starts a login, instructs a key account, and adopts a set key with its model" {
     const gpa = std.testing.allocator;
     var rig: testing.Rig = undefined;
-    try rig.init(&.{ .variables = &.{
-        .{ "OPENAI_API_KEY", "sk-openai" },
-        .{ "DS4_BASE_URL", "http://127.0.0.1:8000/v1" },
-    } });
+    try rig.init(&.{ .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }} });
     defer rig.deinit();
-    var engine = try accounts.Model.init("deepseek-v4-flash");
-    engine.thinking = .supported;
-    try rig.registry().catalog.setAccount(accounts.testing.ds4, &.{
-        .models = &.{engine},
-        .base_url = "http://127.0.0.1:8000/v1",
-    });
-    rig.remembered[accounts.testing.ds4] = "deepseek-v4-flash";
+    try rig.account_rig.seed(accounts.testing.openai_api_key, &.{"gpt-5.6-sol"});
+    rig.remembered[accounts.testing.openai_api_key] = "gpt-5.6-sol";
     var context = rig.context();
 
     const pick = try picker(&context);
     defer pick.deinit(gpa);
     try std.testing.expect(pick.current == null);
     try std.testing.expectEqualStrings("Set", pick.options[accounts.testing.openai_api_key].tag.?);
-    try std.testing.expectEqualStrings("Set", pick.options[accounts.testing.ds4].tag.?);
     try std.testing.expect(pick.options[accounts.testing.google_cloud_key].tag == null);
 
     for (
@@ -197,16 +190,16 @@ test "select starts a login, instructs a key account, and adopts a set key with 
         .information,
         case.setting,
     );
-    switch (try testing.selectRow(&pick, &context, accounts.testing.ds4)) {
+    switch (try testing.selectRow(&pick, &context, accounts.testing.openai_api_key)) {
         .event => |event| {
             defer event.deinit(gpa);
             try std.testing.expectEqualStrings(
-                "Drinky now uses ds4/deepseek-v4-flash.",
+                "Drinky now uses openai-api-key/gpt-5.6-sol.",
                 event.content,
             );
         },
         else => return error.ExpectedEvent,
     }
-    try std.testing.expectEqual(accounts.testing.ds4, rig.choice.account.?);
-    try std.testing.expectEqualStrings("deepseek-v4-flash", rig.choice.model.?.name());
+    try std.testing.expectEqual(accounts.testing.openai_api_key, rig.choice.account.?);
+    try std.testing.expectEqualStrings("gpt-5.6-sol", rig.choice.model.?.name());
 }

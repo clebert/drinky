@@ -12,11 +12,7 @@ const body_bytes_max = 4 * 1024 * 1024;
 
 const List = struct {
     endpoint: []const u8,
-    token: ?[]const u8,
-    decoder: *const fn (
-        std.mem.Allocator,
-        []const u8,
-    ) error{ OutOfMemory, BadModelList }![]Model = parse,
+    token: []const u8,
 };
 
 pub fn fetch(
@@ -35,22 +31,19 @@ fn request(
     transport: ?providers.Transport,
     list: *const List,
 ) ![]Model {
-    var maybe_authorization: ?[]u8 = null;
-    if (list.token) |token| {
-        if (!providers.Transport.validHeaderValue(token)) return error.BadModelListCredentials;
-        maybe_authorization = try std.fmt.allocPrint(gpa, "Bearer {s}", .{token});
-    }
-    defer if (maybe_authorization) |authorization| gpa.free(authorization);
+    if (!providers.Transport.validHeaderValue(list.token)) return error.BadModelListCredentials;
+    const authorization = try std.fmt.allocPrint(gpa, "Bearer {s}", .{list.token});
+    defer gpa.free(authorization);
 
     const body = try net.getBody(gpa, io, transport, &.{
         .method = .GET,
         .url = list.endpoint,
-        .authorization = maybe_authorization,
+        .authorization = authorization,
         .headers = &.{net.accept_json},
     }, body_bytes_max);
     defer gpa.free(body);
 
-    return list.decoder(gpa, body);
+    return parse(gpa, body);
 }
 
 fn release(models: *const []Model, args: *const std.meta.ArgsTuple(@TypeOf(request))) void {
@@ -125,24 +118,4 @@ test parse {
     try std.testing.expectEqualStrings("", models[3].servedName());
     try std.testing.expectEqualStrings("grok-4.20", models[4].name());
     try std.testing.expectEqualStrings("grok-4.20-0309-reasoning", models[4].servedName());
-}
-
-test "a list without a credential omits the Authorization header" {
-    const gpa = std.testing.allocator;
-    var transport: providers.testing.FakeTransport = .{
-        .gpa = gpa,
-        .replies = &.{.{ .body = "{\"object\":\"list\",\"data\":[]}" }},
-    };
-    defer transport.deinit();
-
-    const models = try fetch(gpa, std.testing.io, transport.transport(), &.unbounded, &.{
-        .endpoint = "http://127.0.0.1:8000/v1/models",
-        .token = null,
-    });
-    defer gpa.free(models);
-    try std.testing.expectEqual(@as(usize, 0), models.len);
-    try std.testing.expectEqualStrings(
-        "GET http://127.0.0.1:8000/v1/models\naccept: application/json\n\n",
-        transport.requests.items[0],
-    );
 }

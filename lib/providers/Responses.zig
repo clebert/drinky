@@ -28,12 +28,11 @@ pub const Options = struct {
 
 pub const Switches = struct {
     plain_reasoning: bool = false,
-    empty_reasoning: bool = false,
     require_parameters: bool = false,
 };
 
 const IdentifyOptions = struct {
-    token: ?[]const u8,
+    token: []const u8,
     codex_account_id: []const u8 = "",
 };
 
@@ -46,8 +45,7 @@ const Stored = struct {
     fn replayable(self: *const Stored, switches: *const Switches) bool {
         if (self.id.len == 0) return false;
         if (self.encrypted_content.len != 0) return true;
-        if (self.text.len != 0 or self.raw_text.len != 0) return switches.plain_reasoning;
-        return switches.empty_reasoning;
+        return switches.plain_reasoning and (self.text.len != 0 or self.raw_text.len != 0);
     }
 };
 
@@ -117,7 +115,7 @@ fn prepare(
     ptr: *anyopaque,
     arena: std.mem.Allocator,
     request: *const core.Provider.Request,
-    maybe_token: ?[]const u8,
+    token: []const u8,
 ) Dialect.Error!Transport.Request {
     const self: *Responses = @ptrCast(@alignCast(ptr));
     var prepared: Transport.Request = .{
@@ -126,7 +124,7 @@ fn prepare(
         .body = try self.body(arena, request),
     };
     try identify(arena, &prepared, &.{
-        .token = maybe_token,
+        .token = token,
         .codex_account_id = self.options.codex_account_id,
     });
     return prepared;
@@ -137,9 +135,7 @@ pub fn identify(
     request: *Transport.Request,
     options: *const IdentifyOptions,
 ) error{OutOfMemory}!void {
-    if (options.token) |token| {
-        request.authorization = try std.fmt.allocPrint(arena, "Bearer {s}", .{token});
-    }
+    request.authorization = try std.fmt.allocPrint(arena, "Bearer {s}", .{options.token});
     request.user_agent = Transport.client_name;
     if (options.codex_account_id.len == 0) return;
     request.headers = try std.mem.concat(arena, std.http.Header, &.{ request.headers, &.{
@@ -1194,35 +1190,6 @@ test "a routed request requires its parameters and replays plain reasoning" {
     try std.testing.expectEqual(@as(usize, 1), strict.value.object.get("input").?.array.items.len);
 }
 
-test "an account that accepts empty reasoning replays a proof that holds an id alone" {
-    const items = [_]core.Conversation.Item{try proofItem("ds4", &.{ .id = "rs_local" })};
-    defer freeProofs(&items);
-    var request = testRequest(&items, null);
-    request.tools = &testing.tools;
-    const parsed = try Rig.body(.{
-        .account = "ds4",
-        .endpoint = "e",
-        .switches = .{ .plain_reasoning = true, .empty_reasoning = true },
-    }, &request);
-    defer parsed.deinit();
-    const root = parsed.value.object;
-    try std.testing.expect(root.get("include") == null);
-    try std.testing.expect(root.get("parallel_tool_calls").?.bool);
-    const input = root.get("input").?.array.items;
-    try std.testing.expectEqual(@as(usize, 1), input.len);
-    try std.testing.expectEqualStrings("rs_local", input[0].object.get("id").?.string);
-    try std.testing.expectEqual(@as(usize, 0), input[0].object.get("summary").?.array.items.len);
-    try std.testing.expect(input[0].object.get("encrypted_content") == null);
-    try std.testing.expect(input[0].object.get("content") == null);
-
-    const plain = try Rig.body(
-        .{ .account = "ds4", .endpoint = "e", .switches = .{ .plain_reasoning = true } },
-        &request,
-    );
-    defer plain.deinit();
-    try std.testing.expectEqual(@as(usize, 0), plain.value.object.get("input").?.array.items.len);
-}
-
 test "prepare sends the bearer token, the event-stream accept, and the Codex identity" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
@@ -1247,14 +1214,6 @@ test "prepare sends the bearer token, the event-stream accept, and the Codex ide
     try std.testing.expectEqualStrings("originator", prepared.headers[2].name);
     try std.testing.expectEqualStrings(Transport.client_name, prepared.headers[2].value);
     try std.testing.expect(std.mem.startsWith(u8, prepared.body, "{\"model\":\"gpt-5.6-sol\""));
-
-    var local: Responses = .init(std.testing.allocator, .{
-        .account = "ds4",
-        .endpoint = "http://127.0.0.1:8000/v1/responses",
-    });
-    const bare = try local.dialect().prepare(arena.allocator(), &request, null);
-    try std.testing.expectEqual(@as(?[]const u8, null), bare.authorization);
-    try std.testing.expectEqual(@as(usize, 1), bare.headers.len);
 }
 
 test "an empty terminal output snapshot does not reject the streamed reply" {
@@ -1619,21 +1578,6 @@ test "a plain account keeps the reasoning text of an item without encryption" {
     });
     try rig.frames.expect(
         \\proof:deepseek-api-key:{"id":"rs_1","text":"sum","encrypted_content":"","raw_text":"raw"}
-        \\
-    );
-
-    var local: Rig = undefined;
-    local.init(.{
-        .account = "ds4",
-        .endpoint = "e",
-        .switches = .{ .plain_reasoning = true, .empty_reasoning = true },
-    });
-    defer local.deinit();
-    try local.frames.feed(&.{
-        \\{"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_1","summary":[]}}
-    });
-    try local.frames.expect(
-        \\proof:ds4:{"id":"rs_1","text":"","encrypted_content":"","raw_text":""}
         \\
     );
 }

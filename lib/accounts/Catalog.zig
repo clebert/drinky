@@ -14,25 +14,17 @@ const Catalog = @This();
 
 const efforts_bytes_max = 64;
 const models_key = "models";
-const base_url_key = "base_url";
 
 gpa: std.mem.Allocator,
 io: std.Io,
 models_path: []const u8,
 metadata_path: []const u8,
 lists: [Account.table.len][]Model,
-base_urls: [Account.table.len]?[]const u8,
 metadata: Metadata,
 mutex: std.Io.Mutex,
 
-const Replacement = struct {
-    models: []const Model,
-    base_url: ?[]const u8 = null,
-};
-
 const Encoded = struct {
     name: []const u8,
-    engine: ?[]const u8,
     served_as: ?[]const u8,
     context_window: ?u64,
     tokens_max: ?u32,
@@ -89,7 +81,6 @@ pub fn init(
         .models_path = models_path,
         .metadata_path = metadata_path,
         .lists = @splat(&.{}),
-        .base_urls = @splat(null),
         .metadata = .{ .gpa = gpa, .entries = &.{} },
         .mutex = .init,
     };
@@ -100,9 +91,6 @@ pub fn init(
 
 pub fn deinit(self: *Catalog) void {
     for (self.lists) |models| self.gpa.free(models);
-    for (self.base_urls) |maybe_base_url| {
-        if (maybe_base_url) |base_url| self.gpa.free(base_url);
-    }
     self.metadata.deinit();
     self.gpa.free(self.models_path);
     self.gpa.free(self.metadata_path);
@@ -143,12 +131,7 @@ fn offered(self: *const Catalog, index: usize) Offered {
 
 fn merge(self: *const Catalog, index: usize, listed: *const Model) ?Model {
     var merged = listed.*;
-    const row = &Account.table[index];
-    const public = if (row.model_source == .local)
-        null
-    else
-        self.metadata.lookup(row.vendor, listed.name());
-    if (public) |extra| {
+    if (self.metadata.lookup(Account.table[index].vendor, listed.name())) |extra| {
         if (merged.price == null) merged.price = extra.price;
         if (merged.context_window == null) merged.context_window = extra.context_window;
         if (merged.tokens_max == null) merged.tokens_max = extra.tokens_max;
@@ -168,48 +151,23 @@ fn merge(self: *const Catalog, index: usize, listed: *const Model) ?Model {
 pub fn setAccount(
     self: *Catalog,
     index: usize,
-    replacement: *const Replacement,
+    fetched: []const Model,
 ) json_store.SaveError!void {
-    const row = &Account.table[index];
-    std.debug.assert(row.model_source != .public);
-    std.debug.assert((row.model_source == .local) == (replacement.base_url != null));
-    const models = try self.gpa.dupe(Model, replacement.models);
-    var installed = false;
-    errdefer if (!installed) self.gpa.free(models);
-    const base_url = if (replacement.base_url) |source| try self.gpa.dupe(u8, source) else null;
-    errdefer if (!installed) if (base_url) |url| self.gpa.free(url);
+    std.debug.assert(Account.table[index].model_source != .public);
+    const models = try self.gpa.dupe(Model, fetched);
 
     self.mutex.lockUncancelable(self.io);
     defer self.mutex.unlock(self.io);
     self.gpa.free(self.lists[index]);
-    if (self.base_urls[index]) |old| self.gpa.free(old);
     self.lists[index] = models;
-    self.base_urls[index] = base_url;
-    installed = true;
     try self.saveAccount(index);
-}
-
-pub fn dropAccountFromAnotherUrl(self: *Catalog, index: usize, base_url: []const u8) void {
-    std.debug.assert(Account.table[index].model_source == .local);
-    self.mutex.lockUncancelable(self.io);
-    defer self.mutex.unlock(self.io);
-    if (self.base_urls[index]) |stored| {
-        if (std.mem.eql(u8, stored, base_url)) return;
-    } else if (self.lists[index].len == 0) return;
-    self.dropLocked(index);
 }
 
 pub fn dropAccount(self: *Catalog, index: usize) void {
     self.mutex.lockUncancelable(self.io);
     defer self.mutex.unlock(self.io);
-    self.dropLocked(index);
-}
-
-fn dropLocked(self: *Catalog, index: usize) void {
     self.gpa.free(self.lists[index]);
-    if (self.base_urls[index]) |base_url| self.gpa.free(base_url);
     self.lists[index] = &.{};
-    self.base_urls[index] = null;
     json_store.remove(self.gpa, self.io, &.{
         .path = self.models_path,
         .key = Account.table[index].id,
@@ -231,20 +189,8 @@ fn loadAccounts(self: *Catalog) void {
         const entry = file.entry(row.id) orelse continue;
         const listed = providers.json.array(entry.getPtr(models_key)) orelse continue;
         const models = json.models(self.gpa, listed.items, decodeModel) catch continue;
-        const maybe_source = if (row.model_source == .local) providers.json.string(
-            entry.getPtr(base_url_key),
-        ) else null;
-        const base_url = if (maybe_source) |source|
-            self.gpa.dupe(u8, source) catch {
-                self.gpa.free(models);
-                continue;
-            }
-        else
-            null;
         self.gpa.free(self.lists[index]);
-        if (self.base_urls[index]) |old| self.gpa.free(old);
         self.lists[index] = models;
-        self.base_urls[index] = base_url;
     }
 }
 
@@ -271,17 +217,9 @@ fn saveAccount(self: *Catalog, index: usize) !void {
     var arena: std.heap.ArenaAllocator = .init(self.gpa);
     defer arena.deinit();
     const encoded = try encodeList(arena.allocator(), self.lists[index]);
-    const row = &Account.table[index];
-    if (row.model_source == .local) {
-        try json_store.save(self.gpa, self.io, &.{ .path = self.models_path, .key = row.id }, .{
-            .base_url = self.base_urls[index].?,
-            .models = encoded,
-        }, .{});
-        return;
-    }
     try json_store.save(self.gpa, self.io, &.{
         .path = self.models_path,
-        .key = row.id,
+        .key = Account.table[index].id,
     }, .{ .models = encoded }, .{});
 }
 
@@ -323,10 +261,6 @@ fn encode(gpa: std.mem.Allocator, model: *const Model) !Encoded {
     }
     return .{
         .name = try gpa.dupe(u8, model.name()),
-        .engine = if (model.engineName().len != 0)
-            try gpa.dupe(u8, model.engineName())
-        else
-            null,
         .served_as = if (model.servedName().len != 0)
             try gpa.dupe(u8, model.servedName())
         else
@@ -345,8 +279,6 @@ fn decodeModel(value: *const std.json.Value) ?Model {
     const object = providers.json.object(value) orelse return null;
     const name = providers.json.string(object.getPtr("name")) orelse return null;
     var model = Model.init(name) catch return null;
-    if (providers.json.string(object.getPtr("engine"))) |engine|
-        model.setEngine(engine) catch return null;
     if (providers.json.string(object.getPtr("served_as"))) |served_as|
         model.serveAs(served_as) catch return null;
     model.context_window = json.positive(u64, object.getPtr("context_window"));
@@ -396,7 +328,7 @@ test "a list makes an account nonempty, and a drop empties it" {
     const catalog = &rig.catalog;
 
     const kept = [_]Model{vendorModel("kept", 10, .high)};
-    try catalog.setAccount(testing.anthropic_api_key, &.{ .models = &kept });
+    try catalog.setAccount(testing.anthropic_api_key, &kept);
     try std.testing.expect(!catalog.isEmpty(testing.anthropic_api_key));
     catalog.dropAccount(testing.anthropic_api_key);
     try std.testing.expect(catalog.isEmpty(testing.anthropic_api_key));
@@ -462,7 +394,7 @@ test "the vendor list wins every field it states, and the public metadata fills 
     var vendor = vendorModel("gpt-5.6-sol", 272_000, .high);
     vendor.tokens_max = null;
     vendor.price = .{ .input = 1, .output = 4, .cache_read = 0.1, .cache_write = 1 };
-    try catalog.setAccount(testing.openai_plan, &.{ .models = &.{vendor} });
+    try catalog.setAccount(testing.openai_plan, &.{vendor});
 
     var public = Model.init("gpt-5.6-sol") catch unreachable;
     public.context_window = 1_050_000;
@@ -489,7 +421,7 @@ test "a vendor list that states no reasoning keeps every level of the public met
 
     var vendor = vendorModel("claude-haiku-4-5-20251001", 200_000, null);
     vendor.thinking = .unsupported;
-    try catalog.setAccount(testing.anthropic_api_key, &.{ .models = &.{vendor} });
+    try catalog.setAccount(testing.anthropic_api_key, &.{vendor});
 
     var public = Model.init("claude-haiku-4.5") catch unreachable;
     public.thinking = .supported;
@@ -513,7 +445,7 @@ test "a vendor list that denies the effort control keeps every level of the publ
 
     var vendor = vendorModel("claude-fable-5", 200_000, null);
     vendor.efforts_denied = true;
-    try catalog.setAccount(testing.anthropic_api_key, &.{ .models = &.{vendor} });
+    try catalog.setAccount(testing.anthropic_api_key, &.{vendor});
 
     var public = Model.init("claude-fable-5") catch unreachable;
     public.thinking = .supported;
@@ -534,7 +466,7 @@ test "public metadata that states no reasoning keeps the levels of the vendor li
 
     try catalog.setAccount(
         testing.anthropic_api_key,
-        &.{ .models = &.{vendorModel("claude-opus-4-8", 1_000_000, .high)} },
+        &.{vendorModel("claude-opus-4-8", 1_000_000, .high)},
     );
 
     var public = Model.init("claude-opus-4.8") catch unreachable;
@@ -554,10 +486,10 @@ test "a model that no source describes is not offered" {
     defer rig.deinit();
     const catalog = &rig.catalog;
 
-    try catalog.setAccount(testing.openai_api_key, &.{ .models = &.{
+    try catalog.setAccount(testing.openai_api_key, &.{
         vendorModel("text-embedding-3-large", null, null),
         vendorModel("gpt-5.6-sol", null, null),
-    } });
+    });
     try std.testing.expect(catalog.isEmpty(testing.openai_api_key));
 
     var public = Model.init("gpt-5.6-sol") catch unreachable;
@@ -582,9 +514,7 @@ test "metadata of one vendor never reaches the account of another" {
     defer rig.deinit();
     const catalog = &rig.catalog;
 
-    try catalog.setAccount(testing.anthropic_api_key, &.{
-        .models = &.{vendorModel("shared-name", null, .high)},
-    });
+    try catalog.setAccount(testing.anthropic_api_key, &.{vendorModel("shared-name", null, .high)});
     var public = Model.init("shared-name") catch unreachable;
     public.price = .{ .input = 1, .output = 2, .cache_read = 0, .cache_write = 0 };
     try describe(catalog, &.{.{ .vendor = .openai, .model = public }});
@@ -606,7 +536,6 @@ test "a stored model survives a round trip through both files" {
     var model = Model.init("claude-opus-4-8") catch unreachable;
     model.context_window = 1_000_000;
     model.tokens_max = 128_000;
-    try model.setEngine("Claude weights");
     model.thinking = .supported;
     model.tools = .supported;
     model.addEffort(.low);
@@ -627,7 +556,7 @@ test "a stored model survives a round trip through both files" {
     var alias = Model.init("grok-4.20") catch unreachable;
     alias.context_window = 256_000;
     alias.serveAs("grok-4.20-0309-reasoning") catch unreachable;
-    try written.setAccount(testing.anthropic_plan, &.{ .models = &.{ model, alias } });
+    try written.setAccount(testing.anthropic_plan, &.{ model, alias });
 
     var bare = Model.init("anthropic/public-only") catch unreachable;
     bare.context_window = 200_000;
@@ -644,7 +573,6 @@ test "a stored model survives a round trip through both files" {
     const restored = read.find(testing.anthropic_plan, "claude-opus-4-8").?;
     try std.testing.expectEqual(@as(?u64, 1_000_000), restored.context_window);
     try std.testing.expectEqual(@as(?u32, 128_000), restored.tokens_max);
-    try std.testing.expectEqualStrings("Claude weights", restored.engineName());
     try std.testing.expectEqual(Model.Thinking.supported, restored.thinking);
     try std.testing.expectEqual(Model.Tools.supported, restored.tools);
     try std.testing.expect(restored.efforts.contains(.low));
@@ -690,12 +618,8 @@ test "a metadata save replaces the entries of every vendor at once" {
     defer written.deinit();
     const claude = vendorModel("claude-opus-4.8", 1_000_000, .high);
     const gpt = vendorModel("gpt-5.6-sol", 1_050_000, .high);
-    try written.setAccount(testing.anthropic_api_key, &.{
-        .models = &.{vendorModel(claude.name(), null, null)},
-    });
-    try written.setAccount(testing.openai_api_key, &.{
-        .models = &.{vendorModel(gpt.name(), null, null)},
-    });
+    try written.setAccount(testing.anthropic_api_key, &.{vendorModel(claude.name(), null, null)});
+    try written.setAccount(testing.openai_api_key, &.{vendorModel(gpt.name(), null, null)});
     try written.setMetadata(.{ .gpa = gpa, .entries = try gpa.dupe(Metadata.Entry, &.{
         .{ .vendor = .anthropic, .model = claude },
         .{ .vendor = .openai, .model = gpt },
@@ -709,53 +633,6 @@ test "a metadata save replaces the entries of every vendor at once" {
     try std.testing.expect(read.find(testing.anthropic_api_key, "claude-opus-4.8") == null);
     const described = read.find(testing.openai_api_key, "gpt-5.6-sol").?;
     try std.testing.expectEqual(@as(?u64, 1_050_000), described.context_window);
-}
-
-test "a DwarfStar list keeps its base URL and drops after an address change" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var home_buffer: [128]u8 = undefined;
-    const home = try testing.tmpHome(&home_buffer, &tmp);
-
-    var written = try init(gpa, io, &.{ .working_directory = ".", .home = home });
-    defer written.deinit();
-    var model = vendorModel("deepseek-v4-pro", 1_048_576, .high);
-    try model.setEngine("DeepSeek V4 Flash");
-    model.tools = .supported;
-    try written.setAccount(testing.ds4, &.{
-        .models = &.{model},
-        .base_url = "http://127.0.0.1:8000/v1",
-    });
-
-    var read = try init(gpa, io, &.{ .working_directory = ".", .home = home });
-    defer read.deinit();
-    try std.testing.expectEqualStrings(
-        "DeepSeek V4 Flash",
-        read.find(testing.ds4, "deepseek-v4-pro").?.engineName(),
-    );
-
-    read.dropAccountFromAnotherUrl(testing.ds4, "http://127.0.0.1:8000/v1");
-    try std.testing.expect(!read.isEmpty(testing.ds4));
-    read.dropAccountFromAnotherUrl(testing.ds4, "http://127.0.0.1:9000/v1");
-    try std.testing.expect(read.isEmpty(testing.ds4));
-    var dropped = try init(gpa, io, &.{ .working_directory = ".", .home = home });
-    defer dropped.deinit();
-    try std.testing.expect(dropped.isEmpty(testing.ds4));
-}
-
-test "a DwarfStar list with no stored URL is foreign" {
-    var rig: TestCatalog = undefined;
-    try rig.init(std.testing.allocator);
-    defer rig.deinit();
-    try rig.reload(
-        \\{ "ds4": { "models": [ { "name": "deepseek-v4-pro", "context_window": 1048576 } ] } }
-    );
-    const catalog = &rig.catalog;
-    try std.testing.expect(!catalog.isEmpty(testing.ds4));
-    catalog.dropAccountFromAnotherUrl(testing.ds4, "http://127.0.0.1:8000/v1");
-    try std.testing.expect(catalog.isEmpty(testing.ds4));
 }
 
 test "a locked cache file keeps the fetched list of this session" {
@@ -780,7 +657,7 @@ test "a locked cache file keeps the fetched list of this session" {
     const fetched = [_]Model{vendorModel("claude-opus-4-8", 1_000_000, .high)};
     try std.testing.expectError(
         error.StoreBusy,
-        catalog.setAccount(testing.anthropic_api_key, &.{ .models = &fetched }),
+        catalog.setAccount(testing.anthropic_api_key, &fetched),
     );
     try std.testing.expect(!catalog.isEmpty(testing.anthropic_api_key));
     try std.testing.expect(catalog.find(testing.anthropic_api_key, "claude-opus-4-8") != null);
@@ -869,9 +746,7 @@ test "a merged model without tool support is not offered" {
     defer rig.deinit();
     const catalog = &rig.catalog;
 
-    try catalog.setAccount(testing.openai_api_key, &.{
-        .models = &.{vendorModel("gpt-5.6-sol", 272_000, .high)},
-    });
+    try catalog.setAccount(testing.openai_api_key, &.{vendorModel("gpt-5.6-sol", 272_000, .high)});
     var public = Model.init("gpt-5.6-sol") catch unreachable;
     public.tools = .unsupported;
     public.price = .{ .input = 2, .output = 10, .cache_read = 0.2, .cache_write = 2.5 };
@@ -887,10 +762,10 @@ test "a DeepSeek account takes public metadata by the vendor id" {
     defer rig.deinit();
     const catalog = &rig.catalog;
 
-    try catalog.setAccount(testing.deepseek_api_key, &.{ .models = &.{
+    try catalog.setAccount(testing.deepseek_api_key, &.{
         vendorModel("deepseek-v4-pro", null, null),
         vendorModel("deepseek-flash", null, null),
-    } });
+    });
 
     var public_pro = Model.init("deepseek-v4-pro") catch unreachable;
     public_pro.context_window = 1_048_576;

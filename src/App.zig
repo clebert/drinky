@@ -1867,7 +1867,7 @@ const Rig = struct {
         model.addEffort(.low);
         model.addEffort(.high);
         for (model_accounts) |account| {
-            try app.account_registry.catalog.setAccount(account, &.{ .models = &.{model} });
+            try app.account_registry.catalog.setAccount(account, &.{model});
             try app.state.seed(account, model.name(), .high);
         }
         app.adopt(app.startAccount());

@@ -164,10 +164,9 @@ fn prepare(
     ptr: *anyopaque,
     arena: std.mem.Allocator,
     request: *const core.Provider.Request,
-    maybe_token: ?[]const u8,
+    token: []const u8,
 ) Dialect.Error!Transport.Request {
     const self: *Messages = @ptrCast(@alignCast(ptr));
-    const token = maybe_token orelse return error.MissingCredential;
     var prepared: Transport.Request = .{ .url = endpoint, .body = try self.body(arena, request) };
     try identify(arena, &prepared, &.{
         .identity = self.options.identity,
@@ -1103,11 +1102,6 @@ test "prepare forks the headers by identity and every identity streams tool inpu
     try std.testing.expectEqualStrings("anthropic-version", key.headers[1].name);
     try std.testing.expectEqualStrings("anthropic-beta", key.headers[2].name);
     try std.testing.expectEqualStrings(streaming_beta, key.headers[2].value);
-
-    try std.testing.expectError(
-        error.MissingCredential,
-        keyed.dialect().prepare(arena.allocator(), &empty, null),
-    );
 }
 
 test "a thinking block streams its deltas and closes as one signed proof" {

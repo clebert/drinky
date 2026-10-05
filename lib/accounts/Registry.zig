@@ -7,7 +7,6 @@ const Account = @import("Account.zig");
 const anthropic = @import("anthropic/root.zig");
 const Catalog = @import("Catalog.zig");
 const Client = @import("Client.zig");
-const ds4 = @import("ds4/root.zig");
 const google = @import("google/root.zig");
 const json_store = @import("json_store.zig");
 const Metadata = @import("Metadata.zig");
@@ -42,7 +41,7 @@ mailbox: core.actor.Mailbox(Mail, mail_capacity),
 loop: ?std.Io.Future(void),
 worker: ?Worker,
 
-pub const LoadError = oauth.store.Error || google.Auth.InitError || error{BadBaseUrl};
+pub const LoadError = oauth.store.Error || google.Auth.InitError;
 
 pub const FetchError = paging.Error ||
     Metadata.FetchError ||
@@ -52,52 +51,45 @@ pub const FetchError = paging.Error ||
 pub const Timeouts = std.EnumArray(Account.Vendor, providers.Transport.Timeouts);
 
 const Wait = struct {
-    timeouts: providers.Transport.Timeouts,
+    idle_ms: u64 = @as(providers.Transport.Timeouts, .{}).idle_ms,
     idle_note: []const u8,
-    connect_note: ?[]const u8 = null,
 };
 
 pub const waits: std.EnumArray(Account.Vendor, Wait) = .init(.{
     .anthropic = .{
-        .timeouts = .{},
         .idle_note = "A keepalive ping is not an event and does not restart the wait.",
     },
     .openai = .{
-        .timeouts = .{ .idle_ms = 300_000 },
+        .idle_ms = 300_000,
         .idle_note = "The stream is silent while the model reasons privately, so the default " ++
             "matches the wait of the official client.",
     },
     .xai = .{
-        .timeouts = .{ .idle_ms = 300_000 },
+        .idle_ms = 300_000,
         .idle_note = "The stream can stay silent while the model reasons, so the default " ++
             "matches the OpenAI wait.",
     },
     .openrouter = .{
-        .timeouts = .{ .idle_ms = 300_000 },
+        .idle_ms = 300_000,
         .idle_note = "The stream can stay silent while the model reasons, so the default " ++
             "matches the OpenAI wait.",
     },
     .deepseek = .{
-        .timeouts = .{ .idle_ms = 300_000 },
+        .idle_ms = 300_000,
         .idle_note = "The first reasoning event can take a long time to arrive, so the " ++
             "default matches the OpenAI wait.",
     },
     .google = .{
-        .timeouts = .{ .idle_ms = 300_000 },
+        .idle_ms = 300_000,
         .idle_note = "The stream can stay silent while the model thinks, so the default " ++
             "matches the OpenAI wait.",
-    },
-    .ds4 = .{
-        .timeouts = .{ .connect_ms = 3_600_000, .idle_ms = 3_600_000 },
-        .idle_note = "A local prefill can take many minutes.",
-        .connect_note = "One window of this size also bounds its model fetch.",
     },
 });
 
 pub const timeouts_default: Timeouts = timeouts: {
     var timeouts: Timeouts = undefined;
     for (std.enums.values(Account.Vendor)) |vendor| {
-        timeouts.set(vendor, waits.get(vendor).timeouts);
+        timeouts.set(vendor, .{ .idle_ms = waits.get(vendor).idle_ms });
     }
     break :timeouts timeouts;
 };
@@ -254,13 +246,12 @@ const Callback = struct {
 const Slot = union(enum) {
     absent,
     key: Key,
-    local: []const u8,
     login: Login,
     google: google.Auth,
 
     fn deinit(self: *Slot) void {
         switch (self.*) {
-            .absent, .key, .local => {},
+            .absent, .key => {},
             .login => |*login| switch (login.*) {
                 inline else => |*store| store.deinit(),
             },
@@ -396,10 +387,6 @@ pub fn init(self: *Registry, gpa: std.mem.Allocator, io: std.Io, options: *const
         loaded += 1;
     }
     self.catalog = try Catalog.init(gpa, io, &options.directories);
-    for (&self.slots, 0..) |*slot, index| switch (slot.*) {
-        .local => |base_url| self.catalog.dropAccountFromAnotherUrl(index, base_url),
-        .absent, .key, .login, .google => {},
-    };
     self.mailbox = .init;
 }
 
@@ -415,14 +402,6 @@ fn load(
         .timeouts = self.timeouts.get(row.vendor),
     };
     switch (row.credential) {
-        .none => {
-            const configured = environment.get(row.setting().?) orelse return .absent;
-            const base_url = normalizeBaseUrl(configured) catch |err| {
-                load_error.* = err;
-                return .absent;
-            };
-            return .{ .local = base_url };
-        },
         .environment => |name| {
             const key = environment.get(name) orelse return .absent;
             return .{ .key = .{ .value = key } };
@@ -471,18 +450,6 @@ fn openLogin(
     }
 }
 
-fn normalizeBaseUrl(configured: []const u8) error{BadBaseUrl}![]const u8 {
-    const base_url = std.mem.trimEnd(u8, configured, "/");
-    const uri = std.Uri.parse(base_url) catch return error.BadBaseUrl;
-    if (!std.ascii.eqlIgnoreCase(uri.scheme, "http") and
-        !std.ascii.eqlIgnoreCase(uri.scheme, "https")) return error.BadBaseUrl;
-    const host = uri.host orelse return error.BadBaseUrl;
-    if (host.isEmpty()) return error.BadBaseUrl;
-    if (uri.query != null or uri.fragment != null) return error.BadBaseUrl;
-    if (!std.mem.endsWith(u8, base_url, "/v1")) return error.BadBaseUrl;
-    return base_url;
-}
-
 pub fn start(self: *Registry) std.Io.ConcurrentError!void {
     self.loop = try self.io.concurrent(run, .{self});
 }
@@ -504,7 +471,7 @@ pub fn send(self: *Registry, command: *const Command) error{OutOfMemory}!void {
 pub fn isAuthenticated(self: *Registry, index: usize) bool {
     return switch (self.slots[index]) {
         .absent => false,
-        .key, .local, .google => true,
+        .key, .google => true,
         .login => |*login| switch (login.*) {
             inline else => |*store| store.signedIn(),
         },
@@ -530,7 +497,6 @@ fn credential(self: *Registry, index: usize) ?providers.Credential {
     return switch (self.slots[index]) {
         .absent => unreachable,
         .key => |*key| key.credential(),
-        .local => providers.Credential.none,
         .login => |*login| switch (login.*) {
             inline else => |*store| store.credential(),
         },
@@ -549,7 +515,6 @@ pub fn open(self: *Registry, client: *Client, index: usize) error{ SignedOut, Ou
     var maybe_account_id: ?[]const u8 = null;
     defer if (maybe_account_id) |account_id| self.gpa.free(account_id);
     switch (self.slots[index]) {
-        .local => |base_url| options.base_url = base_url,
         .login => |*login| switch (login.*) {
             .chatgpt => |*store| {
                 maybe_account_id = try store.copyField("account_id", self.gpa);
@@ -577,7 +542,7 @@ pub fn takesPaste(account: *const Account) bool {
 fn callback(account: *const Account) ?Callback {
     const login = switch (account.credential) {
         .store => |flow| flow,
-        .none, .environment, .key_file => return null,
+        .environment, .key_file => return null,
     };
     switch (login) {
         inline else => |tag| {
@@ -599,7 +564,7 @@ pub fn logout(self: *Registry, index: usize) !void {
             self.load_errors[index] = null;
             self.catalog.dropAccount(index);
         },
-        .absent, .key, .local, .google => return error.AccountHasNoLogout,
+        .absent, .key, .google => return error.AccountHasNoLogout,
     }
 }
 
@@ -609,7 +574,7 @@ pub fn invalidate(
 ) (oauth.store.Error || error{AccountHasNoRefreshCredential})!bool {
     const login = switch (self.slots[index]) {
         .login => |*login| login,
-        .absent, .key, .local, .google => return error.AccountHasNoRefreshCredential,
+        .absent, .key, .google => return error.AccountHasNoRefreshCredential,
     };
     switch (login.*) {
         inline else => |*store| switch (comptime @TypeOf(store.*).flow.secret) {
@@ -731,7 +696,7 @@ fn runLogin(self: *Registry, index: usize) Mail {
         .login => |*login| switch (login.*) {
             inline else => |*store| store.signIn(&context),
         },
-        .absent, .key, .local, .google => unreachable,
+        .absent, .key, .google => unreachable,
     } };
 }
 
@@ -809,31 +774,22 @@ fn emit(self: *Registry, event: *const Event) void {
 fn refresh(self: *Registry, index: usize) Refresh {
     const deadline = core.timeout.Deadline.start(self.io, self.timeoutsOf(index).connect_ms);
     var result: Refresh = .{};
-    const source = Account.table[index].model_source;
+    const public = Account.table[index].model_source == .public;
 
-    if (source == .public) {
-        if (Metadata.fetch(self.gpa, self.io, self.transport, &deadline)) |metadata| {
-            recordSave(&result.metadata_save_error, self.catalog.setMetadata(metadata));
-        } else |err| {
-            result.models_error = err;
-        }
-    } else {
+    if (!public) {
         if (self.fetchModels(index, &deadline)) |discovered| {
             defer self.gpa.free(discovered);
-            recordSave(&result.models_save_error, self.storeModels(index, discovered));
+            recordSave(&result.models_save_error, self.catalog.setAccount(index, discovered));
         } else |err| {
             result.models_error = err;
         }
         if (isCanceled(FetchError, result.models_error)) return result;
         if (isCanceled(json_store.SaveError, result.models_save_error)) return result;
-
-        if (source != .local) {
-            if (Metadata.fetch(self.gpa, self.io, self.transport, &deadline)) |metadata| {
-                recordSave(&result.metadata_save_error, self.catalog.setMetadata(metadata));
-            } else |err| {
-                result.metadata_error = err;
-            }
-        }
+    }
+    if (Metadata.fetch(self.gpa, self.io, self.transport, &deadline)) |metadata| {
+        recordSave(&result.metadata_save_error, self.catalog.setMetadata(metadata));
+    } else |err| {
+        if (public) result.models_error = err else result.metadata_error = err;
     }
 
     var listed: std.ArrayList(Model) = .empty;
@@ -844,16 +800,8 @@ fn refresh(self: *Registry, index: usize) Refresh {
     return result;
 }
 
-fn storeModels(self: *Registry, index: usize, discovered: []const Model) !void {
-    const base_url: ?[]const u8 = switch (self.slots[index]) {
-        .local => |base_url| base_url,
-        .absent, .key, .login, .google => null,
-    };
-    try self.catalog.setAccount(index, &.{ .models = discovered, .base_url = base_url });
-}
-
 fn modelsUrl(gpa: std.mem.Allocator, row: *const Account) error{OutOfMemory}![]u8 {
-    return std.fmt.allocPrint(gpa, "{s}/models", .{row.dialect.responses.base.url});
+    return std.fmt.allocPrint(gpa, "{s}/models", .{row.dialect.responses.base_url});
 }
 
 fn recordSave(target: *?json_store.SaveError, outcome: json_store.SaveError!void) void {
@@ -903,7 +851,6 @@ fn fetchModels(
             .location = slot.google.location,
         }),
         .public => unreachable,
-        .local => return ds4.models.fetch(self.gpa, self.io, self.transport, deadline, slot.local),
     }
 }
 
@@ -927,7 +874,7 @@ fn fetchToken(
             },
         },
         .google => |*auth| deadline.run(self.io, google.Auth.accessToken, .{ auth, copies }, null),
-        .absent, .local => unreachable,
+        .absent => unreachable,
     };
 }
 
@@ -950,7 +897,6 @@ test "the environment keys authenticate their accounts, and a login account come
     try std.testing.expect(!keys.registry.isAuthenticated(testing.anthropic_plan));
     try std.testing.expect(!keys.registry.isAuthenticated(testing.xai_api_key));
     try std.testing.expect(!keys.registry.isAuthenticated(testing.google_cloud_key));
-    try std.testing.expect(!keys.registry.isAuthenticated(testing.ds4));
     try std.testing.expectEqual(testing.anthropic_api_key, keys.registry.firstAuthenticated().?);
     try std.testing.expect(keys.registry.credential(testing.anthropic_api_key) != null);
     try std.testing.expect(keys.registry.credential(testing.openai_plan) == null);
@@ -1031,10 +977,11 @@ test "a client opens for an authenticated account and not for a signed-out one" 
     var timeouts = timeouts_default;
     timeouts.set(.xai, .{ .idle_ms = 4 });
     var rig: testing.Rig = undefined;
-    try rig.init(gpa, io, &.{ .home = home, .timeouts = timeouts, .variables = &.{
-        .{ "XAI_API_KEY", "xai-key" },
-        .{ "DS4_BASE_URL", "http://127.0.0.1:8000/v1/" },
-    } });
+    try rig.init(gpa, io, &.{
+        .home = home,
+        .timeouts = timeouts,
+        .variables = &.{.{ "XAI_API_KEY", "xai-key" }},
+    });
     defer rig.deinit();
 
     var client: Client = undefined;
@@ -1042,15 +989,6 @@ test "a client opens for an authenticated account and not for a signed-out one" 
     defer client.deinit();
     try expectRequestLine(&rig, &client, "POST https://api.x.ai/v1/responses\n");
     try std.testing.expectEqual(@as(u64, 4), rig.registry.timeoutsOf(testing.xai_api_key).idle_ms);
-
-    var local_client: Client = undefined;
-    try rig.registry.open(&local_client, testing.ds4);
-    defer local_client.deinit();
-    try expectRequestLine(&rig, &local_client, "POST http://127.0.0.1:8000/v1/responses\n");
-    try std.testing.expectEqual(
-        @as(u64, 3_600_000),
-        rig.registry.timeoutsOf(testing.ds4).connect_ms,
-    );
 
     var refused: Client = undefined;
     try std.testing.expectError(
@@ -1060,43 +998,6 @@ test "a client opens for an authenticated account and not for a signed-out one" 
             testing.openai_api_key,
         ),
     );
-}
-
-test "the DwarfStar account loads from DS4_BASE_URL and records a malformed URL" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var home_buffer: [128]u8 = undefined;
-    const home = try testing.tmpHome(&home_buffer, &tmp);
-
-    for ([_][]const u8{
-        "http://127.0.0.1:8000",
-        "http://127.0.0.1:8000/v1?x=1",
-        "http://127.0.0.1:8000/v1#frag",
-        "ftp://127.0.0.1:8000/v1",
-        "http:///v1",
-    }) |configured| {
-        var bad: testing.Rig = undefined;
-        try bad.init(gpa, io, &.{ .home = home, .variables = &.{.{ "DS4_BASE_URL", configured }} });
-        defer bad.deinit();
-        try std.testing.expect(!bad.registry.isAuthenticated(testing.ds4));
-        try std.testing.expectEqual(
-            @as(?LoadError, error.BadBaseUrl),
-            bad.registry.loadError(testing.ds4),
-        );
-    }
-    var ready: testing.Rig = undefined;
-    try ready.init(gpa, io, &.{
-        .home = home,
-        .variables = &.{.{ "DS4_BASE_URL", "http://127.0.0.1:8000/v1/" }},
-    });
-    defer ready.deinit();
-    try std.testing.expect(ready.registry.loadError(testing.ds4) == null);
-    var client: Client = undefined;
-    try ready.registry.open(&client, testing.ds4);
-    defer client.deinit();
-    try expectRequestLine(&ready, &client, "POST http://127.0.0.1:8000/v1/responses\n");
 }
 
 test "the key file account loads from the key file and records a failed load" {
@@ -1228,7 +1129,6 @@ test "logout and invalidation refuse the accounts without a store credential" {
         testing.openrouter_api_key,
         testing.deepseek_api_key,
         testing.google_cloud_key,
-        testing.ds4,
     }) |index| {
         try std.testing.expectError(error.AccountHasNoLogout, rig.registry.logout(index));
     }
@@ -1241,7 +1141,6 @@ test "logout and invalidation refuse the accounts without a store credential" {
         testing.openrouter_api_key,
         testing.deepseek_api_key,
         testing.google_cloud_key,
-        testing.ds4,
     }) |index| {
         try std.testing.expectError(
             error.AccountHasNoRefreshCredential,
@@ -1279,21 +1178,13 @@ test "invalidation forgets a rejected credential when store removal fails" {
     try std.testing.expect(!rig.registry.offersModel(testing.anthropic_plan));
 }
 
-test "a vendor with its own connect window notes it, and the others share the connect bound" {
+test "an Anthropic stream keeps the shared window, and every other stream waits five minutes" {
     const shared: providers.Transport.Timeouts = .{};
-    for (std.enums.values(Account.Vendor)) |vendor| {
-        const wait = waits.get(vendor);
-        try std.testing.expectEqual(
-            wait.connect_note == null,
-            wait.timeouts.connect_ms == shared.connect_ms,
-        );
-    }
     try std.testing.expectEqual(shared, timeouts_default.get(.anthropic));
     for ([_]Account.Vendor{ .openai, .xai, .openrouter, .deepseek, .google }) |vendor| {
+        try std.testing.expectEqual(shared.connect_ms, timeouts_default.get(vendor).connect_ms);
         try std.testing.expectEqual(@as(u64, 300_000), timeouts_default.get(vendor).idle_ms);
     }
-    try std.testing.expectEqual(@as(u64, 3_600_000), timeouts_default.get(.ds4).connect_ms);
-    try std.testing.expectEqual(@as(u64, 3_600_000), timeouts_default.get(.ds4).idle_ms);
 }
 
 test "the model list of a Responses account is the models sibling of its base" {
@@ -1390,8 +1281,11 @@ test "a failed cache write reports a failed save, not a failed fetch" {
     const io = clock.io();
     var rig: testing.Rig = undefined;
     try rig.init(gpa, io, &.{
-        .variables = &.{.{ "DS4_BASE_URL", "http://127.0.0.1:8000/v1" }},
-        .replies = &.{.{ .body = "{\"data\":[{\"id\":\"deepseek-v4-pro\"}]}" }},
+        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .replies = &.{
+            .{ .body = "{\"data\":[{\"id\":\"gpt-5.6-sol\"}]}" },
+            .{ .body = "{\"data\":[{\"id\":\"openai/gpt-5.6-sol\",\"context_length\":1050000}]}" },
+        },
         .timeouts = .initFill(.{ .connect_ms = 0, .idle_ms = 0 }),
     });
     defer rig.deinit();
@@ -1401,9 +1295,9 @@ test "a failed cache write reports a failed save, not a failed fetch" {
     defer held.close(io);
     try rig.registry.start();
 
-    try rig.registry.send(&.{ .fetch = testing.ds4 });
-    try rig.recorder.expect("fetch_ended:ds4:1:save:StoreBusy");
-    try std.testing.expect(rig.registry.offersModel(testing.ds4));
+    try rig.registry.send(&.{ .fetch = testing.openai_api_key });
+    try rig.recorder.expect("fetch_ended:openai-api-key:1:save:StoreBusy");
+    try std.testing.expect(rig.registry.offersModel(testing.openai_api_key));
 }
 
 test "an expired window ends both parts of a fetch without a request" {
@@ -1495,72 +1389,6 @@ test "an OpenRouter fetch runs no list request and reports a failed body as the 
     try std.testing.expectEqual(@as(usize, 2), rig.transport.requests.items.len);
 }
 
-test "a DwarfStar fetch skips public metadata and keeps no list after a refusal" {
-    var rig: testing.Rig = undefined;
-    try rig.init(std.testing.allocator, std.testing.io, &.{
-        .variables = &.{
-            .{ "DS4_BASE_URL", "http://127.0.0.1:8000/v1" },
-        },
-        .replies = &.{
-            .{ .fail = error.ConnectionRefused },
-            .{ .body = "{\"data\":[{\"id\":\"deepseek-v4-pro\",\"name\":\"DeepSeek V4 Flash\"}]}" },
-        },
-    });
-    defer rig.deinit();
-    try rig.registry.start();
-
-    try rig.registry.send(&.{ .fetch = testing.ds4 });
-    try rig.recorder.expect("fetch_ended:ds4:0:ConnectionRefused");
-    try std.testing.expect(!rig.registry.offersModel(testing.ds4));
-    try rig.registry.send(&.{ .fetch = testing.ds4 });
-    try rig.recorder.expect("fetch_ended:ds4:1");
-    try std.testing.expectEqual(@as(usize, 2), rig.transport.requests.items.len);
-    var listed: std.ArrayList(Model) = .empty;
-    defer listed.deinit(std.testing.allocator);
-    try rig.registry.listModels(testing.ds4, &listed, std.testing.allocator);
-    try std.testing.expectEqualStrings("DeepSeek V4 Flash", listed.items[0].engineName());
-}
-
-test "startup drops a DwarfStar list that another URL stored" {
-    const gpa = std.testing.allocator;
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var home_buffer: [128]u8 = undefined;
-    const home = try testing.tmpHome(&home_buffer, &tmp);
-
-    var model = Model.init("deepseek-v4-pro") catch unreachable;
-    model.thinking = .supported;
-    model.tools = .supported;
-
-    var written: testing.Rig = undefined;
-    try written.init(gpa, io, &.{
-        .home = home,
-        .variables = &.{.{ "DS4_BASE_URL", "http://127.0.0.1:8000/v1" }},
-    });
-    try written.registry.catalog.setAccount(testing.ds4, &.{
-        .models = &.{model},
-        .base_url = "http://127.0.0.1:8000/v1",
-    });
-    written.deinit();
-
-    var same: testing.Rig = undefined;
-    try same.init(gpa, io, &.{
-        .home = home,
-        .variables = &.{.{ "DS4_BASE_URL", "http://127.0.0.1:8000/v1" }},
-    });
-    defer same.deinit();
-    try std.testing.expect(same.registry.offersModel(testing.ds4));
-
-    var other: testing.Rig = undefined;
-    try other.init(gpa, io, &.{
-        .home = home,
-        .variables = &.{.{ "DS4_BASE_URL", "http://127.0.0.1:9000/v1" }},
-    });
-    defer other.deinit();
-    try std.testing.expect(!other.registry.offersModel(testing.ds4));
-}
-
 test "a command without its account or its sign-in is refused" {
     var rig: testing.Rig = undefined;
     try rig.init(std.testing.allocator, std.testing.io, &.{
@@ -1582,22 +1410,22 @@ test "a fetch runs as a child task that a cancel ends, and a command meanwhile i
     var stall: providers.testing.FakeTransport.Stall = .{ .io = std.testing.io };
     var rig: testing.Rig = undefined;
     try rig.init(std.testing.allocator, std.testing.io, &.{
-        .variables = &.{.{ "DS4_BASE_URL", "http://127.0.0.1:8000/v1" }},
+        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
         .replies = &.{.{ .stall = &stall }},
     });
     defer rig.deinit();
     try rig.registry.start();
 
-    try rig.registry.send(&.{ .fetch = testing.ds4 });
+    try rig.registry.send(&.{ .fetch = testing.openai_api_key });
     try stall.reached.wait(std.testing.io);
     try rig.registry.send(&.{ .login = testing.anthropic_plan });
     try rig.recorder.expect("refused:anthropic-plan:login:busy");
-    try rig.registry.send(&.{ .fetch = testing.ds4 });
-    try rig.recorder.expect("refused:ds4:fetch:busy");
+    try rig.registry.send(&.{ .fetch = testing.openai_api_key });
+    try rig.recorder.expect("refused:openai-api-key:fetch:busy");
     try rig.registry.send(&.cancel);
-    try rig.recorder.expect("fetch_ended:ds4:0:Canceled");
+    try rig.recorder.expect("fetch_ended:openai-api-key:0:Canceled");
     try std.testing.expect(stall.canceled);
-    try std.testing.expect(!rig.registry.offersModel(testing.ds4));
+    try std.testing.expect(!rig.registry.offersModel(testing.openai_api_key));
 }
 
 test "a worker task that cannot start ends its fetch or its sign-in with the failure" {
@@ -1606,17 +1434,17 @@ test "a worker task that cannot start ends its fetch or its sign-in with the fai
     defer threaded.deinit();
     var rig: testing.Rig = undefined;
     try rig.init(gpa, threaded.io(), &.{
-        .variables = &.{.{ "DS4_BASE_URL", "http://127.0.0.1:1/v1" }},
+        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
     });
     defer rig.deinit();
     try rig.registry.start();
 
-    try rig.registry.send(&.{ .fetch = testing.ds4 });
-    try rig.recorder.expect("fetch_ended:ds4:0:ConcurrencyUnavailable");
+    try rig.registry.send(&.{ .fetch = testing.openai_api_key });
+    try rig.recorder.expect("fetch_ended:openai-api-key:0:ConcurrencyUnavailable");
     try rig.registry.send(&.{ .login = testing.anthropic_plan });
     try rig.recorder.expect("login_ended:anthropic-plan:failed:ConcurrencyUnavailable");
-    try rig.registry.send(&.{ .fetch = testing.ds4 });
-    try rig.recorder.expect("fetch_ended:ds4:0:ConcurrencyUnavailable");
+    try rig.registry.send(&.{ .fetch = testing.openai_api_key });
+    try rig.recorder.expect("fetch_ended:openai-api-key:0:ConcurrencyUnavailable");
 }
 
 const token_body = "{\"access_token\":\"at\",\"refresh_token\":\"rt\",\"expires_in\":3600}";

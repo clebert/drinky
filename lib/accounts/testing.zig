@@ -23,7 +23,6 @@ pub const openrouter_api = Account.index("openrouter-api").?;
 pub const openrouter_api_key = Account.index("openrouter-api-key").?;
 pub const deepseek_api_key = Account.index("deepseek-api-key").?;
 pub const google_cloud_key = Account.index("google-cloud-key").?;
-pub const ds4 = Account.index("ds4").?;
 
 const Recorder = core.testing.Recorder(Registry.Event, render);
 
@@ -198,7 +197,7 @@ pub const Rig = struct {
             models[index].addEffort(.low);
             models[index].addEffort(.high);
         }
-        try self.registry.catalog.setAccount(account, &.{ .models = models[0..names.len] });
+        try self.registry.catalog.setAccount(account, models[0..names.len]);
     }
 };
 

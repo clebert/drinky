@@ -14,7 +14,7 @@ pub const VTable = struct {
         ptr: *anyopaque,
         arena: std.mem.Allocator,
         request: *const core.Provider.Request,
-        maybe_token: ?[]const u8,
+        token: []const u8,
     ) Error!Transport.Request,
     failure: *const fn (
         ptr: *anyopaque,
@@ -40,7 +40,7 @@ pub const VTable = struct {
     ) error{OutOfMemory}!void,
 };
 
-pub const Error = error{ OutOfMemory, OrphanToolResult, MissingCredential };
+pub const Error = error{ OutOfMemory, OrphanToolResult };
 
 pub const Events = std.ArrayList(core.Provider.Event);
 
@@ -146,9 +146,9 @@ pub fn prepare(
     self: Dialect,
     arena: std.mem.Allocator,
     request: *const core.Provider.Request,
-    maybe_token: ?[]const u8,
+    token: []const u8,
 ) Error!Transport.Request {
-    return self.vtable.prepare(self.ptr, arena, request, maybe_token);
+    return self.vtable.prepare(self.ptr, arena, request, token);
 }
 
 pub fn failure(

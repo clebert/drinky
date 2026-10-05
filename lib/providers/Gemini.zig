@@ -137,10 +137,9 @@ fn prepare(
     ptr: *anyopaque,
     arena: std.mem.Allocator,
     request: *const core.Provider.Request,
-    maybe_token: ?[]const u8,
+    token: []const u8,
 ) Dialect.Error!Transport.Request {
     const self: *Gemini = @ptrCast(@alignCast(ptr));
-    const token = maybe_token orelse return error.MissingCredential;
     self.call_number_max = callNumberMax(request.items);
     return .{
         .url = try url(arena, &self.options, request.model),
@@ -656,10 +655,6 @@ test "prepare builds the URL of the model and sends the bearer token" {
         global,
     );
     try std.testing.expectEqualStrings("aiplatform.us.rep.googleapis.com", Location.us.host());
-    try std.testing.expectError(
-        error.MissingCredential,
-        multi_region.dialect().prepare(arena.allocator(), &request, null),
-    );
 }
 
 test "text deltas stream as they arrive and close as one message at the end" {

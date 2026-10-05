@@ -144,26 +144,23 @@ fn attempt(self: *Provider, request: *const core.Provider.Request) core.Provider
         try self.credentialFailed(err);
         return .failed;
     };
-    if (maybe_token) |token| if (!Transport.validHeaderValue(token)) {
+    const token = maybe_token orelse {
+        try self.fail(.{ .reason = .unauthorized, .message = "The account has no credential." });
+        return .failed;
+    };
+    if (!Transport.validHeaderValue(token)) {
         try self.fail(.{
             .reason = .unauthorized,
             .message = "The credential cannot be a header value.",
         });
         return .failed;
-    };
-    var prepared = self.dialect.prepare(arena, request, maybe_token) catch |err| switch (err) {
+    }
+    var prepared = self.dialect.prepare(arena, request, token) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.OrphanToolResult => {
             try self.fail(.{
                 .reason = .invalid_request,
                 .message = "The conversation holds a tool result without its call.",
-            });
-            return .failed;
-        },
-        error.MissingCredential => {
-            try self.fail(.{
-                .reason = .unauthorized,
-                .message = "The account has no credential.",
             });
             return .failed;
         },
@@ -631,19 +628,6 @@ test "a read whose task cannot start fails the stream with the name of that fail
     );
 }
 
-test "an account without a credential sends no Authorization header" {
-    var rig: Rig = undefined;
-    rig.init(std.testing.io, &.{
-        .replies = &.{.{ .body = "data: [DONE]\n" }},
-        .tokens = &.{null},
-    });
-    defer rig.deinit();
-    try rig.expectTrace("");
-    try std.testing.expect(
-        std.mem.indexOf(u8, rig.transport.requests.items[0], "authorization:") == null,
-    );
-}
-
 test "a credential that cannot be a header value or that fails never reaches the wire" {
     var split: Rig = undefined;
     split.init(std.testing.io, &.{
@@ -685,25 +669,18 @@ test "a provider serves one request after another" {
     try std.testing.expectEqual(@as(usize, 3), rig.transport.requests.items.len);
 }
 
+test "an account without a token fails before it opens the transport" {
+    var rig: Rig = undefined;
+    rig.init(std.testing.io, &.{ .replies = &.{.{ .body = complete_body }}, .tokens = &.{null} });
+    defer rig.deinit();
+    try rig.expectTrace("failed:unauthorized|-|The account has no credential.\n");
+    try std.testing.expectEqual(@as(usize, 0), rig.transport.requests.items.len);
+}
+
 test "a request the dialect cannot build fails before it opens the transport" {
     const gpa = std.testing.allocator;
-    var messages: Messages = .init(gpa, .{ .account = "anthropic-api-key", .identity = .api_key });
-    defer messages.deinit();
     var transport: testing.FakeTransport = .{ .gpa = gpa };
     defer transport.deinit();
-    var provider_under_test: Provider = .init(gpa, std.testing.io, &.{
-        .dialect = messages.dialect(),
-        .transport = transport.transport(),
-        .credential = Credential.none,
-    });
-    defer provider_under_test.deinit();
-    const actual = try testing.trace(gpa, provider_under_test.provider(), &testing.empty_request);
-    defer gpa.free(actual);
-    try std.testing.expectEqualStrings(
-        "failed:unauthorized|-|The account has no credential.\n",
-        actual,
-    );
-    try std.testing.expectEqual(@as(usize, 0), transport.requests.items.len);
 
     var gemini: Gemini = .init(gpa, .{
         .account = "google-cloud-key",
@@ -818,10 +795,11 @@ fn expectCanceledRead(hold: Hold, timeouts: Transport.Timeouts) !void {
     var http: Http = .init(gpa, io);
     defer http.deinit();
     var opened: OpenedTransport = .{ .io = io, .inner = http.transport() };
+    var credential: testing.FakeCredential = .{ .tokens = &.{"token"} };
     var provider_under_test: Provider = .init(gpa, io, &.{
         .dialect = responses.dialect(),
         .transport = opened.transport(),
-        .credential = Credential.none,
+        .credential = credential.credential(),
         .timeouts = timeouts,
     });
     defer provider_under_test.deinit();

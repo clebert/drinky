@@ -18,7 +18,6 @@ pub const Vendor = enum {
     openrouter,
     deepseek,
     google,
-    ds4,
 
     pub fn label(self: Vendor) []const u8 {
         return switch (self) {
@@ -28,7 +27,6 @@ pub const Vendor = enum {
             .openrouter => "OpenRouter",
             .deepseek => "DeepSeek",
             .google => "Google",
-            .ds4 => "DwarfStar",
         };
     }
 };
@@ -39,19 +37,13 @@ const Dialect = union(enum) {
     gemini,
 
     const Responses = struct {
-        base: Base,
+        base_url: []const u8,
         codex: bool = false,
         switches: providers.Responses.Switches = .{},
-
-        const Base = union(enum) {
-            url: []const u8,
-            environment: []const u8,
-        };
     };
 };
 
 const Credential = union(enum) {
-    none,
     environment: []const u8,
     store: Login,
     key_file,
@@ -59,7 +51,7 @@ const Credential = union(enum) {
 
 pub const Login = enum { claude, console, chatgpt, grok, openrouter };
 
-const ModelSource = enum { messages, codex, responses, gemini, public, local };
+const ModelSource = enum { messages, codex, responses, gemini, public };
 
 const Usage = union(enum) {
     none,
@@ -104,7 +96,7 @@ pub const table = [_]Account{
         .id = "openai-plan",
         .vendor = .openai,
         .dialect = .{ .responses = .{
-            .base = .{ .url = "https://chatgpt.com/backend-api/codex" },
+            .base_url = "https://chatgpt.com/backend-api/codex",
             .codex = true,
         } },
         .credential = .{ .store = .chatgpt },
@@ -114,7 +106,7 @@ pub const table = [_]Account{
     .{
         .id = "openai-api-key",
         .vendor = .openai,
-        .dialect = .{ .responses = .{ .base = .{ .url = "https://api.openai.com/v1" } } },
+        .dialect = .{ .responses = .{ .base_url = "https://api.openai.com/v1" } },
         .credential = .{ .environment = "OPENAI_API_KEY" },
         .model_source = .responses,
         .usage = .none,
@@ -122,7 +114,7 @@ pub const table = [_]Account{
     .{
         .id = "xai-plan",
         .vendor = .xai,
-        .dialect = .{ .responses = .{ .base = .{ .url = "https://api.x.ai/v1" } } },
+        .dialect = .{ .responses = .{ .base_url = "https://api.x.ai/v1" } },
         .credential = .{ .store = .grok },
         .model_source = .responses,
         .usage = .{ .xai_billing = xai_billing_url },
@@ -130,7 +122,7 @@ pub const table = [_]Account{
     .{
         .id = "xai-api-key",
         .vendor = .xai,
-        .dialect = .{ .responses = .{ .base = .{ .url = "https://api.x.ai/v1" } } },
+        .dialect = .{ .responses = .{ .base_url = "https://api.x.ai/v1" } },
         .credential = .{ .environment = "XAI_API_KEY" },
         .model_source = .responses,
         .usage = .none,
@@ -139,7 +131,7 @@ pub const table = [_]Account{
         .id = "openrouter-api",
         .vendor = .openrouter,
         .dialect = .{ .responses = .{
-            .base = .{ .url = "https://openrouter.ai/api/v1" },
+            .base_url = "https://openrouter.ai/api/v1",
             .switches = .{ .plain_reasoning = true, .require_parameters = true },
         } },
         .credential = .{ .store = .openrouter },
@@ -150,7 +142,7 @@ pub const table = [_]Account{
         .id = "openrouter-api-key",
         .vendor = .openrouter,
         .dialect = .{ .responses = .{
-            .base = .{ .url = "https://openrouter.ai/api/v1" },
+            .base_url = "https://openrouter.ai/api/v1",
             .switches = .{ .plain_reasoning = true, .require_parameters = true },
         } },
         .credential = .{ .environment = "OPENROUTER_API_KEY" },
@@ -161,7 +153,7 @@ pub const table = [_]Account{
         .id = "deepseek-api-key",
         .vendor = .deepseek,
         .dialect = .{ .responses = .{
-            .base = .{ .url = "https://api.deepseek.com/v1" },
+            .base_url = "https://api.deepseek.com/v1",
             .switches = .{ .plain_reasoning = true },
         } },
         .credential = .{ .environment = "DEEPSEEK_API_KEY" },
@@ -176,31 +168,13 @@ pub const table = [_]Account{
         .model_source = .gemini,
         .usage = .none,
     },
-    .{
-        .id = "ds4",
-        .vendor = .ds4,
-        .dialect = .{ .responses = .{
-            .base = .{ .environment = "DS4_BASE_URL" },
-            .switches = .{ .plain_reasoning = true, .empty_reasoning = true },
-        } },
-        .credential = .none,
-        .model_source = .local,
-        .usage = .none,
-    },
 };
 
 comptime {
     for (&table) |*row| {
-        const base_environment = switch (row.dialect) {
-            .responses => |responses| responses.base == .environment,
-            .messages, .gemini => false,
-        };
-        if ((row.credential == .none) != base_environment) {
-            @compileError("A row without a credential must name a base URL variable.");
-        }
         const login: ?Login = switch (row.credential) {
             .store => |flow| flow,
-            .none, .environment, .key_file => null,
+            .environment, .key_file => null,
         };
         const fetchable = switch (row.model_source) {
             .messages => row.dialect == .messages and
@@ -209,7 +183,6 @@ comptime {
             .responses => row.credential == .environment or login == .grok,
             .gemini => row.credential == .key_file,
             .public => true,
-            .local => row.credential == .none,
         };
         if (!fetchable) {
             @compileError("The model source of a row must match its dialect and its credential.");
@@ -239,13 +212,6 @@ pub fn setting(self: *const Account) ?[]const u8 {
     return switch (self.credential) {
         .environment => |name| name,
         .key_file => key_file_setting,
-        .none => switch (self.dialect) {
-            .responses => |responses| switch (responses.base) {
-                .environment => |name| name,
-                .url => unreachable,
-            },
-            .messages, .gemini => unreachable,
-        },
         .store => null,
     };
 }
@@ -257,15 +223,10 @@ test "an account identifier starts with its vendor and ends in -key without a lo
         try std.testing.expect(std.mem.indexOfAny(u8, account.id, "_/") == null);
         try std.testing.expectEqual(position, index(account.id).?);
         try std.testing.expectEqual(!account.hasLogin(), account.setting() != null);
-        if (account.vendor == .ds4) {
-            try std.testing.expectEqualStrings(prefix, account.id);
-            continue;
-        }
         try std.testing.expectEqual(account.id[prefix.len], '-');
         try std.testing.expectEqual(!account.hasLogin(), std.mem.endsWith(u8, account.id, "-key"));
     }
-    try std.testing.expectEqual(@as(usize, 12), table.len);
-    try std.testing.expectEqualStrings("ds4", table[table.len - 1].id);
+    try std.testing.expectEqual(@as(usize, 11), table.len);
     try std.testing.expect(index("anthropic_plan") == null);
     try std.testing.expect(index("anthropic-plan/claude-fable-5-1") == null);
     try std.testing.expect(index("") == null);
@@ -279,7 +240,6 @@ test "an account names the setting that the login picker shows" {
         .{ "openrouter-api-key", "OPENROUTER_API_KEY" },
         .{ "deepseek-api-key", "DEEPSEEK_API_KEY" },
         .{ "google-cloud-key", key_file_setting },
-        .{ "ds4", "DS4_BASE_URL" },
     };
     for (cases) |case| {
         try std.testing.expectEqualStrings(case[1], table[index(case[0]).?].setting().?);
@@ -287,19 +247,18 @@ test "an account names the setting that the login picker shows" {
     try std.testing.expect(table[index("anthropic-api").?].setting() == null);
 }
 
-test "only OpenRouter, DeepSeek, and DwarfStar replay plain reasoning, and DwarfStar alone empty" {
+test "only OpenRouter and DeepSeek replay plain reasoning" {
     for (&table) |*account| {
         const options = switch (account.dialect) {
             .responses => |responses| responses,
             .messages, .gemini => continue,
         };
         const plain = switch (account.vendor) {
-            .openrouter, .deepseek, .ds4 => true,
+            .openrouter, .deepseek => true,
             .anthropic, .openai, .xai, .google => false,
         };
         const switches = options.switches;
         try std.testing.expectEqual(plain, switches.plain_reasoning);
-        try std.testing.expectEqual(account.vendor == .ds4, switches.empty_reasoning);
         try std.testing.expectEqual(account.vendor == .openrouter, switches.require_parameters);
         try std.testing.expectEqual(std.mem.eql(u8, account.id, "openai-plan"), options.codex);
     }
@@ -313,7 +272,7 @@ test "a usage source belongs to the plan and the pool accounts alone" {
             .openrouter_credits
         else if (account.vendor == .deepseek)
             .deepseek_balance
-        else if (account.vendor == .ds4 or !account.hasLogin())
+        else if (!account.hasLogin())
             .none
         else if (account.credential.store == .console)
             .none

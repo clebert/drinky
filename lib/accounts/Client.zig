@@ -28,7 +28,6 @@ pub const Options = struct {
     account: *const Account,
     credential: providers.Credential,
     timeouts: providers.Transport.Timeouts = .{},
-    base_url: []const u8 = "",
     codex_account_id: []const u8 = "",
     project: []const u8 = "",
     location: providers.Gemini.Location = .global,
@@ -74,11 +73,7 @@ pub fn init(
     errdefer gpa.free(self.codex_account_id);
     switch (account.dialect) {
         .responses => |responses| {
-            const base = switch (responses.base) {
-                .url => |url| url,
-                .environment => options.base_url,
-            };
-            self.endpoint = try std.fmt.allocPrint(gpa, "{s}/responses", .{base});
+            self.endpoint = try std.fmt.allocPrint(gpa, "{s}/responses", .{responses.base_url});
             if (responses.codex) {
                 self.codex_account_id = try gpa.dupe(u8, options.codex_account_id);
             }
@@ -343,35 +338,6 @@ test "a client without a usage source passes the stream through" {
         transport.requests.items[0],
         "authorization: Bearer sk-openai\n",
     ) != null);
-}
-
-test "a DwarfStar client posts to the responses path of the base URL of the environment" {
-    const gpa = std.testing.allocator;
-    var transport: providers.testing.FakeTransport = .{
-        .gpa = gpa,
-        .replies = &.{.{ .body = "data: [DONE]\n\n" }},
-    };
-    defer transport.deinit();
-    var client: Client = undefined;
-    try client.init(gpa, std.testing.io, &.{
-        .account = &Account.table[testing.ds4],
-        .credential = providers.Credential.none,
-        .base_url = "http://127.0.0.1:8000/v1",
-        .transport = transport.transport(),
-    });
-    defer client.deinit();
-
-    const actual = try traceReply(gpa, &client);
-    defer gpa.free(actual);
-    try std.testing.expectEqualStrings("", actual);
-    try std.testing.expect(std.mem.startsWith(
-        u8,
-        transport.requests.items[0],
-        "POST http://127.0.0.1:8000/v1/responses\n",
-    ));
-    try std.testing.expect(
-        std.mem.indexOf(u8, transport.requests.items[0], "authorization:") == null,
-    );
 }
 
 test "a Codex client names the account in its header and a Gemini client its project" {

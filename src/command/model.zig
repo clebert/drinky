@@ -18,8 +18,6 @@ const lead_rows = 1;
 
 const extra_output_limit = "The output limit is unknown.";
 
-const extra_engine = "Weights: {s}";
-
 const vendors_max = std.enums.values(accounts.Account.Vendor).len;
 const rows_max = accounts.Account.table.len;
 
@@ -340,8 +338,6 @@ fn row(
 ) !void {
     if (model.outputLimitUnknown(account))
         return options.addExtra(true, model.name(), extra_output_limit, .{});
-    if (model.engineName().len != 0)
-        return options.addExtra(false, model.name(), extra_engine, .{model.engineName()});
     return options.print("{s}", .{model.name()});
 }
 
@@ -661,22 +657,12 @@ test "a model row switches to the chosen account and model, and a repeat is a no
     try std.testing.expectEqualStrings("gpt-5.6-sol", rig.choice.model.?.name());
 }
 
-test "a model row marks an output limit that no source states and names the engine" {
+test "a model row marks an output limit that no source states" {
     const gpa = std.testing.allocator;
     var rig: testing.Rig = undefined;
-    try rig.init(&.{ .variables = &.{
-        .{ "ANTHROPIC_API_KEY", "sk-ant" },
-        .{ "DS4_BASE_URL", "http://127.0.0.1:8000/v1" },
-    } });
+    try rig.init(&.{ .variables = &.{.{ "ANTHROPIC_API_KEY", "sk-ant" }} });
     defer rig.deinit();
     try rig.account_rig.seed(accounts.testing.anthropic_api_key, &.{"claude-sonnet-4-6"});
-    var engine = try accounts.Model.init("deepseek-v4-flash");
-    engine.thinking = .supported;
-    try engine.setEngine("DeepSeek V4 Flash");
-    try rig.registry().catalog.setAccount(accounts.testing.ds4, &.{
-        .models = &.{engine},
-        .base_url = "http://127.0.0.1:8000/v1",
-    });
     var context = rig.context();
 
     const anthropic_models = try forAccount(&context, accounts.testing.anthropic_api_key);
@@ -684,13 +670,6 @@ test "a model row marks an output limit that no source states and names the engi
     try std.testing.expectEqualStrings("claude-sonnet-4-6", anthropic_models.options[1].name);
     try std.testing.expectEqualStrings(extra_output_limit, anthropic_models.options[1].extra.?);
     try std.testing.expect(anthropic_models.options[1].extra_pressure);
-
-    const local_models = try forAccount(&context, accounts.testing.ds4);
-    defer local_models.deinit(gpa);
-    try std.testing.expectEqualStrings("deepseek-v4-flash", local_models.options[1].name);
-    const engine_row = local_models.options[1];
-    try std.testing.expectEqualStrings("Weights: DeepSeek V4 Flash", engine_row.extra.?);
-    try std.testing.expect(!local_models.options[1].extra_pressure);
 }
 
 test "an OpenRouter account opens the author step then the models of that author" {

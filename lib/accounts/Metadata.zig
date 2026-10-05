@@ -88,7 +88,7 @@ pub fn lookup(self: *const Metadata, vendor: Account.Vendor, name: []const u8) ?
     }
     return switch (vendor) {
         .deepseek => self.newestDeepseekSpelling(wanted),
-        .anthropic, .openai, .xai, .openrouter, .google, .ds4 => null,
+        .anthropic, .openai, .xai, .openrouter, .google => null,
     };
 }
 
@@ -144,7 +144,7 @@ fn vendorAuthor(vendor: Account.Vendor) ?[]const u8 {
         .xai => "x-ai",
         .google => "google",
         .deepseek => "deepseek",
-        .openrouter, .ds4 => null,
+        .openrouter => null,
     };
 }
 

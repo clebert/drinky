@@ -11,7 +11,6 @@ in the working directory. Drinky talks to:
 - OpenRouter
 - DeepSeek
 - Gemini Enterprise Agent Platform (Vertex AI)
-- [DwarfStar](https://github.com/antirez/ds4) (local)
 
 Drinky is a single Zig program. It needs no Node.js runtime or third-party package tree, so a
 complete review covers Drinky and the Zig standard library. Use Drinky as it is, or fork it and add
@@ -46,7 +45,7 @@ zig build -Doptimize=ReleaseSafe
 
 An account reads `vendor-product`, and a model under it reads `account/model`, as in
 `anthropic-plan/claude-opus-4-8`. A `-key` suffix marks a credential that an environment variable
-holds or names. The local `ds4` account is the exception: it has no product and no credential.
+holds or names.
 
 | Account              | Credential                                                   |
 | -------------------- | ------------------------------------------------------------ |
@@ -61,16 +60,15 @@ holds or names. The local `ds4` account is the exception: it has no product and 
 | `openrouter-api-key` | `OPENROUTER_API_KEY`                                         |
 | `deepseek-api-key`   | `DEEPSEEK_API_KEY`                                           |
 | `google-cloud-key`   | `GOOGLE_APPLICATION_CREDENTIALS` and `GOOGLE_CLOUD_LOCATION` |
-| `ds4`                | none                                                         |
 
 Run `/login` to sign in with an account that has no `-key` suffix. A successful sign-in opens its
 model or author list. The first row fetches or refreshes that list. Drinky puts the cursor on the
 remembered model or OpenRouter author when that row is available. Only an active model appears as
 current. Set the variable of a `-key` account by hand. For `google-cloud-key`, set the Agent
 Platform service account key file in `GOOGLE_APPLICATION_CREDENTIALS`. Set `GOOGLE_CLOUD_LOCATION`
-to `eu`, `us`, or `global`. For `ds4`, set `DS4_BASE_URL` to the local base URL, ending at `/v1`.
+to `eu`, `us`, or `global`.
 
-Drinky is not affiliated with Anthropic, OpenAI, xAI, OpenRouter, DeepSeek, Google, or DwarfStar.
+Drinky is not affiliated with Anthropic, OpenAI, xAI, OpenRouter, DeepSeek, or Google.
 
 ## Cost display
 
