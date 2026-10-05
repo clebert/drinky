@@ -21,14 +21,12 @@ the features your workflow needs.
 
 1. **Terminal-native:** The conversation stays in the normal scrollback. A session is the process,
    and Drinky saves no conversation to resume.
-2. **Telegram remote control:** Attach a bot and drive the session from its chat, while the terminal
-   shows the work.
-3. **One job:** An agent loop and a small set of tools, with no sub-agents and no workflow mode.
-4. **Small system prompt:** The compiled prompt states the mechanics. Your instruction files and
+2. **One job:** An agent loop and a small set of tools, with no sub-agents and no workflow mode.
+3. **Small system prompt:** The compiled prompt states the mechanics. Your instruction files and
    skills carry every rule about how to work.
-5. **Self-describing:** The model can read every command, config key, and key binding of Drinky, so
+4. **Self-describing:** The model can read every command, config key, and key binding of Drinky, so
    it can maintain your config file for you.
-6. **No compiled-in models:** Every model comes from the provider at runtime, and every limit and
+5. **No compiled-in models:** Every model comes from the provider at runtime, and every limit and
    price from the provider or the public metadata.
 
 ## Build and run
@@ -90,22 +88,6 @@ provider states.
 A line that starts with a slash runs in Drinky and reaches no model. Type `/` or `/help` to open the
 complete command list. Drinky refuses an unknown command, an unknown skill, and a command with an
 argument. A second Enter then sends the refused line to the model as a message.
-
-## Telegram remote control
-
-Create a bot with BotFather, run `/remote`, and paste the token. Drinky shows a pairing code, and
-the private chat that sends it binds to the bot. A saved bot attaches with one pick.
-
-While a bot is attached, the chat holds the input and the terminal shows the work. A message from
-the chat runs as a prompt, and a message during a turn gets a refusal. The chat mirrors every answer
-and event, and one message per turn shows the state and holds a `Cancel turn` button. `/new` runs
-from the chat, and the other commands run in the terminal alone. Every exit key in the terminal
-detaches the bot.
-
-> On macOS, run `caffeinate -is` so the Mac stays awake.
-
-The bot tokens live in the owner-only `~/.drinky/remote.json`, and Drinky talks to the Telegram Bot
-API directly.
 
 ## Herdr
 

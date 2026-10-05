@@ -7,14 +7,12 @@ const tools = @import("tools");
 
 const discovery = @import("discovery/root.zig");
 const layout = @import("layout.zig");
-const remote = @import("remote/root.zig");
 const testing = @import("testing.zig");
 const ui = @import("ui/root.zig");
 
 const Config = @This();
 
 path: []const u8,
-connect_timeout_ms: u64 = transport_timeouts_default.connect_ms,
 timeouts: accounts.Registry.Timeouts = accounts.Registry.timeouts_default,
 retry: core.Retry = .{},
 bash: tools.Context.Bash = .{},
@@ -196,12 +194,8 @@ const keys = [_]Key{
     },
     .{
         .path = "request.connect_timeout_ms",
-        .description = std.fmt.comptimePrint(
-            "The time that Drinky waits for the head of a remote provider reply. One " ++
-                "window of this size also bounds a remote model fetch and each Telegram " ++
-                "request. A Telegram poll waits at least {d} seconds.",
-            .{@divExact(remote.Client.poll_connect_ms_min, std.time.ms_per_s)},
-        ),
+        .description = "The time that Drinky waits for the head of a remote provider reply. " ++
+            "One window of this size also bounds a remote model fetch.",
     },
     .{
         .path = "request.attempts_max",
@@ -613,7 +607,6 @@ fn loadFromData(gpa: std.mem.Allocator, io: std.Io, options: *const DataOptions)
     const required_skills = try required.toOwnedSlice(gpa);
     return .{
         .path = owned_path,
-        .connect_timeout_ms = request.connect_timeout_ms,
         .timeouts = timeoutsOf(&request),
         .retry = .{
             .attempts_max = request.attempts_max,
@@ -789,7 +782,6 @@ test "load reads the request section" {
         \\  "delay_ms_initial": 100, "delay_ms_max": 900 } }
     );
     defer config.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u64, 1000), config.connect_timeout_ms);
     try std.testing.expectEqual(@as(u64, 1000), config.timeouts.get(.anthropic).connect_ms);
     try std.testing.expectEqual(@as(u64, 1000), config.timeouts.get(.openai).connect_ms);
     try std.testing.expectEqual(@as(u64, 1000), config.timeouts.get(.xai).connect_ms);

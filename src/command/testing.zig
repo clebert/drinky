@@ -15,13 +15,11 @@ pub const Rig = struct {
     choice: Choice,
     remembered: [accounts.Account.table.len]?[]const u8,
     skill_registry: *const discovery.skills.Registry,
-    remote_bots: []const []const u8,
 
     const Options = struct {
         variables: []const [2][]const u8 = &.{},
         store: ?[]const u8 = null,
         skill_registry: *const discovery.skills.Registry = &no_skills,
-        remote_bots: []const []const u8 = &.{},
     };
 
     pub fn init(self: *Rig, options: *const Options) !void {
@@ -32,7 +30,6 @@ pub const Rig = struct {
         self.choice = .{ .effort = .high };
         self.remembered = @splat(null);
         self.skill_registry = options.skill_registry;
-        self.remote_bots = options.remote_bots;
     }
 
     pub fn deinit(self: *Rig) void {
@@ -51,7 +48,6 @@ pub const Rig = struct {
             .account_registry = &self.account_rig.registry,
             .remembered_model_names = &self.remembered,
             .skill_registry = self.skill_registry,
-            .remote_bots = self.remote_bots,
             .system_prompt = "",
             .sources_page = "",
         };
@@ -189,14 +185,6 @@ fn release(outcome: *const Context.Outcome) void {
         .pick => |*pick| pick.deinit(gpa),
         .prompt => |*prompt| prompt.deinit(gpa),
         .editor_text => |text| gpa.free(text),
-        .page,
-        .login,
-        .logout,
-        .fetch,
-        .new_conversation,
-        .remote_attach,
-        .remote_add,
-        .remote_remove,
-        => {},
+        .page, .login, .logout, .fetch, .new_conversation => {},
     }
 }

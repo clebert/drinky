@@ -39,7 +39,6 @@ choice: Choice,
 directory_shown: []const u8,
 branch_buffer: [project.head_bytes_max]u8,
 branch_length: usize,
-pending_events: std.ArrayList(PendingEvent),
 bash_timeout_ms: u64,
 window_pages: usize,
 gauge: ui.status.Gauge,
@@ -91,7 +90,6 @@ const Turn = struct {
     start: usize,
     committed: usize,
     blocks: std.ArrayList(Block),
-    call_count: usize,
     served_buffer: [accounts.Model.name_bytes_max]u8,
     served_length: usize,
     activity_tick: u64,
@@ -106,7 +104,6 @@ const Turn = struct {
             .start = start,
             .committed = committed,
             .blocks = .empty,
-            .call_count = 0,
             .served_buffer = undefined,
             .served_length = 0,
             .activity_tick = 0,
@@ -161,15 +158,6 @@ const Turn = struct {
             if (call.phase == .running and std.mem.eql(u8, call.id, id)) return block;
         }
         return null;
-    }
-
-    fn runningTool(self: *const Turn) ?[]const u8 {
-        var found: ?[]const u8 = null;
-        for (self.blocks.items) |*block| {
-            const call = if (block.call) |*call| call else continue;
-            if (call.phase == .running) found = call.name;
-        }
-        return found;
     }
 
     fn boxes(self: *Turn, gpa: std.mem.Allocator, now_ms: i64) ![]const ui.paint.Box {
@@ -349,26 +337,6 @@ const Trail = struct {
     }
 };
 
-const PendingEvent = struct {
-    message: Message,
-    options: AsyncEventOptions,
-};
-
-pub const AsyncEventOptions = struct {
-    mirrored: bool = true,
-};
-
-const Wait = struct {
-    title: []const u8,
-    text: []const u8,
-};
-
-const LiveTail = struct {
-    streaming: ?ui.Block.Kind,
-    tool: ?[]const u8,
-    call_count: usize,
-};
-
 pub fn init(gpa: std.mem.Allocator, writer: *std.Io.Writer, effort: core.Provider.Effort) Screen {
     var self: Screen = .{
         .gpa = gpa,
@@ -386,7 +354,6 @@ pub fn init(gpa: std.mem.Allocator, writer: *std.Io.Writer, effort: core.Provide
         .directory_shown = "",
         .branch_buffer = undefined,
         .branch_length = 0,
-        .pending_events = .empty,
         .bash_timeout_ms = (tools.Context.Bash{}).timeout_ms,
         .window_pages = layout.window_pages_default,
         .gauge = .{},
@@ -399,8 +366,6 @@ pub fn init(gpa: std.mem.Allocator, writer: *std.Io.Writer, effort: core.Provide
 pub fn deinit(self: *Screen) void {
     self.deinitWidget();
     self.clearNotice();
-    for (self.pending_events.items) |pending| pending.message.deinit(self.gpa);
-    self.pending_events.deinit(self.gpa);
     self.transcript.deinit();
     self.page_view.deinit();
     self.view.deinit();
@@ -500,7 +465,7 @@ pub fn apply(
         .tool_result => |*result| try self.settleCall(turn, result),
         .committed => {
             self.statistics.charge(self.chosenModel());
-            try self.closeRun();
+            self.transcript.endMessage();
             turn.committed = self.transcript.blocks().len;
             turn.releaseBlocks(self.gpa, 0);
         },
@@ -518,18 +483,18 @@ pub fn apply(
         .model_served => |served| try self.recordServed(turn, &served),
         .attempt_failed => |*attempt| {
             self.statistics.charge(self.chosenModel());
-            try self.closeRun();
+            self.transcript.endMessage();
             const text = try attemptText(self.gpa, attempt);
             defer self.gpa.free(text);
             try self.transcript.append(&.{ .event = .{ .text = text, .survives_rewind = true } });
         },
         .skill_loaded => |*loaded| {
-            try self.closeRun();
+            self.transcript.endMessage();
             try self.appendSkillNote(loaded);
         },
         .turn_ended => |outcome| {
             self.statistics.charge(self.chosenModel());
-            try self.closeRun();
+            self.transcript.endMessage();
             try self.recordOutcome(&outcome);
             self.endTurn();
             return outcome;
@@ -561,13 +526,8 @@ fn chosenModel(self: *const Screen) ?*const accounts.Model {
     return if (self.choice.model) |*found| found else null;
 }
 
-fn closeRun(self: *Screen) !void {
-    self.transcript.endMessage();
-    try self.flushPendingEvents();
-}
-
 fn beginBlock(self: *Screen, turn: *Turn, kind: Block.Kind) !void {
-    try self.closeRun();
+    self.transcript.endMessage();
     try turn.blocks.append(self.gpa, .{ .kind = kind, .transcript_index = null, .call = null });
     self.transcript.beginRun(switch (kind) {
         .text => .model,
@@ -577,7 +537,7 @@ fn beginBlock(self: *Screen, turn: *Turn, kind: Block.Kind) !void {
 }
 
 fn startCall(self: *Screen, turn: *Turn, name: []const u8) !void {
-    try self.closeRun();
+    self.transcript.endMessage();
     if (turn.firstCall(&.{.streaming})) |block| {
         block.call.?.phase = .queued;
         try block.call.?.refresh(self.gpa);
@@ -585,7 +545,6 @@ fn startCall(self: *Screen, turn: *Turn, name: []const u8) !void {
     var call = try Call.init(self.gpa, name);
     errdefer call.deinit(self.gpa);
     try turn.blocks.append(self.gpa, .{ .kind = .call, .transcript_index = null, .call = call });
-    turn.call_count += 1;
 }
 
 fn growCall(self: *Screen, turn: *Turn, delta: []const u8) !void {
@@ -663,7 +622,7 @@ fn appendToolBlock(self: *Screen, head: []const u8, output: *const core.Tool.Out
 }
 
 fn discardTail(self: *Screen, turn: *Turn, count: usize) !void {
-    try self.closeRun();
+    self.transcript.endMessage();
     const kept = turn.blocks.items.len -| count;
     var first: ?usize = null;
     for (turn.blocks.items[kept..]) |block| {
@@ -683,7 +642,7 @@ fn recordServed(self: *Screen, turn: *Turn, served: *const core.Session.Event.Mo
     if (std.mem.eql(u8, reported, served.served[0..length])) return;
     @memcpy(turn.served_buffer[0..length], served.served[0..length]);
     turn.served_length = length;
-    try self.closeRun();
+    self.transcript.endMessage();
     const text = try std.fmt.allocPrint(
         self.gpa,
         "The provider answered with the model \"{s}\" instead of the requested model \"{s}\".",
@@ -794,40 +753,6 @@ pub fn replaceEvent(self: *Screen, index: usize, message: Message) !void {
     self.dirty = true;
 }
 
-pub fn recordAsyncEvent(self: *Screen, message: Message, options: AsyncEventOptions) !void {
-    const pending: PendingEvent = .{ .message = message, .options = options };
-    if (!self.transcript.streaming()) {
-        defer message.deinit(self.gpa);
-        try self.appendAsyncEvent(&pending);
-        self.dirty = true;
-        return;
-    }
-    errdefer message.deinit(self.gpa);
-    try self.pending_events.append(self.gpa, pending);
-}
-
-fn appendAsyncEvent(self: *Screen, pending: *const PendingEvent) !void {
-    const event: ui.Block.Event.Payload = .{
-        .text = pending.message.content,
-        .severity = pending.message.severity,
-        .survives_rewind = true,
-        .mirrored = pending.options.mirrored,
-    };
-    if (try self.transcript.repeatEvent(&event)) return;
-    try self.transcript.append(&.{ .event = event });
-}
-
-fn flushPendingEvents(self: *Screen) !void {
-    std.debug.assert(!self.transcript.streaming());
-    while (self.pending_events.items.len > 0) {
-        const pending = self.pending_events.items[0];
-        try self.appendAsyncEvent(&pending);
-        pending.message.deinit(self.gpa);
-        _ = self.pending_events.orderedRemove(0);
-    }
-    self.dirty = true;
-}
-
 pub fn setDraft(self: *Screen, text: []const u8) !void {
     self.editor.clear();
     try self.editor.insert(text);
@@ -911,33 +836,6 @@ pub fn closePicker(self: *Screen) void {
     }
 }
 
-pub fn openWait(self: *Screen, wait: *const Wait) !void {
-    try self.enterPicker(&.{
-        .select = selectNone,
-        .title = wait.title,
-        .cancellation_message = "",
-        .options = &.{},
-        .current = null,
-    }, .{}, null);
-    try self.beginPickerWait(wait.text);
-}
-
-fn selectNone(
-    context: *command.Context,
-    selection: command.Context.Outcome.Pick.Selection,
-) command.Context.Error!command.Context.Outcome {
-    _ = context;
-    _ = selection;
-    unreachable;
-}
-
-pub fn setPickerWait(self: *Screen, text: []const u8, url: []const u8) !void {
-    const picking = &self.widget.picking;
-    std.debug.assert(picking.wait_tick != null);
-    try picking.picker.beginLinkedWait(text, url);
-    self.dirty = true;
-}
-
 pub fn beginPickerWait(self: *Screen, text: []const u8) !void {
     const picking = &self.widget.picking;
     try picking.picker.beginWait(text);
@@ -975,25 +873,6 @@ pub fn closePage(self: *Screen) void {
     }
 }
 
-pub fn committedCount(self: *const Screen) usize {
-    return switch (self.widget) {
-        .turn => |*turn| turn.committed,
-        else => self.transcript.blocks().len,
-    };
-}
-
-pub fn liveTail(self: *const Screen) ?LiveTail {
-    const turn = switch (self.widget) {
-        .turn => |*turn| turn,
-        else => return null,
-    };
-    return .{
-        .streaming = if (self.transcript.current) |current| current.kind else null,
-        .tool = turn.runningTool(),
-        .call_count = turn.call_count,
-    };
-}
-
 pub fn setBranch(self: *Screen, name: []const u8) void {
     std.debug.assert(name.len <= self.branch_buffer.len);
     if (std.mem.eql(u8, self.branch_buffer[0..self.branch_length], name)) return;
@@ -1012,7 +891,6 @@ fn endTurn(self: *Screen) void {
     self.clearNotice();
     self.widget = .prompt;
     self.transcript.endMessage();
-    self.flushPendingEvents() catch {};
 }
 
 pub fn paint(
@@ -1058,7 +936,6 @@ pub fn paint(
                     .tools = boxes,
                     .tracks = tracks,
                     .activity = turn.activity(),
-                    .caption = caption.*,
                     .editor = &self.editor,
                 },
             };
@@ -1150,7 +1027,6 @@ test "a turn streams reasoning and text into blocks, commits them, and ends at t
     defer rig.deinit();
     try rig.start("hi");
     try std.testing.expect(rig.screen.widget == .turn);
-    try std.testing.expectEqual(@as(usize, 1), rig.screen.committedCount());
 
     try rig.apply(&.reasoning_started);
     try rig.apply(&.{ .reasoning = "weigh " });
@@ -1163,11 +1039,9 @@ test "a turn streams reasoning and text into blocks, commits them, and ends at t
     try rig.expectKinds(&.{ .user, .thinking, .model });
     try std.testing.expectEqualStrings("weigh it", rig.blocks()[1].content.thinking.items);
     try std.testing.expectEqualStrings("hello", rig.blocks()[2].content.model.items);
-    try std.testing.expectEqual(@as(usize, 1), rig.screen.committedCount());
     try std.testing.expectEqual(@as(f64, 0), rig.screen.statusInfo(0).cost);
 
     try rig.apply(&.committed);
-    try std.testing.expectEqual(@as(usize, 3), rig.screen.committedCount());
     try std.testing.expectApproxEqAbs(@as(f64, 18), rig.screen.statusInfo(0).cost, 1e-9);
     try std.testing.expectEqual(@as(?u64, 2_000_000), rig.screen.statusInfo(0).context_tokens);
 
@@ -1273,8 +1147,6 @@ test "a tool call streams as a row, runs with its subject and timer, and ends as
     const streamed = try rig.paintPlain(80);
     defer gpa.free(streamed);
     try expectContains(streamed, "Tool: bash · Received: 23 B · Status: Streaming");
-    try std.testing.expect(rig.screen.liveTail().?.tool == null);
-    try std.testing.expectEqual(@as(usize, 1), rig.screen.liveTail().?.call_count);
 
     rig.time.awake_ms = 1_000;
     try rig.apply(&.{ .tool_started = .{
@@ -1287,7 +1159,6 @@ test "a tool call streams as a row, runs with its subject and timer, and ends as
     defer gpa.free(running);
     try expectContains(running, "Tool: bash · Command: zig build");
     try expectContains(running, "Time: 12s · Timeout: 2m 0s");
-    try std.testing.expectEqualStrings("bash", rig.screen.liveTail().?.tool.?);
 
     var output: core.Tool.Output = .{ .content = "ok\n" };
     output.measures.put(.duration_ms, 1500);
@@ -1304,13 +1175,11 @@ test "a tool call streams as a row, runs with its subject and timer, and ends as
         block.text.items,
     );
     try std.testing.expect(!block.failed);
-    try std.testing.expect(rig.screen.liveTail().?.tool == null);
     const done = try rig.paintPlain(80);
     defer gpa.free(done);
     try std.testing.expect(std.mem.indexOf(u8, done, "Status: Streaming") == null);
 
     try rig.apply(&.committed);
-    try std.testing.expectEqual(@as(usize, 2), rig.screen.committedCount());
     try rig.end(&.{ .stopped = .complete });
 }
 
@@ -1375,7 +1244,6 @@ test "queued calls read as queued until each one runs" {
         .output = .{ .content = "x" },
     } });
     try rig.apply(&.{ .tool_started = .{ .id = "w1", .name = "write", .arguments = "{}" } });
-    try std.testing.expectEqualStrings("write", rig.screen.liveTail().?.tool.?);
     try rig.apply(&.{ .tool_result = .{
         .call = .{ .id = "w1", .name = "write", .arguments = "{}" },
         .output = .{ .content = "x" },
@@ -1550,20 +1418,6 @@ test "a withdrawn turn leaves the transcript and returns its message to the edit
     try std.testing.expectEqualStrings("late", rig.screen.editor.visible());
 }
 
-test "a withdrawn turn keeps an async event that arrived after its start" {
-    const gpa = std.testing.allocator;
-    const report = "Telegram rejected the message.";
-    var rig: Rig = undefined;
-    rig.init();
-    defer rig.deinit();
-    try rig.start("late");
-    try rig.screen.recordAsyncEvent(try Message.print(gpa, .failure, report, .{}), .{});
-    try rig.screen.withdrawTurn();
-    try rig.expectKinds(&.{.event});
-    try std.testing.expectEqualStrings(report, rig.eventText(0));
-    try std.testing.expectEqualStrings("late", rig.screen.editor.visible());
-}
-
 test "the statistics forget the evidence of the last turn and report the new one" {
     var rig: Rig = undefined;
     rig.init();
@@ -1626,51 +1480,6 @@ test "the cost takes a reported charge over the estimate, skips an unpriced mode
     try rig.apply(&.{ .usage = .{ .input = 1, .cost_usd = 5 } });
     try rig.end(&.canceled);
     try std.testing.expectEqual(core.Provider.amount_usd_max, rig.screen.statusInfo(0).cost);
-}
-
-test "an async event waits for the run boundary and survives a rewind" {
-    const gpa = std.testing.allocator;
-    const attached = "@bot attached.";
-    var rig: Rig = undefined;
-    rig.init();
-    defer rig.deinit();
-    try rig.start("hi");
-    try rig.apply(&.text_started);
-    try rig.apply(&.{ .text = "partial" });
-    try rig.screen.recordAsyncEvent(try Message.print(gpa, .information, attached, .{}), .{});
-    try rig.expectKinds(&.{ .user, .model });
-
-    try rig.apply(&.{ .tail_discarded = 1 });
-    try rig.expectKinds(&.{ .user, .event });
-    try std.testing.expectEqualStrings(attached, rig.eventText(1));
-    try rig.apply(&.text_started);
-    try rig.apply(&.{ .text = "fresh" });
-    try rig.screen.recordAsyncEvent(try Message.print(gpa, .information, attached, .{}), .{});
-    try rig.apply(&.committed);
-    try rig.expectKinds(&.{ .user, .event, .model, .event });
-    try rig.end(&.{ .stopped = .complete });
-}
-
-test "a terminal event that repeats the last event folds into it, and a mirrored event stands" {
-    const gpa = std.testing.allocator;
-    const unreachable_chat = "Drinky could not reach Telegram.";
-    const attached = "You attached @drinky_bot.";
-    var rig: Rig = undefined;
-    rig.init();
-    defer rig.deinit();
-    for (0..3) |_| try rig.screen.recordAsyncEvent(
-        try Message.print(gpa, .failure, unreachable_chat, .{}),
-        .{ .mirrored = false },
-    );
-    try rig.expectKinds(&.{.event});
-    try std.testing.expectEqualStrings(unreachable_chat ++ " · Repeats: 3", rig.eventText(0));
-
-    for (0..2) |_| try rig.screen.recordAsyncEvent(
-        try Message.print(gpa, .information, attached, .{}),
-        .{},
-    );
-    try rig.expectKinds(&.{ .event, .event, .event });
-    try std.testing.expectEqualStrings(attached, rig.eventText(2));
 }
 
 test "an account switch keeps every block and the scrollback" {

@@ -39,15 +39,6 @@ pub fn replaceEvent(
     try self.block_list.items[index].replaceEvent(self.gpa, payload);
 }
 
-pub fn repeatEvent(self: *Transcript, payload: *const ui.Block.Event.Payload) !bool {
-    std.debug.assert(!self.streaming());
-    if (payload.mirrored or self.block_list.items.len == 0) return false;
-    const last = &self.block_list.items[self.block_list.items.len - 1];
-    if (!last.statesEvent(payload)) return false;
-    try last.repeatEvent(self.gpa);
-    return true;
-}
-
 pub fn beginRun(self: *Transcript, kind: ui.Block.Kind) void {
     self.current = .{ .kind = kind, .index = null };
     self.held.clearRetainingCapacity();
@@ -80,10 +71,6 @@ fn openRun(self: *Transcript, kind: ui.Block.Kind) !usize {
     try self.block_list.append(self.gpa, block);
     self.held.clearRetainingCapacity();
     return self.block_list.items.len - 1;
-}
-
-pub fn streaming(self: *const Transcript) bool {
-    return self.current != null;
 }
 
 pub fn endMessage(self: *Transcript) void {
@@ -157,7 +144,6 @@ test "a run holds its whitespace until another byte opens the block" {
     try transcript.appendStream(.thinking, "\n");
     try transcript.appendStream(.thinking, " \t\r\n");
     try std.testing.expectEqual(@as(usize, 0), transcript.blocks().len);
-    try std.testing.expect(transcript.streaming());
 
     try transcript.appendStream(.model, "answer");
     try std.testing.expectEqual(@as(usize, 1), transcript.blocks().len);
@@ -173,7 +159,6 @@ test "a run holds its whitespace until another byte opens the block" {
     transcript.endMessage();
     try transcript.appendStream(.model, " ");
     transcript.endMessage();
-    try std.testing.expect(!transcript.streaming());
     try transcript.appendStream(.model, " ");
     transcript.endMessage();
     try transcript.appendStream(.model, "fresh");
@@ -193,7 +178,6 @@ test "endMessage and beginRun force the next delta into a new block" {
     try std.testing.expectEqual(@as(?usize, 1), transcript.runIndex());
 
     transcript.beginRun(.model);
-    try std.testing.expect(transcript.streaming());
     try std.testing.expect(transcript.runIndex() == null);
     try transcript.appendStream(.model, "c");
     try std.testing.expectEqual(@as(usize, 3), transcript.blocks().len);

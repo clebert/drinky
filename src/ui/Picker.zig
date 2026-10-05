@@ -32,7 +32,6 @@ cursor_offset: usize,
 columns: usize,
 can_step_back: bool,
 wait: ?[]const u8,
-wait_link: ?[]const u8,
 marks: std.ArrayList(paint.Mark),
 
 pub const Position = struct {
@@ -109,7 +108,6 @@ pub fn init(
         .columns = unbounded,
         .can_step_back = start.can_step_back,
         .wait = null,
-        .wait_link = null,
         .marks = .empty,
     };
     errdefer self.content.deinit(gpa);
@@ -127,20 +125,14 @@ pub fn deinit(self: *Picker) void {
 }
 
 pub fn beginWait(self: *Picker, text: []const u8) !void {
-    return self.beginLinkedWait(text, null);
-}
-
-pub fn beginLinkedWait(self: *Picker, text: []const u8, url: ?[]const u8) !void {
     self.freeOptions();
     self.options = &.{};
     self.cursor = 0;
     self.current = null;
     self.window = .{};
     self.wait = text;
-    self.wait_link = url;
     errdefer {
         self.wait = null;
-        self.wait_link = null;
         self.marks.clearRetainingCapacity();
         self.content.clearRetainingCapacity();
         self.line_roles.clearRetainingCapacity();
@@ -246,17 +238,6 @@ fn compose(self: *Picker) !void {
         try self.startLine(.muted);
         try self.content.appendSlice(self.gpa, pad_plain);
         try self.content.appendSlice(self.gpa, text);
-        if (self.wait_link) |url| {
-            try self.content.appendSlice(self.gpa, paint.separator);
-            const start = self.content.items.len;
-            try self.content.appendSlice(self.gpa, url);
-            try self.marks.append(self.gpa, .{
-                .start = start,
-                .end = self.content.items.len,
-                .role = .link,
-                .url = url,
-            });
-        }
         return self.cut(.{ .start = 0, .columns_max = self.columns });
     }
 
@@ -471,30 +452,6 @@ fn renderForTest(
     return gpa.dupe(u8, try rig.painted());
 }
 
-test "a linked wait paints its link as a terminal hyperlink" {
-    const gpa = std.testing.allocator;
-    var picker = try testPicker(gpa, &.{"row"}, &.{ .current = 0 });
-    defer picker.deinit();
-    const size: terminal.View.Size = .{ .columns = 80, .rows = 24 };
-
-    try picker.beginLinkedWait("Send the code x7kq4m2p to @bot", "https://t.me/bot?start=x7kq4m2p");
-    try picker.reflow(size);
-    const painted = try renderForTest(gpa, &picker, size);
-    defer gpa.free(painted);
-    try testing.expectShows(painted, &.{
-        "   Send the code x7kq4m2p to @bot · ",
-        comptime role.sequence(.link) ++ attribute.sequence(.underline) ++
-            "\x1b]8;;https://t.me/bot?start=x7kq4m2p\x1b\\" ++
-            "https://t.me/bot?start=x7kq4m2p\x1b]8;;\x1b\\",
-    });
-
-    try picker.beginWait("Drinky checks the bot token.");
-    const plain_wait = try renderForTest(gpa, &picker, size);
-    defer gpa.free(plain_wait);
-    try testing.expectShows(plain_wait, &.{"Drinky checks the bot token."});
-    try testing.expectHides(plain_wait, &.{ "\x1b]8;;", "token. ·" });
-}
-
 test "a wait that cannot compose keeps no borrowed text" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     const gpa = failing.allocator();
@@ -504,17 +461,14 @@ test "a wait that cannot compose keeps no borrowed text" {
     const text = "x" ** 4096;
     failing.fail_index = failing.alloc_index;
     failing.resize_fail_index = failing.resize_index;
-    try std.testing.expectError(
-        error.OutOfMemory,
-        picker.beginLinkedWait(text, "https://t.me/bot"),
-    );
+    try std.testing.expectError(error.OutOfMemory, picker.beginWait(text));
     failing.fail_index = std.math.maxInt(usize);
     failing.resize_fail_index = std.math.maxInt(usize);
 
     const painted = try renderForTest(gpa, &picker, .{ .columns = 80, .rows = 24 });
     defer gpa.free(painted);
     try testing.expectShows(painted, &.{"Esc: Cancel"});
-    try testing.expectHides(painted, &.{ "xxxx", "https://t.me/bot", "row" });
+    try testing.expectHides(painted, &.{ "xxxx", "row" });
 }
 
 test "a list that waits drops its rows, states the wait, and moves its frame edges" {

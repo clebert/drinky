@@ -16,11 +16,11 @@ const Herdr = @import("Herdr.zig");
 const layout = @import("layout.zig");
 const Message = @import("Message.zig");
 const project = @import("project.zig");
-const remote = @import("remote/root.zig");
 const Reports = @import("Reports.zig");
 const Screen = @import("Screen.zig");
 const sources = @import("sources.zig");
 const system_prompt = @import("system_prompt.zig");
+const testing = @import("testing.zig");
 const ui = @import("ui/root.zig");
 
 const App = @This();
@@ -30,17 +30,10 @@ const effort_default: core.Provider.Effort = .xhigh;
 const no_model_refusal = "Select a model with /model before you send a message.";
 const signed_out_refusal = "Sign in with /login before you send a message.";
 
-const signed_out_refusal_telegram =
-    "Sign in with /login in the terminal before you send a message.";
-const no_model_refusal_telegram =
-    "Select a model with /model in the terminal before you send a message.";
-
 const fetch_wait_text = "Drinky fetches the model list.";
 
 const turn_cancel_notice = "Press Esc again to cancel the turn. The draft stays.";
 const turn_message_notice = "Drinky sends no message while a turn runs. The draft stays.";
-const turn_refusal_telegram =
-    "A turn runs, so Drinky did not send the message. Send it again after the turn ends.";
 
 const intro_keys = [_][]const u8{
     "Enter: Send",
@@ -55,8 +48,6 @@ const intro_text = blk: {
     for (intro_keys) |hint| line = line ++ hint ++ ui.paint.separator;
     break :blk line ++ "/help: Commands";
 };
-
-const token_check_wait_text = "Drinky checks the bot token.";
 
 const login_callback_controls = "Enter: Replay callback URL · Esc: Cancel";
 const login_device_controls = "Esc: Cancel";
@@ -73,21 +64,6 @@ const escape_wait_ms = 50;
 
 const queue_capacity = 256;
 
-const bot_commands = blk: {
-    var count = 0;
-    for (command.summaries) |summary| {
-        if (summary.remote and summary.tail.len == 0) count += 1;
-    }
-    var list: [count]remote.Client.Command = undefined;
-    var index = 0;
-    for (command.summaries) |summary| {
-        if (!summary.remote or summary.tail.len != 0) continue;
-        list[index] = .{ .command = summary.name, .description = summary.summary };
-        index += 1;
-    }
-    break :blk list;
-};
-
 gpa: std.mem.Allocator,
 io: std.Io,
 tty: *terminal.Tty,
@@ -100,7 +76,6 @@ session: core.Session,
 client: ?*accounts.Client,
 client_account: ?usize,
 leases: std.ArrayList(Lease),
-action_failure: ?RemoteActionError,
 configured: ?Choice,
 choice: Choice,
 mode: Mode,
@@ -127,11 +102,6 @@ resize_future: ?std.Io.Future(void),
 tick_future: ?std.Io.Future(void),
 frame_grid: FrameGrid,
 herdr: Herdr,
-controller: remote.Controller,
-mirror: remote.Mirror,
-remote_title: []const u8,
-pairing_wait_text: []const u8,
-pairing_wait_link: []const u8,
 
 const Options = struct {
     working_directory: []const u8,
@@ -143,7 +113,6 @@ const Options = struct {
     transport: ?providers.Transport = null,
     browser: ?accounts.oauth.login.Browser = null,
     loopback: ?accounts.oauth.callback.Loopback = null,
-    telegram_transport: ?providers.Transport = null,
 };
 
 const FrameGrid = struct {
@@ -167,16 +136,12 @@ const UiEvent = union(enum) {
     accounts: accounts.Registry.Event,
     tick,
     resize,
-    remote: remote.Attachment.Event,
-    pairing: remote.Pairing.Event,
 
     fn deinit(self: *const UiEvent, gpa: std.mem.Allocator) void {
         switch (self.*) {
             .keys => |bytes| gpa.free(bytes),
             .session => |*event| event.deinit(gpa),
             .accounts => |*event| event.deinit(gpa),
-            .remote => |*event| event.deinit(gpa),
-            .pairing => |*event| event.deinit(gpa),
             .tick, .resize => {},
         }
     }
@@ -194,9 +159,6 @@ const Mode = union(enum) {
     fetch: Fetch,
     page,
     sign_in: SignIn,
-    token_prompt,
-    pairing,
-    remote: Remote,
 
     const Prompt = struct {
         confirmation: ?Confirmation = null,
@@ -222,29 +184,10 @@ const Mode = union(enum) {
         event_index: ?usize = null,
         cancel_sent: bool = false,
     };
-
-    const Remote = struct {
-        detaching: bool = false,
-        turn: ?Turn = null,
-    };
 };
-
-const Target = union(enum) {
-    terminal,
-    chat: i64,
-};
-
-const Refusal = enum { signed_out, no_model };
-
-const RemoteActionError = @typeInfo(
-    @typeInfo(@TypeOf(applyRemoteAction)).@"fn".return_type.?,
-).error_union.error_set;
 
 const session_sink_vtable: core.Session.Sink.VTable = .{ .emit = emitSessionEvent };
 const accounts_sink_vtable: accounts.Registry.Sink.VTable = .{ .emit = emitAccountsEvent };
-const action_sink_vtable: remote.Controller.Sink.VTable = .{ .emit = onRemoteAction };
-const attachment_sink_vtable: remote.Attachment.Sink.VTable = .{ .emit = emitRemoteEvent };
-const pairing_sink_vtable: remote.Pairing.Sink.VTable = .{ .emit = emitPairingEvent };
 
 fn emitSessionEvent(ptr: *anyopaque, event: *const core.Session.Event) void {
     const self: *App = @ptrCast(@alignCast(ptr));
@@ -314,19 +257,6 @@ pub fn init(self: *App, gpa: std.mem.Allocator, io: std.Io, options: *const Opti
         .loopback = options.loopback,
     });
     errdefer self.account_registry.deinit();
-    self.controller = try .init(gpa, io, &.{
-        .directories = directories,
-        .sink = .{ .ptr = self, .vtable = &action_sink_vtable },
-        .attachment_sink = .{ .ptr = self, .vtable = &attachment_sink_vtable },
-        .pairing_sink = .{ .ptr = self, .vtable = &pairing_sink_vtable },
-        .transport = options.telegram_transport,
-        .connect_ms = self.config.connect_timeout_ms,
-        .bot_commands = &bot_commands,
-    });
-    errdefer self.controller.deinit();
-    var serial_seed: [8]u8 = undefined;
-    io.random(&serial_seed);
-    self.mirror.seedSerials(std.mem.readInt(u64, &serial_seed, .little));
 
     self.working_directory = cwd;
     self.home_directory = try homeDirectory(gpa, io, &directories);
@@ -448,7 +378,6 @@ pub fn deinit(self: *App) void {
     self.project_instructions.deinit();
     self.gpa.free(self.directory_label);
     self.gpa.free(self.home_directory);
-    self.controller.deinit();
     self.account_registry.deinit();
     self.config.deinit(self.gpa);
     self.input.deinit();
@@ -520,11 +449,6 @@ fn reportStart(self: *App, required_capped: bool) !void {
         "Drinky used only the first {d} required skills in {s}.",
         .{ tools.SkillGuard.rules_max, config.path },
     );
-    if (self.controller.loadError()) |err| try self.recordEvent(
-        .failure,
-        "Drinky could not read the saved bots in {s} because of error {s}.",
-        .{ self.controller.storePath(), @errorName(err) },
-    );
     if (config.load_error) |err| try self.recordEvent(
         .failure,
         "Drinky could not read the config file {s} because of error {s}. Drinky uses " ++
@@ -564,7 +488,6 @@ fn initFields(self: *App, gpa: std.mem.Allocator, io: std.Io) void {
         .client = null,
         .client_account = null,
         .leases = .empty,
-        .action_failure = null,
         .configured = null,
         .choice = .{ .effort = effort_default },
         .mode = .{ .prompt = .{} },
@@ -591,11 +514,6 @@ fn initFields(self: *App, gpa: std.mem.Allocator, io: std.Io) void {
         .tick_future = null,
         .frame_grid = .reset(0),
         .herdr = .init(io),
-        .controller = undefined,
-        .mirror = .init(gpa),
-        .remote_title = "",
-        .pairing_wait_text = "",
-        .pairing_wait_link = "",
     };
     self.queue = std.Io.Queue(UiEvent).init(&self.queue_buffer);
 }
@@ -614,8 +532,6 @@ fn stopTasks(self: *App) void {
 
 fn closeQueue(self: *App) void {
     self.queue.close(self.io);
-    self.controller.shutdown();
-    self.freeRemoteStrings();
     self.drainQueue();
 }
 
@@ -726,33 +642,14 @@ fn caption(self: *const App) ?ui.Caption {
             .controls = if (sign_in.takes_paste) login_callback_controls else login_device_controls,
             .rows_max = Screen.editor_caption_rows_max,
         },
-        .token_prompt => .{
-            .title = "Bot token",
-            .controls = "Enter: Save · Esc: Cancel",
-            .rows_max = Screen.editor_caption_rows_max,
-        },
-        .remote => |attached| .{
-            .title = self.remote_title,
-            .controls = if (attached.detaching) "Esc: Cancel" else "Esc: Detach",
-            .rows_max = Screen.editor_caption_rows_max,
-        },
-        .prompt, .turn, .picker, .fetch, .page, .pairing => null,
+        .prompt, .turn, .picker, .fetch, .page => null,
     };
 }
 
 fn herdrState(self: *const App) Herdr.State {
     return switch (self.mode) {
         .turn => .working,
-        .remote => |attached| if (attached.turn == null) .idle else .working,
-        .prompt, .picker, .fetch, .page, .sign_in, .token_prompt, .pairing => .idle,
-    };
-}
-
-fn runningTurn(self: *App) ?*Mode.Turn {
-    return switch (self.mode) {
-        .turn => |*turn| turn,
-        .remote => |*attached| if (attached.turn) |*turn| turn else null,
-        .prompt, .picker, .fetch, .page, .sign_in, .token_prompt, .pairing => null,
+        .prompt, .picker, .fetch, .page, .sign_in => .idle,
     };
 }
 
@@ -780,20 +677,7 @@ fn applyBatch(self: *App, events: []const UiEvent) !bool {
                 defer accounts_event.deinit(self.gpa);
                 try self.applyAccountsEvent(accounts_event);
             },
-            .remote => |*remote_event| {
-                defer remote_event.deinit(self.gpa);
-                try self.controller.applyAttachmentEvent(remote_event);
-            },
-            .pairing => |*pairing_event| {
-                defer pairing_event.deinit(self.gpa);
-                try self.controller.applyPairingEvent(pairing_event);
-            },
         }
-        if (self.action_failure) |err| {
-            self.action_failure = null;
-            return err;
-        }
-        try self.syncMirror();
     }
     return ticked;
 }
@@ -980,12 +864,10 @@ fn handleKey(self: *App, event: *const terminal.Input.Key) !void {
     self.screen.clearNotice();
     switch (self.mode) {
         .prompt => try self.handlePromptKey(event),
-        .turn, .sign_in, .token_prompt => try self.handleEditorKey(event),
+        .turn, .sign_in => try self.handleEditorKey(event),
         .picker => try self.handlePickerKey(event),
         .fetch => try self.handleFetchKey(event),
         .page => try self.handlePageKey(event),
-        .pairing => try self.handlePairingKey(event),
-        .remote => |attached| try self.handleRemoteKey(event, attached),
     }
 }
 
@@ -1002,7 +884,7 @@ fn disarm(self: *App, event: *const terminal.Input.Key) void {
         .turn => |*turn| if (event.* != .escape) {
             turn.cancel_armed = false;
         },
-        .picker, .fetch, .page, .sign_in, .token_prompt, .pairing, .remote => {},
+        .picker, .fetch, .page, .sign_in => {},
     }
 }
 
@@ -1047,7 +929,6 @@ fn handleEditorKey(self: *App, event: *const terminal.Input.Key) !void {
         .enter => switch (self.mode) {
             .turn => try self.submitDuringTurn(),
             .sign_in => try self.submitLoginLine(),
-            .token_prompt => try self.submitToken(),
             else => unreachable,
         },
         .escape => if (self.mode == .turn) try self.warnOrCancel() else try self.exitMode(),
@@ -1070,7 +951,6 @@ fn exitMode(self: *App) !void {
     switch (self.mode) {
         .turn => try self.cancelTurn(),
         .sign_in => try self.cancelLogin(),
-        .token_prompt => try self.cancelTokenPrompt(),
         else => unreachable,
     }
 }
@@ -1121,7 +1001,7 @@ fn submitDuringTurn(self: *App) !void {
 }
 
 fn cancelTurn(self: *App) !void {
-    const turn = self.runningTurn() orelse return;
+    const turn = &self.mode.turn;
     if (turn.cancel_sent) return;
     turn.cancel_sent = true;
     try self.session.send(&.cancel);
@@ -1175,22 +1055,15 @@ fn submit(self: *App) !void {
         if (try self.dispatchCommand(text)) |outcome|
             return self.applySubmittedCommand(&outcome);
     }
-    if (self.turnRefusal()) |refusal| return self.reportTurnRefusal(refusal);
+    if (self.turnRefusal()) |refusal| return self.reportNotice(.failure, "{s}", .{refusal});
     try self.startUserTurn(text);
     self.screen.editor.clear();
 }
 
-fn turnRefusal(self: *const App) ?Refusal {
-    if (self.choice.account == null or self.client == null) return .signed_out;
-    if (self.choice.model == null) return .no_model;
+fn turnRefusal(self: *const App) ?[]const u8 {
+    if (self.choice.account == null or self.client == null) return signed_out_refusal;
+    if (self.choice.model == null) return no_model_refusal;
     return null;
-}
-
-fn reportTurnRefusal(self: *App, refusal: Refusal) !void {
-    try self.reportNotice(.failure, "{s}", .{switch (refusal) {
-        .signed_out => signed_out_refusal,
-        .no_model => no_model_refusal,
-    }});
 }
 
 fn applySubmittedCommand(self: *App, outcome: *const command.Context.Outcome) !void {
@@ -1198,7 +1071,7 @@ fn applySubmittedCommand(self: *App, outcome: *const command.Context.Outcome) !v
         .prompt, .refusal => {},
         else => self.screen.editor.clear(),
     }
-    try self.applyOutcome(outcome, .terminal);
+    try self.applyOutcome(outcome);
 }
 
 fn armMessageSend(self: *App, refusal: Message) !void {
@@ -1223,26 +1096,16 @@ fn startUserTurn(self: *App, text: []const u8) !void {
 }
 
 fn runTurn(self: *App, text: []const u8, start: usize) !void {
+    std.debug.assert(self.mode == .prompt);
     self.refreshBranch();
     try self.session.send(&.{ .prompt = text });
-    switch (self.mode) {
-        .prompt => self.setMode(.{ .turn = .{} }),
-        .remote => |*attached| {
-            std.debug.assert(attached.turn == null);
-            attached.turn = .{};
-        },
-        else => unreachable,
-    }
+    self.setMode(.{ .turn = .{} });
     self.screen.beginTurn(start);
-    self.mirror.beginTurn(self.controller.chat(), self.nowMs()) catch {};
 }
 
 fn leaveTurn(self: *App) void {
-    switch (self.mode) {
-        .turn => self.setMode(.{ .prompt = .{} }),
-        .remote => |*attached| attached.turn = null,
-        else => unreachable,
-    }
+    std.debug.assert(self.mode == .turn);
+    self.setMode(.{ .prompt = .{} });
 }
 
 fn applySessionEvent(self: *App, event: *const core.Session.Event) !void {
@@ -1259,7 +1122,6 @@ fn applySessionEvent(self: *App, event: *const core.Session.Event) !void {
 fn refusePrompt(self: *App, refusal: core.Session.Event.Refusal) !void {
     try self.screen.withdrawTurn();
     self.leaveTurn();
-    try self.endMirrorTurn(.canceled);
     try self.reportNotice(.failure, "{s}", .{switch (refusal) {
         .turn_running => turn_message_notice,
         .unconfigured => no_model_refusal,
@@ -1269,12 +1131,8 @@ fn refusePrompt(self: *App, refusal: core.Session.Event.Refusal) !void {
 fn endTurn(self: *App, outcome: *const core.Session.Outcome) !void {
     self.refreshBranch();
     switch (outcome.*) {
-        .stopped, .exhausted => try self.endMirrorTurn(.completed),
-        .canceled => try self.endMirrorTurn(.canceled),
-        .failed => |failure| {
-            try self.endMirrorTurn(.failed);
-            if (failure.reason == .unauthorized) try self.rejectCredential();
-        },
+        .stopped, .exhausted, .canceled => {},
+        .failed => |failure| if (failure.reason == .unauthorized) try self.rejectCredential(),
     }
 }
 
@@ -1303,13 +1161,6 @@ fn rejectCredential(self: *App) !void {
         );
         try self.handOff(account);
     }
-    const step: remote.Controller.DetachCause.Step = if (self.choice.account == null)
-        .sign_in
-    else if (self.choice.model == null)
-        .model_selection
-    else
-        return;
-    try self.controller.detach(&.{ .credential_rejected = step });
 }
 
 fn reportCredentialStep(self: *App, account: usize, comptime lead: []const u8) !void {
@@ -1344,7 +1195,6 @@ fn handOff(self: *App, account: usize) !void {
             "Drinky signed out of {s}. Select an account to sign in.",
             .{id},
         );
-        if (self.mode == .remote) return;
         return self.openLoginPicker();
     };
     const next_id = accounts.Account.table[next].id;
@@ -1659,16 +1509,9 @@ fn commandContext(self: *App) command.Context {
         .account_registry = &self.account_registry,
         .remembered_model_names = &self.state.model_names,
         .skill_registry = &self.skill_registry,
-        .remote_bots = self.controller.usernames(),
         .system_prompt = self.system,
         .sources_page = self.sources_page,
     };
-}
-
-fn chatContext(self: *App) command.Context {
-    var context = self.commandContext();
-    context.remote = true;
-    return context;
 }
 
 fn dispatchCommand(self: *App, line: []const u8) !?command.Context.Outcome {
@@ -1682,23 +1525,17 @@ fn checkCommand(self: *App, line: []const u8) !?Message {
 }
 
 fn runCommand(self: *App, line: []const u8) !void {
-    if (try self.dispatchCommand(line)) |outcome| try self.applyOutcome(&outcome, .terminal);
+    if (try self.dispatchCommand(line)) |outcome| try self.applyOutcome(&outcome);
 }
 
-fn applyOutcome(self: *App, outcome: *const command.Context.Outcome, target: Target) !void {
+fn applyOutcome(self: *App, outcome: *const command.Context.Outcome) !void {
     switch (outcome.*) {
-        .notice, .refusal => |message| switch (target) {
-            .terminal => self.setNotice(message),
-            .chat => |message_id| {
-                defer message.deinit(self.gpa);
-                try self.controller.reply(message_id, message.severity, message.content);
-            },
-        },
+        .notice, .refusal => |message| self.setNotice(message),
         .event => |message| try self.screen.appendEvent(message),
         .pick => |*pick| try self.openPicker(pick),
         .prompt => |*prompt| {
             defer prompt.deinit(self.gpa);
-            if (self.turnRefusal()) |refusal| return self.reportTurnRefusal(refusal);
+            if (self.turnRefusal()) |refusal| return self.reportNotice(.failure, "{s}", .{refusal});
             try self.startSkillTurn(prompt);
             self.screen.editor.clear();
             return;
@@ -1711,23 +1548,11 @@ fn applyOutcome(self: *App, outcome: *const command.Context.Outcome, target: Tar
         .new_conversation => {
             try self.session.send(&.clear);
             self.screen.clearConversation();
-            self.mirror.resetCursor();
             try self.screen.appendIntro(intro_text);
-            if (self.controller.listens()) try self.recordEvent(
-                .information,
-                "You cleared the conversation while @{s} is attached.",
-                .{self.controller.botUsername().?},
-            );
         },
         .login => |account| return self.startLogin(account),
         .logout => |account| try self.logoutAccount(account),
         .fetch => |account| return self.startFetch(account),
-        .remote_attach => |index| return self.controller.attachSaved(index),
-        .remote_add => {
-            self.screen.editor.clear();
-            return self.controller.beginTokenPrompt();
-        },
-        .remote_remove => |index| return self.controller.removeBot(index),
     }
     try self.sync();
 }
@@ -1824,16 +1649,6 @@ fn recordReports(self: *App, reports: *const Reports) !void {
     }
 }
 
-fn recordAsyncEvent(
-    self: *App,
-    severity: Message.Severity,
-    options: Screen.AsyncEventOptions,
-    text: []const u8,
-) !void {
-    const message: Message = .{ .content = try self.gpa.dupe(u8, text), .severity = severity };
-    try self.screen.recordAsyncEvent(message, options);
-}
-
 fn recordEvent(
     self: *App,
     severity: Message.Severity,
@@ -1853,235 +1668,6 @@ fn recordEventAt(
     const message = try Message.print(self.gpa, severity, format, args);
     if (maybe_index) |index| return self.screen.replaceEvent(index, message);
     try self.screen.appendEvent(message);
-}
-
-fn emitRemoteEvent(ptr: *anyopaque, event: *const remote.Attachment.Event) void {
-    const self: *App = @ptrCast(@alignCast(ptr));
-    const owned = event.dupe(self.gpa) catch return;
-    self.keep(.{ .remote = owned });
-}
-
-fn emitPairingEvent(ptr: *anyopaque, event: *const remote.Pairing.Event) void {
-    const self: *App = @ptrCast(@alignCast(ptr));
-    const owned = event.dupe(self.gpa) catch return;
-    self.keep(.{ .pairing = owned });
-}
-
-fn onRemoteAction(ptr: *anyopaque, action: *const remote.Controller.Action) void {
-    const self: *App = @ptrCast(@alignCast(ptr));
-    self.applyRemoteAction(action) catch |err| {
-        if (self.action_failure == null) self.action_failure = err;
-    };
-}
-
-fn applyRemoteAction(self: *App, action: *const remote.Controller.Action) !void {
-    switch (action.*) {
-        .chat_message => |message| try self.submitChatMessage(message.text, message.id),
-        .cancel_tap => |tap| try self.handleCancelTap(tap.query_id, tap.serial),
-        .report => |report| switch (report.kind) {
-            .event => try self.recordAsyncEvent(report.severity, .{}, report.text),
-            .terminal_event => try self.recordAsyncEvent(
-                report.severity,
-                .{ .mirrored = false },
-                report.text,
-            ),
-            .notice => try self.reportNotice(report.severity, "{s}", .{report.text}),
-        },
-        .state_changed => try self.syncRemoteState(),
-        .pairing_changed => |change| try self.applyPairingChange(change),
-    }
-}
-
-fn syncRemoteState(self: *App) !void {
-    switch (self.controller.state()) {
-        .idle => switch (self.mode) {
-            .token_prompt, .pairing => self.setMode(.{ .prompt = .{} }),
-            .remote => |attached| {
-                if (attached.turn) |turn| return self.setMode(.{ .turn = turn });
-                self.setMode(.{ .prompt = .{} });
-                if (self.choice.account == null) try self.openLoginPicker();
-            },
-            .prompt, .turn, .picker, .fetch, .page, .sign_in => {},
-        },
-        .token_prompt => self.setMode(.token_prompt),
-        .checking_token, .pairing => self.setMode(.pairing),
-        .attached => if (self.mode != .remote) {
-            std.debug.assert(self.mode == .prompt);
-            const username = self.controller.botUsername().?;
-            try self.takeRemoteTitle(username);
-            self.setMode(.{ .remote = .{} });
-            try self.openChat(username);
-        },
-        .detaching => {
-            self.setMode(.{ .remote = .{ .detaching = true, .turn = self.mode.remote.turn } });
-            self.mirror.forgetActivity();
-        },
-    }
-}
-
-fn takeRemoteTitle(self: *App, username: []const u8) !void {
-    const title = try std.fmt.allocPrint(self.gpa, "Remote: @{s}", .{username});
-    self.gpa.free(self.remote_title);
-    self.remote_title = title;
-}
-
-fn openChat(self: *App, username: []const u8) !void {
-    self.screen.clearNotice();
-    const text = try std.fmt.allocPrint(self.gpa, "You attached @{s}.", .{username});
-    defer self.gpa.free(text);
-    try self.recordAsyncEvent(.information, .{ .mirrored = false }, text);
-    try self.controller.sendEvent(.information, text);
-    try self.mirror.open(self.controller.chat(), &self.mirrorView());
-}
-
-fn mirrorView(self: *const App) remote.Mirror.View {
-    return .{
-        .blocks = self.screen.transcript.blocks(),
-        .committed = self.screen.committedCount(),
-        .tail = if (self.screen.liveTail()) |tail| .{
-            .streaming = tail.streaming,
-            .tool = tail.tool,
-            .call_count = tail.call_count,
-        } else null,
-    };
-}
-
-fn syncMirror(self: *App) !void {
-    try self.mirror.sync(self.controller.chat(), &self.mirrorView());
-}
-
-fn endMirrorTurn(self: *App, outcome: remote.Mirror.End.Outcome) !void {
-    const status = self.screen.statusInfo(self.nowBootMs());
-    try self.mirror.endTurn(self.controller.chat(), &self.mirrorView(), &.{
-        .outcome = outcome,
-        .status = &status,
-        .now_ms = self.nowMs(),
-    });
-}
-
-fn applyPairingChange(self: *App, change: remote.Controller.Action.PairingChange) !void {
-    switch (change) {
-        .check_started => try self.screen.openWait(&.{
-            .title = "Remote",
-            .text = token_check_wait_text,
-        }),
-        .code_ready => {
-            const link = try self.controller.pairingLink(self.gpa);
-            errdefer self.gpa.free(link);
-            const text = try std.fmt.allocPrint(
-                self.gpa,
-                "Send the code {s} to @{s}.",
-                .{ self.controller.pairingCode(), self.controller.pairingUsername() },
-            );
-            errdefer self.gpa.free(text);
-            try self.screen.setPickerWait(text, link);
-            self.freePairingStrings();
-            self.pairing_wait_text = text;
-            self.pairing_wait_link = link;
-        },
-        .prompt_restored => {
-            self.screen.closePicker();
-            self.freePairingStrings();
-        },
-        .ended => {
-            self.screen.closePicker();
-            self.screen.editor.clear();
-            self.freePairingStrings();
-        },
-    }
-}
-
-fn freePairingStrings(self: *App) void {
-    self.gpa.free(self.pairing_wait_text);
-    self.gpa.free(self.pairing_wait_link);
-    self.pairing_wait_text = "";
-    self.pairing_wait_link = "";
-}
-
-fn freeRemoteStrings(self: *App) void {
-    self.freePairingStrings();
-    self.gpa.free(self.remote_title);
-    self.remote_title = "";
-}
-
-fn handleRemoteKey(
-    self: *App,
-    event: *const terminal.Input.Key,
-    attached: Mode.Remote,
-) !void {
-    switch (event.*) {
-        .escape => try self.exitRemote(attached),
-        .ctrl => |letter| switch (letter) {
-            'c', 'd' => try self.exitRemote(attached),
-            else => {},
-        },
-        .enter => try self.reportRemoteNotice(attached),
-        else => {},
-    }
-}
-
-fn exitRemote(self: *App, attached: Mode.Remote) !void {
-    if (attached.detaching) return self.controller.abortDetach();
-    try self.controller.detach(&.user);
-}
-
-fn reportRemoteNotice(self: *App, attached: Mode.Remote) !void {
-    const username = self.controller.botUsername().?;
-    if (attached.detaching) return self.reportNotice(
-        .information,
-        "Drinky detaches @{s}. Esc ends the wait.",
-        .{username},
-    );
-    try self.reportNotice(.information, "@{s} holds the input. Esc detaches.", .{username});
-}
-
-fn submitChatMessage(self: *App, text: []const u8, message_id: i64) !void {
-    const attached = self.mode.remote;
-    std.debug.assert(!attached.detaching);
-    var context = self.chatContext();
-    const target: Target = .{ .chat = message_id };
-    if (attached.turn != null) {
-        if (try command.checkDuringTurn(&context, text)) |refusal|
-            return self.applyOutcome(&.{ .refusal = refusal }, target);
-        return self.controller.reply(message_id, .warning, turn_refusal_telegram);
-    }
-    if (try command.run(&context, text)) |outcome| return self.applyOutcome(&outcome, target);
-    if (self.turnRefusal()) |refusal| return self.controller.reply(
-        message_id,
-        .failure,
-        switch (refusal) {
-            .signed_out => signed_out_refusal_telegram,
-            .no_model => no_model_refusal_telegram,
-        },
-    );
-    try self.startUserTurn(text);
-}
-
-fn handleCancelTap(self: *App, query_id: []const u8, serial: u64) !void {
-    try self.controller.answer(query_id);
-    if (self.mirror.namesTurn(serial)) try self.cancelTurn();
-}
-
-fn submitToken(self: *App) !void {
-    const token = try self.screen.editor.expanded();
-    defer self.gpa.free(token);
-    try self.controller.submitToken(token);
-}
-
-fn cancelTokenPrompt(self: *App) !void {
-    self.screen.editor.clear();
-    try self.controller.cancelTokenPrompt();
-}
-
-fn handlePairingKey(self: *App, event: *const terminal.Input.Key) !void {
-    switch (event.*) {
-        .escape => try self.controller.cancelPairing(.step),
-        .ctrl => |letter| switch (letter) {
-            'c', 'd' => try self.controller.cancelPairing(.command),
-            else => {},
-        },
-        else => {},
-    }
 }
 
 fn handlePageKey(self: *App, event: *const terminal.Input.Key) !void {
@@ -2149,7 +1735,7 @@ fn applyPickerOutcome(self: *App, outcome: *const command.Context.Outcome) !void
         .pick, .fetch => {},
         else => self.closePicker(),
     }
-    try self.applyOutcome(outcome, .terminal);
+    try self.applyOutcome(outcome);
 }
 
 fn leavePicker(self: *App) !void {
@@ -2160,7 +1746,7 @@ fn leavePicker(self: *App) !void {
         .pick => |*pick| try self.screen.openPickerAbove(pick),
         else => {
             self.closePicker();
-            try self.applyOutcome(&outcome, .terminal);
+            try self.applyOutcome(&outcome);
         },
     }
 }
@@ -2207,9 +1793,7 @@ const Rig = struct {
     transport: providers.testing.FakeTransport,
     browser: accounts.testing.FakeBrowser,
     loopback: accounts.testing.FakeLoopback,
-    clock: remote.testing.Clock,
-    telegram: ?remote.testing.Telegram,
-    pacer: ?std.Io.Future(void),
+    clock: testing.Clock,
     out: std.Io.Writer.Allocating,
     app: App,
 
@@ -2221,7 +1805,6 @@ const Rig = struct {
         replies: []const providers.testing.FakeTransport.Reply = &.{},
         model: ?[]const u8 = null,
         model_accounts: []const usize = &.{accounts.testing.openai_api_key},
-        telegram: ?[]const remote.testing.Script = null,
     };
 
     fn init(self: *Rig, options: *const Rig.Options) !void {
@@ -2251,9 +1834,6 @@ const Rig = struct {
         self.loopback = .{ .io = io };
         self.out = .init(gpa);
         errdefer self.out.deinit();
-        self.telegram = null;
-        errdefer if (self.telegram) |*telegram| telegram.deinit();
-        if (options.telegram) |scripts| try self.addTelegram(scripts);
 
         try self.app.init(gpa, io, &.{
             .working_directory = self.directory,
@@ -2263,14 +1843,9 @@ const Rig = struct {
             .transport = self.transport.transport(),
             .browser = self.browser.browser(),
             .loopback = self.loopback.loopback(),
-            .telegram_transport = if (self.telegram) |*telegram| telegram.transport() else null,
         });
         errdefer self.app.deinit();
         if (options.model) |name| try self.seedModel(name, options.model_accounts);
-        self.pacer = null;
-        if (options.telegram != null) {
-            self.pacer = try io.concurrent(passSpacing, .{&self.clock});
-        }
         self.app.running = true;
     }
 
@@ -2299,34 +1874,10 @@ const Rig = struct {
         try app.sync();
     }
 
-    fn directories(self: *const Rig) accounts.json_store.Directories {
-        return .{ .working_directory = self.directory, .home = self.directory };
-    }
-
-    fn addTelegram(self: *Rig, scripts: []const remote.testing.Script) !void {
-        const gpa = std.testing.allocator;
-        const io = self.clock.io();
-        var store = try remote.Store.open(gpa, io, &self.directories());
-        defer store.deinit();
-        try store.save(&.{
-            .token = "42:secret",
-            .id = 42,
-            .username = "drinky_bot",
-            .chat_id = 99,
-        });
-        self.telegram = try remote.testing.Telegram.init(gpa, io, scripts);
-    }
-
-    fn passSpacing(clock: *remote.testing.Clock) void {
-        while (true) clock.pass(remote.Attachment.send_spacing_ms) catch return;
-    }
-
     fn deinit(self: *Rig) void {
-        if (self.pacer) |*pacer| pacer.cancel(self.app.io);
         self.app.deinit();
         self.out.deinit();
         self.transport.deinit();
-        if (self.telegram) |*telegram| telegram.deinit();
         self.environment.deinit();
         std.testing.allocator.free(self.directory);
         self.tmp.cleanup();
@@ -2346,7 +1897,7 @@ const Rig = struct {
     fn settle(self: *Rig) !void {
         var batch: [queue_capacity]UiEvent = undefined;
         for (0..1 << 16) |_| {
-            const waits = self.app.runningTurn() != null or self.app.mode == .fetch or
+            const waits = self.app.mode == .turn or self.app.mode == .fetch or
                 self.app.mode == .sign_in;
             const count = try self.app.queue.get(self.app.io, &batch, if (waits) 1 else 0);
             if (count == 0) return;
@@ -2361,23 +1912,6 @@ const Rig = struct {
 
     fn lastRequest(self: *const Rig) []const u8 {
         return self.transport.requests.items[self.transport.requests.items.len - 1];
-    }
-
-    fn pumpUntilSent(self: *Rig, needle: []const u8) ![]const u8 {
-        var sent = try self.app.io.concurrent(tickOnSend, .{ self, needle });
-        defer sent.cancel(self.app.io);
-        var batch: [queue_capacity]UiEvent = undefined;
-        for (0..1 << 16) |_| {
-            if (self.telegram.?.sentWith(needle)) |body| return body;
-            const count = try self.app.queue.get(self.app.io, &batch, 1);
-            _ = try self.app.applyBatch(batch[0..count]);
-        }
-        return error.TooManyEvents;
-    }
-
-    fn tickOnSend(self: *Rig, needle: []const u8) void {
-        _ = self.telegram.?.waitForSent(needle) catch return;
-        self.app.queue.putOne(self.app.io, .tick) catch {};
     }
 
     fn pumpUntil(self: *Rig, reached: *const fn (app: *const App) bool) !void {
@@ -2426,14 +1960,6 @@ fn expectEventText(rig: *const Rig, text: []const u8) !void {
     };
     std.debug.print("the transcript holds no event \"{s}\"\n", .{text});
     return error.TestExpectedEvent;
-}
-
-fn expectUserBlock(rig: *const Rig, text: []const u8) !void {
-    for (rig.blocks()) |*block| switch (block.content) {
-        .user => |user| if (std.mem.eql(u8, user.items, text)) return,
-        else => {},
-    };
-    return error.TestExpectedUserBlock;
 }
 
 fn expectRequestHolds(rig: *const Rig, index: usize, needle: []const u8) !void {
@@ -2690,11 +2216,13 @@ test "a notice that replaces the send offer of a refused command line withdraws 
 
     try rig.keys("/nope\r");
     try expectNoticeHolds(&rig, "Enter: Send as a message");
-    onRemoteAction(&rig.app, &.{ .report = .{
-        .kind = .notice,
-        .severity = .information,
-        .text = "Paste the token that @BotFather gave you.",
+    emitAccountsEvent(&rig.app, &.{ .refused = .{
+        .account = accounts.testing.openai_api_key,
+        .command = .fetch,
+        .reason = .busy,
     } });
+    try rig.settle();
+    try expectNoticeHolds(&rig, "Drinky cannot start this now");
     try rig.keys("\r");
     try std.testing.expect(rig.app.mode == .prompt);
     try expectNoticeHolds(&rig, "Enter: Send as a message");
@@ -3004,104 +2532,6 @@ test "a failed allocation at the sink ends the turn, and a refusal keeps its mes
     try expectTurnEndAfterFailedAllocation(&.{ .prompt_refused = .turn_running }, "hi");
 }
 
-const telegram_ok_true = "{\"ok\":true,\"result\":true}";
-const telegram_ok_sent = "{\"ok\":true,\"result\":{\"message_id\":1}}";
-const telegram_sent_replies = [_]remote.testing.Reply{.{ .body = telegram_ok_sent }} ** 8;
-const telegram_true_replies = [_]remote.testing.Reply{.{ .body = telegram_ok_true }} ** 8;
-
-fn chatScripts(comptime updates: []const u8) []const remote.testing.Script {
-    return &.{
-        .{ .method = "deleteWebhook", .replies = &.{.{ .body = telegram_ok_true }} },
-        .{ .method = "setMyCommands", .replies = &.{.{ .body = telegram_ok_true }} },
-        .{ .method = "getUpdates", .replies = &.{
-            .{ .body = "{\"ok\":true,\"result\":[]}" },
-            .{ .body = updates },
-        } },
-        .{ .method = "sendMessage", .replies = &telegram_sent_replies },
-        .{ .method = "editMessageText", .replies = &telegram_true_replies },
-        .{ .method = "deleteMessage", .replies = &telegram_true_replies },
-    };
-}
-
-const chat_hi = chatScripts(
-    \\{"ok":true,"result":[{"update_id":1,"message":{"message_id":7,"date":0,
-    \\"chat":{"id":99,"type":"private"},"text":"hi"}}]}
-);
-
-const chat_commands = chatScripts(
-    \\{"ok":true,"result":[
-    \\{"update_id":1,"message":{"message_id":7,"date":0,"chat":{"id":99,
-    \\"type":"private"},"text":"/effort"}},
-    \\{"update_id":2,"message":{"message_id":8,"date":0,"chat":{"id":99,
-    \\"type":"private"},"text":"/new"}},
-    \\{"update_id":3,"message":{"message_id":9,"date":0,"chat":{"id":99,
-    \\"type":"private"},"text":"hi"}}
-    \\]}
-);
-
-const chat_hi_more = chatScripts(
-    \\{"ok":true,"result":[
-    \\{"update_id":1,"message":{"message_id":7,"date":0,"chat":{"id":99,
-    \\"type":"private"},"text":"hi"}},
-    \\{"update_id":2,"message":{"message_id":8,"date":0,"chat":{"id":99,
-    \\"type":"private"},"text":"more"}}
-    \\]}
-);
-
-test "a chat message runs as a prompt, and a chat message during the turn gets a refusal" {
-    var stall: providers.testing.FakeTransport.Stall = .{ .io = std.testing.io };
-    const replies = [_]providers.testing.FakeTransport.Reply{.{ .stall = &stall }};
-    var rig: Rig = undefined;
-    try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
-        .replies = &replies,
-        .model = "gpt-5.6-sol",
-        .telegram = chat_hi_more,
-    });
-    defer rig.deinit();
-
-    try rig.app.controller.attachSaved(0);
-    const refusal = try rig.pumpUntilSent("\"reply_parameters\":{\"message_id\":8}");
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        refusal,
-        "A turn runs, so Drinky did not send the message.",
-    ) != null);
-    try std.testing.expect(rig.app.mode == .remote);
-    try std.testing.expectEqual(Herdr.State.working, rig.app.herdrState());
-    try stall.reached.wait(std.testing.io);
-    try expectRequestHolds(&rig, 0, "\"text\":\"hi\"");
-    try expectUserBlock(&rig, "hi");
-
-    try rig.app.cancelTurn();
-    try rig.settle();
-    try std.testing.expect(stall.canceled);
-    try std.testing.expect(rig.app.mode == .remote);
-    try std.testing.expectEqual(Herdr.State.idle, rig.app.herdrState());
-    try expectLastEvent(&rig, "You canceled the turn.");
-}
-
-test "a chat runs /new, refuses a terminal command, and refuses a message without a model" {
-    var rig: Rig = undefined;
-    try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
-        .telegram = chat_commands,
-    });
-    defer rig.deinit();
-
-    try rig.app.controller.attachSaved(0);
-    const refusal = try rig.pumpUntilSent("\"reply_parameters\":{\"message_id\":9}");
-    try std.testing.expect(std.mem.indexOf(u8, refusal, no_model_refusal_telegram) != null);
-    const terminal_only = rig.telegram.?.sentWith("\"reply_parameters\":{\"message_id\":7}").?;
-    try std.testing.expect(std.mem.indexOf(
-        u8,
-        terminal_only,
-        "The command /effort runs in the terminal alone.",
-    ) != null);
-    try expectEventText(&rig, "You cleared the conversation while @drinky_bot is attached.");
-    try std.testing.expectEqual(@as(usize, 0), rig.transport.requests.items.len);
-}
-
 const rejected_reply: providers.testing.FakeTransport.Reply = .{
     .status = .unauthorized,
     .body = "{\"error\":{\"message\":\"expired\"}}",
@@ -3121,65 +2551,49 @@ const plan_options: Rig.Options = .{
     .model_accounts = &.{ accounts.testing.openai_plan, accounts.testing.openai_api_key },
 };
 
-test "a rejected plan credential leaves the store, and the chat stays with the next account" {
-    var options = plan_options;
-    options.telegram = chat_hi;
-    var rig: Rig = undefined;
-    try rig.init(&options);
-    defer rig.deinit();
-    try std.testing.expectEqual(accounts.testing.openai_plan, rig.app.choice.account.?);
-
-    try accounts.testing.writeStore(rig.app.io, &rig.tmp, planStore("second"));
-    try rig.app.controller.attachSaved(0);
-    const hand_off_text =
-        "Drinky signed out of openai-plan. Drinky now uses openai-api-key/gpt-5.6-sol.";
-    _ = try rig.pumpUntilSent(hand_off_text);
-    try rig.settle();
-    try std.testing.expectEqual(remote.Controller.State.attached, rig.app.controller.state());
-    try std.testing.expectEqual(@as(usize, 2), rig.transport.requests.items.len);
-    try expectRequestHolds(&rig, 0, "authorization: Bearer access-first\n");
-    try expectRequestHolds(&rig, 1, "authorization: Bearer access-second\n");
-    try std.testing.expect(!rig.app.account_registry.isAuthenticated(accounts.testing.openai_plan));
-    try std.testing.expectEqual(accounts.testing.openai_api_key, rig.app.choice.account.?);
-    try std.testing.expectEqualStrings("openai-api-key", rig.app.screen.statusInfo(0).account.?);
-    try expectEventText(&rig, hand_off_text);
-}
-
-fn detached(app: *const App) bool {
-    return app.controller.state() == .idle;
-}
-
-fn expectRejectionDetach(
+fn expectRejectionHandOff(
     options: *const Rig.Options,
-    comptime step: []const u8,
+    event: []const u8,
     rest: std.meta.Tag(Mode),
 ) !void {
     var rig: Rig = undefined;
     try rig.init(options);
     defer rig.deinit();
+    try std.testing.expectEqual(accounts.testing.openai_plan, rig.app.choice.account.?);
 
     try accounts.testing.writeStore(rig.app.io, &rig.tmp, planStore("second"));
-    try rig.app.controller.attachSaved(0);
-    const detach_text = "The credential is missing or invalid, so Drinky detached @drinky_bot. " ++
-        step;
-    _ = try rig.pumpUntilSent(detach_text);
+    try rig.keys("hi\r");
     try rig.settle();
-    try std.testing.expect(rig.app.controller.state() != .attached);
+    try std.testing.expectEqual(@as(usize, 2), rig.transport.requests.items.len);
+    try expectRequestHolds(&rig, 0, "authorization: Bearer access-first\n");
+    try expectRequestHolds(&rig, 1, "authorization: Bearer access-second\n");
     try std.testing.expect(!rig.app.account_registry.isAuthenticated(accounts.testing.openai_plan));
-    try expectEventText(&rig, detach_text);
-    try rig.pumpUntil(detached);
+    try expectEventHolds(&rig, event);
     try std.testing.expectEqual(rest, std.meta.activeTag(rig.app.mode));
 }
 
-test "a rejected plan credential detaches the bot, and the sign-in picker waits for the detach" {
+test "a rejected plan credential leaves the store and hands the session to the next account" {
+    try expectRejectionHandOff(
+        &plan_options,
+        "Drinky signed out of openai-plan. Drinky now uses openai-api-key/gpt-5.6-sol.",
+        .prompt,
+    );
+
     var model_step = plan_options;
     model_step.model_accounts = &.{accounts.testing.openai_plan};
-    model_step.telegram = chat_hi;
-    try expectRejectionDetach(&model_step, "Select a model in the terminal.", .prompt);
+    try expectRejectionHandOff(
+        &model_step,
+        "Drinky signed out of openai-plan. Drinky now uses openai-api-key. ",
+        .prompt,
+    );
 
     var sign_in_step = model_step;
     sign_in_step.variables = &.{};
-    try expectRejectionDetach(&sign_in_step, "Sign in again in the terminal.", .picker);
+    try expectRejectionHandOff(
+        &sign_in_step,
+        "Drinky signed out of openai-plan. Select an account to sign in.",
+        .picker,
+    );
 }
 
 test "a rejected key credential keeps its account" {
@@ -3256,7 +2670,7 @@ fn expectEventHolds(rig: *const Rig, needle: []const u8) !void {
     return error.TestExpectedEvent;
 }
 
-test "the start reports each dropped config value, each notice, and a corrupt bot store" {
+test "the start reports each dropped config value and each notice" {
     var rig: Rig = undefined;
     try rig.init(&.{
         .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
@@ -3267,7 +2681,6 @@ test "the start reports each dropped config value, each notice, and a corrupt bo
             tools.SkillGuard.rules_max ++ "{\"glob\":\"*.md\",\"skill\":\"docs\"}]," ++
             "\"mystery\":1}",
         .files = &.{
-            .{ ".drinky/remote.json", "{ not json" },
             .{ ".agents/skills/broken/SKILL.md", "no front matter" },
             .{
                 ".agents/skills/docs/SKILL.md",
@@ -3293,9 +2706,6 @@ test "the start reports each dropped config value, each notice, and a corrupt bo
     try expectEventHolds(&rig, "missing.md");
     try expectEventHolds(&rig, "because the YAML front matter is missing.");
     try expectEventHolds(&rig, "Drinky used only the first 64 required skills in ");
-    const bots = eventWith(&rig, "Drinky could not read the saved bots in ") orelse
-        return error.TestExpectedEvent;
-    try std.testing.expect(std.mem.endsWith(u8, bots, "because of error CorruptStore."));
 
     var corrupt: Rig = undefined;
     try corrupt.init(&.{
@@ -3459,30 +2869,4 @@ test "the page keys scroll the page, M toggles the source, and Esc closes the pa
     try std.testing.expectEqual(ui.Page.Presentation.markdown, page.presentation);
     try rig.escape();
     try std.testing.expect(rig.app.mode == .prompt);
-}
-
-test "the token prompt refuses a blank or malformed token, and Ctrl+C clears before it cancels" {
-    var rig: Rig = undefined;
-    try rig.init(&.{ .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }} });
-    defer rig.deinit();
-    try rig.keys("/remote\r");
-    try std.testing.expect(rig.app.mode == .picker);
-    try rig.keys("\r");
-    try std.testing.expect(rig.app.mode == .token_prompt);
-    try std.testing.expectEqualStrings("Bot token", rig.app.caption().?.title);
-    try expectNoticeHolds(&rig, "Paste the token that @BotFather gave you.");
-
-    try rig.keys("\r");
-    try std.testing.expect(rig.app.mode == .token_prompt);
-    try expectNoticeHolds(&rig, "Type the bot token.");
-    try rig.keys("not a token\r");
-    try std.testing.expect(rig.app.mode == .token_prompt);
-    try expectNoticeHolds(&rig, "A bot token holds digits, a colon, and the letters");
-
-    try rig.keys("\x03");
-    try std.testing.expect(rig.app.mode == .token_prompt);
-    try std.testing.expectEqualStrings("", rig.app.screen.editor.visible());
-    try rig.keys("\x03");
-    try std.testing.expect(rig.app.mode == .prompt);
-    try expectNoticeHolds(&rig, "You canceled the bot token.");
 }

@@ -13,10 +13,6 @@ when the user drops it.
 
 ## Open items
 
-- Drinky can abort after a sleep or a network change of macOS while a Telegram bot is attached. One
-  terminal trace names errno 49, and one crash report names `EBADF` with `SIGABRT`. Their relation
-  stays unproven. A fix in the standard library outranks a workaround in Drinky. Trigger: another
-  occurrence with its terminal trace, its exit status, and its crash report.
 - A reasoning passage of `anthropic-api/claude-fable-5-1` showed three blank rows where one
   paragraph separator belongs. A transcript copy cannot tell doubled block-boundary newlines from an
   invisible Unicode byte. Trigger: a capture of the raw SSE frames of such a passage.
@@ -58,44 +54,26 @@ when the user drops it.
   `Failed turn` above the editor. Ctrl+N then sent a `<retry_request>` that named the failure. The
   request asked the model to continue from the last committed checkpoint. The transcript showed the
   note `Drinky asked the model to continue from the committed work.` in place of the request. A
-  failed retry attempt offered the retry again. The Telegram chat showed a `Failed turn` message
-  with `Try again` and `Dismiss`. Esc or a new turn dismissed the offer, and Herdr read the wait as
-  `blocked`. The user wants the offer back when the core makes it cheap. A turn that failed before
-  its first commit keeps its user message in the conversation too. The session appends the message
-  before the turn starts, and the editor holds no copy of it.
+  failed retry attempt offered the retry again. Esc or a new turn dismissed the offer, and Herdr
+  read the wait as `blocked`. The user wants the offer back when the core makes it cheap. A turn
+  that failed before its first commit keeps its user message in the conversation too. The session
+  appends the message before the turn starts, and the editor holds no copy of it.
 - A canceled turn that committed work stays in the conversation as it is. Under the caption
   `Canceled turn`, Ctrl+N removed the turn from the conversation and the transcript. It kept the
-  events of the session and retreated the chat cursor over the removed blocks. It returned the
-  prompt and the committed steering messages to the editor as editable text. A turn that ran
-  `write`, `edit`, or `bash` warned first and removed on the second press. Esc kept the turn, and a
-  new turn or `/new` dropped the offer. The user wants the removal back when the core makes it
-  cheap.
+  events of the session. It returned the prompt and the committed steering messages to the editor as
+  editable text. A turn that ran `write`, `edit`, or `bash` warned first and removed on the second
+  press. Esc kept the turn, and a new turn or `/new` dropped the offer. The user wants the removal
+  back when the core makes it cheap.
 - Drinky takes no message during a turn. Enter queued the line as a steering message. The turn took
   the queue at its next tool round as one combined user message. Ctrl+P moved the queued messages
-  back into the editor above the draft. A Telegram message during a turn queued the same way, with a
-  reaction on the queue, the commit, and the drop. A `Withdraw` button stood beside `Cancel turn`. A
-  cancel or a failure returned the uncommitted messages to the editor. A `steer` command can return
-  once the core and the design stand.
-- The chat runs `/new` alone, and a tap gets no toast. `/effort`, `/model`, `/help`, `/skill`, and
-  `/status` ran from the chat too, and the bot registered them with `setMyCommands`. A command that
-  picks opened an inline keyboard with one button per row and a `✓` mark on the current row. A step
-  below the first added a `‹ Back` button, and every keyboard ended with a `Cancel` button. The
-  keyboard held the first 98 rows and named no dropped row. A step edited the same message, and the
-  back trail held eight steps. A return can state the dropped rows. A model step with no cached list
-  named the terminal for the fetch. A tapped skill row loaded its skill with no task. A return can
-  let the user add optional task text after the selection. `/status` replied in the chat, wrote no
-  terminal event, and ran during a turn too. The last answer of a completed turn carried a `Shorten`
-  button. Its tap sent a fixed request for a phone-screen summary and kept the editor text. The
-  transcript showed the note `Drinky asked the model to shorten the last answer.` in place of a
-  prompt. A stale, closed, or busy tap got a toast that named the reason. A random seed per process
-  kept a keyboard of an earlier process stale.
+  back into the editor above the draft. A cancel or a failure returned the uncommitted messages to
+  the editor. A `steer` command can return once the core and the design stand.
 - Drinky has no `/status` command, and no command runs during a turn. `/status` recorded the status
   line as one terminal event in full. The event named the directory, the branch, the context gauge
   with its token counts, and the cost. It named the quota windows, the credit pool, and the cache
   rate of a running turn, then the account, the model, and the effort. Inside a Herdr pane, it named
   the directory and the branch that the status line leaves to the pane label. It ran during a turn
-  too, and its event waited for the message boundary and survived the rewind of a failed turn. Two
-  requests in a row wrote two events in place of a repeat count.
+  too, and its event waited for the message boundary and survived the rewind of a failed turn.
 - Drinky keeps no principal marker and settles no session on a reread of the credential file. A
   login saved the account and organization ids of the Anthropic OAuth profile and the user id of the
   xAI id token. A stored token of the same principal counted as a rotation, and a token of another
@@ -112,17 +90,8 @@ when the user drops it.
   the server rotated away forces a new sign-in, and no text names the cause. A notice needs a path
   from the credential to the client. Trigger: a sign-in that a lost refresh token forces after a
   restart.
-- `/prompt` opens the prompt history as an editable picker in the terminal and as an inline keyboard
-  in Telegram. A selection in Telegram starts its saved prompt at once. Plain Telegram messages that
-  start a turn enter the history, and steering messages and skill commands stay out. Trigger: the
-  return of the prompt history.
-- A canceled turn in Telegram offers `Revise`, which removes that turn from the conversation and
-  waits for the next Telegram message. The offer has no `Keep` button, so a new message or `/new`
-  keeps the canceled turn and dismisses the offer. The chat keeps the original messages and
-  reactions, and the canceled summary states `Removed from conversation`. A stale tap reports that
-  the revision is unavailable. After `write`, `edit`, or `bash`, the first tap warns that tool
-  changes stay, and the second tap removes the turn. Trigger: the return of the removal of a
-  canceled turn.
+- `/prompt` opens the prompt history as an editable picker. Steering messages and skill commands
+  stay out of the history. Trigger: the return of the prompt history.
 - No test covers the paint of the client when its frame task cannot start. `App.armTick` then paints
   at once, and `App.refresh` reads the size and switches the screen through the terminal. A test
   needs a terminal that it can fake. Trigger: a second need for a seam of the terminal, such as a

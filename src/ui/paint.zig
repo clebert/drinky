@@ -85,7 +85,6 @@ pub const Mark = struct {
     start: usize,
     end: usize,
     role: role.Name,
-    url: ?[]const u8 = null,
     underline: bool = false,
 };
 
@@ -152,7 +151,7 @@ pub const Window = struct {
         body_rows: usize,
         viewport_rows: usize,
 
-        pub fn visibleRows(self: Extent) usize {
+        fn visibleRows(self: Extent) usize {
             return @min(self.body_rows, bodyLimit(self.viewport_rows));
         }
 
@@ -551,12 +550,8 @@ fn framedRowText(sink: *terminal.View.Sink, row: *const FramedRow) !void {
         std.debug.assert(start >= position);
         try sink.text(text[position..start]);
         try role.apply(sink, mark.role);
-        if (mark.underline or mark.url != null) try attribute.apply(sink, .underline);
-        if (mark.url) |url| {
-            try sink.linkSet(url);
-        }
+        if (mark.underline) try attribute.apply(sink, .underline);
         try sink.text(text[start..end]);
-        try sink.linkReset();
         try attribute.apply(sink, .reset);
         if (row.role) |name| try role.apply(sink, name);
         position = end;
@@ -1281,9 +1276,9 @@ test "a head notice keeps one row and marks its cut" {
     defer gpa.free(plain);
     try std.testing.expectEqualStrings("Drinky sends no" ++ ellipsis, plain);
 
-    const short = try paintedNotice(gpa, &style, "Esc: Detach", 16);
+    const short = try paintedNotice(gpa, &style, "Esc: Cancel", 16);
     defer gpa.free(short);
-    try std.testing.expectEqualStrings("Esc: Detach", short);
+    try std.testing.expectEqualStrings("Esc: Cancel", short);
 
     const dropped = try paintedNotice(gpa, &style, "boom\nmore", 16);
     defer gpa.free(dropped);

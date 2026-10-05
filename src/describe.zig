@@ -100,15 +100,11 @@ fn writeCommands(writer: *std.Io.Writer) !void {
             try writer.print(" The line `{s}` runs it too.", .{summary.alias});
         if (summary.tail.len > 0)
             try writer.print(" It takes {s} as trailing text.", .{summary.tail});
-        if (summary.remote)
-            try writer.writeAll(" It runs from the Telegram chat too.");
         try writer.writeByte('\n');
     }
     try writer.writeAll(
         "\nA command refuses text after its name unless its row names trailing text. " ++
-            "Drinky refuses every command while a turn runs, and the draft stays. A command " ++
-            "runs in the terminal alone unless its row says that it runs from the Telegram " ++
-            "chat too.\n",
+            "Drinky refuses every command while a turn runs, and the draft stays.\n",
     );
 }
 
@@ -124,8 +120,8 @@ fn writeKeys(writer: *std.Io.Writer, options: *const Options) !void {
         \\- Ctrl+C clears the editor. A second press within {d} milliseconds quits Drinky.
         \\- Ctrl+D quits at an empty editor. Ctrl+D with a draft warns first and quits on the
         \\  second press.
-        \\- Within {d} milliseconds after a Ctrl+D that ended a step, a page, a sign-in, a turn,
-        \\  or an attached bot, Ctrl+D warns first.
+        \\- Within {d} milliseconds after a Ctrl+D that ended a step, a page, a sign-in, or a turn,
+        \\  Ctrl+D warns first.
         \\
         \\A sign-in takes these keys:
         \\
@@ -143,17 +139,9 @@ fn writeKeys(writer: *std.Io.Writer, options: *const Options) !void {
         \\- Ctrl+D cancels the turn at once.
         \\- Ctrl+C clears a draft, and it cancels the turn at an empty editor.
         \\
-        \\While a Telegram bot is attached, the chat holds the input, and the terminal takes these
-        \\keys:
-        \\
-        \\- Esc, Ctrl+C, or Ctrl+D detaches the bot. The same keys during the detach end the wait,
-        \\  and the last message to the chat stays unsent.
-        \\- Enter shows a notice that names the bot and the key that detaches it.
-        \\- Drinky ignores every other key.
-        \\
-        \\This section names the keys of the prompt, a sign-in, a turn, and an attached bot. A
-        \\full-window page states its own keys in its header, and the editor carries the movement
-        \\keys of a text field.
+        \\This section names the keys of the prompt, a sign-in, and a turn. A full-window page
+        \\states its own keys in its header, and the editor carries the movement keys of a text
+        \\field.
         \\
     , .{ options.repeat_window_ms, options.repeat_window_ms });
 }

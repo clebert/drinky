@@ -225,14 +225,6 @@ pub fn render(placement: *const paint.Placement, info: *const Info) !void {
     placement.end(placement.base);
 }
 
-pub fn writeNumbers(out: *std.Io.Writer, info: *const Info) !void {
-    var scratch: [128]u8 = undefined;
-    var line: Line = .init(&scratch);
-    try writeContext(&line, info, .short);
-    try writeCost(&line, info);
-    try out.writeAll(line.text());
-}
-
 fn writeRight(line: *Line, info: *const Info, parts: *const Parts) !void {
     try line.out.writeAll("Model: ");
     const value_start = line.offset();
@@ -502,36 +494,23 @@ const test_info: Info = .{
     .turn_active = true,
 };
 
-test "the numbers state the gauge in its short form and the cost" {
-    var buffer: [128]u8 = undefined;
-    var out: std.Io.Writer = .fixed(&buffer);
-    try writeNumbers(&out, &test_info);
-    try std.testing.expectEqualStrings("Context: 21% · Cost: ~$0.39", out.buffered());
-
-    var unknown = test_info;
-    unknown.context_tokens = null;
-    unknown.cost = 0;
-    out = .fixed(&buffer);
-    try writeNumbers(&out, &unknown);
-    try std.testing.expectEqualStrings("Context: Unknown · Cost: ~$0.00", out.buffered());
-}
-
 test "a positive sub-cent cost never displays as zero" {
     const cases = [_]struct { cost: f64, expected: []const u8 }{
-        .{ .cost = 0.000123, .expected = " · Cost: ~$0.01" },
-        .{ .cost = 0.00999, .expected = " · Cost: ~$0.01" },
-        .{ .cost = 1e-12, .expected = " · Cost: ~$0.01" },
-        .{ .cost = 0, .expected = " · Cost: ~$0.00" },
-        .{ .cost = 0.01, .expected = " · Cost: ~$0.01" },
-        .{ .cost = 0.42, .expected = " · Cost: ~$0.42" },
+        .{ .cost = 0.000123, .expected = " · Cost: ~$0.01 · " },
+        .{ .cost = 0.00999, .expected = " · Cost: ~$0.01 · " },
+        .{ .cost = 1e-12, .expected = " · Cost: ~$0.01 · " },
+        .{ .cost = 0, .expected = " · Cost: ~$0.00 · " },
+        .{ .cost = 0.01, .expected = " · Cost: ~$0.01 · " },
+        .{ .cost = 0.42, .expected = " · Cost: ~$0.42 · " },
     };
     for (cases) |case| {
         var info = test_info;
         info.cost = case.cost;
-        var buffer: [64]u8 = undefined;
-        var out: std.Io.Writer = .fixed(&buffer);
-        try writeNumbers(&out, &info);
-        try std.testing.expectStringEndsWith(out.buffered(), case.expected);
+        var rig: testing.Rig = undefined;
+        rig.init(std.testing.allocator);
+        defer rig.deinit();
+        try renderForTest(&rig, &info, 200);
+        try testing.expectShows(try rig.painted(), &.{case.expected});
     }
 }
 

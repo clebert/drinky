@@ -1,7 +1,6 @@
 # Drinky
 
 Drinky is a dependency-free Zig coding agent that keeps the conversation in the terminal scrollback.
-A Telegram bot can drive the session from its chat while the terminal shows the work.
 
 ## Layers
 
@@ -36,17 +35,10 @@ every library. `lib/providers` and `lib/tools` import `lib/core`, and `lib/accou
   `Screen.zig`, and `Screen.zig` paints the widgets that it holds. The client reads no session
   state, and `Choice.zig` holds the account, the model, and the effort that the client chose. `src`
   also holds the slash commands under `src/command/` and the instruction and skill discovery under
-  `src/discovery/`. It holds the widgets under `src/ui/`, the Telegram remote under `src/remote/`,
-  and Herdr too. `src` names no vendor, wire, or account row. It reads each such fact from
-  `lib/accounts`.
-- The remote controller reports an action through its sink, and the client translates it into a
-  command. The remote depends on neither the session nor the account registry. Its store uses the
-  JSON store of `lib/accounts`. Its HTTP client uses the timeout race of `lib/core` and the
-  transport of `lib/providers`. The store and the HTTP client read JSON through the accessors of
-  `lib/providers`.
-- `src/ui/role.zig` maps a role to terminal colors, and `src/remote/html.zig` maps a role to the
-  look of a Telegram message. A widget names a role and writes no color of its own. `Message.zig`
-  holds the severity that a notice, an event, and a chat message share.
+  `src/discovery/`. It holds the widgets under `src/ui/` and Herdr too. `src` names no vendor, wire,
+  or account row. It reads each such fact from `lib/accounts`.
+- `src/ui/role.zig` maps a role to terminal colors. A widget names a role and writes no color of its
+  own. `Message.zig` holds the severity that a notice and an event share.
 
 A loop task lends state to its child task and touches none of it until the child ends. The child
 returns its result with its end. A lock guards state that the tasks of two actors share.
@@ -165,15 +157,6 @@ terminal-width limits when you reword a text.
 Use `drinky` for a machine-parsed name and format it as code. Use `Drinky` for the product in prose
 and in user-facing text, and never start a sentence with lowercase `drinky`. Reserve `DRINKY` for an
 environment variable.
-
-## Remote vocabulary
-
-- **bot**: The Telegram account with its token.
-- **chat**: The private exchange of Telegram messages between the bot and the user.
-- **Telegram**: The source of messages, updates, and actions.
-
-Reserve **conversation** for the model conversation that `/new` clears. Never write **bot** for a
-message from the user, because a bot message reads as a message that the bot wrote.
 
 ## Models vocabulary
 

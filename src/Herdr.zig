@@ -3,7 +3,7 @@ const std = @import("std");
 const accounts = @import("accounts");
 const core = @import("core");
 
-const remote = @import("remote/root.zig");
+const testing = @import("testing.zig");
 
 const Herdr = @This();
 
@@ -261,7 +261,7 @@ const FakeHerdr = struct {
 
 test "the reporter numbers its lines from the clock, forwards each change once, and releases" {
     const gpa = std.testing.allocator;
-    var clock: remote.testing.Clock = undefined;
+    var clock: testing.Clock = undefined;
     clock.init(gpa);
     defer clock.deinit();
     clock.advance(std.time.ms_per_s);

@@ -12,7 +12,6 @@ pub const model = @import("model.zig");
 const effort = @import("effort.zig");
 const logout = @import("logout.zig");
 const new = @import("new.zig");
-const remote = @import("remote.zig");
 const skill = @import("skill.zig");
 const sources = @import("sources.zig");
 const system = @import("system.zig");
@@ -22,7 +21,6 @@ const Entry = struct {
     name: []const u8,
     summary: []const u8,
     run: *const fn (*Context) Context.Error!Context.Outcome,
-    remote: bool,
 };
 
 const help_name = "help";
@@ -32,66 +30,15 @@ const skill_prefix = skill.name ++ ":";
 const help_opener: Context.Outcome.Opener = .{ .open = reopenHelp };
 
 const commands = [_]Entry{
-    .{
-        .name = effort.name,
-        .summary = effort.summary,
-        .run = effort.run,
-        .remote = false,
-    },
-    .{
-        .name = help_name,
-        .summary = help_summary,
-        .run = runHelp,
-        .remote = false,
-    },
-    .{
-        .name = login.name,
-        .summary = login.summary,
-        .run = login.run,
-        .remote = false,
-    },
-    .{
-        .name = logout.name,
-        .summary = logout.summary,
-        .run = logout.run,
-        .remote = false,
-    },
-    .{
-        .name = model.name,
-        .summary = model.summary,
-        .run = model.run,
-        .remote = false,
-    },
-    .{
-        .name = new.name,
-        .summary = new.summary,
-        .run = new.run,
-        .remote = true,
-    },
-    .{
-        .name = remote.name,
-        .summary = remote.summary,
-        .run = remote.run,
-        .remote = false,
-    },
-    .{
-        .name = skill.name,
-        .summary = skill.summary,
-        .run = skill.run,
-        .remote = false,
-    },
-    .{
-        .name = sources.name,
-        .summary = sources.summary,
-        .run = sources.run,
-        .remote = false,
-    },
-    .{
-        .name = system.name,
-        .summary = system.summary,
-        .run = system.run,
-        .remote = false,
-    },
+    .{ .name = effort.name, .summary = effort.summary, .run = effort.run },
+    .{ .name = help_name, .summary = help_summary, .run = runHelp },
+    .{ .name = login.name, .summary = login.summary, .run = login.run },
+    .{ .name = logout.name, .summary = logout.summary, .run = logout.run },
+    .{ .name = model.name, .summary = model.summary, .run = model.run },
+    .{ .name = new.name, .summary = new.summary, .run = new.run },
+    .{ .name = skill.name, .summary = skill.summary, .run = skill.run },
+    .{ .name = sources.name, .summary = sources.summary, .run = sources.run },
+    .{ .name = system.name, .summary = system.summary, .run = system.run },
 };
 
 comptime {
@@ -106,7 +53,6 @@ const Summary = struct {
     summary: []const u8,
     alias: []const u8 = "",
     tail: []const u8 = "",
-    remote: bool,
 };
 
 pub const summaries = blk: {
@@ -115,13 +61,11 @@ pub const summaries = blk: {
         .name = entry.name,
         .summary = entry.summary,
         .alias = aliasOf(entry.name),
-        .remote = entry.remote,
     };
     list[commands.len] = .{
         .name = skill_prefix ++ "name",
         .summary = "Load a skill",
         .tail = "the task of the skill",
-        .remote = false,
     };
     break :blk list;
 };
@@ -203,12 +147,8 @@ fn selectCommand(
 
 pub fn check(context: *Context, line: []const u8) !?Message {
     const name = parse(line) orelse return null;
-    if (loadsSkill(name)) {
-        if (try checkSkill(context, name)) |refusal| return refusal;
-        return if (context.remote) try terminalOnly(context.gpa, name) else null;
-    }
-    const entry = lookup(name) orelse return try unknownCommand(context.gpa, name);
-    if (context.remote and !entry.remote) return try terminalOnly(context.gpa, entry.name);
+    if (loadsSkill(name)) return checkSkill(context, name);
+    if (lookup(name) == null) return try unknownCommand(context.gpa, name);
     if (tail(line, name).len > 0) return try Message.print(
         context.gpa,
         .warning,
@@ -243,10 +183,6 @@ fn checkSkill(context: *Context, command_name: []const u8) !?Message {
     const name = command_name[skill_prefix.len..];
     if (context.skill_registry.get(name) == null) return try unknownSkill(context.gpa, name);
     return null;
-}
-
-fn terminalOnly(gpa: std.mem.Allocator, name: []const u8) !Message {
-    return Message.print(gpa, .warning, "The command /{s} runs in the terminal alone.", .{name});
 }
 
 fn unknownCommand(gpa: std.mem.Allocator, name: []const u8) !Message {
@@ -297,16 +233,6 @@ test "a command line during a turn gets a refusal, and a message line gets none"
     );
     const unknown = (try checkDuringTurn(&context, "/nope")).?;
     try testing.expectMessage(&unknown, .warning, "Drinky does not recognize the command /nope.");
-
-    context.remote = true;
-    const chat = (try checkDuringTurn(&context, "/new")).?;
-    try testing.expectMessage(&chat, .warning, "The command /new cannot run while a turn runs.");
-    const terminal = (try checkDuringTurn(&context, "/effort")).?;
-    try testing.expectMessage(
-        &terminal,
-        .warning,
-        "The command /effort runs in the terminal alone.",
-    );
 }
 
 test "a line without a leading slash is not dispatched" {
@@ -366,13 +292,6 @@ test "skill prefix dispatch loads instructions and preserves trailing arguments"
         .warning,
         "does not recognize the skill",
     );
-
-    context.remote = true;
-    try testing.expectRefusal(
-        (try run(&context, "/skill:alpha apply it")).?,
-        .warning,
-        "The command /skill:alpha runs in the terminal alone.",
-    );
 }
 
 test "a line without a name opens its list, and a command row runs its command" {
@@ -411,41 +330,4 @@ test "a line without a name opens its list, and a command row runs its command" 
         .warning,
         "The command /help takes no argument.",
     );
-}
-
-test "a remote host runs /new alone" {
-    const gpa = std.testing.allocator;
-    var rig: testing.Rig = undefined;
-    try rig.init(&.{});
-    defer rig.deinit();
-    var context = rig.context();
-    context.remote = true;
-
-    const terminal_lines = [_][]const u8{
-        "/effort", "/help",  "/login",   "/logout", "/model",
-        "/remote", "/skill", "/sources", "/system",
-    };
-    for (terminal_lines) |line| {
-        const refusal = (try check(&context, line)).?;
-        defer refusal.deinit(gpa);
-        try std.testing.expectEqual(Message.Severity.warning, refusal.severity);
-        const terminal_only = std.mem.endsWith(u8, refusal.content, "runs in the terminal alone.");
-        try std.testing.expect(terminal_only);
-        try std.testing.expect(std.mem.indexOf(u8, refusal.content, line) != null);
-    }
-    try testing.expectRefusal(
-        (try run(&context, "/")).?,
-        .warning,
-        "The command /help runs in the terminal alone.",
-    );
-    const unknown = (try run(&context, "/nope")).?;
-    try testing.expectRefusal(unknown, .warning, "does not recognize");
-    try std.testing.expect((try check(&context, "/new")) == null);
-    try std.testing.expect((try run(&context, "/new")).? == .new_conversation);
-
-    var registered: usize = 0;
-    for (summaries) |command| {
-        if (command.remote and command.tail.len == 0) registered += 1;
-    }
-    try std.testing.expectEqual(@as(usize, 1), registered);
 }

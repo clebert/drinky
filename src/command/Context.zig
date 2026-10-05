@@ -15,10 +15,8 @@ choice: *Choice,
 account_registry: *accounts.Registry,
 remembered_model_names: *const [accounts.Account.table.len]?[]const u8,
 skill_registry: *const discovery.skills.Registry,
-remote_bots: []const []const u8,
 system_prompt: []const u8,
 sources_page: []const u8,
-remote: bool = false,
 
 pub const Error = error{OutOfMemory};
 
@@ -34,9 +32,6 @@ pub const Outcome = union(enum) {
     logout: usize,
     fetch: usize,
     new_conversation,
-    remote_attach: usize,
-    remote_add,
-    remote_remove: usize,
 
     pub const Prompt = struct {
         name: []const u8,

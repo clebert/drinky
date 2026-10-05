@@ -15,7 +15,7 @@ const rule_columns = 80;
 
 const rule_cells = rule_cell ** rule_columns;
 
-pub const Look = struct {
+const Look = struct {
     role: ?role.Name = null,
     url: []const u8 = "",
     bold: bool = false,
@@ -160,12 +160,12 @@ const Fence = struct {
     }
 };
 
-pub const Table = struct {
+const Table = struct {
     count: usize,
     widths: [count_max]usize,
     indent: []const u8,
 
-    pub const count_max = 16;
+    const count_max = 16;
 
     const Border = struct { left: []const u8, joint: []const u8, right: []const u8 };
 
@@ -173,11 +173,11 @@ pub const Table = struct {
     const border_inner: Border = .{ .left = "├", .joint = "┼", .right = "┤" };
     const border_bottom: Border = .{ .left = "└", .joint = "┴", .right = "┘" };
 
-    pub const Cells = struct {
+    const Cells = struct {
         rest: []const u8,
         done: bool = false,
 
-        pub fn init(row: []const u8) Cells {
+        fn init(row: []const u8) Cells {
             var body = std.mem.trim(u8, row, " \t\r");
             if (body.len > 0 and body[0] == '|') body = body[1..];
             if (body.len > 0 and body[body.len - 1] == '|' and !isEscaped(body, body.len - 1)) {
@@ -186,7 +186,7 @@ pub const Table = struct {
             return .{ .rest = body };
         }
 
-        pub fn next(self: *Cells) ?[]const u8 {
+        fn next(self: *Cells) ?[]const u8 {
             if (self.done) return null;
             var search_from: usize = 0;
             while (std.mem.indexOfScalarPos(u8, self.rest, search_from, '|')) |pipe| {
@@ -282,7 +282,7 @@ pub const Table = struct {
         }
     }
 
-    pub fn measureRow(widths: []usize, row: []const u8) void {
+    fn measureRow(widths: []usize, row: []const u8) void {
         var cells = Cells.init(row);
         for (widths) |*width| {
             const cell = cells.next() orelse break;
@@ -402,11 +402,11 @@ pub const Table = struct {
     }
 };
 
-pub const Block = struct {
+const Block = struct {
     line: []const u8,
     kind: Kind,
 
-    pub const Kind = union(enum) {
+    const Kind = union(enum) {
         fence_open,
         fence_line,
         fence_close,
@@ -431,12 +431,12 @@ pub const Block = struct {
         body: []const u8,
     };
 
-    pub const TableRows = struct {
+    const TableRows = struct {
         count: usize,
         delimiter: []const u8,
         body: []const u8,
 
-        pub fn rows(self: *const TableRows) Rows {
+        fn rows(self: *const TableRows) Rows {
             return .{ .rest = if (self.body.len == 0) null else self.body };
         }
     };
@@ -444,7 +444,7 @@ pub const Block = struct {
     const Rows = struct {
         rest: ?[]const u8,
 
-        pub fn next(self: *Rows) ?[]const u8 {
+        fn next(self: *Rows) ?[]const u8 {
             const rest = self.rest orelse return null;
             const end = std.mem.indexOfScalar(u8, rest, '\n') orelse {
                 self.rest = null;
@@ -456,17 +456,13 @@ pub const Block = struct {
     };
 };
 
-pub const Blocks = struct {
+const Blocks = struct {
     text: []const u8,
     lines: std.mem.SplitIterator(u8, .scalar),
     fence: ?Fence = null,
 
-    pub fn init(text: []const u8) Blocks {
+    fn init(text: []const u8) Blocks {
         return .{ .text = text, .lines = std.mem.splitScalar(u8, text, '\n') };
-    }
-
-    pub fn fenced(self: *const Blocks) bool {
-        return self.fence != null;
     }
 
     fn peek(self: *Blocks) ?[]const u8 {
@@ -477,7 +473,7 @@ pub const Blocks = struct {
         return @intFromPtr(line.ptr) - @intFromPtr(self.text.ptr);
     }
 
-    pub fn next(self: *Blocks) ?Block {
+    fn next(self: *Blocks) ?Block {
         const line = std.mem.trimEnd(u8, self.lines.next() orelse return null, "\r");
         const indentation = leading(line);
         const rest = line[indentation..];
@@ -581,7 +577,7 @@ const Closer = struct {
 
 const Link = struct { label: Closer = .{ .byte = ']' }, url: Closer = .{ .byte = ')' } };
 
-pub const InlineScanner = struct {
+const InlineScanner = struct {
     text: []const u8,
     base: Look,
     look: Look,
@@ -599,11 +595,11 @@ pub const InlineScanner = struct {
     const Context = enum { block, table };
     const Span = struct { look: Look, bytes: []const u8 };
 
-    pub fn init(base: Look, text: []const u8, context: Context) InlineScanner {
+    fn init(base: Look, text: []const u8, context: Context) InlineScanner {
         return .{ .text = text, .base = base, .look = base, .context = context };
     }
 
-    pub fn next(self: *InlineScanner) ?Span {
+    fn next(self: *InlineScanner) ?Span {
         while (true) {
             while (self.queue_head < self.queue_len) {
                 const span = self.queue[self.queue_head];
@@ -2196,7 +2192,6 @@ test "the block iterator classifies each line once for every walker" {
         }
     }
     try std.testing.expect(blocks.next() == null);
-    try std.testing.expect(blocks.fenced());
 
     var bare: Blocks = .init("| a |\n|---|");
     const shape = bare.next().?.kind.table;

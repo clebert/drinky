@@ -53,15 +53,11 @@ pub const Event = struct {
     text: std.ArrayList(u8),
     severity: Message.Severity,
     survives_rewind: bool,
-    mirrored: bool,
-    repeats: usize,
-    base_len: usize,
 
     pub const Payload = struct {
         text: []const u8,
         severity: Message.Severity = .information,
         survives_rewind: bool = false,
-        mirrored: bool = true,
     };
 
     fn init(gpa: std.mem.Allocator, payload: *const Payload) !Event {
@@ -69,21 +65,7 @@ pub const Event = struct {
             .text = try copy(gpa, payload.text),
             .severity = payload.severity,
             .survives_rewind = payload.survives_rewind,
-            .mirrored = payload.mirrored,
-            .repeats = 1,
-            .base_len = payload.text.len,
         };
-    }
-
-    fn states(self: *const Event, payload: *const Payload) bool {
-        return self.severity == payload.severity and
-            self.survives_rewind == payload.survives_rewind and
-            self.mirrored == payload.mirrored and
-            std.mem.eql(u8, self.stated(), payload.text);
-    }
-
-    fn stated(self: *const Event) []const u8 {
-        return self.text.items[0..self.base_len];
     }
 };
 
@@ -187,26 +169,6 @@ pub fn takeRewritten(self: *Block, epoch: u64) bool {
 
 pub fn stampEpoch(self: *Block, epoch: u64) void {
     self.cache.epoch = epoch;
-}
-
-pub fn statesEvent(self: *const Block, payload: *const Event.Payload) bool {
-    return switch (self.content) {
-        .event => |*event| event.states(payload),
-        .intro, .user, .user_note, .thinking, .model, .tool_result => false,
-    };
-}
-
-pub fn repeatEvent(self: *Block, gpa: std.mem.Allocator) !void {
-    const event = &self.content.event;
-    const repeats = event.repeats + 1;
-    var text: std.ArrayList(u8) = .empty;
-    errdefer text.deinit(gpa);
-    try text.appendSlice(gpa, event.stated());
-    try text.print(gpa, "{s}Repeats: {d}", .{ paint.separator, repeats });
-    event.text.deinit(gpa);
-    event.text = text;
-    event.repeats = repeats;
-    self.cache.invalidate();
 }
 
 pub fn survivesRewind(self: *const Block) bool {
@@ -649,35 +611,6 @@ test "each notice paints the symbol of its kind in its role" {
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, painted, warning_sequence));
     try testing.expectHides(painted, &.{"Event: "});
     try testing.expectHides(painted, &.{"Error: "});
-}
-
-test "a repeated event states one count and matches its own text" {
-    const gpa = std.testing.allocator;
-    const stated: Block.Event.Payload = .{ .text = "no route to host", .severity = .failure };
-    var block = try Block.init(gpa, &.{ .event = stated });
-    defer block.deinit(gpa);
-
-    try std.testing.expect(block.statesEvent(&stated));
-    var other = stated;
-    other.mirrored = false;
-    try std.testing.expect(!block.statesEvent(&other));
-    other = stated;
-    other.severity = .warning;
-    try std.testing.expect(!block.statesEvent(&other));
-    other = stated;
-    other.survives_rewind = true;
-    try std.testing.expect(!block.statesEvent(&other));
-    other = stated;
-    other.text = "other";
-    try std.testing.expect(!block.statesEvent(&other));
-
-    for (0..9) |_| try block.repeatEvent(gpa);
-    const painted = try rendered(gpa, &block, 60, 0);
-    defer gpa.free(painted);
-    const plain = try terminal.testing.plainText(gpa, painted);
-    defer gpa.free(plain);
-    try std.testing.expectEqualStrings("⚠ no route to host · Repeats: 10", plain);
-    try std.testing.expect(block.statesEvent(&stated));
 }
 
 test "a clipped block streams into a warmed frame without allocating" {

@@ -11,7 +11,7 @@ pub const Backoff = struct {
     delay_ms_initial: u64 = 500,
     delay_ms_max: u64 = 16_000,
 
-    pub fn delay(self: *const Backoff, attempt: u32) u64 {
+    fn delay(self: *const Backoff, attempt: u32) u64 {
         const steps: u6 = @intCast(@min(attempt -| 1, std.math.maxInt(u6)));
         return @min(self.delay_ms_initial *| (@as(u64, 1) << steps), self.delay_ms_max);
     }

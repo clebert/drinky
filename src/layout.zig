@@ -44,7 +44,6 @@ pub const Tail = union(enum) {
         tools: []const ui.paint.Box,
         tracks: []Track,
         activity: ui.paint.Activity,
-        caption: ?ui.Caption,
         editor: *const ui.Editor,
     };
 };
@@ -259,7 +258,7 @@ fn tailSlot(tail: *const Tail, offset: usize) Slot {
             return editorSlot(&.{
                 .editor = turn.editor,
                 .activity = turn.activity,
-                .caption = turn.caption,
+                .caption = null,
             });
         },
     }
@@ -329,7 +328,6 @@ const Rig = struct {
         window_pages: usize = window_pages_default,
         tools: []const ui.paint.Box = &.{},
         tracks: []Track = &.{},
-        caption: ?ui.Caption = null,
     };
 
     fn init() Rig {
@@ -373,7 +371,6 @@ const Rig = struct {
                 .tools = options.tools,
                 .tracks = options.tracks,
                 .activity = .{ .motion_tick = 0, .progress_age_ticks = 0 },
-                .caption = options.caption,
                 .editor = &self.editor,
             } },
             .status = &test_status,
@@ -422,27 +419,6 @@ test "frame edge activity does not change the input tail height" {
     );
 }
 
-test "a turn tail shows its input caption above the editor" {
-    const gpa = std.testing.allocator;
-    var rig: Rig = .init();
-    defer rig.deinit();
-
-    const scene = rig.turn(&.{ .caption = .{
-        .title = "Remote: @drinky_bot",
-        .controls = "Esc: Detach",
-    } });
-    const painted = try projected(gpa, .{ .columns = 40, .rows = 24 }, &scene);
-    defer gpa.free(painted);
-
-    const title = std.mem.indexOf(u8, painted, "Remote: @drinky_bot").?;
-    const control = std.mem.indexOf(u8, painted, "Esc: Detach").?;
-    const frame = std.mem.indexOf(u8, painted, "─").?;
-    const footer = std.mem.indexOf(u8, painted, "footerqq").?;
-    try std.testing.expect(title < control);
-    try std.testing.expect(control < frame);
-    try std.testing.expect(frame < footer);
-}
-
 test "a prompt tail shows its input caption above the editor" {
     const gpa = std.testing.allocator;
     var rig: Rig = .init();
@@ -486,9 +462,9 @@ test "a narrow editor caption keeps every row inside the window" {
     var rig: Rig = .init();
     defer rig.deinit();
 
-    const scene = rig.turn(&.{ .caption = .{
-        .title = "Remote: @drinky_bot",
-        .controls = "Esc: Detach",
+    const scene = rig.prompt(&.{ .caption = .{
+        .title = "Sign in: anthropic-plan",
+        .controls = "Enter: Replay callback URL · Esc: Cancel",
     } });
     const painted = try projected(gpa, .{ .columns = 8, .rows = 24 }, &scene);
     defer gpa.free(painted);
