@@ -24,4 +24,5 @@ when the user drops it.
 
 ## Ideas
 
-- Restart the same prompt in a new session.
+- Add `/restart` to restart the same prompt in a new session.
+- Add `/reload` to reload skills and instructions without a restart.
