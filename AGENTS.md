@@ -8,7 +8,8 @@ Drinky is a dependency-free Zig coding agent that keeps the conversation in the 
 every library. `lib/providers` and `lib/tools` import `lib/core`, and `lib/accounts` imports
 `lib/core` and `lib/providers`. No other library imports another, and no library imports the app.
 
-- `lib/terminal` reads the keyboard and paints the screen. It knows no model and no provider.
+- `lib/terminal` reads the keyboard and paints the screen. It knows no model and no provider. It
+  holds the device seam that the client reads and paints through, and `Tty` implements it.
 - `lib/core` imports `std` alone. It holds the neutral conversation, the provider seam, the tool
   seam, the retry policy, and the session. It also holds the parts that the libraries share: the
   actor shell, the timeout race over `std.Io`, the compile-time check of an error set, and the

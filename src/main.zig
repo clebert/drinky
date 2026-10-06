@@ -77,13 +77,13 @@ fn runTerminal(
     try app.init(init.gpa, init.io, &.{
         .working_directory = directories.working_directory,
         .home = directories.home,
-        .writer = tty.writer(),
+        .device = tty.device(),
         .environment = init.environ_map,
         .environ = init.minimal.environ,
         .herdr = Herdr.fromEnviron(init.environ_map),
     });
     defer app.deinit();
-    try app.run(&tty);
+    try app.run();
 }
 
 fn validateWorkingDirectory(gpa: std.mem.Allocator, path: []const u8) !void {

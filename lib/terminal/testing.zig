@@ -1,8 +1,301 @@
 const std = @import("std");
 
+const Device = @import("Device.zig");
 const escape = @import("escape.zig");
 const grapheme = @import("grapheme.zig");
+const View = @import("View.zig");
 const width = @import("width.zig");
+
+const wait_ms_max = 5_000;
+const wait_polls_max = 1024;
+
+pub const FakeDevice = struct {
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    mutex: std.Io.Mutex,
+    changes: std.atomic.Value(u32),
+    window: View.Size,
+    alternate: bool,
+    conversation: Emulator,
+    page: Emulator,
+    frame_count: usize,
+    keys_count: usize,
+    keys_taken: usize,
+    keys_delivered: usize,
+    resize_count: usize,
+    resize_taken: usize,
+    resize_delivered: usize,
+    stopped: bool,
+    pending: std.ArrayList(u8),
+    output: std.Io.Writer,
+    keys: std.Io.Queue(u8),
+    keys_buffer: [4096]u8,
+    resizes: std.Io.Queue(u8),
+    resizes_buffer: [64]u8,
+
+    pub const Snapshot = struct {
+        rows: []const []const u8,
+        alternate: bool,
+    };
+
+    const WaitError = error{ TestDeviceStopped, TestDeviceTimeout };
+
+    const vtable: Device.VTable = .{
+        .read = read,
+        .waitResize = waitResize,
+        .size = size,
+        .setAlternateScreen = setAlternateScreen,
+        .writer = writer,
+    };
+
+    pub fn init(self: *FakeDevice, gpa: std.mem.Allocator, io: std.Io, window: View.Size) !void {
+        var conversation: Emulator = try .init(gpa, window.columns);
+        errdefer conversation.deinit();
+        conversation.resize(window.rows);
+        var page: Emulator = try .init(gpa, window.columns);
+        errdefer page.deinit();
+        page.resize(window.rows);
+        self.* = .{
+            .gpa = gpa,
+            .io = io,
+            .mutex = .init,
+            .changes = .init(0),
+            .window = window,
+            .alternate = false,
+            .conversation = conversation,
+            .page = page,
+            .frame_count = 0,
+            .keys_count = 0,
+            .keys_taken = 0,
+            .keys_delivered = 0,
+            .resize_count = 0,
+            .resize_taken = 0,
+            .resize_delivered = 0,
+            .stopped = false,
+            .pending = .empty,
+            .output = .{ .vtable = &.{ .drain = drain, .flush = flush }, .buffer = &.{} },
+            .keys = undefined,
+            .keys_buffer = undefined,
+            .resizes = undefined,
+            .resizes_buffer = undefined,
+        };
+        self.keys = .init(&self.keys_buffer);
+        self.resizes = .init(&self.resizes_buffer);
+    }
+
+    pub fn deinit(self: *FakeDevice) void {
+        self.pending.deinit(self.gpa);
+        self.page.deinit();
+        self.conversation.deinit();
+    }
+
+    pub fn device(self: *FakeDevice) Device {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    pub fn press(
+        self: *FakeDevice,
+        bytes: []const u8,
+    ) (std.Io.QueueClosedError || WaitError)!void {
+        self.mutex.lockUncancelable(self.io);
+        self.keys_count += bytes.len;
+        const target = self.keys_count;
+        self.mutex.unlock(self.io);
+        _ = try self.keys.putUncancelable(self.io, bytes, bytes.len);
+        try self.waitUntil(target, keysDelivered);
+    }
+
+    pub fn close(self: *FakeDevice) void {
+        self.keys.close(self.io);
+    }
+
+    pub fn resize(self: *FakeDevice, window: View.Size) WaitError!void {
+        self.mutex.lockUncancelable(self.io);
+        self.window = window;
+        for ([_]*Emulator{ &self.conversation, &self.page }) |emulator| {
+            emulator.columns = window.columns;
+            emulator.resize(window.rows);
+        }
+        self.resize_count += 1;
+        const target = self.resize_count;
+        self.mutex.unlock(self.io);
+        _ = self.resizes.putUncancelable(self.io, &.{0}, 1) catch unreachable;
+        try self.waitUntil(target, resizeDelivered);
+    }
+
+    pub fn stop(self: *FakeDevice) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.stopped = true;
+        self.notify();
+    }
+
+    pub fn waitStop(self: *FakeDevice) WaitError!void {
+        try self.waitUntil(0, halted);
+    }
+
+    pub fn frameCount(self: *FakeDevice) usize {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.frame_count;
+    }
+
+    pub fn waitFrame(self: *FakeDevice, seen: usize) WaitError!void {
+        try self.waitUntil(seen, painted);
+    }
+
+    pub fn snapshot(self: *FakeDevice, arena: std.mem.Allocator) error{OutOfMemory}!Snapshot {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const document = self.screen().document.items;
+        const rows = try arena.alloc([]const u8, document.len);
+        for (rows, document) |*row, source| row.* = try arena.dupe(u8, source.items);
+        return .{ .rows = rows, .alternate = self.alternate };
+    }
+
+    fn screen(self: *FakeDevice) *Emulator {
+        return if (self.alternate) &self.page else &self.conversation;
+    }
+
+    fn notify(self: *FakeDevice) void {
+        _ = self.changes.fetchAdd(1, .release);
+        self.io.futexWake(u32, &self.changes.raw, std.math.maxInt(u32));
+    }
+
+    fn painted(self: *const FakeDevice, seen: usize) bool {
+        return self.frame_count != seen;
+    }
+
+    fn halted(self: *const FakeDevice, _: usize) bool {
+        return self.stopped;
+    }
+
+    fn keysDelivered(self: *const FakeDevice, target: usize) bool {
+        return self.keys_delivered >= target;
+    }
+
+    fn resizeDelivered(self: *const FakeDevice, target: usize) bool {
+        return self.resize_delivered >= target;
+    }
+
+    fn waitUntil(
+        self: *FakeDevice,
+        target: usize,
+        reached: *const fn (device: *const FakeDevice, target: usize) bool,
+    ) WaitError!void {
+        const deadline = std.Io.Timestamp.now(std.testing.io, .awake)
+            .addDuration(.fromMilliseconds(wait_ms_max));
+        for (0..wait_polls_max) |_| {
+            const observed = self.changes.load(.acquire);
+            {
+                self.mutex.lockUncancelable(self.io);
+                defer self.mutex.unlock(self.io);
+                if (reached(self, target)) return;
+                if (self.stopped) return error.TestDeviceStopped;
+            }
+            const remaining = std.Io.Timestamp.now(std.testing.io, .awake).durationTo(deadline);
+            if (remaining.nanoseconds <= 0) break;
+            const timeout: std.Io.Timeout = .{ .duration = .{ .raw = remaining, .clock = .awake } };
+            self.io.futexWaitTimeout(u32, &self.changes.raw, observed, timeout) catch |err|
+                switch (err) {
+                    error.Canceled => unreachable,
+                };
+        }
+        return error.TestDeviceTimeout;
+    }
+
+    fn read(ptr: *anyopaque, buffer: []u8) std.Io.File.ReadStreamingError!usize {
+        const self: *FakeDevice = @ptrCast(@alignCast(ptr));
+        self.mutex.lockUncancelable(self.io);
+        self.keys_delivered = self.keys_taken;
+        self.notify();
+        self.mutex.unlock(self.io);
+        const count = self.keys.get(self.io, buffer, 1) catch |err| {
+            self.stop();
+            return switch (err) {
+                error.Canceled => error.Canceled,
+                error.Closed => error.EndOfStream,
+            };
+        };
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.keys_taken += count;
+        return count;
+    }
+
+    fn waitResize(ptr: *anyopaque) std.Io.File.ReadStreamingError!void {
+        const self: *FakeDevice = @ptrCast(@alignCast(ptr));
+        self.mutex.lockUncancelable(self.io);
+        self.resize_delivered = self.resize_taken;
+        self.notify();
+        self.mutex.unlock(self.io);
+        var buffer: [64]u8 = undefined;
+        const count = self.resizes.get(self.io, &buffer, 1) catch |err| switch (err) {
+            error.Canceled => {
+                self.stop();
+                return error.Canceled;
+            },
+            error.Closed => unreachable,
+        };
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.resize_taken += count;
+    }
+
+    fn size(ptr: *anyopaque) ?View.Size {
+        const self: *FakeDevice = @ptrCast(@alignCast(ptr));
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.window;
+    }
+
+    fn setAlternateScreen(ptr: *anyopaque, enabled: bool) std.Io.Writer.Error!void {
+        const self: *FakeDevice = @ptrCast(@alignCast(ptr));
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (enabled and !self.alternate) {
+            var fresh = Emulator.init(self.gpa, self.window.columns) catch return error.WriteFailed;
+            fresh.resize(self.window.rows);
+            self.page.deinit();
+            self.page = fresh;
+        }
+        self.alternate = enabled;
+    }
+
+    fn writer(ptr: *anyopaque) *std.Io.Writer {
+        const self: *FakeDevice = @ptrCast(@alignCast(ptr));
+        return &self.output;
+    }
+
+    fn drain(
+        output: *std.Io.Writer,
+        data: []const []const u8,
+        splat: usize,
+    ) std.Io.Writer.Error!usize {
+        const self: *FakeDevice = @alignCast(@fieldParentPtr("output", output));
+        std.debug.assert(output.end == 0);
+        var count: usize = 0;
+        for (data[0 .. data.len - 1]) |bytes| {
+            self.pending.appendSlice(self.gpa, bytes) catch return error.WriteFailed;
+            count += bytes.len;
+        }
+        const last = data[data.len - 1];
+        for (0..splat) |_| {
+            self.pending.appendSlice(self.gpa, last) catch return error.WriteFailed;
+        }
+        return count + last.len * splat;
+    }
+
+    fn flush(output: *std.Io.Writer) std.Io.Writer.Error!void {
+        const self: *FakeDevice = @alignCast(@fieldParentPtr("output", output));
+        defer self.pending.clearRetainingCapacity();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.screen().feed(self.pending.items) catch return error.WriteFailed;
+        self.frame_count += std.mem.count(u8, self.pending.items, escape.sync_reset);
+        self.notify();
+    }
+};
 
 pub const Emulator = struct {
     gpa: std.mem.Allocator,

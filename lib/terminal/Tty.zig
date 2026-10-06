@@ -1,6 +1,8 @@
 const std = @import("std");
 
+const Device = @import("Device.zig");
 const escape = @import("escape.zig");
+const Resize = @import("Resize.zig");
 const View = @import("View.zig");
 
 const Tty = @This();
@@ -12,6 +14,7 @@ in_handle: std.posix.fd_t,
 out_handle: std.posix.fd_t,
 original: std.posix.termios,
 raw_state: RawState,
+resize: Resize,
 out_buffer: [16384]u8,
 out_stream: std.Io.File.Writer,
 
@@ -132,6 +135,14 @@ const RestoreSetup = struct {
     }
 };
 
+const device_vtable: Device.VTable = .{
+    .read = read,
+    .waitResize = waitResize,
+    .size = size,
+    .setAlternateScreen = setAlternateScreen,
+    .writer = writer,
+};
+
 pub fn init(self: *Tty, io: std.Io) !void {
     const stdin = std.Io.File.stdin();
     const stdout = std.Io.File.stdout();
@@ -141,6 +152,8 @@ pub fn init(self: *Tty, io: std.Io) !void {
     self.raw_state = .{};
     self.original = try std.posix.tcgetattr(self.in_handle);
     self.out_stream = stdout.writerStreaming(io, &self.out_buffer);
+    try self.resize.init();
+    errdefer self.resize.deinit();
     var setup: PosixSetup = .{ .in_handle = self.in_handle, .original = &self.original };
     try enterWith(&self.raw_state, &self.out_stream.interface, setup.termios());
     active.store(self, .release);
@@ -150,6 +163,11 @@ pub fn deinit(self: *Tty) void {
     active.store(null, .release);
     var setup: PosixSetup = .{ .in_handle = self.in_handle, .original = &self.original };
     cleanupWith(&self.raw_state, &self.out_stream.interface, setup.termios());
+    self.resize.deinit();
+}
+
+pub fn device(self: *Tty) Device {
+    return .{ .ptr = self, .vtable = &device_vtable };
 }
 
 pub fn restore() void {
@@ -161,25 +179,34 @@ pub fn restore() void {
     writeHandle(tty.out_handle, output.buffered());
 }
 
-pub fn writer(self: *Tty) *std.Io.Writer {
-    return &self.out_stream.interface;
-}
-
-pub fn setAlternateScreen(self: *Tty, enabled: bool) !void {
-    try setAlternateScreenWith(&self.raw_state, &self.out_stream.interface, enabled);
-}
-
-pub fn read(self: *Tty, buffer: []u8) std.Io.File.ReadStreamingError!usize {
+fn read(ptr: *anyopaque, buffer: []u8) std.Io.File.ReadStreamingError!usize {
+    const self: *Tty = @ptrCast(@alignCast(ptr));
     const file: std.Io.File = .{ .handle = self.in_handle, .flags = .{ .nonblocking = false } };
     return file.readStreaming(self.io, &.{buffer});
 }
 
-pub fn size(self: *Tty) ?View.Size {
+fn waitResize(ptr: *anyopaque) std.Io.File.ReadStreamingError!void {
+    const self: *Tty = @ptrCast(@alignCast(ptr));
+    return self.resize.wait(self.io);
+}
+
+fn size(ptr: *anyopaque) ?View.Size {
+    const self: *Tty = @ptrCast(@alignCast(ptr));
     var window: std.posix.winsize = .{ .row = 0, .col = 0, .xpixel = 0, .ypixel = 0 };
     const result =
         std.posix.system.ioctl(self.out_handle, std.posix.T.IOCGWINSZ, @intFromPtr(&window));
     if (std.posix.errno(result) != .SUCCESS or window.col == 0) return null;
     return .{ .columns = window.col, .rows = window.row };
+}
+
+fn setAlternateScreen(ptr: *anyopaque, enabled: bool) std.Io.Writer.Error!void {
+    const self: *Tty = @ptrCast(@alignCast(ptr));
+    try setAlternateScreenWith(&self.raw_state, &self.out_stream.interface, enabled);
+}
+
+fn writer(ptr: *anyopaque) *std.Io.Writer {
+    const self: *Tty = @ptrCast(@alignCast(ptr));
+    return &self.out_stream.interface;
 }
 
 fn enterWith(state: *RawState, output: *std.Io.Writer, termios: Termios) !void {
@@ -250,10 +277,10 @@ test "read returns the waiting bytes, and a closed input ends the stream" {
     tty.in_handle = handles[0];
     var buffer: [8]u8 = undefined;
     _ = std.posix.system.write(handles[1], "xy", 2);
-    try std.testing.expectEqual(@as(usize, 2), try tty.read(&buffer));
+    try std.testing.expectEqual(@as(usize, 2), try tty.device().read(&buffer));
     try std.testing.expectEqualStrings("xy", buffer[0..2]);
     _ = std.posix.system.close(handles[1]);
-    try std.testing.expectError(error.EndOfStream, tty.read(&buffer));
+    try std.testing.expectError(error.EndOfStream, tty.device().read(&buffer));
 }
 
 const TestControl = struct {
@@ -415,6 +442,7 @@ test "a restore reverses each pending mode once, and a restore after deinit writ
     tty.in_handle = handles[0];
     tty.out_handle = handles[1];
     tty.original = std.mem.zeroes(std.posix.termios);
+    try tty.resize.init();
     tty.raw_state = .{
         .raw_owned = true,
         .resets_pending = .initMany(&.{ .paste, .keyboard, .grapheme, .cursor, .screen_alternate }),
@@ -450,7 +478,7 @@ test "size reports absence on a handle that is not a terminal" {
     };
     var tty: Tty = undefined;
     tty.out_handle = handles[1];
-    try std.testing.expectEqual(@as(?View.Size, null), tty.size());
+    try std.testing.expectEqual(@as(?View.Size, null), tty.device().size());
 }
 
 test "each alternate screen transition pairs its own keyboard and scroll modes" {

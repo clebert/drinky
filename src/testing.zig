@@ -1,5 +1,10 @@
 const std = @import("std");
 
+const accounts = @import("accounts");
+const core = @import("core");
+
+const Herdr = @import("Herdr.zig");
+
 pub const Clock = struct {
     threaded: std.Io.Threaded,
     vtable: std.Io.VTable,
@@ -137,5 +142,81 @@ pub const Tree = struct {
             => return error.SkipZigTest,
             else => return err,
         };
+    }
+};
+
+const take_ms_max = 5_000;
+
+pub const FakeHerdr = struct {
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    tmp: std.testing.TmpDir,
+    path_buffer: [128]u8,
+    path_length: usize,
+    server: std.Io.net.Server,
+    lines_buffer: [8][]u8,
+    lines: std.Io.Queue([]u8),
+
+    pub fn init(self: *FakeHerdr, gpa: std.mem.Allocator, io: std.Io) !void {
+        self.gpa = gpa;
+        self.io = io;
+        self.tmp = std.testing.tmpDir(.{});
+        errdefer self.tmp.cleanup();
+        var home_buffer: [128]u8 = undefined;
+        const home = try accounts.testing.tmpHome(&home_buffer, &self.tmp);
+        const socket_path = try std.fmt.bufPrint(&self.path_buffer, "{s}/herdr.sock", .{home});
+        self.path_length = socket_path.len;
+        const address = try std.Io.net.UnixAddress.init(socket_path);
+        self.server = try address.listen(io, .{});
+        self.lines = .init(&self.lines_buffer);
+    }
+
+    pub fn deinit(self: *FakeHerdr) void {
+        var taken: [8][]u8 = undefined;
+        const count = self.lines.get(self.io, &taken, 0) catch 0;
+        for (taken[0..count]) |line| self.gpa.free(line);
+        self.server.deinit(self.io);
+        self.tmp.cleanup();
+    }
+
+    pub fn endpoint(self: *const FakeHerdr) Herdr.Endpoint {
+        return .{ .socket_path = self.path_buffer[0..self.path_length], .pane_id = "w1:p1" };
+    }
+
+    pub fn serve(self: *FakeHerdr, count: usize) !void {
+        for (0..count) |_| {
+            const stream = try self.server.accept(self.io);
+            defer stream.close(self.io);
+            var read_buffer: [Herdr.line_bytes_max]u8 = undefined;
+            var reader = stream.reader(self.io, &read_buffer);
+            const line = try reader.interface.takeDelimiterInclusive('\n');
+            const owned = try self.gpa.dupe(u8, line[0 .. line.len - 1]);
+            errdefer self.gpa.free(owned);
+            var write_buffer: [64]u8 = undefined;
+            var writer = stream.writer(self.io, &write_buffer);
+            try writer.interface.writeAll("{\"id\":\"drinky\",\"result\":{\"type\":\"ok\"}}\n");
+            try writer.interface.flush();
+            try self.lines.putOne(self.io, owned);
+        }
+    }
+
+    pub fn take(self: *FakeHerdr) ![]u8 {
+        return core.timeout.run(self.io, take_ms_max, takeLine, .{self}, releaseLine);
+    }
+
+    fn takeLine(self: *FakeHerdr) (std.Io.QueueClosedError || std.Io.Cancelable)![]u8 {
+        var taken: [1][]u8 = undefined;
+        const count = try self.lines.get(self.io, &taken, 1);
+        std.debug.assert(count == 1);
+        return taken[0];
+    }
+
+    fn releaseLine(line: *const []u8, args: *const struct { *FakeHerdr }) void {
+        args[0].gpa.free(line.*);
+    }
+
+    pub fn drained(self: *FakeHerdr) !bool {
+        var taken: [1][]u8 = undefined;
+        return try self.lines.get(self.io, &taken, 0) == 0;
     }
 };

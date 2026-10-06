@@ -34,7 +34,6 @@ page_view: terminal.View,
 widget: Widget,
 columns: usize,
 rows: usize,
-dirty: bool,
 statistics: Statistics,
 choice: Choice,
 directory_shown: []const u8,
@@ -349,7 +348,6 @@ pub fn init(gpa: std.mem.Allocator, writer: *std.Io.Writer, effort: core.Provide
         .widget = .prompt,
         .columns = 80,
         .rows = 24,
-        .dirty = false,
         .statistics = .{},
         .choice = .{ .effort = effort },
         .directory_shown = "",
@@ -379,27 +377,23 @@ pub fn clearConversation(self: *Screen) void {
     self.transcript.truncate(0);
     self.statistics = .{};
     self.view.resetScreen();
-    self.dirty = true;
 }
 
 pub fn showChoice(self: *Screen, choice: *const Choice) void {
     if (self.choice.account != choice.account) self.statistics.forgetBilling();
     self.choice = choice.*;
-    self.dirty = true;
 }
 
 pub fn clearNotice(self: *Screen) void {
     if (self.notice) |notice| {
         notice.deinit(self.gpa);
         self.notice = null;
-        self.dirty = true;
     }
 }
 
 pub fn setNotice(self: *Screen, notice: Message) void {
     self.clearNotice();
     self.notice = notice;
-    self.dirty = true;
 }
 
 fn showNotice(self: *Screen, severity: Message.Severity, text: []const u8) !void {
@@ -421,7 +415,6 @@ pub fn beginTurn(self: *Screen, start: usize) void {
     self.transcript.endMessage();
     self.statistics.forgetTurnEvidence();
     self.widget = .{ .turn = .init(start, self.transcript.blocks().len) };
-    self.dirty = true;
 }
 
 pub fn removeTurn(self: *Screen, range: Transcript.Range, line: []const u8) !void {
@@ -438,7 +431,6 @@ pub fn apply(
     time: Time,
 ) !?core.Session.Outcome {
     const turn = self.activeTurn() orelse return self.applyIdle(event, time);
-    self.dirty = true;
     switch (event.*) {
         .setup_dropped => unreachable,
         .text_started => try self.beginBlock(turn, .text),
@@ -512,7 +504,6 @@ fn applyIdle(
         .credits => |credits| self.statistics.credits = credits,
         else => {},
     }
-    self.dirty = true;
     return null;
 }
 
@@ -716,12 +707,10 @@ pub fn appendEvent(self: *Screen, message: Message) !void {
         .text = message.content,
         .severity = message.severity,
     } });
-    self.dirty = true;
 }
 
 pub fn appendUser(self: *Screen, text: []const u8) !void {
     try self.transcript.append(&.{ .user = text });
-    self.dirty = true;
 }
 
 pub fn appendSkillNote(self: *Screen, skill: *const core.Session.Event.SkillLoaded) !void {
@@ -734,12 +723,10 @@ pub fn appendSkillNote(self: *Screen, skill: *const core.Session.Event.SkillLoad
 
 pub fn appendNote(self: *Screen, text: []const u8) !void {
     try self.transcript.append(&.{ .user_note = text });
-    self.dirty = true;
 }
 
 pub fn appendIntro(self: *Screen, text: []const u8) !void {
     try self.transcript.append(&.{ .intro = text });
-    self.dirty = true;
 }
 
 pub fn replaceEvent(self: *Screen, index: usize, message: Message) !void {
@@ -748,7 +735,6 @@ pub fn replaceEvent(self: *Screen, index: usize, message: Message) !void {
         .text = message.content,
         .severity = message.severity,
     });
-    self.dirty = true;
 }
 
 pub fn setDraft(self: *Screen, text: []const u8) !void {
@@ -815,7 +801,6 @@ fn enterPicker(
         .trail = trail,
         .wait_tick = null,
     } };
-    self.dirty = true;
 }
 
 fn freePickerOptions(gpa: std.mem.Allocator, options: []const ui.Picker.Option) void {
@@ -828,7 +813,6 @@ pub fn closePicker(self: *Screen) void {
         .picking => |*picking| {
             picking.picker.deinit();
             self.widget = .prompt;
-            self.dirty = true;
         },
         else => {},
     }
@@ -838,7 +822,6 @@ pub fn beginPickerWait(self: *Screen, text: []const u8) !void {
     const picking = &self.widget.picking;
     try picking.picker.beginWait(text);
     picking.wait_tick = 0;
-    self.dirty = true;
 }
 
 pub fn cancelPicker(self: *Screen) !void {
@@ -857,7 +840,6 @@ pub fn openPage(self: *Screen, options: *const ui.Page.Options) !void {
     self.page_view.forget();
     self.page_view.resetScreen();
     self.widget = .{ .page = page };
-    self.dirty = true;
 }
 
 pub fn closePage(self: *Screen) void {
@@ -865,7 +847,6 @@ pub fn closePage(self: *Screen) void {
         .page => |*page| {
             page.deinit();
             self.widget = .prompt;
-            self.dirty = true;
         },
         else => {},
     }
@@ -876,7 +857,6 @@ pub fn setBranch(self: *Screen, name: []const u8) void {
     if (std.mem.eql(u8, self.branch_buffer[0..self.branch_length], name)) return;
     @memcpy(self.branch_buffer[0..name.len], name);
     self.branch_length = name.len;
-    self.dirty = true;
 }
 
 fn branch(self: *const Screen) ?[]const u8 {
@@ -956,7 +936,7 @@ pub fn paint(
     try layout.project(self.gpa, &self.view, size, &scene);
 }
 
-pub fn statusInfo(self: *const Screen, boot_ms: i64) ui.status.Info {
+fn statusInfo(self: *const Screen, boot_ms: i64) ui.status.Info {
     return .{
         .directory = self.directory_shown,
         .branch = self.branch(),
@@ -981,7 +961,6 @@ pub fn parkCursor(self: *Screen) !void {
 }
 
 pub fn markEdited(self: *Screen) void {
-    self.dirty = true;
     if (self.activeTurn()) |turn| turn.caret_tick = 0;
 }
 
@@ -1001,7 +980,7 @@ pub fn advanceFrame(self: *Screen) bool {
         },
         .prompt, .page => {},
     }
-    return self.dirty or activity_changed;
+    return activity_changed;
 }
 
 pub fn animating(self: *const Screen) bool {
