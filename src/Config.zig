@@ -7,6 +7,7 @@ const tools = @import("tools");
 
 const discovery = @import("discovery/root.zig");
 const layout = @import("layout.zig");
+const Reports = @import("Reports.zig");
 const testing = @import("testing.zig");
 const ui = @import("ui/root.zig");
 
@@ -32,6 +33,11 @@ load_error: ?LoadError = null,
 pub const RequiredSkill = struct {
     glob: []const u8,
     skill: []const u8,
+};
+
+pub const ReportOptions = struct {
+    effort: core.Provider.Effort,
+    required_capped: bool,
 };
 
 const LoadError = std.Io.Dir.ReadFileAllocError || std.json.ParseError(std.json.Scanner) ||
@@ -487,6 +493,82 @@ pub fn deinit(self: *Config, gpa: std.mem.Allocator) void {
     if (self.effort_dropped) |name| gpa.free(name);
     for (self.unknown_keys) |key| gpa.free(key);
     gpa.free(self.unknown_keys);
+}
+
+pub fn reports(
+    self: *const Config,
+    gpa: std.mem.Allocator,
+    options: ReportOptions,
+) error{OutOfMemory}!Reports {
+    var result: Reports = .{ .subject = "config file" };
+    errdefer result.deinit(gpa);
+    if (self.effort_dropped) |dropped| try result.add(
+        gpa,
+        .failure,
+        "Drinky ignored the configured default effort level \"{s}\" because Drinky does not " ++
+            "know that level. Drinky uses the effort level \"{s}\".",
+        .{ dropped, @tagName(options.effort) },
+    );
+    if (self.bash_timeout_ms_dropped) |dropped| try result.add(
+        gpa,
+        .failure,
+        "Drinky ignored the configured command timeout {d} because the value must be from {d} " ++
+            "to {d} milliseconds. Drinky uses the default timeout of {d} milliseconds.",
+        .{
+            dropped,
+            tools.Context.Bash.timeout_ms_min,
+            tools.Context.Bash.timeout_ms_max,
+            self.bash.timeout_ms,
+        },
+    );
+    if (self.window_pages_dropped) |dropped| try result.add(
+        gpa,
+        .failure,
+        "Drinky ignored the configured window page count {d} because the count must be from " ++
+            "{d} to {d}. Drinky uses the default count of {d} pages.",
+        .{ dropped, layout.window_pages_min, layout.window_pages_max, self.window_pages },
+    );
+    if (self.gauge_dropped) |dropped| try result.add(
+        gpa,
+        .failure,
+        "Drinky ignored the gauge shares {d} and {d}. A share must be from {d} to {d}, and " ++
+            "the warning share must not pass the error share. Drinky uses the shares {d} " ++
+            "and {d}.",
+        .{
+            dropped.percent_warning,
+            dropped.percent_error,
+            ui.status.Gauge.percent_min,
+            ui.status.Gauge.percent_max,
+            self.gauge.percent_warning,
+            self.gauge.percent_error,
+        },
+    );
+    if (options.required_capped) try result.add(
+        gpa,
+        .failure,
+        "Drinky used only the first {d} required skills in {s}.",
+        .{ tools.SkillGuard.rules_max, self.path },
+    );
+    if (self.load_error) |err| try result.add(
+        gpa,
+        .failure,
+        "Drinky could not read the config file {s} because of error {s}. Drinky uses " ++
+            "the default value of each key.",
+        .{ self.path, @errorName(err) },
+    );
+    for (self.unknown_keys) |key| try result.add(
+        gpa,
+        .failure,
+        "Drinky ignored the unknown config key \"{s}\" in {s}.",
+        .{ key, self.path },
+    );
+    if (self.unknown_keys_omitted) try result.add(
+        gpa,
+        .failure,
+        "Drinky omitted the remaining unknown config keys in {s}.",
+        .{self.path},
+    );
+    return result;
 }
 
 pub fn load(

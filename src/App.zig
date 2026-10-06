@@ -7,11 +7,11 @@ const terminal = @import("terminal");
 const tools = @import("tools");
 
 const Choice = @import("Choice.zig");
+const Clients = @import("Clients.zig");
 const command = @import("command/root.zig");
 const escape = @import("escape.zig");
 const Harness = @import("Harness.zig");
 const Herdr = @import("Herdr.zig");
-const layout = @import("layout.zig");
 const Message = @import("Message.zig");
 const project = @import("project.zig");
 const Reports = @import("Reports.zig");
@@ -75,12 +75,10 @@ harness: Harness,
 account_registry: accounts.Registry,
 state: accounts.State,
 session: core.Session,
-client: ?*accounts.Client,
-client_account: ?usize,
-leases: std.ArrayList(Lease),
-configured: ?Choice,
+clients: Clients,
 choice: Choice,
 mode: Mode,
+confirmation: ?Confirmation,
 offer: ?Offer,
 directory_label: []const u8,
 working_directory: []const u8,
@@ -145,30 +143,18 @@ const UiEvent = union(enum) {
     }
 };
 
-const Lease = struct {
-    client: *accounts.Client,
-    setups: usize,
-};
-
 const Mode = union(enum) {
-    prompt: Prompt,
+    prompt,
     turn: Turn,
     picker,
     fetch: Fetch,
     page,
     sign_in: SignIn,
 
-    const Prompt = struct {
-        confirmation: ?Confirmation = null,
-
-        const Confirmation = enum { message, quit, removal };
-    };
-
     const Turn = struct {
         start: usize,
         line: ?[]u8,
         mutated: bool = false,
-        cancel_armed: bool = false,
         cancel_sent: bool = false,
     };
 
@@ -185,6 +171,22 @@ const Mode = union(enum) {
         event_index: ?usize = null,
         cancel_sent: bool = false,
     };
+};
+
+const Confirmation = enum {
+    message,
+    quit,
+    removal,
+    cancel,
+
+    fn confirms(self: Confirmation, event: *const terminal.Input.Key) bool {
+        return switch (self) {
+            .message => event.* == .enter,
+            .quit => event.* == .ctrl and event.ctrl == 'd',
+            .removal => event.* == .ctrl and event.ctrl == 'n',
+            .cancel => event.* == .escape,
+        };
+    }
 };
 
 const Offer = union(enum) {
@@ -313,7 +315,7 @@ pub fn init(self: *App, gpa: std.mem.Allocator, io: std.Io, options: *const Opti
     });
     errdefer gpa.free(self.sources_page);
 
-    errdefer self.freeClients();
+    errdefer self.clients.deinit();
     self.session = harness.session(gpa, io, .{ .ptr = self, .vtable = &session_sink_vtable });
     errdefer self.session.deinit();
 
@@ -357,7 +359,7 @@ pub fn deinit(self: *App) void {
     }
     self.screen.deinit();
     self.session.deinit();
-    self.freeClients();
+    self.clients.deinit();
     self.gpa.free(self.sources_page);
     self.state.deinit();
     self.gpa.free(self.directory_label);
@@ -386,69 +388,12 @@ pub fn run(self: *App, tty: *terminal.Tty) !void {
 fn reportStart(self: *App) !void {
     const config = &self.harness.config;
     try self.screen.appendIntro(intro_text);
-    if (config.effort_dropped) |dropped| try self.recordEvent(
-        .failure,
-        "Drinky ignored the configured default effort level \"{s}\" because Drinky does not " ++
-            "know that level. Drinky uses the effort level \"{s}\".",
-        .{ dropped, @tagName(self.choice.effort) },
-    );
-    if (config.bash_timeout_ms_dropped) |dropped| try self.recordEvent(
-        .failure,
-        "Drinky ignored the configured command timeout {d} because the value must be from {d} " ++
-            "to {d} milliseconds. Drinky uses the default timeout of {d} milliseconds.",
-        .{
-            dropped,
-            tools.Context.Bash.timeout_ms_min,
-            tools.Context.Bash.timeout_ms_max,
-            config.bash.timeout_ms,
-        },
-    );
-    if (config.window_pages_dropped) |dropped| try self.recordEvent(
-        .failure,
-        "Drinky ignored the configured window page count {d} because the count must be from " ++
-            "{d} to {d}. Drinky uses the default count of {d} pages.",
-        .{
-            dropped,
-            layout.window_pages_min,
-            layout.window_pages_max,
-            config.window_pages,
-        },
-    );
-    if (config.gauge_dropped) |dropped| try self.recordEvent(
-        .failure,
-        "Drinky ignored the gauge shares {d} and {d}. A share must be from {d} to {d}, and " ++
-            "the warning share must not pass the error share. Drinky uses the shares {d} " ++
-            "and {d}.",
-        .{
-            dropped.percent_warning,
-            dropped.percent_error,
-            ui.status.Gauge.percent_min,
-            ui.status.Gauge.percent_max,
-            config.gauge.percent_warning,
-            config.gauge.percent_error,
-        },
-    );
-    if (self.harness.required_capped) try self.recordEvent(
-        .failure,
-        "Drinky used only the first {d} required skills in {s}.",
-        .{ tools.SkillGuard.rules_max, config.path },
-    );
-    if (config.load_error) |err| try self.recordEvent(
-        .failure,
-        "Drinky could not read the config file {s} because of error {s}. Drinky uses " ++
-            "the default value of each key.",
-        .{ config.path, @errorName(err) },
-    );
-    for (config.unknown_keys) |key| try self.recordEvent(
-        .failure,
-        "Drinky ignored the unknown config key \"{s}\" in {s}.",
-        .{ key, config.path },
-    );
-    if (config.unknown_keys_omitted) try self.recordEvent(
-        .failure,
-        "Drinky omitted the remaining unknown config keys in {s}.",
-        .{config.path},
-    );
+    var config_reports = try config.reports(self.gpa, .{
+        .effort = self.choice.effort,
+        .required_capped = self.harness.required_capped,
+    });
+    defer config_reports.deinit(self.gpa);
+    try self.recordReports(&config_reports);
     try self.recordReports(&config.user_instructions.reports);
     try self.recordReports(&self.harness.project_instructions.reports);
     try self.recordReports(&self.harness.skill_registry.reports);
@@ -468,12 +413,10 @@ fn initFields(self: *App, gpa: std.mem.Allocator, io: std.Io) void {
         .account_registry = undefined,
         .state = undefined,
         .session = undefined,
-        .client = null,
-        .client_account = null,
-        .leases = .empty,
-        .configured = null,
+        .clients = .init(gpa),
         .choice = .{ .effort = Harness.effort_default },
-        .mode = .{ .prompt = .{} },
+        .mode = .prompt,
+        .confirmation = null,
         .offer = null,
         .directory_label = "",
         .working_directory = "",
@@ -512,55 +455,6 @@ fn stopTasks(self: *App) void {
 fn closeQueue(self: *App) void {
     self.queue.close(self.io);
     self.drainQueue();
-}
-
-fn openClient(self: *App, account: usize) !*accounts.Client {
-    try self.leases.ensureUnusedCapacity(self.gpa, 1);
-    const client = try self.gpa.create(accounts.Client);
-    errdefer self.gpa.destroy(client);
-    try self.account_registry.open(client, account);
-    self.leases.appendAssumeCapacity(.{ .client = client, .setups = 0 });
-    return client;
-}
-
-fn closeClient(self: *App) void {
-    self.client = null;
-    self.client_account = null;
-    self.configured = null;
-    self.sweepClients();
-}
-
-fn releaseSetup(self: *App, provider: core.Provider) void {
-    for (self.leases.items) |*lease| {
-        if (lease.client.provider().ptr != provider.ptr) continue;
-        lease.setups -= 1;
-        break;
-    }
-    self.sweepClients();
-}
-
-fn sweepClients(self: *App) void {
-    var index = self.leases.items.len;
-    while (index > 0) {
-        index -= 1;
-        const lease = self.leases.items[index];
-        if (lease.setups > 0 or lease.client == self.client) continue;
-        lease.client.deinit();
-        self.gpa.destroy(lease.client);
-        _ = self.leases.swapRemove(index);
-    }
-}
-
-fn freeClients(self: *App) void {
-    self.client = null;
-    self.client_account = null;
-    self.configured = null;
-    for (self.leases.items) |lease| {
-        lease.client.deinit();
-        self.gpa.destroy(lease.client);
-    }
-    self.leases.deinit(self.gpa);
-    self.leases = .empty;
 }
 
 fn cancelFuture(self: *App, maybe_future: *?std.Io.Future(void)) void {
@@ -610,7 +504,12 @@ fn runLoop(self: *App) !void {
 }
 
 fn setMode(self: *App, mode: Mode) void {
+    switch (self.mode) {
+        .turn => |turn| std.debug.assert(turn.line == null),
+        .prompt, .picker, .fetch, .page, .sign_in => {},
+    }
     self.mode = mode;
+    self.confirmation = null;
     self.screen.dirty = true;
 }
 
@@ -658,10 +557,12 @@ fn applyBatch(self: *App, events: []const UiEvent) !bool {
             .session => |*session_event| {
                 defer session_event.deinit(self.gpa);
                 try self.applySessionEvent(session_event);
+                self.assertWidget();
             },
             .accounts => |*accounts_event| {
                 defer accounts_event.deinit(self.gpa);
                 try self.applyAccountsEvent(accounts_event);
+                self.assertWidget();
             },
         }
     }
@@ -729,40 +630,30 @@ fn startAccount(self: *App) ?usize {
 }
 
 fn sync(self: *App) !void {
-    if (self.choice.account != self.client_account) {
-        self.closeClient();
-        if (self.choice.account) |account| {
-            if (self.openClient(account)) |client| {
-                self.client = client;
-                self.client_account = account;
-            } else |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.SignedOut => {
-                    self.choice.account = null;
-                    self.choice.model = null;
-                },
-            }
-        }
-    }
+    self.clients.select(&self.account_registry, self.choice.account) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.SignedOut => {
+            self.choice.account = null;
+            self.choice.model = null;
+        },
+    };
     try self.configure();
     self.screen.showChoice(&self.choice);
     try self.recordState();
 }
 
 fn configure(self: *App) !void {
-    const client = self.client orelse return;
-    const account = self.client_account orelse return;
+    const current = self.clients.current orelse return;
     const model = if (self.choice.model) |*model| model else return;
-    if (self.configured) |*configured| {
+    if (self.clients.configured) |*configured| {
         if (configured.eql(&self.choice)) return;
     }
-    self.configured = self.choice;
-    const account_id = accounts.Account.table[account].id;
+    const account_id = accounts.Account.table[current.account].id;
     const model_value = try std.fmt.allocPrint(self.gpa, "{s}/{s}", .{ account_id, model.name() });
     defer self.gpa.free(model_value);
     const variables = tool_environment.variables(model_value, self.choice.effort);
     try self.session.send(&.{ .configure = .{
-        .provider = client.provider(),
+        .provider = current.client.provider(),
         .account = account_id,
         .model = model.name(),
         .effort = self.choice.fold(),
@@ -770,9 +661,7 @@ fn configure(self: *App) !void {
         .system = self.harness.system,
         .variables = &variables,
     } });
-    for (self.leases.items) |*lease| {
-        if (lease.client == client) lease.setups += 1;
-    }
+    self.clients.addSetup(&self.choice);
 }
 
 fn recordState(self: *App) !void {
@@ -843,41 +732,32 @@ fn handleKey(self: *App, event: *const terminal.Input.Key) !void {
     self.disarm(event);
     if (self.mode != .prompt and event.* == .ctrl and event.ctrl == 'd')
         self.ctrl_d_ms_last = self.nowMs();
-    switch (self.mode) {
-        .turn => |turn| if (event.* == .escape and self.screen.notice != null and
-            !turn.cancel_armed)
-        {
-            self.screen.clearNotice();
-            return;
-        },
-        else => {},
-    }
+    const notice_shown = self.screen.notice != null;
     self.screen.clearNotice();
     switch (self.mode) {
         .prompt => try self.handlePromptKey(event),
-        .turn, .sign_in => try self.handleEditorKey(event),
+        .turn => |*turn| try self.handleTurnKey(turn, event, notice_shown),
+        .sign_in => |*sign_in| try self.handleSignInKey(sign_in, event),
         .picker => try self.handlePickerKey(event),
-        .fetch => try self.handleFetchKey(event),
+        .fetch => |*fetch| try self.handleFetchKey(fetch, event),
         .page => try self.handlePageKey(event),
     }
+    self.assertWidget();
+}
+
+fn assertWidget(self: *const App) void {
+    const widget: std.meta.Tag(Screen.Widget) = switch (self.mode) {
+        .prompt, .sign_in => .prompt,
+        .turn => .turn,
+        .picker, .fetch => .picking,
+        .page => .page,
+    };
+    std.debug.assert(std.meta.activeTag(self.screen.widget) == widget);
 }
 
 fn disarm(self: *App, event: *const terminal.Input.Key) void {
-    switch (self.mode) {
-        .prompt => |*prompt| {
-            const confirmation = prompt.confirmation orelse return;
-            const confirms = switch (confirmation) {
-                .message => event.* == .enter,
-                .quit => event.* == .ctrl and event.ctrl == 'd',
-                .removal => event.* == .ctrl and event.ctrl == 'n',
-            };
-            if (!confirms) prompt.confirmation = null;
-        },
-        .turn => |*turn| if (event.* != .escape) {
-            turn.cancel_armed = false;
-        },
-        .picker, .fetch, .page, .sign_in => {},
-    }
+    const confirmation = self.confirmation orelse return;
+    if (!confirmation.confirms(event)) self.confirmation = null;
 }
 
 fn handlePromptKey(self: *App, event: *const terminal.Input.Key) !void {
@@ -922,21 +802,21 @@ fn retryTurn(self: *App, request: []const u8) !void {
 }
 
 fn removeTurn(self: *App, removal: *const Offer.Removal) !void {
-    if (removal.mutated and self.mode.prompt.confirmation != .removal) {
+    if (removal.mutated and self.confirmation != .removal) {
         try self.reportNotice(.warning, removal_warning, .{});
-        self.mode.prompt.confirmation = .removal;
+        self.confirmation = .removal;
         return;
     }
-    self.mode.prompt.confirmation = null;
+    self.confirmation = null;
     try self.screen.removeTurn(removal.range, removal.line);
     try self.session.send(&.remove_turn);
     self.dropOffer();
 }
 
 fn quitOrWarn(self: *App) !void {
-    const draft = self.screen.editor.visible().len != 0;
+    const draft = !self.draftEmpty();
     const recent_exit = self.nowMs() - self.ctrl_d_ms_last < Harness.repeat_window_ms;
-    if (self.mode.prompt.confirmation == .quit or (!draft and !recent_exit)) {
+    if (self.confirmation == .quit or (!draft and !recent_exit)) {
         self.running = false;
         return;
     }
@@ -949,39 +829,49 @@ fn quitOrWarn(self: *App) !void {
     } else {
         try self.reportNotice(.warning, "Press Ctrl+D again to quit.", .{});
     }
-    self.mode.prompt.confirmation = .quit;
+    self.confirmation = .quit;
 }
 
-fn handleEditorKey(self: *App, event: *const terminal.Input.Key) !void {
+fn handleTurnKey(
+    self: *App,
+    turn: *Mode.Turn,
+    event: *const terminal.Input.Key,
+    notice_shown: bool,
+) !void {
     if (try self.editKey(event)) return;
     switch (event.*) {
-        .enter => switch (self.mode) {
-            .turn => try self.submitDuringTurn(),
-            .sign_in => try self.submitLoginLine(),
-            else => unreachable,
-        },
-        .escape => if (self.mode == .turn) try self.warnOrCancel() else try self.exitMode(),
+        .enter => try self.submitDuringTurn(),
+        .escape => if (!notice_shown or self.confirmation == .cancel) try self.warnOrCancel(turn),
         .ctrl => |letter| switch (letter) {
-            'c' => try self.clearOrExit(),
-            'd' => try self.exitMode(),
+            'c' => if (self.draftEmpty()) try self.cancelTurn(turn) else self.clearDraft(),
+            'd' => try self.cancelTurn(turn),
             else => {},
         },
         else => {},
     }
 }
 
-fn clearOrExit(self: *App) !void {
-    if (self.screen.editor.visible().len == 0) return self.exitMode();
-    self.screen.editor.clear();
-    self.screen.markEdited();
+fn handleSignInKey(self: *App, sign_in: *Mode.SignIn, event: *const terminal.Input.Key) !void {
+    if (try self.editKey(event)) return;
+    switch (event.*) {
+        .enter => try self.submitLoginLine(),
+        .escape => try self.cancelLogin(sign_in),
+        .ctrl => |letter| switch (letter) {
+            'c' => if (self.draftEmpty()) try self.cancelLogin(sign_in) else self.clearDraft(),
+            'd' => try self.cancelLogin(sign_in),
+            else => {},
+        },
+        else => {},
+    }
 }
 
-fn exitMode(self: *App) !void {
-    switch (self.mode) {
-        .turn => try self.cancelTurn(),
-        .sign_in => try self.cancelLogin(),
-        else => unreachable,
-    }
+fn draftEmpty(self: *const App) bool {
+    return self.screen.editor.visible().len == 0;
+}
+
+fn clearDraft(self: *App) void {
+    self.screen.editor.clear();
+    self.screen.markEdited();
 }
 
 fn editKey(self: *App, event: *const terminal.Input.Key) !bool {
@@ -1013,11 +903,10 @@ fn submitLoginLine(self: *App) !void {
     try self.account_registry.send(&.{ .paste = text });
 }
 
-fn warnOrCancel(self: *App) !void {
-    const turn = &self.mode.turn;
-    if (self.screen.editor.visible().len == 0 or turn.cancel_armed) return self.cancelTurn();
+fn warnOrCancel(self: *App, turn: *Mode.Turn) !void {
+    if (self.draftEmpty() or self.confirmation == .cancel) return self.cancelTurn(turn);
     try self.reportNotice(.warning, turn_cancel_notice, .{});
-    turn.cancel_armed = true;
+    self.confirmation = .cancel;
 }
 
 fn submitDuringTurn(self: *App) !void {
@@ -1029,8 +918,7 @@ fn submitDuringTurn(self: *App) !void {
     try self.reportNotice(.information, turn_message_notice, .{});
 }
 
-fn cancelTurn(self: *App) !void {
-    const turn = &self.mode.turn;
+fn cancelTurn(self: *App, turn: *Mode.Turn) !void {
     if (turn.cancel_sent) return;
     turn.cancel_sent = true;
     try self.session.send(&.cancel);
@@ -1070,9 +958,8 @@ fn nowNs(self: *App) i96 {
 }
 
 fn submit(self: *App) !void {
-    const prompt = &self.mode.prompt;
-    const message_confirmed = prompt.confirmation == .message;
-    prompt.confirmation = null;
+    const message_confirmed = self.confirmation == .message;
+    self.confirmation = null;
     if (self.screen.editor.blank()) return;
     const text = try self.screen.editor.expanded();
     defer self.gpa.free(text);
@@ -1090,7 +977,7 @@ fn submit(self: *App) !void {
 }
 
 fn turnRefusal(self: *const App) ?[]const u8 {
-    if (self.choice.account == null or self.client == null) return signed_out_refusal;
+    if (self.choice.account == null or self.clients.current == null) return signed_out_refusal;
     if (self.choice.model == null) return no_model_refusal;
     return null;
 }
@@ -1122,7 +1009,7 @@ fn submitSkill(
 fn armMessageSend(self: *App, refusal: Message) !void {
     defer refusal.deinit(self.gpa);
     try self.reportNotice(refusal.severity, "Enter: Send as a message · {s}", .{refusal.content});
-    self.mode.prompt.confirmation = .message;
+    self.confirmation = .message;
 }
 
 fn startSkillTurn(
@@ -1156,13 +1043,14 @@ fn runTurn(self: *App, turn: *const TurnStart) !void {
 
 fn leaveTurn(self: *App) Mode.Turn {
     const turn = self.mode.turn;
-    self.setMode(.{ .prompt = .{} });
+    self.mode.turn.line = null;
+    self.setMode(.prompt);
     return turn;
 }
 
 fn applySessionEvent(self: *App, event: *const core.Session.Event) !void {
     switch (event.*) {
-        .setup_dropped => |provider| return self.releaseSetup(provider),
+        .setup_dropped => |provider| return self.clients.release(provider),
         .tool_started => |*call| if (core.Tool.mutating(&tools.Registry.specs, call.name)) {
             self.mode.turn.mutated = true;
         },
@@ -1211,7 +1099,7 @@ fn rejectCredential(self: *App) !void {
             break :failure false;
         },
     };
-    self.closeClient();
+    self.clients.close();
     if (recovered) {
         try self.sync();
         try self.reportCredentialStep(
@@ -1287,10 +1175,7 @@ fn applyAccountsEvent(self: *App, event: *const accounts.Registry.Event) !void {
             "Drinky could not open the browser for the sign-in to {s}. Open the URL above.",
             .{accounts.Account.table[account].id},
         ),
-        .paste_replayed => {
-            self.screen.editor.clear();
-            self.screen.markEdited();
-        },
+        .paste_replayed => self.clearDraft(),
         .paste_refused => |refusal| try self.reportPasteRefusal(refusal),
         .login_ended => |*ended| try self.finishLogin(ended),
         .fetch_ended => |*ended| try self.finishFetch(ended),
@@ -1323,23 +1208,7 @@ fn recordAuthorization(
         else => return,
     };
     if (sign_in.account != authorization.account) return;
-    const id = accounts.Account.table[sign_in.account].id;
-    if (authorization.code) |code| {
-        try self.recordEvent(
-            .information,
-            "Open this URL to authorize the sign-in to {s}:\n\n{s}\n\n" ++
-                "Enter this code if the page asks for one: {s}",
-            .{ id, authorization.url, code },
-        );
-    } else {
-        try self.recordEvent(
-            .information,
-            "Open this URL to authorize the sign-in to {s}:\n\n{s}\n\n" ++
-                "If the browser shows an error, paste the callback URL from its address bar " ++
-                "and press Enter.",
-            .{ id, authorization.url },
-        );
-    }
+    try self.screen.appendEvent(try command.login.authorization(self.gpa, authorization));
     sign_in.event_index = self.screen.transcript.blocks().len - 1;
 }
 
@@ -1365,8 +1234,7 @@ fn reportPasteRefusal(self: *App, refusal: accounts.Registry.Event.Paste) !void 
         .replay_failed => |err| {
             switch (err) {
                 error.ConnectionRefused => {
-                    self.screen.editor.clear();
-                    self.screen.markEdited();
+                    self.clearDraft();
                     return self.reportNotice(
                         .information,
                         "Drinky already received the response for the sign-in to {s}.",
@@ -1397,8 +1265,7 @@ fn startLogin(self: *App, account: usize) !void {
     } });
 }
 
-fn cancelLogin(self: *App) !void {
-    const sign_in = &self.mode.sign_in;
+fn cancelLogin(self: *App, sign_in: *Mode.SignIn) !void {
     if (sign_in.cancel_sent) return;
     sign_in.cancel_sent = true;
     try self.account_registry.send(&.cancel);
@@ -1410,15 +1277,17 @@ fn finishLogin(self: *App, ended: *const accounts.Registry.Event.LoginEnd) !void
         else => return,
     };
     if (sign_in.account != ended.account) return;
-    self.setMode(.{ .prompt = .{} });
+    self.setMode(.prompt);
     self.screen.clearNotice();
-    const committed = ended.outcome catch |login_error|
-        return self.reportLoginFailure(&sign_in, login_error);
+    const committed = ended.outcome catch |login_error| return self.reportLoginEnd(
+        &sign_in,
+        try command.login.failure(self.gpa, sign_in.account, login_error),
+    );
     try self.completeLogin(&sign_in, &committed);
 }
 
 fn dropLogin(self: *App) void {
-    if (self.mode == .sign_in) self.setMode(.{ .prompt = .{} });
+    if (self.mode == .sign_in) self.setMode(.prompt);
 }
 
 fn completeLogin(
@@ -1456,72 +1325,9 @@ fn completeLogin(
     try self.openPicker(&try command.model.forAccount(&context, account));
 }
 
-fn reportLoginFailure(
-    self: *App,
-    sign_in: *const Mode.SignIn,
-    login_error: accounts.oauth.store.SignInError,
-) !void {
-    const id = accounts.Account.table[sign_in.account].id;
-    const message: ?[]const u8 = switch (login_error) {
-        error.Canceled => return self.reportLoginEnd(
-            sign_in,
-            .information,
-            "You canceled the sign-in to {s}.",
-            .{id},
-        ),
-        error.CallbackTimeout => "Drinky stopped the sign-in because the browser did not " ++
-            "respond in time.",
-        error.CallbackRequestTooLarge => "Drinky could not sign in because the browser " ++
-            "response was too large.",
-        error.CallbackTimeoutUnavailable => "Drinky could not sign in because it could not " ++
-            "set a browser time limit.",
-        error.AuthorizationFailed, error.AuthorizationDenied => "The provider did not " ++
-            "authorize Drinky. Start the sign-in again.",
-        error.DeviceCodeExpired => "Drinky stopped the sign-in because the authorization did " ++
-            "not arrive in time.",
-        error.StateMismatch => "The response belongs to another sign-in. " ++
-            "Start the sign-in again.",
-        error.TokenGrantRejected => "The provider rejected the authorization. " ++
-            "Start the sign-in again.",
-        error.TokenServiceUnavailable => "The provider credential service is not available. " ++
-            "Try the sign-in again later.",
-        error.OutOfMemory,
-        error.TokenResponseTooLarge,
-        error.TokenRequestFailed,
-        error.AuthorizationPending,
-        error.SlowDown,
-        error.BadTokenResponse,
-        error.BadDeviceResponse,
-        error.BadCredentials,
-        error.MissingAccessToken,
-        error.MissingRefreshToken,
-        error.MissingExpiry,
-        error.MissingAccountId,
-        error.MissingApiKey,
-        => null,
-        inline else => |cause| network: {
-            comptime core.error_set.requireMember(accounts.oauth.login.NetworkError, cause);
-            break :network null;
-        },
-    };
-    const text = message orelse return self.reportLoginEnd(
-        sign_in,
-        .failure,
-        "Drinky could not sign in because of error {s}.",
-        .{@errorName(login_error)},
-    );
-    return self.reportLoginEnd(sign_in, .failure, "{s}", .{text});
-}
-
-fn reportLoginEnd(
-    self: *App,
-    sign_in: *const Mode.SignIn,
-    severity: Message.Severity,
-    comptime format: []const u8,
-    args: anytype,
-) !void {
-    const index = sign_in.event_index orelse return self.reportNotice(severity, format, args);
-    try self.recordEventAt(index, severity, format, args);
+fn reportLoginEnd(self: *App, sign_in: *const Mode.SignIn, message: Message) !void {
+    const index = sign_in.event_index orelse return self.setNotice(message);
+    try self.screen.replaceEvent(index, message);
 }
 
 fn startFetch(self: *App, account: usize) !void {
@@ -1559,8 +1365,7 @@ fn reopenStep(self: *App) !void {
     try self.applyPickerOutcome(&try opener.run(&context));
 }
 
-fn cancelFetch(self: *App, exit: Mode.Fetch.Exit) !void {
-    const fetch = &self.mode.fetch;
+fn cancelFetch(self: *App, fetch: *Mode.Fetch, exit: Mode.Fetch.Exit) !void {
     if (fetch.exit != null) return;
     fetch.exit = exit;
     try self.account_registry.send(&.cancel);
@@ -1624,12 +1429,12 @@ fn openPicker(self: *App, pick: *const command.Context.Outcome.Pick) !void {
 
 fn closePicker(self: *App) void {
     self.screen.closePicker();
-    self.setMode(.{ .prompt = .{} });
+    self.setMode(.prompt);
 }
 
 fn cancelPicker(self: *App) !void {
     try self.screen.cancelPicker();
-    self.setMode(.{ .prompt = .{} });
+    self.setMode(.prompt);
 }
 
 fn openPage(self: *App, options: *const ui.Page.Options) !void {
@@ -1639,7 +1444,7 @@ fn openPage(self: *App, options: *const ui.Page.Options) !void {
 
 fn closePage(self: *App) void {
     self.screen.closePage();
-    self.setMode(.{ .prompt = .{} });
+    self.setMode(.prompt);
 }
 
 fn openLoginPicker(self: *App) !void {
@@ -1649,7 +1454,7 @@ fn openLoginPicker(self: *App) !void {
 
 fn logoutAccount(self: *App, account: usize) !void {
     const was_active = self.choice.isActive(account);
-    if (was_active) self.closeClient();
+    if (was_active) self.clients.close();
     self.account_registry.logout(account) catch |err| {
         return self.reportNotice(
             .failure,
@@ -1666,12 +1471,7 @@ fn logoutAccount(self: *App, account: usize) !void {
 }
 
 fn setNotice(self: *App, message: Message) void {
-    switch (self.mode) {
-        .prompt => |*prompt| if (prompt.confirmation == .message) {
-            prompt.confirmation = null;
-        },
-        else => {},
-    }
+    if (self.confirmation == .message) self.confirmation = null;
     self.screen.setNotice(message);
 }
 
@@ -1714,7 +1514,7 @@ fn recordEventAt(
 }
 
 fn handlePageKey(self: *App, event: *const terminal.Input.Key) !void {
-    const page = &self.screen.widget.page;
+    const page = self.screen.activePage().?;
     const size: terminal.View.Size = .{
         .columns = self.screen.columns,
         .rows = self.screen.rows,
@@ -1741,7 +1541,7 @@ fn handlePageKey(self: *App, event: *const terminal.Input.Key) !void {
 }
 
 fn handlePickerKey(self: *App, event: *const terminal.Input.Key) !void {
-    const picker = &self.screen.widget.picking.picker;
+    const picker = self.screen.activePicker().?;
     switch (event.*) {
         .up => try picker.moveUp(),
         .down => try picker.moveDown(),
@@ -1756,11 +1556,11 @@ fn handlePickerKey(self: *App, event: *const terminal.Input.Key) !void {
     self.screen.dirty = true;
 }
 
-fn handleFetchKey(self: *App, event: *const terminal.Input.Key) !void {
+fn handleFetchKey(self: *App, fetch: *Mode.Fetch, event: *const terminal.Input.Key) !void {
     switch (event.*) {
-        .escape => try self.cancelFetch(.step),
+        .escape => try self.cancelFetch(fetch, .step),
         .ctrl => |letter| switch (letter) {
-            'c', 'd' => try self.cancelFetch(.command),
+            'c', 'd' => try self.cancelFetch(fetch, .command),
             else => {},
         },
         else => {},
@@ -1805,14 +1605,14 @@ test "a prompt runs a turn through the session, and the answer joins the transcr
         .model = "gpt-5.6-sol",
     });
     defer rig.deinit();
-    try std.testing.expectEqual(accounts.testing.openai_api_key, rig.app.choice.account.?);
-    try std.testing.expectEqualStrings("gpt-5.6-sol", rig.app.screen.statusInfo(0).model.?);
+    try std.testing.expectEqualStrings("openai-api-key", rig.status().account.?);
+    try std.testing.expectEqualStrings("gpt-5.6-sol", rig.status().model.?);
 
     try rig.keys("hi\r");
-    try std.testing.expect(rig.app.mode == .turn);
+    try std.testing.expect(rig.view() == .turn);
     try std.testing.expectEqualStrings("", rig.app.screen.editor.visible());
     try rig.settle();
-    try std.testing.expect(rig.app.mode == .prompt);
+    try std.testing.expect(rig.view() == .prompt);
     const blocks = rig.blocks();
     try std.testing.expectEqual(@as(usize, 3), blocks.len);
     try std.testing.expectEqualStrings("hi", blocks[1].content.user.items);
@@ -1820,7 +1620,7 @@ test "a prompt runs a turn through the session, and the answer joins the transcr
     try expectRequested(&rig, "\"model\":\"gpt-5.6-sol\"");
     try expectRequested(&rig, "\"effort\":\"high\"");
     try expectRequested(&rig, "You run inside Drinky, a terminal coding-agent harness.");
-    try std.testing.expectEqual(@as(?u64, 12), rig.app.screen.statusInfo(0).context_tokens);
+    try std.testing.expectEqual(@as(?u64, 12), rig.status().context_tokens);
 
     try rig.keys("again\r");
     try rig.settle();
@@ -1850,6 +1650,8 @@ const Rig = struct {
         model_accounts: []const usize = &.{accounts.testing.openai_api_key},
     };
 
+    const View = enum { prompt, turn, picker, fetch, page, sign_in };
+
     fn init(self: *Rig, options: *const Rig.Options) !void {
         const gpa = std.testing.allocator;
         self.clock.init(gpa);
@@ -1865,6 +1667,7 @@ const Rig = struct {
         for (options.variables) |variable| try self.environment.put(variable[0], variable[1]);
         if (options.store) |data| try accounts.testing.writeStore(io, &self.tmp, data);
         try self.writeConfig(options);
+        if (options.model) |name| try self.writeModel(name, options.model_accounts);
         for (options.files) |file| {
             const parent_path = std.fs.path.dirname(file[0]).?;
             var parent = try self.tmp.dir.createDirPathOpen(io, parent_path, .{});
@@ -1887,8 +1690,6 @@ const Rig = struct {
             .browser = self.browser.browser(),
             .loopback = self.loopback.loopback(),
         });
-        errdefer self.app.deinit();
-        if (options.model) |name| try self.seedModel(name, options.model_accounts);
         self.app.running = true;
     }
 
@@ -1901,20 +1702,33 @@ const Rig = struct {
         try directory.writeFile(io, .{ .sub_path = "config.json", .data = data });
     }
 
-    fn seedModel(self: *Rig, name: []const u8, model_accounts: []const usize) !void {
-        const app = &self.app;
-        var model = try accounts.Model.init(name);
-        model.context_window = 400_000;
-        model.tokens_max = 32_000;
-        model.thinking = .supported;
-        model.addEffort(.low);
-        model.addEffort(.high);
-        for (model_accounts) |account| {
-            try app.account_registry.catalog.setAccount(account, &.{model});
-            try app.state.seed(account, model.name(), .high);
+    fn writeModel(self: *Rig, name: []const u8, model_accounts: []const usize) !void {
+        const gpa = std.testing.allocator;
+        const io = std.testing.io;
+        var lists: std.Io.Writer.Allocating = .init(gpa);
+        defer lists.deinit();
+        var names: std.Io.Writer.Allocating = .init(gpa);
+        defer names.deinit();
+        for (model_accounts, 0..) |account, index| {
+            const separator = if (index == 0) "" else ",";
+            const id = accounts.Account.table[account].id;
+            try lists.writer.print(
+                "{s}\"{s}\":{{\"models\":[{{\"name\":\"{s}\",\"context_window\":400000," ++
+                    "\"tokens_max\":32000,\"thinking\":\"supported\",\"efforts\":\"low,high\"}}]}}",
+                .{ separator, id, name },
+            );
+            try names.writer.print("{s}\"{s}\":\"{s}\"", .{ separator, id, name });
         }
-        app.adopt(app.startAccount());
-        try app.sync();
+        const lists_data = try std.fmt.allocPrint(gpa, "{{{s}}}", .{lists.written()});
+        defer gpa.free(lists_data);
+        try self.tmp.dir.writeFile(io, .{ .sub_path = ".drinky/models.json", .data = lists_data });
+        const state_data = try std.fmt.allocPrint(
+            gpa,
+            "{{{f}:{{\"models\":{{{s}}}}}}}",
+            .{ std.json.fmt(self.directory, .{}), names.written() },
+        );
+        defer gpa.free(state_data);
+        try self.tmp.dir.writeFile(io, .{ .sub_path = ".drinky/state.json", .data = state_data });
     }
 
     fn deinit(self: *Rig) void {
@@ -1940,9 +1754,11 @@ const Rig = struct {
     fn settle(self: *Rig) !void {
         var batch: [queue_capacity]UiEvent = undefined;
         for (0..1 << 16) |_| {
-            const waits = self.app.mode == .turn or self.app.mode == .fetch or
-                self.app.mode == .sign_in;
-            const count = try self.app.queue.get(self.app.io, &batch, if (waits) 1 else 0);
+            const waits = switch (self.view()) {
+                .turn, .fetch, .sign_in => true,
+                .prompt, .picker, .page => false,
+            };
+            const count = try self.app.queue.get(self.clock.io(), &batch, if (waits) 1 else 0);
             if (count == 0) return;
             _ = try self.app.applyBatch(batch[0..count]);
         }
@@ -1953,23 +1769,35 @@ const Rig = struct {
         return self.app.screen.transcript.blocks();
     }
 
+    fn status(self: *const Rig) ui.status.Info {
+        return self.app.screen.statusInfo(0);
+    }
+
+    fn view(self: *Rig) View {
+        const screen = &self.app.screen;
+        if (screen.statusInfo(0).turn_active) return .turn;
+        if (screen.activePage() != null) return .page;
+        if (screen.activePicker()) |picker| return if (picker.wait == null) .picker else .fetch;
+        return if (self.app.mode == .sign_in) .sign_in else .prompt;
+    }
+
     fn lastRequest(self: *const Rig) []const u8 {
         return self.transport.requests.items[self.transport.requests.items.len - 1];
     }
 
-    fn pumpUntil(self: *Rig, reached: *const fn (app: *const App) bool) !void {
+    fn pumpUntil(self: *Rig, reached: *const fn (rig: *Rig) bool) !void {
         var batch: [queue_capacity]UiEvent = undefined;
         for (0..1 << 16) |_| {
-            if (reached(&self.app)) return;
-            const count = try self.app.queue.get(self.app.io, &batch, 1);
+            if (reached(self)) return;
+            const count = try self.app.queue.get(self.clock.io(), &batch, 1);
             _ = try self.app.applyBatch(batch[0..count]);
         }
         return error.TooManyEvents;
     }
 
     fn startLoginOf(self: *Rig, account: usize) !void {
-        try std.testing.expect(self.app.mode == .picker);
-        const picker = &self.app.screen.widget.picking.picker;
+        try std.testing.expect(self.view() == .picker);
+        const picker = self.app.screen.activePicker().?;
         try std.testing.expectEqualStrings("Sign in", picker.title);
         for (0..accounts.Account.table.len) |_| {
             if (picker.cursor == account) break;
@@ -1977,13 +1805,19 @@ const Rig = struct {
         }
         try std.testing.expectEqual(account, picker.cursor);
         try self.keys("\r");
-        try std.testing.expectEqual(account, self.app.mode.sign_in.account);
         try self.pumpUntil(showsAuthorization);
+        const lead = try std.fmt.allocPrint(
+            std.testing.allocator,
+            authorization_lead ++ "{s}:",
+            .{accounts.Account.table[account].id},
+        );
+        defer std.testing.allocator.free(lead);
+        try std.testing.expect(std.mem.startsWith(u8, loginEvent(self), lead));
     }
 
     fn takeUntilTurnEnd(self: *Rig, batch: *[queue_capacity]UiEvent) ![]const UiEvent {
         for (0..queue_capacity) |index| {
-            batch[index] = try self.app.queue.getOne(self.app.io);
+            batch[index] = try self.app.queue.getOne(self.clock.io());
             const event = &batch[index];
             if (event.* == .session and event.session == .turn_ended) return batch[0 .. index + 1];
         }
@@ -2019,7 +1853,7 @@ fn expectRequested(rig: *const Rig, needle: []const u8) !void {
 }
 
 fn expectNoticeHolds(rig: *const Rig, needle: []const u8) !void {
-    const notice = rig.app.screen.notice orelse return error.TestExpectedNotice;
+    const notice = rig.status().notice orelse return error.TestExpectedNotice;
     if (std.mem.indexOf(u8, notice.content, needle) != null) return;
     std.debug.print("the notice \"{s}\" holds no \"{s}\"\n", .{ notice.content, needle });
     return error.TestExpectedNeedle;
@@ -2039,7 +1873,7 @@ test "a failed turn ends at the prompt with its event, and the message stays" {
 
     try rig.keys("hi\r");
     try rig.settle();
-    try std.testing.expect(rig.app.mode == .prompt);
+    try std.testing.expect(rig.view() == .prompt);
     const blocks = rig.blocks();
     try std.testing.expectEqual(@as(usize, 4), blocks.len);
     const attempt = blocks[2].content.event.text.items;
@@ -2084,13 +1918,13 @@ test "a failed turn or retry offers a retry that Esc dismisses and Ctrl+N sends 
     try std.testing.expectEqual(Herdr.State.idle, rig.app.herdrState());
     try std.testing.expectEqualStrings("draft", rig.app.screen.editor.visible());
     try rig.keys("\x0e");
-    try std.testing.expect(rig.app.mode == .prompt);
+    try std.testing.expect(rig.view() == .prompt);
     try std.testing.expectEqual(@as(usize, 2), rig.transport.requests.items.len);
 
     try rig.keys("\x03again\r");
     try rig.settle();
     try rig.keys("draft\x0e");
-    try std.testing.expect(rig.app.mode == .turn);
+    try std.testing.expect(rig.view() == .turn);
     const blocks = rig.blocks();
     try std.testing.expectEqualStrings(retry_note, blocks[blocks.len - 1].content.user_note.items);
     try rig.settle();
@@ -2103,7 +1937,7 @@ test "a failed turn or retry offers a retry that Esc dismisses and Ctrl+N sends 
     try rig.keys("\x0e");
     try rig.settle();
     try std.testing.expectEqual(@as(usize, 7), rig.transport.requests.items.len);
-    try std.testing.expect(rig.app.mode == .prompt);
+    try std.testing.expect(rig.view() == .prompt);
     try std.testing.expect(rig.app.caption() == null);
     try std.testing.expectEqualStrings("draft", rig.app.screen.editor.visible());
 }
@@ -2184,7 +2018,7 @@ test "a command sees the chosen model and effort, and an effort change reaches t
     try rig.keys("check\r");
     try rig.settle();
     try rig.keys("/effort\r\x1b[B\r");
-    try std.testing.expectEqual(core.Provider.Effort.max, rig.app.choice.effort);
+    try std.testing.expectEqualStrings("max", rig.status().effort);
     try rig.settle();
     try rig.keys("again\r");
     try rig.settle();
@@ -2300,20 +2134,20 @@ test "a signed-out submit and a submit without a model are refused with a notice
     var rig: Rig = undefined;
     try rig.init(&.{});
     defer rig.deinit();
-    try std.testing.expect(rig.app.choice.account == null);
+    try std.testing.expect(rig.status().account == null);
     try rig.keys("\x03");
     try rig.keys("hi\r");
-    try std.testing.expect(rig.app.mode == .prompt);
+    try std.testing.expect(rig.view() == .prompt);
     try expectNoticeHolds(&rig, signed_out_refusal);
     try std.testing.expectEqualStrings("hi", rig.app.screen.editor.visible());
 
     var keyed: Rig = undefined;
     try keyed.init(&.{ .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }} });
     defer keyed.deinit();
-    try std.testing.expectEqual(accounts.testing.openai_api_key, keyed.app.choice.account.?);
-    try std.testing.expect(keyed.app.choice.model == null);
+    try std.testing.expectEqualStrings("openai-api-key", keyed.status().account.?);
+    try std.testing.expect(keyed.status().model == null);
     try keyed.keys("hi\r");
-    try std.testing.expect(keyed.app.mode == .prompt);
+    try std.testing.expect(keyed.view() == .prompt);
     try expectNoticeHolds(&keyed, no_model_refusal);
 }
 
@@ -2327,24 +2161,24 @@ test "a slash command opens its picker, a pick applies, and Esc leaves with a no
     defer rig.deinit();
 
     try rig.keys("/effort\r");
-    try std.testing.expect(rig.app.mode == .picker);
-    try std.testing.expectEqualStrings("Effort", rig.app.screen.widget.picking.picker.title);
+    try std.testing.expect(rig.view() == .picker);
+    try std.testing.expectEqualStrings("Effort", rig.app.screen.activePicker().?.title);
     try rig.keys("\x1b");
     rig.clock.advance(escape_wait_ms - 1);
     try rig.app.flushEscape();
     try rig.settle();
-    try std.testing.expect(rig.app.mode == .picker);
+    try std.testing.expect(rig.view() == .picker);
     rig.clock.advance(1);
     try rig.app.flushEscape();
-    try std.testing.expect(rig.app.mode == .prompt);
+    try std.testing.expect(rig.view() == .prompt);
     try expectNoticeHolds(&rig, "You canceled the effort selection.");
 
     try rig.keys("/effort\r");
-    try std.testing.expectEqual(@as(usize, 3), rig.app.screen.widget.picking.picker.cursor);
+    try std.testing.expectEqual(@as(usize, 3), rig.app.screen.activePicker().?.cursor);
     try rig.keys("\x1b[A" ** 3 ++ "\x1b[B" ++ "\x1b[A");
     try rig.keys("\r");
-    try std.testing.expect(rig.app.mode == .prompt);
-    try std.testing.expectEqual(core.Provider.Effort.low, rig.app.choice.effort);
+    try std.testing.expect(rig.view() == .prompt);
+    try std.testing.expectEqualStrings("low", rig.status().effort);
     const blocks = rig.blocks();
     try std.testing.expectEqualStrings(
         "Drinky set the effort level to low.",
@@ -2365,9 +2199,9 @@ test "Ctrl+C and Ctrl+D in a picker end its command with its notice" {
     defer rig.deinit();
     for ([_][]const u8{ "\x03", "\x04" }) |exit_key| {
         try rig.keys("/effort\r");
-        try std.testing.expect(rig.app.mode == .picker);
+        try std.testing.expect(rig.view() == .picker);
         try rig.keys(exit_key);
-        try std.testing.expect(rig.app.mode == .prompt);
+        try std.testing.expect(rig.view() == .prompt);
         try std.testing.expect(rig.app.running);
         try expectNoticeHolds(&rig, "You canceled the effort selection.");
     }
@@ -2383,11 +2217,11 @@ test "a refused command line reaches the model on the next Enter" {
     defer rig.deinit();
 
     try rig.keys("/nope\r");
-    try std.testing.expect(rig.app.mode == .prompt);
+    try std.testing.expect(rig.view() == .prompt);
     try expectNoticeHolds(&rig, "Enter: Send as a message · Drinky does not recognize the command");
     try std.testing.expectEqualStrings("/nope", rig.app.screen.editor.visible());
     try rig.keys("\r");
-    try std.testing.expect(rig.app.mode == .turn);
+    try std.testing.expect(rig.view() == .turn);
     try rig.settle();
     try expectRequested(&rig, "\"text\":\"/nope\"");
 }
@@ -2400,8 +2234,8 @@ test "a command that its state refuses keeps its line" {
         try rig.keys("\x03");
         try rig.keys(line);
         try rig.keys("\r");
-        try std.testing.expect(rig.app.mode == .prompt);
-        try std.testing.expect(rig.app.screen.notice != null);
+        try std.testing.expect(rig.view() == .prompt);
+        try std.testing.expect(rig.status().notice != null);
         try std.testing.expectEqualStrings(line, rig.app.screen.editor.visible());
     }
 }
@@ -2425,7 +2259,7 @@ test "/new clears the conversation, and the next request starts fresh" {
     try rig.settle();
     try std.testing.expectEqual(@as(usize, 1), rig.blocks().len);
     try std.testing.expect(rig.blocks()[0].content == .intro);
-    try std.testing.expectEqual(@as(?u64, 0), rig.app.screen.statusInfo(0).context_tokens);
+    try std.testing.expectEqual(@as(?u64, 0), rig.status().context_tokens);
 
     try rig.keys("second\r");
     try rig.settle();
@@ -2442,12 +2276,12 @@ test "Enter during a turn keeps the text, and Ctrl+D with a draft warns before i
     });
     defer rig.deinit();
     try rig.keys("hi\r");
-    try std.testing.expect(rig.app.mode == .turn);
+    try std.testing.expect(rig.view() == .turn);
     try rig.keys("more\r");
     try expectNoticeHolds(&rig, turn_message_notice);
     try std.testing.expectEqualStrings("more", rig.app.screen.editor.visible());
     try rig.settle();
-    try std.testing.expect(rig.app.mode == .prompt);
+    try std.testing.expect(rig.view() == .prompt);
     try std.testing.expectEqualStrings("more", rig.app.screen.editor.visible());
 
     try rig.keys("\x04");
@@ -2475,16 +2309,16 @@ test "a Ctrl+D that ends a turn or closes a page warns before the next Ctrl+D qu
     try rig.keys("\x04");
     hold.released.set(std.testing.io);
     try rig.settle();
-    try std.testing.expect(rig.app.mode == .prompt);
+    try std.testing.expect(rig.view() == .prompt);
     try rig.keys("\x04");
     try std.testing.expect(rig.app.running);
     try expectNoticeHolds(&rig, "Press Ctrl+D again to quit.");
     try rig.keys("\x03");
 
     try rig.keys("/system\r");
-    try std.testing.expect(rig.app.mode == .page);
+    try std.testing.expect(rig.view() == .page);
     try rig.keys("\x04");
-    try std.testing.expect(rig.app.mode == .prompt);
+    try std.testing.expect(rig.view() == .prompt);
     try rig.keys("\x04");
     try std.testing.expect(rig.app.running);
     try expectNoticeHolds(&rig, "Press Ctrl+D again to quit.");
@@ -2511,32 +2345,30 @@ test "a notice that replaces the send offer of a refused command line withdraws 
     try rig.settle();
     try expectNoticeHolds(&rig, "Drinky cannot start this now");
     try rig.keys("\r");
-    try std.testing.expect(rig.app.mode == .prompt);
+    try std.testing.expect(rig.view() == .prompt);
     try expectNoticeHolds(&rig, "Enter: Send as a message");
     try rig.keys("\r");
-    try std.testing.expect(rig.app.mode == .turn);
+    try std.testing.expect(rig.view() == .turn);
     try rig.settle();
     try expectRequested(&rig, "\"text\":\"/nope\"");
 }
 
-fn showsAuthorization(app: *const App) bool {
-    const sign_in = switch (app.mode) {
-        .sign_in => |sign_in| sign_in,
-        else => return false,
-    };
-    return sign_in.event_index != null and app.screen.notice != null;
+const authorization_lead = "Open this URL to authorize the sign-in to ";
+
+fn showsAuthorization(rig: *Rig) bool {
+    return eventWith(rig, authorization_lead) != null and rig.status().notice != null;
 }
 
-fn showsNotice(app: *const App) bool {
-    return app.screen.notice != null;
+fn showsNotice(rig: *Rig) bool {
+    return rig.status().notice != null;
 }
 
-fn editorEmpty(app: *const App) bool {
-    return app.screen.editor.visible().len == 0;
+fn editorEmpty(rig: *Rig) bool {
+    return rig.app.screen.editor.visible().len == 0;
 }
 
 fn loginEvent(rig: *const Rig) []const u8 {
-    return rig.blocks()[rig.app.mode.sign_in.event_index.?].content.event.text.items;
+    return eventWith(rig, authorization_lead).?;
 }
 
 const denied_login_event = "The provider did not authorize Drinky. Start the sign-in again.";
@@ -2566,7 +2398,7 @@ test "a sign-in shows its URL, and a pasted callback line reaches its listener" 
 
     try rig.keys("http://localhost:53692/callback?error=access_denied&state=unknown\r");
     try rig.pumpUntil(editorEmpty);
-    try std.testing.expect(rig.app.mode == .sign_in);
+    try std.testing.expect(rig.view() == .sign_in);
 
     const shown = loginEvent(&rig);
     const state_start = std.mem.indexOf(u8, shown, "&state=").? + "&state=".len;
@@ -2579,7 +2411,7 @@ test "a sign-in shows its URL, and a pasted callback line reaches its listener" 
     defer std.testing.allocator.free(line);
     try rig.keys(line);
     try rig.settle();
-    try std.testing.expect(rig.app.mode != .sign_in);
+    try std.testing.expect(rig.view() != .sign_in);
     try std.testing.expectEqualStrings("", rig.app.screen.editor.visible());
     try expectEventText(&rig, denied_login_event);
     try std.testing.expect(!rig.app.account_registry.isAuthenticated(anthropic_plan));
@@ -2612,7 +2444,7 @@ test "a sign-in with a callback path takes a pasted line of that path alone" {
         &rig,
         "The line is not the callback URL for the sign-in to openrouter-api.",
     );
-    try std.testing.expect(rig.app.mode == .sign_in);
+    try std.testing.expect(rig.view() == .sign_in);
 
     const line = try std.fmt.allocPrint(
         std.testing.allocator,
@@ -2622,7 +2454,7 @@ test "a sign-in with a callback path takes a pasted line of that path alone" {
     defer std.testing.allocator.free(line);
     try rig.keys(line);
     try rig.settle();
-    try std.testing.expect(rig.app.mode != .sign_in);
+    try std.testing.expect(rig.view() != .sign_in);
     try expectEventText(&rig, denied_login_event);
 }
 
@@ -2642,8 +2474,8 @@ test "a completed sign-in reports a memory-only save and opens the model step" {
         .body = "{\"access_token\":\"at\",\"refresh_token\":\"rt\",\"expires_in\":3600}",
     }} });
     defer rig.deinit();
-    var blocked = try rig.tmp.dir.createDirPathOpen(rig.app.io, ".drinky/auth.json", .{});
-    blocked.close(rig.app.io);
+    var blocked = try rig.tmp.dir.createDirPathOpen(rig.clock.io(), ".drinky/auth.json", .{});
+    blocked.close(rig.clock.io());
 
     try rig.startLoginOf(anthropic_plan);
     const shown = loginEvent(&rig);
@@ -2667,7 +2499,7 @@ test "a completed sign-in reports a memory-only save and opens the model step" {
         unsaved,
         "The sign-in stays active until Drinky exits.",
     ));
-    try std.testing.expect(rig.app.mode == .picker);
+    try std.testing.expect(rig.view() == .picker);
 }
 
 test "a paste after the listener closed clears the editor with a notice" {
@@ -2684,7 +2516,7 @@ test "a paste after the listener closed clears the editor with a notice" {
         &rig,
         "Drinky already received the response for the sign-in to anthropic-plan.",
     );
-    try std.testing.expect(rig.app.mode == .sign_in);
+    try std.testing.expect(rig.view() == .sign_in);
 }
 
 test "Esc with a draft warns before it cancels the turn, and Ctrl+D cancels at once" {
@@ -2705,12 +2537,12 @@ test "Esc with a draft warns before it cancels the turn, and Ctrl+D cancels at o
     try stalls[0].reached.wait(std.testing.io);
     try rig.keys("draft");
     try rig.escape();
-    try std.testing.expect(rig.app.mode == .turn);
+    try std.testing.expect(rig.view() == .turn);
     try expectNoticeHolds(&rig, turn_cancel_notice);
     try rig.escape();
     try rig.settle();
     try std.testing.expect(stalls[0].canceled);
-    try std.testing.expect(rig.app.mode == .prompt);
+    try std.testing.expect(rig.view() == .prompt);
     try std.testing.expectEqualStrings("draft", rig.app.screen.editor.visible());
     try expectLastEvent(&rig, "You canceled the turn.");
 
@@ -2720,9 +2552,72 @@ test "Esc with a draft warns before it cancels the turn, and Ctrl+D cancels at o
     try rig.keys("\x04");
     try rig.settle();
     try std.testing.expect(stalls[1].canceled);
-    try std.testing.expect(rig.app.mode == .prompt);
+    try std.testing.expect(rig.view() == .prompt);
     try std.testing.expectEqualStrings("more", rig.app.screen.editor.visible());
     try expectLastEvent(&rig, "You canceled the turn.");
+}
+
+test "Esc in a turn clears another notice first, and Ctrl+C clears a draft before it cancels" {
+    var stall: providers.testing.FakeTransport.Stall = .{ .io = std.testing.io };
+    const replies = [_]providers.testing.FakeTransport.Reply{.{ .stall = &stall }};
+    var rig: Rig = undefined;
+    try rig.init(&.{
+        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .replies = &replies,
+        .model = "gpt-5.6-sol",
+    });
+    defer rig.deinit();
+
+    try rig.keys("hi\r");
+    try stall.reached.wait(std.testing.io);
+    try rig.keys("more\r");
+    try expectNoticeHolds(&rig, turn_message_notice);
+    try rig.escape();
+    try std.testing.expect(rig.status().notice == null);
+    try rig.escape();
+    try expectNoticeHolds(&rig, turn_cancel_notice);
+    try rig.keys("x");
+    try rig.escape();
+    try expectNoticeHolds(&rig, turn_cancel_notice);
+
+    try rig.keys("\x03");
+    try std.testing.expect(rig.view() == .turn);
+    try std.testing.expectEqualStrings("", rig.app.screen.editor.visible());
+    try rig.keys("\x03");
+    try rig.settle();
+    try std.testing.expect(stall.canceled);
+    try std.testing.expect(rig.view() == .prompt);
+}
+
+test "Esc and Ctrl+D cancel a sign-in and keep the draft" {
+    const anthropic_plan = accounts.Account.index("anthropic-plan").?;
+    for ([_][]const u8{ "\x1b", "\x04" }) |exit_key| {
+        var rig: Rig = undefined;
+        try rig.init(&.{});
+        defer rig.deinit();
+        try rig.startLoginOf(anthropic_plan);
+        try rig.keys("draft");
+        if (std.mem.eql(u8, exit_key, "\x1b")) try rig.escape() else try rig.keys(exit_key);
+        try rig.settle();
+        try std.testing.expect(rig.view() == .prompt);
+        try std.testing.expectEqualStrings("draft", rig.app.screen.editor.visible());
+        try expectEventText(&rig, "You canceled the sign-in to anthropic-plan.");
+    }
+}
+
+test "Ctrl+C in a sign-in clears the draft first and cancels at an empty editor" {
+    const anthropic_plan = accounts.Account.index("anthropic-plan").?;
+    var rig: Rig = undefined;
+    try rig.init(&.{});
+    defer rig.deinit();
+    try rig.startLoginOf(anthropic_plan);
+    try rig.keys("draft\x03");
+    try std.testing.expect(rig.view() == .sign_in);
+    try std.testing.expectEqualStrings("", rig.app.screen.editor.visible());
+    try rig.keys("\x03");
+    try rig.settle();
+    try std.testing.expect(rig.view() == .prompt);
+    try expectEventText(&rig, "You canceled the sign-in to anthropic-plan.");
 }
 
 test "exit keys during a slow cancel cannot block the end of the turn" {
@@ -2743,7 +2638,7 @@ test "exit keys during a slow cancel cannot block the end of the turn" {
     try rig.keys("\x04" ** 65);
     hold.released.set(std.testing.io);
     try rig.settle();
-    try std.testing.expect(rig.app.mode == .prompt);
+    try std.testing.expect(rig.view() == .prompt);
 }
 
 test "a failed allocation at the sink still ends the turn" {
@@ -2767,9 +2662,9 @@ test "a failed allocation at the sink still ends the turn" {
     } } });
     rig.app.gpa = std.testing.allocator;
     var batch: [queue_capacity]UiEvent = undefined;
-    const count = try rig.app.queue.get(rig.app.io, &batch, 0);
+    const count = try rig.app.queue.get(rig.clock.io(), &batch, 0);
     _ = try rig.app.applyBatch(batch[0..count]);
-    try std.testing.expect(rig.app.mode == .prompt);
+    try std.testing.expect(rig.view() == .prompt);
 }
 
 const rejected_reply: providers.testing.FakeTransport.Reply = .{
@@ -2794,14 +2689,14 @@ const plan_options: Rig.Options = .{
 fn expectRejectionHandOff(
     options: *const Rig.Options,
     event: []const u8,
-    rest: std.meta.Tag(Mode),
+    rest: Rig.View,
 ) !void {
     var rig: Rig = undefined;
     try rig.init(options);
     defer rig.deinit();
-    try std.testing.expectEqual(accounts.testing.openai_plan, rig.app.choice.account.?);
+    try std.testing.expectEqualStrings("openai-plan", rig.status().account.?);
 
-    try accounts.testing.writeStore(rig.app.io, &rig.tmp, planStore("second"));
+    try accounts.testing.writeStore(rig.clock.io(), &rig.tmp, planStore("second"));
     try rig.keys("hi\r");
     try rig.settle();
     try std.testing.expectEqual(@as(usize, 2), rig.transport.requests.items.len);
@@ -2809,7 +2704,7 @@ fn expectRejectionHandOff(
     try expectRequestHolds(&rig, 1, "authorization: Bearer access-second\n");
     try std.testing.expect(!rig.app.account_registry.isAuthenticated(accounts.testing.openai_plan));
     try expectEventHolds(&rig, event);
-    try std.testing.expectEqual(rest, std.meta.activeTag(rig.app.mode));
+    try std.testing.expectEqual(rest, rig.view());
 }
 
 test "a rejected plan credential leaves the store and hands the session to the next account" {
@@ -2851,7 +2746,7 @@ test "a rejected key credential keeps its account" {
     try std.testing.expect(
         rig.app.account_registry.isAuthenticated(accounts.testing.openai_api_key),
     );
-    try std.testing.expectEqual(accounts.testing.openai_api_key, rig.app.choice.account.?);
+    try std.testing.expectEqualStrings("openai-api-key", rig.status().account.?);
     try expectLastEvent(
         &rig,
         "The credential is missing or invalid. Details: 401 Unauthorized: expired",
@@ -2863,15 +2758,15 @@ test "a rejected plan credential yields to the credential that another instance 
     try rig.init(&plan_options);
     defer rig.deinit();
 
-    try accounts.testing.writeStore(rig.app.io, &rig.tmp, planStore("second"));
+    try accounts.testing.writeStore(rig.clock.io(), &rig.tmp, planStore("second"));
     try rig.keys("hi\r");
     var batch: [queue_capacity]UiEvent = undefined;
     const held = try rig.takeUntilTurnEnd(&batch);
-    try accounts.testing.writeStore(rig.app.io, &rig.tmp, planStore("third"));
+    try accounts.testing.writeStore(rig.clock.io(), &rig.tmp, planStore("third"));
     _ = try rig.app.applyBatch(held);
     try rig.settle();
     try std.testing.expect(rig.app.account_registry.isAuthenticated(accounts.testing.openai_plan));
-    try std.testing.expectEqual(accounts.testing.openai_plan, rig.app.choice.account.?);
+    try std.testing.expectEqualStrings("openai-plan", rig.status().account.?);
     try expectLastEvent(
         &rig,
         "Drinky reloaded the refresh credential that another Drinky instance saved. " ++
@@ -2887,21 +2782,20 @@ test "the login picker opens with the accounts, and a set key account switches a
     });
     defer rig.deinit();
     try rig.keys("/login\r");
-    try std.testing.expect(rig.app.mode == .picker);
-    const picker = &rig.app.screen.widget.picking.picker;
+    try std.testing.expect(rig.view() == .picker);
+    const picker = rig.app.screen.activePicker().?;
     try std.testing.expectEqualStrings("Sign in", picker.title);
     try std.testing.expectEqual(accounts.testing.openai_api_key, picker.cursor);
     try rig.keys("\x1b[B\x1b[B\r");
     try rig.settle();
-    try std.testing.expect(rig.app.mode == .prompt);
-    try std.testing.expectEqual(accounts.Account.index("xai-api-key").?, rig.app.choice.account.?);
-    try std.testing.expect(rig.app.choice.model == null);
+    try std.testing.expect(rig.view() == .prompt);
+    try std.testing.expectEqualStrings("xai-api-key", rig.status().account.?);
+    try std.testing.expect(rig.status().model == null);
     const blocks = rig.blocks();
     try std.testing.expectEqualStrings(
         "Drinky now uses xai-api-key. Fetch the model list of xai-api-key with /model.",
         blocks[blocks.len - 1].content.event.text.items,
     );
-    try std.testing.expectEqualStrings("xai-api-key", rig.app.screen.statusInfo(0).account.?);
 }
 
 fn expectEventHolds(rig: *const Rig, needle: []const u8) !void {
@@ -2929,7 +2823,7 @@ test "the start reports each dropped config value and each notice" {
         },
     });
     defer rig.deinit();
-    try std.testing.expect(rig.app.mode == .prompt);
+    try std.testing.expect(rig.view() == .prompt);
     try expectEventText(
         &rig,
         "Drinky ignored the configured default effort level \"turbo\" because Drinky does not " ++
@@ -2962,12 +2856,22 @@ test "the start reports each dropped config value and each notice" {
     ));
 }
 
+test "the start escapes a control character in an unknown config key" {
+    var rig: Rig = undefined;
+    try rig.init(&.{
+        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .config = "{\"\\u001b[2J\":1}",
+    });
+    defer rig.deinit();
+    try expectEventHolds(&rig, "Drinky ignored the unknown config key \"\\x1b[2J\" in ");
+}
+
 test "a start without an account opens the sign-in picker with a notice" {
     var rig: Rig = undefined;
     try rig.init(&.{});
     defer rig.deinit();
-    try std.testing.expect(rig.app.mode == .picker);
-    try std.testing.expectEqualStrings("Sign in", rig.app.screen.widget.picking.picker.title);
+    try std.testing.expect(rig.view() == .picker);
+    try std.testing.expectEqualStrings("Sign in", rig.app.screen.activePicker().?.title);
     try expectNoticeHolds(&rig, "Select an account to sign in.");
     try std.testing.expectEqual(@as(usize, 1), rig.blocks().len);
 }
@@ -2977,9 +2881,9 @@ test "an exit key that closes a page drops the rest of its read" {
     try rig.init(&.{ .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }} });
     defer rig.deinit();
     try rig.keys("/system\r");
-    try std.testing.expect(rig.app.mode == .page);
+    try std.testing.expect(rig.view() == .page);
     try rig.keys("\x04abc");
-    try std.testing.expect(rig.app.mode == .prompt);
+    try std.testing.expect(rig.view() == .prompt);
     try std.testing.expectEqualStrings("", rig.app.screen.editor.visible());
     try rig.keys("abc");
     try std.testing.expectEqualStrings("abc", rig.app.screen.editor.visible());
@@ -3007,45 +2911,50 @@ test "Esc ends a model fetch at its step, and Ctrl+C ends the whole command" {
     defer rig.deinit();
 
     try rig.keys("/model\r");
-    try std.testing.expect(rig.app.mode == .picker);
+    try std.testing.expect(rig.view() == .picker);
     try rig.keys("\r");
-    try std.testing.expect(rig.app.mode == .fetch);
+    try std.testing.expect(rig.view() == .fetch);
     try step_stall.reached.wait(std.testing.io);
     try rig.escape();
     try rig.settle();
     try std.testing.expect(step_stall.canceled);
-    try std.testing.expect(rig.app.mode == .picker);
+    try std.testing.expect(rig.view() == .picker);
     try expectNoticeHolds(&rig, "You canceled the model fetch.");
 
     try rig.keys("\r");
-    try std.testing.expect(rig.app.mode == .fetch);
+    try std.testing.expect(rig.view() == .fetch);
     try command_stall.reached.wait(std.testing.io);
     try rig.keys("\x03");
     try rig.settle();
     try std.testing.expect(command_stall.canceled);
-    try std.testing.expect(rig.app.mode == .prompt);
+    try std.testing.expect(rig.view() == .prompt);
     try expectNoticeHolds(&rig, "You canceled the model selection.");
 }
 
 test "Esc on the models of an author returns to the author step at that author" {
     var rig: Rig = undefined;
-    try rig.init(&.{ .variables = &.{.{ "OPENROUTER_API_KEY", "sk-or" }} });
+    try rig.init(&.{
+        .variables = &.{.{ "OPENROUTER_API_KEY", "sk-or" }},
+        .files = &.{.{
+            ".drinky/metadata.json",
+            "{\"openrouter\":{\"models\":[" ++
+                "{\"name\":\"qwen/qwen-new\",\"context_window\":1,\"tools\":\"supported\"}," ++
+                "{\"name\":\"openai/gpt-new\",\"context_window\":1,\"tools\":\"supported\"}," ++
+                "{\"name\":\"openai/gpt-old\",\"context_window\":1,\"tools\":\"supported\"}]}}",
+        }},
+    });
     defer rig.deinit();
-    try accounts.testing.seedMetadata(
-        &rig.app.account_registry.catalog,
-        &.{ "qwen/qwen-new", "openai/gpt-new", "openai/gpt-old" },
-    );
 
     try rig.keys("/model\r");
-    try std.testing.expect(rig.app.mode == .picker);
-    const authors = &rig.app.screen.widget.picking.picker;
+    try std.testing.expect(rig.view() == .picker);
+    const authors = rig.app.screen.activePicker().?;
     try std.testing.expectEqualStrings("Author: openrouter-api-key", authors.title);
     try rig.keys("\x1b[B\r");
-    const models = &rig.app.screen.widget.picking.picker;
+    const models = rig.app.screen.activePicker().?;
     try std.testing.expectEqualStrings("Model: openrouter-api-key", models.title);
     try rig.escape();
-    try std.testing.expect(rig.app.mode == .picker);
-    const restored = &rig.app.screen.widget.picking.picker;
+    try std.testing.expect(rig.view() == .picker);
+    const restored = rig.app.screen.activePicker().?;
     try std.testing.expectEqualStrings("Author: openrouter-api-key", restored.title);
     try std.testing.expectEqualStrings("openai", restored.options[restored.cursor].name);
 }
@@ -3059,15 +2968,15 @@ test "/logout signs out of the chosen account and hands the session to the next 
         .model_accounts = &.{ accounts.testing.openai_plan, accounts.testing.openai_api_key },
     });
     defer rig.deinit();
-    try std.testing.expectEqual(accounts.testing.openai_plan, rig.app.choice.account.?);
+    try std.testing.expectEqualStrings("openai-plan", rig.status().account.?);
 
     try rig.keys("/logout\r");
-    try std.testing.expect(rig.app.mode == .picker);
-    try std.testing.expectEqualStrings("Sign out", rig.app.screen.widget.picking.picker.title);
+    try std.testing.expect(rig.view() == .picker);
+    try std.testing.expectEqualStrings("Sign out", rig.app.screen.activePicker().?.title);
     try rig.keys("\r");
-    try std.testing.expect(rig.app.mode == .prompt);
+    try std.testing.expect(rig.view() == .prompt);
     try std.testing.expect(!rig.app.account_registry.isAuthenticated(accounts.testing.openai_plan));
-    try std.testing.expectEqual(accounts.testing.openai_api_key, rig.app.choice.account.?);
+    try std.testing.expectEqualStrings("openai-api-key", rig.status().account.?);
     try expectLastEvent(
         &rig,
         "Drinky signed out of openai-plan. Drinky now uses openai-api-key/gpt-5.6-sol.",
@@ -3083,8 +2992,8 @@ test "the page keys scroll the page, M toggles the source, and Esc closes the pa
     });
     defer rig.deinit();
     try rig.keys("/system\r");
-    try std.testing.expect(rig.app.mode == .page);
-    const page = &rig.app.screen.widget.page;
+    try std.testing.expect(rig.view() == .page);
+    const page = rig.app.screen.activePage().?;
 
     try rig.keys("\x1b[B");
     try std.testing.expectEqual(@as(usize, 1), page.scroll);
@@ -3108,5 +3017,5 @@ test "the page keys scroll the page, M toggles the source, and Esc closes the pa
     try rig.keys("M");
     try std.testing.expectEqual(ui.Page.Presentation.markdown, page.presentation);
     try rig.escape();
-    try std.testing.expect(rig.app.mode == .prompt);
+    try std.testing.expect(rig.view() == .prompt);
 }

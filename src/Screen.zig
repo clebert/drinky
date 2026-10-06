@@ -80,7 +80,7 @@ const Statistics = struct {
     }
 };
 
-const Widget = union(enum) {
+pub const Widget = union(enum) {
     prompt,
     turn: Turn,
     picking: Picking,
@@ -1009,6 +1009,20 @@ pub fn animating(self: *const Screen) bool {
         .turn => true,
         .picking => |*picking| picking.wait_tick != null,
         .prompt, .page => false,
+    };
+}
+
+pub fn activePicker(self: *Screen) ?*ui.Picker {
+    return switch (self.widget) {
+        .picking => |*picking| &picking.picker,
+        .prompt, .turn, .page => null,
+    };
+}
+
+pub fn activePage(self: *Screen) ?*ui.Page {
+    return switch (self.widget) {
+        .page => |*page| page,
+        .prompt, .turn, .picking => null,
     };
 }
 

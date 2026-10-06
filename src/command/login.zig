@@ -1,10 +1,12 @@
 const std = @import("std");
 
 const accounts = @import("accounts");
+const core = @import("core");
 
 const Context = @import("Context.zig");
-const testing = @import("testing.zig");
+const Message = @import("../Message.zig");
 const model = @import("model.zig");
+const testing = @import("testing.zig");
 
 pub const name = "login";
 pub const summary = "Sign in or switch the account";
@@ -60,6 +62,90 @@ fn select(
         .information,
         "Set {s} in the environment. Restart Drinky to use {s}.",
         .{ row.setting().?, row.id },
+    );
+}
+
+pub fn authorization(
+    gpa: std.mem.Allocator,
+    event: *const accounts.Registry.Event.Authorization,
+) error{OutOfMemory}!Message {
+    const id = accounts.Account.table[event.account].id;
+    const lead = "Open this URL to authorize the sign-in to {s}:\n\n{s}\n\n";
+    if (event.code) |code| return Message.print(
+        gpa,
+        .information,
+        lead ++ "Enter this code if the page asks for one: {s}",
+        .{ id, event.url, code },
+    );
+    return Message.print(
+        gpa,
+        .information,
+        lead ++ "If the browser shows an error, paste the callback URL from its address bar " ++
+            "and press Enter.",
+        .{ id, event.url },
+    );
+}
+
+pub fn failure(
+    gpa: std.mem.Allocator,
+    account: usize,
+    login_error: accounts.oauth.store.SignInError,
+) error{OutOfMemory}!Message {
+    const id = accounts.Account.table[account].id;
+    const text: []const u8 = switch (login_error) {
+        error.Canceled => return Message.print(
+            gpa,
+            .information,
+            "You canceled the sign-in to {s}.",
+            .{id},
+        ),
+        error.CallbackTimeout => "Drinky stopped the sign-in because the browser did not " ++
+            "respond in time.",
+        error.CallbackRequestTooLarge => "Drinky could not sign in because the browser " ++
+            "response was too large.",
+        error.CallbackTimeoutUnavailable => "Drinky could not sign in because it could not " ++
+            "set a browser time limit.",
+        error.AuthorizationFailed, error.AuthorizationDenied => "The provider did not " ++
+            "authorize Drinky. Start the sign-in again.",
+        error.DeviceCodeExpired => "Drinky stopped the sign-in because the authorization did " ++
+            "not arrive in time.",
+        error.StateMismatch => "The response belongs to another sign-in. " ++
+            "Start the sign-in again.",
+        error.TokenGrantRejected => "The provider rejected the authorization. " ++
+            "Start the sign-in again.",
+        error.TokenServiceUnavailable => "The provider credential service is not available. " ++
+            "Try the sign-in again later.",
+        error.OutOfMemory,
+        error.TokenResponseTooLarge,
+        error.TokenRequestFailed,
+        error.AuthorizationPending,
+        error.SlowDown,
+        error.BadTokenResponse,
+        error.BadDeviceResponse,
+        error.BadCredentials,
+        error.MissingAccessToken,
+        error.MissingRefreshToken,
+        error.MissingExpiry,
+        error.MissingAccountId,
+        error.MissingApiKey,
+        => return unnamed(gpa, login_error),
+        inline else => |cause| {
+            comptime core.error_set.requireMember(accounts.oauth.login.NetworkError, cause);
+            return unnamed(gpa, login_error);
+        },
+    };
+    return .{ .content = try gpa.dupe(u8, text), .severity = .failure };
+}
+
+fn unnamed(
+    gpa: std.mem.Allocator,
+    login_error: accounts.oauth.store.SignInError,
+) error{OutOfMemory}!Message {
+    return Message.print(
+        gpa,
+        .failure,
+        "Drinky could not sign in because of error {s}.",
+        .{@errorName(login_error)},
     );
 }
 
@@ -202,4 +288,57 @@ test "select starts a login, instructs a key account, and adopts a set key with 
     }
     try std.testing.expectEqual(accounts.testing.openai_api_key, rig.choice.account.?);
     try std.testing.expectEqualStrings("gpt-5.6-sol", rig.choice.model.?.name());
+}
+
+test "a sign-in failure names its cause, and a canceled sign-in is information" {
+    const gpa = std.testing.allocator;
+    const Case = struct {
+        err: accounts.oauth.store.SignInError,
+        severity: Message.Severity,
+        text: []const u8,
+    };
+    const cases = [_]Case{
+        .{
+            .err = error.Canceled,
+            .severity = .information,
+            .text = "You canceled the sign-in to anthropic-plan.",
+        },
+        .{
+            .err = error.AuthorizationDenied,
+            .severity = .failure,
+            .text = "The provider did not authorize Drinky. Start the sign-in again.",
+        },
+        .{
+            .err = error.BadTokenResponse,
+            .severity = .failure,
+            .text = "Drinky could not sign in because of error BadTokenResponse.",
+        },
+        .{
+            .err = error.ConnectionRefused,
+            .severity = .failure,
+            .text = "Drinky could not sign in because of error ConnectionRefused.",
+        },
+    };
+    for (cases) |case| {
+        const message = try failure(gpa, accounts.testing.anthropic_plan, case.err);
+        defer message.deinit(gpa);
+        try std.testing.expectEqual(case.severity, message.severity);
+        try std.testing.expectEqualStrings(case.text, message.content);
+    }
+}
+
+test "an authorization with a device code asks for the code" {
+    const gpa = std.testing.allocator;
+    const message = try authorization(gpa, &.{
+        .account = accounts.testing.openai_plan,
+        .url = "https://auth.example/device",
+        .code = "ABCD-1234",
+        .callback_path = null,
+    });
+    defer message.deinit(gpa);
+    try std.testing.expectEqualStrings(
+        "Open this URL to authorize the sign-in to openai-plan:\n\n" ++
+            "https://auth.example/device\n\nEnter this code if the page asks for one: ABCD-1234",
+        message.content,
+    );
 }
