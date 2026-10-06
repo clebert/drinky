@@ -73,6 +73,7 @@ fn writeSkills(gpa: std.mem.Allocator, writer: *std.Io.Writer, options: *const O
     for (items) |skill| {
         try writer.print("- `{s}` · Scope: {s}", .{ skill.name, @tagName(skill.scope) });
         if (skill.model_invocation_disabled) try writer.writeAll(" · Hidden from the model");
+        if (skill.run_hidden) try writer.writeAll(" · Hidden in a run");
         try writer.writeAll(" · File: ");
         try writePath(gpa, writer, &options.roots, skill.path);
         if (skill.replaced_path) |replaced_path| {
@@ -127,6 +128,11 @@ test "the page names every file behind the startup counts" {
         "work/.agents/skills/hidden/SKILL.md",
         "---\nname: hidden\ndescription: a manual skill\n" ++
             "disable-model-invocation: true\n---\nbody\n",
+    );
+    try tree.write(
+        "work/.agents/skills/review/SKILL.md",
+        "---\nname: review\ndescription: a session skill\n" ++
+            "metadata:\n  drinky-run: hidden\n---\nbody\n",
     );
     try tree.skill("home/.agents/skills/demo", &.{
         .name = "demo",
@@ -191,6 +197,12 @@ test "the page names every file behind the startup counts" {
         page,
         "- `hidden` · Scope: project · Hidden from the model · File: " ++
             "`.agents/skills/hidden/SKILL.md`\n",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        page,
+        "- `review` · Scope: project · Hidden in a run · File: " ++
+            "`.agents/skills/review/SKILL.md`\n",
     ) != null);
     try std.testing.expect(std.mem.indexOf(
         u8,

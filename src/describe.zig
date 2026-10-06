@@ -59,6 +59,12 @@ const discovery =
     \\  directory symbolic link.
     \\- The front matter of a `SKILL.md` file carries a `name` and a `description`. Drinky
     \\  advertises both, and it loads the instructions on demand.
+    \\- `disable-model-invocation: true` in the front matter keeps a skill out of the skill list
+    \\  in the system prompt. The `/skill` picker still shows it, and `/skill:name` loads it.
+    \\- A `drinky-run: hidden` entry in the `metadata` map of the front matter keeps a skill out
+    \\  of the skill list in the system prompt of a run. A session still lists it.
+    \\- Drinky reads `metadata` only as a block map, with one indented `key: value` line for each
+    \\  entry. Drinky ignores a value on the `metadata:` line itself and reports it at startup.
     \\
 ;
 
@@ -191,6 +197,8 @@ fn writeHeadless(writer: *std.Io.Writer) !void {
         \\  prompt must hold the whole task.
         \\- A run uses the config file, the instruction files, the skills, and the tools of a
         \\  session. It saves no choice and signs in to no account.
+        \\- The skill list of a run leaves out each skill that sets `drinky-run: hidden` in the
+        \\  block map of its `metadata`.
         \\- A run drops the start reports of a session, such as an unknown config key or an
         \\  instruction file that Drinky cannot read.
         \\- A failure of the run goes to stderr, and the exit code is then 1. A run that stops at

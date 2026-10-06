@@ -36,6 +36,7 @@ pub const repeat_window_ms = 500;
 pub const Options = struct {
     directories: accounts.json_store.Directories,
     environ: std.process.Environ,
+    surface: discovery.skills.Skill.Surface,
 };
 
 pub fn init(self: *Harness, gpa: std.mem.Allocator, io: std.Io, options: *const Options) !void {
@@ -69,6 +70,7 @@ pub fn init(self: *Harness, gpa: std.mem.Allocator, io: std.Io, options: *const 
         .project_instructions = &self.project_instructions,
         .skills = self.skill_registry.items(),
         .required_skills = self.skill_guard.rules(),
+        .surface = options.surface,
     });
     errdefer gpa.free(self.system);
     self.document = try describe.compose(gpa, &.{

@@ -269,7 +269,11 @@ pub fn init(self: *App, gpa: std.mem.Allocator, io: std.Io, options: *const Opti
     self.initFields(gpa, io);
     errdefer self.input.deinit();
 
-    try self.harness.init(gpa, io, &.{ .directories = directories, .environ = options.environ });
+    try self.harness.init(gpa, io, &.{
+        .directories = directories,
+        .environ = options.environ,
+        .surface = .session,
+    });
     errdefer self.harness.deinit(gpa);
     const harness = &self.harness;
 

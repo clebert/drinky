@@ -28,6 +28,7 @@ const Options = struct {
     project_instructions: *const discovery.instructions.Result,
     skills: []const discovery.skills.Skill,
     required_skills: []const tools.SkillGuard.Rule,
+    surface: discovery.skills.Skill.Surface,
 };
 
 const InstructionsOptions = struct {
@@ -62,14 +63,14 @@ fn write(
         .tag = "project_instructions",
         .files = project_files,
     });
-    if (anyVisible(options.skills)) try writeSkills(gpa, writer, options.skills);
+    if (anyAdvertised(options)) try writeSkills(gpa, writer, options);
     if (options.required_skills.len > 0)
         try writeRequiredSkills(gpa, writer, options.required_skills);
 }
 
 fn writePrecedence(writer: *std.Io.Writer, options: *const Options) !void {
     const project_files = options.project_instructions.files();
-    const has_skills = anyVisible(options.skills);
+    const has_skills = anyAdvertised(options);
     if (options.user_instructions.len == 0 and project_files.len == 0 and !has_skills) return;
     try writer.writeAll("\n\n## Instruction precedence\n\n" ++
         "Drinky gives you instructions from the sources below. Where two conflict, obey this " ++
@@ -161,18 +162,14 @@ fn writeEnvironment(
     try writer.writeAll("</environment>");
 }
 
-fn anyVisible(items: []const discovery.skills.Skill) bool {
-    for (items) |skill| {
-        if (!skill.model_invocation_disabled) return true;
+fn anyAdvertised(options: *const Options) bool {
+    for (options.skills) |*skill| {
+        if (skill.advertised(options.surface)) return true;
     }
     return false;
 }
 
-fn writeSkills(
-    gpa: std.mem.Allocator,
-    writer: *std.Io.Writer,
-    items: []const discovery.skills.Skill,
-) !void {
+fn writeSkills(gpa: std.mem.Allocator, writer: *std.Io.Writer, options: *const Options) !void {
     try writer.writeAll("\n\n## Skills\n\n");
     try writer.writeAll(
         "The skills below provide specialized instructions.\n" ++
@@ -180,8 +177,8 @@ fn writeSkills(
             "skill file before you proceed.\n\n" ++
             "<skills>\n",
     );
-    for (items) |skill| {
-        if (skill.model_invocation_disabled) continue;
+    for (options.skills) |*skill| {
+        if (!skill.advertised(options.surface)) continue;
         try writer.writeAll("  <skill_file path=\"");
         try writePath(gpa, writer, skill.path);
         try writer.writeAll("\">\n    <name>");
@@ -264,6 +261,7 @@ fn emptyOptions() Options {
         .project_instructions = &no_instructions,
         .skills = &.{},
         .required_skills = &.{},
+        .surface = .session,
     };
 }
 
@@ -273,6 +271,7 @@ fn testSkill(options: *const struct {
     path: []const u8,
     description_truncated: bool = false,
     model_invocation_disabled: bool = false,
+    run_hidden: bool = false,
     scope: discovery.skills.Skill.Scope = .user,
 }) discovery.skills.Skill {
     return .{
@@ -281,6 +280,7 @@ fn testSkill(options: *const struct {
         .description_truncated = options.description_truncated,
         .path = options.path,
         .model_invocation_disabled = options.model_invocation_disabled,
+        .run_hidden = options.run_hidden,
         .scope = options.scope,
     };
 }
@@ -518,6 +518,37 @@ test "generated paths cannot add prompt lines or controls" {
         "  <working_directory>/work\\x0a```\\x1b\\xe2\\x80\\xae&amp;&quot;&apos;" ++
             "</working_directory>\n",
     ) != null);
+}
+
+test "a session lists a skill that its metadata hides from a run, and a run leaves it out" {
+    const gpa = std.testing.allocator;
+    const skill_items = [_]discovery.skills.Skill{
+        testSkill(&.{
+            .name = "review",
+            .description = "Review through a second agent.",
+            .path = "/skills/review/SKILL.md",
+            .run_hidden = true,
+        }),
+    };
+    var session_options = emptyOptions();
+    session_options.skills = &skill_items;
+    const session_prompt = try compose(gpa, &session_options);
+    defer gpa.free(session_prompt);
+    try std.testing.expect(std.mem.indexOf(u8, session_prompt, "<name>review</name>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, session_prompt, "2. The skills.") != null);
+
+    var run_options = emptyOptions();
+    run_options.skills = &skill_items;
+    run_options.surface = .run;
+    const run_prompt = try compose(gpa, &run_options);
+    defer gpa.free(run_prompt);
+    try std.testing.expectEqualStrings(
+        default_core ++ "\n\n## Environment\n\n<environment>\n" ++
+            "  <current_date>1970-01-01</current_date>\n" ++
+            "  <working_directory>/work</working_directory>\n" ++
+            "  <repository_root />\n</environment>",
+        run_prompt,
+    );
 }
 
 test "empty project and skill sections are omitted independently" {

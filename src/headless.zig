@@ -167,6 +167,7 @@ pub fn run(
     try harness.init(gpa, io, &.{
         .directories = options.directories,
         .environ = .{ .block = block },
+        .surface = .run,
     });
     defer harness.deinit(gpa);
     var registry: accounts.Registry = undefined;
@@ -430,6 +431,29 @@ const truncated_stream = frame(
 ) ++ frame(
     \\{"type":"response.incomplete","response":{"status":"incomplete"}}
 );
+
+test "a run leaves a skill out of its system prompt when the metadata hides it from a run" {
+    const io = std.testing.io;
+    var rig: Rig = undefined;
+    try rig.init(&.{ .replies = &.{.{ .body = providers.testing.reply_stream }} });
+    defer rig.deinit();
+    try rig.tmp.dir.createDirPath(io, ".agents/skills/listed");
+    try rig.tmp.dir.writeFile(io, .{
+        .sub_path = ".agents/skills/listed/SKILL.md",
+        .data = "---\nname: listed\ndescription: the listed skill\n---\nbody\n",
+    });
+    try rig.tmp.dir.createDirPath(io, ".agents/skills/review");
+    try rig.tmp.dir.writeFile(io, .{
+        .sub_path = ".agents/skills/review/SKILL.md",
+        .data = "---\nname: review\ndescription: the review skill\n" ++
+            "metadata:\n  drinky-run: hidden\n---\nbody\n",
+    });
+
+    try std.testing.expect(try rig.ask(.high, "openai-api-key/gpt-5.6-sol", "check"));
+    const request = rig.transport.requests.items[0];
+    try testing.expectContains(request, "the listed skill");
+    try std.testing.expect(std.mem.indexOf(u8, request, "the review skill") == null);
+}
 
 test "a run asks for the effort level of the model that is nearest to the requested level" {
     var rig: Rig = undefined;

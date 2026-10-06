@@ -19,10 +19,21 @@ pub const Skill = struct {
     description_truncated: bool,
     path: []const u8,
     model_invocation_disabled: bool,
+    run_hidden: bool,
     scope: Scope,
     replaced_path: ?[]const u8 = null,
 
     pub const Scope = enum { user, project };
+
+    pub const Surface = enum { session, run };
+
+    pub fn advertised(self: *const Skill, surface: Surface) bool {
+        if (self.model_invocation_disabled) return false;
+        return switch (surface) {
+            .session => true,
+            .run => !self.run_hidden,
+        };
+    }
 
     fn deinit(self: *Skill, gpa: std.mem.Allocator) void {
         gpa.free(self.name);
@@ -276,6 +287,11 @@ pub const Registry = struct {
                 "{d} characters.",
             .{ path, description_codepoints_max },
         );
+        if (frontmatter.metadata_inline) try self.report(
+            .warning,
+            "Drinky ignored the metadata in {s} because the value is not a block map.",
+            .{path},
+        );
 
         var skill: Skill = .{
             .name = try self.gpa.dupe(u8, name_source),
@@ -283,6 +299,7 @@ pub const Registry = struct {
             .description_truncated = description_truncated,
             .path = undefined,
             .model_invocation_disabled = frontmatter.model_invocation_disabled,
+            .run_hidden = frontmatter.run_hidden,
             .scope = scope,
         };
         errdefer self.gpa.free(skill.name);
@@ -598,6 +615,38 @@ test "a skill that loads warns, and a skipped skill fails" {
     defer gpa.free(explicit);
     try std.testing.expect(std.mem.indexOf(u8, explicit, manual.path) != null);
     try std.testing.expect(std.mem.indexOf(u8, explicit, "body") != null);
+}
+
+test "an inline metadata value hides no skill from a run and warns" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tree: testing.Tree = try .init();
+    defer tree.deinit();
+    try tree.write("user/inline/SKILL.md", "---\nname: inline\ndescription: an inline map\n" ++
+        "metadata: {drinky-run: hidden}\n---\nbody\n");
+    try tree.directory("work");
+
+    const user_root = try tree.path("user");
+    const project_start = try tree.path("work");
+    var registry = try discover(gpa, io, &.{
+        .user_root = user_root,
+        .project_start = project_start,
+        .project_root = null,
+    });
+    defer registry.deinit();
+
+    try std.testing.expect(registry.get("inline").?.advertised(.run));
+    const reports = registry.reports.messages();
+    try std.testing.expectEqual(@as(usize, 1), reports.len);
+    try std.testing.expectEqual(Message.Severity.warning, reports[0].severity);
+    const path = try tree.path("user/inline/SKILL.md");
+    const expected = try std.fmt.allocPrint(
+        gpa,
+        "Drinky ignored the metadata in {s} because the value is not a block map.",
+        .{path},
+    );
+    defer gpa.free(expected);
+    try std.testing.expectEqualStrings(expected, reports[0].content);
 }
 
 test "explicit invocation loads the full file and appends arguments" {

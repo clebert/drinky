@@ -4,6 +4,8 @@ const Parsed = struct {
     name: ?[]const u8,
     description: ?[]u8,
     model_invocation_disabled: bool,
+    run_hidden: bool,
+    metadata_inline: bool,
 
     pub fn deinit(self: *Parsed, gpa: std.mem.Allocator) void {
         if (self.description) |description| gpa.free(description);
@@ -54,6 +56,8 @@ pub fn parse(
     var name: ?[]const u8 = null;
     var description_seen = false;
     var model_invocation_disabled = false;
+    var run_hidden = false;
+    var metadata_inline = false;
     var closed = false;
     var description: std.Io.Writer.Allocating = .init(gpa);
     errdefer description.deinit();
@@ -78,6 +82,11 @@ pub fn parse(
                 return error.OutOfMemory;
         } else if (std.mem.eql(u8, key, "disable-model-invocation")) {
             model_invocation_disabled = std.ascii.eqlIgnoreCase(scalarValue(value), "true");
+        } else if (std.mem.eql(u8, key, "metadata")) {
+            const inline_value = scalar(value);
+            if (inline_value.value.len > 0 or inline_value.quote != null) {
+                metadata_inline = true;
+            } else if (metadataRunHidden(&lines)) run_hidden = true;
         }
     }
     if (!closed) return error.UnclosedFrontmatter;
@@ -86,7 +95,41 @@ pub fn parse(
         .name = name,
         .description = if (description_seen) try description.toOwnedSlice() else null,
         .model_invocation_disabled = model_invocation_disabled,
+        .run_hidden = run_hidden,
+        .metadata_inline = metadata_inline,
     };
+}
+
+fn metadataRunHidden(lines: *std.mem.SplitIterator(u8, .scalar)) bool {
+    var entry_indent: ?usize = null;
+    var run_hidden = false;
+    while (true) {
+        const resume_index = lines.index;
+        const line = trimLine(lines.next() orelse break);
+        const indent = leadingWhitespace(line);
+        if (indent == line.len or line[indent] == '#') continue;
+        if (indent == 0) {
+            lines.index = resume_index;
+            break;
+        }
+        if ((entry_indent orelse indent) != indent) continue;
+        entry_indent = indent;
+        const entry = line[indent..];
+        const separator = keySeparator(entry) orelse continue;
+        if (!std.mem.eql(u8, scalarValue(entry[0..separator]), "drinky-run")) continue;
+        const hidden = std.ascii.eqlIgnoreCase(scalarValue(entry[separator + 1 ..]), "hidden");
+        if (hidden) run_hidden = true;
+    }
+    return run_hidden;
+}
+
+fn keySeparator(entry: []const u8) ?usize {
+    const key_end = if (Quote.of(entry[0])) |quote|
+        (flowClose(entry[1..], quote) orelse return null) + 2
+    else
+        0;
+    const offset = std.mem.indexOfScalar(u8, entry[key_end..], ':') orelse return null;
+    return key_end + offset;
 }
 
 fn trimLine(line: []const u8) []const u8 {
@@ -516,6 +559,94 @@ test "block headers tolerate a trailing comment" {
         "---\n");
     defer parsed.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("body line", parsed.description.?);
+}
+
+test "only a block metadata map can hide a skill from a run, and an inline value is flagged" {
+    const gpa = std.testing.allocator;
+    const cases = [_]struct { entries: []const u8, run_hidden: bool, metadata_inline: bool }{
+        .{
+            .entries = "metadata: { note: \"before, drinky-run: hidden, after\" }\n",
+            .run_hidden = false,
+            .metadata_inline = true,
+        },
+        .{
+            .entries = "metadata: { note: \"a # b\", drinky-run: hidden }\n",
+            .run_hidden = false,
+            .metadata_inline = true,
+        },
+        .{
+            .entries = "metadata: {\n  drinky-run: hidden\n  }\n",
+            .run_hidden = false,
+            .metadata_inline = true,
+        },
+        .{
+            .entries = "metadata: {drinky-run: hidden}\n",
+            .run_hidden = false,
+            .metadata_inline = true,
+        },
+        .{
+            .entries = "metadata: \"\"\n  drinky-run: hidden\n",
+            .run_hidden = false,
+            .metadata_inline = true,
+        },
+        .{
+            .entries = "metadata: |\n  drinky-run: hidden\n",
+            .run_hidden = false,
+            .metadata_inline = true,
+        },
+        .{
+            .entries = "metadata:\n  drinky-run: hidden\n",
+            .run_hidden = true,
+            .metadata_inline = false,
+        },
+        .{
+            .entries = "metadata: # client keys\n" ++
+                "  author: example\n" ++
+                "\n" ++
+                "  # the run entry\n" ++
+                "  \"drinky-run\": \"Hidden\" # in a run\n",
+            .run_hidden = true,
+            .metadata_inline = false,
+        },
+        .{
+            .entries = "metadata:\n  note: \"before, drinky-run: hidden\"\n",
+            .run_hidden = false,
+            .metadata_inline = false,
+        },
+        .{
+            .entries = "metadata:\n  \"drinky-run: 'hidden'\": shown\n",
+            .run_hidden = false,
+            .metadata_inline = false,
+        },
+        .{
+            .entries = "metadata:\n  drinky-run: shown\n",
+            .run_hidden = false,
+            .metadata_inline = false,
+        },
+        .{
+            .entries = "metadata:\n  author:\n    drinky-run: hidden\n",
+            .run_hidden = false,
+            .metadata_inline = false,
+        },
+        .{
+            .entries = "drinky-run: hidden\n",
+            .run_hidden = false,
+            .metadata_inline = false,
+        },
+    };
+    for (cases) |case| {
+        const source = try std.fmt.allocPrint(
+            gpa,
+            "---\nname: case\n{s}description: after the map\n---\nbody\n",
+            .{case.entries},
+        );
+        defer gpa.free(source);
+        var parsed = try parse(gpa, source);
+        defer parsed.deinit(gpa);
+        try std.testing.expectEqual(case.run_hidden, parsed.run_hidden);
+        try std.testing.expectEqual(case.metadata_inline, parsed.metadata_inline);
+        try std.testing.expectEqualStrings("after the map", parsed.description.?);
+    }
 }
 
 test "requires both fences" {
