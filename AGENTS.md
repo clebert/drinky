@@ -34,12 +34,14 @@ every library. `lib/providers` and `lib/tools` import `lib/core`, and `lib/accou
 - `src` is the client. `App.zig` holds the client loop, the input mode, and the key handling. A key
   becomes a command to the session or the account registry. An event becomes a change of
   `Screen.zig`, and `Screen.zig` paints the widgets that it holds. The client reads no session
-  state, and `Choice.zig` holds the account, the model, and the effort that the client chose. `src`
-  also holds the slash commands under `src/command/` and the instruction and skill discovery under
-  `src/discovery/`. It holds the widgets under `src/ui/` and Herdr too. `headless.zig` answers
-  `drinky run` and `drinky models` without a terminal. `Harness.zig` holds the setup that the client
-  and the headless mode share: the config, the discovery, the system prompt, and the tools. `src`
-  names no vendor, wire, or account row. It reads each such fact from `lib/accounts`.
+  state, and `Choice.zig` holds the account, the model, and the effort that the client chose.
+  `Turns.zig` holds the turns that the client started. A rewind names a turn by its index in that
+  list. `src` also holds the slash commands under `src/command/` and the instruction and skill
+  discovery under `src/discovery/`. It holds the widgets under `src/ui/` and Herdr too.
+  `headless.zig` answers `drinky run` and `drinky models` without a terminal. `Harness.zig` holds
+  the setup that the client and the headless mode share: the config, the discovery, the system
+  prompt, and the tools. `src` names no vendor, wire, or account row. It reads each such fact from
+  `lib/accounts`.
 - `src/ui/role.zig` maps a role to terminal colors. A widget names a role and writes no color of its
   own. `Message.zig` holds the severity that a notice and an event share.
 

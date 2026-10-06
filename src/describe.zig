@@ -115,6 +115,15 @@ fn writeCommands(writer: *std.Io.Writer) !void {
         "\nA command refuses text after its name unless its row names trailing text. " ++
             "Drinky refuses every command while a turn runs, and the draft stays.\n",
     );
+    try writer.writeAll(
+        \\
+        \\`/rewind` lists the prompts of the conversation, with the oldest prompt first. A row
+        \\holds the typed line of a message or a skill command. A retry gets no row. Enter drops
+        \\the turn of the chosen prompt and every later turn, and it returns the line to the
+        \\editor as editable text. Tool changes and the cost stay. When a turn that the rewind
+        \\drops ran `write`, `edit`, or `bash`, Enter warns first and rewinds on the second press.
+        \\
+    );
 }
 
 fn writeKeys(writer: *std.Io.Writer, options: *const Options) !void {
@@ -138,7 +147,7 @@ fn writeKeys(writer: *std.Io.Writer, options: *const Options) !void {
         \\  `write`, `edit`, or `bash`, Ctrl+N warns first and removes the turn on the second
         \\  press.
         \\- Esc dismisses a waiting offer. A dismissed canceled turn stays in the conversation. A
-        \\  new turn and `/new` dismiss the offer too.
+        \\  new turn, `/new`, and a rewind with `/rewind` dismiss the offer too.
         \\
         \\A sign-in takes these keys:
         \\

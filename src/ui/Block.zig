@@ -52,19 +52,19 @@ const ToolResult = struct {
 pub const Event = struct {
     text: std.ArrayList(u8),
     severity: Message.Severity,
-    survives_rewind: bool,
+    survives_discard: bool,
 
     pub const Payload = struct {
         text: []const u8,
         severity: Message.Severity = .information,
-        survives_rewind: bool = false,
+        survives_discard: bool = false,
     };
 
     fn init(gpa: std.mem.Allocator, payload: *const Payload) !Event {
         return .{
             .text = try copy(gpa, payload.text),
             .severity = payload.severity,
-            .survives_rewind = payload.survives_rewind,
+            .survives_discard = payload.survives_discard,
         };
     }
 };
@@ -171,9 +171,9 @@ pub fn stampEpoch(self: *Block, epoch: u64) void {
     self.cache.epoch = epoch;
 }
 
-pub fn survivesRewind(self: *const Block) bool {
+pub fn survivesDiscard(self: *const Block) bool {
     return switch (self.content) {
-        .event => |*event| event.survives_rewind,
+        .event => |*event| event.survives_discard,
         .intro, .user, .user_note, .thinking, .model, .tool_result => false,
     };
 }

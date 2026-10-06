@@ -12,6 +12,7 @@ pub const model = @import("model.zig");
 const effort = @import("effort.zig");
 const logout = @import("logout.zig");
 const new = @import("new.zig");
+const rewind = @import("rewind.zig");
 const skill = @import("skill.zig");
 const sources = @import("sources.zig");
 const system = @import("system.zig");
@@ -36,6 +37,7 @@ const commands = [_]Entry{
     .{ .name = logout.name, .summary = logout.summary, .run = logout.run },
     .{ .name = model.name, .summary = model.summary, .run = model.run },
     .{ .name = new.name, .summary = new.summary, .run = new.run },
+    .{ .name = rewind.name, .summary = rewind.summary, .run = rewind.run },
     .{ .name = skill.name, .summary = skill.summary, .run = skill.run },
     .{ .name = sources.name, .summary = sources.summary, .run = sources.run },
     .{ .name = system.name, .summary = system.summary, .run = system.run },

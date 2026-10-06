@@ -5,6 +5,7 @@ const accounts = @import("accounts");
 const Choice = @import("../Choice.zig");
 const discovery = @import("../discovery/root.zig");
 const Message = @import("../Message.zig");
+const Turns = @import("../Turns.zig");
 const ui = @import("../ui/root.zig");
 
 const Context = @This();
@@ -17,6 +18,7 @@ remembered_model_names: *const [accounts.Account.table.len]?[]const u8,
 skill_registry: *const discovery.skills.Registry,
 system_prompt: []const u8,
 sources_page: []const u8,
+turns: *const Turns,
 
 pub const Error = error{OutOfMemory};
 
@@ -32,6 +34,7 @@ pub const Outcome = union(enum) {
     logout: usize,
     fetch: usize,
     new_conversation,
+    rewind: usize,
 
     pub const Prompt = struct {
         name: []const u8,

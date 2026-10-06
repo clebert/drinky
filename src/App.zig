@@ -19,7 +19,7 @@ const Screen = @import("Screen.zig");
 const sources = @import("sources.zig");
 const testing = @import("testing.zig");
 const tool_environment = @import("tool_environment.zig");
-const Transcript = @import("Transcript.zig");
+const Turns = @import("Turns.zig");
 const ui = @import("ui/root.zig");
 
 const App = @This();
@@ -47,6 +47,7 @@ const removal_caption: ui.Caption = .{
     .rows_max = Screen.editor_caption_rows_max,
 };
 const removal_warning = "Press Ctrl+N again to remove the canceled turn. Tool changes stay.";
+const rewind_warning = "Press Enter again to rewind. Tool changes stay.";
 
 const intro_text = blk: {
     var line: []const u8 = "";
@@ -79,6 +80,7 @@ choice: Choice,
 mode: Mode,
 confirmation: ?Confirmation,
 offer: ?Offer,
+turns: Turns,
 directory_label: []const u8,
 working_directory: []const u8,
 home_directory: []const u8,
@@ -152,9 +154,6 @@ const Mode = union(enum) {
     sign_in: SignIn,
 
     const Turn = struct {
-        start: usize,
-        line: ?[]u8,
-        mutated: bool = false,
         cancel_sent: bool = false,
     };
 
@@ -177,11 +176,12 @@ const Confirmation = enum {
     message,
     quit,
     removal,
+    rewind,
     cancel,
 
     fn confirms(self: Confirmation, event: *const terminal.Input.Key) bool {
         return switch (self) {
-            .message => event.* == .enter,
+            .message, .rewind => event.* == .enter,
             .quit => event.* == .ctrl and event.ctrl == 'd',
             .removal => event.* == .ctrl and event.ctrl == 'n',
             .cancel => event.* == .escape,
@@ -191,18 +191,12 @@ const Confirmation = enum {
 
 const Offer = union(enum) {
     retry: []u8,
-    removal: Removal,
-
-    const Removal = struct {
-        line: []u8,
-        range: Transcript.Range,
-        mutated: bool,
-    };
+    removal,
 
     fn deinit(self: *const Offer, gpa: std.mem.Allocator) void {
         switch (self.*) {
             .retry => |request| gpa.free(request),
-            .removal => |removal| gpa.free(removal.line),
+            .removal => {},
         }
     }
 };
@@ -353,10 +347,7 @@ pub fn deinit(self: *App) void {
     self.closeQueue();
     self.herdr.deinit();
     self.dropOffer();
-    switch (self.mode) {
-        .turn => |turn| if (turn.line) |line| self.gpa.free(line),
-        .prompt, .picker, .fetch, .page, .sign_in => {},
-    }
+    self.turns.deinit();
     self.screen.deinit();
     self.session.deinit();
     self.clients.deinit();
@@ -414,6 +405,7 @@ fn initFields(self: *App, gpa: std.mem.Allocator, io: std.Io, device: terminal.D
         .mode = .prompt,
         .confirmation = null,
         .offer = null,
+        .turns = .init(gpa),
         .directory_label = "",
         .working_directory = "",
         .home_directory = "",
@@ -502,10 +494,6 @@ fn runLoop(self: *App) !void {
 }
 
 fn setMode(self: *App, mode: Mode) void {
-    switch (self.mode) {
-        .turn => |turn| std.debug.assert(turn.line == null),
-        .prompt, .picker, .fetch, .page, .sign_in => {},
-    }
     self.mode = mode;
     self.confirmation = null;
 }
@@ -778,7 +766,7 @@ fn takeOffer(self: *App) !void {
     const offer = if (self.offer) |*offer| offer else return;
     switch (offer.*) {
         .retry => |request| try self.retryTurn(request),
-        .removal => |*removal| try self.removeTurn(removal),
+        .removal => try self.removeTurn(),
     }
 }
 
@@ -796,15 +784,21 @@ fn retryTurn(self: *App, request: []const u8) !void {
     try self.runTurn(&.{ .text = request, .start = start, .line = null });
 }
 
-fn removeTurn(self: *App, removal: *const Offer.Removal) !void {
-    if (removal.mutated and self.confirmation != .removal) {
+fn removeTurn(self: *App) !void {
+    const last = self.turns.all().len - 1;
+    if (self.turns.mutatedFrom(last) and self.confirmation != .removal) {
         try self.reportNotice(.warning, removal_warning, .{});
         self.confirmation = .removal;
         return;
     }
     self.confirmation = null;
-    try self.screen.removeTurn(removal.range, removal.line);
-    try self.session.send(&.remove_turn);
+    try self.rewind(last);
+}
+
+fn rewind(self: *App, turn: usize) !void {
+    try self.screen.rewind(self.turns.all()[turn..]);
+    try self.session.send(&.{ .rewind = turn });
+    self.turns.truncate(turn);
     self.dropOffer();
 }
 
@@ -1028,47 +1022,35 @@ fn startUserTurn(self: *App, text: []const u8) !void {
 fn runTurn(self: *App, turn: *const TurnStart) !void {
     std.debug.assert(self.mode == .prompt);
     self.refreshBranch();
-    const maybe_line: ?[]u8 = if (turn.line) |line| try self.gpa.dupe(u8, line) else null;
-    errdefer if (maybe_line) |line| self.gpa.free(line);
+    try self.turns.begin(turn.start, turn.line);
+    errdefer self.turns.truncate(self.turns.all().len - 1);
     try self.session.send(&.{ .prompt = turn.text });
-    self.setMode(.{ .turn = .{ .start = turn.start, .line = maybe_line } });
-    self.screen.beginTurn(turn.start);
-}
-
-fn leaveTurn(self: *App) Mode.Turn {
-    const turn = self.mode.turn;
-    self.mode.turn.line = null;
-    self.setMode(.prompt);
-    return turn;
+    self.setMode(.{ .turn = .{} });
+    self.screen.beginTurn();
 }
 
 fn applySessionEvent(self: *App, event: *const core.Session.Event) !void {
     switch (event.*) {
         .setup_dropped => |provider| return self.clients.release(provider),
         .tool_started => |*call| if (core.Tool.mutating(&tools.Registry.specs, call.name)) {
-            self.mode.turn.mutated = true;
+            self.turns.markMutated();
         },
         else => {},
     }
     const outcome = (try self.screen.apply(event, self.screenTime())) orelse return;
-    const turn = self.leaveTurn();
-    try self.endTurn(&turn, &outcome);
+    self.setMode(.prompt);
+    try self.endTurn(&outcome);
 }
 
-fn endTurn(self: *App, turn: *const Mode.Turn, outcome: *const core.Session.Outcome) !void {
-    var maybe_line = turn.line;
-    defer if (maybe_line) |line| self.gpa.free(line);
+fn endTurn(self: *App, outcome: *const core.Session.Outcome) !void {
+    self.turns.end(self.screen.transcript.blocks().len);
     self.dropOffer();
     self.refreshBranch();
+    const turns = self.turns.all();
     switch (outcome.*) {
         .stopped, .exhausted => {},
-        .canceled => if (maybe_line) |line| {
-            self.offer = .{ .removal = .{
-                .line = line,
-                .range = .{ .start = turn.start, .end = self.screen.transcript.blocks().len },
-                .mutated = turn.mutated,
-            } };
-            maybe_line = null;
+        .canceled => if (turns[turns.len - 1].line != null) {
+            self.offer = .removal;
         },
         .failed => |*failure| {
             try self.offerRetry(failure);
@@ -1375,6 +1357,7 @@ fn commandContext(self: *App) command.Context {
         .skill_registry = &self.harness.skill_registry,
         .system_prompt = self.harness.system,
         .sources_page = self.sources_page,
+        .turns = &self.turns,
     };
 }
 
@@ -1406,9 +1389,11 @@ fn applyOutcome(self: *App, outcome: *const command.Context.Outcome) !void {
         .new_conversation => {
             try self.session.send(&.clear);
             self.dropOffer();
+            self.turns.truncate(0);
             self.screen.clearConversation();
             try self.screen.appendIntro(intro_text);
         },
+        .rewind => |turn| try self.rewind(turn),
         .login => |account| return self.startLogin(account),
         .logout => |account| try self.logoutAccount(account),
         .fetch => |account| return self.startFetch(account),
@@ -1568,6 +1553,14 @@ fn confirmPicker(self: *App) !void {
 fn applyPickerOutcome(self: *App, outcome: *const command.Context.Outcome) !void {
     switch (outcome.*) {
         .pick, .fetch => {},
+        .rewind => |turn| {
+            if (self.turns.mutatedFrom(turn) and self.confirmation != .rewind) {
+                try self.reportNotice(.warning, rewind_warning, .{});
+                self.confirmation = .rewind;
+                return;
+            }
+            self.closePicker();
+        },
         else => self.closePicker(),
     }
     try self.applyOutcome(outcome);
@@ -2246,6 +2239,104 @@ test "Ctrl+N returns the command line of a canceled skill turn" {
     });
 }
 
+const rewind_picker = "Prompt · ↑/↓";
+const effort_event = "Drinky set the effort level to ";
+
+test "/rewind returns the chosen prompt to the editor and drops its turn and every later turn" {
+    const replies: [4]providers.testing.FakeTransport.Reply =
+        @splat(.{ .body = providers.testing.reply_stream });
+    var rig: Rig = undefined;
+    try rig.init(&.{
+        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .replies = &replies,
+        .model = "gpt-5.6-sol",
+    });
+    defer rig.deinit();
+
+    try rig.keys("first\r");
+    try rig.waitFor(&.{ .{ .rows = &.{ "first", "done" } }, .{ .activity = false } });
+    try rig.keys("second\r");
+    try rig.waitFor(&.{ .{ .rows = &.{ "first", "second", "done" } }, .{ .activity = false } });
+    try rig.keys("/effort\r\x1b[A\r");
+    try rig.waitFor(&.{.{ .text = effort_event }});
+    try rig.keys("third\r");
+    try rig.waitFor(&.{
+        .{ .rows = &.{ "second", "done", effort_event, "third", "done" } },
+        .{ .activity = false },
+    });
+
+    try rig.keys("/rewind\r");
+    try rig.waitFor(&.{
+        .{ .text = rewind_picker },
+        .{ .rows = &.{ "   first", "   second", " > third" } },
+    });
+    try rig.keys("\x1b[A\r");
+    try rig.waitFor(&.{
+        .{ .absent = rewind_picker },
+        .{ .absent = "third" },
+        .{ .rows = &.{ "first", "done", effort_event } },
+        .{ .editor = "second" },
+    });
+    try rig.keys("\r");
+    try rig.waitFor(&.{
+        .{ .rows = &.{ "first", "done", effort_event, "second", "done" } },
+        .{ .activity = false },
+    });
+    try std.testing.expectEqual(@as(usize, 4), rig.transport.requests.items.len);
+    try expectRequested(&rig, "\"text\":\"first\"");
+    const request = rig.lastRequest();
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, request, "\"text\":\"second\""));
+    try std.testing.expect(std.mem.indexOf(u8, request, "\"text\":\"third\"") == null);
+}
+
+test "/rewind warns before it drops a turn that ran a mutating tool" {
+    const replies = [_]providers.testing.FakeTransport.Reply{
+        .{ .body = write_call_stream },
+        .{ .body = providers.testing.reply_stream },
+        .{ .body = providers.testing.reply_stream },
+        .{ .body = providers.testing.reply_stream },
+    };
+    var rig: Rig = undefined;
+    try rig.init(&.{
+        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .replies = &replies,
+        .model = "gpt-5.6-sol",
+    });
+    defer rig.deinit();
+
+    try rig.keys("fix it\r");
+    try rig.waitFor(&.{ .{ .rows = &.{ "fix it", "done" } }, .{ .activity = false } });
+    try rig.keys("next\r");
+    try rig.waitFor(&.{ .{ .rows = &.{ "fix it", "next", "done" } }, .{ .activity = false } });
+
+    try rig.keys("/rewind\r\x1b[A\r");
+    try rig.waitFor(&.{ .{ .status = rewind_warning }, .{ .line = " > fix it" } });
+    try rig.keys("\x1b");
+    try rig.waitFor(&.{
+        .{ .absent = rewind_picker },
+        .{ .status = "You canceled the prompt selection." },
+        .{ .rows = &.{ "fix it", "next", "done" } },
+    });
+
+    try rig.keys("/rewind\r\x1b[A\r");
+    try rig.waitFor(&.{ .{ .status = rewind_warning }, .{ .line = " > fix it" } });
+    try rig.keys("\x1b[B\x1b[A");
+    try rig.waitFor(&.{ .{ .absent = rewind_warning }, .{ .line = " > fix it" } });
+    try rig.keys("\r");
+    try rig.waitFor(&.{ .{ .status = rewind_warning }, .{ .text = rewind_picker } });
+    try rig.keys("\r");
+    try rig.waitFor(&.{
+        .{ .absent = rewind_picker },
+        .{ .absent = "next" },
+        .{ .editor = "fix it" },
+    });
+    try rig.keys("\r");
+    try rig.waitFor(&.{ .{ .rows = &.{ "fix it", "done" } }, .{ .activity = false } });
+    try std.testing.expectEqual(@as(usize, 4), rig.transport.requests.items.len);
+    try expectRequested(&rig, "\"text\":\"fix it\"");
+    try std.testing.expect(std.mem.indexOf(u8, rig.lastRequest(), "\"text\":\"next\"") == null);
+}
+
 test "a signed-out submit and a submit without a model are refused with a notice" {
     var rig: Rig = undefined;
     try rig.init(&.{});
@@ -2416,6 +2507,7 @@ test "a command that its state refuses keeps its line" {
         .{ .line = "/model", .refusal = "Sign in to an account" },
         .{ .line = "/logout", .refusal = "No accounts are signed in." },
         .{ .line = "/skill", .refusal = "Drinky found no skill." },
+        .{ .line = "/rewind", .refusal = "No prompts are in the conversation." },
     };
     for (&cases) |case| {
         var rig: Rig = undefined;
@@ -2455,8 +2547,13 @@ test "/new clears the conversation, and the next request starts fresh" {
         .{ .text = "/help: Commands" },
         .{ .status = "(0/400k)" },
     });
+    try rig.keys("/rewind\r");
+    try rig.waitFor(&.{
+        .{ .status = "No prompts are in the conversation." },
+        .{ .editor = "/rewind" },
+    });
 
-    try rig.keys("second\r");
+    try rig.keys("\x03second\r");
     try rig.waitFor(&.{ .{ .rows = &.{ "second", "done" } }, .{ .activity = false } });
     try std.testing.expect(std.mem.indexOf(u8, rig.lastRequest(), "\"text\":\"first\"") == null);
     try expectRequested(&rig, "\"text\":\"second\"");

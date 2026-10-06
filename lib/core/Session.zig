@@ -17,7 +17,8 @@ gpa: std.mem.Allocator,
 io: std.Io,
 options: Options,
 conversation: Conversation,
-turn_start: ?usize,
+turn_count: usize,
+turn_starts: std.ArrayList(TurnStart),
 setup: ?Setup,
 next_setup: ?Setup,
 clear_pending: bool,
@@ -33,6 +34,11 @@ pub const Options = struct {
 };
 
 pub const Sink = actor.Sink(Event);
+
+const TurnStart = struct {
+    turn: usize,
+    item: usize,
+};
 
 pub const Setup = struct {
     provider: Provider,
@@ -74,13 +80,13 @@ pub const Command = union(enum) {
     cancel,
     configure: Setup,
     clear,
-    remove_turn,
+    rewind: usize,
 
     fn dupe(self: *const Command, gpa: std.mem.Allocator) error{OutOfMemory}!Command {
         return switch (self.*) {
             .prompt => |text| .{ .prompt = try gpa.dupe(u8, text) },
             .configure => |*setup| .{ .configure = try setup.dupe(gpa) },
-            .cancel, .clear, .remove_turn => self.*,
+            .cancel, .clear, .rewind => self.*,
         };
     }
 
@@ -88,7 +94,7 @@ pub const Command = union(enum) {
         switch (self.*) {
             .prompt => |text| gpa.free(text),
             .configure => |*setup| setup.deinit(gpa),
-            .cancel, .clear, .remove_turn => {},
+            .cancel, .clear, .rewind => {},
         }
     }
 };
@@ -253,7 +259,8 @@ pub fn init(gpa: std.mem.Allocator, io: std.Io, options: *const Options) Session
         .io = io,
         .options = options.*,
         .conversation = .init(io),
-        .turn_start = null,
+        .turn_count = 0,
+        .turn_starts = .empty,
         .setup = null,
         .next_setup = null,
         .clear_pending = false,
@@ -275,6 +282,7 @@ pub fn deinit(self: *Session) void {
     if (self.setup) |*setup| setup.deinit(self.gpa);
     if (self.next_setup) |*setup| setup.deinit(self.gpa);
     if (self.measured) |*measured| measured.deinit(self.gpa);
+    self.turn_starts.deinit(self.gpa);
     self.conversation.deinit(self.gpa);
 }
 
@@ -305,19 +313,20 @@ fn handle(self: *Session, command: Command) void {
         .cancel => self.mailbox.cancel(self.io),
         .configure => |setup| self.configure(setup),
         .clear => self.requestClear(),
-        .remove_turn => self.removeTurn(),
+        .rewind => |turn| self.rewind(turn),
     }
 }
 
 fn prompt(self: *Session, text: []const u8) void {
     std.debug.assert(!self.mailbox.busy());
     std.debug.assert(self.setup != null);
-    self.conversation.append(self.gpa, .{ .message = .{ .role = .user, .text = text } }) catch {
+    const turn_index = self.turn_count;
+    self.turn_count += 1;
+    self.appendPrompt(turn_index, text) catch {
         self.gpa.free(text);
         self.emit(&.{ .turn_ended = .{ .failed = .{ .reason = .out_of_memory } } });
         return;
     };
-    self.turn_start = self.conversation.items.items.len - 1;
     const turn: Turn = .{
         .gpa = self.gpa,
         .io = self.io,
@@ -328,6 +337,13 @@ fn prompt(self: *Session, text: []const u8) void {
     };
     self.mailbox.start(self.io, runTurn, .{turn}) catch
         self.emit(&.{ .turn_ended = .{ .failed = .{ .reason = .out_of_memory } } });
+}
+
+fn appendPrompt(self: *Session, turn: usize, text: []const u8) error{OutOfMemory}!void {
+    try self.turn_starts.ensureUnusedCapacity(self.gpa, 1);
+    const item = self.conversation.items.items.len;
+    try self.conversation.append(self.gpa, .{ .message = .{ .role = .user, .text = text } });
+    self.turn_starts.appendAssumeCapacity(.{ .turn = turn, .item = item });
 }
 
 fn runTurn(lent: Turn) Mail {
@@ -361,16 +377,23 @@ fn drop(self: *Session, setup: *const Setup) void {
 
 fn clear(self: *Session) void {
     self.conversation.clear(self.gpa, self.io);
-    self.turn_start = null;
+    self.turn_count = 0;
+    self.turn_starts.clearRetainingCapacity();
     self.forgetMeasured();
     self.options.runner.reset();
     self.emit(&.{ .context = 0 });
 }
 
-fn removeTurn(self: *Session) void {
+fn rewind(self: *Session, turn: usize) void {
     std.debug.assert(!self.mailbox.busy());
-    self.conversation.truncate(self.gpa, self.turn_start.?);
-    self.turn_start = null;
+    std.debug.assert(turn < self.turn_count);
+    const kept = for (self.turn_starts.items, 0..) |turn_start, index| {
+        if (turn_start.turn >= turn) break index;
+    } else self.turn_starts.items.len;
+    if (kept < self.turn_starts.items.len)
+        self.conversation.truncate(self.gpa, self.turn_starts.items[kept].item);
+    self.turn_starts.shrinkRetainingCapacity(kept);
+    self.turn_count = turn;
     self.forgetMeasured();
     self.options.runner.reset();
     self.emit(&.{ .context = self.contextShown() });
@@ -1329,7 +1352,7 @@ test "a clear empties the conversation and resets the runner, also at the end of
     try std.testing.expectEqualStrings("model-a|user:c", harness.provider.requests.items[3]);
 }
 
-test "a turn removal drops the items of the last turn, its measurement, and the skill evidence" {
+test "a rewind of the last turn drops its items, its measurement, and the skill evidence" {
     var harness: testing.Harness = undefined;
     try harness.init(std.testing.allocator, std.testing.io, &.{});
     defer harness.deinit();
@@ -1364,7 +1387,7 @@ test "a turn removal drops the items of the last turn, its measurement, and the 
     , try harness.until("text:I read "));
     try harness.session.send(&.cancel);
     _ = try harness.until("turn_ended:canceled");
-    try harness.session.send(&.remove_turn);
+    try harness.session.send(&.{ .rewind = 1 });
     try harness.expect("context:none");
     try std.testing.expectEqual(@as(u32, 1), harness.runner.resets);
     _ = try harness.turn("c");
@@ -1379,11 +1402,57 @@ test "a turn removal drops the items of the last turn, its measurement, and the 
     _ = try harness.until("text:I write ");
     try harness.session.send(&.cancel);
     _ = try harness.until("turn_ended:canceled");
-    try harness.session.send(&.remove_turn);
+    try harness.session.send(&.{ .rewind = 0 });
     try harness.expect("context:0");
     try std.testing.expectEqual(@as(u32, 3), harness.runner.resets);
     _ = try harness.turn("e");
     try std.testing.expectEqualStrings("model-a|user:e", harness.provider.requests.items[5]);
+}
+
+test "a rewind drops the chosen turn and every later turn, and keeps the cache key" {
+    var harness: testing.Harness = undefined;
+    try harness.init(std.testing.allocator, std.testing.io, &.{});
+    defer harness.deinit();
+
+    harness.provider.load(&.{
+        .{ .done = &.{
+            fixture.message("one"),
+            .{ .usage = .{ .input = 10, .output = 2 } },
+            fixture.stop_complete,
+        } },
+        .{ .done = &.{ fixture.toolCall(fixture.call), fixture.stop_complete } },
+        .{ .done = &.{ fixture.message("two"), fixture.stop_complete } },
+        .{ .done = &.{ fixture.message("three"), fixture.stop_complete } },
+        .{ .done = &.{ fixture.message("four"), fixture.stop_complete } },
+        .{ .done = &.{ fixture.message("five"), fixture.stop_complete } },
+        .{ .done = &.{ fixture.message("six"), fixture.stop_complete } },
+    });
+    _ = try harness.turn("a");
+    _ = try harness.turn("b");
+    _ = try harness.turn("c");
+    try harness.session.send(&.{ .rewind = 1 });
+    try harness.expect("context:none");
+    try std.testing.expectEqual(@as(u32, 1), harness.runner.resets);
+    _ = try harness.turn("d");
+    try std.testing.expectEqualStrings(
+        "model-a|user:a|assistant:one|user:d",
+        harness.provider.requests.items[4],
+    );
+
+    try harness.session.send(&.{ .rewind = 1 });
+    try harness.expect("context:none");
+    _ = try harness.turn("e");
+    try std.testing.expectEqualStrings(
+        "model-a|user:a|assistant:one|user:e",
+        harness.provider.requests.items[5],
+    );
+
+    try harness.session.send(&.{ .rewind = 0 });
+    try harness.expect("context:0");
+    _ = try harness.turn("f");
+    try std.testing.expectEqualStrings("model-a|user:f", harness.provider.requests.items[6]);
+    const keys = harness.provider.keys.items;
+    for (keys[1..]) |key| try std.testing.expectEqualStrings(keys[0], key);
 }
 
 test "the context gauge binds to the account, the model, and the effort of its request" {

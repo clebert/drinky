@@ -6,6 +6,7 @@ const Choice = @import("../Choice.zig");
 const discovery = @import("../discovery/root.zig");
 const Message = @import("../Message.zig");
 const testing = @import("../testing.zig");
+const Turns = @import("../Turns.zig");
 const Context = @import("Context.zig");
 
 pub const no_skills: discovery.skills.Registry = .init(std.testing.allocator);
@@ -15,6 +16,7 @@ pub const Rig = struct {
     choice: Choice,
     remembered: [accounts.Account.table.len]?[]const u8,
     skill_registry: *const discovery.skills.Registry,
+    turns: Turns,
 
     const Options = struct {
         variables: []const [2][]const u8 = &.{},
@@ -30,9 +32,11 @@ pub const Rig = struct {
         self.choice = .{ .effort = .high };
         self.remembered = @splat(null);
         self.skill_registry = options.skill_registry;
+        self.turns = .init(std.testing.allocator);
     }
 
     pub fn deinit(self: *Rig) void {
+        self.turns.deinit();
         self.account_rig.deinit();
     }
 
@@ -50,6 +54,7 @@ pub const Rig = struct {
             .skill_registry = self.skill_registry,
             .system_prompt = "",
             .sources_page = "",
+            .turns = &self.turns,
         };
     }
 };
@@ -185,6 +190,6 @@ fn release(outcome: *const Context.Outcome) void {
         .pick => |*pick| pick.deinit(gpa),
         .prompt => |*prompt| prompt.deinit(gpa),
         .editor_text => |text| gpa.free(text),
-        .page, .login, .logout, .fetch, .new_conversation => {},
+        .page, .login, .logout, .fetch, .new_conversation, .rewind => {},
     }
 }

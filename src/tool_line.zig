@@ -44,7 +44,7 @@ pub fn head(
         .pattern, .command => try gpa.dupe(u8, subject.text),
     };
     defer gpa.free(shown);
-    const line = singleLine(shown);
+    const line = ui.paint.singleLine(shown);
     if (line.len == 0) return std.fmt.allocPrint(gpa, "Tool: {s}", .{name});
     return std.fmt.allocPrint(gpa, "Tool: {s} · {s}: {s}", .{ name, label(subject.kind), line });
 }
@@ -55,25 +55,6 @@ fn label(kind: tools.Registry.Description.Kind) []const u8 {
         .pattern => "Pattern",
         .command => "Command",
     };
-}
-
-fn singleLine(text: []u8) []u8 {
-    var length: usize = 0;
-    var blank = false;
-    for (text) |byte| {
-        if (byte == ' ' or byte <= 0x1f or byte == 0x7f) {
-            blank = length != 0;
-            continue;
-        }
-        if (blank) {
-            text[length] = ' ';
-            length += 1;
-            blank = false;
-        }
-        text[length] = byte;
-        length += 1;
-    }
-    return text[0..length];
 }
 
 pub fn render(gpa: std.mem.Allocator, output: *const core.Tool.Output) error{OutOfMemory}!Line {

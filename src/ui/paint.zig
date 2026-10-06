@@ -234,6 +234,25 @@ const FramedRow = struct {
     marks: []const Mark = &.{},
 };
 
+pub fn singleLine(text: []u8) []u8 {
+    var length: usize = 0;
+    var blank = false;
+    for (text) |byte| {
+        if (byte == ' ' or byte <= 0x1f or byte == 0x7f) {
+            blank = length != 0;
+            continue;
+        }
+        if (blank) {
+            text[length] = ' ';
+            length += 1;
+            blank = false;
+        }
+        text[length] = byte;
+        length += 1;
+    }
+    return text[0..length];
+}
+
 pub fn isBlank(text: []const u8) bool {
     return std.mem.indexOfNone(u8, text, blank_bytes) == null;
 }

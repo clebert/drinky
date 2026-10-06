@@ -14,6 +14,7 @@ const project = @import("project.zig");
 const testing = @import("testing.zig");
 const tool_line = @import("tool_line.zig");
 const Transcript = @import("Transcript.zig");
+const Turns = @import("Turns.zig");
 const ui = @import("ui/root.zig");
 
 const Screen = @This();
@@ -87,7 +88,6 @@ pub const Widget = union(enum) {
 };
 
 const Turn = struct {
-    start: usize,
     committed: usize,
     blocks: std.ArrayList(Block),
     served_buffer: [accounts.Model.name_bytes_max]u8,
@@ -99,9 +99,8 @@ const Turn = struct {
     box_hashes: std.ArrayList(u64),
     box_tracks: std.ArrayList(layout.Track),
 
-    fn init(start: usize, committed: usize) Turn {
+    fn init(committed: usize) Turn {
         return .{
-            .start = start,
             .committed = committed,
             .blocks = .empty,
             .served_buffer = undefined,
@@ -409,18 +408,17 @@ fn deinitWidget(self: *Screen) void {
     }
 }
 
-pub fn beginTurn(self: *Screen, start: usize) void {
+pub fn beginTurn(self: *Screen) void {
     std.debug.assert(self.widget == .prompt);
-    std.debug.assert(start <= self.transcript.blocks().len);
     self.transcript.endMessage();
     self.statistics.forgetTurnEvidence();
-    self.widget = .{ .turn = .init(start, self.transcript.blocks().len) };
+    self.widget = .{ .turn = .init(self.transcript.blocks().len) };
 }
 
-pub fn removeTurn(self: *Screen, range: Transcript.Range, line: []const u8) !void {
+pub fn rewind(self: *Screen, dropped: []const Turns.Turn) !void {
     std.debug.assert(self.widget == .prompt);
-    try self.editor.prependText(line);
-    self.transcript.remove(range);
+    try self.editor.prependText(dropped[0].line.?);
+    for (0..dropped.len) |offset| self.transcript.remove(dropped[dropped.len - 1 - offset].range);
     self.view.resetScreen();
     self.markEdited();
 }
@@ -472,7 +470,7 @@ pub fn apply(
             self.transcript.endMessage();
             const text = try attemptText(self.gpa, attempt);
             defer self.gpa.free(text);
-            try self.transcript.append(&.{ .event = .{ .text = text, .survives_rewind = true } });
+            try self.transcript.append(&.{ .event = .{ .text = text, .survives_discard = true } });
         },
         .skill_loaded => |*loaded| {
             self.transcript.endMessage();
@@ -615,7 +613,7 @@ fn discardTail(self: *Screen, turn: *Turn, count: usize) !void {
         first = if (first) |found| @min(found, index) else index;
     }
     turn.releaseBlocks(self.gpa, kept);
-    if (first) |index| self.transcript.rewind(@max(index, turn.committed));
+    if (first) |index| self.transcript.discard(@max(index, turn.committed));
 }
 
 fn recordServed(self: *Screen, turn: *Turn, served: *const core.Session.Event.ModelServed) !void {
@@ -1077,9 +1075,8 @@ const Rig = struct {
     }
 
     fn start(self: *Rig, text: []const u8) !void {
-        const base = self.screen.transcript.blocks().len;
         try self.screen.appendUser(text);
-        self.screen.beginTurn(base);
+        self.screen.beginTurn();
     }
 
     fn apply(self: *Rig, event: *const core.Session.Event) !void {
@@ -1271,7 +1268,7 @@ test "a discarded tail leaves the screen with its rows, and a cancel keeps the r
     try std.testing.expectEqualStrings("I read ", rig.blocks()[1].content.model.items);
 }
 
-test "a rejected attempt drops its tail, records the retry, and the retry survives a rewind" {
+test "a rejected attempt drops its tail, records the retry, and the retry survives the discard" {
     var rig: Rig = undefined;
     rig.init();
     defer rig.deinit();
