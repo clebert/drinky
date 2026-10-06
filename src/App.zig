@@ -1770,6 +1770,19 @@ const Rig = struct {
         try self.device.press(bytes);
     }
 
+    fn keyFrame(self: *Rig, bytes: []const u8) !void {
+        const slept = self.clock.sleepCount();
+        const painted = self.device.frameCount();
+        try self.keys(bytes);
+        self.advanceTo(try self.clock.waitSleep(slept));
+        try self.device.waitFrame(painted);
+    }
+
+    fn advanceTo(self: *Rig, deadline_ms: i64) void {
+        const now_ms = std.Io.Timestamp.now(self.clock.io(), .awake).toMilliseconds();
+        self.clock.advance(@intCast(@max(0, deadline_ms - now_ms)));
+    }
+
     fn waitFor(self: *Rig, sights: []const Sight) !void {
         self.paintUntil(sights) catch |err| {
             self.printMiss(sights);
@@ -2283,6 +2296,78 @@ test "a slash command opens its picker, a pick applies, and Esc leaves with a no
     try rig.keys("hello\r");
     try rig.waitFor(&.{ .{ .rows = &.{ "hello", "done" } }, .{ .activity = false } });
     try expectRequested(&rig, "\"effort\":\"low\"");
+}
+
+test "a lone Esc waits 50 ms and repaints without a resize" {
+    for ([_]i64{ 49, 50 }) |elapsed_ms| {
+        var rig: Rig = undefined;
+        try rig.init(&.{
+            .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+            .model = "gpt-5.6-sol",
+        });
+        defer rig.deinit();
+        try rig.keys("/effort\r");
+        try rig.waitFor(&.{.{ .text = effort_picker }});
+        try rig.keyFrame("\x00");
+
+        rig.clock.advance(@intCast(4 * Rig.frame_interval_ms - elapsed_ms));
+        const started_ms = std.Io.Timestamp.now(rig.clock.io(), .awake).toMilliseconds();
+        var slept = rig.clock.sleepCount();
+        try rig.keys("\x1b");
+        var deadline_ms = try rig.clock.waitSleep(slept);
+        for (0..3) |_| {
+            slept = rig.clock.sleepCount();
+            rig.advanceTo(deadline_ms);
+            deadline_ms = try rig.clock.waitSleep(slept);
+            try rig.expectSees(&.{.{ .text = effort_picker }});
+        }
+        try std.testing.expectEqual(elapsed_ms, deadline_ms - started_ms);
+
+        slept = rig.clock.sleepCount();
+        const painted = rig.device.frameCount();
+        rig.advanceTo(deadline_ms);
+        if (elapsed_ms == 49) {
+            deadline_ms = try rig.clock.waitSleep(slept);
+            try rig.expectSees(&.{.{ .text = effort_picker }});
+            rig.advanceTo(deadline_ms);
+        }
+        try rig.device.waitFrame(painted);
+        try rig.expectSees(&.{
+            .{ .absent = effort_picker },
+            .{ .status = "You canceled the effort selection." },
+        });
+    }
+}
+
+test "an arrow sequence split within the Esc delay stays one key" {
+    var rig: Rig = undefined;
+    try rig.init(&.{
+        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .model = "gpt-5.6-sol",
+    });
+    defer rig.deinit();
+    try rig.keys("/effort\r");
+    try rig.waitFor(&.{ .{ .text = effort_picker }, .{ .text = " > xhigh" } });
+    try rig.keyFrame("\x00");
+
+    var slept = rig.clock.sleepCount();
+    try rig.keys("\x1b");
+    var deadline_ms = try rig.clock.waitSleep(slept);
+    slept = rig.clock.sleepCount();
+    const painted = rig.device.frameCount();
+    rig.advanceTo(deadline_ms);
+    try rig.device.waitFrame(painted);
+    deadline_ms = try rig.clock.waitSleep(slept);
+    try rig.expectSees(&.{ .{ .text = effort_picker }, .{ .text = " > xhigh" } });
+
+    const moved = rig.device.frameCount();
+    try rig.keys("[A");
+    rig.advanceTo(deadline_ms);
+    try rig.device.waitFrame(moved);
+    try rig.expectSees(&.{ .{ .text = effort_picker }, .{ .text = " > high" } });
+    rig.clock.advance(50);
+    try rig.keyFrame("\x00");
+    try rig.expectSees(&.{ .{ .text = effort_picker }, .{ .text = " > high" } });
 }
 
 test "Ctrl+C and Ctrl+D in a picker end its command with its notice" {

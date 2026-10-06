@@ -21,10 +21,6 @@ when the user drops it.
   test hits that panic. The panic handler then waits on the lock of the unwinder, and the test
   hangs. A Debug build of Drinky records stacks through the same allocator and can hang too.
   Trigger: a Zig release whose unwinder reads the unwind data of macOS 27.0.
-- The `App` tests cannot see when the loop of `App` is idle. `Rig.waitFor` sends a resize before
-  each frame, so no test finds a lost repaint, such as the dirty mark in `flushEscape`. No test
-  checks the 50 ms wait for a lone Esc, because a test cannot know the fake time at which `App`
-  handles a key. A test `Io` with a deterministic scheduler can give this signal.
 
 ## Ideas
 

@@ -11,6 +11,8 @@ pub const Clock = struct {
     mutex: std.Io.Mutex,
     now_ms: i64,
     changes: std.atomic.Value(u32),
+    sleep_count: usize,
+    sleep_deadline_ms: i64,
 
     pub fn init(self: *Clock, gpa: std.mem.Allocator) void {
         self.threaded = .init(gpa, .{});
@@ -20,6 +22,8 @@ pub const Clock = struct {
         self.mutex = .init;
         self.now_ms = 0;
         self.changes = .init(0);
+        self.sleep_count = 0;
+        self.sleep_deadline_ms = 0;
     }
 
     pub fn deinit(self: *Clock) void {
@@ -35,8 +39,39 @@ pub const Clock = struct {
         self.mutex.lockUncancelable(backend);
         self.now_ms +|= @intCast(milliseconds);
         self.mutex.unlock(backend);
+        self.notify();
+    }
+
+    pub fn sleepCount(self: *Clock) usize {
+        const backend = self.threaded.io();
+        self.mutex.lockUncancelable(backend);
+        defer self.mutex.unlock(backend);
+        return self.sleep_count;
+    }
+
+    pub fn waitSleep(
+        self: *Clock,
+        seen: usize,
+    ) error{ Timeout, Canceled, ConcurrencyUnavailable }!i64 {
+        return core.timeout.run(std.testing.io, 5_000, sleepAfter, .{ self, seen }, null);
+    }
+
+    fn sleepAfter(self: *Clock, seen: usize) std.Io.Cancelable!i64 {
+        const backend = self.threaded.io();
+        while (true) {
+            const changed = self.changes.load(.acquire);
+            self.mutex.lockUncancelable(backend);
+            const started = self.sleep_count > seen;
+            const deadline_ms = self.sleep_deadline_ms;
+            self.mutex.unlock(backend);
+            if (started) return deadline_ms;
+            try std.testing.io.futexWait(u32, &self.changes.raw, changed);
+        }
+    }
+
+    fn notify(self: *Clock) void {
         _ = self.changes.fetchAdd(1, .release);
-        backend.futexWake(u32, &self.changes.raw, std.math.maxInt(u32));
+        self.threaded.io().futexWake(u32, &self.changes.raw, std.math.maxInt(u32));
     }
 
     fn of(userdata: ?*anyopaque) *Clock {
@@ -64,6 +99,11 @@ pub const Clock = struct {
             .duration => |duration| self.nowMs() +| @max(0, duration.raw.toMilliseconds()),
             .deadline => |deadline| deadline.raw.toMilliseconds(),
         };
+        self.mutex.lockUncancelable(backend);
+        self.sleep_count += 1;
+        self.sleep_deadline_ms = deadline_ms;
+        self.mutex.unlock(backend);
+        self.notify();
         var seen = self.changes.load(.acquire);
         while (self.nowMs() < deadline_ms) : (seen = self.changes.load(.acquire)) {
             try backend.futexWait(u32, &self.changes.raw, seen);
