@@ -23,5 +23,3 @@ when the user drops it.
   Trigger: a Zig release whose unwinder reads the unwind data of macOS 27.0.
 
 ## Ideas
-
-- Add `/reload` to reload skills and instructions without a restart.
