@@ -14,14 +14,12 @@ const project = @import("project.zig");
 const testing = @import("testing.zig");
 const tool_line = @import("tool_line.zig");
 const Transcript = @import("Transcript.zig");
+const turn_text = @import("turn_text.zig");
 const Turns = @import("Turns.zig");
 const ui = @import("ui/root.zig");
 
 const Screen = @This();
 
-pub const truncated_event =
-    "The reply is incomplete. The model reached an output or context limit.";
-pub const exhausted_event = "The turn reached the limit for tool rounds.";
 const canceled_event = "You canceled the turn.";
 
 pub const editor_caption_rows_max: usize = 3;
@@ -637,41 +635,16 @@ fn recordOutcome(self: *Screen, outcome: *const core.Session.Outcome) !void {
     switch (outcome.*) {
         .stopped => |reason| switch (reason) {
             .complete => {},
-            .truncated => try self.appendFailure(truncated_event),
+            .truncated => try self.appendFailure(turn_text.truncated),
         },
         .canceled => try self.transcript.append(&.{ .event = .{ .text = canceled_event } }),
-        .exhausted => try self.appendFailure(exhausted_event),
+        .exhausted => try self.appendFailure(turn_text.exhausted),
         .failed => |*failure| {
-            const text = try failureText(self.gpa, failure);
+            const text = try turn_text.failureText(self.gpa, failure);
             defer self.gpa.free(text);
             try self.appendFailure(text);
         },
     }
-}
-
-fn failureSentence(reason: core.Provider.Failure.Reason) []const u8 {
-    return switch (reason) {
-        .unauthorized => "The credential is missing or invalid.",
-        .rate_limited => "The provider limits the request rate.",
-        .quota_exhausted => "The account has no quota left.",
-        .overloaded => "The provider is overloaded.",
-        .invalid_request => "The request is invalid.",
-        .context_overflow => "The conversation does not fit the context window of the model.",
-        .network => "Drinky could not reach the provider.",
-        .invalid_reply => "Drinky did not receive the complete reply of the model.",
-        .empty_reply => "The model returned an empty reply.",
-        .unsupported_reply => "Drinky cannot keep the reply because the model returned a " ++
-            "refusal, a pause, or an unsupported result.",
-        .too_many_tool_calls => "Drinky stopped the reply because it asked for too many tool " ++
-            "calls.",
-        .out_of_memory => "Drinky ran out of memory.",
-    };
-}
-
-pub fn failureText(gpa: std.mem.Allocator, failure: *const core.Provider.Failure) ![]u8 {
-    const sentence = failureSentence(failure.reason);
-    if (failure.message.len == 0) return gpa.dupe(u8, sentence);
-    return gpa.print("{s} Details: {s}", .{ sentence, failure.message });
 }
 
 fn attemptText(gpa: std.mem.Allocator, attempt: *const core.Session.Event.Attempt) ![]u8 {
@@ -680,7 +653,7 @@ fn attemptText(gpa: std.mem.Allocator, attempt: *const core.Session.Event.Attemp
         attempt.delay_ms,
         std.math.maxInt(i64),
     )));
-    const sentence = failureSentence(attempt.failure.reason);
+    const sentence = turn_text.failureSentence(attempt.failure.reason);
     if (attempt.failure.message.len == 0) return gpa.print(
         "Attempt {d} failed. {s} Drinky tries again in {s}.",
         .{ attempt.attempt, sentence, delay },
@@ -1314,12 +1287,12 @@ test "every outcome states its end, and a failure names its details" {
 
     try rig.start("a");
     try rig.end(&.{ .stopped = .truncated });
-    try std.testing.expectEqualStrings(truncated_event, rig.eventText(1));
+    try std.testing.expectEqualStrings(turn_text.truncated, rig.eventText(1));
     try std.testing.expectEqual(.failure, rig.blocks()[1].content.event.severity);
 
     try rig.start("b");
     try rig.end(&.exhausted);
-    try std.testing.expectEqualStrings(exhausted_event, rig.eventText(3));
+    try std.testing.expectEqualStrings(turn_text.exhausted, rig.eventText(3));
 
     try rig.start("c");
     try rig.end(&.{ .failed = .{ .reason = .unauthorized, .message = "401 Unauthorized" } });

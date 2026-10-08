@@ -19,6 +19,7 @@ const Screen = @import("Screen.zig");
 const sources = @import("sources.zig");
 const testing = @import("testing.zig");
 const tool_environment = @import("tool_environment.zig");
+const turn_text = @import("turn_text.zig");
 const Turns = @import("Turns.zig");
 const ui = @import("ui/root.zig");
 
@@ -1060,7 +1061,7 @@ fn endTurn(self: *App, outcome: *const core.Session.Outcome) !void {
 }
 
 fn offerRetry(self: *App, failure: *const core.Provider.Failure) !void {
-    const text = try Screen.failureText(self.gpa, failure);
+    const text = try turn_text.failureText(self.gpa, failure);
     defer self.gpa.free(text);
     self.offer = .{ .retry = try self.gpa.print(retry_request, .{text}) };
 }

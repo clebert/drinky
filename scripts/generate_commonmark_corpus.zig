@@ -5,8 +5,8 @@ const download = @import("download.zig");
 const version = "0.31.2";
 const corpus_url = "https://spec.commonmark.org/" ++ version ++ "/spec.json";
 const license_url = "https://creativecommons.org/licenses/by-sa/4.0/legalcode.txt";
-const corpus_output_path = "src/ui/commonmark_spec.json";
-const license_output_path = "src/ui/COMMONMARK_LICENSE";
+const corpus_output_path = "lib/markdown/commonmark_spec.json";
+const license_output_path = "lib/markdown/COMMONMARK_LICENSE";
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();

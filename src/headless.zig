@@ -8,9 +8,9 @@ const command_line = @import("command_line.zig");
 const escape = @import("escape.zig");
 const Harness = @import("Harness.zig");
 const project = @import("project.zig");
-const Screen = @import("Screen.zig");
 const testing = @import("testing.zig");
 const tool_environment = @import("tool_environment.zig");
+const turn_text = @import("turn_text.zig");
 
 const nested_refusal = "Drinky cannot start drinky run inside another drinky run process.";
 const prompt_missing = "Drinky received no prompt on stdin.";
@@ -124,12 +124,12 @@ const Listener = struct {
                 try self.writeFinal(options.stdout);
                 return switch (reason) {
                     .complete => true,
-                    .truncated => refuse(options.stderr, Screen.truncated_event),
+                    .truncated => refuse(options.stderr, turn_text.truncated),
                 };
             },
             .exhausted => {
                 try self.writeFinal(options.stdout);
-                return refuse(options.stderr, Screen.exhausted_event);
+                return refuse(options.stderr, turn_text.exhausted);
             },
             .failed => |*failure| return refuseFailure(self.gpa, options, failure),
             .canceled => unreachable,
@@ -267,7 +267,7 @@ fn refuseFailure(
     options: *const Options,
     failure: *const core.Provider.Failure,
 ) !bool {
-    const text = try Screen.failureText(gpa, failure);
+    const text = try turn_text.failureText(gpa, failure);
     defer gpa.free(text);
     return refuse(options.stderr, text);
 }
@@ -471,7 +471,7 @@ test "a truncated final reply reaches stdout, and its event reaches stderr as a 
 
     try std.testing.expect(!try rig.ask(.high, "openai-api-key/gpt-5.6-sol", "review"));
     try std.testing.expectEqualStrings("partial\n", rig.stdout.written());
-    try std.testing.expectEqualStrings(Screen.truncated_event ++ "\n", rig.stderr.written());
+    try std.testing.expectEqualStrings(turn_text.truncated ++ "\n", rig.stderr.written());
 }
 
 test "a failed turn writes its failure to stderr and nothing to stdout" {

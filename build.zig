@@ -10,6 +10,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const markdown_module = b.addModule("markdown", .{
+        .root_source_file = b.path("lib/markdown/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const core_module = b.addModule("core", .{
         .root_source_file = b.path("lib/core/root.zig"),
         .target = target,
@@ -50,6 +56,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "terminal", .module = terminal_module },
+            .{ .name = "markdown", .module = markdown_module },
             .{ .name = "core", .module = core_module },
             .{ .name = "providers", .module = providers_module },
             .{ .name = "tools", .module = tools_module },
@@ -90,6 +97,7 @@ pub fn build(b: *std.Build) void {
 
     const tested_modules = [_]TestedModule{
         .{ .name = "terminal", .module = terminal_module },
+        .{ .name = "markdown", .module = markdown_module },
         .{ .name = "core", .module = core_module },
         .{ .name = "providers", .module = providers_module },
         .{ .name = "tools", .module = tools_module },

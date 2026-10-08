@@ -10,6 +10,9 @@ every library. `lib/providers` and `lib/tools` import `lib/core`, and `lib/accou
 
 - `lib/terminal` reads the keyboard and paints the screen. It knows no model and no provider. It
   holds the device seam that the client reads and paints through, and `Tty` implements it.
+- `lib/markdown` imports `std` alone. It parses blocks, table cells, inline spans, and link
+  destinations. It exposes source offsets and knows no terminal, role, or URL limit. It holds the
+  CommonMark test corpus and its license notice.
 - `lib/core` imports `std` alone. It holds the neutral conversation, the provider seam, the tool
   seam, the retry policy, and the session. It also holds the parts that the libraries share: the
   actor shell, the timeout race over `std.Io`, the compile-time check of an error set, the plural
@@ -37,11 +40,12 @@ every library. `lib/providers` and `lib/tools` import `lib/core`, and `lib/accou
   state, and `Choice.zig` holds the account, the model, and the effort that the client chose.
   `Turns.zig` holds the turns that the client started. A rewind names a turn by its index in that
   list. `src` also holds the slash commands under `src/command/` and the instruction and skill
-  discovery under `src/discovery/`. It holds the widgets under `src/ui/` and Herdr too.
-  `headless.zig` answers `drinky run` and `drinky models` without a terminal. `Harness.zig` holds
-  the setup that the client and the headless mode share: the config, the discovery, the system
-  prompt, and the tools. `src` names no vendor, wire, or account row. It reads each such fact from
-  `lib/accounts`.
+  discovery under `src/discovery/`. It holds the widgets under `src/ui/` and Herdr too. The UI fits
+  and paints the Markdown syntax from `lib/markdown` through one shared layout walk. `turn_text.zig`
+  holds the outcome text that the terminal and headless clients share. `headless.zig` answers
+  `drinky run` and `drinky models` without a terminal. `Harness.zig` holds the setup that the client
+  and the headless mode share: the config, the discovery, the system prompt, and the tools. `src`
+  names no vendor, wire, or account row. It reads each such fact from `lib/accounts`.
 - `src/ui/role.zig` maps a role to terminal colors. A widget names a role and writes no color of its
   own. `Message.zig` holds the severity that a notice and an event share.
 
