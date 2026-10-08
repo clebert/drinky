@@ -389,7 +389,7 @@ fn readCommandChildError(io: std.Io, error_file: std.Io.File) !?std.process.Spaw
 }
 
 fn reapCommandChild(process_id: std.posix.pid_t) void {
-    var status: if (builtin.link_libc) c_int else u32 = undefined;
+    var status: if (builtin.link_libc) c_int else i32 = undefined;
     for (0..child_setup_attempts_max) |_| switch (std.posix.errno(
         std.posix.system.waitpid(process_id, &status, 0),
     )) {
@@ -969,7 +969,7 @@ test "bash timeout reaps a command after output closes" {
     try std.testing.expect(std.mem.find(u8, result.content, "timed out after 200ms") != null);
 
     const process_id = try readProcessId(gpa, std.testing.io, &tmp);
-    var status: if (builtin.link_libc) c_int else u32 = undefined;
+    var status: if (builtin.link_libc) c_int else i32 = undefined;
     const wait_result = std.posix.system.waitpid(process_id, &status, std.posix.W.NOHANG);
     try std.testing.expectEqual(std.posix.E.CHILD, std.posix.errno(wait_result));
 }
