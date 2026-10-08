@@ -29,7 +29,7 @@ fn collectRoot(
     for (0..entries_max) |_| {
         const entry = (try walker.next(io)) orelse return;
         if (entry.kind != .file or !std.mem.endsWith(u8, entry.basename, ".zig")) continue;
-        try paths.append(arena, try std.fs.path.join(arena, &.{ root, entry.path }));
+        try paths.append(arena, try std.Io.Dir.path.join(arena, &.{ root, entry.path }));
     }
     return error.TooManyEntries;
 }

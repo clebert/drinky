@@ -184,7 +184,7 @@ pub fn percentEncode(writer: *std.Io.Writer, value: []const u8) std.Io.Writer.Er
 }
 
 fn isUnreserved(byte: u8) bool {
-    return std.ascii.isAlphanumeric(byte) or std.mem.indexOfScalar(u8, "-._~", byte) != null;
+    return std.ascii.isAlphanumeric(byte) or std.mem.findScalar(u8, "-._~", byte) != null;
 }
 
 pub fn post(
@@ -521,9 +521,9 @@ test "postBearer rejects an authorization value that can split the request head"
     );
 }
 
-test "a token response at the cap fails, and a smaller one returns its body" {
+test "a token response over the cap fails, and a smaller one returns its body" {
     const gpa = std.testing.allocator;
-    const oversized = try gpa.alloc(u8, token_response_bytes_max);
+    const oversized = try gpa.alloc(u8, token_response_bytes_max + 1);
     defer gpa.free(oversized);
     @memset(oversized, 'x');
     const body =

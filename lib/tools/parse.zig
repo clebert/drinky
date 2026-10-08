@@ -20,22 +20,23 @@ pub fn input(
 
 pub fn check(comptime Args: type, comptime parameters: []const core.Tool.Parameter) void {
     comptime {
-        for (@typeInfo(Args).@"struct".fields) |field| {
+        const info = @typeInfo(Args).@"struct";
+        for (info.field_names, info.field_types, info.field_attrs) |name, field_type, attributes| {
             for (parameters) |parameter| {
-                if (!std.mem.eql(u8, field.name, parameter.name)) continue;
-                if ((field.default_value_ptr == null) != parameter.required) {
-                    @compileError("field '" ++ field.name ++
+                if (!std.mem.eql(u8, name, parameter.name)) continue;
+                if ((attributes.default_value_ptr == null) != parameter.required) {
+                    @compileError("field '" ++ name ++
                         "' required-ness disagrees with its parameter");
                 }
-                if (!typeMatches(field.type, parameter.type)) {
-                    @compileError("field '" ++ field.name ++ "' type disagrees with its parameter");
+                if (!typeMatches(field_type, parameter.type)) {
+                    @compileError("field '" ++ name ++ "' type disagrees with its parameter");
                 }
                 break;
-            } else @compileError("field '" ++ field.name ++ "' is not an advertised parameter");
+            } else @compileError("field '" ++ name ++ "' is not an advertised parameter");
         }
         for (parameters) |parameter| {
-            for (@typeInfo(Args).@"struct".fields) |field| {
-                if (std.mem.eql(u8, parameter.name, field.name)) break;
+            for (info.field_names) |name| {
+                if (std.mem.eql(u8, parameter.name, name)) break;
             } else @compileError("parameter '" ++ parameter.name ++ "' has no matching field");
         }
     }

@@ -100,7 +100,7 @@ pub const Outcome = union(enum) {
         }
 
         pub fn print(self: *Options, comptime format: []const u8, args: anytype) !void {
-            const name = try std.fmt.allocPrint(self.gpa, format, args);
+            const name = try self.gpa.print(format, args);
             errdefer self.gpa.free(name);
             try self.add(.{ .name = name });
         }
@@ -114,7 +114,7 @@ pub const Outcome = union(enum) {
         ) !void {
             const name_copy = try self.gpa.dupe(u8, name);
             errdefer self.gpa.free(name_copy);
-            const extra = try std.fmt.allocPrint(self.gpa, extra_format, extra_args);
+            const extra = try self.gpa.print(extra_format, extra_args);
             errdefer self.gpa.free(extra);
             try self.add(.{ .name = name_copy, .extra = extra, .extra_pressure = extra_pressure });
         }
@@ -127,9 +127,9 @@ pub const Outcome = union(enum) {
             comptime extra_format: []const u8,
             extra_args: anytype,
         ) !void {
-            const name = try std.fmt.allocPrint(self.gpa, name_format, name_args);
+            const name = try self.gpa.print(name_format, name_args);
             errdefer self.gpa.free(name);
-            const extra = try std.fmt.allocPrint(self.gpa, extra_format, extra_args);
+            const extra = try self.gpa.print(extra_format, extra_args);
             errdefer self.gpa.free(extra);
             try self.add(.{ .name = name, .extra = extra, .extra_pressure = extra_pressure });
         }

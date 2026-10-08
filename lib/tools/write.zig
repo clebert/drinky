@@ -58,13 +58,13 @@ test "write creates a file with the given contents" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var input_buffer: [128]u8 = undefined;
-    const input = try std.fmt.bufPrint(&input_buffer,
+    const input = try std.mem.print(&input_buffer,
         \\{{"path":".zig-cache/tmp/{s}/new.txt","content":"hello\nworld\n"}}
     , .{tmp.sub_path});
     const result = try run(&context, input);
     defer result.deinit(gpa);
     try std.testing.expect(!result.hasFailure());
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "wrote 12 bytes") != null);
+    try std.testing.expect(std.mem.find(u8, result.content, "wrote 12 bytes") != null);
     const data = try tmp.dir.readFileAlloc(io, "new.txt", gpa, .limited(64));
     defer gpa.free(data);
     try std.testing.expectEqualStrings("hello\nworld\n", data);
@@ -78,7 +78,7 @@ test "write overwrites an existing file entirely" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "f.txt", .data = "old contents" });
     var input_buffer: [128]u8 = undefined;
-    const input = try std.fmt.bufPrint(&input_buffer,
+    const input = try std.mem.print(&input_buffer,
         \\{{"path":".zig-cache/tmp/{s}/f.txt","content":"new"}}
     , .{tmp.sub_path});
     const result = try run(&context, input);
@@ -97,7 +97,7 @@ test "a write through a dangling link creates the target and keeps the link" {
     defer tmp.cleanup();
     try tmp.dir.symLink(io, "AGENTS.md", "CLAUDE.md", .{});
     var input_buffer: [128]u8 = undefined;
-    const input = try std.fmt.bufPrint(&input_buffer,
+    const input = try std.mem.print(&input_buffer,
         \\{{"path":".zig-cache/tmp/{s}/CLAUDE.md","content":"new"}}
     , .{tmp.sub_path});
 
@@ -121,14 +121,14 @@ test "a write through a link cycle fails and keeps both links" {
     try tmp.dir.symLink(io, "b.md", "a.md", .{});
     try tmp.dir.symLink(io, "a.md", "b.md", .{});
     var input_buffer: [128]u8 = undefined;
-    const input = try std.fmt.bufPrint(&input_buffer,
+    const input = try std.mem.print(&input_buffer,
         \\{{"path":".zig-cache/tmp/{s}/a.md","content":"new"}}
     , .{tmp.sub_path});
 
     const result = try run(&context, input);
     defer result.deinit(gpa);
     try testing.expectConditions(&result, &.{.failed});
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "SymLinkLoop") != null);
+    try std.testing.expect(std.mem.find(u8, result.content, "SymLinkLoop") != null);
     var link_buffer: [64]u8 = undefined;
     for ([_][2][]const u8{ .{ "a.md", "b.md" }, .{ "b.md", "a.md" } }) |link| {
         const link_len = try tmp.dir.readLink(io, link[0], &link_buffer);
@@ -142,14 +142,14 @@ test "write to a missing directory reports an error" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var input_buffer: [128]u8 = undefined;
-    const input = try std.fmt.bufPrint(&input_buffer,
+    const input = try std.mem.print(&input_buffer,
         \\{{"path":".zig-cache/tmp/{s}/missing/f.txt","content":"x"}}
     , .{tmp.sub_path});
     const result = try run(&context, input);
     defer result.deinit(gpa);
     try testing.expectConditions(&result, &.{.path_missing});
     try testing.expectMeasures(&result, &.{});
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "could not write") != null);
+    try std.testing.expect(std.mem.find(u8, result.content, "could not write") != null);
 }
 
 test "write canceled mid-write propagates and leaves the file untouched" {
@@ -159,7 +159,7 @@ test "write canceled mid-write propagates and leaves the file untouched" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "f.txt", .data = "old" });
     var input_buffer: [128]u8 = undefined;
-    const input = try std.fmt.bufPrint(&input_buffer,
+    const input = try std.mem.print(&input_buffer,
         \\{{"path":".zig-cache/tmp/{s}/f.txt","content":"new"}}
     , .{tmp.sub_path});
     var cancel: testing.CancelIo = .init(.file_write);
@@ -177,7 +177,7 @@ test "write measures the lines of what it wrote" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var input_buffer: [160]u8 = undefined;
-    const input = try std.fmt.bufPrint(&input_buffer,
+    const input = try std.mem.print(&input_buffer,
         \\{{"path":".zig-cache/tmp/{s}/sample.txt","content":"one\ntwo\nthree\n"}}
     , .{tmp.sub_path});
 

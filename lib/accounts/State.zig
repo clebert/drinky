@@ -424,13 +424,13 @@ test "temporary store contention leaves project-state saving enabled" {
     var state = try openForTest(gpa, clock.io(), home);
     defer state.deinit();
     try state.seed(testing.anthropic_api_key, "claude-opus-5", .low);
-    const lock_path = try std.fmt.allocPrint(gpa, "{s}.lock", .{state.path});
+    const lock_path = try gpa.print("{s}.lock", .{state.path});
     defer gpa.free(lock_path);
     {
         var held = try std.Io.Dir.cwd().createFile(io, lock_path, .{
             .truncate = false,
             .lock = .exclusive,
-            .permissions = @enumFromInt(0o600),
+            .permissions = .fromMode(0o600),
         });
         defer held.close(io);
         try std.testing.expectError(

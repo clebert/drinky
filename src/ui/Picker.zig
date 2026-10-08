@@ -1,5 +1,6 @@
 const std = @import("std");
 
+const core = @import("core");
 const terminal = @import("terminal");
 
 const Caption = @import("Caption.zig");
@@ -371,10 +372,10 @@ test "the frame holds the option rows alone and the caption stays above it" {
     try testing.expectShows(painted, &.{ title, controls, selected });
     try testing.expectHides(painted, &.{comptime role.sequence(.selection) ++ " > alpha"});
     try std.testing.expect(
-        std.mem.indexOf(u8, painted, "Pick").? < std.mem.indexOf(u8, painted, "─").?,
+        std.mem.find(u8, painted, "Pick").? < std.mem.find(u8, painted, "─").?,
     );
     try std.testing.expect(
-        std.mem.indexOf(u8, painted, "Esc: Cancel").? < std.mem.indexOf(u8, painted, "─").?,
+        std.mem.find(u8, painted, "Esc: Cancel").? < std.mem.find(u8, painted, "─").?,
     );
     try std.testing.expectEqual(@as(usize, 5), testing.paintedRows(painted));
 
@@ -458,7 +459,7 @@ test "a wait that cannot compose keeps no borrowed text" {
     var picker = try testPicker(gpa, &.{"row"}, &.{ .current = 0 });
     defer picker.deinit();
 
-    const text = "x" ** 4096;
+    const text = core.text.repeat("x", 4096);
     failing.fail_index = failing.alloc_index;
     failing.resize_fail_index = failing.resize_index;
     try std.testing.expectError(error.OutOfMemory, picker.beginWait(text));
@@ -642,7 +643,7 @@ test "a tall option list scrolls the window to keep the selection in view" {
     var storage: [20][8]u8 = undefined;
     var labels: [20][]const u8 = undefined;
     for (&labels, 0..) |*label, index| {
-        label.* = std.fmt.bufPrint(&storage[index], "row{d:0>2}", .{index}) catch unreachable;
+        label.* = std.mem.print(&storage[index], "row{d:0>2}", .{index}) catch unreachable;
     }
     var picker = try testPicker(gpa, &labels, &.{ .current = 0 });
     defer picker.deinit();

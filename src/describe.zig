@@ -249,12 +249,12 @@ test "the document orders sections and states each command, key hint, window, li
     });
     defer gpa.free(text);
 
-    const commands = std.mem.indexOf(u8, text, "## Commands").?;
-    const configuration = std.mem.indexOf(u8, text, "## Config file").?;
-    const keys = std.mem.indexOf(u8, text, "## Key bindings").?;
-    const discovery_index = std.mem.indexOf(u8, text, "## Discovery").?;
-    const headless_index = std.mem.indexOf(u8, text, "## Headless mode").?;
-    const repository_index = std.mem.indexOf(u8, text, "## Repository").?;
+    const commands = std.mem.find(u8, text, "## Commands").?;
+    const configuration = std.mem.find(u8, text, "## Config file").?;
+    const keys = std.mem.find(u8, text, "## Key bindings").?;
+    const discovery_index = std.mem.find(u8, text, "## Discovery").?;
+    const headless_index = std.mem.find(u8, text, "## Headless mode").?;
+    const repository_index = std.mem.find(u8, text, "## Repository").?;
     try std.testing.expect(commands < configuration);
     try std.testing.expect(configuration < keys);
     try std.testing.expect(keys < discovery_index);
@@ -262,30 +262,29 @@ test "the document orders sections and states each command, key hint, window, li
     try std.testing.expect(headless_index < repository_index);
 
     for (command.summaries) |summary| {
-        const row = try std.fmt.allocPrint(
-            gpa,
+        const row = try gpa.print(
             "- `/{s}` \u{2014} {s}.",
             .{ summary.name, summary.summary },
         );
         defer gpa.free(row);
-        try std.testing.expect(std.mem.indexOf(u8, text[commands..configuration], row) != null);
+        try std.testing.expect(std.mem.find(u8, text[commands..configuration], row) != null);
     }
     const path = "/unused/config.json";
-    try std.testing.expect(std.mem.indexOf(u8, text[configuration..keys], path) != null);
+    try std.testing.expect(std.mem.find(u8, text[configuration..keys], path) != null);
     const hints = "- Enter: Send\n- Ctrl+D: Quit\n";
-    try std.testing.expect(std.mem.indexOf(u8, text[keys..discovery_index], hints) != null);
+    try std.testing.expect(std.mem.find(u8, text[keys..discovery_index], hints) != null);
     try std.testing.expectEqual(
         @as(usize, 2),
         std.mem.count(u8, text[keys..discovery_index], "500 milliseconds"),
     );
-    const window = try std.fmt.allocPrint(gpa, "{d} lines or {d} KiB", .{
+    const window = try gpa.print("{d} lines or {d} KiB", .{
         tools.read.lines_max,
         @divExact(tools.read.bytes_max, 1024),
     });
     defer gpa.free(window);
     try std.testing.expect(
-        std.mem.indexOf(u8, text[discovery_index..headless_index], window) != null,
+        std.mem.find(u8, text[discovery_index..headless_index], window) != null,
     );
     const headless = text[headless_index..repository_index];
-    try std.testing.expect(std.mem.indexOf(u8, headless, command_line.effort_levels) != null);
+    try std.testing.expect(std.mem.find(u8, headless, command_line.effort_levels) != null);
 }

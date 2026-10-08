@@ -231,7 +231,7 @@ fn homeDirectory(
     io: std.Io,
     directories: *const accounts.json_store.Directories,
 ) ![]u8 {
-    const resolved = try std.fs.path.resolve(
+    const resolved = try std.Io.Dir.path.resolve(
         gpa,
         &.{ directories.working_directory, directories.home },
     );
@@ -635,7 +635,7 @@ fn configure(self: *App) !void {
         if (configured.eql(&self.choice)) return;
     }
     const account_id = accounts.Account.table[current.account].id;
-    const model_value = try std.fmt.allocPrint(self.gpa, "{s}/{s}", .{ account_id, model.name() });
+    const model_value = try self.gpa.print("{s}/{s}", .{ account_id, model.name() });
     defer self.gpa.free(model_value);
     const variables = tool_environment.variables(model_value, self.choice.effort);
     try self.session.send(&.{ .configure = .{
@@ -1062,7 +1062,7 @@ fn endTurn(self: *App, outcome: *const core.Session.Outcome) !void {
 fn offerRetry(self: *App, failure: *const core.Provider.Failure) !void {
     const text = try Screen.failureText(self.gpa, failure);
     defer self.gpa.free(text);
-    self.offer = .{ .retry = try std.fmt.allocPrint(self.gpa, retry_request, .{text}) };
+    self.offer = .{ .retry = try self.gpa.print(retry_request, .{text}) };
 }
 
 fn rejectCredential(self: *App) !void {
@@ -1670,7 +1670,7 @@ const Rig = struct {
         try self.writeConfig(options);
         if (options.model) |name| try self.writeModel(name, options.model_accounts);
         for (options.files) |file| {
-            const parent_path = std.fs.path.dirname(file[0]).?;
+            const parent_path = std.Io.Dir.path.dirname(file[0]).?;
             var parent = try self.tmp.dir.createDirPathOpen(io, parent_path, .{});
             parent.close(io);
             try self.tmp.dir.writeFile(io, .{ .sub_path = file[0], .data = file[1] });
@@ -1722,11 +1722,10 @@ const Rig = struct {
             );
             try names.writer.print("{s}\"{s}\":\"{s}\"", .{ separator, id, name });
         }
-        const lists_data = try std.fmt.allocPrint(gpa, "{{{s}}}", .{lists.written()});
+        const lists_data = try gpa.print("{{{s}}}", .{lists.written()});
         defer gpa.free(lists_data);
         try self.tmp.dir.writeFile(io, .{ .sub_path = ".drinky/models.json", .data = lists_data });
-        const state_data = try std.fmt.allocPrint(
-            gpa,
+        const state_data = try gpa.print(
             "{{{f}:{{\"models\":{{{s}}}}}}}",
             .{ std.json.fmt(self.directory, .{}), names.written() },
         );
@@ -1837,7 +1836,7 @@ const Rig = struct {
     }
 
     fn lastRequest(self: *const Rig) []const u8 {
-        return self.transport.requests.items[self.transport.requests.items.len - 1];
+        return self.transport.requests.last().?;
     }
 
     fn startLoginOf(self: *Rig, account: usize) !void {
@@ -1845,13 +1844,13 @@ const Rig = struct {
         const id = accounts.Account.table[account].id;
         try self.waitFor(&.{.{ .text = "Sign in · ↑/↓" }});
         for (0..account) |_| try self.keys("\x1b[B");
-        const cursor = try std.fmt.allocPrint(gpa, " > {s}", .{id});
+        const cursor = try gpa.print(" > {s}", .{id});
         defer gpa.free(cursor);
         try self.waitFor(&.{.{ .line = cursor }});
         try self.keys("\r");
-        const lead = try std.fmt.allocPrint(gpa, authorization_lead ++ "{s}:", .{id});
+        const lead = try gpa.print(authorization_lead ++ "{s}:", .{id});
         defer gpa.free(lead);
-        const caption_row = try std.fmt.allocPrint(gpa, "{s} · ", .{sign_in_titles[account]});
+        const caption_row = try gpa.print("{s} · ", .{sign_in_titles[account]});
         defer gpa.free(caption_row);
         try self.waitFor(&.{ .{ .text = lead }, .{ .text = caption_row } });
     }
@@ -1891,7 +1890,7 @@ fn sees(snapshot: *const terminal.testing.FakeDevice.Snapshot, sight: *const Rig
 
 fn rowWith(rows: []const []const u8, needle: []const u8) ?usize {
     for (rows, 0..) |row, index| {
-        if (std.mem.indexOf(u8, row, needle) != null) return index;
+        if (std.mem.find(u8, row, needle) != null) return index;
     }
     return null;
 }
@@ -1928,7 +1927,7 @@ fn statusHolds(rows: []const []const u8, needle: []const u8) bool {
         if (index > 0) status.writeByte(' ') catch return false;
         status.writeAll(trimmed(row)) catch return false;
     }
-    return std.mem.indexOf(u8, status.buffered(), needle) != null;
+    return std.mem.find(u8, status.buffered(), needle) != null;
 }
 
 fn editorHolds(rows: []const []const u8, text: []const u8) bool {
@@ -1944,13 +1943,13 @@ fn editorHolds(rows: []const []const u8, text: []const u8) bool {
 
 fn expectRequestHolds(rig: *const Rig, index: usize, needle: []const u8) !void {
     const request = rig.transport.requests.items[index];
-    if (std.mem.indexOf(u8, request, needle) != null) return;
+    if (std.mem.find(u8, request, needle) != null) return;
     std.debug.print("request {d} holds no {s}:\n{s}\n", .{ index, needle, request });
     return error.TestExpectedNeedle;
 }
 
 fn expectRequested(rig: *const Rig, needle: []const u8) !void {
-    if (std.mem.indexOf(u8, rig.lastRequest(), needle) != null) return;
+    if (std.mem.find(u8, rig.lastRequest(), needle) != null) return;
     std.debug.print("the last request holds no {s}:\n{s}\n", .{ needle, rig.lastRequest() });
     return error.TestExpectedNeedle;
 }
@@ -2286,7 +2285,7 @@ test "/rewind returns the chosen prompt to the editor and drops its turn and eve
     try expectRequested(&rig, "\"text\":\"first\"");
     const request = rig.lastRequest();
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, request, "\"text\":\"second\""));
-    try std.testing.expect(std.mem.indexOf(u8, request, "\"text\":\"third\"") == null);
+    try std.testing.expect(std.mem.find(u8, request, "\"text\":\"third\"") == null);
 }
 
 test "/rewind warns before it drops a turn that ran a mutating tool" {
@@ -2334,7 +2333,7 @@ test "/rewind warns before it drops a turn that ran a mutating tool" {
     try rig.waitFor(&.{ .{ .rows = &.{ "fix it", "done" } }, .{ .activity = false } });
     try std.testing.expectEqual(@as(usize, 4), rig.transport.requests.items.len);
     try expectRequested(&rig, "\"text\":\"fix it\"");
-    try std.testing.expect(std.mem.indexOf(u8, rig.lastRequest(), "\"text\":\"next\"") == null);
+    try std.testing.expect(std.mem.find(u8, rig.lastRequest(), "\"text\":\"next\"") == null);
 }
 
 test "a signed-out submit and a submit without a model are refused with a notice" {
@@ -2376,7 +2375,7 @@ test "a slash command opens its picker, a pick applies, and Esc leaves with a no
 
     try rig.keys("/effort\r");
     try rig.waitFor(&.{ .{ .text = effort_picker }, .{ .text = " > xhigh" } });
-    try rig.keys("\x1b[A" ** 3 ++ "\x1b[B" ++ "\x1b[A");
+    try rig.keys(core.text.repeat("\x1b[A", 3) ++ "\x1b[B" ++ "\x1b[A");
     try rig.waitFor(&.{.{ .text = " > low" }});
     try rig.keys("\r");
     try rig.waitFor(&.{
@@ -2555,7 +2554,7 @@ test "/new clears the conversation, and the next request starts fresh" {
 
     try rig.keys("\x03second\r");
     try rig.waitFor(&.{ .{ .rows = &.{ "second", "done" } }, .{ .activity = false } });
-    try std.testing.expect(std.mem.indexOf(u8, rig.lastRequest(), "\"text\":\"first\"") == null);
+    try std.testing.expect(std.mem.find(u8, rig.lastRequest(), "\"text\":\"first\"") == null);
     try expectRequested(&rig, "\"text\":\"second\"");
 }
 
@@ -2658,9 +2657,9 @@ const denied_login_event = "The provider did not authorize Drinky. Start the sig
 const anthropic_plan_caption = "Sign in: anthropic-plan · ";
 
 fn urlParameter(url: []const u8, comptime name: []const u8) ![]const u8 {
-    const start = (std.mem.indexOf(u8, url, "&" ++ name ++ "=") orelse
+    const start = (std.mem.find(u8, url, "&" ++ name ++ "=") orelse
         return error.TestExpectedParameter) + name.len + 2;
-    const end = std.mem.indexOfScalarPos(u8, url, start, '&') orelse url.len;
+    const end = std.mem.findScalarPos(u8, url, start, '&') orelse url.len;
     return url[start..end];
 }
 
@@ -2688,8 +2687,7 @@ test "a sign-in shows its URL, and a pasted callback line reaches its listener" 
 
     const url = try rig.authorizationUrl();
     defer std.testing.allocator.free(url);
-    const line = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const line = try std.testing.allocator.print(
         "http://localhost:53692/callback?error=access_denied&state={s}\r",
         .{try urlParameter(url, "state")},
     );
@@ -2716,9 +2714,9 @@ test "a sign-in with a callback path takes a pasted line of that path alone" {
     const url = try rig.authorizationUrl();
     defer std.testing.allocator.free(url);
     const encoded_prefix = "localhost%3A53694%2F";
-    const path_start = std.mem.indexOf(u8, url, encoded_prefix).? + encoded_prefix.len;
+    const path_start = std.mem.find(u8, url, encoded_prefix).? + encoded_prefix.len;
     const after_prefix = url[path_start..];
-    const hex_end = std.mem.indexOfNone(u8, after_prefix, "0123456789abcdef") orelse
+    const hex_end = std.mem.findNone(u8, after_prefix, "0123456789abcdef") orelse
         after_prefix.len;
     const callback_hex = after_prefix[0..hex_end];
 
@@ -2728,8 +2726,7 @@ test "a sign-in with a callback path takes a pasted line of that path alone" {
         .{ .text = "Sign in: openrouter-api · " },
     });
 
-    const line = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const line = try std.testing.allocator.print(
         "\x03http://localhost:53694/{s}?error=access_denied\r",
         .{callback_hex},
     );
@@ -2757,8 +2754,7 @@ test "a completed sign-in reports a memory-only save and opens the model step" {
     try rig.startLoginOf(anthropic_plan);
     const url = try rig.authorizationUrl();
     defer std.testing.allocator.free(url);
-    const line = try std.fmt.allocPrint(
-        std.testing.allocator,
+    const line = try std.testing.allocator.print(
         "http://localhost:53692/callback?code=abc&state={s}\r",
         .{try urlParameter(url, "state")},
     );
@@ -2907,7 +2903,7 @@ test "exit keys during a slow cancel cannot block the end of the turn" {
 
     try rig.keys("hello\r");
     try hold.reached.wait(std.testing.io);
-    try rig.keys("\x04" ** 65 ++ "x");
+    try rig.keys(core.text.repeat("\x04", 65) ++ "x");
     try rig.waitFor(&.{ .{ .editor = "x" }, .{ .activity = true } });
     hold.released.set(std.testing.io);
     try rig.waitFor(&.{ .{ .activity = false }, .{ .editor = "x" } });
@@ -3034,14 +3030,15 @@ test "the login picker opens with the accounts, and a set key account switches a
 }
 
 test "the start reports each dropped config value and each notice" {
+    const rule = "{\"glob\":\"*.md\",\"skill\":\"docs\"}";
     var rig: Rig = undefined;
     try rig.init(&.{
         .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
         .config = "{\"default_effort\":\"turbo\",\"bash\":{\"timeout_ms\":1}," ++
             "\"interface\":{\"window_pages\":0,\"gauge_percent_warning\":90," ++
             "\"gauge_percent_error\":10},\"user_instructions\":[{\"path\":\"missing.md\"}]," ++
-            "\"required_skills\":[" ++ "{\"glob\":\"*.md\",\"skill\":\"docs\"}," **
-            tools.SkillGuard.rules_max ++ "{\"glob\":\"*.md\",\"skill\":\"docs\"}]," ++
+            "\"required_skills\":[" ++ core.text.repeat(rule ++ ",", tools.SkillGuard.rules_max) ++
+            rule ++ "]," ++
             "\"mystery\":1}",
         .files = &.{
             .{ ".agents/skills/broken/SKILL.md", "no front matter" },
@@ -3215,7 +3212,10 @@ test "a page on the alternate screen scrolls, toggles the source, and closes on 
     try rig.init(&.{
         .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
         .config = "{\"user_instructions\":[{\"path\":\"long.md\"}]}",
-        .files = &.{.{ ".drinky/long.md", "Keep this line.\n\n" ** 40 ++ "Last line.\n" }},
+        .files = &.{.{
+            ".drinky/long.md",
+            core.text.repeat("Keep this line.\n\n", 40) ++ "Last line.\n",
+        }},
     });
     defer rig.deinit();
     try rig.keys("/system\r");
@@ -3225,7 +3225,7 @@ test "a page on the alternate screen scrolls, toggles the source, and closes on 
         .{ .text = system_lead },
     });
 
-    try rig.keys("\x1b[B" ** 3);
+    try rig.keys(core.text.repeat("\x1b[B", 3));
     try rig.waitFor(&.{.{ .absent = system_lead }});
     try rig.keys("\x1b[A");
     try rig.waitFor(&.{.{ .text = system_lead }});
@@ -3290,7 +3290,7 @@ fn expectHerdrState(herdr: *testing.FakeHerdr, comptime state: []const u8) !void
             return err;
         };
         defer std.testing.allocator.free(line);
-        if (std.mem.indexOf(u8, line, "\"state\":\"" ++ state ++ "\"") != null) return;
+        if (std.mem.find(u8, line, "\"state\":\"" ++ state ++ "\"") != null) return;
     }
     std.debug.print("Herdr heard {d} lines without the state \"{s}\"\n", .{ lines_max, state });
     return error.TestExpectedHerdrState;

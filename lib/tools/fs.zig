@@ -63,8 +63,11 @@ fn resolveLinks(gpa: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, path: []con
             else => |other| return other,
         };
         const link = link_buffer[0..link_len];
-        const parent = if (std.fs.path.isAbsolute(link)) "" else std.fs.path.dirname(current);
-        const next = try std.fs.path.join(gpa, &.{ parent orelse "", link });
+        const parent = if (std.Io.Dir.path.isAbsolute(link))
+            ""
+        else
+            std.Io.Dir.path.dirname(current);
+        const next = try std.Io.Dir.path.join(gpa, &.{ parent orelse "", link });
         gpa.free(current);
         current = next;
     }

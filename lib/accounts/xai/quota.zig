@@ -70,7 +70,7 @@ fn parseRfc3339(text: []const u8) ?i64 {
     }
     if (month < 1 or month > 12 or day < 1 or hour > 23 or minute > 59 or second > 60)
         return null;
-    const month_enum: std.time.epoch.Month = @enumFromInt(month);
+    const month_enum: std.time.epoch.Month = @fromBackingInt(@intCast(month));
     const year_epoch: std.time.epoch.Year = @intCast(year);
     if (day > std.time.epoch.getDaysInMonth(year_epoch, month_enum)) return null;
     const offset_seconds = parseOffset(text, &index) orelse return null;

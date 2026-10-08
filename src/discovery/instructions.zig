@@ -1,5 +1,6 @@
 const std = @import("std");
 
+const core = @import("core");
 const tools = @import("tools");
 
 const Message = @import("../Message.zig");
@@ -212,20 +213,20 @@ const Discovery = struct {
             self.working_directory;
 
         var current = self.working_directory;
-        for (0..std.fs.max_path_bytes) |_| {
+        for (0..std.Io.Dir.max_path_bytes) |_| {
             try self.scanDirectory(&.{
                 .directory = current,
                 .source_boundary = boundary.path,
                 .link_boundary = link_boundary,
             });
             if (std.mem.eql(u8, current, boundary.path)) break;
-            current = std.fs.path.dirname(current) orelse break;
+            current = std.Io.Dir.path.dirname(current) orelse break;
         }
         std.mem.reverse(File, self.result.file_items.items);
     }
 
     fn reportUnreadableMarker(self: *Discovery, marker: *const project.Boundary.Marker) !void {
-        const marker_path = try std.fs.path.join(
+        const marker_path = try std.Io.Dir.path.join(
             self.gpa,
             &.{ marker.directory, project.marker_name },
         );
@@ -290,7 +291,7 @@ const Discovery = struct {
         }
 
         if (agents_present) {
-            const path = try std.fs.path.join(self.gpa, &.{ options.directory, "AGENTS.md" });
+            const path = try std.Io.Dir.path.join(self.gpa, &.{ options.directory, "AGENTS.md" });
             defer self.gpa.free(path);
             try self.loadCandidate(&.{
                 .source_path = path,
@@ -301,7 +302,7 @@ const Discovery = struct {
         }
         if (!scan_complete) return;
         if (claude_present) {
-            const path = try std.fs.path.join(self.gpa, &.{ options.directory, "CLAUDE.md" });
+            const path = try std.Io.Dir.path.join(self.gpa, &.{ options.directory, "CLAUDE.md" });
             defer self.gpa.free(path);
             if (try self.isRegularFile(path)) try self.result.report(
                 .failure,
@@ -311,7 +312,7 @@ const Discovery = struct {
             );
         }
         if (agent_present) {
-            const path = try std.fs.path.join(self.gpa, &.{ options.directory, "AGENT.md" });
+            const path = try std.Io.Dir.path.join(self.gpa, &.{ options.directory, "AGENT.md" });
             defer self.gpa.free(path);
             if (try self.isRegularFile(path)) try self.result.report(
                 .failure,
@@ -443,7 +444,7 @@ const Discovery = struct {
             return;
         }
 
-        var target_buffer: [std.fs.max_path_bytes]u8 = undefined;
+        var target_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
         const target_length = file.realPath(self.io, &target_buffer) catch |err| {
             if (err == error.Canceled or err == error.OutOfMemory) return err;
             try self.result.report(
@@ -484,7 +485,7 @@ fn readContent(
     var file_reader = file.reader(io, &.{});
     const content = file_reader.interface.allocRemaining(
         gpa,
-        .limited(file_bytes_max + 1),
+        .limited(file_bytes_max),
     ) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.StreamTooLong => return .{ .rejected = .too_large },
@@ -503,7 +504,6 @@ fn readContent(
 
 fn checkContent(content: []const u8) ?Problem {
     if (content.len == 0) return .empty;
-    if (content.len > file_bytes_max) return .too_large;
     if (!tools.format.isText(content)) return .not_text;
     return null;
 }
@@ -513,7 +513,7 @@ pub fn discover(
     io: std.Io,
     working_directory: []const u8,
 ) !Result {
-    std.debug.assert(std.fs.path.isAbsolute(working_directory));
+    std.debug.assert(std.Io.Dir.path.isAbsolute(working_directory));
     std.debug.assert(std.unicode.utf8ValidateSlice(working_directory));
 
     var result = Result.init(gpa, .project);
@@ -529,7 +529,7 @@ pub fn discover(
 }
 
 pub fn load(gpa: std.mem.Allocator, io: std.Io, options: *const LoadOptions) !Result {
-    std.debug.assert(std.fs.path.isAbsolute(options.directory));
+    std.debug.assert(std.Io.Dir.path.isAbsolute(options.directory));
 
     var result = Result.init(gpa, .user);
     errdefer result.deinit();
@@ -543,7 +543,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, options: *const LoadOptions) !Re
             );
             break;
         }
-        const path = try std.fs.path.resolve(gpa, &.{ options.directory, configured });
+        const path = try std.Io.Dir.path.resolve(gpa, &.{ options.directory, configured });
         defer gpa.free(path);
         try loadPath(&result, io, path);
     }
@@ -584,7 +584,7 @@ fn loadPath(result: *Result, io: std.Io, path: []const u8) !void {
         );
     };
     defer file.close(io);
-    var target_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var target_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const target_length = file.realPath(io, &target_buffer) catch |err| {
         if (err == error.Canceled or err == error.OutOfMemory) return err;
         return result.report(
@@ -625,26 +625,26 @@ test "Git-root instructions are retained broad-to-specific without crossing the 
 }
 
 test "outside Git only the working directory is inspected and compatibility files warn" {
-    if (std.fs.path.sep != '/') return error.SkipZigTest;
+    if (std.Io.Dir.path.sep != '/') return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var seed = std.testing.tmpDir(.{});
     defer seed.cleanup();
 
-    const outside_root = try std.fmt.allocPrint(gpa, "/tmp/drinky-instructions-{s}", .{
+    const outside_root = try gpa.print("/tmp/drinky-instructions-{s}", .{
         seed.sub_path,
     });
     defer gpa.free(outside_root);
     defer std.Io.Dir.cwd().deleteTree(io, outside_root) catch {};
     try std.Io.Dir.cwd().createDirPath(io, outside_root);
-    const parent_agents = try std.fs.path.join(gpa, &.{ outside_root, "AGENTS.md" });
+    const parent_agents = try std.Io.Dir.path.join(gpa, &.{ outside_root, "AGENTS.md" });
     defer gpa.free(parent_agents);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = parent_agents, .data = "parent" });
-    const working_directory = try std.fs.path.join(gpa, &.{ outside_root, "work" });
+    const working_directory = try std.Io.Dir.path.join(gpa, &.{ outside_root, "work" });
     defer gpa.free(working_directory);
     try std.Io.Dir.cwd().createDirPath(io, working_directory);
     for ([_][]const u8{ "agents.md", "CLAUDE.md", "AGENT.md" }) |name| {
-        const path = try std.fs.path.join(gpa, &.{ working_directory, name });
+        const path = try std.Io.Dir.path.join(gpa, &.{ working_directory, name });
         defer gpa.free(path);
         try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "ignored" });
     }
@@ -655,10 +655,10 @@ test "outside Git only the working directory is inspected and compatibility file
     try std.testing.expectEqual(@as(usize, 0), result.files().len);
     try std.testing.expectEqual(@as(usize, 2), result.reports.messages().len);
     try std.testing.expect(
-        std.mem.indexOf(u8, result.reports.messages()[0].content, "CLAUDE.md") != null,
+        std.mem.find(u8, result.reports.messages()[0].content, "CLAUDE.md") != null,
     );
     try std.testing.expect(
-        std.mem.indexOf(u8, result.reports.messages()[1].content, "AGENT.md") != null,
+        std.mem.find(u8, result.reports.messages()[1].content, "AGENT.md") != null,
     );
 }
 
@@ -679,7 +679,7 @@ test "an exact AGENTS.md entry suppresses compatibility warnings even when skipp
     try std.testing.expectEqual(@as(usize, 0), result.files().len);
     try std.testing.expectEqual(@as(usize, 1), result.reports.messages().len);
     try std.testing.expect(
-        std.mem.indexOf(u8, result.reports.messages()[0].content, "is not a regular file") != null,
+        std.mem.find(u8, result.reports.messages()[0].content, "is not a regular file") != null,
     );
 }
 
@@ -693,8 +693,8 @@ test "invalid, oversized, and empty files are skipped and reported" {
     try tree.write("repo/AGENTS.md", "");
     try tree.write("repo/a/AGENTS.md", "nul\x00text");
     try tree.write("repo/a/b/AGENTS.md", "bad\xfftext");
-    try tree.write("repo/a/b/c/AGENTS.md", "x" ** (file_bytes_max + 1));
-    try tree.write("repo/a/b/c/d/AGENTS.md", "v" ** file_bytes_max);
+    try tree.write("repo/a/b/c/AGENTS.md", core.text.repeat("x", file_bytes_max + 1));
+    try tree.write("repo/a/b/c/d/AGENTS.md", core.text.repeat("v", file_bytes_max));
     const working_directory = try tree.path("repo/a/b/c/d");
 
     var result = try discover(gpa, io, working_directory);
@@ -706,16 +706,16 @@ test "invalid, oversized, and empty files are skipped and reported" {
     var oversized_found = false;
     var not_text_count: usize = 0;
     for (result.reports.messages()) |notice| {
-        if (std.mem.indexOf(u8, notice.content, "is empty") != null) {
+        if (std.mem.find(u8, notice.content, "is empty") != null) {
             empty_found = true;
             try std.testing.expectEqual(Message.Severity.information, notice.severity);
             continue;
         }
         try std.testing.expectEqual(Message.Severity.failure, notice.severity);
-        if (std.mem.indexOf(u8, notice.content, "larger than 32 KiB") != null) {
+        if (std.mem.find(u8, notice.content, "larger than 32 KiB") != null) {
             oversized_found = true;
         }
-        if (std.mem.indexOf(u8, notice.content, "not UTF-8 text") != null) not_text_count += 1;
+        if (std.mem.find(u8, notice.content, "not UTF-8 text") != null) not_text_count += 1;
     }
     try std.testing.expect(empty_found);
     try std.testing.expect(oversized_found);
@@ -729,9 +729,9 @@ test "aggregate budgeting keeps the nearest whole files" {
     defer tree.deinit();
 
     try tree.directory("repo/.git");
-    try tree.write("repo/AGENTS.md", "r" ** (24 << 10));
-    try tree.write("repo/a/AGENTS.md", "a" ** (24 << 10));
-    try tree.write("repo/a/b/AGENTS.md", "b" ** (24 << 10));
+    try tree.write("repo/AGENTS.md", core.text.repeat("r", 24 << 10));
+    try tree.write("repo/a/AGENTS.md", core.text.repeat("a", 24 << 10));
+    try tree.write("repo/a/b/AGENTS.md", core.text.repeat("b", 24 << 10));
     const working_directory = try tree.path("repo/a/b");
 
     var result = try discover(gpa, io, working_directory);
@@ -741,7 +741,7 @@ test "aggregate budgeting keeps the nearest whole files" {
     try std.testing.expectEqual(@as(u8, 'b'), result.files()[1].content[0]);
     try std.testing.expectEqual(@as(usize, 1), result.reports.messages().len);
     try std.testing.expect(
-        std.mem.indexOf(u8, result.reports.messages()[0].content, "64 KiB") != null,
+        std.mem.find(u8, result.reports.messages()[0].content, "64 KiB") != null,
     );
 }
 
@@ -758,7 +758,7 @@ test "the file-count limit also retains the nearest instructions" {
     try relative.writer.writeAll("repo");
     for (0..files_max) |index| {
         try relative.writer.print("/d{d:0>2}", .{index});
-        const path = try std.fmt.allocPrint(gpa, "{s}/AGENTS.md", .{relative.written()});
+        const path = try gpa.print("{s}/AGENTS.md", .{relative.written()});
         defer gpa.free(path);
         try tree.write(path, "nested");
     }
@@ -802,9 +802,9 @@ test "instruction symlinks stay inside the project and load one file once" {
     try std.testing.expectEqual(@as(usize, 4), result.reports.messages().len);
     var repeat_found = false;
     for (result.reports.messages()) |notice| {
-        if (std.mem.indexOf(u8, notice.content, "already loaded the same file") == null) continue;
+        if (std.mem.find(u8, notice.content, "already loaded the same file") == null) continue;
         repeat_found = true;
-        try std.testing.expect(std.mem.indexOf(u8, notice.content, "a/b/AGENTS.md") != null);
+        try std.testing.expect(std.mem.find(u8, notice.content, "a/b/AGENTS.md") != null);
     }
     try std.testing.expect(repeat_found);
 }
@@ -820,7 +820,7 @@ test "unreadable instruction files are reported and do not load" {
     try tree.tmp.dir.setFilePermissions(io, "repo/AGENTS.md", .fromMode(0), .{});
     defer tree.tmp.dir.setFilePermissions(io, "repo/AGENTS.md", .fromMode(0o600), .{}) catch {};
     const working_directory = try tree.path("repo");
-    const source_path = try std.fs.path.join(gpa, &.{ working_directory, "AGENTS.md" });
+    const source_path = try std.Io.Dir.path.join(gpa, &.{ working_directory, "AGENTS.md" });
     defer gpa.free(source_path);
     const maybe_probe: ?std.Io.File = probe: {
         const file = std.Io.Dir.cwd().openFile(io, source_path, .{}) catch |err| {
@@ -839,7 +839,7 @@ test "unreadable instruction files are reported and do not load" {
     try std.testing.expectEqual(@as(usize, 0), result.files().len);
     try std.testing.expectEqual(@as(usize, 1), result.reports.messages().len);
     try std.testing.expect(
-        std.mem.indexOf(u8, result.reports.messages()[0].content, "could not open") != null,
+        std.mem.find(u8, result.reports.messages()[0].content, "could not open") != null,
     );
 }
 
@@ -855,7 +855,7 @@ test "repository marker inspection errors stop ancestor traversal conservatively
     try blocked.setPermissions(io, .fromMode(0));
     defer blocked.setPermissions(io, .fromMode(0o700)) catch {};
     const working_directory = try tree.path("blocked/work");
-    const marker_path = try std.fs.path.join(gpa, &.{ working_directory, project.marker_name });
+    const marker_path = try std.Io.Dir.path.join(gpa, &.{ working_directory, project.marker_name });
     defer gpa.free(marker_path);
     const marker_blocked = inspect: {
         _ = std.Io.Dir.cwd().statFile(io, marker_path, .{}) catch |err| {
@@ -872,7 +872,7 @@ test "repository marker inspection errors stop ancestor traversal conservatively
     try std.testing.expect(result.projectRoot() == null);
     try std.testing.expectEqual(@as(usize, 0), result.files().len);
     try std.testing.expectEqual(@as(usize, 2), result.reports.messages().len);
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(
         u8,
         result.reports.messages()[0].content,
         "could not inspect the repository marker",
@@ -933,7 +933,7 @@ test "configured files load in order and one file loads once" {
     for (result.reports.messages()) |notice| {
         try std.testing.expectEqual(Message.Severity.failure, notice.severity);
         try std.testing.expect(
-            std.mem.indexOf(u8, notice.content, "already loaded the same file") != null,
+            std.mem.find(u8, notice.content, "already loaded the same file") != null,
         );
     }
 }
@@ -950,7 +950,7 @@ test "a configured list stops after the file cap and reports the rest" {
         paths.deinit(gpa);
     }
     for (0..files_max + 1) |index| {
-        const name = try std.fmt.allocPrint(gpa, "f{d:0>2}.md", .{index});
+        const name = try gpa.print("f{d:0>2}.md", .{index});
         errdefer gpa.free(name);
         try tree.write(name, "Instructions.\n");
         try paths.append(gpa, name);
@@ -961,7 +961,7 @@ test "a configured list stops after the file cap and reports the rest" {
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, files_max), result.files().len);
     try std.testing.expectEqual(@as(usize, 1), result.reports.messages().len);
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(
         u8,
         result.reports.messages()[0].content,
         "skipped the remaining user instruction files",
@@ -974,9 +974,9 @@ test "configured files stop at the shared byte budget" {
     var tree: testing.Tree = try .init();
     defer tree.deinit();
 
-    try tree.write("a.md", "a" ** (24 << 10));
-    try tree.write("b.md", "b" ** (24 << 10));
-    try tree.write("c.md", "c" ** (24 << 10));
+    try tree.write("a.md", core.text.repeat("a", 24 << 10));
+    try tree.write("b.md", core.text.repeat("b", 24 << 10));
+    try tree.write("c.md", core.text.repeat("c", 24 << 10));
     const directory = tree.root;
 
     var result = try load(gpa, io, &.{
@@ -989,7 +989,7 @@ test "configured files stop at the shared byte budget" {
     try std.testing.expectEqual(@as(u8, 'b'), result.files()[1].content[0]);
     try std.testing.expectEqual(@as(usize, 1), result.reports.messages().len);
     try std.testing.expect(
-        std.mem.indexOf(u8, result.reports.messages()[0].content, "64 KiB") != null,
+        std.mem.find(u8, result.reports.messages()[0].content, "64 KiB") != null,
     );
 }
 
@@ -1003,8 +1003,8 @@ test "an unusable configured path is skipped and reported" {
     try tree.write("empty.md", "");
     try tree.write("nul.md", "nul\x00text");
     try tree.write("bad.md", "bad\xfftext");
-    try tree.write("exact.md", "e" ** file_bytes_max);
-    try tree.write("oversized.md", "o" ** (file_bytes_max + 1));
+    try tree.write("exact.md", core.text.repeat("e", file_bytes_max));
+    try tree.write("oversized.md", core.text.repeat("o", file_bytes_max + 1));
     const directory = tree.root;
 
     var result = try load(gpa, io, &.{ .directory = directory, .paths = &.{
@@ -1029,9 +1029,9 @@ test "an unusable configured path is skipped and reported" {
         "the file is larger than 32 KiB",
     };
     for (expected_reasons, result.reports.messages()) |reason, notice| {
-        try std.testing.expect(std.mem.indexOf(u8, notice.content, reason) != null);
+        try std.testing.expect(std.mem.find(u8, notice.content, reason) != null);
         try std.testing.expect(
-            std.mem.indexOf(u8, notice.content, "the user instruction ") != null,
+            std.mem.find(u8, notice.content, "the user instruction ") != null,
         );
     }
     const empty = result.reports.messages()[2];
@@ -1066,7 +1066,7 @@ test "an unreadable configured file is skipped and reported" {
     try std.testing.expectEqual(@as(usize, 0), result.files().len);
     try std.testing.expectEqual(@as(usize, 1), result.reports.messages().len);
     try std.testing.expect(
-        std.mem.indexOf(u8, result.reports.messages()[0].content, "could not open") != null,
+        std.mem.find(u8, result.reports.messages()[0].content, "could not open") != null,
     );
 }
 

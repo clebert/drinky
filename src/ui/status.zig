@@ -181,7 +181,7 @@ pub fn directoryLabel(gpa: std.mem.Allocator, directory: *const Directory) ![]co
     defer gpa.free(label);
     const budget = directory_bytes_max - paint.ellipsis.len;
     const start = terminal.width.boundaryAtOrAfter(label, label.len - budget);
-    return std.fmt.allocPrint(gpa, "{s}{s}", .{ paint.ellipsis, label[start..] });
+    return gpa.print("{s}{s}", .{ paint.ellipsis, label[start..] });
 }
 
 pub fn render(placement: *const paint.Placement, info: *const Info) !void {
@@ -318,7 +318,7 @@ fn writePlace(line: *Line, info: *const Info, parts: *const Parts) !void {
 fn writeDirectory(out: *std.Io.Writer, directory: []const u8, place: Parts.Form) !void {
     const home_prefix = if (std.mem.startsWith(u8, directory, "~/")) "~/" else "";
     const mark = paint.ellipsis ++ "/";
-    const base = std.fs.path.basename(directory);
+    const base = std.Io.Dir.path.basename(directory);
     const short_columns = terminal.width.ofText(home_prefix) + terminal.width.ofText(mark) +
         terminal.width.ofText(base);
     if (place != .short or short_columns >= terminal.width.ofText(directory)) {
@@ -522,7 +522,7 @@ fn renderForTest(rig: *testing.Rig, info: *const Info, columns: usize) !void {
 fn expectNoColor(painted: []const u8) !void {
     inline for (comptime std.enums.values(role.Name)) |name| {
         if (comptime !role.paints(name) or name == .muted) continue;
-        if (std.mem.indexOf(u8, painted, role.sequence(name)) != null) {
+        if (std.mem.find(u8, painted, role.sequence(name)) != null) {
             std.debug.print("the status line took the {s} role\n", .{@tagName(name)});
             return error.TestExpectedColorless;
         }
@@ -548,10 +548,10 @@ test render {
         " · Effort: ",
         "xhigh",
     });
-    const place = std.mem.indexOf(u8, painted, "~/github").?;
-    const context = std.mem.indexOf(u8, painted, "Context:").?;
+    const place = std.mem.find(u8, painted, "~/github").?;
+    const context = std.mem.find(u8, painted, "Context:").?;
     try std.testing.expect(place < context);
-    try std.testing.expect(context < std.mem.indexOf(u8, painted, "claude-opus-4-8").?);
+    try std.testing.expect(context < std.mem.find(u8, painted, "claude-opus-4-8").?);
 }
 
 test "an unmeasured context reads as unknown, and an unmeasured rate hides" {
@@ -665,8 +665,8 @@ test "a narrow window shortens fields before it gives up parts" {
         try testing.expectShows(painted, step.shows);
         try testing.expectHides(painted, step.hides);
         try std.testing.expectEqual(
-            std.mem.indexOf(u8, painted, "Effort:") != null,
-            std.mem.indexOf(u8, painted, "xhigh") != null,
+            std.mem.find(u8, painted, "Effort:") != null,
+            std.mem.find(u8, painted, "xhigh") != null,
         );
     }
 }
@@ -830,7 +830,7 @@ test "shortening the directory never costs columns" {
 test "a long branch keeps 16 columns and a whole grapheme" {
     const gpa = std.testing.allocator;
     var info = test_info;
-    info.branch = "feature/" ++ "🇩🇪" ** 8;
+    info.branch = "feature/" ++ core.text.repeat("🇩🇪", 8);
     var rig: testing.Rig = undefined;
     rig.init(gpa);
     defer rig.deinit();
@@ -838,14 +838,14 @@ test "a long branch keeps 16 columns and a whole grapheme" {
 
     const painted = try rig.painted();
     try testing.expectShows(painted, &.{
-        "~/…/drinky (feature/" ++ "🇩🇪" ** 4 ++ "…)",
+        "~/…/drinky (feature/" ++ core.text.repeat("🇩🇪", 4) ++ "…)",
         "Context: 21% (206k/1.0M)",
         "Cost: ~$0.39",
         "5h: 12% (53m)",
         "Week: 74% (6d)",
         "Cache: 87%",
     });
-    try testing.expectHides(painted, &.{ "~/github", "🇩🇪" ** 5 });
+    try testing.expectHides(painted, &.{ "~/github", core.text.repeat("🇩🇪", 5) });
 }
 
 test "a directory outside a repository shows without a branch" {
@@ -912,7 +912,7 @@ test "an information notice takes the information symbol in the accent role" {
         comptime role.sequence(.accent) ++ "ℹ You canceled the model fetch.",
     });
     try testing.expectHides(painted, &.{ "Error:", "⚠" });
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(
         u8,
         painted,
         comptime role.sequence(.muted),
@@ -1199,7 +1199,7 @@ test "the directory label names the home with a tilde and keeps the tail of a lo
     defer gpa.free(outside);
     try std.testing.expectEqualStrings("/srv/work", outside);
 
-    const long_path = "/srv/" ++ "a" ** 100 ++ "/tail";
+    const long_path = "/srv/" ++ core.text.repeat("a", 100) ++ "/tail";
     const cut = try directoryLabel(gpa, &.{ .path = long_path, .home = "/home/me" });
     defer gpa.free(cut);
     try std.testing.expect(cut.len <= directory_bytes_max);

@@ -52,8 +52,8 @@ pub const Result = struct {
 
 pub const Output = struct {
     content: []const u8 = "",
-    conditions: std.EnumSet(Condition) = .initEmpty(),
-    measures: std.EnumMap(Measure, u64) = .init(.{}),
+    conditions: std.EnumSet(Condition) = .empty,
+    measures: std.EnumMap(Measure, u64) = .empty,
 
     pub fn dupe(self: *const Output, gpa: std.mem.Allocator) error{OutOfMemory}!Output {
         return .{

@@ -44,11 +44,10 @@ fn request(
     const arena = arena_state.allocator();
     var list: providers.Transport.Request = .{
         .method = .GET,
-        .url = if (cursor) |after| try std.fmt.allocPrint(
-            arena,
+        .url = if (cursor) |after| try arena.print(
             endpoint ++ "?limit={d}&after_id={s}",
             .{ page_size, after },
-        ) else try std.fmt.allocPrint(arena, endpoint ++ "?limit={d}", .{page_size}),
+        ) else try arena.print(endpoint ++ "?limit={d}", .{page_size}),
         .headers = &.{net.accept_json},
     };
     try providers.Messages.identify(arena, &list, access);
@@ -169,9 +168,9 @@ const sample =
 
 test "the list follows the last id to the next page and bounds the entries of every page" {
     const gpa = std.testing.allocator;
-    const first_page = "{\"data\":[" ++ ("{\"id\":\"claude-a\"}," ** 999) ++
+    const first_page = "{\"data\":[" ++ core.text.repeat("{\"id\":\"claude-a\"},", 999) ++
         "{\"id\":\"claude-b\"}],\"has_more\":true}";
-    const last_page = "{\"data\":[" ++ ("{\"id\":\"claude-c\"}," ** 99) ++
+    const last_page = "{\"data\":[" ++ core.text.repeat("{\"id\":\"claude-c\"},", 99) ++
         "{\"id\":\"claude-c\"}],\"has_more\":false}";
     var transport: providers.testing.FakeTransport = .{
         .gpa = gpa,
@@ -288,5 +287,5 @@ test "an id that a request line cannot carry never becomes a cursor" {
     try std.testing.expectEqual(@as(usize, 1), page.models.len);
     const cursor = page.cursor.?;
     try std.testing.expectEqualStrings("claude-opus-4-8", cursor);
-    try std.testing.expect(std.mem.indexOfAny(u8, cursor, "\r\n&?# ") == null);
+    try std.testing.expect(std.mem.findAny(u8, cursor, "\r\n&?# ") == null);
 }

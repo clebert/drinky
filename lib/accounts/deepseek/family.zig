@@ -58,7 +58,7 @@ fn parse(name: []const u8) ?Parsed {
 }
 
 fn snapshotOf(family: []const u8) Snapshot {
-    const dash = std.mem.lastIndexOfScalar(u8, family, '-') orelse
+    const dash = std.mem.findScalarLast(u8, family, '-') orelse
         return .{ .family = family, .snapshot = 0 };
     const tail = family[dash + 1 ..];
     if (tail.len == 0 or dash == 0) return .{ .family = family, .snapshot = 0 };

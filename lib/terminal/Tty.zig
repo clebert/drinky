@@ -20,7 +20,7 @@ out_stream: std.Io.File.Writer,
 
 const RawState = struct {
     raw_owned: bool = false,
-    resets_pending: std.EnumSet(Mode) = .initEmpty(),
+    resets_pending: std.EnumSet(Mode) = .empty,
     setup_complete: bool = false,
 
     fn set(self: *RawState, output: *std.Io.Writer, mode: Mode) std.Io.Writer.Error!void {
@@ -104,8 +104,8 @@ const PosixSetup = struct {
         raw.iflag.INPCK = false;
         raw.iflag.ISTRIP = false;
         raw.oflag.OPOST = false;
-        raw.cc[@intFromEnum(std.posix.V.MIN)] = 1;
-        raw.cc[@intFromEnum(std.posix.V.TIME)] = 0;
+        raw.cc[@backingInt(std.posix.V.MIN)] = 1;
+        raw.cc[@backingInt(std.posix.V.TIME)] = 0;
         try std.posix.tcsetattr(self.in_handle, .FLUSH, raw);
     }
 
@@ -719,7 +719,7 @@ test "shutdown restores cooked mode even when presentation output fails" {
     try std.testing.expectEqual(@as(usize, 1), control.restore_count);
     try std.testing.expectEqual(RawState{}, state);
     const recorded = output.operations[0..output.operations_len];
-    const restore_at = std.mem.indexOfScalar(TestWriter.Operation, recorded, .restore).?;
-    const cursor_at = std.mem.indexOfScalar(TestWriter.Operation, recorded, .cursor_show).?;
+    const restore_at = std.mem.findScalar(TestWriter.Operation, recorded, .restore).?;
+    const cursor_at = std.mem.findScalar(TestWriter.Operation, recorded, .cursor_show).?;
     try std.testing.expect(restore_at < cursor_at);
 }

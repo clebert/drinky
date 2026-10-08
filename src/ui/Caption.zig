@@ -74,7 +74,7 @@ fn renderRowCells(
     try self.renderTitle(sink, columns);
     const title_columns = terminal.width.ofText(self.title);
     if (title_columns > columns or
-        std.mem.indexOfScalar(u8, self.title, '\n') != null)
+        std.mem.findScalar(u8, self.title, '\n') != null)
     {
         return;
     }
@@ -105,8 +105,8 @@ fn layout(self: *const Caption, columns: usize) Layout {
 }
 
 fn fitsOneRow(self: *const Caption, columns: usize) bool {
-    if (std.mem.indexOfScalar(u8, self.title, '\n') != null or
-        std.mem.indexOfScalar(u8, self.controls, '\n') != null)
+    if (std.mem.findScalar(u8, self.title, '\n') != null or
+        std.mem.findScalar(u8, self.controls, '\n') != null)
     {
         return false;
     }
@@ -125,7 +125,7 @@ fn rowControls(self: *const Caption, columns: usize) []const u8 {
 }
 
 fn packedSpan(text: []const u8, room: usize) []const u8 {
-    if (text.len == 0 or std.mem.indexOfScalar(u8, text, '\n') != null) return "";
+    if (text.len == 0 or std.mem.findScalar(u8, text, '\n') != null) return "";
     return text[0..paint.packRow(text, room, .drop).end];
 }
 

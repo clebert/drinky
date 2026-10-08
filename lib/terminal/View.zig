@@ -602,7 +602,7 @@ const Harness = struct {
     }
 
     fn lastResets(self: *Harness) bool {
-        return std.mem.indexOf(u8, self.lastBytes(), escape.screen_reset) != null;
+        return std.mem.find(u8, self.lastBytes(), escape.screen_reset) != null;
     }
 };
 
@@ -776,9 +776,9 @@ test "a one-row editor shrink preserves clipped session scrollback" {
         try std.testing.expectEqualStrings(expected, actual.items);
     }
     const shrink_bytes = harness.lastBytes();
-    try std.testing.expect(std.mem.indexOf(u8, shrink_bytes, escape.screen_repaint) == null);
-    try std.testing.expect(std.mem.indexOf(u8, shrink_bytes, "\x1b[3J") == null);
-    try std.testing.expect(std.mem.indexOf(u8, shrink_bytes, escape.screen_clear_below) != null);
+    try std.testing.expect(std.mem.find(u8, shrink_bytes, escape.screen_repaint) == null);
+    try std.testing.expect(std.mem.find(u8, shrink_bytes, "\x1b[3J") == null);
+    try std.testing.expect(std.mem.find(u8, shrink_bytes, escape.screen_clear_below) != null);
 
     try harness.render(&expanded, .{ .columns = 20, .rows = 3 }, 2);
     try harness.emulator.expectScreen(&.{ "edit", "wrap", "status" });
@@ -848,7 +848,7 @@ test "a backward slide within one page reprints from row zero" {
     try harness.emulator.expectVisible(&.{ "r0", "r1", "r2" });
     const last = harness.lastBytes();
     try std.testing.expect(!harness.lastResets());
-    try std.testing.expect(std.mem.indexOf(u8, last, escape.screen_clear_below) != null);
+    try std.testing.expect(std.mem.find(u8, last, escape.screen_clear_below) != null);
 }
 
 test "a change above the viewport resets" {
@@ -925,8 +925,8 @@ test "a height resize preserves scrollback and leaves blank rows below" {
     try harness.emulator.expectScreen(&.{ "editor", "status" });
     const screen_top = harness.emulator.screen_top;
     const shrink = harness.lastBytes();
-    try std.testing.expect(std.mem.indexOf(u8, shrink, escape.screen_repaint) == null);
-    try std.testing.expect(std.mem.indexOf(u8, shrink, "thinking") == null);
+    try std.testing.expect(std.mem.find(u8, shrink, escape.screen_repaint) == null);
+    try std.testing.expect(std.mem.find(u8, shrink, "thinking") == null);
 
     try harness.render(&extended, .{ .columns = 20, .rows = 4 }, 2);
     try harness.emulator.expectScreen(&.{ "editor", "status", "", "" });
@@ -940,10 +940,10 @@ test "a height resize preserves scrollback and leaves blank rows below" {
         try std.testing.expectEqualStrings(text, row.items);
     }
     const growth = harness.lastBytes();
-    try std.testing.expect(std.mem.indexOf(u8, growth, escape.screen_repaint) == null);
-    try std.testing.expect(std.mem.indexOf(u8, growth, "thinking") == null);
-    try std.testing.expect(std.mem.indexOf(u8, growth, "editor") == null);
-    try std.testing.expect(std.mem.indexOf(u8, growth, "status") == null);
+    try std.testing.expect(std.mem.find(u8, growth, escape.screen_repaint) == null);
+    try std.testing.expect(std.mem.find(u8, growth, "thinking") == null);
+    try std.testing.expect(std.mem.find(u8, growth, "editor") == null);
+    try std.testing.expect(std.mem.find(u8, growth, "status") == null);
 }
 
 test "a shrink above the screen top keeps the tail on screen" {
@@ -1111,8 +1111,8 @@ test "an over-wide row clips at the margin and keeps the cursor synced" {
     try harness.emulator.feed(harness.out.written());
     try std.testing.expectEqual(@as(usize, 2), harness.emulator.document.items.len);
     const top_row = harness.emulator.document.items[0].items;
-    try std.testing.expect(std.mem.indexOf(u8, top_row, "abc") != null);
-    try std.testing.expect(std.mem.indexOfAny(u8, top_row, "defgh") == null);
+    try std.testing.expect(std.mem.find(u8, top_row, "abc") != null);
+    try std.testing.expect(std.mem.findAny(u8, top_row, "defgh") == null);
     try harness.emulator.expectCaret(&.{ .frame_len = 2, .row = 1, .column = 1 });
 }
 
@@ -1152,8 +1152,8 @@ test "a replayed capture composes the rows of the composition it captured" {
     try harness.emulator.feed(harness.out.written()[harness.consumed..]);
     harness.consumed = harness.out.written().len;
     try harness.emulator.expectVisible(&.{ "bold", "你好" });
-    try std.testing.expect(std.mem.indexOf(u8, harness.lastBytes(), "bold") == null);
-    try std.testing.expect(std.mem.indexOf(u8, harness.lastBytes(), "你好") == null);
+    try std.testing.expect(std.mem.find(u8, harness.lastBytes(), "bold") == null);
+    try std.testing.expect(std.mem.find(u8, harness.lastBytes(), "你好") == null);
 }
 
 test "the caret is hidden with no caret and when above the viewport" {
@@ -1164,7 +1164,7 @@ test "the caret is hidden with no caret and when above the viewport" {
     try harness.render(&none, .{ .columns = 5, .rows = 2 }, 2);
     try std.testing.expect(!harness.emulator.cursor_visible);
     try harness.render(&none, .{ .columns = 5, .rows = 2 }, 2);
-    try std.testing.expect(std.mem.indexOf(u8, harness.lastBytes(), escape.cursor_hide) == null);
+    try std.testing.expect(std.mem.find(u8, harness.lastBytes(), escape.cursor_hide) == null);
 
     const above = [_]Line{
         caretLine("a", .{ .id = 0, .column = 1 }), line("b", 1), line("c", 2), line("d", 3),
@@ -1280,10 +1280,10 @@ test "an unchanged frame emits only caret motion" {
     try harness.emulator.expectCaret(&.{ .frame_len = 2, .row = 0, .column = 1 });
     const last = harness.lastBytes();
     try std.testing.expect(!harness.lastResets());
-    try std.testing.expect(std.mem.indexOf(u8, last, escape.screen_clear_below) == null);
-    try std.testing.expect(std.mem.indexOf(u8, last, "ab") == null);
-    try std.testing.expect(std.mem.indexOf(u8, last, "cd") == null);
-    try std.testing.expect(std.mem.indexOf(u8, last, escape.cursor_show) == null);
+    try std.testing.expect(std.mem.find(u8, last, escape.screen_clear_below) == null);
+    try std.testing.expect(std.mem.find(u8, last, "ab") == null);
+    try std.testing.expect(std.mem.find(u8, last, "cd") == null);
+    try std.testing.expect(std.mem.find(u8, last, escape.cursor_show) == null);
 }
 
 test "a top-trim with nothing scrolled off reprints from row zero" {
@@ -1369,9 +1369,9 @@ test "a screen reset drops the scrollback and keeps the cursor visible" {
     try std.testing.expectEqual(@as(usize, 2), harness.emulator.document.items.len);
     const last = harness.lastBytes();
     try std.testing.expect(harness.lastResets());
-    try std.testing.expect(std.mem.indexOf(u8, last, "r0") == null);
+    try std.testing.expect(std.mem.find(u8, last, "r0") == null);
     try std.testing.expect(harness.emulator.cursor_visible);
-    try std.testing.expect(std.mem.indexOf(u8, last, escape.cursor_show) == null);
+    try std.testing.expect(std.mem.find(u8, last, escape.cursor_show) == null);
 }
 
 test "a view that preserves the scrollback resets the screen alone and paints from its top" {
@@ -1397,8 +1397,8 @@ test "a view that preserves the scrollback resets the screen alone and paints fr
     };
     try harness.render(&repainted, .{ .columns = 10, .rows = 2 }, 4);
     const last = harness.lastBytes();
-    try std.testing.expect(std.mem.indexOf(u8, last, escape.screen_repaint) != null);
-    try std.testing.expect(std.mem.indexOf(u8, last, "\x1b[3J") == null);
+    try std.testing.expect(std.mem.find(u8, last, escape.screen_repaint) != null);
+    try std.testing.expect(std.mem.find(u8, last, "\x1b[3J") == null);
     try std.testing.expectEqual(@as(usize, 4), harness.emulator.screen_top);
     try harness.emulator.expectScreen(&.{ "Q", "state" });
     for ([_][]const u8{ "r0", "r1", "r2", "r3" }, 0..) |row, index| {
@@ -1496,8 +1496,8 @@ test "canonical text boundaries survive separate sink writes" {
     const rows = harness.emulator.document.items;
     try std.testing.expectEqual(@as(usize, 2), rows.len);
     for (rows) |row| try std.testing.expectEqual(@as(usize, 9), width.ofText(row.items));
-    try std.testing.expect(std.mem.indexOf(u8, harness.out.written(), "\u{200D}👩") == null);
-    try std.testing.expect(std.mem.indexOf(u8, harness.out.written(), "\x1b\u{FE0F}") == null);
+    try std.testing.expect(std.mem.find(u8, harness.out.written(), "\u{200D}👩") == null);
+    try std.testing.expect(std.mem.find(u8, harness.out.written(), "\x1b\u{FE0F}") == null);
 }
 
 test "a fragment boundary takes a guard only where the two fragments can fuse" {
@@ -1567,7 +1567,7 @@ test "a hyperlink frames its text and closes within its row" {
     try view.render();
 
     const framed = "\x1b]8;;https://example.com/a\x1b\\docs\x1b]8;;\x1b\\!";
-    try std.testing.expect(std.mem.indexOf(u8, out.written(), framed) != null);
+    try std.testing.expect(std.mem.find(u8, out.written(), framed) != null);
     try emulator.feed(out.written());
     try emulator.expectVisible(&.{"docs!"});
 
@@ -1576,7 +1576,8 @@ test "a hyperlink frames its text and closes within its row" {
     try std.testing.expect(!Sink.linkable(""));
     try std.testing.expect(!Sink.linkable("https://example.com/a b"));
     try std.testing.expect(!Sink.linkable("https://example.com/\u{00e9}"));
-    try std.testing.expect(!Sink.linkable("https://x.y/" ++ ("a" ** Sink.url_bytes_max)));
+    const path: [Sink.url_bytes_max]u8 = @splat('a');
+    try std.testing.expect(!Sink.linkable("https://x.y/" ++ path));
     try std.testing.expect(!Sink.linkable("javascript:alert(1)"));
     try std.testing.expect(!Sink.linkable("file:///etc/passwd"));
     try std.testing.expect(!Sink.linkable("./x.md"));
@@ -1593,7 +1594,7 @@ test "a styled row reprinted from its own start carries its escapes" {
     const second = [_]Line{ line("a", 0), boldLine("BOLD", 1) };
     try harness.render(&second, .{ .columns = 20, .rows = 4 }, 2);
     try harness.emulator.expectVisible(&.{ "a", "BOLD" });
-    try std.testing.expect(std.mem.indexOf(u8, harness.lastBytes(), styled) != null);
+    try std.testing.expect(std.mem.find(u8, harness.lastBytes(), styled) != null);
 }
 
 test "a frame sequence keeps the scrollback seamless, the tail on screen, and the caret right" {
@@ -1631,7 +1632,7 @@ const Transcript = struct {
         var remaining = index;
         for (self.blocks[0..self.count]) |block| {
             if (remaining < block.lines) {
-                const text = std.fmt.bufPrint(buffer, "{d}.{d}v{d}", .{
+                const text = std.mem.print(buffer, "{d}.{d}v{d}", .{
                     block.id,
                     remaining,
                     block.version,

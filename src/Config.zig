@@ -273,7 +273,7 @@ fn sectionField(comptime T: type, comptime name: [:0]const u8, comptime default:
 fn Section(comptime fields: []const SectionField) type {
     var names: [fields.len][]const u8 = undefined;
     var types: [fields.len]type = undefined;
-    var attributes: [fields.len]std.builtin.Type.StructField.Attributes = undefined;
+    var attributes: [fields.len]std.lang.Type.Struct.FieldAttributes = undefined;
     for (fields, &names, &types, &attributes) |field, *name, *field_type, *attribute| {
         name.* = field.name;
         field_type.* = field.type;
@@ -309,49 +309,56 @@ fn jsonTypeName(comptime T: type) []const u8 {
     };
 }
 
-fn maybeDefaultText(comptime field: std.builtin.Type.StructField) ?[]const u8 {
-    const pointer = field.default_value_ptr orelse return null;
-    const value = @as(*const field.type, @ptrCast(@alignCast(pointer))).*;
-    return switch (@typeInfo(field.type)) {
+fn maybeDefaultText(comptime T: type, comptime index: usize) ?[]const u8 {
+    const info = @typeInfo(T).@"struct";
+    const field_type = info.field_types[index];
+    const value = info.field_attrs[index].defaultValue(field_type) orelse return null;
+    return switch (@typeInfo(field_type)) {
         .bool => if (value) "true" else "false",
         .int, .float => std.fmt.comptimePrint("{d}", .{value}),
         .optional => if (value == null) "unset" else @compileError("expected a null default"),
         .pointer => if (value.len == 0) "empty" else @compileError("expected an empty default"),
-        else => @compileError("the config field " ++ field.name ++ " has no printable default"),
+        else => @compileError(
+            "the config field " ++ info.field_names[index] ++ " has no printable default",
+        ),
     };
 }
 
-fn defaultText(comptime field: std.builtin.Type.StructField) []const u8 {
-    return maybeDefaultText(field) orelse
-        @compileError("the config field " ++ field.name ++ " declares no default");
+fn defaultText(comptime T: type, comptime index: usize) []const u8 {
+    return maybeDefaultText(T, index) orelse @compileError(
+        "the config field " ++ @typeInfo(T).@"struct".field_names[index] ++ " declares no default",
+    );
 }
 
 const leaves: []const Leaf = blk: {
     @setEvalBranchQuota(20_000);
     var list: []const Leaf = &.{};
-    for (@typeInfo(File).@"struct".fields) |field| {
-        if (isSection(field.type)) {
-            for (@typeInfo(field.type).@"struct".fields) |leaf| {
+    const file = @typeInfo(File).@"struct";
+    for (file.field_names, file.field_types, 0..) |name, field_type, index| {
+        if (isSection(field_type)) {
+            const section = @typeInfo(field_type).@"struct";
+            for (section.field_names, section.field_types, 0..) |leaf, leaf_type, leaf_index| {
                 list = list ++ [_]Leaf{.{
-                    .path = field.name ++ "." ++ leaf.name,
-                    .type_name = jsonTypeName(leaf.type),
-                    .default_text = defaultText(leaf),
+                    .path = name ++ "." ++ leaf,
+                    .type_name = jsonTypeName(leaf_type),
+                    .default_text = defaultText(field_type, leaf_index),
                 }};
             }
             continue;
         }
         list = list ++ [_]Leaf{.{
-            .path = field.name,
-            .type_name = jsonTypeName(field.type),
-            .default_text = defaultText(field),
+            .path = name,
+            .type_name = jsonTypeName(field_type),
+            .default_text = defaultText(File, index),
         }};
-        if (isObjectSlice(field.type)) {
-            const child = @typeInfo(field.type).pointer.child;
-            for (@typeInfo(child).@"struct".fields) |leaf| {
+        if (isObjectSlice(field_type)) {
+            const child = @typeInfo(field_type).pointer.child;
+            const entry = @typeInfo(child).@"struct";
+            for (entry.field_names, entry.field_types, 0..) |leaf, leaf_type, leaf_index| {
                 list = list ++ [_]Leaf{.{
-                    .path = field.name ++ "[]." ++ leaf.name,
-                    .type_name = jsonTypeName(leaf.type),
-                    .default_text = maybeDefaultText(leaf),
+                    .path = name ++ "[]." ++ leaf,
+                    .type_name = jsonTypeName(leaf_type),
+                    .default_text = maybeDefaultText(child, leaf_index),
                 }};
             }
         }
@@ -362,7 +369,7 @@ const leaves: []const Leaf = blk: {
 const key_lines = blk: {
     @setEvalBranchQuota(20_000);
     var text: []const u8 = "";
-    var used = [_]bool{false} ** keys.len;
+    var used: [keys.len]bool = @splat(false);
     for (leaves) |leaf| {
         var found = false;
         for (keys, 0..) |key, index| {
@@ -398,13 +405,7 @@ fn joinNames(comptime list: []const []const u8) []const u8 {
     }
 }
 
-const effort_levels = blk: {
-    var list: []const []const u8 = &.{};
-    for (@typeInfo(core.Provider.Effort).@"enum".fields) |field| {
-        list = list ++ [_][]const u8{field.name};
-    }
-    break :blk joinNames(list);
-};
+const effort_levels = joinNames(@typeInfo(core.Provider.Effort).@"enum".field_names);
 
 const settings_lines = lines: {
     var text: []const u8 = "";
@@ -433,7 +434,7 @@ pub fn document(
     gpa: std.mem.Allocator,
     effort_default: core.Provider.Effort,
 ) ![]u8 {
-    return std.fmt.allocPrint(gpa,
+    return gpa.print(
         \\## Config file
         \\
         \\Drinky reads {s} once, at startup. A change to that file applies at
@@ -578,7 +579,7 @@ pub fn load(
 ) !Config {
     const path = try accounts.json_store.locate(gpa, directories, "config.json");
     defer gpa.free(path);
-    const directory = std.fs.path.dirname(path).?;
+    const directory = std.Io.Dir.path.dirname(path).?;
     const cwd = std.Io.Dir.cwd();
     const data = cwd.readFileAlloc(io, path, gpa, .unlimited) catch |err| switch (err) {
         error.FileNotFound => return defaults(gpa, path, null),
@@ -723,13 +724,14 @@ fn collectUnknownKeys(
     std.debug.assert(source.* == .object);
     for (source.object.keys(), source.object.values()) |name, *value| {
         var known = false;
-        inline for (@typeInfo(File).@"struct".fields) |field| {
-            if (std.mem.eql(u8, field.name, name)) {
+        const file = @typeInfo(File).@"struct";
+        inline for (file.field_names, file.field_types) |field_name, field_type| {
+            if (std.mem.eql(u8, field_name, name)) {
                 known = true;
-                if (comptime isSection(field.type)) {
-                    if (try collectUnknownSection(field.type, gpa, value, name, out)) return true;
-                } else if (comptime isObjectSlice(field.type)) {
-                    const child = @typeInfo(field.type).pointer.child;
+                if (comptime isSection(field_type)) {
+                    if (try collectUnknownSection(field_type, gpa, value, name, out)) return true;
+                } else if (comptime isObjectSlice(field_type)) {
+                    const child = @typeInfo(field_type).pointer.child;
                     if (try collectUnknownEntries(child, gpa, value, name, out)) return true;
                 }
             }
@@ -778,8 +780,8 @@ fn collectUnknownEntries(
 }
 
 fn hasField(comptime T: type, name: []const u8) bool {
-    inline for (@typeInfo(T).@"struct".fields) |field| {
-        if (std.mem.eql(u8, field.name, name)) return true;
+    for (@typeInfo(T).@"struct".field_names) |field_name| {
+        if (std.mem.eql(u8, field_name, name)) return true;
     }
     return false;
 }
@@ -791,7 +793,7 @@ fn appendUnknownKey(
     args: anytype,
 ) !bool {
     if (out.items.len == unknown_keys_max) return true;
-    const path = try std.fmt.allocPrint(gpa, format, args);
+    const path = try gpa.print(format, args);
     errdefer gpa.free(path);
     try out.append(gpa, path);
     return false;
@@ -924,8 +926,7 @@ test "load reads the interface section" {
 test "a page count Drinky cannot use falls back to the default and is reported" {
     const cases = [_]usize{ 0, layout.window_pages_max + 1, 100_000 };
     for (cases) |configured| {
-        const data = try std.fmt.allocPrint(
-            std.testing.allocator,
+        const data = try std.testing.allocator.print(
             "{{ \"interface\": {{ \"window_pages\": {d} }} }}",
             .{configured},
         );
@@ -938,8 +939,7 @@ test "a page count Drinky cannot use falls back to the default and is reported" 
 
     const edges = [_]usize{ layout.window_pages_min, layout.window_pages_max };
     for (edges) |configured| {
-        const data = try std.fmt.allocPrint(
-            std.testing.allocator,
+        const data = try std.testing.allocator.print(
             "{{ \"interface\": {{ \"window_pages\": {d} }} }}",
             .{configured},
         );
@@ -999,8 +999,7 @@ test "a command timeout Drinky cannot use falls back to the default and is repor
         tools.Context.Bash.timeout_ms_max + 1,
     };
     for (cases) |configured| {
-        const data = try std.fmt.allocPrint(
-            std.testing.allocator,
+        const data = try std.testing.allocator.print(
             "{{ \"bash\": {{ \"timeout_ms\": {d} }} }}",
             .{configured},
         );
@@ -1013,8 +1012,7 @@ test "a command timeout Drinky cannot use falls back to the default and is repor
 
     const edges = [_]u64{ tools.Context.Bash.timeout_ms_min, tools.Context.Bash.timeout_ms_max };
     for (edges) |configured| {
-        const data = try std.fmt.allocPrint(
-            std.testing.allocator,
+        const data = try std.testing.allocator.print(
             "{{ \"bash\": {{ \"timeout_ms\": {d} }} }}",
             .{configured},
         );
@@ -1203,11 +1201,11 @@ test "the config document names the file, each key, and each limit, and its exam
 
     const text = try config.document(gpa, .xhigh);
     defer gpa.free(text);
-    try std.testing.expect(std.mem.indexOf(u8, text, config.path) != null);
+    try std.testing.expect(std.mem.find(u8, text, config.path) != null);
     for (leaves) |leaf| {
-        const line = try std.fmt.allocPrint(gpa, "- `{s}` — {s}", .{ leaf.path, leaf.type_name });
+        const line = try gpa.print("- `{s}` — {s}", .{ leaf.path, leaf.type_name });
         defer gpa.free(line);
-        try std.testing.expect(std.mem.indexOf(u8, text, line) != null);
+        try std.testing.expect(std.mem.find(u8, text, line) != null);
     }
     const stated_keys = [_][]const u8{
         std.fmt.comptimePrint(
@@ -1217,20 +1215,20 @@ test "the config document names the file, each key, and each limit, and its exam
         "- `default_effort` — string, default: unset.",
         "- `user_instructions[].path` — string, required.",
     };
-    for (stated_keys) |line| try std.testing.expect(std.mem.indexOf(u8, text, line) != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, effort_levels) != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "uses xhigh.") != null);
+    for (stated_keys) |line| try std.testing.expect(std.mem.find(u8, text, line) != null);
+    try std.testing.expect(std.mem.find(u8, text, effort_levels) != null);
+    try std.testing.expect(std.mem.find(u8, text, "uses xhigh.") != null);
     for (&accounts.Account.table) |*row| {
         const setting = row.setting() orelse continue;
-        const line = try std.fmt.allocPrint(gpa, "- `{s}`: {s}\n", .{ row.id, setting });
+        const line = try gpa.print("- `{s}`: {s}\n", .{ row.id, setting });
         defer gpa.free(line);
-        try std.testing.expect(std.mem.indexOf(u8, text, line) != null);
+        try std.testing.expect(std.mem.find(u8, text, line) != null);
     }
-    try std.testing.expect(std.mem.indexOf(u8, text, std.fmt.comptimePrint(
+    try std.testing.expect(std.mem.find(u8, text, std.fmt.comptimePrint(
         "count must be from {d} to {d}",
         .{ layout.window_pages_min, layout.window_pages_max },
     )) != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, std.fmt.comptimePrint(
+    try std.testing.expect(std.mem.find(u8, text, std.fmt.comptimePrint(
         "at most {d} files",
         .{discovery.instructions.files_max},
     )) != null);
@@ -1271,16 +1269,16 @@ test "load resolves user instruction paths against the config directory in order
     defer config.deinit(gpa);
     const files = config.user_instructions.files();
     try std.testing.expectEqual(@as(usize, 2), files.len);
-    const second_path = try std.fs.path.join(gpa, &.{ home, ".drinky", "second.md" });
+    const second_path = try std.Io.Dir.path.join(gpa, &.{ home, ".drinky", "second.md" });
     defer gpa.free(second_path);
-    const first_path = try std.fs.path.join(gpa, &.{ home, ".drinky", "first.md" });
+    const first_path = try std.Io.Dir.path.join(gpa, &.{ home, ".drinky", "first.md" });
     defer gpa.free(first_path);
     try std.testing.expectEqualStrings(second_path, files[0].path);
     try std.testing.expectEqualStrings("Second.\n", files[0].content);
     try std.testing.expectEqualStrings(first_path, files[1].path);
     try std.testing.expectEqualStrings("First.\n", files[1].content);
     try std.testing.expectEqual(@as(usize, 1), config.user_instructions.reports.messages().len);
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(
         u8,
         config.user_instructions.reports.messages()[0].content,
         "missing.md",

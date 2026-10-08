@@ -7,7 +7,7 @@ const escape = @import("escape.zig");
 const usage = "Use drinky, drinky models, or drinky run --model account/model --effort level.";
 
 pub const effort_levels = levels: {
-    const names = std.meta.fieldNames(core.Provider.Effort);
+    const names = @typeInfo(core.Provider.Effort).@"enum".field_names;
     var text: []const u8 = "";
     for (names, 0..) |name, index| {
         const separator = if (index == 0) "" else if (index + 1 == names.len) ", or " else ", ";

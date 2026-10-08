@@ -13,14 +13,14 @@ const Rounding = enum {
 };
 
 pub fn bytes(buffer: []u8, count: usize) []const u8 {
-    if (count < 1024) return std.fmt.bufPrint(buffer, "{d} B", .{count}) catch unreachable;
+    if (count < 1024) return std.mem.print(buffer, "{d} B", .{count}) catch unreachable;
     const tenths_kib = @divFloor(count * 10, 1024);
-    if (tenths_kib < 10 * 1024) return std.fmt.bufPrint(buffer, "{d}.{d} KiB", .{
+    if (tenths_kib < 10 * 1024) return std.mem.print(buffer, "{d}.{d} KiB", .{
         @divFloor(tenths_kib, 10),
         @mod(tenths_kib, 10),
     }) catch unreachable;
     const tenths_mib = @divFloor(count * 10, 1024 * 1024);
-    return std.fmt.bufPrint(buffer, "{d}.{d} MiB", .{
+    return std.mem.print(buffer, "{d}.{d} MiB", .{
         @divFloor(tenths_mib, 10),
         @mod(tenths_mib, 10),
     }) catch unreachable;
@@ -36,7 +36,7 @@ pub fn path(
     if (tools.format.relativeTo(&.{ .boundary = working, .target = target })) |relative|
         return gpa.dupe(u8, relative);
     if (tools.format.relativeTo(&.{ .boundary = home, .target = target })) |relative|
-        return std.fmt.allocPrint(gpa, "~/{s}", .{relative});
+        return gpa.print("~/{s}", .{relative});
     if (home.len > 0 and tools.format.contains(&.{ .boundary = home, .target = target }))
         return gpa.dupe(u8, "~");
     return gpa.dupe(u8, target);
@@ -46,11 +46,11 @@ pub fn durationSeconds(buffer: []u8, milliseconds: i64, rounding: Rounding) []co
     const total: u64 = @intCast(@max(milliseconds, 0));
     const seconds = switch (rounding) {
         .down => @divFloor(total, std.time.ms_per_s),
-        .up => std.math.divCeil(u64, total, std.time.ms_per_s) catch unreachable,
+        .up => @divCeil(total, std.time.ms_per_s),
     };
     if (seconds < std.time.s_per_min)
-        return std.fmt.bufPrint(buffer, "{d}s", .{seconds}) catch unreachable;
-    return std.fmt.bufPrint(buffer, "{d}m {d}s", .{
+        return std.mem.print(buffer, "{d}s", .{seconds}) catch unreachable;
+    return std.mem.print(buffer, "{d}m {d}s", .{
         @divFloor(seconds, std.time.s_per_min),
         @mod(seconds, std.time.s_per_min),
     }) catch unreachable;

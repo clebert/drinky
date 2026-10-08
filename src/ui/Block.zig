@@ -241,8 +241,8 @@ fn replay(placement: *const paint.Placement, lines: *const terminal.View.Lines) 
 }
 
 fn trimBlank(text: []const u8) []const u8 {
-    const first = std.mem.indexOfNone(u8, text, paint.blank_bytes) orelse return text[0..0];
-    const line_start = if (std.mem.lastIndexOfScalar(u8, text[0..first], '\n')) |newline|
+    const first = std.mem.findNone(u8, text, paint.blank_bytes) orelse return text[0..0];
+    const line_start = if (std.mem.findScalarLast(u8, text[0..first], '\n')) |newline|
         newline + 1
     else
         0;
@@ -434,13 +434,13 @@ test "a tool box wraps a sentence and cuts a line of measures" {
 }
 
 fn expectRowOpensOnText(painted: []const u8, row: []const u8) !void {
-    const start = std.mem.indexOf(u8, painted, row) orelse return error.TestExpectedRow;
-    const break_end = if (std.mem.lastIndexOf(u8, painted[0..start], "\r\n")) |cut|
+    const start = std.mem.find(u8, painted, row) orelse return error.TestExpectedRow;
+    const break_end = if (std.mem.findLast(u8, painted[0..start], "\r\n")) |cut|
         cut + 2
     else
         0;
     try std.testing.expect(start > break_end);
-    try std.testing.expect(std.mem.indexOfScalar(u8, painted[break_end..start], ' ') == null);
+    try std.testing.expect(std.mem.findScalar(u8, painted[break_end..start], ' ') == null);
 }
 
 test "a clipped block shows its bottom rows" {
@@ -527,14 +527,14 @@ test "each block kind paints in the role of its kind" {
         .{ .source = .{ .thinking = "one line" }, .role = .muted },
         .{ .source = .{ .model = "one line" }, .role = null },
     };
-    var seen: std.EnumSet(Block.Kind) = .initEmpty();
+    var seen: std.EnumSet(Block.Kind) = .empty;
     for (&pinned) |*pin| {
         var block = try Block.init(gpa, &pin.source);
         defer block.deinit(gpa);
         const painted = try rendered(gpa, &block, 40, 0);
         defer gpa.free(painted);
         inline for (comptime std.enums.values(role.Name)) |name| {
-            const shown = std.mem.indexOf(u8, painted, role.sequence(name)) != null;
+            const shown = std.mem.find(u8, painted, role.sequence(name)) != null;
             if (pin.role == name) try std.testing.expect(shown);
             if (pin.role == null and comptime role.paints(name)) try std.testing.expect(!shown);
         }

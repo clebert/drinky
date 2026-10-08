@@ -13,7 +13,7 @@ pub fn print(
     comptime format: []const u8,
     args: anytype,
 ) error{OutOfMemory}!Message {
-    return .{ .content = try std.fmt.allocPrint(gpa, format, args), .severity = severity };
+    return .{ .content = try gpa.print(format, args), .severity = severity };
 }
 
 pub fn deinit(self: *const Message, gpa: std.mem.Allocator) void {

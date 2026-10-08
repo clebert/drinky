@@ -281,10 +281,10 @@ test "projection stacks the transcript above the tail, newest at the bottom" {
     const painted = try projected(gpa, .{ .columns = 40, .rows = 24 }, &scene);
     defer gpa.free(painted);
 
-    const intro = std.mem.indexOf(u8, painted, "introxx").?;
-    const user = std.mem.indexOf(u8, painted, "useryy").?;
-    const reply = std.mem.indexOf(u8, painted, "replyzz").?;
-    const footer = std.mem.indexOf(u8, painted, "footerqq").?;
+    const intro = std.mem.find(u8, painted, "introxx").?;
+    const user = std.mem.find(u8, painted, "useryy").?;
+    const reply = std.mem.find(u8, painted, "replyzz").?;
+    const footer = std.mem.find(u8, painted, "footerqq").?;
     try std.testing.expect(intro < user);
     try std.testing.expect(user < reply);
     try std.testing.expect(reply < footer);
@@ -350,7 +350,7 @@ const Rig = struct {
     fn addModels(self: *Rig, first: usize, end: usize) !void {
         for (first..end) |index| {
             var buffer: [16]u8 = undefined;
-            try self.add(&.{ .model = try std.fmt.bufPrint(&buffer, "block{d}", .{index}) });
+            try self.add(&.{ .model = try std.mem.print(&buffer, "block{d}", .{index}) });
         }
     }
 
@@ -391,10 +391,10 @@ test "a turn tail stacks tool boxes above the active editor" {
     const painted = try projected(gpa, .{ .columns = 40, .rows = 24 }, &scene);
     defer gpa.free(painted);
 
-    const first = std.mem.indexOf(u8, painted, "readbox").?;
-    const second = std.mem.indexOf(u8, painted, "grepbox").?;
-    const activity = std.mem.indexOf(u8, painted, "━").?;
-    const footer = std.mem.indexOf(u8, painted, "footerqq").?;
+    const first = std.mem.find(u8, painted, "readbox").?;
+    const second = std.mem.find(u8, painted, "grepbox").?;
+    const activity = std.mem.find(u8, painted, "━").?;
+    const footer = std.mem.find(u8, painted, "footerqq").?;
     try std.testing.expect(first < second);
     try std.testing.expect(second < activity);
     try std.testing.expect(activity < footer);
@@ -437,11 +437,11 @@ test "a prompt tail shows its input caption above the editor" {
     const painted = try projected(gpa, .{ .columns = 80, .rows = 24 }, &scene);
     defer gpa.free(painted);
 
-    const failure = std.mem.indexOf(u8, painted, "the turn failed").?;
-    const title = std.mem.indexOf(u8, painted, "Sign in: anthropic-plan").?;
-    const control = std.mem.indexOf(u8, painted, "Enter: Replay callback URL").?;
-    const draft = std.mem.indexOf(u8, painted, "draft text").?;
-    const footer = std.mem.indexOf(u8, painted, "footerqq").?;
+    const failure = std.mem.find(u8, painted, "the turn failed").?;
+    const title = std.mem.find(u8, painted, "Sign in: anthropic-plan").?;
+    const control = std.mem.find(u8, painted, "Enter: Replay callback URL").?;
+    const draft = std.mem.find(u8, painted, "draft text").?;
+    const footer = std.mem.find(u8, painted, "footerqq").?;
     try std.testing.expect(failure < title);
     try std.testing.expect(title < control);
     try std.testing.expect(control < draft);
@@ -549,17 +549,17 @@ test "a block outside the window releases the rows it retained" {
 
     try ui.testing.expectHides(painted, &.{"block0"});
     try std.testing.expectEqual(@as(usize, 0), rig.blocks.items[0].cache.lines.count());
-    try std.testing.expect(rig.blocks.items[rig.blocks.items.len - 1].cache.lines.count() > 0);
+    try std.testing.expect(rig.blocks.lastPtr().?.cache.lines.count() > 0);
     for (rig.blocks.items, 0..) |*block, index| {
         var buffer: [16]u8 = undefined;
-        const text = try std.fmt.bufPrint(&buffer, "block{d}", .{index});
-        if (std.mem.indexOf(u8, painted, text) != null) continue;
+        const text = try std.mem.print(&buffer, "block{d}", .{index});
+        if (std.mem.find(u8, painted, text) != null) continue;
         try std.testing.expectEqual(@as(usize, 0), block.cache.lines.count());
     }
 }
 
 fn resetSince(written: []const u8, painted: usize) bool {
-    return std.mem.indexOf(u8, written[painted..], terminal.escape.screen_reset) != null;
+    return std.mem.find(u8, written[painted..], terminal.escape.screen_reset) != null;
 }
 
 test "a block that changes above the window forces a reset" {
@@ -605,7 +605,7 @@ test "a block that changes above the window forces a reset" {
     const streaming = rig.prompt(&.{ .window_pages = window_pages_min });
     try project(gpa, &screen.view, size, &streaming);
     for (0..4) |_| {
-        try rig.blocks.items[rig.blocks.items.len - 1].appendText(gpa, "\nmore");
+        try rig.blocks.lastPtr().?.appendText(gpa, "\nmore");
         painted = screen.out.written().len;
         try project(gpa, &screen.view, size, &streaming);
         try ui.testing.expectShows(screen.out.written()[painted..], &.{"more"});
@@ -639,11 +639,11 @@ test "a tool box that changes above the window forces a reset" {
     var tools: [6]ui.paint.Box = undefined;
     for (&tools, 0..) |*box, index| {
         var buffer: [16]u8 = undefined;
-        const text = try std.fmt.bufPrint(&buffer, "tool{d}", .{index});
+        const text = try std.mem.print(&buffer, "tool{d}", .{index});
         box.* = .{ .text = try gpa.dupe(u8, text), .fit = .head };
     }
     defer for (tools) |box| gpa.free(box.text);
-    var tracks = [_]Track{.{}} ** tools.len;
+    var tracks: [tools.len]Track = @splat(.{});
 
     var screen: ui.testing.Rig = undefined;
     screen.init(gpa);

@@ -158,14 +158,14 @@ test "read paginates and points at the next offset" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "f.txt", .data = "one\ntwo\nthree" });
     var input_buffer: [128]u8 = undefined;
-    const input = try std.fmt.bufPrint(&input_buffer,
+    const input = try std.mem.print(&input_buffer,
         \\{{"path":".zig-cache/tmp/{s}/f.txt","limit":1}}
     , .{tmp.sub_path});
     const result = try run(&context, input);
     defer result.deinit(gpa);
     try std.testing.expect(!result.hasFailure());
     try std.testing.expect(std.mem.startsWith(u8, result.content, "one\n"));
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "Use offset=2 to continue") != null);
+    try std.testing.expect(std.mem.find(u8, result.content, "Use offset=2 to continue") != null);
     try testing.expectMeasures(&result, &.{
         .{ .lines, 1 },
         .{ .line_first, 1 },
@@ -181,7 +181,7 @@ test "read measures a fully shown file" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "f.txt", .data = "one\ntwo\nthree" });
     var input_buffer: [128]u8 = undefined;
-    const input = try std.fmt.bufPrint(&input_buffer,
+    const input = try std.mem.print(&input_buffer,
         \\{{"path":".zig-cache/tmp/{s}/f.txt"}}
     , .{tmp.sub_path});
     const result = try run(&context, input);
@@ -201,7 +201,7 @@ test "read does not count a trailing newline as an empty line" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "f.txt", .data = "one\n" });
     var input_buffer: [128]u8 = undefined;
-    const input = try std.fmt.bufPrint(&input_buffer,
+    const input = try std.mem.print(&input_buffer,
         \\{{"path":".zig-cache/tmp/{s}/f.txt"}}
     , .{tmp.sub_path});
     const result = try run(&context, input);
@@ -221,7 +221,7 @@ test "read measures an empty file as zero lines" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "f.txt", .data = "" });
     var input_buffer: [128]u8 = undefined;
-    const input = try std.fmt.bufPrint(&input_buffer,
+    const input = try std.mem.print(&input_buffer,
         \\{{"path":".zig-cache/tmp/{s}/f.txt"}}
     , .{tmp.sub_path});
     const result = try run(&context, input);
@@ -247,7 +247,7 @@ test "read rejects an offset past the end of the file and names its line count" 
     };
     for (cases) |case| {
         var input_buffer: [128]u8 = undefined;
-        const input = try std.fmt.bufPrint(&input_buffer,
+        const input = try std.mem.print(&input_buffer,
             \\{{"path":".zig-cache/tmp/{s}/{s}","offset":100000}}
         , .{ tmp.sub_path, case.name });
         const result = try run(&context, input);
@@ -264,7 +264,7 @@ test "read rejects a zero limit" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "f.txt", .data = "one" });
     var input_buffer: [128]u8 = undefined;
-    const input = try std.fmt.bufPrint(&input_buffer,
+    const input = try std.mem.print(&input_buffer,
         \\{{"path":".zig-cache/tmp/{s}/f.txt","limit":0}}
     , .{tmp.sub_path});
     const result = try run(&context, input);
@@ -281,14 +281,14 @@ test "read rejects a binary or non-UTF-8 file" {
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "latin1.txt", .data = "caf\xE9" });
     for ([_][]const u8{ "bin.dat", "latin1.txt" }) |name| {
         var input_buffer: [128]u8 = undefined;
-        const input = try std.fmt.bufPrint(&input_buffer,
+        const input = try std.mem.print(&input_buffer,
             \\{{"path":".zig-cache/tmp/{s}/{s}"}}
         , .{ tmp.sub_path, name });
         const result = try run(&context, input);
         defer result.deinit(gpa);
         try testing.expectConditions(&result, &.{.path_not_text});
         try std.testing.expect(
-            std.mem.indexOf(u8, result.content, "not a UTF-8 text file") != null,
+            std.mem.find(u8, result.content, "not a UTF-8 text file") != null,
         );
     }
 }
@@ -303,13 +303,13 @@ test "read rejects an oversized file" {
     @memset(data, 'a');
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "big.txt", .data = data });
     var input_buffer: [128]u8 = undefined;
-    const input = try std.fmt.bufPrint(&input_buffer,
+    const input = try std.mem.print(&input_buffer,
         \\{{"path":".zig-cache/tmp/{s}/big.txt"}}
     , .{tmp.sub_path});
     const result = try run(&context, input);
     defer result.deinit(gpa);
     try testing.expectConditions(&result, &.{.path_too_large});
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "larger than") != null);
+    try std.testing.expect(std.mem.find(u8, result.content, "larger than") != null);
 }
 
 test "read stops at the byte cap with a next-offset hint" {
@@ -323,7 +323,7 @@ test "read stops at the byte cap with a next-offset hint" {
     for (0..60) |index| data[index * 1024 + 1023] = '\n';
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "wide.txt", .data = data });
     var input_buffer: [128]u8 = undefined;
-    const input = try std.fmt.bufPrint(&input_buffer,
+    const input = try std.mem.print(&input_buffer,
         \\{{"path":".zig-cache/tmp/{s}/wide.txt"}}
     , .{tmp.sub_path});
     const result = try run(&context, input);
@@ -331,7 +331,7 @@ test "read stops at the byte cap with a next-offset hint" {
     try std.testing.expect(!result.hasFailure());
     try std.testing.expect(result.content.len <= bytes_max + 128);
     try std.testing.expect(
-        std.mem.indexOf(u8, result.content, "Use offset=51 to continue") != null,
+        std.mem.find(u8, result.content, "Use offset=51 to continue") != null,
     );
     try testing.expectMeasures(&result, &.{
         .{ .lines, 50 },
@@ -353,14 +353,14 @@ test "read truncates to the line cap by default" {
     }
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "many.txt", .data = data });
     var input_buffer: [128]u8 = undefined;
-    const input = try std.fmt.bufPrint(&input_buffer,
+    const input = try std.mem.print(&input_buffer,
         \\{{"path":".zig-cache/tmp/{s}/many.txt"}}
     , .{tmp.sub_path});
     const result = try run(&context, input);
     defer result.deinit(gpa);
     try std.testing.expect(!result.hasFailure());
     try std.testing.expect(
-        std.mem.indexOf(u8, result.content, "Use offset=2001 to continue") != null,
+        std.mem.find(u8, result.content, "Use offset=2001 to continue") != null,
     );
 }
 
@@ -370,7 +370,7 @@ test "read canceled while opening propagates" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "f.txt", .data = "one" });
     var input_buffer: [128]u8 = undefined;
-    const input = try std.fmt.bufPrint(&input_buffer,
+    const input = try std.mem.print(&input_buffer,
         \\{{"path":".zig-cache/tmp/{s}/f.txt"}}
     , .{tmp.sub_path});
     var cancel: testing.CancelIo = .init(.file_open);
@@ -388,14 +388,14 @@ test "read truncates a single line longer than the byte cap" {
     @memset(line, 'a');
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "long.txt", .data = line });
     var input_buffer: [128]u8 = undefined;
-    const input = try std.fmt.bufPrint(&input_buffer,
+    const input = try std.mem.print(&input_buffer,
         \\{{"path":".zig-cache/tmp/{s}/long.txt"}}
     , .{tmp.sub_path});
     const result = try run(&context, input);
     defer result.deinit(gpa);
     try std.testing.expect(!result.hasFailure());
     try std.testing.expect(result.content.len < bytes_max + 100);
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "truncated") != null);
+    try std.testing.expect(std.mem.find(u8, result.content, "truncated") != null);
     try testing.expectConditions(&result, &.{.line_truncated});
     try testing.expectMeasures(&result, &.{
         .{ .lines, 1 },
@@ -417,13 +417,13 @@ test "read clamps an explicit limit to the line cap" {
     }
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "many.txt", .data = data });
     var input_buffer: [128]u8 = undefined;
-    const input = try std.fmt.bufPrint(&input_buffer,
+    const input = try std.mem.print(&input_buffer,
         \\{{"path":".zig-cache/tmp/{s}/many.txt","limit":100000}}
     , .{tmp.sub_path});
     const result = try run(&context, input);
     defer result.deinit(gpa);
     try std.testing.expect(!result.hasFailure());
     try std.testing.expect(
-        std.mem.indexOf(u8, result.content, "Use offset=2001 to continue") != null,
+        std.mem.find(u8, result.content, "Use offset=2001 to continue") != null,
     );
 }

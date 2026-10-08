@@ -60,7 +60,7 @@ pub const SkillFixture = struct {
         try tmp.dir.writeFile(io, .{ .sub_path = "SKILL.md", .data = fixture.body });
         fixture.root = try tmp.dir.realPathFileAlloc(io, ".", gpa);
         errdefer gpa.free(fixture.root);
-        fixture.source = try std.fs.path.join(gpa, &.{ fixture.root, "SKILL.md" });
+        fixture.source = try std.Io.Dir.path.join(gpa, &.{ fixture.root, "SKILL.md" });
         errdefer gpa.free(fixture.source);
         fixture.guard = .{ .working_directory = fixture.root };
         try fixture.guard.add(.{

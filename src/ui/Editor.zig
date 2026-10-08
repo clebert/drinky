@@ -1,5 +1,6 @@
 const std = @import("std");
 
+const core = @import("core");
 const terminal = @import("terminal");
 
 const paint = @import("paint.zig");
@@ -176,11 +177,11 @@ fn markerSpan(
     if (marker.line_count > line_count_max) {
         const form = terminal.width.grapheme_boundary ++ "[Paste #{d}: {d} lines]" ++
             terminal.width.grapheme_boundary;
-        return std.fmt.bufPrint(buffer, form, .{ marker.id, marker.line_count }) catch unreachable;
+        return std.mem.print(buffer, form, .{ marker.id, marker.line_count }) catch unreachable;
     }
     const form = terminal.width.grapheme_boundary ++ "[Paste #{d}: {d} bytes]" ++
         terminal.width.grapheme_boundary;
-    return std.fmt.bufPrint(buffer, form, .{ marker.id, marker.byte_count }) catch unreachable;
+    return std.mem.print(buffer, form, .{ marker.id, marker.byte_count }) catch unreachable;
 }
 
 pub fn insertCodepoint(self: *Editor, codepoint: u21) !void {
@@ -626,13 +627,13 @@ test "the line threshold collapses more than ten logical lines" {
 test "the byte threshold collapses more than a thousand bytes" {
     var editor = Editor.init(std.testing.allocator);
     defer editor.deinit();
-    const long = "x" ** 1000;
+    const long = core.text.repeat("x", 1000);
     try pasteWhole(&editor, long);
     try std.testing.expectEqual(@as(usize, 0), editor.draft.atoms.items.len);
     try std.testing.expectEqualStrings(long, editor.visible());
 
     editor.clear();
-    const longer = "x" ** 1001;
+    const longer = core.text.repeat("x", 1001);
     try pasteWhole(&editor, longer);
     try std.testing.expectEqualStrings("\u{200B}[Paste #1: 1001 bytes]\u{200B}", editor.visible());
     try expectExpanded(&editor, longer);
@@ -641,13 +642,13 @@ test "the byte threshold collapses more than a thousand bytes" {
 test "the byte threshold counts bytes, not characters" {
     var editor = Editor.init(std.testing.allocator);
     defer editor.deinit();
-    const multibyte = "é" ** 501;
+    const multibyte = core.text.repeat("é", 501);
     try pasteWhole(&editor, multibyte);
     try std.testing.expectEqualStrings("\u{200B}[Paste #1: 1002 bytes]\u{200B}", editor.visible());
     try expectExpanded(&editor, multibyte);
 
     editor.clear();
-    const malformed = "\xff" ** 1001;
+    const malformed = core.text.repeat("\xff", 1001);
     try pasteWhole(&editor, malformed);
     try std.testing.expectEqualStrings("\u{200B}[Paste #2: 1001 bytes]\u{200B}", editor.visible());
     try expectExpanded(&editor, malformed);
@@ -656,11 +657,11 @@ test "the byte threshold counts bytes, not characters" {
 test "a lone CR is payload, and CRLF counts one line" {
     var editor = Editor.init(std.testing.allocator);
     defer editor.deinit();
-    try pasteWhole(&editor, "x\r" ** 11);
+    try pasteWhole(&editor, core.text.repeat("x\r", 11));
     try std.testing.expectEqual(@as(usize, 0), editor.draft.atoms.items.len);
 
     editor.clear();
-    const crlf = "x\r\n" ** 11;
+    const crlf = core.text.repeat("x\r\n", 11);
     try pasteWhole(&editor, crlf);
     try std.testing.expectEqualStrings("\u{200B}[Paste #1: 12 lines]\u{200B}", editor.visible());
     try editor.insert(">");
@@ -670,7 +671,8 @@ test "a lone CR is payload, and CRLF counts one line" {
 test "the line form wins when both thresholds are crossed" {
     var editor = Editor.init(std.testing.allocator);
     defer editor.deinit();
-    const big = ("x" ** 100 ++ "\n") ** 10 ++ "x" ** 100;
+    const line = core.text.repeat("x", 100);
+    const big = core.text.repeat(line ++ "\n", 10) ++ line;
     try pasteWhole(&editor, big);
     try std.testing.expectEqualStrings("\u{200B}[Paste #1: 11 lines]\u{200B}", editor.visible());
     try expectExpanded(&editor, big);
@@ -702,21 +704,21 @@ test "multiple atoms mixed with ordinary text expand in document order" {
     try editor.insert("A");
     try pasteWhole(&editor, eleven_lines);
     try editor.insert("B");
-    try pasteWhole(&editor, "z" ** 1001);
+    try pasteWhole(&editor, core.text.repeat("z", 1001));
     try editor.insert("C");
     try std.testing.expectEqual(@as(usize, 2), editor.draft.atoms.items.len);
     try std.testing.expectEqualStrings(
         "A\u{200B}[Paste #1: 11 lines]\u{200B}B\u{200B}[Paste #2: 1001 bytes]\u{200B}C",
         editor.visible(),
     );
-    try expectExpanded(&editor, "A" ++ eleven_lines ++ "B" ++ "z" ** 1001 ++ "C");
+    try expectExpanded(&editor, "A" ++ eleven_lines ++ "B" ++ core.text.repeat("z", 1001) ++ "C");
 }
 
 test "arbitrary payload bytes round-trip through expansion exactly" {
     var editor = Editor.init(std.testing.allocator);
     defer editor.deinit();
     const payload =
-        "tab\tesc\x1b bad\xff\xfe text [paste #99 +5 lines] literal\n" ** 40;
+        core.text.repeat("tab\tesc\x1b bad\xff\xfe text [paste #99 +5 lines] literal\n", 40);
     try pasteWhole(&editor, payload);
     try std.testing.expectEqual(@as(usize, 1), editor.draft.atoms.items.len);
     try editor.insert(">");
@@ -1010,9 +1012,9 @@ test "expanded whole-prompt trimming matches literal trimming, guards aside" {
     var editor = Editor.init(std.testing.allocator);
     defer editor.deinit();
     try editor.insert("  ");
-    try pasteWhole(&editor, "  " ++ "y" ** 1001 ++ "  ");
+    try pasteWhole(&editor, "  " ++ core.text.repeat("y", 1001) ++ "  ");
     try editor.insert("  ");
-    try expectExpanded(&editor, "y" ** 1001);
+    try expectExpanded(&editor, core.text.repeat("y", 1001));
     try std.testing.expect(!editor.blank());
 }
 
@@ -1027,7 +1029,7 @@ test "a placeholder-only prompt is nonblank and sends its payload" {
     try std.testing.expectEqualStrings(eleven_lines, text);
 
     editor.clear();
-    try pasteWhole(&editor, " " ** 1001);
+    try pasteWhole(&editor, core.text.repeat(" ", 1001));
     try std.testing.expect(editor.blank());
 }
 
@@ -1437,7 +1439,7 @@ test "prependText puts the text and a line break before a draft and fills a blan
     const gpa = std.testing.allocator;
     var editor = Editor.init(gpa);
     defer editor.deinit();
-    const payload = "line\n" ** 15;
+    const payload = core.text.repeat("line\n", 15);
     try editor.paste(payload, true);
     try editor.insert("draft");
     try editor.prependText("");

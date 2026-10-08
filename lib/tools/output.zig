@@ -7,7 +7,7 @@ pub fn sentence(
     comptime format: []const u8,
     args: anytype,
 ) error{OutOfMemory}!core.Tool.Output {
-    return .{ .content = try std.fmt.allocPrint(gpa, format, args) };
+    return .{ .content = try gpa.print(format, args) };
 }
 
 pub fn failure(
@@ -17,7 +17,7 @@ pub fn failure(
     args: anytype,
 ) error{OutOfMemory}!core.Tool.Output {
     return .{
-        .content = try std.fmt.allocPrint(gpa, format, args),
+        .content = try gpa.print(format, args),
         .conditions = .initOne(reason),
     };
 }

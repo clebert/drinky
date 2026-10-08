@@ -285,18 +285,19 @@ pub fn Store(comptime Flow: type) type {
 
         fn loadEntry(self: *Self, file: *const json_store.File) Error!bool {
             const entry = file.entry(self.account) orelse return false;
+            const info = @typeInfo(Tokens).@"struct";
             var tokens: Tokens = undefined;
             var filled: usize = 0;
             errdefer {
-                inline for (@typeInfo(Tokens).@"struct".fields, 0..) |field, index| {
-                    if (comptime field.type == []const u8) {
-                        if (index < filled) self.gpa.free(@field(tokens, field.name));
+                inline for (info.field_names, info.field_types, 0..) |name, field_type, index| {
+                    if (comptime field_type == []const u8) {
+                        if (index < filled) self.gpa.free(@field(tokens, name));
                     }
                 }
             }
-            inline for (@typeInfo(Tokens).@"struct".fields, 0..) |field, index| {
-                const value = entry.get(field.name) orelse return error.BadCredentials;
-                @field(tokens, field.name) = if (comptime field.type == []const u8) switch (value) {
+            inline for (info.field_names, info.field_types, 0..) |name, field_type, index| {
+                const value = entry.get(name) orelse return error.BadCredentials;
+                @field(tokens, name) = if (comptime field_type == []const u8) switch (value) {
                     .string => |string| try self.gpa.dupe(u8, string),
                     else => return error.BadCredentials,
                 } else switch (value) {
@@ -1114,13 +1115,13 @@ test "a busy store retries a refreshed credential before the next request" {
 
     var path_buffer: [128]u8 = undefined;
     const path = try storePath(&path_buffer, &tmp);
-    const lock_path = try std.fmt.allocPrint(gpa, "{s}.lock", .{path});
+    const lock_path = try gpa.print("{s}.lock", .{path});
     defer gpa.free(lock_path);
     {
         var held = try std.Io.Dir.cwd().createFile(io, lock_path, .{
             .truncate = false,
             .lock = .exclusive,
-            .permissions = @enumFromInt(0o600),
+            .permissions = .fromMode(0o600),
         });
         defer held.close(io);
         try expectAccess("fresh", &subject);

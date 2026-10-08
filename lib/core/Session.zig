@@ -494,7 +494,7 @@ const fixture = struct {
         events: *[count + 1]Provider.Event,
     ) void {
         for (0..count) |index| {
-            const id = std.fmt.bufPrint(&ids[index], "r{d}", .{index}) catch unreachable;
+            const id = std.mem.print(&ids[index], "r{d}", .{index}) catch unreachable;
             events[index] = toolCall(.{ .id = id, .name = "read", .arguments = "{}" });
         }
         events[count] = stop_complete;

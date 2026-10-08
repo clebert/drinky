@@ -77,7 +77,7 @@ pub fn next(self: *Sse) Error!?[]const u8 {
 }
 
 fn takeLine(self: *Sse) Error!?[]const u8 {
-    if (std.mem.indexOfScalar(u8, self.body.buffered(), '\n') != null) return self.readLine();
+    if (std.mem.findScalar(u8, self.body.buffered(), '\n') != null) return self.readLine();
     return self.deadline.run(self.io, readLine, .{self}, null);
 }
 
@@ -131,7 +131,7 @@ fn drain(gpa: std.mem.Allocator, io: std.Io, body: []const u8) ![]u8 {
 }
 
 test "next ends at the end of the body and reads a line larger than the reader buffer" {
-    const blob = "A" ** 4000;
+    const blob = core.text.repeat("A", 4000);
     const body = "data: " ++ blob ++ "\ndata: tail\n";
     var buffer: [256]u8 = undefined;
     var chunked: std.testing.Reader = .init(&buffer, &.{.{ .buffer = body }});
@@ -154,7 +154,7 @@ test "a body cut inside a line is incomplete, never a frame" {
 
 test "the byte budget stops a stream once its lines pass the ceiling" {
     const frame = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"chunk\"}\n";
-    const body = frame ** 5;
+    const body = core.text.repeat(frame, 5);
     var reader: std.Io.Reader = .fixed(body);
     var sse = testSse(std.testing.io, &reader, .{ .idle_ms = 60_000, .bytes_max = frame.len * 2 });
     defer sse.deinit();
@@ -166,7 +166,7 @@ test "the byte budget stops a stream once its lines pass the ceiling" {
 
 test "the byte budget counts the lines that carry no data too" {
     const frame = ": keepalive\n";
-    const body = frame ** 100;
+    const body = core.text.repeat(frame, 100);
     var reader: std.Io.Reader = .fixed(body);
     var sse = testSse(std.testing.io, &reader, .{ .idle_ms = 60_000, .bytes_max = frame.len * 3 });
     defer sse.deinit();

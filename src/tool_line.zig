@@ -38,15 +38,15 @@ pub fn head(
     description: *const tools.Registry.Description,
     roots: *const format.Roots,
 ) error{OutOfMemory}![]u8 {
-    const subject = description.subject orelse return std.fmt.allocPrint(gpa, "Tool: {s}", .{name});
+    const subject = description.subject orelse return gpa.print("Tool: {s}", .{name});
     const shown = switch (subject.kind) {
         .path => try format.path(gpa, subject.text, roots),
         .pattern, .command => try gpa.dupe(u8, subject.text),
     };
     defer gpa.free(shown);
     const line = ui.paint.singleLine(shown);
-    if (line.len == 0) return std.fmt.allocPrint(gpa, "Tool: {s}", .{name});
-    return std.fmt.allocPrint(gpa, "Tool: {s} · {s}: {s}", .{ name, label(subject.kind), line });
+    if (line.len == 0) return gpa.print("Tool: {s}", .{name});
+    return gpa.print("Tool: {s} · {s}: {s}", .{ name, label(subject.kind), line });
 }
 
 fn label(kind: tools.Registry.Description.Kind) []const u8 {

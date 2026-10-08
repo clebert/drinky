@@ -45,8 +45,7 @@ const Response = struct {
 const Payload = struct { body: []const u8, content_type: []const u8 };
 
 pub fn authorizeUrl(gpa: std.mem.Allocator, pkce: *const wire.Pkce) ![]u8 {
-    return std.fmt.allocPrint(
-        gpa,
+    return gpa.print(
         authorize_url ++ "?response_type=code&client_id=" ++ client_id ++
             "&redirect_uri=" ++ redirect_encoded ++ "&scope=" ++ scope_encoded ++
             "&code_challenge={s}&code_challenge_method=S256" ++
@@ -63,8 +62,7 @@ pub fn exchange(
     redirect: *const callback.Redirect,
     pkce: *const wire.Pkce,
 ) !Tokens {
-    const body = try std.fmt.allocPrint(
-        gpa,
+    const body = try gpa.print(
         "grant_type=authorization_code&client_id=" ++ client_id ++
             "&code={s}&code_verifier={s}&redirect_uri=" ++ redirect_encoded,
         .{ redirect.code, pkce.verifier },
@@ -188,11 +186,11 @@ test authorizeUrl {
     @memset(&pkce.state, 's');
     const url = try authorizeUrl(std.testing.allocator, &pkce);
     defer std.testing.allocator.free(url);
-    try std.testing.expect(std.mem.indexOf(u8, url, "state=sss") != null);
-    try std.testing.expect(std.mem.indexOf(u8, url, "vvv") == null);
-    try std.testing.expect(std.mem.indexOf(u8, url, "code_challenge_method=S256") != null);
-    try std.testing.expect(std.mem.indexOf(u8, url, client_id) != null);
-    try std.testing.expect(std.mem.indexOf(u8, url, "codex_cli_simplified_flow=true") != null);
+    try std.testing.expect(std.mem.find(u8, url, "state=sss") != null);
+    try std.testing.expect(std.mem.find(u8, url, "vvv") == null);
+    try std.testing.expect(std.mem.find(u8, url, "code_challenge_method=S256") != null);
+    try std.testing.expect(std.mem.find(u8, url, client_id) != null);
+    try std.testing.expect(std.mem.find(u8, url, "codex_cli_simplified_flow=true") != null);
 }
 
 test refreshBody {
@@ -214,8 +212,7 @@ test parseTokens {
         "{\"https://api.openai.com/auth\":{\"chatgpt_account_id\":\"acct_123\"}}",
     );
     defer gpa.free(id);
-    const body = try std.fmt.allocPrint(
-        gpa,
+    const body = try gpa.print(
         "{{\"access_token\":\"{s}\",\"refresh_token\":\"rt\",\"id_token\":\"{s}\"}}",
         .{ access, id },
     );
@@ -236,7 +233,7 @@ test "parseTokens carries over refresh token and account id on a partial refresh
     const gpa = std.testing.allocator;
     const access = try testing.fakeJwt(gpa, "{\"exp\":2000000000}");
     defer gpa.free(access);
-    const body = try std.fmt.allocPrint(gpa, "{{\"access_token\":\"{s}\"}}", .{access});
+    const body = try gpa.print("{{\"access_token\":\"{s}\"}}", .{access});
     defer gpa.free(body);
 
     const tokens = try parseTokens(gpa, &.{
@@ -253,8 +250,7 @@ test "parseTokens fails cleanly when the account id cannot be found" {
     const gpa = std.testing.allocator;
     const access = try testing.fakeJwt(gpa, "{\"exp\":2000000000}");
     defer gpa.free(access);
-    const body = try std.fmt.allocPrint(
-        gpa,
+    const body = try gpa.print(
         "{{\"access_token\":\"{s}\",\"refresh_token\":\"rt\"}}",
         .{access},
     );
@@ -269,8 +265,7 @@ test "parseTokens rejects a token whose JWT has no expiry" {
     const gpa = std.testing.allocator;
     const access = try testing.fakeJwt(gpa, "{\"sub\":\"x\"}");
     defer gpa.free(access);
-    const body = try std.fmt.allocPrint(
-        gpa,
+    const body = try gpa.print(
         "{{\"access_token\":\"{s}\",\"refresh_token\":\"rt\"}}",
         .{access},
     );
@@ -285,8 +280,7 @@ test "parseTokens skips a crafted expiry that overflows" {
     const gpa = std.testing.allocator;
     const access = try testing.fakeJwt(gpa, "{\"exp\":9223372036854775807}");
     defer gpa.free(access);
-    const body = try std.fmt.allocPrint(
-        gpa,
+    const body = try gpa.print(
         "{{\"access_token\":\"{s}\",\"refresh_token\":\"rt\"}}",
         .{access},
     );

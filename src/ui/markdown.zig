@@ -1,5 +1,6 @@
 const std = @import("std");
 
+const core = @import("core");
 const terminal = @import("terminal");
 
 const attribute = @import("attribute.zig");
@@ -7,13 +8,13 @@ const paint = @import("paint.zig");
 const role = @import("role.zig");
 const testing = @import("testing.zig");
 
-const blanks = " " ** 32;
+const blanks = core.text.repeat(" ", 32);
 
 const rule_cell = "─";
 
 const rule_columns = 80;
 
-const rule_cells = rule_cell ** rule_columns;
+const rule_cells = core.text.repeat(rule_cell, rule_columns);
 
 const Look = struct {
     role: ?role.Name = null,
@@ -143,7 +144,7 @@ const Fence = struct {
         if (marker != '`' and marker != '~') return null;
         const length = markerLength(line, marker);
         if (length < 3) return null;
-        if (marker == '`' and std.mem.indexOfScalar(u8, line[length..], '`') != null) return null;
+        if (marker == '`' and std.mem.findScalar(u8, line[length..], '`') != null) return null;
         return .{ .marker = marker, .length = length };
     }
 
@@ -189,7 +190,7 @@ const Table = struct {
         fn next(self: *Cells) ?[]const u8 {
             if (self.done) return null;
             var search_from: usize = 0;
-            while (std.mem.indexOfScalarPos(u8, self.rest, search_from, '|')) |pipe| {
+            while (std.mem.findScalarPos(u8, self.rest, search_from, '|')) |pipe| {
                 if (!isEscaped(self.rest, pipe)) {
                     defer self.rest = self.rest[pipe + 1 ..];
                     return std.mem.trim(u8, self.rest[0..pipe], " \t");
@@ -446,7 +447,7 @@ const Block = struct {
 
         fn next(self: *Rows) ?[]const u8 {
             const rest = self.rest orelse return null;
-            const end = std.mem.indexOfScalar(u8, rest, '\n') orelse {
+            const end = std.mem.findScalar(u8, rest, '\n') orelse {
                 self.rest = null;
                 return rest;
             };
@@ -568,7 +569,7 @@ const Closer = struct {
     fn find(self: *Closer, text: []const u8, from: usize) ?usize {
         if (self.spent) return null;
         if (self.at == null or self.at.? < from) {
-            self.at = std.mem.indexOfScalarPos(u8, text, from, self.byte);
+            self.at = std.mem.findScalarPos(u8, text, from, self.byte);
             self.spent = self.at == null;
         }
         return self.at;
@@ -645,7 +646,7 @@ const InlineScanner = struct {
             return;
         }
         if (self.depth > 0 and self.stack[self.depth - 1].look.code) {
-            const next_backslash = std.mem.indexOfScalarPos(
+            const next_backslash = std.mem.findScalarPos(
                 u8,
                 text[0..limit],
                 self.index + 1,
@@ -660,7 +661,7 @@ const InlineScanner = struct {
                 const inner = merged(&self.look, &run.look);
                 const has_pipe = self.context == .table and
                     run.look.code and
-                    std.mem.indexOf(u8, text[run.start..run.end], "\\|") != null;
+                    std.mem.find(u8, text[run.start..run.end], "\\|") != null;
                 const opens = (run.nests and self.depth < nesting_max) or has_pipe;
                 if (opens) {
                     std.debug.assert(self.depth < self.stack.len);
@@ -1030,7 +1031,7 @@ fn inlines(comptime Sink: type, sink: *Sink, base: Look, text: []const u8) !void
 fn runAt(text: []const u8, index: usize, link: *Link) ?Run {
     const rest = text[index..];
     if (rest[0] == '`') {
-        const close = std.mem.indexOfScalarPos(u8, text, index + 1, '`') orelse return null;
+        const close = std.mem.findScalarPos(u8, text, index + 1, '`') orelse return null;
         if (close == index + 1) return null;
         return .{
             .look = inline_code_look,
@@ -1070,7 +1071,7 @@ fn closerAt(search: *const struct { text: []const u8, from: usize, mark: []const
     const mark = search.mark;
     var at = search.from;
     for (0..closers_max) |_| {
-        const close = std.mem.indexOfPos(u8, text, at, mark) orelse return null;
+        const close = std.mem.findPos(u8, text, at, mark) orelse return null;
         const end = runEnd(text, close, mark[0]);
         at = end;
         if (end - close != mark.len) continue;
@@ -1155,7 +1156,7 @@ fn urlLength(url: []const u8) usize {
         if (last == ')') {
             if (closed <= opened) break;
             closed -= 1;
-        } else if (std.mem.indexOfScalar(u8, url_trailing, last) == null) {
+        } else if (std.mem.findScalar(u8, url_trailing, last) == null) {
             break;
         }
         length -= 1;
@@ -1517,7 +1518,7 @@ test "markdown paints each element in its own role" {
 
     const first = heading ++ "\x1b[1m\x1b[4mHeading one";
     try testing.expectShows(bytes, &.{first});
-    try std.testing.expect(std.mem.indexOfScalar(u8, bytes, '#') == null);
+    try std.testing.expect(std.mem.findScalar(u8, bytes, '#') == null);
     try testing.expectShows(bytes, &.{heading ++ "Heading three"});
     try testing.expectShows(bytes, &.{heading ++ "\x1b[1mtwo"});
     try testing.expectShows(bytes, &.{code});
@@ -1556,7 +1557,7 @@ test "a table renders as a box grid with padded cells" {
     const bytes = try painted(gpa, tables, 40, null, 0);
     defer gpa.free(bytes);
     try testing.expectShows(bytes, &.{"\x1b[1mName"});
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(
         u8,
         bytes,
         comptime role.sequence(.muted) ++ "┌",
@@ -1779,7 +1780,7 @@ test "a table below its narrowest grid stays prose" {
     const bytes = try painted(gpa, text, 8, null, 0);
     defer gpa.free(bytes);
     try testing.expectHides(bytes, &.{"┌"});
-    try std.testing.expect(std.mem.indexOfScalar(u8, bytes, '|') != null);
+    try std.testing.expect(std.mem.findScalar(u8, bytes, '|') != null);
 }
 
 test "a table appears only when its delimiter row is complete" {
@@ -1884,7 +1885,7 @@ test "a prefix leaves room for the body it pushes right" {
             const bytes = try painted(gpa, text, columns, null, 0);
             defer gpa.free(bytes);
             for ("abc") |letter| {
-                try std.testing.expect(std.mem.indexOfScalar(u8, bytes, letter) != null);
+                try std.testing.expect(std.mem.findScalar(u8, bytes, letter) != null);
             }
         }
     }
@@ -2037,7 +2038,7 @@ test "a bare URL ends before the punctuation behind it" {
         const bytes = try painted(gpa, case.text, 40, null, 0);
         defer gpa.free(bytes);
         var buffer: [64]u8 = undefined;
-        const link = try std.fmt.bufPrint(
+        const link = try std.mem.print(
             &buffer,
             terminal.escape.link_set ++ "{s}" ++ terminal.escape.string_end ++ "{s}" ++
                 terminal.escape.link_reset,
@@ -2054,7 +2055,7 @@ test "a heading with no body paints an empty row" {
     const bytes = try painted(gpa, "######", 20, null, 0);
     defer gpa.free(bytes);
     try std.testing.expectEqual(@as(usize, 1), testing.paintedRows(bytes));
-    try std.testing.expect(std.mem.indexOfScalar(u8, bytes, '#') == null);
+    try std.testing.expect(std.mem.findScalar(u8, bytes, '#') == null);
 }
 
 test "an unclosed bold marker stays literal" {

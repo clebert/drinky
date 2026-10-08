@@ -36,7 +36,7 @@ const AuthorRow = struct {
 
 const AuthorModels = packed struct(usize) {
     account: u8,
-    first: std.meta.Int(.unsigned, @bitSizeOf(usize) - 8),
+    first: @Int(.unsigned, @bitSizeOf(usize) - 8),
 };
 
 pub fn run(context: *Context) Context.Error!Context.Outcome {
@@ -101,13 +101,13 @@ fn accountStep(context: *Context, vendor: accounts.Account.Vendor) !Context.Outc
         .cancellation_message = cancellation_message,
         .options = try options.toOwnedSlice(),
         .current = current,
-        .payload = @intFromEnum(vendor),
-        .reopen = .{ .open = reopenAccounts, .payload = @intFromEnum(vendor) },
+        .payload = @backingInt(vendor),
+        .reopen = .{ .open = reopenAccounts, .payload = @backingInt(vendor) },
     } };
 }
 
 fn reopenAccounts(context: *Context, payload: usize) Context.Error!Context.Outcome {
-    return accountStep(context, @enumFromInt(payload));
+    return accountStep(context, @fromBackingInt(@intCast(payload)));
 }
 
 fn selectAccount(
@@ -115,7 +115,7 @@ fn selectAccount(
     selection: Context.Outcome.Pick.Selection,
 ) Context.Error!Context.Outcome {
     var buffer: [rows_max]usize = undefined;
-    const vendor: accounts.Account.Vendor = @enumFromInt(selection.payload);
+    const vendor: accounts.Account.Vendor = @fromBackingInt(@intCast(selection.payload));
     const list = authenticatedAccounts(context.account_registry, vendor, &buffer);
     return .{ .pick = try forAccount(context, list[selection.row]) };
 }

@@ -1,5 +1,7 @@
 const std = @import("std");
 
+const core = @import("core");
+
 const testing = @import("testing.zig");
 
 pub const marker_name = ".git";
@@ -30,12 +32,12 @@ pub fn findBoundary(
     working_directory: []const u8,
 ) !Boundary {
     var current = working_directory;
-    for (0..std.fs.max_path_bytes) |_| {
-        const marker_path = try std.fs.path.join(gpa, &.{ current, marker_name });
+    for (0..std.Io.Dir.max_path_bytes) |_| {
+        const marker_path = try std.Io.Dir.path.join(gpa, &.{ current, marker_name });
         defer gpa.free(marker_path);
         const stat = std.Io.Dir.cwd().statFile(io, marker_path, .{}) catch |err| {
             if (err == error.FileNotFound) {
-                const parent = std.fs.path.dirname(current) orelse
+                const parent = std.Io.Dir.path.dirname(current) orelse
                     return .{ .path = working_directory, .has_root = false };
                 current = parent;
                 continue;
@@ -50,7 +52,7 @@ pub fn findBoundary(
         if (stat.kind == .directory or stat.kind == .file) {
             return .{ .path = current, .has_root = true };
         }
-        const parent = std.fs.path.dirname(current) orelse
+        const parent = std.Io.Dir.path.dirname(current) orelse
             return .{ .path = working_directory, .has_root = false };
         current = parent;
     }
@@ -64,7 +66,7 @@ const object_name_columns = 7;
 pub fn head(gpa: std.mem.Allocator, io: std.Io, root: []const u8) ?Head {
     const directory = headDirectory(gpa, io, root) orelse return null;
     defer gpa.free(directory);
-    const path = std.fs.path.join(gpa, &.{ directory, "HEAD" }) catch return null;
+    const path = std.Io.Dir.path.join(gpa, &.{ directory, "HEAD" }) catch return null;
     defer gpa.free(path);
     const data = readHeadFile(gpa, io, path) orelse return null;
     defer gpa.free(data);
@@ -72,7 +74,7 @@ pub fn head(gpa: std.mem.Allocator, io: std.Io, root: []const u8) ?Head {
 }
 
 fn headDirectory(gpa: std.mem.Allocator, io: std.Io, root: []const u8) ?[]u8 {
-    const marker_path = std.fs.path.join(gpa, &.{ root, marker_name }) catch return null;
+    const marker_path = std.Io.Dir.path.join(gpa, &.{ root, marker_name }) catch return null;
     const stat = std.Io.Dir.cwd().statFile(io, marker_path, .{}) catch {
         gpa.free(marker_path);
         return null;
@@ -88,8 +90,8 @@ fn headDirectory(gpa: std.mem.Allocator, io: std.Io, root: []const u8) ?[]u8 {
     if (!std.mem.startsWith(u8, line, prefix)) return null;
     const target = std.mem.trim(u8, line[prefix.len..], " \t");
     if (target.len == 0) return null;
-    if (std.fs.path.isAbsolute(target)) return gpa.dupe(u8, target) catch null;
-    return std.fs.path.resolve(gpa, &.{ root, target }) catch null;
+    if (std.Io.Dir.path.isAbsolute(target)) return gpa.dupe(u8, target) catch null;
+    return std.Io.Dir.path.resolve(gpa, &.{ root, target }) catch null;
 }
 
 fn readHeadFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ?[]u8 {
@@ -105,7 +107,7 @@ fn parseHead(data: []const u8) ?Head {
         if (std.mem.startsWith(u8, reference, branches)) {
             return headName(reference[branches.len..]);
         }
-        return headName(std.fs.path.basename(reference));
+        return headName(std.Io.Dir.path.basename(reference));
     }
     if (!objectName(line)) return null;
     return headName(line[0..object_name_columns]);
@@ -187,15 +189,15 @@ test "an unreadable marker stops the walk and travels back as a value" {
 }
 
 test "outside a repository the boundary is the working directory" {
-    if (std.fs.path.sep != '/') return error.SkipZigTest;
+    if (std.Io.Dir.path.sep != '/') return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var seed = std.testing.tmpDir(.{});
     defer seed.cleanup();
-    const outside_root = try std.fmt.allocPrint(gpa, "/tmp/drinky-project-{s}", .{seed.sub_path});
+    const outside_root = try gpa.print("/tmp/drinky-project-{s}", .{seed.sub_path});
     defer gpa.free(outside_root);
     defer std.Io.Dir.cwd().deleteTree(io, outside_root) catch {};
-    const created = try std.fs.path.join(gpa, &.{ outside_root, "work" });
+    const created = try std.Io.Dir.path.join(gpa, &.{ outside_root, "work" });
     defer gpa.free(created);
     var work = try std.Io.Dir.cwd().createDirPathOpen(io, created, .{});
     work.close(io);
@@ -216,16 +218,16 @@ test "a head names its branch, its tag, or its detached object, and only as prin
     const root = try tree.path("repo");
 
     const branch_prefix = "ref: refs/heads/";
-    const longest = "b" ** (head_bytes_max - branch_prefix.len - 1);
+    const longest = core.text.repeat("b", head_bytes_max - branch_prefix.len - 1);
     const object = "6ab94da2f0a1b3c4d5e6f708192a3b4c5d6e7f80";
     const cases = [_]struct { data: []const u8, name: ?[]const u8 }{
         .{ .data = "ref: refs/heads/main\n", .name = "main" },
         .{ .data = "ref: refs/heads/feature/status-bar\n", .name = "feature/status-bar" },
         .{ .data = "ref: refs/tags/v1.2.0\n", .name = "v1.2.0" },
         .{ .data = object ++ "\n", .name = "6ab94da" },
-        .{ .data = object ++ "0" ** 24, .name = "6ab94da" },
+        .{ .data = object ++ core.text.repeat("0", 24), .name = "6ab94da" },
         .{ .data = "ref: refs/heads/wörk\n", .name = "wörk" },
-        .{ .data = branch_prefix ++ "ä" ** 40, .name = "ä" ** 40 },
+        .{ .data = branch_prefix ++ core.text.repeat("ä", 40), .name = core.text.repeat("ä", 40) },
         .{ .data = branch_prefix ++ longest, .name = longest },
         .{ .data = branch_prefix ++ longest ++ "b", .name = null },
         .{ .data = "", .name = null },

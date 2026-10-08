@@ -455,7 +455,7 @@ pub const Emulator = struct {
 
     fn trimBlankTail(self: *Emulator) void {
         while (self.document.items.len > self.cursor_row + 1 and
-            self.document.items[self.document.items.len - 1].items.len == 0)
+            self.document.last().?.items.len == 0)
         {
             var row = self.document.pop().?;
             row.deinit(self.gpa);
@@ -530,7 +530,7 @@ pub fn plainText(gpa: std.mem.Allocator, bytes: []const u8) ![]u8 {
     while (index < bytes.len) {
         if (std.mem.startsWith(u8, bytes[index..], escape.link_set)) {
             const rest = bytes[index + escape.link_set.len ..];
-            const end = std.mem.indexOf(u8, rest, escape.string_end) orelse rest.len;
+            const end = std.mem.find(u8, rest, escape.string_end) orelse rest.len;
             index = bytes.len - rest.len + end + escape.string_end.len;
             continue;
         }

@@ -140,7 +140,7 @@ fn fetch(arena: std.mem.Allocator, client: *std.http.Client, url: []const u8) ![
         .response_writer = &response.writer,
     });
     if (result.status != .ok) {
-        std.debug.print("fetch {s} returned {d}\n", .{ url, @intFromEnum(result.status) });
+        std.debug.print("fetch {s} returned {d}\n", .{ url, @backingInt(result.status) });
         return error.FetchFailed;
     }
     return response.written();
@@ -269,7 +269,7 @@ fn emit(
 }
 
 fn before(text: []const u8, byte: u8) []const u8 {
-    return text[0 .. std.mem.indexOfScalar(u8, text, byte) orelse text.len];
+    return text[0 .. std.mem.findScalar(u8, text, byte) orelse text.len];
 }
 
 fn contains(list: []const []const u8, value: []const u8) bool {
@@ -278,7 +278,7 @@ fn contains(list: []const []const u8, value: []const u8) bool {
 }
 
 fn parseRange(field: []const u8) ?Bounds {
-    if (std.mem.indexOf(u8, field, "..")) |dots| {
+    if (std.mem.find(u8, field, "..")) |dots| {
         const first = parseHex(field[0..dots]) orelse return null;
         const last = parseHex(field[dots + 2 ..]) orelse return null;
         return .{ .first = first, .last = last };

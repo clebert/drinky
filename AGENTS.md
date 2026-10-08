@@ -12,12 +12,12 @@ every library. `lib/providers` and `lib/tools` import `lib/core`, and `lib/accou
   holds the device seam that the client reads and paints through, and `Tty` implements it.
 - `lib/core` imports `std` alone. It holds the neutral conversation, the provider seam, the tool
   seam, the retry policy, and the session. It also holds the parts that the libraries share: the
-  actor shell, the timeout race over `std.Io`, the compile-time check of an error set, and the
-  plural suffix of a count. It names no vendor: an account is an opaque id, and a reasoning proof is
-  that id with opaque payload bytes. The session is an actor. One task runs its command loop and
-  owns its state. A client sends commands and receives events through a sink, and a turn runs as a
-  child task. The actor shell holds the generic sink and the mailbox that starts, cancels, and reaps
-  one child task.
+  actor shell, the timeout race over `std.Io`, the compile-time check of an error set, the plural
+  suffix of a count, and the compile-time repetition of a text. It names no vendor: an account is an
+  opaque id, and a reasoning proof is that id with opaque payload bytes. The session is an actor.
+  One task runs its command loop and owns its state. A client sends commands and receives events
+  through a sink, and a turn runs as a child task. The actor shell holds the generic sink and the
+  mailbox that starts, cancels, and reaps one child task.
 - `lib/providers` implements the provider seam of the core. It holds the transport seam with its
   HTTP implementation, the SSE line engine, the JSON accessors, the credential seam, and one dialect
   per wire: Responses, Messages, and Gemini. A dialect builds the request, classifies a failure, and

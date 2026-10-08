@@ -163,7 +163,7 @@ fn carries(history: []const core.Conversation.Item, content: []const u8) bool {
                 result.output.content,
             .reasoning, .tool_call => continue,
         };
-        if (std.mem.indexOf(u8, text, content) != null) return true;
+        if (std.mem.find(u8, text, content) != null) return true;
     }
     return false;
 }
@@ -184,9 +184,9 @@ fn resolve(
     gpa: std.mem.Allocator,
     target: []const u8,
 ) error{OutOfMemory}![]u8 {
-    if (self.working_directory.len == 0 or std.fs.path.isAbsolute(target))
-        return std.fs.path.resolve(gpa, &.{target});
-    return std.fs.path.resolve(gpa, &.{ self.working_directory, target });
+    if (self.working_directory.len == 0 or std.Io.Dir.path.isAbsolute(target))
+        return std.Io.Dir.path.resolve(gpa, &.{target});
+    return std.Io.Dir.path.resolve(gpa, &.{ self.working_directory, target });
 }
 
 test "a rule refuses a matching write until the history carries the whole skill file" {
@@ -197,8 +197,8 @@ test "a rule refuses a matching write until the history carries the whole skill 
     const refused = (try refusalOf(&fixture, gpa, &.{})).?;
     defer refused.deinit(gpa);
     try testing.expectConditions(&refused, &.{.skill_required});
-    try std.testing.expect(std.mem.indexOf(u8, refused.content, "zig-style") != null);
-    try std.testing.expect(std.mem.indexOf(u8, refused.content, "sends you") != null);
+    try std.testing.expect(std.mem.find(u8, refused.content, "zig-style") != null);
+    try std.testing.expect(std.mem.find(u8, refused.content, "sends you") != null);
     try testing.expectMeasures(&refused, &.{});
 
     const read_history = [_]core.Conversation.Item{
@@ -245,8 +245,8 @@ test "a read of a matching path queues the skill file, and the delivery carries 
     defer skill.deinit(gpa);
     try std.testing.expectEqualStrings("zig-style", skill.name);
     try std.testing.expectEqualStrings(fixture.source, skill.source);
-    try std.testing.expect(std.mem.indexOf(u8, skill.text, "**/*.zig") != null);
-    try std.testing.expect(std.mem.indexOf(u8, skill.text, "Skill location: ") != null);
+    try std.testing.expect(std.mem.find(u8, skill.text, "**/*.zig") != null);
+    try std.testing.expect(std.mem.find(u8, skill.text, "Skill location: ") != null);
     try std.testing.expect(std.mem.endsWith(u8, skill.text, fixture.body));
 
     try std.testing.expect((try fixture.guard.takeQueued(gpa, std.testing.io, &.{})) == null);
@@ -338,7 +338,7 @@ test "a rule never guards its own skill file" {
         .history = &.{},
     })) == null);
 
-    const other = try std.fs.path.join(gpa, &.{ fixture.root, "README.md" });
+    const other = try std.Io.Dir.path.join(gpa, &.{ fixture.root, "README.md" });
     defer gpa.free(other);
     const refused = (try guard.refusal(&.{
         .gpa = gpa,
@@ -391,8 +391,7 @@ test "a partial file, a failed call, and opaque items prove nothing" {
         try std.testing.expect(refused.hasFailure());
     }
 
-    const invoked = try std.fmt.allocPrint(
-        gpa,
+    const invoked = try gpa.print(
         "Skill location: {s}\n\n{s}\nformat the file",
         .{ fixture.source, fixture.body },
     );
@@ -412,8 +411,8 @@ test "a skill file Drinky cannot read refuses the call and names the error" {
     const refused = (try refusalOf(&fixture, gpa, &.{})).?;
     defer refused.deinit(gpa);
     try testing.expectConditions(&refused, &.{.skill_required});
-    try std.testing.expect(std.mem.indexOf(u8, refused.content, "FileNotFound") != null);
-    try std.testing.expect(std.mem.indexOf(u8, refused.content, fixture.source) != null);
+    try std.testing.expect(std.mem.find(u8, refused.content, "FileNotFound") != null);
+    try std.testing.expect(std.mem.find(u8, refused.content, fixture.source) != null);
 }
 
 test "a glob measures against the working directory, and against the absolute path" {
@@ -423,7 +422,7 @@ test "a glob measures against the working directory, and against the absolute pa
 
     var rooted: SkillGuard = .{ .working_directory = fixture.root };
     try rooted.add(.{ .glob = "src/**/*.zig", .skill = "zig-style", .source = fixture.source });
-    const inside = try std.fs.path.join(gpa, &.{ fixture.root, "src", "App.zig" });
+    const inside = try std.Io.Dir.path.join(gpa, &.{ fixture.root, "src", "App.zig" });
     defer gpa.free(inside);
     const refused = (try rooted.refusal(&.{
         .gpa = gpa,
@@ -458,7 +457,7 @@ test "a glob measures against the working directory, and against the absolute pa
         .history = &.{},
     })).?;
     defer hosts.deinit(gpa);
-    try std.testing.expect(std.mem.indexOf(u8, hosts.content, "skill ops") != null);
+    try std.testing.expect(std.mem.find(u8, hosts.content, "skill ops") != null);
 }
 
 test "an empty guard blocks nothing and the rule count is capped" {

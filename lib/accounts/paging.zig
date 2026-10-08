@@ -119,9 +119,9 @@ test "the pages stop at the page cap" {
     const gpa = std.testing.allocator;
     var trace: std.ArrayList(u8) = .empty;
     defer trace.deinit(gpa);
-    const endless: FakePages.Script = .{ .count = 1, .cursor = "again" };
+    const scripts: [pages_max + 1]FakePages.Script = @splat(.{ .count = 1, .cursor = "again" });
     const models = try collect(FakePages, gpa, std.testing.io, null, &.unbounded, &.{
-        .scripts = &([_]FakePages.Script{endless} ** (pages_max + 1)),
+        .scripts = &scripts,
         .trace = &trace,
     }, FakePages.request);
     defer gpa.free(models);

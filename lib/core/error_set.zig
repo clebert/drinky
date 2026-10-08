@@ -2,8 +2,8 @@ const std = @import("std");
 
 pub fn requireMember(comptime Set: type, comptime err: anyerror) void {
     @setEvalBranchQuota(100_000);
-    for (@typeInfo(Set).error_set.?) |member| {
-        if (std.mem.eql(u8, member.name, @errorName(err))) return;
+    for (@typeInfo(Set).error_set.error_names.?) |name| {
+        if (std.mem.eql(u8, name, @errorName(err))) return;
     }
     @compileError("The error " ++ @errorName(err) ++ " needs its own arm.");
 }

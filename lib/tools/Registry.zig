@@ -317,7 +317,7 @@ test "the runner hands a call to its tool with the state of the host" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "f.txt", .data = "one\ntwo\n" });
     var arguments_buffer: [128]u8 = undefined;
-    const arguments = try std.fmt.bufPrint(&arguments_buffer,
+    const arguments = try std.mem.print(&arguments_buffer,
         \\{{"path":".zig-cache/tmp/{s}/f.txt"}}
     , .{tmp.sub_path});
     const shown = try tools.run(
@@ -370,14 +370,12 @@ test "a guarded change waits for its skill, which a round boundary delivers and 
     var registry: Registry = .{ .host = .{ .io = io }, .skill_guard = &fixture.guard };
     const tools = registry.runner();
 
-    const write_arguments = try std.fmt.allocPrint(
-        gpa,
+    const write_arguments = try gpa.print(
         "{{\"path\":\"{s}/new.zig\",\"content\":\"const y = 2;\\n\"}}",
         .{fixture.root},
     );
     defer gpa.free(write_arguments);
-    const edit_arguments = try std.fmt.allocPrint(
-        gpa,
+    const edit_arguments = try gpa.print(
         "{{\"path\":\"{s}/old.zig\",\"old_text\":\"1\",\"new_text\":\"2\"}}",
         .{fixture.root},
     );
@@ -439,8 +437,7 @@ test "a read of a guarded file queues its skill, and a failed read queues none" 
     var registry: Registry = .{ .host = .{ .io = io }, .skill_guard = &fixture.guard };
     const tools = registry.runner();
 
-    const missing_arguments = try std.fmt.allocPrint(
-        gpa,
+    const missing_arguments = try gpa.print(
         "{{\"path\":\"{s}/missing.zig\"}}",
         .{fixture.root},
     );
@@ -454,7 +451,7 @@ test "a read of a guarded file queues its skill, and a failed read queues none" 
     try testing.expectConditions(&missing, &.{.path_missing});
     try std.testing.expect((try tools.takeSkill(gpa, &.{})) == null);
 
-    const arguments = try std.fmt.allocPrint(gpa, "{{\"path\":\"{s}/a.zig\"}}", .{fixture.root});
+    const arguments = try gpa.print("{{\"path\":\"{s}/a.zig\"}}", .{fixture.root});
     defer gpa.free(arguments);
     const shown = try tools.run(
         gpa,

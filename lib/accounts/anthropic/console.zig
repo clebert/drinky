@@ -53,7 +53,7 @@ fn createApiKey(
     link: *const wire.Link,
     access: []const u8,
 ) ![]u8 {
-    const authorization = try std.fmt.allocPrint(gpa, "Bearer {s}", .{access});
+    const authorization = try gpa.print("Bearer {s}", .{access});
     defer gpa.free(authorization);
     const payload = try wire.postBearer(gpa, io, link, &.{
         .url = create_key_url,
@@ -84,10 +84,10 @@ test authorizeUrl {
     const url = try authorizeUrl(std.testing.allocator, &pkce);
     defer std.testing.allocator.free(url);
     try std.testing.expect(std.mem.startsWith(u8, url, console.url ++ "?code=true&client_id="));
-    try std.testing.expect(std.mem.indexOf(u8, url, "state=sss") != null);
-    try std.testing.expect(std.mem.indexOf(u8, url, "vvv") == null);
-    try std.testing.expect(std.mem.indexOf(u8, url, "org%3Acreate_api_key") != null);
-    try std.testing.expect(std.mem.indexOf(u8, url, "53693") != null);
+    try std.testing.expect(std.mem.find(u8, url, "state=sss") != null);
+    try std.testing.expect(std.mem.find(u8, url, "vvv") == null);
+    try std.testing.expect(std.mem.find(u8, url, "org%3Acreate_api_key") != null);
+    try std.testing.expect(std.mem.find(u8, url, "53693") != null);
 }
 
 test parseField {

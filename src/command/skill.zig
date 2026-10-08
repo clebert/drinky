@@ -40,8 +40,7 @@ fn select(
     const gpa = context.gpa;
     const items = try sorted(gpa, context.skill_registry);
     defer gpa.free(items);
-    return .{ .editor_text = try std.fmt.allocPrint(
-        gpa,
+    return .{ .editor_text = try gpa.print(
         "/{s}:{s} ",
         .{ name, items[selection.row].name },
     ) };
@@ -93,12 +92,12 @@ fn nameLessThan(_: void, a: *const discovery.skills.Skill, b: *const discovery.s
 
 fn firstSentence(description: []const u8) []const u8 {
     var index: usize = 0;
-    while (std.mem.indexOfScalarPos(u8, description, index, '.')) |stop| {
+    while (std.mem.findScalarPos(u8, description, index, '.')) |stop| {
         const end = stop + 1;
         index = end;
         if (end == description.len) break;
-        if (std.mem.indexOfScalar(u8, ui.paint.blank_bytes, description[end]) == null) continue;
-        const next = std.mem.indexOfNone(u8, description[end..], ui.paint.blank_bytes) orelse break;
+        if (std.mem.findScalar(u8, ui.paint.blank_bytes, description[end]) == null) continue;
+        const next = std.mem.findNone(u8, description[end..], ui.paint.blank_bytes) orelse break;
         const start = description[end + next];
         if (start < 'a' or start > 'z') return description[0..end];
     }

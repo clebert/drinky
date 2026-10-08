@@ -61,5 +61,5 @@ pub fn truncate(self: *Turns, count: usize) void {
 }
 
 fn last(self: *Turns) *Turn {
-    return &self.list.items[self.list.items.len - 1];
+    return self.list.lastPtr().?;
 }

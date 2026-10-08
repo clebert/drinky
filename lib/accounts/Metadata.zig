@@ -133,7 +133,7 @@ fn withoutDate(name: []const u8) []const u8 {
 }
 
 pub fn authorOf(name: []const u8) []const u8 {
-    const separator = std.mem.indexOfScalar(u8, name, '/') orelse return name;
+    const separator = std.mem.findScalar(u8, name, '/') orelse return name;
     return name[0..separator];
 }
 
@@ -159,10 +159,10 @@ fn vendorOf(author: []const u8) ?Account.Vendor {
 fn decodeVendor(value: *const std.json.Value) ?Entry {
     const object = providers.json.object(value) orelse return null;
     const id = providers.json.string(object.getPtr("id")) orelse return null;
-    const separator = std.mem.indexOfScalar(u8, id, '/') orelse return null;
+    const separator = std.mem.findScalar(u8, id, '/') orelse return null;
     const vendor = vendorOf(id[0..separator]) orelse return null;
     const name = id[separator + 1 ..];
-    if (std.mem.indexOfScalar(u8, name, ':') != null) return null;
+    if (std.mem.findScalar(u8, name, ':') != null) return null;
 
     var model = Model.init(name) catch return null;
     fillShared(&model, object);
@@ -175,9 +175,9 @@ fn decodeVendor(value: *const std.json.Value) ?Entry {
 fn decodeOpenRouter(value: *const std.json.Value) ?Model {
     const object = providers.json.object(value) orelse return null;
     const id = providers.json.string(object.getPtr("id")) orelse return null;
-    if (std.mem.indexOfScalar(u8, id, ':') != null) return null;
-    const separator = std.mem.indexOfScalar(u8, id, '/') orelse return null;
-    if (std.mem.indexOfScalar(u8, id[separator + 1 ..], '/') != null) return null;
+    if (std.mem.findScalar(u8, id, ':') != null) return null;
+    const separator = std.mem.findScalar(u8, id, '/') orelse return null;
+    if (std.mem.findScalar(u8, id[separator + 1 ..], '/') != null) return null;
     const author = id[0..separator];
     const name = id[separator + 1 ..];
     if (author.len == 0 or name.len == 0) return null;

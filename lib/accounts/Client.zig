@@ -73,7 +73,7 @@ pub fn init(
     errdefer gpa.free(self.codex_account_id);
     switch (account.dialect) {
         .responses => |responses| {
-            self.endpoint = try std.fmt.allocPrint(gpa, "{s}/responses", .{responses.base_url});
+            self.endpoint = try gpa.print("{s}/responses", .{responses.base_url});
             if (responses.codex) {
                 self.codex_account_id = try gpa.dupe(u8, options.codex_account_id);
             }
@@ -217,7 +217,7 @@ test "a client of a usage source reports the pool before the stop, and a failed 
         \\stopped:complete|
         \\
     , first);
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(
         u8,
         transport.requests.items[0],
         "POST https://api.deepseek.com/v1/responses\n",
@@ -328,12 +328,12 @@ test "a client without a usage source passes the stream through" {
         \\stopped:complete|
         \\
     , actual);
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(
         u8,
         transport.requests.items[0],
         "POST https://api.openai.com/v1/responses\n",
     ) != null);
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(
         u8,
         transport.requests.items[0],
         "authorization: Bearer sk-openai\n",
@@ -364,7 +364,7 @@ test "a Codex client names the account in its header and a Gemini client its pro
         transport.requests.items[0],
         "POST https://chatgpt.com/backend-api/codex/responses\n",
     ));
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(
         u8,
         transport.requests.items[0],
         "chatgpt-account-id: account-1\n",

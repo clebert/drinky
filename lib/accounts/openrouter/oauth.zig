@@ -36,8 +36,7 @@ pub fn authorizeUrl(
     pkce: *const wire.Pkce,
     callback_path: []const u8,
 ) ![]u8 {
-    const callback_url = try std.fmt.allocPrint(
-        gpa,
+    const callback_url = try gpa.print(
         "http://localhost:{d}{s}",
         .{ callback_port, callback_path },
     );
@@ -91,9 +90,9 @@ test authorizeUrl {
     const url = try authorizeUrl(std.testing.allocator, &pkce, "/deadbeef");
     defer std.testing.allocator.free(url);
     try std.testing.expect(std.mem.startsWith(u8, url, authorize_url ++ "?callback_url="));
-    try std.testing.expect(std.mem.indexOf(u8, url, "code_challenge_method=S256") != null);
-    try std.testing.expect(std.mem.indexOf(u8, url, "53694") != null);
-    try std.testing.expect(std.mem.indexOf(u8, url, "deadbeef") != null);
+    try std.testing.expect(std.mem.find(u8, url, "code_challenge_method=S256") != null);
+    try std.testing.expect(std.mem.find(u8, url, "53694") != null);
+    try std.testing.expect(std.mem.find(u8, url, "deadbeef") != null);
 }
 
 test callbackPath {

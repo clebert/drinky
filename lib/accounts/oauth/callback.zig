@@ -219,15 +219,15 @@ const Query = struct {
 
 pub fn holdsStateRedirect(line: []const u8) bool {
     if (!fitsRequestLine(line)) return false;
-    if (std.mem.indexOf(u8, line, "error=") != null) return true;
-    return std.mem.indexOf(u8, line, "code=") != null and
-        std.mem.indexOf(u8, line, "state=") != null;
+    if (std.mem.find(u8, line, "error=") != null) return true;
+    return std.mem.find(u8, line, "code=") != null and
+        std.mem.find(u8, line, "state=") != null;
 }
 
 pub fn holdsPathRedirect(options: *const PasteOptions) bool {
     if (!fitsRequestLine(options.line)) return false;
-    if (std.mem.indexOf(u8, options.line, "error=") == null and
-        std.mem.indexOf(u8, options.line, "code=") == null) return false;
+    if (std.mem.find(u8, options.line, "error=") == null and
+        std.mem.find(u8, options.line, "code=") == null) return false;
     const found = targetPath(options.line) orelse return false;
     return std.mem.eql(u8, found, options.path);
 }
@@ -309,7 +309,7 @@ pub fn redirectOf(
         .needle = "code=",
     }) catch |err| switch (err) {
         error.MissingCallbackParam => {
-            if (std.mem.indexOf(u8, request_line, "error=") == null) return null;
+            if (std.mem.find(u8, request_line, "error=") == null) return null;
             if (!endsSignIn(request_line, expected)) return null;
             return error.AuthorizationFailed;
         },
@@ -341,13 +341,13 @@ fn requestPath(request_line: []const u8) ?[]const u8 {
 
 fn targetPath(target: []const u8) ?[]const u8 {
     if (target.len == 0) return null;
-    const after_host = if (std.mem.indexOf(u8, target, "://")) |scheme| body: {
+    const after_host = if (std.mem.find(u8, target, "://")) |scheme| body: {
         const host = target[scheme + 3 ..];
-        const path_start = std.mem.indexOfScalar(u8, host, '/') orelse return "/";
+        const path_start = std.mem.findScalar(u8, host, '/') orelse return "/";
         break :body host[path_start..];
     } else target;
     if (after_host[0] != '/') return null;
-    const query = std.mem.indexOfScalar(u8, after_host, '?') orelse after_host.len;
+    const query = std.mem.findScalar(u8, after_host, '?') orelse after_host.len;
     return after_host[0..query];
 }
 
@@ -371,7 +371,7 @@ fn queryParameter(
 }
 
 fn queryValue(query: *const Query) ?[]const u8 {
-    const at = std.mem.indexOf(u8, query.request_line, query.needle) orelse return null;
+    const at = std.mem.find(u8, query.request_line, query.needle) orelse return null;
     const rest = query.request_line[at + query.needle.len ..];
     const end = std.mem.findAny(u8, rest, "& \r") orelse rest.len;
     return rest[0..end];
@@ -777,7 +777,7 @@ test "a maximal paste frames a request line at the wire byte limit" {
     try std.testing.expect(holdsStateRedirect(&line));
 
     var request: [request_bytes_max]u8 = undefined;
-    const framed = try std.fmt.bufPrint(&request, "GET {s} HTTP/1.1\r\n", .{&line});
+    const framed = try std.mem.print(&request, "GET {s} HTTP/1.1\r\n", .{&line});
     try std.testing.expectEqual(request.len, framed.len);
 
     var fake: Fake = .{ .requests = &.{framed} };

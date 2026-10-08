@@ -75,5 +75,5 @@ description:
   `bool`, `bool` over `u64`, `u64` over `?u64`, `?u64` over `!u64`.
 - **`*const` for large parameters**: pass a parameter as `*const T` when `T` exceeds 16 bytes and
   you do not intend a copy. An accidental stack copy then cannot hide.
-- **Show rounding intent**: divide with `@divExact`, `@divFloor`, or `std.math.divCeil`, and never
-  with a bare `/`. The choice proves that you considered the rounding.
+- **Show rounding intent**: divide with `@divExact`, `@divFloor`, or `@divCeil`, and never with a
+  bare `/`. The choice proves that you considered the rounding.

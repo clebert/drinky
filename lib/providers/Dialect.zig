@@ -217,7 +217,7 @@ pub fn reason(status: std.http.Status) core.Provider.Failure.Reason {
         .payment_required => .quota_exhausted,
         .request_timeout => .network,
         .too_many_requests => .rate_limited,
-        else => if (@divFloor(@intFromEnum(status), 100) == 5) .overloaded else .invalid_request,
+        else => if (@divFloor(@backingInt(status), 100) == 5) .overloaded else .invalid_request,
     };
 }
 
@@ -227,8 +227,8 @@ fn describe(
     detail: []const u8,
 ) error{OutOfMemory}![]const u8 {
     const phrase = status.phrase() orelse "";
-    return std.fmt.allocPrint(arena, "{d}{s}{s}{s}{s}", .{
-        @intFromEnum(status),
+    return arena.print("{d}{s}{s}{s}{s}", .{
+        @backingInt(status),
         if (phrase.len == 0) "" else " ",
         phrase,
         if (detail.len == 0) "" else ": ",
@@ -282,10 +282,10 @@ test "a head status maps to the failure reason of the core" {
         .{ .status = .request_timeout, .reason = .network },
         .{ .status = .too_many_requests, .reason = .rate_limited },
         .{ .status = .internal_server_error, .reason = .overloaded },
-        .{ .status = @enumFromInt(529), .reason = .overloaded },
+        .{ .status = @fromBackingInt(529), .reason = .overloaded },
         .{ .status = .forbidden, .reason = .invalid_request },
         .{ .status = .bad_request, .reason = .invalid_request },
-        .{ .status = @enumFromInt(999), .reason = .invalid_request },
+        .{ .status = @fromBackingInt(999), .reason = .invalid_request },
     };
     for (cases) |case| try std.testing.expectEqual(case.reason, reason(case.status));
 }
@@ -304,6 +304,6 @@ test "describe names the status, its phrase, and the detail that exists" {
     );
     try std.testing.expectEqualStrings(
         "999: raw",
-        try describe(allocator, @enumFromInt(999), "raw"),
+        try describe(allocator, @fromBackingInt(999), "raw"),
     );
 }

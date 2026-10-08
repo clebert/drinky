@@ -127,7 +127,7 @@ fn dateUtc(timestamp: std.Io.Timestamp) ?[10]u8 {
     const year_day = epoch_seconds.getEpochDay().calculateYearDay();
     const month_day = year_day.calculateMonthDay();
     var date: [10]u8 = undefined;
-    const rendered = std.fmt.bufPrint(&date, "{d:0>4}-{d:0>2}-{d:0>2}", .{
+    const rendered = std.mem.print(&date, "{d:0>4}-{d:0>2}-{d:0>2}", .{
         year_day.year,
         month_day.month.numeric(),
         month_day.day_index + 1,
@@ -342,19 +342,19 @@ test "composition orders sections and preserves instruction Markdown" {
     defer gpa.free(prompt);
 
     try std.testing.expect(std.mem.startsWith(u8, prompt, default_core));
-    const environment_index = std.mem.indexOf(u8, prompt, "## Environment").?;
-    const precedence_index = std.mem.indexOf(u8, prompt, "## Instruction precedence").?;
-    const project_index = std.mem.indexOf(u8, prompt, "## Project instructions").?;
-    const skills_index = std.mem.indexOf(u8, prompt, "## Skills").?;
+    const environment_index = std.mem.find(u8, prompt, "## Environment").?;
+    const precedence_index = std.mem.find(u8, prompt, "## Instruction precedence").?;
+    const project_index = std.mem.find(u8, prompt, "## Project instructions").?;
+    const skills_index = std.mem.find(u8, prompt, "## Skills").?;
     try std.testing.expect(environment_index < precedence_index);
     try std.testing.expect(precedence_index < project_index);
     try std.testing.expect(project_index < skills_index);
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(
         u8,
         prompt,
         "<current_date>1970-01-01</current_date>",
     ) != null);
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(
         u8,
         prompt,
         "1. The system prompt core.\n" ++
@@ -364,16 +364,16 @@ test "composition orders sections and preserves instruction Markdown" {
             "sources.\n" ++
             "A more specific project instruction file wins in its own directory tree.",
     ) != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "The user instructions.") == null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "repo&amp;root/package") != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, broad) != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "left &amp;&amp;") == null);
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(u8, prompt, "The user instructions.") == null);
+    try std.testing.expect(std.mem.find(u8, prompt, "repo&amp;root/package") != null);
+    try std.testing.expect(std.mem.find(u8, prompt, broad) != null);
+    try std.testing.expect(std.mem.find(u8, prompt, "left &amp;&amp;") == null);
+    try std.testing.expect(std.mem.find(
         u8,
         prompt,
         "Use &lt;this&gt; &amp; &quot;that&quot;…",
     ) != null);
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(
         u8,
         prompt,
         "The skills below provide specialized instructions.\n" ++
@@ -381,33 +381,33 @@ test "composition orders sections and preserves instruction Markdown" {
             "skill file before you proceed.\n\n" ++
             "<skills>\n  <skill_file path=\"/skills/a&apos;b/SKILL.md\">",
     ) != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "<location>") == null);
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(u8, prompt, "<location>") == null);
+    try std.testing.expect(std.mem.find(
         u8,
         prompt,
         "<skill_file path=\"/skills/second/SKILL.md\">\n" ++
             "    <name>second</name>\n" ++
             "    <description>Use the second skill.</description>",
     ) != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "<name>hidden</name>") == null);
+    try std.testing.expect(std.mem.find(u8, prompt, "<name>hidden</name>") == null);
     try std.testing.expectEqual(
         @as(usize, 2),
         std.mem.count(u8, prompt, "<skill_file path="),
     );
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(
         u8,
         prompt,
         "## Project instructions\n\n" ++
             "<project_instructions>\n" ++
             "  <instruction_file path=\"",
     ) != null);
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(
         u8,
         prompt,
         "  </instruction_file>\n</project_instructions>\n\n## Skills",
     ) != null);
-    const broad_index = std.mem.indexOf(u8, prompt, "# Broad").?;
-    const specific_index = std.mem.indexOf(u8, prompt, "\">\nspecific\n").?;
+    const broad_index = std.mem.find(u8, prompt, "# Broad").?;
+    const specific_index = std.mem.find(u8, prompt, "\">\nspecific\n").?;
     try std.testing.expect(broad_index < specific_index);
 }
 
@@ -481,10 +481,10 @@ test "the required skills section names every rule and stays out without one" {
     const prompt = try compose(gpa, &options);
     defer gpa.free(prompt);
 
-    const skills_index = std.mem.indexOf(u8, prompt, "## Skills").?;
-    const required_index = std.mem.indexOf(u8, prompt, "## Required skills").?;
+    const skills_index = std.mem.find(u8, prompt, "## Skills").?;
+    const required_index = std.mem.find(u8, prompt, "## Required skills").?;
     try std.testing.expect(skills_index < required_index);
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(
         u8,
         prompt,
         "Drinky refuses the write tool and the edit tool for a file of that pattern until " ++
@@ -501,8 +501,8 @@ test "the required skills section names every rule and stays out without one" {
     plain_options.skills = &skill_items;
     const plain = try compose(gpa, &plain_options);
     defer gpa.free(plain);
-    try std.testing.expect(std.mem.indexOf(u8, plain, "## Skills") != null);
-    try std.testing.expect(std.mem.indexOf(u8, plain, "## Required skills") == null);
+    try std.testing.expect(std.mem.find(u8, plain, "## Skills") != null);
+    try std.testing.expect(std.mem.find(u8, plain, "## Required skills") == null);
 }
 
 test "generated paths cannot add prompt lines or controls" {
@@ -512,7 +512,7 @@ test "generated paths cannot add prompt lines or controls" {
     const prompt = try compose(gpa, &options);
     defer gpa.free(prompt);
 
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(
         u8,
         prompt,
         "  <working_directory>/work\\x0a```\\x1b\\xe2\\x80\\xae&amp;&quot;&apos;" ++
@@ -534,8 +534,8 @@ test "a session lists a skill that its metadata hides from a run, and a run leav
     session_options.skills = &skill_items;
     const session_prompt = try compose(gpa, &session_options);
     defer gpa.free(session_prompt);
-    try std.testing.expect(std.mem.indexOf(u8, session_prompt, "<name>review</name>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, session_prompt, "2. The skills.") != null);
+    try std.testing.expect(std.mem.find(u8, session_prompt, "<name>review</name>") != null);
+    try std.testing.expect(std.mem.find(u8, session_prompt, "2. The skills.") != null);
 
     var run_options = emptyOptions();
     run_options.skills = &skill_items;
@@ -582,8 +582,8 @@ test "empty project and skill sections are omitted independently" {
     skill_options.skills = &visible_items;
     const skill_prompt = try compose(gpa, &skill_options);
     defer gpa.free(skill_prompt);
-    try std.testing.expect(std.mem.indexOf(u8, skill_prompt, "## Project instructions") == null);
-    try std.testing.expect(std.mem.indexOf(u8, skill_prompt, "## Skills") != null);
+    try std.testing.expect(std.mem.find(u8, skill_prompt, "## Project instructions") == null);
+    try std.testing.expect(std.mem.find(u8, skill_prompt, "## Skills") != null);
 
     var tree: testing.Tree = try .init();
     defer tree.deinit();
@@ -598,6 +598,6 @@ test "empty project and skill sections are omitted independently" {
     project_options.skills = &hidden_items;
     const project_prompt = try compose(gpa, &project_options);
     defer gpa.free(project_prompt);
-    try std.testing.expect(std.mem.indexOf(u8, project_prompt, "## Project instructions") != null);
-    try std.testing.expect(std.mem.indexOf(u8, project_prompt, "## Skills") == null);
+    try std.testing.expect(std.mem.find(u8, project_prompt, "## Project instructions") != null);
+    try std.testing.expect(std.mem.find(u8, project_prompt, "## Skills") == null);
 }

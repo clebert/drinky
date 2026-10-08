@@ -1,5 +1,6 @@
 const std = @import("std");
 
+const core = @import("core");
 const tools = @import("tools");
 
 const escape = @import("../escape.zig");
@@ -236,7 +237,7 @@ pub const Registry = struct {
             );
             return;
         }
-        if (std.mem.indexOfScalar(u8, description, 0) != null) {
+        if (std.mem.findScalar(u8, description, 0) != null) {
             try self.report(
                 .failure,
                 "Drinky skipped {s} because the skill description contains a NUL byte.",
@@ -245,8 +246,8 @@ pub const Registry = struct {
             return;
         }
 
-        const directory_path = std.fs.path.dirname(path).?;
-        const directory_name = std.fs.path.basename(directory_path);
+        const directory_path = std.Io.Dir.path.dirname(path).?;
+        const directory_name = std.Io.Dir.path.basename(directory_path);
         const name_source = if (frontmatter.name) |declared| name: {
             if (nameValid(declared)) break :name declared;
             const safe = try escape.diagnostic(self.gpa, declared);
@@ -367,8 +368,8 @@ pub fn discover(
     io: std.Io,
     options: *const DiscoverOptions,
 ) !Registry {
-    std.debug.assert(std.fs.path.isAbsolute(options.user_root));
-    std.debug.assert(std.fs.path.isAbsolute(options.project_start));
+    std.debug.assert(std.Io.Dir.path.isAbsolute(options.user_root));
+    std.debug.assert(std.Io.Dir.path.isAbsolute(options.project_start));
     const boundary = options.project_root orelse options.project_start;
     std.debug.assert(tools.format.contains(&.{
         .boundary = boundary,
@@ -382,8 +383,8 @@ pub fn discover(
     defer if (user_root_canonical) |path| gpa.free(path);
 
     var current = options.project_start;
-    for (0..std.fs.max_path_bytes) |_| {
-        const skills_root = try std.fs.path.join(gpa, &.{ current, ".agents", "skills" });
+    for (0..std.Io.Dir.max_path_bytes) |_| {
+        const skills_root = try std.Io.Dir.path.join(gpa, &.{ current, ".agents", "skills" });
         defer gpa.free(skills_root);
         var matches_user_root = std.mem.eql(u8, skills_root, options.user_root);
         if (!matches_user_root and user_root_canonical != null) {
@@ -396,7 +397,7 @@ pub fn discover(
         }
         if (!matches_user_root) try registry.scanRoot(io, skills_root, .project);
         if (current.len <= boundary.len) break;
-        const parent = std.fs.path.dirname(current) orelse break;
+        const parent = std.Io.Dir.path.dirname(current) orelse break;
         if (std.mem.eql(u8, parent, current)) break;
         current = parent;
     }
@@ -481,7 +482,7 @@ test "discovery is recursive and project skills shadow user and ancestor skills"
     try std.testing.expect(registry.get("other").?.replaced_path == null);
     try std.testing.expectEqual(@as(usize, 1), registry.reports.messages().len);
     try std.testing.expect(
-        std.mem.indexOf(u8, registry.reports.messages()[0].content, "has priority") != null,
+        std.mem.find(u8, registry.reports.messages()[0].content, "has priority") != null,
     );
 }
 
@@ -523,9 +524,9 @@ test "a skill file above the window of one read call is skipped" {
     defer tree.deinit();
 
     const head = "---\nname: {s}\ndescription: a long skill\n---\n";
-    const wide = try std.fmt.allocPrint(gpa, head ++ "{s}\n", .{
+    const wide = try gpa.print(head ++ "{s}\n", .{
         "wide",
-        "x" ** (tools.read.bytes_max + 1),
+        core.text.repeat("x", tools.read.bytes_max + 1),
     });
     defer gpa.free(wide);
     try tree.write("user/wide/SKILL.md", wide);
@@ -555,12 +556,12 @@ test "a skill file above the window of one read call is skipped" {
     try std.testing.expect(registry.get("tall") == null);
     try std.testing.expect(registry.get("edge") != null);
     try std.testing.expectEqual(@as(usize, 2), registry.reports.messages().len);
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(
         u8,
         registry.reports.messages()[1].content,
         "larger than",
     ) != null);
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(
         u8,
         registry.reports.messages()[0].content,
         "more than",
@@ -580,7 +581,7 @@ test "a skill that loads warns, and a skipped skill fails" {
         "description: hidden from the model\n" ++
         "disable-model-invocation: true\n---\nbody\n");
     try tree.write("user/long/SKILL.md", "---\nname: long\ndescription: " ++
-        "x" ** (description_codepoints_max + 1) ++ "\n---\nbody\n");
+        core.text.repeat("x", description_codepoints_max + 1) ++ "\n---\nbody\n");
     try tree.write("user/Bad Name/SKILL.md", "---\n" ++
         "description: a directory name that is not a valid skill name\n---\nbody\n");
     try tree.directory("work");
@@ -613,8 +614,8 @@ test "a skill that loads warns, and a skipped skill fails" {
     const manual = registry.get("manual").?;
     const explicit = try manual.invoke(gpa, io, "");
     defer gpa.free(explicit);
-    try std.testing.expect(std.mem.indexOf(u8, explicit, manual.path) != null);
-    try std.testing.expect(std.mem.indexOf(u8, explicit, "body") != null);
+    try std.testing.expect(std.mem.find(u8, explicit, manual.path) != null);
+    try std.testing.expect(std.mem.find(u8, explicit, "body") != null);
 }
 
 test "an inline metadata value hides no skill from a run and warns" {
@@ -640,8 +641,7 @@ test "an inline metadata value hides no skill from a run and warns" {
     try std.testing.expectEqual(@as(usize, 1), reports.len);
     try std.testing.expectEqual(Message.Severity.warning, reports[0].severity);
     const path = try tree.path("user/inline/SKILL.md");
-    const expected = try std.fmt.allocPrint(
-        gpa,
+    const expected = try gpa.print(
         "Drinky ignored the metadata in {s} because the value is not a block map.",
         .{path},
     );
@@ -671,8 +671,8 @@ test "explicit invocation loads the full file and appends arguments" {
     const prompt = try skill.invoke(gpa, io, "apply it to report.pdf");
     defer gpa.free(prompt);
     try std.testing.expect(std.mem.startsWith(u8, prompt, "Skill location: "));
-    try std.testing.expect(std.mem.indexOf(u8, prompt, skill.path) != null);
-    try std.testing.expect(std.mem.indexOf(u8, prompt, source) != null);
+    try std.testing.expect(std.mem.find(u8, prompt, skill.path) != null);
+    try std.testing.expect(std.mem.find(u8, prompt, source) != null);
     try std.testing.expect(std.mem.endsWith(u8, prompt, "\napply it to report.pdf"));
 }
 
@@ -713,8 +713,8 @@ test "a skill whose path is not valid UTF-8 is skipped with a safe warning" {
     try std.testing.expectEqual(@as(usize, 1), registry.reports.messages().len);
     const notice = registry.reports.messages()[0];
     try std.testing.expectEqual(Message.Severity.failure, notice.severity);
-    try std.testing.expect(std.mem.indexOf(u8, notice.content, "not valid UTF-8") != null);
-    try std.testing.expect(std.mem.indexOf(u8, notice.content, "\\xff") != null);
+    try std.testing.expect(std.mem.find(u8, notice.content, "not valid UTF-8") != null);
+    try std.testing.expect(std.mem.find(u8, notice.content, "\\xff") != null);
 }
 
 fn checkDiscoverAllocationFailure(

@@ -55,7 +55,7 @@ pub fn locate(
     directories: *const Directories,
     name: []const u8,
 ) error{OutOfMemory}![]u8 {
-    return std.fs.path.resolve(
+    return std.Io.Dir.path.resolve(
         gpa,
         &.{ directories.working_directory, directories.home, ".drinky", name },
     );
@@ -152,7 +152,7 @@ fn rewrite(
 }
 
 fn ensureParent(io: std.Io, path: []const u8) !void {
-    if (std.fs.path.dirname(path)) |directory| {
+    if (std.Io.Dir.path.dirname(path)) |directory| {
         std.Io.Dir.cwd().createDirPath(io, directory) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return err,
@@ -161,14 +161,14 @@ fn ensureParent(io: std.Io, path: []const u8) !void {
 }
 
 fn lockFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !std.Io.File {
-    const lock_path = try std.fmt.allocPrint(gpa, "{s}.lock", .{path});
+    const lock_path = try gpa.print("{s}.lock", .{path});
     defer gpa.free(lock_path);
     for (0..lock_attempts_max) |attempt| {
         const file = std.Io.Dir.cwd().createFile(io, lock_path, .{
             .truncate = false,
             .lock = .exclusive,
             .lock_nonblocking = true,
-            .permissions = @enumFromInt(0o600),
+            .permissions = .fromMode(0o600),
         }) catch |err| switch (err) {
             error.WouldBlock => {
                 if (attempt + 1 == lock_attempts_max) return error.StoreBusy;
@@ -203,7 +203,7 @@ fn stringMatches(
 
 fn replaceFile(io: std.Io, path: []const u8, body: []const u8) !void {
     var atomic = try std.Io.Dir.cwd().createFileAtomic(io, path, .{
-        .permissions = @enumFromInt(0o600),
+        .permissions = .fromMode(0o600),
         .replace = true,
     });
     defer atomic.deinit(io);
@@ -463,8 +463,8 @@ test "save replaces the file atomically at owner-only permissions" {
     try save(gpa, io, &.{ .path = path, .key = "openai-plan" }, entry, .{});
     const before = try tmp.dir.statFile(io, "auth.json", .{});
     try std.testing.expectEqual(
-        @as(u32, 0o600),
-        @as(u32, @intCast(@intFromEnum(before.permissions))) & 0o777,
+        @as(std.posix.mode_t, 0o600),
+        before.permissions.toMode() & 0o777,
     );
 
     try save(gpa, io, &.{ .path = path, .key = "anthropic-plan" }, entry, .{});

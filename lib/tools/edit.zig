@@ -92,9 +92,9 @@ fn applyEdit(
     edit: *const struct { data: []const u8, old: []const u8, new: []const u8 },
 ) error{ EmptyOldText, NotFound, NotUnique, OutOfMemory }![]u8 {
     if (edit.old.len == 0) return error.EmptyOldText;
-    const index = std.mem.indexOf(u8, edit.data, edit.old) orelse return error.NotFound;
-    if (std.mem.indexOfPos(u8, edit.data, index + 1, edit.old) != null) return error.NotUnique;
-    return std.fmt.allocPrint(gpa, "{s}{s}{s}", .{
+    const index = std.mem.find(u8, edit.data, edit.old) orelse return error.NotFound;
+    if (std.mem.findPos(u8, edit.data, index + 1, edit.old) != null) return error.NotUnique;
+    return gpa.print("{s}{s}{s}", .{
         edit.data[0..index],
         edit.new,
         edit.data[index + edit.old.len ..],
@@ -134,13 +134,13 @@ test "edit rewrites the file on disk" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "f.txt", .data = "one two three" });
     var input_buffer: [160]u8 = undefined;
-    const input = try std.fmt.bufPrint(&input_buffer,
+    const input = try std.mem.print(&input_buffer,
         \\{{"path":".zig-cache/tmp/{s}/f.txt","old_text":"two","new_text":"2"}}
     , .{tmp.sub_path});
     const result = try run(&context, input);
     defer result.deinit(gpa);
     try std.testing.expect(!result.hasFailure());
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "edited") != null);
+    try std.testing.expect(std.mem.find(u8, result.content, "edited") != null);
     const data = try tmp.dir.readFileAlloc(io, "f.txt", gpa, .limited(64));
     defer gpa.free(data);
     try std.testing.expectEqualStrings("one 2 three", data);
@@ -158,7 +158,7 @@ test "an edit through a link changes the target, and an edited file keeps its mo
     try tmp.dir.setFilePermissions(io, "run.sh", .fromMode(0o755), .{});
     var input_buffer: [160]u8 = undefined;
 
-    const linked = try std.fmt.bufPrint(&input_buffer,
+    const linked = try std.mem.print(&input_buffer,
         \\{{"path":".zig-cache/tmp/{s}/CLAUDE.md","old_text":"two","new_text":"2"}}
     , .{tmp.sub_path});
     const through = try run(&context, linked);
@@ -171,7 +171,7 @@ test "an edit through a link changes the target, and an edited file keeps its mo
     const link_len = try tmp.dir.readLink(io, "CLAUDE.md", &link_buffer);
     try std.testing.expectEqualStrings("AGENTS.md", link_buffer[0..link_len]);
 
-    const script = try std.fmt.bufPrint(&input_buffer,
+    const script = try std.mem.print(&input_buffer,
         \\{{"path":".zig-cache/tmp/{s}/run.sh","old_text":"one","new_text":"two"}}
     , .{tmp.sub_path});
     const kept = try run(&context, script);
@@ -190,7 +190,7 @@ test "edit measures the lines it took out and put in" {
     try tmp.dir.writeFile(io, .{ .sub_path = "f.txt", .data = "one\ntwo\nthree\nfour\n" });
     var input_buffer: [192]u8 = undefined;
     {
-        const input = try std.fmt.bufPrint(&input_buffer,
+        const input = try std.mem.print(&input_buffer,
             \\{{"path":".zig-cache/tmp/{s}/f.txt","old_text":"two\nthree","new_text":"2"}}
         , .{tmp.sub_path});
         const result = try run(&context, input);
@@ -199,7 +199,7 @@ test "edit measures the lines it took out and put in" {
         try testing.expectConditions(&result, &.{});
     }
     {
-        const input = try std.fmt.bufPrint(&input_buffer,
+        const input = try std.mem.print(&input_buffer,
             \\{{"path":".zig-cache/tmp/{s}/f.txt","old_text":"2\n","new_text":""}}
         , .{tmp.sub_path});
         const result = try run(&context, input);
@@ -222,7 +222,7 @@ test "a missing or ambiguous old_text names its condition" {
         .{ .old = "", .condition = .invalid_arguments },
     };
     for (cases) |case| {
-        const input = try std.fmt.bufPrint(&input_buffer,
+        const input = try std.mem.print(&input_buffer,
             \\{{"path":".zig-cache/tmp/{s}/f.txt","old_text":"{s}","new_text":"2"}}
         , .{ tmp.sub_path, case.old });
         const result = try run(&context, input);
@@ -241,7 +241,7 @@ test "edit canceled while reading propagates" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "f.txt", .data = "one two three" });
     var input_buffer: [160]u8 = undefined;
-    const input = try std.fmt.bufPrint(&input_buffer,
+    const input = try std.mem.print(&input_buffer,
         \\{{"path":".zig-cache/tmp/{s}/f.txt","old_text":"two","new_text":"2"}}
     , .{tmp.sub_path});
     var cancel: testing.CancelIo = .init(.file_open);
@@ -256,7 +256,7 @@ test "edit canceled mid-write propagates and leaves the file untouched" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "f.txt", .data = "one two three" });
     var input_buffer: [160]u8 = undefined;
-    const input = try std.fmt.bufPrint(&input_buffer,
+    const input = try std.mem.print(&input_buffer,
         \\{{"path":".zig-cache/tmp/{s}/f.txt","old_text":"two","new_text":"2"}}
     , .{tmp.sub_path});
     var cancel: testing.CancelIo = .init(.file_write);
@@ -277,11 +277,11 @@ test "edit rejects an oversized file" {
     @memset(data, 'a');
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "big.txt", .data = data });
     var input_buffer: [160]u8 = undefined;
-    const input = try std.fmt.bufPrint(&input_buffer,
+    const input = try std.mem.print(&input_buffer,
         \\{{"path":".zig-cache/tmp/{s}/big.txt","old_text":"a","new_text":"b"}}
     , .{tmp.sub_path});
     const result = try run(&context, input);
     defer result.deinit(gpa);
     try testing.expectConditions(&result, &.{.path_too_large});
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "larger than") != null);
+    try std.testing.expect(std.mem.find(u8, result.content, "larger than") != null);
 }

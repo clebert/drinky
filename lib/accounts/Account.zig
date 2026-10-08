@@ -220,7 +220,7 @@ test "an account identifier starts with its vendor and ends in -key without a lo
     for (&table, 0..) |*account, position| {
         const prefix = @tagName(account.vendor);
         try std.testing.expect(std.mem.startsWith(u8, account.id, prefix));
-        try std.testing.expect(std.mem.indexOfAny(u8, account.id, "_/") == null);
+        try std.testing.expect(std.mem.findAny(u8, account.id, "_/") == null);
         try std.testing.expectEqual(position, index(account.id).?);
         try std.testing.expectEqual(!account.hasLogin(), account.setting() != null);
         try std.testing.expectEqual(account.id[prefix.len], '-');

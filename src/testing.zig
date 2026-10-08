@@ -112,7 +112,7 @@ pub const Clock = struct {
 };
 
 pub fn expectContains(text: []const u8, needle: []const u8) !void {
-    if (std.mem.indexOf(u8, text, needle) != null) return;
+    if (std.mem.find(u8, text, needle) != null) return;
     std.debug.print("the text holds no \"{s}\":\n{s}\n", .{ needle, text });
     return error.TestExpectedNeedle;
 }
@@ -138,7 +138,7 @@ pub const Tree = struct {
 
     pub fn path(self: *Tree, sub_path: []const u8) ![]const u8 {
         const gpa = std.testing.allocator;
-        const joined = try std.fs.path.join(gpa, &.{ self.root, sub_path });
+        const joined = try std.Io.Dir.path.join(gpa, &.{ self.root, sub_path });
         errdefer gpa.free(joined);
         try self.paths.append(gpa, joined);
         return joined;
@@ -149,7 +149,7 @@ pub const Tree = struct {
     }
 
     pub fn write(self: *Tree, sub_path: []const u8, data: []const u8) !void {
-        if (std.fs.path.dirname(sub_path)) |parent| try self.directory(parent);
+        if (std.Io.Dir.path.dirname(sub_path)) |parent| try self.directory(parent);
         try self.tmp.dir.writeFile(std.testing.io, .{ .sub_path = sub_path, .data = data });
     }
 
@@ -159,9 +159,9 @@ pub const Tree = struct {
         options: *const struct { name: []const u8, description: []const u8 },
     ) !void {
         var path_buffer: [256]u8 = undefined;
-        const sub_path = try std.fmt.bufPrint(&path_buffer, "{s}/SKILL.md", .{parent});
+        const sub_path = try std.mem.print(&path_buffer, "{s}/SKILL.md", .{parent});
         var source_buffer: [512]u8 = undefined;
-        const source = try std.fmt.bufPrint(
+        const source = try std.mem.print(
             &source_buffer,
             "---\nname: {s}\ndescription: {s}\n---\nFollow this skill.\n",
             .{ options.name, options.description },
@@ -204,7 +204,7 @@ pub const FakeHerdr = struct {
         errdefer self.tmp.cleanup();
         var home_buffer: [128]u8 = undefined;
         const home = try accounts.testing.tmpHome(&home_buffer, &self.tmp);
-        const socket_path = try std.fmt.bufPrint(&self.path_buffer, "{s}/herdr.sock", .{home});
+        const socket_path = try std.mem.print(&self.path_buffer, "{s}/herdr.sock", .{home});
         self.path_length = socket_path.len;
         const address = try std.Io.net.UnixAddress.init(socket_path);
         self.server = try address.listen(io, .{});

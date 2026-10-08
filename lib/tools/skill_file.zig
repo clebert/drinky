@@ -18,7 +18,7 @@ pub fn write(
 ) std.Io.Writer.Error!void {
     try writer.print(
         "Skill location: {s}\nResolve relative paths in this skill against: {s}\n\n{s}",
-        .{ skill.path, std.fs.path.dirname(skill.path) orelse ".", skill.content },
+        .{ skill.path, std.Io.Dir.path.dirname(skill.path) orelse ".", skill.content },
     );
 }
 

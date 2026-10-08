@@ -62,7 +62,7 @@ pub fn close(self: Transport) void {
 }
 
 pub fn validHeaderValue(value: []const u8) bool {
-    return value.len != 0 and std.mem.indexOfAny(u8, value, "\r\n") == null;
+    return value.len != 0 and std.mem.findAny(u8, value, "\r\n") == null;
 }
 
 test "a header value cannot split the request head" {

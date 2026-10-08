@@ -143,7 +143,7 @@ fn decodeControlSequence(data: []const u8) ?Decoded {
 }
 
 fn decodePasteBody(body: []const u8) ?Decoded {
-    if (std.mem.indexOf(u8, body, escape.paste_end)) |end| {
+    if (std.mem.find(u8, body, escape.paste_end)) |end| {
         return .{
             .key = .{ .paste = .{ .bytes = body[0..end], .final = true } },
             .consumed = end + escape.paste_end.len,
@@ -173,7 +173,7 @@ fn mapControlSequence(parameters: []const u8, final: u8) Key {
 fn mapCsiU(parameters: []const u8) Key {
     var codepoint_field = parameters;
     var modifier_field: []const u8 = "1";
-    if (std.mem.indexOfScalar(u8, parameters, ';')) |semicolon| {
+    if (std.mem.findScalar(u8, parameters, ';')) |semicolon| {
         codepoint_field = parameters[0..semicolon];
         modifier_field = parameters[semicolon + 1 ..];
     }
@@ -192,7 +192,7 @@ fn mapCsiU(parameters: []const u8) Key {
 }
 
 fn beforeColon(field: []const u8) []const u8 {
-    const colon = std.mem.indexOfScalar(u8, field, ':') orelse return field;
+    const colon = std.mem.findScalar(u8, field, ':') orelse return field;
     return field[0..colon];
 }
 
@@ -250,7 +250,7 @@ test "tab decodes as its own key, and a modified tab stays unknown" {
     try expectKeys("\x1b[9;2u", &.{.unknown});
     for (2..257) |modifier| {
         var sequence_buffer: [16]u8 = undefined;
-        const sequence = try std.fmt.bufPrint(&sequence_buffer, "\x1b[9;{d}u", .{modifier});
+        const sequence = try std.mem.print(&sequence_buffer, "\x1b[9;{d}u", .{modifier});
         try expectKeys(sequence, &.{.unknown});
     }
 }
@@ -416,7 +416,7 @@ test "controls, cr, and escape inside a paste stay payload" {
 test "an unterminated csi past the limit is abandoned as unknown" {
     var input = Input.init(std.testing.allocator);
     defer input.deinit();
-    try input.feed("\x1b[" ++ ";" ** sequence_flush_len);
+    try input.feed("\x1b[" ++ @as([sequence_flush_len]u8, @splat(';')));
     try std.testing.expectEqualDeep(Key.unknown, input.next().?);
     try input.feed("a");
     try std.testing.expectEqualDeep(Key{ .char = 'a' }, input.next().?);

@@ -78,7 +78,7 @@ pub fn numberedLines(gpa: std.mem.Allocator, count: usize) !std.ArrayList(u8) {
 
 pub fn expectShows(painted: []const u8, texts: []const []const u8) !void {
     for (texts) |text| {
-        if (std.mem.indexOf(u8, painted, text) != null) continue;
+        if (std.mem.find(u8, painted, text) != null) continue;
         std.debug.print("The painted bytes do not show \"{s}\".\n", .{text});
         return error.TestExpectedShown;
     }
@@ -86,7 +86,7 @@ pub fn expectShows(painted: []const u8, texts: []const []const u8) !void {
 
 pub fn expectHides(painted: []const u8, texts: []const []const u8) !void {
     for (texts) |text| {
-        if (std.mem.indexOf(u8, painted, text) == null) continue;
+        if (std.mem.find(u8, painted, text) == null) continue;
         std.debug.print("The painted bytes still show \"{s}\".\n", .{text});
         return error.TestExpectedHidden;
     }

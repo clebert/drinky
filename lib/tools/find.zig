@@ -154,7 +154,7 @@ test "find matches files by glob under a directory" {
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "a.zig", .data = "" });
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "b.txt", .data = "" });
     var input_buffer: [128]u8 = undefined;
-    const input = try std.fmt.bufPrint(&input_buffer,
+    const input = try std.mem.print(&input_buffer,
         \\{{"pattern":"**/*.zig","path":".zig-cache/tmp/{s}"}}
     , .{tmp.sub_path});
     const result = try run(&context, input);
@@ -162,7 +162,7 @@ test "find matches files by glob under a directory" {
     try std.testing.expect(!result.hasFailure());
     var expected_buffer: [128]u8 = undefined;
     const expected =
-        try std.fmt.bufPrint(&expected_buffer, ".zig-cache/tmp/{s}/a.zig", .{tmp.sub_path});
+        try std.mem.print(&expected_buffer, ".zig-cache/tmp/{s}/a.zig", .{tmp.sub_path});
     try std.testing.expectEqualStrings(expected, result.content);
     try testing.expectTimed(&result, &.{.{ .matches, 1 }});
     try testing.expectConditions(&result, &.{});
@@ -175,14 +175,14 @@ test "find keeps one slash after a search directory with a trailing slash" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "a.zig", .data = "" });
     var input_buffer: [128]u8 = undefined;
-    const input = try std.fmt.bufPrint(&input_buffer,
+    const input = try std.mem.print(&input_buffer,
         \\{{"pattern":"*.zig","path":".zig-cache/tmp/{s}/"}}
     , .{tmp.sub_path});
     const result = try run(&context, input);
     defer result.deinit(gpa);
     var expected_buffer: [128]u8 = undefined;
     const expected =
-        try std.fmt.bufPrint(&expected_buffer, ".zig-cache/tmp/{s}/a.zig", .{tmp.sub_path});
+        try std.mem.print(&expected_buffer, ".zig-cache/tmp/{s}/a.zig", .{tmp.sub_path});
     try std.testing.expectEqualStrings(expected, result.content);
 }
 
@@ -200,7 +200,7 @@ test "find lists a link to a file and follows no link to a directory" {
     try docs.writeFile(io, .{ .sub_path = "guide.md", .data = "" });
     try tmp.dir.symLink(io, ".", "loop", .{ .is_directory = true });
     var input_buffer: [128]u8 = undefined;
-    const input = try std.fmt.bufPrint(&input_buffer,
+    const input = try std.mem.print(&input_buffer,
         \\{{"pattern":"**/*.md","path":".zig-cache/tmp/{s}"}}
     , .{tmp.sub_path});
 
@@ -208,7 +208,7 @@ test "find lists a link to a file and follows no link to a directory" {
     defer result.deinit(gpa);
     try std.testing.expect(!result.hasFailure());
     var expected_buffer: [256]u8 = undefined;
-    const expected = try std.fmt.bufPrint(
+    const expected = try std.mem.print(
         &expected_buffer,
         ".zig-cache/tmp/{s}/AGENTS.md\n.zig-cache/tmp/{s}/CLAUDE.md\n" ++
             ".zig-cache/tmp/{s}/docs/guide.md",
@@ -227,14 +227,14 @@ test "find reports how many more matched beyond the limit" {
         try tmp.dir.writeFile(std.testing.io, .{ .sub_path = name, .data = "" });
     }
     var input_buffer: [128]u8 = undefined;
-    const input = try std.fmt.bufPrint(&input_buffer,
+    const input = try std.mem.print(&input_buffer,
         \\{{"pattern":"*.txt","path":".zig-cache/tmp/{s}","limit":1}}
     , .{tmp.sub_path});
     const result = try run(&context, input);
     defer result.deinit(gpa);
     try std.testing.expect(!result.hasFailure());
     var expected_buffer: [128]u8 = undefined;
-    const expected = try std.fmt.bufPrint(
+    const expected = try std.mem.print(
         &expected_buffer,
         ".zig-cache/tmp/{s}/a.txt\n[Drinky omitted 2 matches. Increase limit to see them.]",
         .{tmp.sub_path},
@@ -242,7 +242,7 @@ test "find reports how many more matched beyond the limit" {
     try std.testing.expectEqualStrings(expected, result.content);
     try testing.expectTimed(&result, &.{ .{ .matches, 1 }, .{ .matches_omitted, 2 } });
 
-    const single_input = try std.fmt.bufPrint(&input_buffer,
+    const single_input = try std.mem.print(&input_buffer,
         \\{{"pattern":"*.txt","path":".zig-cache/tmp/{s}","limit":2}}
     , .{tmp.sub_path});
     const single = try run(&context, single_input);
@@ -268,7 +268,7 @@ test "find reports a search that reached the entry cap" {
     }
     var input_buffer: [128]u8 = undefined;
 
-    const found_input = try std.fmt.bufPrint(&input_buffer,
+    const found_input = try std.mem.print(&input_buffer,
         \\{{"pattern":"*.txt","path":".zig-cache/tmp/{s}"}}
     , .{tmp.sub_path});
     const found = try run(&context, found_input);
@@ -282,7 +282,7 @@ test "find reports a search that reached the entry cap" {
     try testing.expectTimed(&found, &.{.{ .matches, 2 }});
     try testing.expectConditions(&found, &.{.incomplete});
 
-    const missed_input = try std.fmt.bufPrint(&input_buffer,
+    const missed_input = try std.mem.print(&input_buffer,
         \\{{"pattern":"*.md","path":".zig-cache/tmp/{s}"}}
     , .{tmp.sub_path});
     const missed = try run(&context, missed_input);
@@ -309,13 +309,13 @@ test "find marks a search incomplete when it cannot read a directory" {
     var input_buffer: [128]u8 = undefined;
     var expected_buffer: [256]u8 = undefined;
 
-    const found_input = try std.fmt.bufPrint(&input_buffer,
+    const found_input = try std.mem.print(&input_buffer,
         \\{{"pattern":"**/*.md","path":".zig-cache/tmp/{s}"}}
     , .{tmp.sub_path});
     const found = try run(&context, found_input);
     defer found.deinit(gpa);
     try std.testing.expect(!found.hasFailure());
-    const expected = try std.fmt.bufPrint(
+    const expected = try std.mem.print(
         &expected_buffer,
         ".zig-cache/tmp/{s}/a.md\n[Drinky could not read 1 entry.]",
         .{tmp.sub_path},
@@ -324,7 +324,7 @@ test "find marks a search incomplete when it cannot read a directory" {
     try testing.expectTimed(&found, &.{.{ .matches, 1 }});
     try testing.expectConditions(&found, &.{.incomplete});
 
-    const missed_input = try std.fmt.bufPrint(&input_buffer,
+    const missed_input = try std.mem.print(&input_buffer,
         \\{{"pattern":"**/*.zig","path":".zig-cache/tmp/{s}"}}
     , .{tmp.sub_path});
     const missed = try run(&context, missed_input);
@@ -339,7 +339,7 @@ test "find marks a search incomplete when it cannot read a directory" {
 
 fn runIn(context: *const Context, comptime input: []const u8, base: []const u8) !core.Tool.Output {
     var buffer: [256]u8 = undefined;
-    return run(context, try std.fmt.bufPrint(&buffer, input, .{base}));
+    return run(context, try std.mem.print(&buffer, input, .{base}));
 }
 
 test "find accepts an empty path" {
@@ -374,7 +374,7 @@ test "find reports when no files match" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "a.txt", .data = "" });
     var input_buffer: [128]u8 = undefined;
-    const input = try std.fmt.bufPrint(&input_buffer,
+    const input = try std.mem.print(&input_buffer,
         \\{{"pattern":"*.md","path":".zig-cache/tmp/{s}"}}
     , .{tmp.sub_path});
     const result = try run(&context, input);
@@ -407,13 +407,13 @@ test "find reports a search that ran out of time" {
     try tmp.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "" });
     try tmp.dir.writeFile(io, .{ .sub_path = "b.txt", .data = "" });
     var base_buffer: [128]u8 = undefined;
-    const base = try std.fmt.bufPrint(&base_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const base = try std.mem.print(&base_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
 
     const result = try runIn(&context, "{{\"pattern\":\"**/*.zig\",\"path\":\"{s}\"}}", base);
     defer result.deinit(gpa);
     try std.testing.expect(!result.hasFailure());
     try std.testing.expect(
-        std.mem.indexOf(u8, result.content, "Drinky stopped the search after") != null,
+        std.mem.find(u8, result.content, "Drinky stopped the search after") != null,
     );
     try testing.expectTimed(&result, &.{.{ .matches, 0 }});
     try testing.expectConditions(&result, &.{.time_limit_reached});
@@ -431,12 +431,12 @@ test "find keeps the matches it found before the clock ran out" {
     try tmp.dir.writeFile(io, .{ .sub_path = "a.zig", .data = "" });
     try tmp.dir.writeFile(io, .{ .sub_path = "b.zig", .data = "" });
     var base_buffer: [128]u8 = undefined;
-    const base = try std.fmt.bufPrint(&base_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const base = try std.mem.print(&base_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
 
     const result = try runIn(&context, "{{\"pattern\":\"**/*.zig\",\"path\":\"{s}\"}}", base);
     defer result.deinit(gpa);
     try std.testing.expect(!result.hasFailure());
-    try std.testing.expect(std.mem.indexOf(u8, result.content, ".zig\n[Drinky ") != null);
+    try std.testing.expect(std.mem.find(u8, result.content, ".zig\n[Drinky ") != null);
     try std.testing.expectStringEndsWith(
         result.content,
         ". Drinky shows the first 1 match in path order. Use a narrower path or pattern.]",
@@ -458,7 +458,7 @@ test "find measures the matches that it omitted when the clock stops the search"
         try tmp.dir.writeFile(io, .{ .sub_path = name, .data = "" });
     }
     var base_buffer: [128]u8 = undefined;
-    const base = try std.fmt.bufPrint(&base_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const base = try std.mem.print(&base_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
 
     const input = "{{\"pattern\":\"**/*.zig\",\"path\":\"{s}\",\"limit\":1}}";
     const result = try runIn(&context, input, base);
@@ -481,7 +481,7 @@ test "find reports skipped noise after an empty search" {
     defer repository.close(io);
     try repository.writeFile(io, .{ .sub_path = "ignored.md", .data = "" });
     var input_buffer: [128]u8 = undefined;
-    const input = try std.fmt.bufPrint(&input_buffer,
+    const input = try std.mem.print(&input_buffer,
         \\{{"pattern":"**/*.md","path":".zig-cache/tmp/{s}"}}
     , .{tmp.sub_path});
 

@@ -28,7 +28,7 @@ const vtable: Transport.VTable = .{ .open = open, .close = close };
 
 const identity_alone = accepted: {
     var encodings: @TypeOf(std.http.Client.Request.default_accept_encoding) = @splat(false);
-    encodings[@intFromEnum(std.http.ContentEncoding.identity)] = true;
+    encodings[@backingInt(std.http.ContentEncoding.identity)] = true;
     break :accepted encodings;
 };
 
@@ -179,12 +179,12 @@ test "open sends the body with the named headers and hands back the reply" {
     const head = loopback.served.head.items;
     try std.testing.expect(std.mem.startsWith(u8, head, "POST /v1/responses HTTP/1.1\n"));
     try std.testing.expect(
-        std.mem.indexOf(u8, head, "authorization: Bearer secret-token\n") != null,
+        std.mem.find(u8, head, "authorization: Bearer secret-token\n") != null,
     );
-    try std.testing.expect(std.mem.indexOf(u8, head, "user-agent: drinky\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, head, "chatgpt-account-id: acct-1\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, head, "content-type: application/json\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, head, "accept-encoding: identity\n") != null);
+    try std.testing.expect(std.mem.find(u8, head, "user-agent: drinky\n") != null);
+    try std.testing.expect(std.mem.find(u8, head, "chatgpt-account-id: acct-1\n") != null);
+    try std.testing.expect(std.mem.find(u8, head, "content-type: application/json\n") != null);
+    try std.testing.expect(std.mem.find(u8, head, "accept-encoding: identity\n") != null);
     try std.testing.expectEqualStrings("{\"model\":\"m\"}", loopback.served.body.items);
     http.transport().close();
 }
@@ -249,7 +249,7 @@ const Loopback = struct {
         self.io = io;
         var address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
         self.server = try address.listen(io, .{});
-        self.url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/v1/responses", .{
+        self.url = try gpa.print("http://127.0.0.1:{d}/v1/responses", .{
             self.server.socket.address.getPort(),
         });
         self.served = .{};
@@ -286,8 +286,8 @@ test "a request without a credential omits the Authorization header" {
 
     try std.testing.expectEqual(std.http.Status.ok, reply.status);
     const head = loopback.served.head.items;
-    try std.testing.expect(std.mem.indexOf(u8, head, "authorization:") == null);
-    try std.testing.expect(std.mem.indexOf(u8, head, "user-agent: zig/") != null);
+    try std.testing.expect(std.mem.find(u8, head, "authorization:") == null);
+    try std.testing.expect(std.mem.find(u8, head, "user-agent: zig/") != null);
     var buffer: [32]u8 = undefined;
     const length = try reply.body.readSliceShort(&buffer);
     try std.testing.expectEqualStrings("data: [DONE]\n\n", buffer[0..length]);
@@ -310,7 +310,7 @@ test "a request without a body names its method and sends no content type" {
     try std.testing.expectEqualStrings("{}", response.body);
     const head = loopback.served.head.items;
     try std.testing.expect(std.mem.startsWith(u8, head, "GET /v1/responses HTTP/1.1\n"));
-    try std.testing.expect(std.mem.indexOf(u8, head, "content-type:") == null);
+    try std.testing.expect(std.mem.find(u8, head, "content-type:") == null);
     try std.testing.expectEqualStrings("", loopback.served.body.items);
 }
 
@@ -323,7 +323,7 @@ test "a request that times out before the response head leaves the transport rea
     var address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
     var server = try address.listen(io, .{});
     defer server.deinit(io);
-    const url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/v1/responses", .{
+    const url = try gpa.print("http://127.0.0.1:{d}/v1/responses", .{
         server.socket.address.getPort(),
     });
     defer gpa.free(url);
@@ -353,7 +353,7 @@ test "a connect that fails at its first allocation fails as out of memory" {
     var address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
     var server = try address.listen(io, .{});
     defer server.deinit(io);
-    const url = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/v1/messages", .{
+    const url = try gpa.print("http://127.0.0.1:{d}/v1/messages", .{
         server.socket.address.getPort(),
     });
     defer gpa.free(url);

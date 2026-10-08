@@ -47,7 +47,7 @@ pub fn init(self: *Harness, gpa: std.mem.Allocator, io: std.Io, options: *const 
     self.project_instructions = try discovery.instructions.discover(gpa, io, cwd);
     errdefer self.project_instructions.deinit();
 
-    const user_skills = try std.fs.path.resolve(
+    const user_skills = try std.Io.Dir.path.resolve(
         gpa,
         &.{ cwd, directories.home, ".agents", "skills" },
     );

@@ -1,5 +1,6 @@
 const std = @import("std");
 
+const core = @import("core");
 const terminal = @import("terminal");
 
 const Message = @import("../Message.zig");
@@ -50,15 +51,15 @@ const Wrap = struct {
         const lead = self.lead;
         self.lead = 0;
         if (lead > 0 and lead >= self.columns and self.rest.len > 0) {
-            const break_at = std.mem.indexOfScalar(u8, self.rest, '\n') orelse self.rest.len;
+            const break_at = std.mem.findScalar(u8, self.rest, '\n') orelse self.rest.len;
             if (break_at < self.rest.len and lineText(self.rest[0..break_at]).len == 0)
                 self.rest = self.rest[break_at + 1 ..];
             return .{ .kept = "", .shortened = false };
         }
         const room = @max(self.columns -| lead, 1);
-        const line_end = std.mem.indexOfScalar(u8, self.rest, '\n') orelse self.rest.len;
+        const line_end = std.mem.findScalar(u8, self.rest, '\n') orelse self.rest.len;
         const line = lineText(self.rest[0..line_end]);
-        if (self.fresh) self.legend = std.mem.indexOf(u8, line, separator) != null;
+        if (self.fresh) self.legend = std.mem.find(u8, line, separator) != null;
         const row = packRow(line, room, if (self.legend) .cut else .wrap);
         self.fresh = row.next >= line.len;
         if (!self.fresh) {
@@ -254,7 +255,7 @@ pub fn singleLine(text: []u8) []u8 {
 }
 
 pub fn isBlank(text: []const u8) bool {
-    return std.mem.indexOfNone(u8, text, blank_bytes) == null;
+    return std.mem.findNone(u8, text, blank_bytes) == null;
 }
 
 pub fn packRow(line: []const u8, room: usize, overwide: Overwide) Row {
@@ -263,7 +264,7 @@ pub fn packRow(line: []const u8, room: usize, overwide: Overwide) Row {
     var end: usize = 0;
     var columns: usize = 0;
     while (index < line.len) {
-        const piece_end = std.mem.indexOfPos(u8, line, index, separator) orelse line.len;
+        const piece_end = std.mem.findPos(u8, line, index, separator) orelse line.len;
         const piece = line[index..piece_end];
         const lead = if (index == 0) 0 else separator_columns;
         const piece_columns = terminal.width.ofText(piece);
@@ -310,12 +311,12 @@ fn noticeWrap(style: *const NoticeStyle, text: []const u8, columns: usize) Wrap 
 }
 
 fn firstValue(text: []const u8) Run {
-    const head = text[0 .. std.mem.indexOfScalar(u8, text, '\n') orelse text.len];
+    const head = text[0 .. std.mem.findScalar(u8, text, '\n') orelse text.len];
     const key_separator = ": ";
-    const key_end = std.mem.indexOf(u8, head, key_separator) orelse return .{};
+    const key_end = std.mem.find(u8, head, key_separator) orelse return .{};
     const start = key_end + key_separator.len;
     const value = head[start..];
-    const length = std.mem.indexOfScalar(u8, value, ' ') orelse value.len;
+    const length = std.mem.findScalar(u8, value, ' ') orelse value.len;
     return .{ .start = start, .end = start + length };
 }
 
@@ -384,7 +385,7 @@ fn noticeBody(
 }
 
 pub fn headCut(text: []const u8, columns_max: usize) Cut {
-    const line_end = std.mem.indexOfScalar(u8, text, '\n') orelse text.len;
+    const line_end = std.mem.findScalar(u8, text, '\n') orelse text.len;
     const line = lineText(text[0..line_end]);
     if (line_end == text.len) return cut(line, columns_max);
     return .{ .kept = terminal.width.truncate(line, columns_max -| 1), .shortened = true };
@@ -632,12 +633,12 @@ fn frameEdgeCells(
 
 fn moreLabel(buffer: *[32]u8, options: *const LabelOptions) ?[]const u8 {
     if (options.more == 0) return null;
-    const full = std.fmt.bufPrint(buffer, "{s} Hidden: {d}", .{
+    const full = std.mem.print(buffer, "{s} Hidden: {d}", .{
         options.edge.arrow(),
         options.more,
     }) catch return null;
     if (labelFits(options.columns, full)) return full;
-    const compact = std.fmt.bufPrint(buffer, "{s}{d}", .{
+    const compact = std.mem.print(buffer, "{s}{d}", .{
         options.edge.arrow(),
         options.more,
     }) catch return null;
@@ -913,7 +914,7 @@ test "activity at column zero emits no unused frame role" {
 test "a frame edge label reads as muted text between the frame glyphs" {
     const gpa = std.testing.allocator;
     const painted = try paintedFramed(gpa, 20, &.{
-        .body = "a\n" ** 3 ++ "x",
+        .body = core.text.repeat("a\n", 3) ++ "x",
         .body_rows = 1,
         .hidden_above = 3,
     });
@@ -927,7 +928,7 @@ test "a frame edge label reads as muted text between the frame glyphs" {
 test "a frame edge label resets faint before a right activity segment" {
     const gpa = std.testing.allocator;
     const painted = try paintedFramed(gpa, 20, &.{
-        .body = "a\n" ** 3 ++ "x",
+        .body = core.text.repeat("a\n", 3) ++ "x",
         .body_rows = 1,
         .hidden_above = 3,
         .activity = .{ .motion_tick = 16, .progress_age_ticks = 0 },
@@ -940,18 +941,18 @@ test "a frame edge label resets faint before a right activity segment" {
 }
 
 test "one activity segment starts at the top left and crosses both frame edge boundaries" {
-    const light = "─" ** 15;
-    try expectEdges(20, null, .{ "─" ** 20, "─" ** 20 });
+    const light = core.text.repeat("─", 15);
+    try expectEdges(20, null, .{ core.text.repeat("─", 20), core.text.repeat("─", 20) });
     try expectEdges(20, .{ .motion_tick = 0, .progress_age_ticks = 0 }, .{
-        "╼━━━━╾" ++ "─" ** 14,
-        "─" ** 20,
+        "╼━━━━╾" ++ core.text.repeat("─", 14),
+        core.text.repeat("─", 20),
     });
     try expectEdges(20, .{ .motion_tick = 15, .progress_age_ticks = 0 }, .{
         light ++ "╼━━━╾",
-        "━" ++ "─" ** 19,
+        "━" ++ core.text.repeat("─", 19),
     });
     try expectEdges(20, .{ .motion_tick = 35, .progress_age_ticks = 0 }, .{
-        "━" ++ "─" ** 19,
+        "━" ++ core.text.repeat("─", 19),
         light ++ "╼━━━╾",
     });
 }
@@ -1041,7 +1042,7 @@ test "an animated input places its caret on the first of two equal halves alone"
                 .caret_tick = sample.caret_tick,
             },
         });
-        const shown = std.mem.indexOf(u8, try rig.painted(), terminal.escape.cursor_show) != null;
+        const shown = std.mem.find(u8, try rig.painted(), terminal.escape.cursor_show) != null;
         try std.testing.expectEqual(sample.shown, shown);
     }
 }
@@ -1148,7 +1149,7 @@ test "overflow labels compact before disappearing" {
     };
     for (cases) |case| {
         const painted = try paintedFramed(gpa, case.columns, &.{
-            .body = "a\n" ** 17 ++ "x",
+            .body = core.text.repeat("a\n", 17) ++ "x",
             .body_rows = 1,
             .hidden_above = 17,
         });
@@ -1230,7 +1231,7 @@ test "a notice breaks its rows at a separator" {
     }
     const plain = try paintedNotice(gpa, &style, text, 40);
     defer gpa.free(plain);
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(
         u8,
         plain,
         "Enter: Send \u{00B7} Shift+Enter: New line\r\n",

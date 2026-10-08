@@ -175,48 +175,48 @@ test "the page names every file behind the startup counts" {
     });
     defer gpa.free(page);
 
-    const user = std.mem.indexOf(u8, page, "## User instructions").?;
-    const project = std.mem.indexOf(u8, page, "## Project instructions").?;
-    const skills_index = std.mem.indexOf(u8, page, "## Skills").?;
-    const required = std.mem.indexOf(u8, page, "## Required skills").?;
+    const user = std.mem.find(u8, page, "## User instructions").?;
+    const project = std.mem.find(u8, page, "## Project instructions").?;
+    const skills_index = std.mem.find(u8, page, "## Skills").?;
+    const required = std.mem.find(u8, page, "## Required skills").?;
     try std.testing.expect(user < project);
     try std.testing.expect(project < skills_index);
     try std.testing.expect(skills_index < required);
 
-    try std.testing.expect(std.mem.indexOf(u8, page, "\n- `~/first.md`\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, page, "\n- `AGENTS.md`\n") != null);
+    try std.testing.expect(std.mem.find(u8, page, "\n- `~/first.md`\n") != null);
+    try std.testing.expect(std.mem.find(u8, page, "\n- `AGENTS.md`\n") != null);
 
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(
         u8,
         page,
         "- `demo` · Scope: project · File: `.agents/skills/demo/SKILL.md` · Replaces: " ++
             "`~/.agents/skills/demo/SKILL.md`\n",
     ) != null);
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(
         u8,
         page,
         "- `hidden` · Scope: project · Hidden from the model · File: " ++
             "`.agents/skills/hidden/SKILL.md`\n",
     ) != null);
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(
         u8,
         page,
         "- `review` · Scope: project · Hidden in a run · File: " ++
             "`.agents/skills/review/SKILL.md`\n",
     ) != null);
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(
         u8,
         page,
         "- `other` · Scope: user · File: `~/.agents/skills/other/SKILL.md`\n",
     ) != null);
-    try std.testing.expect(std.mem.indexOf(u8, page, "the user copy") == null);
+    try std.testing.expect(std.mem.find(u8, page, "the user copy") == null);
 
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(
         u8,
         page,
         "- `**/*.zig` · Skill: `demo` · File: `.agents/skills/demo/SKILL.md`\n",
     ) != null);
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(
         u8,
         page,
         "- `**/*.ts` · Skill: `nonesuch` · No discovered skill carries this name.\n",

@@ -193,7 +193,7 @@ pub fn identify(
                     subscription_beta },
                 .{ .name = "x-app", .value = "cli" },
             });
-            request.authorization = try std.fmt.allocPrint(arena, "Bearer {s}", .{options.token});
+            request.authorization = try arena.print("Bearer {s}", .{options.token});
             request.user_agent = user_agent;
         },
         .console, .api_key => {
@@ -1334,8 +1334,7 @@ test "stop_reason folds to a terminal status and the last non-null delta wins" {
         rig.init(test_options);
         defer rig.deinit();
         for (case.reasons) |reason| {
-            const delta = try std.fmt.allocPrint(
-                std.testing.allocator,
+            const delta = try std.testing.allocator.print(
                 "{{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"{s}\"}}," ++
                     "\"usage\":{{}}}}",
                 .{reason},
@@ -1524,7 +1523,7 @@ test "malformed and unknown frames are filler that keeps the reply, a block boun
 }
 
 test "a streamed error frame fails with its reason and message" {
-    const long = "x" ** 5000;
+    const long = core.text.repeat("x", 5000);
     const cases = [_]struct { payload: []const u8, expected: []const u8 }{
         .{
             .payload =
@@ -1579,7 +1578,7 @@ test "a failed head reports its status with the message of its body" {
         ,
     }, "failed:unauthorized|-|401 Unauthorized: invalid x-api-key");
     try Rig.expectFailure(test_options, &.{
-        .status = @enumFromInt(529),
+        .status = @fromBackingInt(529),
         .retry_after_ms = null,
         .body =
         \\{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}

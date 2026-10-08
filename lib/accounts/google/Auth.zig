@@ -153,8 +153,7 @@ fn mint(self: *Auth) !Token {
     const now_ms = self.nowMs();
     const assertion = try self.jwt(@divFloor(now_ms, std.time.ms_per_s));
     defer self.gpa.free(assertion);
-    const body = try std.fmt.allocPrint(
-        self.gpa,
+    const body = try self.gpa.print(
         "grant_type=" ++ grant_type ++ "&assertion={s}",
         .{assertion},
     );
@@ -228,7 +227,7 @@ fn validProject(project: []const u8) bool {
     if (project.len == 0) return false;
     for (project) |byte| {
         if (!std.ascii.isLower(byte) and !std.ascii.isDigit(byte) and
-            std.mem.indexOfScalar(u8, "-.:", byte) == null) return false;
+            std.mem.findScalar(u8, "-.:", byte) == null) return false;
     }
     return true;
 }
@@ -237,7 +236,7 @@ test "fromKeyFile reads the project and the location and zeros the key file" {
     const gpa = std.testing.allocator;
     const file = try testKeyFile(gpa, test_fields);
     defer gpa.free(file);
-    try std.testing.expect(std.mem.indexOf(u8, file, "BEGIN PRIVATE KEY") != null);
+    try std.testing.expect(std.mem.find(u8, file, "BEGIN PRIVATE KEY") != null);
 
     var auth = try fromKeyFile(gpa, std.testing.io, .{}, file, .global);
     defer auth.deinit();
@@ -418,7 +417,7 @@ test "a mint posts a signed JWT that names the issuer, the scope, the audience, 
         try std.testing.expect(try auth.renew());
 
         const request = transport.requests.items[0];
-        const head = try std.fmt.allocPrint(gpa, "POST {s}\n" ++
+        const head = try gpa.print("POST {s}\n" ++
             "content-type: application/x-www-form-urlencoded\n\n" ++
             "grant_type=" ++ grant_type ++ "&assertion=", .{case.audience});
         defer gpa.free(head);
@@ -454,7 +453,7 @@ test "a mint posts a signed JWT that names the issuer, the scope, the audience, 
         try decoder.decode(&signature, signature_segment);
         try std.crypto.Certificate.rsa.PKCS1v1_5Signature.verify(
             256,
-            signature,
+            &signature,
             assertion[0 .. header_segment.len + 1 + claims_segment.len],
             public_key,
             std.crypto.hash.sha2.Sha256,

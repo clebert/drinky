@@ -801,7 +801,7 @@ fn refresh(self: *Registry, index: usize) Refresh {
 }
 
 fn modelsUrl(gpa: std.mem.Allocator, row: *const Account) error{OutOfMemory}![]u8 {
-    return std.fmt.allocPrint(gpa, "{s}/models", .{row.dialect.responses.base_url});
+    return gpa.print("{s}/models", .{row.dialect.responses.base_url});
 }
 
 fn recordSave(target: *?json_store.SaveError, outcome: json_store.SaveError!void) void {
@@ -1008,7 +1008,7 @@ test "the key file account loads from the key file and records a failed load" {
     var home_buffer: [128]u8 = undefined;
     const home = try testing.tmpHome(&home_buffer, &tmp);
     var key_buffer: [160]u8 = undefined;
-    const key_path = try std.fmt.bufPrint(&key_buffer, "{s}/key.json", .{home});
+    const key_path = try std.mem.print(&key_buffer, "{s}/key.json", .{home});
 
     var half: testing.Rig = undefined;
     try half.init(gpa, io, &.{
@@ -1454,11 +1454,11 @@ fn pastePlanRedirect(rig: *testing.Rig) !void {
     defer rig.gpa.free(shown);
     try std.testing.expect(std.mem.startsWith(u8, shown, "authorization:anthropic-plan:https://"));
     try rig.recorder.expect("browser_launch_failed:anthropic-plan");
-    const state_at = std.mem.indexOf(u8, shown, "state=").? + "state=".len;
+    const state_at = std.mem.find(u8, shown, "state=").? + "state=".len;
     const rest = shown[state_at..];
-    const state = rest[0 .. std.mem.indexOfScalar(u8, rest, '&') orelse rest.len];
+    const state = rest[0 .. std.mem.findScalar(u8, rest, '&') orelse rest.len];
     var line_buffer: [256]u8 = undefined;
-    const line = try std.fmt.bufPrint(
+    const line = try std.mem.print(
         &line_buffer,
         "http://localhost:53692/callback?code=abc&state={s}",
         .{state},
@@ -1480,7 +1480,7 @@ test "a callback sign-in completes through a pasted redirect and saves the token
     try rig.recorder.expect("login_ended:anthropic-plan:saved");
     try std.testing.expect(rig.registry.isAuthenticated(testing.anthropic_plan));
     try std.testing.expect(
-        std.mem.indexOf(u8, rig.transport.requests.items[0], "\"code\":\"abc\"") != null,
+        std.mem.find(u8, rig.transport.requests.items[0], "\"code\":\"abc\"") != null,
     );
     try std.testing.expectEqual(@as(?u16, null), rig.loopback.listening());
 }

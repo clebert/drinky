@@ -58,7 +58,7 @@ pub fn init(id: []const u8) error{BadModelName}!Model {
         .name_length = @intCast(id.len),
         .served_buffer = undefined,
         .served_length = 0,
-        .efforts = .initEmpty(),
+        .efforts = .empty,
         .efforts_denied = false,
         .thinking = .unknown,
         .tools = .unknown,
@@ -74,7 +74,7 @@ fn validName(id: []const u8) bool {
     if (id.len == 0 or id.len > name_bytes_max) return false;
     for (id) |byte| {
         const safe = std.ascii.isAlphanumeric(byte) or
-            std.mem.indexOfScalar(u8, "-._~:/", byte) != null;
+            std.mem.findScalar(u8, "-._~:/", byte) != null;
         if (!safe) return false;
     }
     return true;
@@ -129,7 +129,7 @@ pub fn fold(self: *const Model, level: core.Provider.Effort) ?core.Provider.Effo
 
 fn nearest(self: *const Model, level: core.Provider.Effort) ?core.Provider.Effort {
     const ladder = comptime std.enums.values(core.Provider.Effort);
-    const start: usize = @intFromEnum(level);
+    const start: usize = @backingInt(level);
     for (0..ladder.len) |distance| {
         if (start >= distance) {
             const lower = ladder[start - distance];
@@ -183,9 +183,9 @@ test init {
     try std.testing.expect(model.price == null);
 
     try std.testing.expectError(error.BadModelName, init(""));
-    const over = "x" ** (name_bytes_max + 1);
+    const over = core.text.repeat("x", name_bytes_max + 1);
     try std.testing.expectError(error.BadModelName, init(over));
-    const at_max = "x" ** name_bytes_max;
+    const at_max = core.text.repeat("x", name_bytes_max);
     try std.testing.expectEqualStrings(at_max, (try init(at_max)).name());
 }
 
@@ -284,7 +284,10 @@ test serves {
 
     try std.testing.expectError(error.BadModelName, alias.serveAs(""));
     try std.testing.expectError(error.BadModelName, alias.serveAs("grok 4"));
-    try std.testing.expectError(error.BadModelName, alias.serveAs("x" ** (name_bytes_max + 1)));
+    try std.testing.expectError(
+        error.BadModelName,
+        alias.serveAs(core.text.repeat("x", name_bytes_max + 1)),
+    );
 }
 
 test "a fold takes the nearest level and prefers the lower one on a tie" {

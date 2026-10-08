@@ -55,8 +55,7 @@ pub fn authorizeUrlOf(
         "http%3A%2F%2Flocalhost%3A{d}%2Fcallback",
         .{authorization.port},
     );
-    return std.fmt.allocPrint(
-        gpa,
+    return gpa.print(
         authorization.url ++ "?code=true&client_id=" ++ client_id ++
             "&response_type=code&redirect_uri=" ++ redirect_encoded ++
             "&scope=" ++ authorization.scope ++
@@ -147,11 +146,11 @@ test authorizeUrl {
     @memset(&pkce.state, 's');
     const url = try authorizeUrl(std.testing.allocator, &pkce);
     defer std.testing.allocator.free(url);
-    try std.testing.expect(std.mem.indexOf(u8, url, "state=sss") != null);
-    try std.testing.expect(std.mem.indexOf(u8, url, "vvv") == null);
-    try std.testing.expect(std.mem.indexOf(u8, url, "code_challenge_method=S256") != null);
-    try std.testing.expect(std.mem.indexOf(u8, url, client_id) != null);
-    try std.testing.expect(std.mem.indexOf(u8, url, "localhost%3A53692%2Fcallback") != null);
+    try std.testing.expect(std.mem.find(u8, url, "state=sss") != null);
+    try std.testing.expect(std.mem.find(u8, url, "vvv") == null);
+    try std.testing.expect(std.mem.find(u8, url, "code_challenge_method=S256") != null);
+    try std.testing.expect(std.mem.find(u8, url, client_id) != null);
+    try std.testing.expect(std.mem.find(u8, url, "localhost%3A53692%2Fcallback") != null);
 }
 
 test exchangeBody {

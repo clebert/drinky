@@ -557,7 +557,7 @@ test "collect propagates an allocation failure from the walker" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "one.txt", .data = "hit\n" });
     var base_buffer: [128]u8 = undefined;
-    const base = try std.fmt.bufPrint(&base_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const base = try std.mem.print(&base_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
 
     var failing: std.testing.FailingAllocator =
         .init(std.testing.allocator, .{ .fail_index = 1 });
@@ -586,12 +586,12 @@ test "collect propagates every allocation failure from a deep walk" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const deep_path = "d/" ** 32 ++ "leaf";
+    const deep_path = core.text.repeat("d/", 32) ++ "leaf";
     var leaf = try tmp.dir.createDirPathOpen(io, deep_path, .{});
     defer leaf.close(io);
     try leaf.writeFile(io, .{ .sub_path = "one.txt", .data = "hit\n" });
     var base_buffer: [128]u8 = undefined;
-    const base = try std.fmt.bufPrint(&base_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const base = try std.mem.print(&base_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
 
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
@@ -625,12 +625,12 @@ fn makeTree(
 ) !void {
     for (0..counts.directories) |directory_index| {
         var name_buffer: [16]u8 = undefined;
-        const name = try std.fmt.bufPrint(&name_buffer, "d{d:0>3}", .{directory_index});
+        const name = try std.mem.print(&name_buffer, "d{d:0>3}", .{directory_index});
         var subdirectory = try dir.createDirPathOpen(io, name, .{});
         defer subdirectory.close(io);
         for (0..counts.files) |file_index| {
             var file_buffer: [16]u8 = undefined;
-            const file = try std.fmt.bufPrint(&file_buffer, "f{d:0>3}.txt", .{file_index});
+            const file = try std.mem.print(&file_buffer, "f{d:0>3}.txt", .{file_index});
             try subdirectory.writeFile(io, .{ .sub_path = file, .data = "hit\n" });
         }
     }
@@ -642,7 +642,7 @@ test "collect retains only the smallest matches and counts the rest" {
     defer tmp.cleanup();
     try makeTree(io, tmp.dir, .{ .directories = 20, .files = 10 });
     var base_buffer: [128]u8 = undefined;
-    const base = try std.fmt.bufPrint(&base_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const base = try std.mem.print(&base_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
 
     var matches = try collect(io, std.testing.allocator, &.{
         .base = base,
@@ -665,7 +665,7 @@ test "collect stops at the entry-visit work cap" {
     defer tmp.cleanup();
     try makeTree(io, tmp.dir, .{ .directories = 20, .files = 10 });
     var base_buffer: [128]u8 = undefined;
-    const base = try std.fmt.bufPrint(&base_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const base = try std.mem.print(&base_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
 
     var matches = try collect(io, std.testing.allocator, &.{
         .base = base,
@@ -686,7 +686,7 @@ test "collect stops when the search runs out of time" {
     defer tmp.cleanup();
     try makeTree(io, tmp.dir, .{ .directories = 20, .files = 10 });
     var base_buffer: [128]u8 = undefined;
-    const base = try std.fmt.bufPrint(&base_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const base = try std.mem.print(&base_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
 
     var clock: core.testing.StepClock = undefined;
     clock.init(std.testing.allocator, search.timeout_ms);
@@ -710,7 +710,7 @@ test "collect reports no stop for a tree it read whole" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "only.txt", .data = "hit\n" });
     var base_buffer: [128]u8 = undefined;
-    const base = try std.fmt.bufPrint(&base_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const base = try std.mem.print(&base_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
 
     var clock: core.testing.StepClock = undefined;
     clock.init(std.testing.allocator, search.timeout_ms);
@@ -790,7 +790,7 @@ test "collect prunes noise directories in an isolated tree" {
         try noise_directory.writeFile(io, .{ .sub_path = "ignored.txt", .data = "ignore\n" });
     }
     var base_buffer: [128]u8 = undefined;
-    const base = try std.fmt.bufPrint(&base_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const base = try std.mem.print(&base_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
 
     var matches = try collect(io, std.testing.allocator, &.{
         .base = base,
@@ -820,7 +820,7 @@ test "collect keeps nested noise visible when the base names noise" {
     defer package.close(io);
     try package.writeFile(io, .{ .sub_path = "index.js", .data = "hit\n" });
     var base_buffer: [160]u8 = undefined;
-    const base = try std.fmt.bufPrint(
+    const base = try std.mem.print(
         &base_buffer,
         ".zig-cache/tmp/{s}/node_modules",
         .{tmp.sub_path},

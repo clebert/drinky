@@ -66,7 +66,7 @@ pub fn build(b: *std.Build) void {
 
     const run = b.addRunArtifact(exe);
 
-    if (b.args) |args| run.addArgs(args);
+    run.addPassthruArgs();
 
     const run_step = b.step("run", "Build and run Drinky");
 
@@ -110,7 +110,9 @@ pub fn build(b: *std.Build) void {
         for (module.import_table.keys(), module.import_table.values()) |name, imported|
             test_module.addImport(name, imported);
         const tests = b.addTest(.{ .name = tested.name, .root_module = test_module });
-        test_step.dependOn(&b.addRunArtifact(tests).step);
+        const run_tests = b.addRunArtifact(tests);
+        run_tests.has_side_effects = true;
+        test_step.dependOn(&run_tests.step);
     }
 
     const unicode_generator = b.addExecutable(.{
@@ -132,9 +134,5 @@ pub fn build(b: *std.Build) void {
     );
     unicode_step.dependOn(&run_unicode.step);
 
-    const check_step = b.step("check", "Check Zig code for errors (used by ZLS)");
-
-    check_step.dependOn(&exe.step);
-    check_step.dependOn(&unicode_generator.step);
-    b.default_step.dependOn(check_step);
+    b.default_step.dependOn(&unicode_generator.step);
 }

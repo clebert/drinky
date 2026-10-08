@@ -49,7 +49,8 @@ fn columns(text: []const u8) usize {
 }
 
 test "a line with multi-byte characters at the width passes, and one more column fails" {
-    const at_width = "·" ** 50 ++ "–" ** 50;
+    const pairs: [50][5]u8 = @splat("·–".*);
+    const at_width: *const [250]u8 = @ptrCast(&pairs);
     try std.testing.expect(at_width.len > columns_max);
 
     var found: std.ArrayList(Overflow) = .empty;

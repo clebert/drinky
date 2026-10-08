@@ -343,11 +343,11 @@ pub fn DialectRig(comptime Wire: type) type {
             const dialect = wire.dialect();
             dialect.reset();
             for (payloads) |payload| {
-                _ = arena.reset(.retain_capacity);
+                _ = arena.reset(.free_all);
                 var events: Dialect.Events = .empty;
                 _ = try dialect.decode(arena.allocator(), payload, &events);
             }
-            _ = arena.reset(.retain_capacity);
+            _ = arena.reset(.free_all);
             var events: Dialect.Events = .empty;
             try dialect.finish(arena.allocator(), &events);
         }

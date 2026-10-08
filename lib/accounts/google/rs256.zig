@@ -71,9 +71,9 @@ const Element = struct {
 };
 
 pub fn parsePem(gpa: std.mem.Allocator, pem: []const u8) !PrivateKey {
-    const begin = std.mem.indexOf(u8, pem, pem_begin) orelse return error.BadPrivateKey;
+    const begin = std.mem.find(u8, pem, pem_begin) orelse return error.BadPrivateKey;
     const body_start = begin + pem_begin.len;
-    const end = std.mem.indexOfPos(u8, pem, body_start, pem_end) orelse return error.BadPrivateKey;
+    const end = std.mem.findPos(u8, pem, body_start, pem_end) orelse return error.BadPrivateKey;
     const body = pem[body_start..end];
 
     const decoder = std.base64.standard.decoderWithIgnore("\r\n");
@@ -197,7 +197,7 @@ test "sign matches the OpenSSL vector and verifies against the public key" {
     );
     try std.crypto.Certificate.rsa.PKCS1v1_5Signature.verify(
         256,
-        signature,
+        &signature,
         fixture_message,
         public_key,
         std.crypto.hash.sha2.Sha256,
@@ -207,7 +207,7 @@ test "sign matches the OpenSSL vector and verifies against the public key" {
         error.InvalidSignature,
         std.crypto.Certificate.rsa.PKCS1v1_5Signature.verify(
             256,
-            signature,
+            &signature,
             fixture_message,
             public_key,
             std.crypto.hash.sha2.Sha256,

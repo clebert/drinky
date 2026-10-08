@@ -80,7 +80,7 @@ pub const Discovered = struct {
         errdefer tree.deinit();
         for (skills, 1..) |skill, index| {
             var buffer: [64]u8 = undefined;
-            const parent = try std.fmt.bufPrint(
+            const parent = try std.mem.print(
                 &buffer,
                 "user/{d:0>2}-{s}",
                 .{ index, skill.name },
@@ -128,7 +128,7 @@ pub fn expectMessage(
 ) !void {
     defer message.deinit(std.testing.allocator);
     try std.testing.expectEqual(severity, message.severity);
-    try std.testing.expect(std.mem.indexOf(u8, message.content, needle) != null);
+    try std.testing.expect(std.mem.find(u8, message.content, needle) != null);
 }
 
 pub fn expectNotice(

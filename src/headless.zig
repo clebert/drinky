@@ -250,7 +250,7 @@ fn openRegistry(
 }
 
 fn find(registry: *accounts.Registry, value: []const u8) Found {
-    const slash = std.mem.indexOfScalar(u8, value, '/') orelse return .unknown;
+    const slash = std.mem.findScalar(u8, value, '/') orelse return .unknown;
     const account = accounts.Account.index(value[0..slash]) orelse return .unknown;
     if (!registry.isAuthenticated(account)) return .{ .unusable = account };
     const model = registry.findModel(account, value[slash + 1 ..]) orelse return .unknown;
@@ -452,7 +452,7 @@ test "a run leaves a skill out of its system prompt when the metadata hides it f
     try std.testing.expect(try rig.ask(.high, "openai-api-key/gpt-5.6-sol", "check"));
     const request = rig.transport.requests.items[0];
     try testing.expectContains(request, "the listed skill");
-    try std.testing.expect(std.mem.indexOf(u8, request, "the review skill") == null);
+    try std.testing.expect(std.mem.find(u8, request, "the review skill") == null);
 }
 
 test "a run asks for the effort level of the model that is nearest to the requested level" {

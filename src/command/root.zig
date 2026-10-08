@@ -91,7 +91,7 @@ fn listed(out: *[commands.len]Entry) []const Entry {
 fn parse(line: []const u8) ?[]const u8 {
     if (!std.mem.startsWith(u8, line, "/")) return null;
     const body = line[1..];
-    const end = std.mem.indexOfAny(u8, body, ui.paint.blank_bytes) orelse body.len;
+    const end = std.mem.findAny(u8, body, ui.paint.blank_bytes) orelse body.len;
     return body[0..end];
 }
 
@@ -282,8 +282,8 @@ test "skill prefix dispatch loads instructions and preserves trailing arguments"
             defer prompt.deinit(gpa);
             try std.testing.expectEqualStrings("alpha", prompt.name);
             try std.testing.expectEqualStrings("apply it\nto this file", prompt.arguments);
-            try std.testing.expect(std.mem.indexOf(u8, prompt.content, "Skill location: ") != null);
-            const body = std.mem.indexOf(u8, prompt.content, "Follow this skill.");
+            try std.testing.expect(std.mem.find(u8, prompt.content, "Skill location: ") != null);
+            const body = std.mem.find(u8, prompt.content, "Follow this skill.");
             try std.testing.expect(body != null);
             try std.testing.expect(std.mem.endsWith(u8, prompt.content, "apply it\nto this file"));
         },

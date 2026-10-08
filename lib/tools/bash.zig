@@ -17,7 +17,7 @@ const child_setup_attempts_max = 64;
 
 const child_error_exit_code = 1;
 
-const ChildErrorInt = std.meta.Int(.unsigned, @sizeOf(anyerror) * 8);
+const ChildErrorInt = @Int(.unsigned, @sizeOf(anyerror) * 8);
 
 const replacement = "\u{FFFD}";
 
@@ -177,7 +177,7 @@ fn spawnCommand(
     defer dev_null.close(io);
     var arena: std.heap.ArenaAllocator = .init(context.gpa);
     defer arena.deinit();
-    const command_z = try arena.allocator().dupeZ(u8, command);
+    const command_z = try arena.allocator().dupeSentinel(u8, command, 0);
     const argv = [_:null]?[*:0]const u8{ "bash", "-c", command_z.ptr };
     const environ = try commandEnviron(arena.allocator(), context);
     const path = context.host.environ.getPosix("PATH") orelse std.Io.Threaded.default_PATH;
@@ -240,7 +240,7 @@ fn commandEnviron(
     var entries: std.ArrayList(?[*:0]const u8) =
         try .initCapacity(arena, variables.len + inherited.len + 1);
     for (variables) |variable| {
-        const entry = try std.fmt.allocPrintSentinel(arena, "{s}={s}", .{
+        const entry = try arena.printSentinel("{s}={s}", .{
             variable.name,
             variable.value,
         }, 0);
@@ -332,7 +332,7 @@ fn commandExecError(err: std.posix.E) std.process.SpawnError {
         .NOENT => error.FileNotFound,
         .NOTDIR => error.NotDir,
         .TXTBSY => error.FileBusy,
-        else => switch (builtin.os.tag) {
+        else => switch (builtin.target.os.tag) {
             .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => switch (err) {
                 .BADEXEC, .BADARCH => error.InvalidExe,
                 else => error.Unexpected,
@@ -407,7 +407,7 @@ fn killAndReapCommandChild(process_id: std.posix.pid_t) void {
 fn exitCommandChild(code: u8) noreturn {
     if (comptime builtin.link_libc) {
         std.c._exit(code);
-    } else if (comptime builtin.os.tag == .linux) {
+    } else if (comptime builtin.target.os.tag == .linux) {
         std.os.linux.exit_group(code);
     } else {
         @compileError("The command child exit path needs a POSIX implementation.");
@@ -561,7 +561,7 @@ fn tailStart(text: []const u8, limits: *const Context.Bash) usize {
     var start = text.len -| limits.bytes_max;
     while (start < text.len and text[start] & 0xC0 == 0x80) start += 1;
     if (start > 0 and text[start - 1] != '\n') {
-        if (std.mem.indexOfScalarPos(u8, text, start, '\n')) |newline| {
+        if (std.mem.findScalarPos(u8, text, start, '\n')) |newline| {
             if (newline + 1 < text.len) start = newline + 1;
         }
     }
@@ -570,7 +570,7 @@ fn tailStart(text: []const u8, limits: *const Context.Bash) usize {
     if (text[scan - 1] == '\n') scan -= 1;
     var kept: usize = 0;
     while (scan > start) {
-        const newline = std.mem.lastIndexOfScalar(u8, text[0..scan], '\n') orelse break;
+        const newline = std.mem.findScalarLast(u8, text[0..scan], '\n') orelse break;
         kept += 1;
         if (kept >= limits.lines_max) {
             if (newline + 1 > start) start = newline + 1;
@@ -638,8 +638,7 @@ test "bash skips a directory with the executable name in PATH" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDir(io, "bash", .default_dir);
-    const path_entry = try std.fmt.allocPrintSentinel(
-        gpa,
+    const path_entry = try gpa.printSentinel(
         "PATH=.zig-cache/tmp/{s}:/bin:/usr/bin",
         .{tmp.sub_path},
         0,
@@ -664,8 +663,7 @@ test "bash reports an executable search failure as a tool error" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDir(io, "bash", .default_dir);
-    const path_entry = try std.fmt.allocPrintSentinel(
-        gpa,
+    const path_entry = try gpa.printSentinel(
         "PATH=.zig-cache/tmp/{s}",
         .{tmp.sub_path},
         0,
@@ -681,8 +679,8 @@ test "bash reports an executable search failure as a tool error" {
     );
     defer result.deinit(gpa);
     try std.testing.expect(result.hasFailure());
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "error AccessDenied") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "exit code") == null);
+    try std.testing.expect(std.mem.find(u8, result.content, "error AccessDenied") != null);
+    try std.testing.expect(std.mem.find(u8, result.content, "exit code") == null);
 }
 
 test "bash reports a non-zero exit as an error" {
@@ -693,8 +691,8 @@ test "bash reports a non-zero exit as an error" {
     );
     defer result.deinit(gpa);
     try std.testing.expect(result.hasFailure());
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "boom") != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "code 3") != null);
+    try std.testing.expect(std.mem.find(u8, result.content, "boom") != null);
+    try std.testing.expect(std.mem.find(u8, result.content, "code 3") != null);
     try testing.expectTimed(&result, &.{ .{ .exit_code, 3 }, .{ .lines, 1 } });
     try testing.expectConditions(&result, &.{.failed});
 }
@@ -911,7 +909,7 @@ const OutputClock = struct {
             remaining -= @min(chunk.len, remaining);
         }
         if (self.marker_handle != null) return;
-        if (std.mem.indexOf(u8, self.seen[0..self.seen_len], self.marker) == null) return;
+        if (std.mem.find(u8, self.seen[0..self.seen_len], self.marker) == null) return;
         self.marker_handle = read.file.handle;
         if (self.fire_at == .marker) self.fired.set(self.backendIo());
     }
@@ -948,7 +946,7 @@ test "bash timeout is absolute while output arrives" {
     );
     defer result.deinit(gpa);
     try std.testing.expect(result.hasFailure());
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "timed out after 200ms") != null);
+    try std.testing.expect(std.mem.find(u8, result.content, "timed out after 200ms") != null);
     try std.testing.expectEqualSlices(u64, &.{test_timeout_ms}, clock.slept());
 }
 
@@ -956,8 +954,7 @@ test "bash timeout reaps a command after output closes" {
     const gpa = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const command = try std.fmt.allocPrint(
-        gpa,
+    const command = try gpa.print(
         "echo $$ > .zig-cache/tmp/{s}/pid; echo closing; exec 1>&- 2>&-; sleep 5",
         .{tmp.sub_path},
     );
@@ -969,7 +966,7 @@ test "bash timeout reaps a command after output closes" {
     const result = try runWithTimeout(&context, command, test_timeout_ms);
     defer result.deinit(gpa);
     try std.testing.expect(result.hasFailure());
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "timed out after 200ms") != null);
+    try std.testing.expect(std.mem.find(u8, result.content, "timed out after 200ms") != null);
 
     const process_id = try readProcessId(gpa, std.testing.io, &tmp);
     var status: if (builtin.link_libc) c_int else u32 = undefined;
@@ -982,8 +979,7 @@ test "bash timeout kills descendant processes" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const command = try std.fmt.allocPrint(
-        gpa,
+    const command = try gpa.print(
         "sleep 5 & echo $! > .zig-cache/tmp/{s}/pid; echo started; wait",
         .{tmp.sub_path},
     );
@@ -999,7 +995,7 @@ test "bash timeout kills descendant processes" {
     const process_id = try readProcessId(gpa, io, &tmp);
     var gone = false;
     for (0..200) |_| {
-        std.posix.kill(process_id, @enumFromInt(0)) catch |err| switch (err) {
+        std.posix.kill(process_id, @fromBackingInt(0)) catch |err| switch (err) {
             error.ProcessNotFound => {
                 gone = true;
                 break;
@@ -1021,7 +1017,7 @@ test "an oversized command keeps its output tail and states the stop" {
     const gpa = std.testing.allocator;
     const context: Context = .{ .gpa = gpa, .host = .{ .io = std.testing.io } };
     var command_buffer: [160]u8 = undefined;
-    const input = try std.fmt.bufPrint(
+    const input = try std.mem.print(
         &command_buffer,
         "{{\"command\":\"echo marker; yes x | head -c {d}\"}}",
         .{capture_bytes_max + (1 << 20)},
@@ -1029,12 +1025,12 @@ test "an oversized command keeps its output tail and states the stop" {
     const result = try run(&context, input);
     defer result.deinit(gpa);
     try std.testing.expect(result.hasFailure());
-    try std.testing.expect(std.mem.indexOf(
+    try std.testing.expect(std.mem.find(
         u8,
         result.content,
         "[The command produced more than 8 MiB of output, so Drinky stopped it.]",
     ) != null);
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "Drinky omitted") != null);
+    try std.testing.expect(std.mem.find(u8, result.content, "Drinky omitted") != null);
     try std.testing.expect(result.measures.get(.duration_ms) != null);
     try std.testing.expect(result.measures.get(.lines) != null);
     try std.testing.expectEqual(@as(?u64, null), result.measures.get(.exit_code));

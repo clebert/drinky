@@ -76,8 +76,8 @@ fn lineComments(
 ) !void {
     const text = source[0..gap.end];
     var index = gap.start;
-    while (std.mem.indexOfPos(u8, text, index, "//")) |start| {
-        const line_end = std.mem.indexOfScalarPos(u8, text, start, '\n') orelse gap.end;
+    while (std.mem.findPos(u8, text, index, "//")) |start| {
+        const line_end = std.mem.findScalarPos(u8, text, start, '\n') orelse gap.end;
         const comment = std.mem.trimEnd(u8, text[start..line_end], "\r");
         try spans.append(arena, .{ .start = start, .end = start + comment.len });
         index = line_end;
@@ -88,7 +88,7 @@ fn strip(arena: std.mem.Allocator, source: []const u8, spans: []const Span) ![]u
     var output: std.ArrayList(u8) = .empty;
     var kept_from: usize = 0;
     for (spans) |span| {
-        const newline = std.mem.lastIndexOfScalar(u8, source[0..span.start], '\n');
+        const newline = std.mem.findScalarLast(u8, source[0..span.start], '\n');
         const line_start = if (newline) |index| index + 1 else 0;
         const code = std.mem.trimEnd(u8, source[line_start..span.start], " \t");
         const alone_on_line = code.len == 0;

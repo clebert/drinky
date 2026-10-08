@@ -31,14 +31,14 @@ the features your workflow needs.
 
 ## Build and run
 
-Drinky requires Zig 0.16.0, a POSIX system, and the `HOME` variable. A terminal with the Kitty
+Drinky requires Zig 0.17.0, a POSIX system, and the `HOME` variable. A terminal with the Kitty
 keyboard protocol and grapheme cluster processing gives the best experience. The project uses
 [Ghostty](https://ghostty.org/) for development and testing.
 
-Build and run the `ReleaseSafe` executable:
+Build and run the executable in the `safe` optimization mode:
 
 ```sh
-zig build -Doptimize=ReleaseSafe
+zig build -Doptimize=safe
 ./zig-out/bin/drinky
 ```
 

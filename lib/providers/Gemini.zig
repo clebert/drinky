@@ -125,8 +125,7 @@ fn url(
     options: *const Options,
     model: []const u8,
 ) error{OutOfMemory}![]u8 {
-    return std.fmt.allocPrint(
-        arena,
+    return arena.print(
         "https://{s}/v1/projects/{s}/locations/{s}/publishers/google/models/{s}" ++
             ":streamGenerateContent?alt=sse",
         .{ options.location.host(), options.project, @tagName(options.location), model },
@@ -143,7 +142,7 @@ fn prepare(
     self.call_number_max = callNumberMax(request.items);
     return .{
         .url = try url(arena, &self.options, request.model),
-        .authorization = try std.fmt.allocPrint(arena, "Bearer {s}", .{token}),
+        .authorization = try arena.print("Bearer {s}", .{token}),
         .body = try self.body(arena, request),
     };
 }
@@ -437,7 +436,7 @@ fn decodePart(
         try events.append(arena, .{ .tool_call_arguments = arguments });
         self.call_number_max +|= 1;
         try events.append(arena, .{ .output = .{ .tool_call = .{
-            .id = try std.fmt.allocPrint(arena, "call_{d}", .{self.call_number_max}),
+            .id = try arena.print("call_{d}", .{self.call_number_max}),
             .name = name,
             .arguments = arguments,
         } } });
@@ -506,7 +505,7 @@ fn knownPartKey(key: []const u8) bool {
 fn errorReason(detail: *const std.json.ObjectMap) core.Provider.Failure.Reason {
     const code = json.integer(detail.getPtr("code")) orelse return .invalid_request;
     if (code < 100 or code > 999) return .invalid_request;
-    return Dialect.reason(@enumFromInt(code));
+    return Dialect.reason(@fromBackingInt(@intCast(code)));
 }
 
 test "the golden bytes place every signature and merge every run" {
@@ -609,8 +608,8 @@ test "a named level sends the thoughts and its name, no effort sends no config" 
         \\"thinkingLevel":"medium"}}}
     ), try gemini.body(arena.allocator(), &named));
     const omitted = try gemini.body(arena.allocator(), &testRequest(&items, null));
-    try std.testing.expect(std.mem.indexOf(u8, omitted, "generationConfig") == null);
-    try std.testing.expect(std.mem.indexOf(u8, omitted, "tools") == null);
+    try std.testing.expect(std.mem.find(u8, omitted, "generationConfig") == null);
+    try std.testing.expect(std.mem.find(u8, omitted, "tools") == null);
 }
 
 test "a result without its call refuses the request" {
@@ -863,14 +862,13 @@ test "each finish reason folds to its stop and an absent one is invalid" {
         .{ .reason = "FUTURE_REASON", .expected = unsupported },
     }) |case| {
         const gpa = std.testing.allocator;
-        const payload = try std.fmt.allocPrint(
-            gpa,
+        const payload = try gpa.print(
             "{{\"candidates\":[{{\"content\":{{\"parts\":[{{\"text\":\"x\"}}]}}," ++
                 "\"finishReason\":\"{s}\"}}]}}",
             .{case.reason},
         );
         defer gpa.free(payload);
-        const expected = try std.fmt.allocPrint(gpa, "text:x\nmessage:x\n{s}\n", .{case.expected});
+        const expected = try gpa.print("text:x\nmessage:x\n{s}\n", .{case.expected});
         defer gpa.free(expected);
         try expectTrace(expected, &.{payload});
     }

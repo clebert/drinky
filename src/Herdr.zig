@@ -132,7 +132,7 @@ fn writeRequest(
     sequence_number: u64,
 ) !void {
     var id_buffer: [32]u8 = undefined;
-    const id = try std.fmt.bufPrint(&id_buffer, "drinky:{d}", .{sequence_number});
+    const id = try std.mem.print(&id_buffer, "drinky:{d}", .{sequence_number});
     switch (request) {
         .report => |state| try std.json.Stringify.value(.{
             .id = id,
@@ -191,7 +191,7 @@ test "the environment gates the reporter on all three Herdr variables" {
     try environ_map.put("HERDR_PANE_ID", "");
     try std.testing.expectEqual(null, fromEnviron(&environ_map));
     try environ_map.put("HERDR_PANE_ID", "w1:p1");
-    const long_path = "/" ++ "a" ** std.Io.net.UnixAddress.max_len;
+    const long_path = "/" ++ core.text.repeat("a", std.Io.net.UnixAddress.max_len);
     try environ_map.put("HERDR_SOCKET_PATH", long_path);
     try std.testing.expectEqual(null, fromEnviron(&environ_map));
 }
@@ -226,21 +226,21 @@ test "the reporter numbers its lines from the clock, forwards each change once, 
     const working = try fake.take();
     defer gpa.free(working);
     try std.testing.expect(
-        std.mem.indexOf(u8, working, "\"state\":\"working\",\"seq\":1000001}") != null,
+        std.mem.find(u8, working, "\"state\":\"working\",\"seq\":1000001}") != null,
     );
 
     herdr.sync(.blocked);
     const blocked = try fake.take();
     defer gpa.free(blocked);
     try std.testing.expect(
-        std.mem.indexOf(u8, blocked, "\"state\":\"blocked\",\"seq\":1000002}") != null,
+        std.mem.find(u8, blocked, "\"state\":\"blocked\",\"seq\":1000002}") != null,
     );
 
     herdr.sync(.idle);
     const idle_again = try fake.take();
     defer gpa.free(idle_again);
     try std.testing.expect(
-        std.mem.indexOf(u8, idle_again, "\"state\":\"idle\",\"seq\":1000003}") != null,
+        std.mem.find(u8, idle_again, "\"state\":\"idle\",\"seq\":1000003}") != null,
     );
 
     herdr.deinit();
@@ -273,7 +273,7 @@ test "a hostile pane id stays inside its JSON string" {
         const line = try fake.take();
         defer gpa.free(line);
         try std.testing.expect(
-            std.mem.indexOf(u8, line, "\"pane_id\":\"w1\\\",\\\"x\\\":\\\"\",") != null,
+            std.mem.find(u8, line, "\"pane_id\":\"w1\\\",\\\"x\\\":\\\"\",") != null,
         );
     }
     try serving.await(io);
@@ -297,11 +297,11 @@ test "the exit skips a state that still waits and sends the release alone" {
 
     const idle = try fake.take();
     defer gpa.free(idle);
-    try std.testing.expect(std.mem.indexOf(u8, idle, "\"state\":\"idle\"") != null);
+    try std.testing.expect(std.mem.find(u8, idle, "\"state\":\"idle\"") != null);
     const release = try fake.take();
     defer gpa.free(release);
     try std.testing.expect(
-        std.mem.indexOf(u8, release, "\"method\":\"pane.release_agent\"") != null,
+        std.mem.find(u8, release, "\"method\":\"pane.release_agent\"") != null,
     );
     try serving.await(io);
     try std.testing.expect(try fake.drained());

@@ -9,7 +9,7 @@ pub fn relativeTo(options: *const Containment) ?[]const u8 {
     const boundary = options.boundary;
     if (boundary.len == 0) return null;
     if (!contains(options)) return null;
-    const separated = std.fs.path.isSep(boundary[boundary.len - 1]);
+    const separated = std.Io.Dir.path.isSep(boundary[boundary.len - 1]);
     const cut = if (separated) boundary.len else boundary.len + 1;
     if (cut >= options.target.len) return null;
     return options.target[cut..];
@@ -21,12 +21,12 @@ pub fn contains(options: *const Containment) bool {
     if (std.mem.eql(u8, boundary, target)) return true;
     if (boundary.len == 0 or target.len <= boundary.len) return false;
     if (!std.mem.startsWith(u8, target, boundary)) return false;
-    if (std.fs.path.isSep(boundary[boundary.len - 1])) return true;
-    return std.fs.path.isSep(target[boundary.len]);
+    if (std.Io.Dir.path.isSep(boundary[boundary.len - 1])) return true;
+    return std.Io.Dir.path.isSep(target[boundary.len]);
 }
 
 pub fn isText(bytes: []const u8) bool {
-    return std.mem.indexOfScalar(u8, bytes, 0) == null and std.unicode.utf8ValidateSlice(bytes);
+    return std.mem.findScalar(u8, bytes, 0) == null and std.unicode.utf8ValidateSlice(bytes);
 }
 
 pub fn truncate(text: []const u8, bytes_max: usize) []const u8 {
@@ -44,16 +44,16 @@ pub fn lines(text: []const u8) usize {
 pub fn duration(buffer: []u8, milliseconds: i64) []const u8 {
     const total: u64 = @intCast(@max(milliseconds, 0));
     if (total < std.time.ms_per_s)
-        return std.fmt.bufPrint(buffer, "{d}ms", .{total}) catch unreachable;
+        return std.mem.print(buffer, "{d}ms", .{total}) catch unreachable;
     if (total < std.time.ms_per_min) {
         const tenths = @divFloor(total, 100);
-        return std.fmt.bufPrint(buffer, "{d}.{d}s", .{
+        return std.mem.print(buffer, "{d}.{d}s", .{
             @divFloor(tenths, 10),
             @mod(tenths, 10),
         }) catch unreachable;
     }
     const seconds = @divFloor(total, std.time.ms_per_s);
-    return std.fmt.bufPrint(buffer, "{d}m {d}s", .{
+    return std.mem.print(buffer, "{d}m {d}s", .{
         @divFloor(seconds, std.time.s_per_min),
         @mod(seconds, std.time.s_per_min),
     }) catch unreachable;

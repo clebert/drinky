@@ -70,7 +70,7 @@ pub fn parse(
         }
         if (line.len == 0 or line[0] == ' ' or line[0] == '\t') continue;
 
-        const separator = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const separator = std.mem.findScalar(u8, line, ':') orelse continue;
         const key = std.mem.trim(u8, line[0..separator], " \t");
         const value = std.mem.trim(u8, line[separator + 1 ..], " \t");
         if (std.mem.eql(u8, key, "name")) {
@@ -128,7 +128,7 @@ fn keySeparator(entry: []const u8) ?usize {
         (flowClose(entry[1..], quote) orelse return null) + 2
     else
         0;
-    const offset = std.mem.indexOfScalar(u8, entry[key_end..], ':') orelse return null;
+    const offset = std.mem.findScalar(u8, entry[key_end..], ':') orelse return null;
     return key_end + offset;
 }
 
@@ -635,8 +635,7 @@ test "only a block metadata map can hide a skill from a run, and an inline value
         },
     };
     for (cases) |case| {
-        const source = try std.fmt.allocPrint(
-            gpa,
+        const source = try gpa.print(
             "---\nname: case\n{s}description: after the map\n---\nbody\n",
             .{case.entries},
         );

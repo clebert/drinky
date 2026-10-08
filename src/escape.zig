@@ -1,7 +1,9 @@
 const std = @import("std");
 
+const core = @import("core");
+
 const diagnostic_bytes_max = 96;
-const display_bytes_max = 4 * std.fs.max_path_bytes + 1024;
+const display_bytes_max = 4 * std.Io.Dir.max_path_bytes + 1024;
 
 pub fn diagnostic(gpa: std.mem.Allocator, text: []const u8) error{OutOfMemory}![]u8 {
     return escaped(gpa, text, diagnostic_bytes_max);
@@ -78,7 +80,7 @@ test display {
         shown,
     );
 
-    const oversized = try display(gpa, "x" ** (display_bytes_max + 1));
+    const oversized = try display(gpa, core.text.repeat("x", display_bytes_max + 1));
     defer gpa.free(oversized);
     try std.testing.expectEqual(display_bytes_max + "…".len, oversized.len);
     try std.testing.expect(std.mem.endsWith(u8, oversized, "…"));
@@ -86,7 +88,8 @@ test display {
 
 test diagnostic {
     const gpa = std.testing.allocator;
-    const shown = try diagnostic(gpa, "a\xc2\x9b\xe2\x80\xae\xff" ++ "b" ** diagnostic_bytes_max);
+    const tail = core.text.repeat("b", diagnostic_bytes_max);
+    const shown = try diagnostic(gpa, "a\xc2\x9b\xe2\x80\xae\xff" ++ tail);
     defer gpa.free(shown);
     try std.testing.expect(std.mem.startsWith(u8, shown, "a\\xc2\\x9b\\xe2\\x80\\xae\\xff"));
     try std.testing.expect(std.mem.endsWith(u8, shown, "b…"));

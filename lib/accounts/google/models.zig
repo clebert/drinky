@@ -43,7 +43,7 @@ fn request(
 
     const url = try pageUrl(gpa, options.location, page_token);
     defer gpa.free(url);
-    const authorization = try std.fmt.allocPrint(gpa, "Bearer {s}", .{options.access_token});
+    const authorization = try gpa.print("Bearer {s}", .{options.access_token});
     defer gpa.free(authorization);
 
     const body = try net.getBody(gpa, io, transport, &.{
@@ -104,7 +104,7 @@ fn decode(value: *const std.json.Value) ?Model {
 fn generation(id: []const u8) ?u32 {
     if (!std.mem.startsWith(u8, id, id_prefix)) return null;
     const rest = id[id_prefix.len..];
-    const end = std.mem.indexOfNone(u8, rest, "0123456789") orelse rest.len;
+    const end = std.mem.findNone(u8, rest, "0123456789") orelse rest.len;
     return std.fmt.parseInt(u32, rest[0..end], 10) catch null;
 }
 
@@ -224,7 +224,7 @@ test "fetch follows the page token to the last page" {
     try std.testing.expectEqualStrings("gemini-3.8-flash", models[1].name());
     try std.testing.expectEqual(@as(usize, 3), transport.requests.items.len);
     const requests = transport.requests.items;
-    try std.testing.expect(std.mem.indexOf(u8, requests[0], "pageToken") == null);
-    try std.testing.expect(std.mem.indexOf(u8, requests[1], "&pageToken=p2\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, requests[2], "&pageToken=p3\n") != null);
+    try std.testing.expect(std.mem.find(u8, requests[0], "pageToken") == null);
+    try std.testing.expect(std.mem.find(u8, requests[1], "&pageToken=p2\n") != null);
+    try std.testing.expect(std.mem.find(u8, requests[2], "&pageToken=p3\n") != null);
 }

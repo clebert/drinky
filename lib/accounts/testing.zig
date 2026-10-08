@@ -99,7 +99,7 @@ pub const FakeLoopback = struct {
                 defer self.mutex.unlock(self.io);
                 self.arrived.reset();
                 const line = self.line_buffer[0..self.line_length];
-                break :request std.fmt.bufPrint(&request_buffer, "GET {s} HTTP/1.1", .{line}) catch
+                break :request std.mem.print(&request_buffer, "GET {s} HTTP/1.1", .{line}) catch
                     unreachable;
             };
             if (try oauth.callback.redirectOf(gpa, request_line, expected)) |redirect|
@@ -274,15 +274,15 @@ pub const private_key_pem =
 pub fn fakeJwt(gpa: std.mem.Allocator, claims: []const u8) ![]u8 {
     var encoded: [1024]u8 = undefined;
     const middle = std.base64.url_safe_no_pad.Encoder.encode(&encoded, claims);
-    return std.fmt.allocPrint(gpa, "e30.{s}.sig", .{middle});
+    return gpa.print("e30.{s}.sig", .{middle});
 }
 
 pub fn tmpHome(buffer: []u8, tmp: *const std.testing.TmpDir) ![]const u8 {
-    return std.fmt.bufPrint(buffer, tmp_root ++ "{s}", .{tmp.sub_path});
+    return std.mem.print(buffer, tmp_root ++ "{s}", .{tmp.sub_path});
 }
 
 pub fn tmpPath(buffer: []u8, tmp: *const std.testing.TmpDir, sub_path: []const u8) ![]const u8 {
-    return std.fmt.bufPrint(buffer, tmp_root ++ "{s}/{s}", .{ tmp.sub_path, sub_path });
+    return std.mem.print(buffer, tmp_root ++ "{s}/{s}", .{ tmp.sub_path, sub_path });
 }
 
 pub fn writeStore(io: std.Io, tmp: *const std.testing.TmpDir, data: []const u8) !void {

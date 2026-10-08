@@ -38,7 +38,7 @@ fn requestJson(
     transport: ?providers.Transport,
     get: *const Get,
 ) !?[]u8 {
-    const authorization = try std.fmt.allocPrint(gpa, "Bearer {s}", .{get.bearer});
+    const authorization = try gpa.print("Bearer {s}", .{get.bearer});
     defer gpa.free(authorization);
     const response = try providers.Http.fetch(gpa, io, transport, &.{
         .method = .GET,

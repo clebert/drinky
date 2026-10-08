@@ -111,8 +111,7 @@ fn next(ptr: *anyopaque) core.Provider.Error!?core.Provider.Event {
             error.ReadFailed,
             => self.end(.{
                 .reason = .network,
-                .message = try std.fmt.allocPrint(
-                    self.frame_arena.allocator(),
+                .message = try self.frame_arena.allocator().print(
                     "The stream failed because of error {s}.",
                     .{@errorName(err)},
                 ),
@@ -170,8 +169,7 @@ fn attempt(self: *Provider, request: *const core.Provider.Request) core.Provider
         error.Canceled => return error.Canceled,
         error.OutOfMemory => return error.OutOfMemory,
         else => {
-            try self.fail(.{ .reason = .network, .message = try std.fmt.allocPrint(
-                arena,
+            try self.fail(.{ .reason = .network, .message = try arena.print(
                 "The connection failed because of error {s}.",
                 .{@errorName(err)},
             ) });
@@ -260,11 +258,11 @@ fn end(self: *Provider, failure: core.Provider.Failure) error{OutOfMemory}!?core
 }
 
 fn endTooLarge(self: *Provider) error{OutOfMemory}!?core.Provider.Event {
-    return self.end(.{ .reason = .unsupported_reply, .message = try std.fmt.allocPrint(
-        self.frame_arena.allocator(),
+    const message = try self.frame_arena.allocator().print(
         "The reply exceeded {d} MiB.",
         .{self.bytes_max >> 20},
-    ) });
+    );
+    return self.end(.{ .reason = .unsupported_reply, .message = message });
 }
 
 fn push(self: *Provider, event: core.Provider.Event) error{OutOfMemory}!void {
@@ -402,7 +400,7 @@ const Rig = struct {
 };
 
 fn expectLine(request: []const u8, line: []const u8) !void {
-    try std.testing.expect(std.mem.indexOf(u8, request, line) != null);
+    try std.testing.expect(std.mem.find(u8, request, line) != null);
 }
 
 test "a complete stream yields its events through the seam and ends at the sentinel" {
@@ -510,7 +508,7 @@ test "a renewal that fails after a 401 reports the failure of the credential" {
 
 test "a reply over the byte cap fails as an unsupported reply and names the cap" {
     const gpa = std.testing.allocator;
-    const line = ":" ++ "x" ** 1022 ++ "\n";
+    const line = ":" ++ core.text.repeat("x", 1022) ++ "\n";
     const body = try gpa.alloc(u8, line.len * (@divFloor(1 << 20, line.len) + 1));
     defer gpa.free(body);
     for (0..@divExact(body.len, line.len)) |index| {
@@ -546,14 +544,15 @@ test "a failed head reports the quota it carries, then the failure with its hint
 }
 
 test "a failed body is read up to the cap and cut at a UTF-8 boundary" {
-    const body = ("x" ** (error_body_bytes_max - 1)) ++ "€" ++ ("y" ** 100);
+    const body = core.text.repeat("x", error_body_bytes_max - 1) ++ "€" ++
+        core.text.repeat("y", 100);
     var rig: Rig = undefined;
     rig.init(std.testing.io, &.{
         .replies = &.{.{ .status = .internal_server_error, .body = body }},
     });
     defer rig.deinit();
     try rig.expectTrace("failed:overloaded|-|500 Internal Server Error: " ++
-        ("x" ** (error_body_bytes_max - 1)) ++ "\n");
+        core.text.repeat("x", error_body_bytes_max - 1) ++ "\n");
 }
 
 test "a transport that cannot connect fails as a network failure with the error name" {
@@ -588,7 +587,7 @@ test "a cancel in the credential or in the transport ends the request as Cancele
 }
 
 test "filler that makes no progress trips the idle window as a network failure" {
-    const body = "data: {\"type\":\"surprise.new.event\"}\n" ** 8;
+    const body = core.text.repeat("data: {\"type\":\"surprise.new.event\"}\n", 8);
     var clock: core.testing.StepClock = undefined;
     clock.init(std.testing.allocator, 30);
     defer clock.deinit();
@@ -777,7 +776,7 @@ fn expectCanceledRead(hold: Hold, timeouts: Transport.Timeouts) !void {
     var address: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
     var server = try address.listen(io, .{});
     defer server.deinit(io);
-    const endpoint = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}/v1/responses", .{
+    const endpoint = try gpa.print("http://127.0.0.1:{d}/v1/responses", .{
         server.socket.address.getPort(),
     });
     defer gpa.free(endpoint);
@@ -843,8 +842,8 @@ const failed_statuses = [_]std.http.Status{
     .request_timeout,
     .too_many_requests,
     .internal_server_error,
-    @enumFromInt(529),
-    @enumFromInt(999),
+    @fromBackingInt(529),
+    @fromBackingInt(999),
 };
 
 const failed_bodies = [_][]const u8{

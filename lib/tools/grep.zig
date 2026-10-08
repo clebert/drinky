@@ -142,7 +142,7 @@ pub fn run(context: *const Context, input_json: []const u8) Context.Error!core.T
         };
         defer gpa.free(data);
         bytes_read += data.len;
-        if (std.mem.indexOfScalar(u8, data, 0) != null) continue;
+        if (std.mem.findScalar(u8, data, 0) != null) continue;
 
         var line_number: usize = 0;
         var lines = std.mem.splitScalar(u8, data, '\n');
@@ -151,7 +151,7 @@ pub fn run(context: *const Context, input_json: []const u8) Context.Error!core.T
             const hit = if (input.ignore_case)
                 std.ascii.findIgnoreCase(line, pattern)
             else
-                std.mem.indexOf(u8, line, pattern);
+                std.mem.find(u8, line, pattern);
             if (hit == null) continue;
             if (count == limit) {
                 line_capped = true;
@@ -262,14 +262,14 @@ test "grep finds a literal substring with a glob filter" {
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "a.zig", .data = "nope\nneedle here\n" });
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "b.txt", .data = "needle here\n" });
     var input_buffer: [128]u8 = undefined;
-    const input = try std.fmt.bufPrint(&input_buffer,
+    const input = try std.mem.print(&input_buffer,
         \\{{"pattern":"needle","path":".zig-cache/tmp/{s}","glob":"**/*.zig"}}
     , .{tmp.sub_path});
     const result = try run(&context, input);
     defer result.deinit(gpa);
     try std.testing.expect(!result.hasFailure());
     var expected_buffer: [128]u8 = undefined;
-    const expected = try std.fmt.bufPrint(
+    const expected = try std.mem.print(
         &expected_buffer,
         ".zig-cache/tmp/{s}/a.zig:2:needle here",
         .{tmp.sub_path},
@@ -294,14 +294,14 @@ test "grep searches a single file given as the path" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "a.zig", .data = "nope\nneedle here\n" });
     var input_buffer: [160]u8 = undefined;
-    const input = try std.fmt.bufPrint(&input_buffer,
+    const input = try std.mem.print(&input_buffer,
         \\{{"pattern":"needle","path":".zig-cache/tmp/{s}/a.zig"}}
     , .{tmp.sub_path});
     const result = try run(&context, input);
     defer result.deinit(gpa);
     try std.testing.expect(!result.hasFailure());
     var expected_buffer: [128]u8 = undefined;
-    const expected = try std.fmt.bufPrint(
+    const expected = try std.mem.print(
         &expected_buffer,
         ".zig-cache/tmp/{s}/a.zig:2:needle here",
         .{tmp.sub_path},
@@ -316,14 +316,14 @@ test "grep ignores the glob when the path is a single file" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "a.zig", .data = "needle here\n" });
     var input_buffer: [192]u8 = undefined;
-    const input = try std.fmt.bufPrint(&input_buffer,
+    const input = try std.mem.print(&input_buffer,
         \\{{"pattern":"needle","path":".zig-cache/tmp/{s}/a.zig","glob":"**/*.txt"}}
     , .{tmp.sub_path});
     const result = try run(&context, input);
     defer result.deinit(gpa);
     try std.testing.expect(!result.hasFailure());
     var expected_buffer: [128]u8 = undefined;
-    const expected = try std.fmt.bufPrint(
+    const expected = try std.mem.print(
         &expected_buffer,
         ".zig-cache/tmp/{s}/a.zig:1:needle here",
         .{tmp.sub_path},
@@ -333,7 +333,7 @@ test "grep ignores the glob when the path is a single file" {
 
 fn runIn(context: *const Context, comptime input: []const u8, base: []const u8) !core.Tool.Output {
     var buffer: [256]u8 = undefined;
-    return run(context, try std.fmt.bufPrint(&buffer, input, .{base}));
+    return run(context, try std.mem.print(&buffer, input, .{base}));
 }
 
 test "grep accepts an empty path" {
@@ -366,7 +366,7 @@ test "grep replaces invalid UTF-8 in matched lines" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "latin1.txt", .data = "caf\xE9 latte\n" });
     var input_buffer: [128]u8 = undefined;
-    const input = try std.fmt.bufPrint(&input_buffer,
+    const input = try std.mem.print(&input_buffer,
         \\{{"pattern":"caf","path":".zig-cache/tmp/{s}"}}
     , .{tmp.sub_path});
 
@@ -376,7 +376,7 @@ test "grep replaces invalid UTF-8 in matched lines" {
     try std.testing.expect(!result.hasFailure());
     try std.testing.expect(std.unicode.utf8ValidateSlice(result.content));
     try std.testing.expect(
-        std.mem.indexOf(u8, result.content, "latin1.txt:1:caf\u{FFFD} latte") != null,
+        std.mem.find(u8, result.content, "latin1.txt:1:caf\u{FFFD} latte") != null,
     );
 }
 
@@ -387,13 +387,13 @@ test "grep is case-insensitive when asked" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "a.txt", .data = "Needle Here\n" });
     var input_buffer: [128]u8 = undefined;
-    const input = try std.fmt.bufPrint(&input_buffer,
+    const input = try std.mem.print(&input_buffer,
         \\{{"pattern":"NEEDLE","path":".zig-cache/tmp/{s}","ignore_case":true}}
     , .{tmp.sub_path});
     const result = try run(&context, input);
     defer result.deinit(gpa);
     try std.testing.expect(!result.hasFailure());
-    try std.testing.expect(std.mem.indexOf(u8, result.content, "a.txt:1:Needle Here") != null);
+    try std.testing.expect(std.mem.find(u8, result.content, "a.txt:1:Needle Here") != null);
 }
 
 test "grep stops at the result limit and reports it" {
@@ -406,14 +406,14 @@ test "grep stops at the result limit and reports it" {
         .data = "hit one\nhit two\nhit three\n",
     });
     var input_buffer: [128]u8 = undefined;
-    const input = try std.fmt.bufPrint(&input_buffer,
+    const input = try std.mem.print(&input_buffer,
         \\{{"pattern":"hit","path":".zig-cache/tmp/{s}","limit":2}}
     , .{tmp.sub_path});
     const result = try run(&context, input);
     defer result.deinit(gpa);
     try std.testing.expect(!result.hasFailure());
     var expected_buffer: [256]u8 = undefined;
-    const expected = try std.fmt.bufPrint(
+    const expected = try std.mem.print(
         &expected_buffer,
         ".zig-cache/tmp/{s}/f.txt:1:hit one\n.zig-cache/tmp/{s}/f.txt:2:hit two\n" ++
             "[Drinky stopped after 2 matches. Refine the search or increase limit.]",
@@ -437,14 +437,14 @@ test "grep skips binary and oversized files" {
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "huge.txt", .data = big });
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "small.txt", .data = "hit\n" });
     var input_buffer: [128]u8 = undefined;
-    const input = try std.fmt.bufPrint(&input_buffer,
+    const input = try std.mem.print(&input_buffer,
         \\{{"pattern":"hit","path":".zig-cache/tmp/{s}"}}
     , .{tmp.sub_path});
     const result = try run(&context, input);
     defer result.deinit(gpa);
     try std.testing.expect(!result.hasFailure());
     var expected_buffer: [128]u8 = undefined;
-    const expected = try std.fmt.bufPrint(
+    const expected = try std.mem.print(
         &expected_buffer,
         ".zig-cache/tmp/{s}/small.txt:1:hit\n" ++
             "[Drinky did not search 1 file larger than 4 MiB.]",
@@ -465,7 +465,7 @@ test "grep finds no match in an oversized file and names the file it did not sea
     @memcpy(big[0..3], "hit");
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "huge.txt", .data = big });
     var input_buffer: [128]u8 = undefined;
-    const input = try std.fmt.bufPrint(&input_buffer,
+    const input = try std.mem.print(&input_buffer,
         \\{{"pattern":"hit","path":".zig-cache/tmp/{s}/huge.txt"}}
     , .{tmp.sub_path});
 
@@ -492,14 +492,14 @@ test "grep marks a search incomplete when it cannot read a file" {
     try tmp.dir.setFilePermissions(io, "locked.txt", .fromMode(0), .{});
     var input_buffer: [160]u8 = undefined;
 
-    const found_input = try std.fmt.bufPrint(&input_buffer,
+    const found_input = try std.mem.print(&input_buffer,
         \\{{"pattern":"hit","path":".zig-cache/tmp/{s}"}}
     , .{tmp.sub_path});
     const found = try run(&context, found_input);
     defer found.deinit(gpa);
     try std.testing.expect(!found.hasFailure());
     var expected_buffer: [128]u8 = undefined;
-    const expected = try std.fmt.bufPrint(
+    const expected = try std.mem.print(
         &expected_buffer,
         ".zig-cache/tmp/{s}/a.txt:1:hit\n[Drinky could not read 1 entry.]",
         .{tmp.sub_path},
@@ -508,7 +508,7 @@ test "grep marks a search incomplete when it cannot read a file" {
     try expectMatches(&found, 1);
     try testing.expectConditions(&found, &.{.incomplete});
 
-    const single_input = try std.fmt.bufPrint(&input_buffer,
+    const single_input = try std.mem.print(&input_buffer,
         \\{{"pattern":"hit","path":".zig-cache/tmp/{s}/locked.txt"}}
     , .{tmp.sub_path});
     const single = try run(&context, single_input);
@@ -540,14 +540,14 @@ test "grep stops at the byte cap and states it" {
     try tmp.dir.writeFile(io, .{ .sub_path = "b.txt", .data = data });
     var input_buffer: [128]u8 = undefined;
 
-    const found_input = try std.fmt.bufPrint(&input_buffer,
+    const found_input = try std.mem.print(&input_buffer,
         \\{{"pattern":"hit","path":".zig-cache/tmp/{s}"}}
     , .{tmp.sub_path});
     const found = try run(&context, found_input);
     defer found.deinit(gpa);
     try std.testing.expect(!found.hasFailure());
     var expected_buffer: [256]u8 = undefined;
-    const expected = try std.fmt.bufPrint(
+    const expected = try std.mem.print(
         &expected_buffer,
         ".zig-cache/tmp/{s}/a.txt:1:hit\n[Drinky stopped after Drinky read 1 MiB. Refine the " ++
             "search or use a narrower path or glob.]",
@@ -557,7 +557,7 @@ test "grep stops at the byte cap and states it" {
     try expectMatches(&found, 1);
     try testing.expectConditions(&found, &.{.byte_limit_reached});
 
-    const missed_input = try std.fmt.bufPrint(&input_buffer,
+    const missed_input = try std.mem.print(&input_buffer,
         \\{{"pattern":"miss","path":".zig-cache/tmp/{s}"}}
     , .{tmp.sub_path});
     const missed = try run(&context, missed_input);
@@ -576,17 +576,17 @@ test "grep caps the reported line length" {
     const context: Context = .{ .gpa = gpa, .host = .{ .io = std.testing.io } };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const line = "hit" ++ "a" ** 397;
+    const line = "hit" ++ core.text.repeat("a", 397);
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "long.txt", .data = line ++ "\n" });
     var input_buffer: [128]u8 = undefined;
-    const input = try std.fmt.bufPrint(&input_buffer,
+    const input = try std.mem.print(&input_buffer,
         \\{{"pattern":"hit","path":".zig-cache/tmp/{s}"}}
     , .{tmp.sub_path});
     const result = try run(&context, input);
     defer result.deinit(gpa);
     try std.testing.expect(!result.hasFailure());
     var expected_buffer: [512]u8 = undefined;
-    const expected = try std.fmt.bufPrint(
+    const expected = try std.mem.print(
         &expected_buffer,
         ".zig-cache/tmp/{s}/long.txt:1:{s}",
         .{ tmp.sub_path, line[0..line_bytes_max] },
@@ -615,7 +615,7 @@ test "grep reports no matches of a complete search" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "f.txt", .data = "hit\n" });
     var input_buffer: [128]u8 = undefined;
-    const input = try std.fmt.bufPrint(&input_buffer,
+    const input = try std.mem.print(&input_buffer,
         \\{{"pattern":"miss","path":".zig-cache/tmp/{s}"}}
     , .{tmp.sub_path});
     const result = try run(&context, input);
@@ -636,7 +636,7 @@ test "grep reports skipped noise after an empty search" {
     defer dependency.close(io);
     try dependency.writeFile(io, .{ .sub_path = "ignored.txt", .data = "needle\n" });
     var input_buffer: [128]u8 = undefined;
-    const input = try std.fmt.bufPrint(&input_buffer,
+    const input = try std.mem.print(&input_buffer,
         \\{{"pattern":"needle","path":".zig-cache/tmp/{s}"}}
     , .{tmp.sub_path});
 
@@ -664,13 +664,13 @@ test "grep reports a search that ran out of time" {
     try tmp.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "nope\n" });
     try tmp.dir.writeFile(io, .{ .sub_path = "b.txt", .data = "nope\n" });
     var base_buffer: [128]u8 = undefined;
-    const base = try std.fmt.bufPrint(&base_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const base = try std.mem.print(&base_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
 
     const result = try runIn(&context, "{{\"pattern\":\"hit\",\"path\":\"{s}\"}}", base);
     defer result.deinit(gpa);
     try std.testing.expect(!result.hasFailure());
     try std.testing.expect(
-        std.mem.indexOf(u8, result.content, "Drinky stopped the search after") != null,
+        std.mem.find(u8, result.content, "Drinky stopped the search after") != null,
     );
     try expectMatches(&result, 0);
     try testing.expectConditions(&result, &.{.time_limit_reached});
@@ -688,12 +688,12 @@ test "grep keeps the matches it found before the clock ran out" {
     try tmp.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "hit\n" });
     try tmp.dir.writeFile(io, .{ .sub_path = "b.txt", .data = "hit\n" });
     var base_buffer: [128]u8 = undefined;
-    const base = try std.fmt.bufPrint(&base_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const base = try std.mem.print(&base_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
 
     const result = try runIn(&context, "{{\"pattern\":\"hit\",\"path\":\"{s}\"}}", base);
     defer result.deinit(gpa);
     try std.testing.expect(!result.hasFailure());
-    try std.testing.expect(std.mem.indexOf(u8, result.content, ".txt:1:hit\n[Drinky ") != null);
+    try std.testing.expect(std.mem.find(u8, result.content, ".txt:1:hit\n[Drinky ") != null);
     try std.testing.expectStringEndsWith(
         result.content,
         ". Drinky shows the matches that it found. Use a narrower path or glob.]",
@@ -714,17 +714,17 @@ test "grep states both the clock and the result limit" {
     try tmp.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "hit\nhit\n" });
     try tmp.dir.writeFile(io, .{ .sub_path = "b.txt", .data = "hit\nhit\n" });
     var base_buffer: [128]u8 = undefined;
-    const base = try std.fmt.bufPrint(&base_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const base = try std.mem.print(&base_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
 
     const input = "{{\"pattern\":\"hit\",\"path\":\"{s}\",\"limit\":1}}";
     const result = try runIn(&context, input, base);
     defer result.deinit(gpa);
     try std.testing.expect(!result.hasFailure());
     try std.testing.expect(
-        std.mem.indexOf(u8, result.content, "Drinky stopped the search after") != null,
+        std.mem.find(u8, result.content, "Drinky stopped the search after") != null,
     );
     try std.testing.expect(
-        std.mem.indexOf(u8, result.content, "Drinky stopped after 1 match.") != null,
+        std.mem.find(u8, result.content, "Drinky stopped after 1 match.") != null,
     );
     try expectMatches(&result, 1);
     try testing.expectConditions(&result, &.{ .time_limit_reached, .match_limit_reached });
@@ -736,7 +736,7 @@ test "grep canceled while reading a file propagates" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "f.txt", .data = "hit\n" });
     var input_buffer: [128]u8 = undefined;
-    const input = try std.fmt.bufPrint(&input_buffer,
+    const input = try std.mem.print(&input_buffer,
         \\{{"pattern":"hit","path":".zig-cache/tmp/{s}"}}
     , .{tmp.sub_path});
     var cancel: testing.CancelIo = .init(.file_open);

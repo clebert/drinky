@@ -135,7 +135,7 @@ pub fn identify(
     request: *Transport.Request,
     options: *const IdentifyOptions,
 ) error{OutOfMemory}!void {
-    request.authorization = try std.fmt.allocPrint(arena, "Bearer {s}", .{options.token});
+    request.authorization = try arena.print("Bearer {s}", .{options.token});
     request.user_agent = Transport.client_name;
     if (options.codex_account_id.len == 0) return;
     request.headers = try std.mem.concat(arena, std.http.Header, &.{ request.headers, &.{
@@ -306,7 +306,7 @@ fn writeToolResult(
     try stringify.write(result.call_id);
     try stringify.objectField("output");
     if (result.output.hasFailure()) {
-        try stringify.write(try std.fmt.allocPrint(arena, "Error: {s}", .{result.output.content}));
+        try stringify.write(try arena.print("Error: {s}", .{result.output.content}));
     } else {
         try stringify.write(result.output.content);
     }
@@ -830,17 +830,16 @@ fn usageLimitText(arena: std.mem.Allocator, detail: *const std.json.ObjectMap) !
     const subject = if (plan.len == 0)
         "The subscription"
     else
-        try std.fmt.allocPrint(arena, "The {c}{s} plan", .{
+        try arena.print("The {c}{s} plan", .{
             std.ascii.toUpper(plan[0]),
             plan[1..],
         });
     const maybe_seconds = json.unsigned(detail.getPtr("resets_in_seconds"));
     const reset_text = if (maybe_seconds) |seconds|
-        try std.fmt.allocPrint(arena, " It resets in {s}.", .{try resetText(arena, seconds)})
+        try arena.print(" It resets in {s}.", .{try resetText(arena, seconds)})
     else
         "";
-    return try std.fmt.allocPrint(
-        arena,
+    return try arena.print(
         "{s} reached its usage limit.{s}",
         .{ subject, reset_text },
     );
@@ -851,17 +850,17 @@ fn resetText(arena: std.mem.Allocator, seconds: u64) ![]const u8 {
     const hours = @divFloor(minutes, 60);
     const days = @divFloor(hours, 24);
     if (minutes == 0) return "less than a minute";
-    if (hours == 0) return std.fmt.allocPrint(arena, "{d} minute{s}", .{
+    if (hours == 0) return arena.print("{d} minute{s}", .{
         minutes,
         core.text.pluralSuffix(minutes),
     });
     if (days == 0) {
         const rest_minutes = minutes - hours * 60;
-        if (rest_minutes == 0) return std.fmt.allocPrint(arena, "{d} hour{s}", .{
+        if (rest_minutes == 0) return arena.print("{d} hour{s}", .{
             hours,
             core.text.pluralSuffix(hours),
         });
-        return std.fmt.allocPrint(arena, "{d} hour{s} {d} minute{s}", .{
+        return arena.print("{d} hour{s} {d} minute{s}", .{
             hours,
             core.text.pluralSuffix(hours),
             rest_minutes,
@@ -870,8 +869,8 @@ fn resetText(arena: std.mem.Allocator, seconds: u64) ![]const u8 {
     }
     const rest_hours = hours - days * 24;
     if (rest_hours == 0)
-        return std.fmt.allocPrint(arena, "{d} day{s}", .{ days, core.text.pluralSuffix(days) });
-    return std.fmt.allocPrint(arena, "{d} day{s} {d} hour{s}", .{
+        return arena.print("{d} day{s}", .{ days, core.text.pluralSuffix(days) });
+    return arena.print("{d} day{s} {d} hour{s}", .{
         days,
         core.text.pluralSuffix(days),
         rest_hours,
@@ -1603,15 +1602,13 @@ test "the terminal cost accepts numeric strings and preserves small charges" {
         var rig: Rig = undefined;
         rig.init(test_options);
         defer rig.deinit();
-        const payload = try std.fmt.allocPrint(
-            std.testing.allocator,
+        const payload = try std.testing.allocator.print(
             "{{\"type\":\"response.completed\",\"response\":{{\"usage\":{{\"cost\":{s}}}}}}}",
             .{case.value},
         );
         defer std.testing.allocator.free(payload);
         try rig.frames.feed(&.{payload});
-        const expected = try std.fmt.allocPrint(
-            std.testing.allocator,
+        const expected = try std.testing.allocator.print(
             "usage:0/0/0/0{s}\nstopped:complete|\n",
             .{case.expected},
         );
@@ -2040,7 +2037,7 @@ test "a failed head reports the upstream text of a routed error" {
         ,
     }, "failed:overloaded|-|502 Bad Gateway: Provider returned error");
     try Rig.expectFailure(test_options, &.{
-        .status = @enumFromInt(529),
+        .status = @fromBackingInt(529),
         .retry_after_ms = null,
         .body = "{\"error\":{\"message\":\"Provider returned error\",\"code\":529," ++
             "\"metadata\":{\"raw\":\"{\\\"type\\\":\\\"error\\\"," ++

@@ -32,7 +32,7 @@ fn request(
     list: *const List,
 ) ![]Model {
     if (!providers.Transport.validHeaderValue(list.token)) return error.BadModelListCredentials;
-    const authorization = try std.fmt.allocPrint(gpa, "Bearer {s}", .{list.token});
+    const authorization = try gpa.print("Bearer {s}", .{list.token});
     defer gpa.free(authorization);
 
     const body = try net.getBody(gpa, io, transport, &.{

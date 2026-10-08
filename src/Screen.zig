@@ -136,8 +136,7 @@ const Turn = struct {
     }
 
     fn lastBlock(self: *Turn, kind: Block.Kind) ?*Block {
-        if (self.blocks.items.len == 0) return null;
-        const block = &self.blocks.items[self.blocks.items.len - 1];
+        const block = self.blocks.lastPtr() orelse return null;
         return if (block.kind == kind) block else null;
     }
 
@@ -572,7 +571,7 @@ fn describeCall(self: *Screen, call: *Call, tool_call: *const core.Tool.Call) !v
 }
 
 fn appendUnknownResult(self: *Screen, result: *const core.Session.Event.ToolResult) !void {
-    const head = try std.fmt.allocPrint(self.gpa, "Tool: {s}", .{result.call.name});
+    const head = try self.gpa.print("Tool: {s}", .{result.call.name});
     defer self.gpa.free(head);
     _ = try self.appendToolBlock(head, &result.output);
 }
@@ -587,12 +586,12 @@ fn appendToolBlock(self: *Screen, head: []const u8, output: *const core.Tool.Out
             .failed = failed,
         } }),
         .measures => |detail| {
-            const text = try std.fmt.allocPrint(self.gpa, "{s}\n{s}", .{ head, detail });
+            const text = try self.gpa.print("{s}\n{s}", .{ head, detail });
             defer self.gpa.free(text);
             try self.transcript.append(&.{ .tool_result = .{ .text = text, .failed = failed } });
         },
         .sentence => |sentence| {
-            const text = try std.fmt.allocPrint(self.gpa, "{s}\nError: {s}", .{ head, sentence });
+            const text = try self.gpa.print("{s}\nError: {s}", .{ head, sentence });
             defer self.gpa.free(text);
             try self.transcript.append(&.{ .tool_result = .{
                 .text = text,
@@ -626,8 +625,7 @@ fn recordServed(self: *Screen, turn: *Turn, served: *const core.Session.Event.Mo
     @memcpy(turn.served_buffer[0..length], served.served[0..length]);
     turn.served_length = length;
     self.transcript.endMessage();
-    const text = try std.fmt.allocPrint(
-        self.gpa,
+    const text = try self.gpa.print(
         "The provider answered with the model \"{s}\" instead of the requested model \"{s}\".",
         .{ served.served, served.requested },
     );
@@ -673,7 +671,7 @@ fn failureSentence(reason: core.Provider.Failure.Reason) []const u8 {
 pub fn failureText(gpa: std.mem.Allocator, failure: *const core.Provider.Failure) ![]u8 {
     const sentence = failureSentence(failure.reason);
     if (failure.message.len == 0) return gpa.dupe(u8, sentence);
-    return std.fmt.allocPrint(gpa, "{s} Details: {s}", .{ sentence, failure.message });
+    return gpa.print("{s} Details: {s}", .{ sentence, failure.message });
 }
 
 fn attemptText(gpa: std.mem.Allocator, attempt: *const core.Session.Event.Attempt) ![]u8 {
@@ -683,13 +681,11 @@ fn attemptText(gpa: std.mem.Allocator, attempt: *const core.Session.Event.Attemp
         std.math.maxInt(i64),
     )));
     const sentence = failureSentence(attempt.failure.reason);
-    if (attempt.failure.message.len == 0) return std.fmt.allocPrint(
-        gpa,
+    if (attempt.failure.message.len == 0) return gpa.print(
         "Attempt {d} failed. {s} Drinky tries again in {s}.",
         .{ attempt.attempt, sentence, delay },
     );
-    return std.fmt.allocPrint(
-        gpa,
+    return gpa.print(
         "Attempt {d} failed. {s} Drinky tries again in {s}. Details: {s}",
         .{ attempt.attempt, sentence, delay, attempt.failure.message },
     );
@@ -714,7 +710,7 @@ pub fn appendUser(self: *Screen, text: []const u8) !void {
 pub fn appendSkillNote(self: *Screen, skill: *const core.Session.Event.SkillLoaded) !void {
     const path = try format.path(self.gpa, skill.source, &self.display_roots);
     defer self.gpa.free(path);
-    const text = try std.fmt.allocPrint(self.gpa, "Skill: {s} · File: {s}", .{ skill.name, path });
+    const text = try self.gpa.print("Skill: {s} · File: {s}", .{ skill.name, path });
     defer self.gpa.free(text);
     try self.appendNote(text);
 }
@@ -1159,7 +1155,7 @@ test "a tool call streams as a row, runs with its subject and timer, and ends as
     try std.testing.expect(!block.failed);
     const done = try rig.paintPlain(80);
     defer gpa.free(done);
-    try std.testing.expect(std.mem.indexOf(u8, done, "Status: Streaming") == null);
+    try std.testing.expect(std.mem.find(u8, done, "Status: Streaming") == null);
 
     try rig.apply(&.committed);
     try rig.end(&.{ .stopped = .complete });
@@ -1219,7 +1215,7 @@ test "queued calls read as queued until each one runs" {
     const one = try rig.paintPlain(80);
     defer gpa.free(one);
     try testing.expectContains(one, "Tool: read ");
-    try std.testing.expect(std.mem.indexOf(u8, one, "Tool: read ·") == null);
+    try std.testing.expect(std.mem.find(u8, one, "Tool: read ·") == null);
     try testing.expectContains(one, "Tool: write · Received: 0 B · Status: Queued");
     try rig.apply(&.{ .tool_result = .{
         .call = .{ .id = "c1", .name = "read", .arguments = "{}" },
@@ -1258,8 +1254,8 @@ test "a discarded tail leaves the screen with its rows, and a cancel keeps the r
     try rig.expectKinds(&.{ .user, .model, .tool_result });
     const painted = try rig.paintPlain(80);
     defer gpa.free(painted);
-    try std.testing.expect(std.mem.indexOf(u8, painted, "Tool: write") == null);
-    try std.testing.expect(std.mem.indexOf(u8, painted, "afterthought") == null);
+    try std.testing.expect(std.mem.find(u8, painted, "Tool: write") == null);
+    try std.testing.expect(std.mem.find(u8, painted, "afterthought") == null);
 
     try rig.apply(&.committed);
     try rig.end(&.canceled);
@@ -1473,7 +1469,7 @@ test "an account switch keeps every block and the scrollback" {
     const switched = try rig.paintPlain(80);
     defer gpa.free(switched);
     try std.testing.expect(
-        std.mem.indexOf(u8, rig.out.written(), terminal.escape.screen_reset) == null,
+        std.mem.find(u8, rig.out.written(), terminal.escape.screen_reset) == null,
     );
     const wider = try rig.paintPlain(100);
     defer gpa.free(wider);
@@ -1564,7 +1560,7 @@ test "a picker keeps its trail, waits with animation, and a repeat of a step sta
     const painted = try rig.paintPlain(80);
     defer gpa.free(painted);
     try testing.expectContains(painted, "Drinky fetches");
-    try std.testing.expect(std.mem.indexOf(u8, painted, "> row") == null);
+    try std.testing.expect(std.mem.find(u8, painted, "> row") == null);
 
     try rig.screen.openPicker(&try pickForTest(gpa, &.{"row"}, model_step));
     try std.testing.expect(!rig.screen.animating());
@@ -1642,8 +1638,8 @@ test "a page repaints the screen and keeps the scrollback" {
     try rig.screen.openPage(&.{ .title = "Page", .content = "body" });
     try rig.screen.paint(.{ .columns = 80, .rows = 24 }, rig.time, &no_caption);
     const painted = rig.out.written();
-    try std.testing.expect(std.mem.indexOf(u8, painted, terminal.escape.screen_repaint) != null);
-    try std.testing.expect(std.mem.indexOf(u8, painted, "\x1b[3J") == null);
+    try std.testing.expect(std.mem.find(u8, painted, terminal.escape.screen_repaint) != null);
+    try std.testing.expect(std.mem.find(u8, painted, "\x1b[3J") == null);
 }
 
 test "a window without a column or a row paints as one column and one row" {

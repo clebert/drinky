@@ -245,7 +245,7 @@ test "UAX #29 grapheme cluster boundaries match the conformance corpus" {
     var checked: usize = 0;
     while (lines.next()) |raw| {
         line_number += 1;
-        const hash = std.mem.indexOfScalar(u8, raw, '#') orelse raw.len;
+        const hash = std.mem.findScalar(u8, raw, '#') orelse raw.len;
         const line = std.mem.trim(u8, raw[0..hash], " \t\r");
         if (line.len == 0) continue;
 
