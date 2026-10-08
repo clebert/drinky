@@ -17,6 +17,11 @@ const lines_max = 1 << 16;
 const rendezvous_timeout_ms = 5_000;
 const rendezvous_polls_max = 1024;
 
+pub const no_resize_allocator = no_resize_allocator_instance.allocator();
+var no_resize_allocator_instance: std.testing.FailingAllocator = .init(std.testing.allocator, .{
+    .resize_fail_index = 0,
+});
+
 pub const FakeProvider = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -528,7 +533,7 @@ pub fn checkCopyAllocationFailures(comptime Event: type, events: []const Event) 
         }
     };
     for (events) |*event| {
-        try std.testing.checkAllAllocationFailures(std.testing.allocator, Copy.run, .{event});
+        try std.testing.checkAllAllocationFailures(no_resize_allocator, Copy.run, .{event});
     }
 }
 

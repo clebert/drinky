@@ -98,6 +98,9 @@ These rules outrank existing behavior and repository precedent.
 - Test through commands and events with a hand-written fake. Use no network and no sleep. A test
   that needs a clock hands in an `Io` that controls it.
 - A test takes `std.testing.io`. Build an `Io` only to set a limit or to control the clock.
+- Run `std.testing.checkAllAllocationFailures` on `core.testing.no_resize_allocator`. The test
+  allocator resizes in place only while its block has room. So the allocation count can change
+  between runs, and the check can fail on one platform alone.
 - A fake that waits for a cancel waits on an event that no task sets. The test checks that the
   cancel ended the wait.
 - A test that changes with every implementation change tests the implementation. Delete it or move
@@ -193,9 +196,10 @@ identifier. A model under an account reads `account/model`.
 
 Run `sh scripts/check.sh` after a change. CI runs the same script and nothing else. The script
 builds the binary and checks the format of the Zig code and of the documents. It fails on a code
-comment and on a Zig line over 100 columns. It runs the tests with the reachability count. Its
-summary prints the runtime of each test binary. The document check needs `npx`, which fetches
-Prettier once into its cache.
+comment, on a Zig line over 100 columns, and on an allocation-failure check without
+`core.testing.no_resize_allocator`. It runs the tests with the reachability count. Its summary
+prints the runtime of each test binary. The document check needs `npx`, which fetches Prettier once
+into its cache.
 
 `zig run scripts/comment_scan.zig -- --fix build.zig build.zig.zon src lib scripts` removes every
 comment, and `zig fmt build.zig build.zig.zon src lib scripts` formats the Zig code.

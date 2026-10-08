@@ -890,7 +890,6 @@ fn checkDiscoveryAllocationFailure(
 }
 
 test "discovery frees every partial allocation" {
-    const gpa = std.testing.allocator;
     const io = std.testing.io;
     var tree: testing.Tree = try .init();
     defer tree.deinit();
@@ -901,7 +900,7 @@ test "discovery frees every partial allocation" {
     const working_directory = try tree.path("repo/work");
 
     try std.testing.checkAllAllocationFailures(
-        gpa,
+        core.testing.no_resize_allocator,
         checkDiscoveryAllocationFailure,
         .{ io, working_directory },
     );
@@ -1084,7 +1083,6 @@ fn checkLoadAllocationFailure(gpa: std.mem.Allocator, io: std.Io, directory: []c
 }
 
 test "the configured load frees every partial allocation" {
-    const gpa = std.testing.allocator;
     const io = std.testing.io;
     var tree: testing.Tree = try .init();
     defer tree.deinit();
@@ -1095,7 +1093,7 @@ test "the configured load frees every partial allocation" {
     const directory = tree.root;
 
     try std.testing.checkAllAllocationFailures(
-        gpa,
+        core.testing.no_resize_allocator,
         checkLoadAllocationFailure,
         .{ io, directory },
     );

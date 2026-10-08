@@ -594,7 +594,7 @@ test "collect propagates every allocation failure from a deep walk" {
     const base = try std.mem.print(&base_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
 
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        core.testing.no_resize_allocator,
         collectUnderAllocationFailure,
         .{ io, base },
     );

@@ -732,7 +732,6 @@ fn checkDiscoverAllocationFailure(
 }
 
 test "a discovery and an invocation free every allocation and fail as OutOfMemory" {
-    const gpa = std.testing.allocator;
     const io = std.testing.io;
     var tree: testing.Tree = try .init();
     defer tree.deinit();
@@ -757,7 +756,7 @@ test "a discovery and an invocation free every allocation and fail as OutOfMemor
     };
 
     try std.testing.checkAllAllocationFailures(
-        gpa,
+        core.testing.no_resize_allocator,
         checkDiscoverAllocationFailure,
         .{ io, &options },
     );

@@ -325,7 +325,7 @@ pub fn DialectRig(comptime Wire: type) type {
             payloads: []const []const u8,
         ) !void {
             try std.testing.checkAllAllocationFailures(
-                std.testing.allocator,
+                core.testing.no_resize_allocator,
                 decodeAll,
                 .{ options, payloads },
             );

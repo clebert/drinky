@@ -1362,7 +1362,6 @@ fn checkLoadAllocationFailure(gpa: std.mem.Allocator, io: std.Io, home: []const 
 }
 
 test "the config load frees every partial allocation" {
-    const gpa = std.testing.allocator;
     const io = std.testing.io;
     var tree: testing.Tree = try .init();
     defer tree.deinit();
@@ -1380,5 +1379,9 @@ test "the config load frees every partial allocation" {
     });
     const home = tree.root;
 
-    try std.testing.checkAllAllocationFailures(gpa, checkLoadAllocationFailure, .{ io, home });
+    try std.testing.checkAllAllocationFailures(
+        core.testing.no_resize_allocator,
+        checkLoadAllocationFailure,
+        .{ io, home },
+    );
 }
