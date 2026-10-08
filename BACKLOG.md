@@ -26,16 +26,6 @@ when the user drops it.
   allocator can consume a pending cancel. Without the strip, two cancel tests of `Session` fail in
   about one of three runs. A Debug build of Drinky records stacks through the same allocator, so it
   can hang or lose a cancel too. Trigger: a Zig release that fixes both defects.
-- Drinky has no `zig build check` step, so `scripts/check.sh` runs the checks outside the build
-  graph. The step can replace the script, and CI can then run `zig build check --summary all`.
-  `b.addFmt` runs `zig fmt --check`. Run steps run the comment scan and the width scan. A system
-  command runs the scan for an allocation-failure check without `core.testing.no_resize_allocator`.
-  A system command runs Prettier through `npx`, and only `check` depends on it. `build.zig` cannot
-  compare the count of tests that ran with the declared tests. The test runner of Zig 0.17.0 accepts
-  only `--listen=-`, `--seed`, and `--cache-dir`, so it cannot list its tests. A new Zig program
-  must run each test binary and read its line `All {d} tests passed.`. It prints the runtime of each
-  binary and compares the sum with the `test` declarations. The Checks section of `AGENTS.md` and
-  the CI workflow change with the script.
 - Drinky calls `std.unicode.utf8Decode` at six sites. Zig 0.17.0 deprecates the function but names
   no successor, and the standard library still calls it. Trigger: a Zig release that names a
   successor or removes the function.
