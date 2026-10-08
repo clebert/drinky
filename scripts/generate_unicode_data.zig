@@ -1,5 +1,7 @@
 const std = @import("std");
 
+const download = @import("download.zig");
+
 const version = "17.0.0";
 const base = "https://www.unicode.org/Public/" ++ version ++ "/ucd";
 const license_url = "https://www.unicode.org/license.txt";
@@ -71,9 +73,13 @@ pub fn main(init: std.process.Init) !void {
     var client: std.http.Client = .{ .allocator = arena, .io = io };
     defer client.deinit();
 
-    const categories = try fetch(arena, &client, base ++ "/extracted/DerivedGeneralCategory.txt");
-    const east_asian = try fetch(arena, &client, base ++ "/EastAsianWidth.txt");
-    const emoji = try fetch(arena, &client, base ++ "/emoji/emoji-data.txt");
+    const categories = try download.bytes(
+        arena,
+        &client,
+        base ++ "/extracted/DerivedGeneralCategory.txt",
+    );
+    const east_asian = try download.bytes(arena, &client, base ++ "/EastAsianWidth.txt");
+    const emoji = try download.bytes(arena, &client, base ++ "/emoji/emoji-data.txt");
 
     const zero = try arena.alloc(bool, codepoint_max + 1);
     @memset(zero, false);
@@ -88,12 +94,12 @@ pub fn main(init: std.process.Init) !void {
 
     const width_ranges = try coalesce(arena, zero, wide);
 
-    const grapheme_break = try fetch(
+    const grapheme_break = try download.bytes(
         arena,
         &client,
         base ++ "/auxiliary/GraphemeBreakProperty.txt",
     );
-    const derived = try fetch(arena, &client, base ++ "/DerivedCoreProperties.txt");
+    const derived = try download.bytes(arena, &client, base ++ "/DerivedCoreProperties.txt");
 
     const classes = try arena.alloc(Class, codepoint_max + 1);
     @memset(classes, .other);
@@ -113,10 +119,14 @@ pub fn main(init: std.process.Init) !void {
     try emit(&out.writer, width_ranges, class_ranges);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = output_path, .data = out.written() });
 
-    const break_test = try fetch(arena, &client, base ++ "/auxiliary/GraphemeBreakTest.txt");
+    const break_test = try download.bytes(
+        arena,
+        &client,
+        base ++ "/auxiliary/GraphemeBreakTest.txt",
+    );
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = test_output_path, .data = break_test });
 
-    const license = try fetch(arena, &client, license_url);
+    const license = try download.bytes(arena, &client, license_url);
     var notice: std.Io.Writer.Allocating = .init(arena);
     try notice.writer.print(license_header, .{version});
     try notice.writer.writeAll(license);
@@ -131,19 +141,6 @@ pub fn main(init: std.process.Init) !void {
     );
     std.debug.print("wrote {s}\n", .{test_output_path});
     std.debug.print("wrote {s}\n", .{license_output_path});
-}
-
-fn fetch(arena: std.mem.Allocator, client: *std.http.Client, url: []const u8) ![]const u8 {
-    var response: std.Io.Writer.Allocating = .init(arena);
-    const result = try client.fetch(.{
-        .location = .{ .url = url },
-        .response_writer = &response.writer,
-    });
-    if (result.status != .ok) {
-        std.debug.print("fetch {s} returned {d}\n", .{ url, @backingInt(result.status) });
-        return error.FetchFailed;
-    }
-    return response.written();
 }
 
 fn mark(text: []const u8, wanted: []const []const u8, flags: []bool) void {

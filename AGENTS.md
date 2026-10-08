@@ -205,8 +205,9 @@ into its cache.
 comment, and `zig fmt build.zig build.zig.zon src lib scripts` formats the Zig code.
 `zig run scripts/width_scan.zig -- build.zig build.zig.zon src lib scripts` lists every Zig line
 over 100 columns and wraps none, because `zig fmt` never wraps a line. `zig build unicode`
-regenerates the Unicode data, its test corpus, and its license notice. It uses the network, so it
-never joins the default build.
+regenerates the Unicode data, its test corpus, and its license notice. `zig build commonmark`
+regenerates the CommonMark test corpus and its license notice. Both steps use the network, so they
+never join the default build.
 
 A rule that a tool can check belongs in `scripts/check.sh`, because an editor setting enforces
 nothing. Add a check to `scripts/check.sh` for a problem that occurred.

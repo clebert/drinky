@@ -121,6 +121,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("scripts/generate_unicode_data.zig"),
             .target = b.graph.host,
             .optimize = optimize,
+            .strip = true,
         }),
     });
 
@@ -135,4 +136,26 @@ pub fn build(b: *std.Build) void {
     unicode_step.dependOn(&run_unicode.step);
 
     b.default_step.dependOn(&unicode_generator.step);
+
+    const commonmark_generator = b.addExecutable(.{
+        .name = "generate-commonmark-corpus",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/generate_commonmark_corpus.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+            .strip = true,
+        }),
+    });
+
+    const run_commonmark = b.addRunArtifact(commonmark_generator);
+    run_commonmark.setCwd(b.path("."));
+    run_commonmark.has_side_effects = true;
+
+    const commonmark_step = b.step(
+        "commonmark",
+        "Regenerate the CommonMark test corpus and its license notice",
+    );
+    commonmark_step.dependOn(&run_commonmark.step);
+
+    b.default_step.dependOn(&commonmark_generator.step);
 }

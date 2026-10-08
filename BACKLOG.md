@@ -16,20 +16,16 @@ when the user drops it.
 - `drinky run` reports no usage. The parent agent and the user see neither the tokens nor the cost
   of a run.
 - A failed test shows no stack trace, because `build.zig` sets `strip = true` for each test module.
-  Two defects of Zig 0.17.0 block the removal of the strip. On macOS 27.0, the MachO unwinder panics
-  with `switch on corrupt value` at `std/debug/SelfInfo/MachO.zig:406`. The compact unwind data
-  holds an arm64 mode that the unwinder does not know. The test allocator records a stack at each
-  allocation, so a test hits that panic. The panic handler then waits on the lock of the unwinder,
-  and the test hangs. Also, `std.debug.captureCurrentStackTrace` does not block cancellation, so a
-  stack capture in the test allocator can consume a pending cancel. Without the strip, two cancel
-  tests of `Session` fail in about one of three runs. A Debug build of Drinky records stacks through
-  the same allocator, so it can hang or lose a cancel too. Trigger: a Zig release that fixes both
-  defects.
-- The Markdown renderer can close an emphasis run inside a code span. `closerAt` in
-  `src/ui/markdown.zig` searches the raw text for the closer. So a bold run that holds `**` in a
-  code span ends at that code span. The backticks after it then pair wrongly, and the rest of the
-  line shows stray backticks and code in the wrong ranges. CommonMark gives a code span precedence
-  over emphasis. `linkAt` also searches its `]` and `)` closers in the raw text.
+  It also sets the strip for the generators of `zig build unicode` and `zig build commonmark`.
+  Without it, a generator hangs at its first allocation. Two defects of Zig 0.17.0 block the removal
+  of the strip. On macOS 27.0, the MachO unwinder panics with `switch on corrupt value` at
+  `std/debug/SelfInfo/MachO.zig:406`. The compact unwind data holds an arm64 mode that the unwinder
+  does not know. The test allocator records a stack at each allocation, so a test hits that panic.
+  The panic handler then waits on the lock of the unwinder, and the test hangs. Also,
+  `std.debug.captureCurrentStackTrace` does not block cancellation, so a stack capture in the test
+  allocator can consume a pending cancel. Without the strip, two cancel tests of `Session` fail in
+  about one of three runs. A Debug build of Drinky records stacks through the same allocator, so it
+  can hang or lose a cancel too. Trigger: a Zig release that fixes both defects.
 - Drinky has no `zig build check` step, so `scripts/check.sh` runs the checks outside the build
   graph. The step can replace the script, and CI can then run `zig build check --summary all`.
   `b.addFmt` runs `zig fmt --check`. Run steps run the comment scan and the width scan. A system

@@ -100,7 +100,7 @@ pub const Sink = struct {
     tail_joining: bool,
     link_open: bool,
 
-    const url_bytes_max = 2048;
+    pub const url_bytes_max = 2048;
 
     const url_schemes = [_][]const u8{ "http://", "https://", "mailto:" };
 
