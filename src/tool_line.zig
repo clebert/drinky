@@ -77,24 +77,24 @@ fn write(writer: *std.Io.Writer, output: *const core.Tool.Output) !void {
         try parts.print("Time: {s}", .{tools.format.duration(&buffer, @intCast(duration_ms))});
     }
     if (output.measures.get(.exit_code)) |code| try parts.print("Exit code: {d}", .{code});
-    if (output.conditions.contains(.terminated)) try parts.print("Status: Terminated", .{});
-    if (output.conditions.contains(.timed_out)) try parts.print("Status: Timed out", .{});
-    if (output.conditions.contains(.overflowed)) try parts.print("Status: Output limit", .{});
+    if (output.conditions.contains(.terminated)) try parts.print("Status: terminated", .{});
+    if (output.conditions.contains(.timed_out)) try parts.print("Status: timed out", .{});
+    if (output.conditions.contains(.overflowed)) try parts.print("Status: output limit", .{});
     if (output.measures.get(.matches)) |count| try parts.print("Matches: {d}", .{count});
     try writeLines(&parts, output);
-    if (output.conditions.contains(.time_limit_reached)) try parts.print("Search: Timed out", .{});
-    if (output.conditions.contains(.match_limit_reached)) try parts.print("Limit: Reached", .{});
+    if (output.conditions.contains(.time_limit_reached)) try parts.print("Search: timed out", .{});
+    if (output.conditions.contains(.match_limit_reached)) try parts.print("Limit: reached", .{});
     if (output.conditions.contains(.byte_limit_reached)) {
         const bytes = output.measures.get(.bytes) orelse 0;
         try parts.print("Stopped at: {d} MiB", .{@divFloor(bytes, mebibyte)});
     }
-    if (output.conditions.contains(.incomplete)) try parts.print("Search: Incomplete", .{});
+    if (output.conditions.contains(.incomplete)) try parts.print("Search: incomplete", .{});
     if (output.measures.get(.matches_omitted)) |count| {
         try parts.print("Omitted matches: {d}", .{count});
     }
-    if (output.conditions.contains(.line_truncated)) try parts.print("Line: Truncated", .{});
-    if (output.conditions.contains(.lines_truncated)) try parts.print("Lines: Truncated", .{});
-    if (output.conditions.contains(.output_truncated)) try parts.print("Output: Truncated", .{});
+    if (output.conditions.contains(.line_truncated)) try parts.print("Line: truncated", .{});
+    if (output.conditions.contains(.lines_truncated)) try parts.print("Lines: truncated", .{});
+    if (output.conditions.contains(.output_truncated)) try parts.print("Output: truncated", .{});
 }
 
 fn writeLines(parts: *Parts, output: *const core.Tool.Output) !void {
@@ -131,7 +131,7 @@ test "a read names its window, and a whole file or an empty file its count alone
     try expectLine(&.{
         .measures = &.{ .{ .lines, 2 }, .{ .line_first, 2 }, .{ .lines_total, 3 } },
         .conditions = &.{.line_truncated},
-        .expected = "Lines: 2\u{2013}3 of 3 \u{00B7} Line: Truncated",
+        .expected = "Lines: 2\u{2013}3 of 3 \u{00B7} Line: truncated",
     });
 }
 
@@ -167,19 +167,19 @@ test "a search reports its time, its matches, and every reached limit" {
     try expectLine(&.{
         .measures = &.{ .{ .duration_ms, 1500 }, .{ .matches, 1 }, .{ .matches_omitted, 2 } },
         .conditions = &.{.time_limit_reached},
-        .expected = "Time: 1.5s \u{00B7} Matches: 1 \u{00B7} Search: Timed out \u{00B7} " ++
+        .expected = "Time: 1.5s \u{00B7} Matches: 1 \u{00B7} Search: timed out \u{00B7} " ++
             "Omitted matches: 2",
     });
     try expectLine(&.{
         .measures = &.{ .{ .duration_ms, 0 }, .{ .matches, 0 } },
         .conditions = &.{.incomplete},
-        .expected = "Time: 0ms \u{00B7} Matches: 0 \u{00B7} Search: Incomplete",
+        .expected = "Time: 0ms \u{00B7} Matches: 0 \u{00B7} Search: incomplete",
     });
     try expectLine(&.{
         .measures = &.{ .{ .duration_ms, 42 }, .{ .matches, 2 }, .{ .bytes, 300 * mebibyte } },
         .conditions = &.{ .match_limit_reached, .byte_limit_reached, .lines_truncated },
-        .expected = "Time: 42ms \u{00B7} Matches: 2 \u{00B7} Limit: Reached \u{00B7} " ++
-            "Stopped at: 300 MiB \u{00B7} Lines: Truncated",
+        .expected = "Time: 42ms \u{00B7} Matches: 2 \u{00B7} Limit: reached \u{00B7} " ++
+            "Stopped at: 300 MiB \u{00B7} Lines: truncated",
     });
     try expectLine(&.{
         .measures = &.{ .{ .duration_ms, 42 }, .{ .matches, 0 }, .{ .bytes, 5 } },
@@ -191,7 +191,7 @@ test "a command reports its time, its exit code or its status, and its output" {
     try expectLine(&.{
         .measures = &.{ .{ .duration_ms, 1500 }, .{ .exit_code, 0 }, .{ .lines, 3 } },
         .conditions = &.{.output_truncated},
-        .expected = "Time: 1.5s \u{00B7} Exit code: 0 \u{00B7} Lines: 3 \u{00B7} Output: Truncated",
+        .expected = "Time: 1.5s \u{00B7} Exit code: 0 \u{00B7} Lines: 3 \u{00B7} Output: truncated",
     });
     try expectLine(&.{
         .measures = &.{ .{ .duration_ms, 10 }, .{ .exit_code, 3 }, .{ .lines, 1 } },
@@ -201,17 +201,17 @@ test "a command reports its time, its exit code or its status, and its output" {
     try expectLine(&.{
         .measures = &.{ .{ .duration_ms, 120_000 }, .{ .lines, 1 } },
         .conditions = &.{.timed_out},
-        .expected = "Time: 2m 0s \u{00B7} Status: Timed out \u{00B7} Lines: 1",
+        .expected = "Time: 2m 0s \u{00B7} Status: timed out \u{00B7} Lines: 1",
     });
     try expectLine(&.{
         .measures = &.{.{ .duration_ms, 5 }},
         .conditions = &.{.terminated},
-        .expected = "Time: 5ms \u{00B7} Status: Terminated",
+        .expected = "Time: 5ms \u{00B7} Status: terminated",
     });
     try expectLine(&.{
         .measures = &.{.{ .duration_ms, 5 }},
         .conditions = &.{.overflowed},
-        .expected = "Time: 5ms \u{00B7} Status: Output limit",
+        .expected = "Time: 5ms \u{00B7} Status: output limit",
     });
 }
 

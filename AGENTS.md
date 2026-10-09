@@ -60,6 +60,8 @@ These rules outrank existing behavior and repository precedent.
   page, or the turn that holds it.
 - Drinky destroys nothing without a decision. If a key press has another meaning, Drinky warns
   first. A second press of the same key confirms the action.
+- `/compact` toggles the transcript mode, even during a turn. It clears terminal scrollback and
+  repaints the complete transcript without a warning.
 - A failure is not a decision. Every draft and user message survives a failure.
 - `user_note` is the role of a message that Drinky writes for the user. An event reports session
   state. A user box holds typed text alone.

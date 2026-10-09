@@ -116,6 +116,7 @@ pub const Box = struct {
     text: []const u8,
     fit: Fit = .wrap,
     emphasis: Emphasis = .none,
+    compact: bool = false,
 
     const Emphasis = enum {
         none,
@@ -321,13 +322,22 @@ fn firstValue(text: []const u8) Run {
 }
 
 pub fn boxRows(body: *const Box, columns: usize) usize {
-    var count: usize = 2;
+    var count: usize = if (body.compact) 0 else 2;
     var lines = std.mem.splitScalar(u8, body.text, '\n');
-    while (lines.next()) |line| count += switch (body.fit) {
-        .wrap => terminal.width.rows(lineText(line), columns),
-        .head => 1,
-    };
+    var first = true;
+    while (lines.next()) |line| {
+        count += switch (boxFit(body, first)) {
+            .wrap => terminal.width.rows(lineText(line), columns),
+            .head => 1,
+        };
+        first = false;
+    }
     return count;
+}
+
+fn boxFit(body: *const Box, first: bool) Fit {
+    if (body.compact and !first) return .wrap;
+    return body.fit;
 }
 
 pub fn activityChanged(activity: *const Activity, columns: usize) bool {
@@ -415,7 +425,7 @@ fn noticeHead(placement: *const Placement, style: *const NoticeStyle, text: []co
 
 pub fn box(placement: *const Placement, name: role.Name, body: *const Box) !void {
     var line = placement.base;
-    try boxEdge(placement, &line, name);
+    if (!body.compact) try boxEdge(placement, &line, name);
     const run: Run = switch (body.emphasis) {
         .none => .{},
         .first_value => firstValue(body.text),
@@ -425,7 +435,7 @@ pub fn box(placement: *const Placement, name: role.Name, body: *const Box) !void
     while (lines.next()) |source| {
         defer offset += source.len + 1;
         const content = lineText(source);
-        switch (body.fit) {
+        switch (boxFit(body, offset == 0)) {
             .wrap => {
                 var iterator = terminal.width.wrapper(content, placement.columns);
                 while (iterator.nextSpan()) |span| {
@@ -445,7 +455,7 @@ pub fn box(placement: *const Placement, name: role.Name, body: *const Box) !void
             }),
         }
     }
-    try boxEdge(placement, &line, name);
+    if (!body.compact) try boxEdge(placement, &line, name);
 }
 
 fn rowRun(run: Run, offset: usize) Run {
@@ -761,6 +771,45 @@ fn writeFrameGlyph(
         .left_light_right_heavy => try sink.repeat("╼", count),
         .left_heavy_right_light => try sink.repeat("╾", count),
     }
+}
+
+test "compact summaries keep each line on its own row and every detail on narrow screens" {
+    const body: Box = .{
+        .text = "Tool: read\nLines: 20 · Time: 2s",
+        .fit = .head,
+        .emphasis = .first_value,
+        .compact = true,
+    };
+    const cases = [_]struct { columns: usize, rows: usize }{
+        .{ .columns = 80, .rows = 2 },
+        .{ .columns = 20, .rows = 2 },
+        .{ .columns = 12, .rows = 3 },
+    };
+    for (cases) |case| {
+        var rig: testing.Rig = undefined;
+        rig.init(std.testing.allocator);
+        defer rig.deinit();
+        const placement = try rig.begin(&.{ .columns = case.columns, .rows = 10 });
+        try box(&placement, .tool_success, &body);
+        const painted = try rig.painted();
+        try std.testing.expectEqual(case.rows, boxRows(&body, case.columns));
+        try std.testing.expectEqual(case.rows, testing.paintedRows(painted));
+        const plain = try rig.plain();
+        try testing.expectShows(plain, &.{ "Tool: read", "Lines: 20", "Time: 2s" });
+        try std.testing.expect(std.mem.find(u8, plain, "Tool: read ·") == null);
+    }
+}
+
+test "compact boxes remove their edge rows without changing message whitespace" {
+    const body: Box = .{ .text = "first\n\nlast", .compact = true };
+    var rig: testing.Rig = undefined;
+    rig.init(std.testing.allocator);
+    defer rig.deinit();
+    const placement = try rig.begin(&.{ .columns = 20, .rows = 10 });
+    try box(&placement, .user, &body);
+    try std.testing.expectEqual(@as(usize, 3), boxRows(&body, 20));
+    try std.testing.expectEqual(@as(usize, 3), testing.paintedRows(try rig.painted()));
+    try testing.expectShows(try rig.plain(), &.{ "first", "last" });
 }
 
 test "a box breaks its rows between words" {

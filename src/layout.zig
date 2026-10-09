@@ -19,6 +19,8 @@ pub const Scene = union(enum) {
 
     const Conversation = struct {
         window_pages: usize,
+        repaint: bool = false,
+        mode: ui.Block.Mode = .full,
         transcript: []ui.Block,
         tail: Tail,
         status: *const ui.status.Info,
@@ -162,39 +164,63 @@ fn projectConversation(
 
     var rows: usize = 0;
     var shown: usize = 0;
-    while (shown < total and rows < capacity) : (shown += 1) {
-        const slot = slotAt(scene, total - 1 - shown);
+    while (shown < total and (scene.repaint or rows < capacity)) : (shown += 1) {
+        const slot = slotAt(scene, .{ .index = total - 1 - shown, .columns = size.columns });
         rows += @intFromBool(slot.leading_blank) + slot.component.measure(size);
     }
-    const skip = if (rows > capacity) rows - capacity else 0;
-    const start = total - shown;
+    var skip = if (!scene.repaint and rows > capacity) rows - capacity else 0;
+    var start = total - shown;
+    var repaint = scene.repaint;
     const epoch = view.resetEpoch();
-    for (0..start) |index| if (slotRewritten(scene, index, epoch)) view.resetScreen();
-    if (skip > 0 and slotRewritten(scene, start, epoch)) view.resetScreen();
-    for (scene.transcript[0..@min(start, scene.transcript.len)]) |*block| block.release(gpa);
-
-    const sink = try view.beginFrame(
-        .{ .columns = size.columns, .rows = size.rows },
-        scene.window_pages,
-    );
-    var index = start;
-    while (index < total) : (index += 1) {
-        const slot = slotAt(scene, index);
-        const placement: ui.paint.Placement = .{
-            .sink = sink,
-            .id = slot.id,
-            .columns = size.columns,
-            .base = @intFromBool(slot.leading_blank),
-            .skip = if (index == start) skip else 0,
-        };
-        if (slot.leading_blank and placement.skip == 0) {
-            sink.begin();
-            sink.end(.{ .id = slot.id, .line = 0 });
-        }
-        try slot.component.render(gpa, &placement, size.rows);
+    for (0..start) |index| if (slotRewritten(scene, index, epoch)) {
+        if (scene.mode == .compact) repaint = true else view.resetScreen();
+    };
+    if (skip > 0 and slotRewritten(scene, start, epoch)) {
+        if (scene.mode == .compact) repaint = true else view.resetScreen();
     }
-    try view.render();
-    for (start..total) |slot_index| stampSlot(scene, slot_index, view.resetEpoch());
+    var measured_all = scene.repaint;
+    for (0..2) |_| {
+        if (repaint and !measured_all) {
+            rows = 0;
+            for (0..total) |index| {
+                const slot = slotAt(scene, .{ .index = index, .columns = size.columns });
+                rows += @intFromBool(slot.leading_blank) + slot.component.measure(size);
+            }
+            start = 0;
+            skip = 0;
+            measured_all = true;
+        }
+        for (scene.transcript[0..@min(start, scene.transcript.len)]) |*block| block.release(gpa);
+
+        const sink = if (repaint)
+            try view.beginRepaint(size, .{ .pages = scene.window_pages, .rows = rows })
+        else
+            try view.beginFrame(size, scene.window_pages);
+        var index = start;
+        while (index < total) : (index += 1) {
+            const slot = slotAt(scene, .{ .index = index, .columns = size.columns });
+            const placement: ui.paint.Placement = .{
+                .sink = sink,
+                .id = slot.id,
+                .columns = size.columns,
+                .base = @intFromBool(slot.leading_blank),
+                .skip = if (index == start) skip else 0,
+            };
+            if (slot.leading_blank and placement.skip == 0) {
+                sink.begin();
+                sink.end(.{ .id = slot.id, .line = 0 });
+            }
+            try slot.component.render(gpa, &placement, size.rows);
+        }
+        if (scene.mode == .compact and !repaint and view.repaintRequired()) {
+            repaint = true;
+            continue;
+        }
+        try view.render();
+        for (start..total) |slot_index| stampSlot(scene, slot_index, view.resetEpoch());
+        return;
+    }
+    unreachable;
 }
 
 fn slotRewritten(scene: *const Scene.Conversation, index: usize, epoch: u64) bool {
@@ -226,11 +252,15 @@ fn tailCount(tail: *const Tail) usize {
     };
 }
 
-fn slotAt(scene: *const Scene.Conversation, index: usize) Slot {
+fn slotAt(
+    scene: *const Scene.Conversation,
+    options: struct { index: usize, columns: usize },
+) Slot {
+    const index = options.index;
     if (index < scene.transcript.len) return .{
         .component = .{ .block = &scene.transcript[index] },
         .id = index,
-        .leading_blank = index > 0,
+        .leading_blank = index > 0 and scene.transcript[index].rows(options.columns) > 0,
     };
     const offset = index - scene.transcript.len;
     if (offset < tailCount(&scene.tail)) return tailSlot(&scene.tail, offset);
@@ -289,6 +319,24 @@ test "projection stacks the transcript above the tail, newest at the bottom" {
     try std.testing.expect(user < reply);
     try std.testing.expect(reply < footer);
     try std.testing.expect(ui.testing.paintedRows(painted) < 24);
+}
+
+test "compact user boxes keep the gap before a model answer" {
+    const gpa = std.testing.allocator;
+    var rig: Rig = .init();
+    defer rig.deinit();
+    try rig.add(&.{ .user = "prompt" });
+    try rig.add(&.{ .model = "answer" });
+    for (rig.blocks.items) |*block| block.present(.compact);
+    const scene = rig.prompt(&.{});
+    const painted = try projected(gpa, .{ .columns = 20, .rows = 24 }, &scene);
+    defer gpa.free(painted);
+    const plain = try terminal.testing.plainText(gpa, painted);
+    defer gpa.free(plain);
+    var rows = std.mem.splitScalar(u8, plain, '\n');
+    try std.testing.expectEqualStrings("prompt", std.mem.trim(u8, rows.next().?, "\r "));
+    try std.testing.expectEqualStrings("", std.mem.trim(u8, rows.next().?, "\r "));
+    try std.testing.expectEqualStrings("answer", std.mem.trim(u8, rows.next().?, "\r "));
 }
 
 const test_status: ui.status.Info = .{

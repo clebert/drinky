@@ -22,6 +22,7 @@ const Entry = struct {
     name: []const u8,
     summary: []const u8,
     run: *const fn (*Context) Context.Error!Context.Outcome,
+    during_turn: bool = false,
 };
 
 const help_name = "help";
@@ -31,6 +32,12 @@ const skill_prefix = skill.name ++ ":";
 const help_opener: Context.Outcome.Opener = .{ .open = reopenHelp };
 
 const commands = [_]Entry{
+    .{
+        .name = "compact",
+        .summary = "Toggle the transcript between Full and Compact modes",
+        .run = runCompact,
+        .during_turn = true,
+    },
     .{ .name = effort.name, .summary = effort.summary, .run = effort.run },
     .{ .name = help_name, .summary = help_summary, .run = runHelp },
     .{ .name = login.name, .summary = login.summary, .run = login.run },
@@ -117,6 +124,11 @@ fn lookup(name: []const u8) ?*const Entry {
     return null;
 }
 
+fn runCompact(context: *Context) Context.Error!Context.Outcome {
+    _ = context;
+    return .toggle_compact;
+}
+
 fn runHelp(context: *Context) Context.Error!Context.Outcome {
     var options: Context.Outcome.Options = .{ .gpa = context.gpa };
     errdefer options.deinit();
@@ -173,6 +185,7 @@ pub fn run(context: *Context, line: []const u8) !?Context.Outcome {
 pub fn checkDuringTurn(context: *Context, line: []const u8) !?Message {
     const name = parse(line) orelse return null;
     if (try check(context, line)) |refusal| return refusal;
+    if (!loadsSkill(name) and lookup(name).?.during_turn) return null;
     return try Message.print(
         context.gpa,
         .warning,
@@ -193,6 +206,26 @@ fn unknownCommand(gpa: std.mem.Allocator, name: []const u8) !Message {
 
 fn unknownSkill(gpa: std.mem.Allocator, name: []const u8) !Message {
     return Message.print(gpa, .warning, "Drinky does not recognize the skill {s}.", .{name});
+}
+
+test "compact is the only display command that can run during a turn" {
+    var rig: testing.Rig = undefined;
+    try rig.init(&.{});
+    defer rig.deinit();
+    var context = rig.context();
+
+    const checked = try check(&context, "/compact");
+    defer if (checked) |message| message.deinit(context.gpa);
+    try std.testing.expect(checked == null);
+    const running = try checkDuringTurn(&context, "/compact");
+    defer if (running) |message| message.deinit(context.gpa);
+    try std.testing.expect(running == null);
+    const argument = (try checkDuringTurn(&context, "/compact extra")).?;
+    try testing.expectMessage(&argument, .warning, "takes no argument");
+    const alias = (try check(&context, "/c")).?;
+    try testing.expectMessage(&alias, .warning, "does not recognize the command");
+    const other = (try checkDuringTurn(&context, "/model")).?;
+    try testing.expectMessage(&other, .warning, "cannot run while a turn runs");
 }
 
 test "check reports only what keeps a line unrunnable" {
@@ -309,8 +342,12 @@ test "a line without a name opens its list, and a command row runs its command" 
         try std.testing.expectEqualStrings("Command", pick.title);
         try testing.expectReopen(&context, &pick);
         try std.testing.expectEqual(commands.len - 1, pick.options.len);
-        try std.testing.expectEqualStrings("/effort", pick.options[0].name);
-        try std.testing.expectEqualStrings("Set the reasoning effort.", pick.options[0].extra.?);
+        try std.testing.expectEqualStrings("/compact", pick.options[0].name);
+        try std.testing.expectEqualStrings(
+            "Toggle the transcript between Full and Compact modes.",
+            pick.options[0].extra.?,
+        );
+        try std.testing.expect((try testing.selectRow(&pick, &context, 0)) == .toggle_compact);
         try std.testing.expectEqualStrings("/system", pick.options[pick.options.len - 1].name);
         for (pick.options) |*option|
             try std.testing.expect(!std.mem.startsWith(u8, option.name, "/help"));

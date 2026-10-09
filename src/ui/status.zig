@@ -342,7 +342,7 @@ fn writeBranch(out: *std.Io.Writer, branch: []const u8, form: Parts.Form) !void 
 
 fn writeContext(line: *Line, info: *const Info, form: Parts.Context) !void {
     const context = info.context_tokens orelse
-        return line.out.writeAll(context_label ++ "Unknown");
+        return line.out.writeAll(context_label ++ "unknown");
     const window = info.context_window orelse {
         try line.out.writeAll(context_label);
         return writeTokens(&line.out, context);
@@ -564,7 +564,7 @@ test "an unmeasured context reads as unknown, and an unmeasured rate hides" {
     unknown_rig.init(gpa);
     defer unknown_rig.deinit();
     try renderForTest(&unknown_rig, &unknown, 200);
-    try testing.expectShows(try unknown_rig.painted(), &.{"Context: Unknown"});
+    try testing.expectShows(try unknown_rig.painted(), &.{"Context: unknown"});
     try testing.expectHides(
         try unknown_rig.painted(),
         &.{ "Context: 21%", "(206k/1.0M)", "Cache:" },
@@ -582,7 +582,7 @@ test "an unmeasured context reads as unknown, and an unmeasured rate hides" {
     narrow_rig.init(gpa);
     defer narrow_rig.deinit();
     try renderForTest(&narrow_rig, &unknown, 20);
-    try testing.expectShows(try narrow_rig.painted(), &.{"Context: Unknown"});
+    try testing.expectShows(try narrow_rig.painted(), &.{"Context: unknown"});
 }
 
 test "a narrow window shortens fields before it gives up parts" {

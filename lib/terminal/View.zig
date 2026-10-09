@@ -90,6 +90,12 @@ pub const Lines = struct {
 
 pub const Caret = struct { row: usize, column: usize };
 
+const Changes = struct {
+    start: usize,
+    same: usize,
+    reset: bool,
+};
+
 pub const Sink = struct {
     frame: *Frame,
     columns: usize,
@@ -326,6 +332,26 @@ pub fn beginFrame(self: *View, size: Size, pages: usize) !*Sink {
     return &self.sink;
 }
 
+pub fn beginRepaint(
+    self: *View,
+    size: Size,
+    options: struct { pages: usize, rows: usize },
+) !*Sink {
+    const sink = try self.beginFrame(size, options.pages);
+    const capacity = @max(sink.rows_max, options.rows);
+    try self.frame.rows.ensureTotalCapacity(self.gpa, capacity);
+    sink.rows_max = capacity;
+    self.resetScreen();
+    return sink;
+}
+
+pub fn repaintRequired(self: *const View) bool {
+    if (self.force_reset or self.size_changed) return true;
+    if (self.frame.rows.items.len == 0) return self.printed.items.len > 0;
+    if (self.printed.items.len == 0) return false;
+    return self.changes().reset;
+}
+
 pub fn render(self: *View) !void {
     defer self.force_reset = false;
     const writer = self.writer;
@@ -361,8 +387,7 @@ pub fn parkCursor(self: *View) !void {
     try writer.flush();
 }
 
-fn paintChanges(self: *View) !void {
-    try self.reprintDropped();
+fn changes(self: *const View) Changes {
     const rows = self.frame.rows.items;
     const printed = self.printed.items;
     const start = self.frameStart();
@@ -370,15 +395,28 @@ fn paintChanges(self: *View) !void {
     while (same < rows.len and start + same < printed.len and
         printed[start + same].matches(&rows[same])) : (same += 1)
     {}
-    self.frame_start = start;
     const changed = start + same;
-    if (same == rows.len and changed == printed.len) return;
-    const removes_only = same == rows.len;
-    if (self.origin_line + changed - @intFromBool(removes_only) < self.screen_top_line) {
+    const screen_top = if (self.dropped.count() > 0)
+        @max(self.screen_top_line, self.origin_line + printed.len - self.screenHeight())
+    else
+        self.screen_top_line;
+    const unchanged = same == rows.len and changed == printed.len;
+    const reset = !unchanged and
+        self.origin_line + changed - @intFromBool(same == rows.len) < screen_top;
+    return .{ .start = start, .same = same, .reset = reset };
+}
+
+fn paintChanges(self: *View) !void {
+    try self.reprintDropped();
+    const change = self.changes();
+    self.frame_start = change.start;
+    const changed = change.start + change.same;
+    if (change.same == self.frame.rows.items.len and changed == self.printed.items.len) return;
+    if (change.reset) {
         try self.writeReset();
         return self.paintRows(.{});
     }
-    try self.paintRows(.{ .printed_index = changed, .row_index = same });
+    try self.paintRows(.{ .printed_index = changed, .row_index = change.same });
 }
 
 fn frameStart(self: *const View) usize {
@@ -1325,6 +1363,43 @@ test "a frame below the capacity that loses its first row removes it from the sc
     try std.testing.expectEqual(@as(usize, 3), harness.emulator.document.items.len);
     try harness.emulator.expectCaret(&.{ .frame_len = 3, .row = 2, .column = 1 });
     try std.testing.expect(harness.lastResets());
+}
+
+test "a complete repaint restores history beyond the frame limit and keeps it on the next frame" {
+    const gpa = std.testing.allocator;
+    const harness = try Harness.create(gpa, 20);
+    defer harness.destroy();
+    const history = [_]Line{
+        line("r0", 0),
+        line("r1", 1),
+        line("r2", 2),
+        line("r3", 3),
+        caretLine("P", .{ .id = 100, .column = 1 }),
+        line("status", 101),
+    };
+    const size: Size = .{ .columns = 20, .rows = 2 };
+    harness.emulator.resize(size.rows);
+    const sink = try harness.view.beginRepaint(size, .{ .pages = 1, .rows = history.len });
+    for (history) |item| {
+        sink.begin();
+        try sink.text(item.bytes);
+        if (item.caret) |column| sink.setCaret(column);
+        sink.end(item.anchor);
+    }
+    try harness.view.render();
+    try harness.emulator.feed(harness.out.written());
+    harness.consumed = harness.out.written().len;
+    try harness.emulator.expectVisible(&.{ "r0", "r1", "r2", "r3", "P", "status" });
+    try harness.emulator.expectCaret(&.{ .frame_len = 6, .row = 4, .column = 1 });
+
+    try harness.render(&history, size, 1);
+    try harness.emulator.expectVisible(&.{ "r0", "r1", "r2", "r3", "P", "status" });
+    try std.testing.expect(!harness.lastResets());
+    try harness.emulator.expectCaret(&.{ .frame_len = 6, .row = 4, .column = 1 });
+    const next = [_]Line{ history[4], line("updated", 101) };
+    try harness.render(&next, size, 1);
+    try harness.emulator.expectVisible(&.{ "r0", "r1", "r2", "r3", "P", "updated" });
+    try std.testing.expect(!harness.lastResets());
 }
 
 test "a screen reset repaints a frame whose content is unchanged" {

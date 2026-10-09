@@ -2,6 +2,7 @@ const std = @import("std");
 
 const terminal = @import("terminal");
 
+const format = @import("../format.zig");
 const Message = @import("../Message.zig");
 
 const Caption = @import("Caption.zig");
@@ -14,6 +15,33 @@ const Block = @This();
 
 content: Content,
 cache: Cache = .{},
+mode: Mode = .full,
+thinking: ?Thinking = null,
+
+pub const Mode = enum { full, compact };
+
+pub const Thinking = struct {
+    started_ms: i64 = 0,
+    ended_ms: ?i64 = 0,
+    joins_previous: bool = false,
+    status: Status = .complete,
+    hidden: bool = false,
+    summary: [128]u8 = undefined,
+    summary_length: usize = 0,
+    summary_status: Status = .complete,
+
+    pub const Status = enum { streaming, complete, canceled, failed, truncated };
+
+    pub const Summary = struct {
+        bytes: usize,
+        elapsed_ms: i64,
+        status: Status,
+    };
+
+    pub fn elapsed(self: *const Thinking, now_ms: i64) i64 {
+        return @max((self.ended_ms orelse now_ms) - self.started_ms, 0);
+    }
+};
 
 const Content = union(enum) {
     intro: std.ArrayList(u8),
@@ -41,6 +69,7 @@ const ToolResult = struct {
     text: std.ArrayList(u8),
     failed: bool,
     fit: paint.Fit,
+    survives_discard: bool = false,
 
     const Payload = struct {
         text: []const u8,
@@ -113,7 +142,7 @@ const Cache = struct {
 };
 
 pub fn init(gpa: std.mem.Allocator, source: *const Source) !Block {
-    return .{ .content = switch (source.*) {
+    return .{ .thinking = if (source.* == .thinking) .{} else null, .content = switch (source.*) {
         .tool_result => |*result| .{ .tool_result = .{
             .text = try copy(gpa, result.text),
             .failed = result.failed,
@@ -174,16 +203,60 @@ pub fn stampEpoch(self: *Block, epoch: u64) void {
 pub fn survivesDiscard(self: *const Block) bool {
     return switch (self.content) {
         .event => |*event| event.survives_discard,
-        .intro, .user, .user_note, .thinking, .model, .tool_result => false,
+        .tool_result => |*result| result.survives_discard,
+        .intro, .user, .user_note, .thinking, .model => false,
     };
 }
 
+pub fn present(self: *Block, mode: Mode) void {
+    if (self.mode == mode) return;
+    self.mode = mode;
+    self.cache.forget();
+}
+
+pub fn presentThinking(self: *Block, maybe_summary: ?*const Thinking.Summary) void {
+    const thinking = &self.thinking.?;
+    const hidden = maybe_summary == null;
+    if (hidden != thinking.hidden) self.cache.invalidate();
+    thinking.hidden = hidden;
+    const summary = maybe_summary orelse return;
+    thinking.summary_status = summary.status;
+    var bytes_buffer: [16]u8 = undefined;
+    var time_buffer: [24]u8 = undefined;
+    var buffer: [128]u8 = undefined;
+    const text = std.mem.print(&buffer, "Thinking: {s}\nReceived: {s} · Time: {s}", .{
+        @tagName(summary.status),
+        format.bytes(&bytes_buffer, summary.bytes),
+        format.durationSeconds(&time_buffer, summary.elapsed_ms, .down),
+    }) catch unreachable;
+    if (std.mem.eql(u8, thinking.summary[0..thinking.summary_length], text)) return;
+    @memcpy(thinking.summary[0..text.len], text);
+    thinking.summary_length = text.len;
+    self.cache.invalidate();
+}
+
 fn look(self: *const Block) Look {
+    const compact = self.mode == .compact;
     return switch (self.content) {
         .intro => |list| .{ .caption = .{ .title = "Drinky", .controls = list.items } },
-        .user => |list| .{ .box = .{ .role = .user, .body = .{ .text = list.items } } },
+        .user => |list| .{ .box = .{
+            .role = .user,
+            .body = .{ .text = list.items, .compact = compact },
+        } },
         .user_note => |list| .{ .notice = .{ .style = .note, .text = list.items } },
-        .thinking => |list| .{ .markdown = .{ .role = .muted, .text = trimBlank(list.items) } },
+        .thinking => |list| if (compact) .{ .box = .{
+            .role = switch (self.thinking.?.summary_status) {
+                .streaming, .canceled => .tool_pending,
+                .complete => .tool_success,
+                .failed, .truncated => .tool_error,
+            },
+            .body = .{
+                .text = self.thinking.?.summary[0..self.thinking.?.summary_length],
+                .fit = .head,
+                .compact = true,
+                .emphasis = .first_value,
+            },
+        } } else .{ .markdown = .{ .role = .muted, .text = trimBlank(list.items) } },
         .model => |list| .{ .markdown = .{ .role = null, .text = trimBlank(list.items) } },
         .tool_result => |*result| .{ .box = .{
             .role = if (result.failed) .tool_error else .tool_success,
@@ -191,6 +264,7 @@ fn look(self: *const Block) Look {
                 .text = result.text.items,
                 .fit = result.fit,
                 .emphasis = .first_value,
+                .compact = compact,
             },
         } },
         .event => |*event| .{ .notice = .{
@@ -200,7 +274,16 @@ fn look(self: *const Block) Look {
     };
 }
 
+fn isHidden(self: *const Block) bool {
+    if (self.thinking == null) return false;
+    return switch (self.mode) {
+        .full => paint.isBlank(self.content.thinking.items),
+        .compact => self.thinking.?.hidden,
+    };
+}
+
 pub fn rows(self: *const Block, columns: usize) usize {
+    if (self.isHidden()) return 0;
     if (self.cache.retained(columns)) |lines| return lines.count();
     return switch (self.look()) {
         .caption => |caption| caption.rows(columns),
@@ -215,6 +298,10 @@ pub fn render(
     gpa: std.mem.Allocator,
     placement: *const paint.Placement,
 ) !void {
+    if (self.isHidden()) {
+        self.cache.rewritten = false;
+        return;
+    }
     if (self.cache.retained(placement.columns)) |lines| return replay(placement, lines);
     const first_row = placement.sink.composed();
     switch (self.look()) {

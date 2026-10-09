@@ -325,6 +325,7 @@ pub fn init(self: *App, gpa: std.mem.Allocator, io: std.Io, options: *const Opti
     errdefer self.screen.deinit();
     self.screen.bash_timeout_ms = harness.config.bash.timeout_ms;
     self.screen.window_pages = harness.config.window_pages;
+    self.screen.transcript_mode = harness.config.transcript_mode;
     self.screen.gauge = harness.config.gauge;
     self.screen.display_roots = .{
         .working_directory = cwd,
@@ -905,6 +906,8 @@ fn submitDuringTurn(self: *App) !void {
     defer self.gpa.free(text);
     var context = self.commandContext();
     if (try command.checkDuringTurn(&context, text)) |refusal| return self.setNotice(refusal);
+    if (try command.run(&context, text)) |outcome|
+        return self.applySubmittedCommand(&outcome, text);
     try self.reportNotice(.information, turn_message_notice, .{});
 }
 
@@ -978,6 +981,11 @@ fn applySubmittedCommand(
 ) !void {
     switch (outcome.*) {
         .prompt => |*prompt| return self.submitSkill(prompt, line),
+        .toggle_compact => {
+            try self.applyOutcome(outcome);
+            self.screen.editor.clear();
+            return;
+        },
         .refusal => {},
         else => self.screen.editor.clear(),
     }
@@ -1393,6 +1401,20 @@ fn applyOutcome(self: *App, outcome: *const command.Context.Outcome) !void {
             self.turns.truncate(0);
             self.screen.clearConversation();
             try self.screen.appendIntro(intro_text);
+        },
+        .toggle_compact => {
+            const next: ui.Block.Mode = switch (self.screen.transcript_mode) {
+                .full => .compact,
+                .compact => .full,
+            };
+            try self.reportNotice(.information, "{s} transcript mode is active.", .{
+                switch (next) {
+                    .full => "Full",
+                    .compact => "Compact",
+                },
+            });
+            self.screen.toggleTranscript();
+            return;
         },
         .rewind => |turn| try self.rewind(turn),
         .login => |account| return self.startLogin(account),
@@ -2557,6 +2579,61 @@ test "/new clears the conversation, and the next request starts fresh" {
     try rig.waitFor(&.{ .{ .rows = &.{ "second", "done" } }, .{ .activity = false } });
     try std.testing.expect(std.mem.find(u8, rig.lastRequest(), "\"text\":\"first\"") == null);
     try expectRequested(&rig, "\"text\":\"second\"");
+}
+
+test "compact uses the startup config and toggles during a turn without sending a message" {
+    var hold: providers.testing.FakeTransport.Hold = .{ .io = std.testing.io };
+    var rig: Rig = undefined;
+    try rig.init(&.{
+        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .config = "{\"interface\":{\"transcript_mode\":\"compact\"}}",
+        .replies = &.{.{ .body = providers.testing.reply_stream, .hold = &hold }},
+        .model = "gpt-5.6-sol",
+    });
+    defer rig.deinit();
+    try rig.keys("/compact\r");
+    try rig.waitFor(&.{ .{ .status = "Full transcript mode is active." }, .{ .editor = "" } });
+    try rig.keys("hello\r");
+    try hold.reached.wait(std.testing.io);
+    try rig.keys("/compact extra\r");
+    try rig.waitFor(&.{
+        .{ .status = "The command /compact takes no argument." },
+        .{ .editor = "/compact extra" },
+        .{ .activity = true },
+    });
+    try rig.keys("\x03/compact\r");
+    try rig.waitFor(&.{
+        .{ .status = "Compact transcript mode is active." },
+        .{ .editor = "" },
+        .{ .activity = true },
+    });
+    try rig.keys("/model\r");
+    try rig.waitFor(&.{
+        .{ .status = "The command /model cannot run while a turn runs." },
+        .{ .editor = "/model" },
+        .{ .activity = true },
+    });
+    try rig.keys("\x03/compact\r");
+    try rig.waitFor(&.{
+        .{ .status = "Full transcript mode is active." },
+        .{ .editor = "" },
+        .{ .activity = true },
+    });
+    hold.released.set(std.testing.io);
+    try rig.waitFor(&.{ .{ .rows = &.{ "hello", "done" } }, .{ .activity = false } });
+    try std.testing.expectEqual(@as(usize, 1), rig.transport.requests.items.len);
+    try std.testing.expect(std.mem.find(u8, rig.lastRequest(), "\"text\":\"/compact\"") == null);
+    const configured = try rig.tmp.dir.readFileAlloc(
+        rig.clock.io(),
+        ".drinky/config.json",
+        std.testing.allocator,
+        .limited(4096),
+    );
+    defer std.testing.allocator.free(configured);
+    try std.testing.expectEqualStrings(
+        "{\"interface\":{\"transcript_mode\":\"compact\"}}",
+        configured,
+    );
 }
 
 test "Enter during a turn keeps the text, and Ctrl+D with a draft warns before it quits" {

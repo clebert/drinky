@@ -88,6 +88,18 @@ A line that starts with a slash runs in Drinky and reaches no model. Type `/` or
 complete command list. Drinky refuses an unknown command, an unknown skill, and a command with an
 argument. A second Enter then sends the refused line to the model as a message.
 
+Use `/compact` to toggle Full and Compact transcript modes, even during a turn. Compact mode hides
+thinking text behind a summary with received bytes, elapsed time, and status. It removes the padding
+inside boxes. The gaps between transcript blocks stay. Each toggle clears terminal scrollback and
+repaints the complete transcript without a warning. Full mode restores the thinking text and the box
+padding. The transcript keeps thinking after a cancellation or failure, without changing the model
+conversation. Compact mode also preserves the complete transcript when an update requires a terminal
+reset.
+
+Set `interface.transcript_mode` to `"compact"` or `"full"` in the config file to select the startup
+mode. The default is `"full"`. The command changes only the current session and never writes the
+config file.
+
 ## Headless mode
 
 `drinky run` answers one prompt without a terminal. It reads the prompt from stdin and writes the

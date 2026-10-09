@@ -18,11 +18,13 @@ timeouts: accounts.Registry.Timeouts = accounts.Registry.timeouts_default,
 retry: core.Retry = .{},
 bash: tools.Context.Bash = .{},
 window_pages: usize = layout.window_pages_default,
+transcript_mode: ui.Block.Mode = .full,
 gauge: ui.status.Gauge = .{},
 effort_default: ?core.Provider.Effort = null,
 user_instructions: discovery.instructions.Result,
 required_skills: []const RequiredSkill = &.{},
 effort_dropped: ?[]const u8 = null,
+transcript_mode_dropped: ?[]const u8 = null,
 bash_timeout_ms_dropped: ?u64 = null,
 window_pages_dropped: ?usize = null,
 gauge_dropped: ?ui.status.Gauge = null,
@@ -87,6 +89,7 @@ const File = struct {
 
     const Interface = struct {
         window_pages: usize = layout.window_pages_default,
+        transcript_mode: JsonString = .{ .value = "full" },
         gauge_percent_warning: f64 = gauge_default.percent_warning,
         gauge_percent_error: f64 = gauge_default.percent_error,
     };
@@ -220,13 +223,21 @@ const keys = [_]Key{
         ),
     },
     .{
+        .path = "interface.transcript_mode",
+        .description = "The transcript mode at startup: full or compact. " ++
+            "The /compact command changes only the current session. " ++
+            "Drinky reports an unknown mode and uses Full mode.",
+    },
+    .{
         .path = "interface.window_pages",
         .description = std.fmt.comptimePrint(
             "The pages of the newest conversation that Drinky keeps on the screen. One page " ++
                 "is one window height. Every frame measures and paints each kept row again, " ++
                 "so a higher count keeps more of the conversation and costs more work per " ++
                 "frame. The count must be from {d} to {d}. Drinky reports a value it cannot " ++
-                "use and keeps the default.",
+                "use and keeps the default. A mode toggle repaints the complete transcript " ++
+                "regardless of this count. Compact mode also repaints the complete " ++
+                "transcript when a change requires a terminal reset.",
             .{ layout.window_pages_min, layout.window_pages_max },
         ),
     },
@@ -316,6 +327,10 @@ fn maybeDefaultText(comptime T: type, comptime index: usize) ?[]const u8 {
     return switch (@typeInfo(field_type)) {
         .bool => if (value) "true" else "false",
         .int, .float => std.fmt.comptimePrint("{d}", .{value}),
+        .@"struct" => if (field_type == File.JsonString)
+            value.value
+        else
+            @compileError("expected a JSON string default"),
         .optional => if (value == null) "unset" else @compileError("expected a null default"),
         .pointer => if (value.len == 0) "empty" else @compileError("expected an empty default"),
         else => @compileError(
@@ -422,7 +437,7 @@ const example =
     \\  "required_skills": [{ "glob": "**/*.zig", "skill": "zig-style" }],
     \\  "request": { "attempts_max": 5 },
     \\  "bash": { "timeout_ms": 300000 },
-    \\  "interface": { "window_pages": 12 },
+    \\  "interface": { "window_pages": 12, "transcript_mode": "compact" },
     \\  "default_effort": "high"
     \\}
 ;
@@ -492,6 +507,7 @@ pub fn deinit(self: *Config, gpa: std.mem.Allocator) void {
     }
     gpa.free(self.required_skills);
     if (self.effort_dropped) |name| gpa.free(name);
+    if (self.transcript_mode_dropped) |name| gpa.free(name);
     for (self.unknown_keys) |key| gpa.free(key);
     gpa.free(self.unknown_keys);
 }
@@ -509,6 +525,13 @@ pub fn reports(
         "Drinky ignored the configured default effort level \"{s}\" because Drinky does not " ++
             "know that level. Drinky uses the effort level \"{s}\".",
         .{ dropped, @tagName(options.effort) },
+    );
+    if (self.transcript_mode_dropped) |dropped| try result.add(
+        gpa,
+        .failure,
+        "Drinky ignored the transcript mode {s}. The mode must be full or compact. " ++
+            "Drinky uses Full mode.",
+        .{dropped},
     );
     if (self.bash_timeout_ms_dropped) |dropped| try result.add(
         gpa,
@@ -651,11 +674,20 @@ fn loadFromData(gpa: std.mem.Allocator, io: std.Io, options: *const DataOptions)
 
     var effort_dropped: ?[]const u8 = null;
     errdefer if (effort_dropped) |name| gpa.free(name);
-    const effort_default = try resolveEffort(
+    const effort_default = try resolveEnum(
+        core.Provider.Effort,
         gpa,
         &effort_dropped,
         if (parsed.value.default_effort) |name| name.value else null,
     );
+    var transcript_mode_dropped: ?[]const u8 = null;
+    errdefer if (transcript_mode_dropped) |name| gpa.free(name);
+    const transcript_mode = try resolveEnum(
+        ui.Block.Mode,
+        gpa,
+        &transcript_mode_dropped,
+        interface.transcript_mode.value,
+    ) orelse .full;
     var bash_timeout_ms_dropped: ?u64 = null;
     const bash_timeout_ms = resolveBashTimeout(&bash_timeout_ms_dropped, bash.timeout_ms);
     var window_pages_dropped: ?usize = null;
@@ -692,6 +724,8 @@ fn loadFromData(gpa: std.mem.Allocator, io: std.Io, options: *const DataOptions)
             .timeout_ms = bash_timeout_ms,
         },
         .window_pages = window_pages,
+        .transcript_mode = transcript_mode,
+        .transcript_mode_dropped = transcript_mode_dropped,
         .gauge = gauge,
         .effort_default = effort_default,
         .user_instructions = user_instructions,
@@ -799,13 +833,14 @@ fn appendUnknownKey(
     return false;
 }
 
-fn resolveEffort(
+fn resolveEnum(
+    comptime T: type,
     gpa: std.mem.Allocator,
     dropped: *?[]const u8,
     name: ?[]const u8,
-) !?core.Provider.Effort {
+) error{OutOfMemory}!?T {
     const level = name orelse return null;
-    if (std.meta.stringToEnum(core.Provider.Effort, level)) |resolved| return resolved;
+    if (std.meta.stringToEnum(T, level)) |resolved| return resolved;
     dropped.* = try gpa.dupe(u8, level);
     return null;
 }
@@ -921,6 +956,41 @@ test "load reads the interface section" {
     try std.testing.expectEqual(gauge_default.percent_error, empty.gauge.percent_error);
     try std.testing.expect(empty.window_pages_dropped == null);
     try std.testing.expect(empty.gauge_dropped == null);
+}
+
+test "the transcript mode defaults to full and accepts compact without an unknown key" {
+    for ([_]ui.Block.Mode{ .full, .compact }) |mode| {
+        const data = try std.testing.allocator.print(
+            "{{\"interface\":{{\"transcript_mode\":\"{s}\"}}}}",
+            .{@tagName(mode)},
+        );
+        defer std.testing.allocator.free(data);
+        var config = try loadDataForTest(data);
+        defer config.deinit(std.testing.allocator);
+        try std.testing.expectEqual(mode, config.transcript_mode);
+        try std.testing.expect(config.transcript_mode_dropped == null);
+        try std.testing.expectEqual(@as(usize, 0), config.unknown_keys.len);
+    }
+    var empty = try loadDataForTest("{}");
+    defer empty.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ui.Block.Mode.full, empty.transcript_mode);
+}
+
+test "an unknown transcript mode keeps the other settings and reports the full fallback" {
+    var config = try loadDataForTest(
+        "{\"interface\":{\"transcript_mode\":\"unknown\",\"window_pages\":3}}",
+    );
+    defer config.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ui.Block.Mode.full, config.transcript_mode);
+    try std.testing.expectEqual(@as(usize, 3), config.window_pages);
+    try std.testing.expectEqualStrings("unknown", config.transcript_mode_dropped.?);
+    var report = try config.reports(std.testing.allocator, .{
+        .effort = .high,
+        .required_capped = false,
+    });
+    defer report.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), report.messages().len);
+    try std.testing.expect(std.mem.find(u8, report.messages()[0].content, "Full mode") != null);
 }
 
 test "a page count Drinky cannot use falls back to the default and is reported" {
@@ -1241,6 +1311,7 @@ test "the config document names the file, each key, and each limit, and its exam
     try std.testing.expectEqual(@as(u32, 5), from_example.retry.attempts_max);
     try std.testing.expectEqual(@as(u64, 300_000), from_example.bash.timeout_ms);
     try std.testing.expectEqual(@as(usize, 12), from_example.window_pages);
+    try std.testing.expectEqual(ui.Block.Mode.compact, from_example.transcript_mode);
 }
 
 test "load resolves user instruction paths against the config directory in order" {
@@ -1356,7 +1427,10 @@ fn checkLoadAllocationFailure(gpa: std.mem.Allocator, io: std.Io, home: []const 
     try std.testing.expectEqual(@as(usize, 1), config.user_instructions.files().len);
     try std.testing.expectEqual(@as(usize, 1), config.user_instructions.reports.messages().len);
     try std.testing.expect(config.effort_dropped != null);
+    try std.testing.expect(config.transcript_mode_dropped != null);
     try std.testing.expectEqual(@as(usize, 2), config.unknown_keys.len);
+    var reports_result = try config.reports(gpa, .{ .effort = .xhigh, .required_capped = false });
+    defer reports_result.deinit(gpa);
     const text = try config.document(gpa, .xhigh);
     defer gpa.free(text);
 }
@@ -1374,7 +1448,7 @@ test "the config load frees every partial allocation" {
         .data =
         \\{ "user_instructions": [{ "path": "first.md" }, { "path": "missing.md" }],
         \\  "future": { "openai-api-key": "nope" }, "default_effort": "nope",
-        \\  "unknown": 1 }
+        \\  "unknown": 1, "interface": { "transcript_mode": "unknown" } }
         ,
     });
     const home = tree.root;

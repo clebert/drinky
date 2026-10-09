@@ -42,6 +42,10 @@ bash_timeout_ms: u64,
 window_pages: usize,
 gauge: ui.status.Gauge,
 display_roots: format.Roots,
+transcript_mode: ui.Block.Mode = .full,
+repaint_transcript: bool = false,
+thinking_active: ?usize = null,
+thinking_joinable: bool = false,
 
 pub const Time = struct {
     awake_ms: i64,
@@ -88,6 +92,7 @@ pub const Widget = union(enum) {
 const Turn = struct {
     committed: usize,
     blocks: std.ArrayList(Block),
+    thinking_discarded: std.ArrayList(ui.Block),
     served_buffer: [accounts.Model.name_bytes_max]u8,
     served_length: usize,
     activity_tick: u64,
@@ -101,6 +106,7 @@ const Turn = struct {
         return .{
             .committed = committed,
             .blocks = .empty,
+            .thinking_discarded = .empty,
             .served_buffer = undefined,
             .served_length = 0,
             .activity_tick = 0,
@@ -113,6 +119,8 @@ const Turn = struct {
     }
 
     fn deinit(self: *Turn, gpa: std.mem.Allocator) void {
+        for (self.thinking_discarded.items) |*block| block.deinit(gpa);
+        self.thinking_discarded.deinit(gpa);
         self.releaseBlocks(gpa, 0);
         self.blocks.deinit(gpa);
         self.box_view.deinit(gpa);
@@ -156,15 +164,20 @@ const Turn = struct {
         return null;
     }
 
-    fn boxes(self: *Turn, gpa: std.mem.Allocator, now_ms: i64) ![]const ui.paint.Box {
+    fn boxes(
+        self: *Turn,
+        gpa: std.mem.Allocator,
+        options: struct { now_ms: i64, compact: bool },
+    ) ![]const ui.paint.Box {
         self.box_view.clearRetainingCapacity();
         for (self.blocks.items) |*block| {
             const call = if (block.call) |*call| call else continue;
             if (call.phase == .done) continue;
             try self.box_view.append(gpa, .{
-                .text = try call.text(gpa, now_ms),
+                .text = try call.text(gpa, options.now_ms),
                 .fit = .head,
                 .emphasis = .first_value,
+                .compact = options.compact,
             });
         }
         return self.box_view.items;
@@ -245,8 +258,7 @@ const Call = struct {
             self.name,
             format.bytes(&bytes_buffer, self.bytes),
             switch (self.phase) {
-                .streaming => "Streaming",
-                .queued => "Queued",
+                .streaming, .queued => @tagName(self.phase),
                 .running, .done => unreachable,
             },
         });
@@ -367,6 +379,14 @@ pub fn deinit(self: *Screen) void {
     self.editor.deinit();
 }
 
+pub fn toggleTranscript(self: *Screen) void {
+    self.transcript_mode = switch (self.transcript_mode) {
+        .full => .compact,
+        .compact => .full,
+    };
+    self.repaint_transcript = true;
+}
+
 pub fn clearConversation(self: *Screen) void {
     std.debug.assert(self.widget == .prompt);
     self.clearNotice();
@@ -428,29 +448,57 @@ pub fn apply(
     const turn = self.activeTurn() orelse return self.applyIdle(event, time);
     switch (event.*) {
         .setup_dropped => unreachable,
-        .text_started => try self.beginBlock(turn, .text),
+        .text_started => {
+            self.finishThinking(time.awake_ms, .complete);
+            try self.beginText(turn);
+        },
         .text => |delta| {
-            if (turn.lastBlock(.text) == null) try self.beginBlock(turn, .text);
+            if (turn.lastBlock(.text) == null) {
+                self.finishThinking(time.awake_ms, .complete);
+                try self.beginText(turn);
+            }
             try self.transcript.appendStream(.model, delta);
-            turn.lastBlock(.text).?.transcript_index = self.transcript.runIndex();
+            const block = turn.lastBlock(.text).?;
+            block.transcript_index = block.transcript_index orelse self.transcript.runIndex();
         },
-        .reasoning_started => try self.beginBlock(turn, .reasoning),
+        .reasoning_started => try self.beginThinking(turn, time.awake_ms),
         .reasoning => |delta| {
-            if (turn.lastBlock(.reasoning) == null) try self.beginBlock(turn, .reasoning);
+            if (turn.lastBlock(.reasoning) == null or self.thinking_active == null) {
+                try self.beginThinking(turn, time.awake_ms);
+            } else if (self.transcript.runIndex() != self.thinking_active) {
+                _ = try self.openThinking(time.awake_ms);
+            }
             try self.transcript.appendStream(.thinking, delta);
-            turn.lastBlock(.reasoning).?.transcript_index = self.transcript.runIndex();
         },
-        .tool_call_started => |name| try self.startCall(turn, name),
+        .tool_call_started => |name| {
+            self.finishThinking(time.awake_ms, .complete);
+            try self.startCall(turn, name);
+        },
         .tool_call_arguments => |delta| try self.growCall(turn, delta),
-        .tool_started => |*call| try self.runCall(turn, call, time),
-        .tool_result => |*result| try self.settleCall(turn, result),
+        .tool_started => |*call| {
+            self.finishThinking(time.awake_ms, .complete);
+            try self.runCall(turn, call, time);
+        },
+        .tool_result => |*result| {
+            self.finishThinking(time.awake_ms, .complete);
+            try self.settleCall(turn, result);
+        },
         .committed => {
+            if (self.thinking_active) |index| {
+                const thinking = &self.transcript.block_list.items[index].thinking.?;
+                thinking.ended_ms = thinking.ended_ms orelse time.awake_ms;
+                thinking.status = .complete;
+            }
+            self.thinking_joinable = false;
             self.statistics.charge(self.chosenModel());
             self.transcript.endMessage();
             turn.committed = self.transcript.blocks().len;
             turn.releaseBlocks(self.gpa, 0);
         },
-        .tail_discarded => |count| try self.discardTail(turn, count),
+        .tail_discarded => |count| try self.discardTail(turn, .{
+            .count = count,
+            .now_ms = time.awake_ms,
+        }),
         .usage => |usage| {
             self.statistics.cache_usage = usage;
             self.statistics.attempt_usage = usage;
@@ -463,6 +511,8 @@ pub fn apply(
         .context => |tokens| self.statistics.context_tokens = tokens,
         .model_served => |served| try self.recordServed(turn, &served),
         .attempt_failed => |*attempt| {
+            self.finishThinking(time.awake_ms, .failed);
+            try self.restoreThinking(turn, time.awake_ms, .failed);
             self.statistics.charge(self.chosenModel());
             self.transcript.endMessage();
             const text = try attemptText(self.gpa, attempt);
@@ -470,10 +520,21 @@ pub fn apply(
             try self.transcript.append(&.{ .event = .{ .text = text, .survives_discard = true } });
         },
         .skill_loaded => |*loaded| {
+            self.finishThinking(time.awake_ms, .complete);
             self.transcript.endMessage();
             try self.appendSkillNote(loaded);
         },
         .turn_ended => |outcome| {
+            const status: ui.Block.Thinking.Status = switch (outcome) {
+                .stopped => |reason| switch (reason) {
+                    .complete => .complete,
+                    .truncated => .truncated,
+                },
+                .canceled => .canceled,
+                .failed, .exhausted => .failed,
+            };
+            self.finishThinking(time.awake_ms, status);
+            if (status != .complete) try self.restoreThinking(turn, time.awake_ms, status);
             self.statistics.charge(self.chosenModel());
             self.transcript.endMessage();
             try self.recordOutcome(&outcome);
@@ -506,14 +567,48 @@ fn chosenModel(self: *const Screen) ?*const accounts.Model {
     return if (self.choice.model) |*found| found else null;
 }
 
-fn beginBlock(self: *Screen, turn: *Turn, kind: Block.Kind) !void {
-    self.transcript.endMessage();
-    try turn.blocks.append(self.gpa, .{ .kind = kind, .transcript_index = null, .call = null });
-    self.transcript.beginRun(switch (kind) {
-        .text => .model,
-        .reasoning => .thinking,
-        .call => unreachable,
+fn beginThinking(self: *Screen, turn: *Turn, now_ms: i64) !void {
+    try turn.blocks.ensureUnusedCapacity(self.gpa, 1);
+    const index = try self.openThinking(now_ms);
+    turn.blocks.appendAssumeCapacity(.{
+        .kind = .reasoning,
+        .transcript_index = index,
+        .call = null,
     });
+}
+
+fn openThinking(self: *Screen, now_ms: i64) !usize {
+    const joins_previous = self.thinking_joinable and
+        self.transcript.runIndex() == self.thinking_active;
+    self.finishThinking(now_ms, .complete);
+    const index = try self.transcript.beginThinking(&.{
+        .started_ms = now_ms,
+        .ended_ms = null,
+        .status = .streaming,
+        .joins_previous = joins_previous,
+    });
+    self.thinking_active = index;
+    self.thinking_joinable = true;
+    return index;
+}
+
+fn finishThinking(self: *Screen, now_ms: i64, status: ui.Block.Thinking.Status) void {
+    const index = self.thinking_active orelse return;
+    const thinking = &self.transcript.block_list.items[index].thinking.?;
+    if (thinking.ended_ms == null or status == .truncated) thinking.status = status;
+    thinking.ended_ms = thinking.ended_ms orelse now_ms;
+    self.thinking_active = null;
+    self.thinking_joinable = false;
+}
+
+fn beginText(self: *Screen, turn: *Turn) !void {
+    self.transcript.endMessage();
+    try turn.blocks.append(self.gpa, .{
+        .kind = .text,
+        .transcript_index = null,
+        .call = null,
+    });
+    self.transcript.beginRun(.model);
 }
 
 fn startCall(self: *Screen, turn: *Turn, name: []const u8) !void {
@@ -601,16 +696,68 @@ fn appendToolBlock(self: *Screen, head: []const u8, output: *const core.Tool.Out
     return self.transcript.blocks().len - 1;
 }
 
-fn discardTail(self: *Screen, turn: *Turn, count: usize) !void {
+fn discardTail(
+    self: *Screen,
+    turn: *Turn,
+    options: struct { count: usize, now_ms: i64 },
+) !void {
     self.transcript.endMessage();
-    const kept = turn.blocks.items.len -| count;
+    const kept = turn.blocks.items.len -| options.count;
     var first: ?usize = null;
     for (turn.blocks.items[kept..]) |block| {
         const index = block.transcript_index orelse continue;
         first = if (first) |found| @min(found, index) else index;
     }
+    if (first) |index| {
+        const discarded = @max(index, turn.committed);
+        const held = turn.thinking_discarded.items.len;
+        try self.transcript.takeThinking(discarded, &turn.thinking_discarded);
+        for (turn.thinking_discarded.items[held..]) |*block| {
+            const thinking = &block.thinking.?;
+            thinking.ended_ms = thinking.ended_ms orelse options.now_ms;
+        }
+        for (turn.blocks.items[0..kept]) |block| {
+            if (block.kind != .call) continue;
+            const retained = block.transcript_index orelse continue;
+            const result = &self.transcript.block_list.items[retained].content.tool_result;
+            if (retained >= discarded) result.survives_discard = true;
+        }
+        for (turn.blocks.items[0..kept]) |*block| {
+            const retained = block.transcript_index orelse continue;
+            if (retained < discarded) continue;
+            var removed: usize = 0;
+            for (self.transcript.blocks()[discarded..retained]) |*item|
+                removed += @intFromBool(!item.survivesDiscard());
+            block.transcript_index = retained - removed;
+        }
+        if (self.thinking_active) |active| if (active >= discarded) {
+            self.thinking_active = null;
+            self.thinking_joinable = false;
+        };
+        self.transcript.discard(discarded);
+    }
     turn.releaseBlocks(self.gpa, kept);
-    if (first) |index| self.transcript.discard(@max(index, turn.committed));
+}
+
+fn restoreThinking(
+    self: *Screen,
+    turn: *Turn,
+    now_ms: i64,
+    status: ui.Block.Thinking.Status,
+) error{OutOfMemory}!void {
+    try self.transcript.block_list.ensureUnusedCapacity(
+        self.gpa,
+        turn.thinking_discarded.items.len,
+    );
+    for (turn.thinking_discarded.items) |*block| {
+        const thinking = &block.thinking.?;
+        if (thinking.status == .streaming) {
+            thinking.ended_ms = thinking.ended_ms orelse now_ms;
+            thinking.status = status;
+        }
+        self.transcript.block_list.appendAssumeCapacity(block.*);
+    }
+    turn.thinking_discarded.clearRetainingCapacity();
 }
 
 fn recordServed(self: *Screen, turn: *Turn, served: *const core.Session.Event.ModelServed) !void {
@@ -860,6 +1007,7 @@ pub fn paint(
         else => {},
     }
 
+    self.transcript.present(self.transcript_mode, time.awake_ms);
     const status = self.statusInfo(time.boot_ms);
 
     const tail: layout.Tail = switch (self.widget) {
@@ -874,7 +1022,10 @@ pub fn paint(
         },
         .turn => |*turn| turn: {
             self.editor.reflow(size);
-            const boxes = try turn.boxes(self.gpa, time.awake_ms);
+            const boxes = try turn.boxes(self.gpa, .{
+                .now_ms = time.awake_ms,
+                .compact = self.transcript_mode == .compact,
+            });
             const tracks = try turn.trackBoxes(self.gpa);
             break :turn .{
                 .turn = .{
@@ -896,11 +1047,14 @@ pub fn paint(
     };
     const scene: layout.Scene = .{ .conversation = .{
         .window_pages = self.window_pages,
+        .repaint = self.repaint_transcript,
+        .mode = self.transcript_mode,
         .transcript = self.transcript.block_list.items,
         .tail = tail,
         .status = &status,
     } };
     try layout.project(self.gpa, &self.view, size, &scene);
+    self.repaint_transcript = false;
 }
 
 fn statusInfo(self: *const Screen, boot_ms: i64) ui.status.Info {
@@ -1084,6 +1238,415 @@ const Rig = struct {
 
 const no_caption: ?ui.Caption = null;
 
+fn expectSummary(painted: []const u8, rows: *const [2][]const u8) !void {
+    var lines = std.mem.splitScalar(u8, painted, '\n');
+    var previous: []const u8 = "";
+    while (lines.next()) |line| {
+        const row = std.mem.trim(u8, line, "\r ");
+        if (std.mem.eql(u8, previous, rows[0]) and std.mem.eql(u8, row, rows[1])) return;
+        previous = row;
+    }
+    std.debug.print("expected the rows \"{s}\" and \"{s}\" in:\n{s}\n", .{
+        rows[0],
+        rows[1],
+        painted,
+    });
+    return error.TestExpectedSummary;
+}
+
+fn checkCompactAllocations(gpa: std.mem.Allocator) error{OutOfMemory}!void {
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var screen = Screen.init(gpa, &out.writer, .high);
+    defer screen.deinit();
+    screen.toggleTranscript();
+    try screen.appendUser("prompt");
+    screen.beginTurn();
+    const call: core.Tool.Call = .{
+        .id = "call",
+        .name = "read",
+        .arguments = "{\"path\":\"src/App.zig\"}",
+    };
+    var output: core.Tool.Output = .{ .content = "text" };
+    output.measures.put(.lines, 1);
+    const events = [_]core.Session.Event{
+        .reasoning_started,
+        .{ .reasoning = "first" },
+        .reasoning_started,
+        .{ .reasoning = "discard" },
+        .{ .tail_discarded = 1 },
+        .reasoning_started,
+        .{ .reasoning = "second" },
+        .{ .tool_call_started = "read" },
+        .{ .tool_call_arguments = call.arguments },
+        .{ .tool_started = call },
+        .{ .tool_result = .{ .call = call, .output = output } },
+        .committed,
+        .{ .turn_ended = .{ .stopped = .complete } },
+    };
+    for (&events) |*event| _ = try screen.apply(event, .{ .awake_ms = 2_000, .boot_ms = 2_000 });
+    try screen.appendUser("next");
+    screen.beginTurn();
+    const canceled = [_]core.Session.Event{
+        .reasoning_started,
+        .{ .reasoning = "partial" },
+        .{ .tail_discarded = 1 },
+        .{ .turn_ended = .canceled },
+    };
+    for (&canceled) |*event| _ = try screen.apply(event, .{ .awake_ms = 4_000, .boot_ms = 4_000 });
+    screen.toggleTranscript();
+}
+
+test "compact reasoning and tool events free each partial allocation" {
+    try std.testing.checkAllAllocationFailures(
+        core.testing.no_resize_allocator,
+        checkCompactAllocations,
+        .{},
+    );
+}
+
+test "an active thinking summary above the frame keeps its current measurements and final status" {
+    const gpa = std.testing.allocator;
+    const size: terminal.View.Size = .{ .columns = 80, .rows = 2 };
+    var device: terminal.testing.FakeDevice = undefined;
+    try device.init(gpa, std.testing.io, size);
+    defer device.deinit();
+    var screen = Screen.init(gpa, device.device().writer(), .high);
+    defer screen.deinit();
+    screen.window_pages = 1;
+    screen.toggleTranscript();
+    try screen.appendUser("prompt");
+    screen.beginTurn();
+    var time: Time = .{ .awake_ms = 0, .boot_ms = 0 };
+    _ = try screen.apply(&.reasoning_started, time);
+    _ = try screen.apply(&.{ .reasoning = "abc" }, time);
+    try screen.paint(size, time, &no_caption);
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const first = try device.snapshot(arena.allocator());
+    try expectSummary(
+        try std.mem.join(arena.allocator(), "\n", first.rows),
+        &.{ "Thinking: streaming", "Received: 3 B · Time: 0s" },
+    );
+    time.awake_ms = 3_000;
+    _ = try screen.apply(&.{ .reasoning = "def" }, time);
+    try screen.paint(size, time, &no_caption);
+    const active = try device.snapshot(arena.allocator());
+    const active_rows = try std.mem.join(arena.allocator(), "\n", active.rows);
+    try expectSummary(active_rows, &.{ "Thinking: streaming", "Received: 6 B · Time: 3s" });
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, active_rows, "Thinking:"));
+    time.awake_ms = 4_000;
+    _ = try screen.apply(&.committed, time);
+    _ = try screen.apply(&.{ .turn_ended = .{ .stopped = .complete } }, time);
+    try screen.paint(size, time, &no_caption);
+    const complete = try device.snapshot(arena.allocator());
+    const complete_rows = try std.mem.join(arena.allocator(), "\n", complete.rows);
+    try expectSummary(complete_rows, &.{ "Thinking: complete", "Received: 6 B · Time: 4s" });
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, complete_rows, "Thinking:"));
+}
+
+test "a thinking update inside the frame keeps all history above the visible screen" {
+    const gpa = std.testing.allocator;
+    const size: terminal.View.Size = .{ .columns = 80, .rows = 8 };
+    var device: terminal.testing.FakeDevice = undefined;
+    try device.init(gpa, std.testing.io, size);
+    defer device.deinit();
+    var screen = Screen.init(gpa, device.device().writer(), .high);
+    defer screen.deinit();
+    for (0..100) |index| {
+        const text = try gpa.print("message-{d}", .{index});
+        defer gpa.free(text);
+        try screen.appendUser(text);
+    }
+    try screen.setDraft("line1\nline2\nline3\nline4\nline5");
+    screen.beginTurn();
+    var time: Time = .{ .awake_ms = 0, .boot_ms = 0 };
+    _ = try screen.apply(&.reasoning_started, time);
+    _ = try screen.apply(&.{ .reasoning = "abc" }, time);
+    screen.toggleTranscript();
+    try screen.paint(size, time, &no_caption);
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const first = try device.snapshot(arena.allocator());
+    var first_count: usize = 0;
+    for (first.rows) |row| first_count += @intFromBool(std.mem.startsWith(u8, row, "message-"));
+    try std.testing.expectEqual(@as(usize, 100), first_count);
+    time.awake_ms = 3_000;
+    _ = try screen.apply(&.{ .reasoning = "def" }, time);
+    try screen.paint(size, time, &no_caption);
+    const active = try device.snapshot(arena.allocator());
+    var active_count: usize = 0;
+    for (active.rows) |row| {
+        active_count += @intFromBool(std.mem.startsWith(u8, row, "message-"));
+    }
+    try std.testing.expectEqual(@as(usize, 100), active_count);
+    try expectSummary(
+        try std.mem.join(arena.allocator(), "\n", active.rows),
+        &.{ "Thinking: streaming", "Received: 6 B · Time: 3s" },
+    );
+}
+
+test "a mode toggle repaints the complete transcript beyond the window limit" {
+    const gpa = std.testing.allocator;
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    rig.screen.window_pages = 1;
+    for (0..60) |index| {
+        const text = try gpa.print("message-{d}", .{index});
+        defer gpa.free(text);
+        try rig.screen.appendUser(text);
+    }
+    const recent = try rig.paintPlain(80);
+    defer gpa.free(recent);
+    try std.testing.expect(std.mem.find(u8, recent, "message-0") == null);
+    for (0..2) |_| {
+        rig.screen.toggleTranscript();
+        const repainted = try rig.paintPlain(80);
+        defer gpa.free(repainted);
+        try std.testing.expectEqual(@as(usize, 60), std.mem.count(u8, repainted, "message-"));
+        try testing.expectContains(repainted, "message-0");
+        try std.testing.expect(std.mem.find(u8, rig.out.written(), "\x1b[3J") != null);
+        const unchanged = try rig.paintPlain(80);
+        defer gpa.free(unchanged);
+        try std.testing.expect(std.mem.find(u8, rig.out.written(), "\x1b[3J") == null);
+    }
+    try std.testing.expectEqual(@as(usize, 1), rig.screen.window_pages);
+}
+
+test "compact thinking joins consecutive blocks and keeps its text and final timer" {
+    const gpa = std.testing.allocator;
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    rig.screen.toggleTranscript();
+    try rig.start("prompt");
+    try rig.apply(&.reasoning_started);
+    rig.time.awake_ms = 2_000;
+    const empty = try rig.paintPlain(80);
+    defer gpa.free(empty);
+    try expectSummary(empty, &.{ "Thinking: streaming", "Received: 0 B · Time: 2s" });
+
+    try rig.apply(&.{ .reasoning = "alpha" });
+    rig.time.awake_ms = 3_000;
+    try rig.apply(&.reasoning_started);
+    try rig.apply(&.{ .reasoning = "βeta" });
+    rig.time.awake_ms = 6_000;
+    rig.screen.toggleTranscript();
+    rig.screen.toggleTranscript();
+    const active = try rig.paintPlain(80);
+    defer gpa.free(active);
+    try expectSummary(active, &.{ "Thinking: streaming", "Received: 10 B · Time: 6s" });
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, active, "Thinking:"));
+    try std.testing.expect(std.mem.find(u8, active, "alpha") == null);
+    try std.testing.expect(std.mem.find(u8, active, "βeta") == null);
+
+    rig.time.awake_ms = 7_000;
+    try rig.apply(&.text_started);
+    try rig.apply(&.{ .text = "answer" });
+    try rig.apply(&.committed);
+    try rig.end(&.{ .stopped = .complete });
+    rig.time.awake_ms = 90_000;
+    rig.screen.toggleTranscript();
+    rig.screen.toggleTranscript();
+    const complete = try rig.paintPlain(80);
+    defer gpa.free(complete);
+    try expectSummary(complete, &.{ "Thinking: complete", "Received: 10 B · Time: 7s" });
+    try testing.expectContains(complete, "answer");
+
+    rig.screen.toggleTranscript();
+    const full = try rig.paintPlain(80);
+    defer gpa.free(full);
+    try testing.expectContains(full, "alpha");
+    try testing.expectContains(full, "βeta");
+    try std.testing.expect(std.mem.find(u8, full, "Thinking:") == null);
+}
+
+test "full mode adds no rows for thinking without visible text" {
+    const gpa = std.testing.allocator;
+    var expected: ?[]u8 = null;
+    defer if (expected) |text| gpa.free(text);
+    for ([_]?[]const u8{ null, "", " \n" }) |maybe_thinking| {
+        var rig: Rig = undefined;
+        rig.init();
+        defer rig.deinit();
+        try rig.start("prompt");
+        if (maybe_thinking) |thinking| {
+            try rig.apply(&.reasoning_started);
+            try rig.apply(&.{ .reasoning = thinking });
+        }
+        try rig.apply(&.text_started);
+        try rig.apply(&.{ .text = "answer" });
+        try rig.apply(&.committed);
+        try rig.end(&.{ .stopped = .complete });
+        const painted = try rig.paintPlain(80);
+        if (expected) |text| {
+            defer gpa.free(painted);
+            try std.testing.expectEqualStrings(text, painted);
+        } else {
+            expected = painted;
+        }
+    }
+}
+
+test "thinking reports each terminal outcome and freezes its measurements" {
+    const outcomes = [_]core.Session.Outcome{
+        .{ .stopped = .complete },
+        .canceled,
+        .{ .failed = .{ .reason = .empty_reply } },
+        .exhausted,
+        .{ .stopped = .truncated },
+    };
+    const statuses = [_][]const u8{ "complete", "canceled", "failed", "failed", "truncated" };
+    for (&outcomes, statuses) |*outcome, status| {
+        var rig: Rig = undefined;
+        rig.init();
+        defer rig.deinit();
+        rig.screen.toggleTranscript();
+        try rig.start("prompt");
+        rig.time.awake_ms = 1_000;
+        try rig.apply(&.reasoning_started);
+        try rig.apply(&.{ .reasoning = "abc" });
+        rig.time.awake_ms = 4_000;
+        if (outcome.* == .stopped and outcome.stopped == .complete) {
+            try rig.apply(&.committed);
+        } else {
+            try rig.apply(&.{ .tail_discarded = 1 });
+        }
+        rig.time.awake_ms = 10_000;
+        try rig.end(outcome);
+        rig.time.awake_ms = 50_000;
+        const painted = try rig.paintPlain(80);
+        defer std.testing.allocator.free(painted);
+        const expected = try std.testing.allocator.print("Thinking: {s}", .{status});
+        defer std.testing.allocator.free(expected);
+        try expectSummary(painted, &.{ expected, "Received: 3 B · Time: 3s" });
+    }
+}
+
+test "a retry keeps the failed thinking summary separate from the new attempt" {
+    const gpa = std.testing.allocator;
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    rig.screen.toggleTranscript();
+    try rig.start("prompt");
+    try rig.apply(&.reasoning_started);
+    try rig.apply(&.{ .reasoning = "first" });
+    rig.time.awake_ms = 1_000;
+    try rig.apply(&.reasoning_started);
+    try rig.apply(&.{ .reasoning = "second" });
+    rig.time.awake_ms = 2_000;
+    try rig.apply(&.{ .tail_discarded = 2 });
+    rig.time.awake_ms = 9_000;
+    try rig.apply(&.{ .attempt_failed = .{
+        .attempt = 1,
+        .failure = .{ .reason = .overloaded },
+        .delay_ms = 0,
+    } });
+    rig.time.awake_ms = 10_000;
+    try rig.apply(&.reasoning_started);
+    try rig.apply(&.{ .reasoning = "new" });
+    rig.time.awake_ms = 12_000;
+    try rig.apply(&.text_started);
+    try rig.apply(&.{ .text = "answer" });
+    try rig.apply(&.committed);
+    try rig.end(&.{ .stopped = .complete });
+    const painted = try rig.paintPlain(80);
+    defer gpa.free(painted);
+    try expectSummary(painted, &.{ "Thinking: failed", "Received: 11 B · Time: 2s" });
+    try expectSummary(painted, &.{ "Thinking: complete", "Received: 3 B · Time: 2s" });
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, painted, "Thinking:"));
+}
+
+test "thinking groups stop at committed attempts and tool calls" {
+    const gpa = std.testing.allocator;
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    rig.screen.toggleTranscript();
+    try rig.start("prompt");
+    try rig.apply(&.reasoning_started);
+    try rig.apply(&.{ .reasoning = "a" });
+    rig.time.awake_ms = 2_000;
+    try rig.apply(&.committed);
+    rig.time.awake_ms = 5_000;
+    try rig.apply(&.reasoning_started);
+    try rig.apply(&.{ .reasoning = "bb" });
+    rig.time.awake_ms = 6_000;
+    try rig.apply(&.{ .tool_call_started = "read" });
+    const painted = try rig.paintPlain(80);
+    defer gpa.free(painted);
+    try expectSummary(painted, &.{ "Thinking: complete", "Received: 1 B · Time: 2s" });
+    try expectSummary(painted, &.{ "Thinking: complete", "Received: 2 B · Time: 1s" });
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, painted, "Thinking:"));
+}
+
+test "a discard removes every part of a text run that a model notice split" {
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    try rig.start("prompt");
+    try rig.apply(&.text_started);
+    try rig.apply(&.{ .text = "discard-before" });
+    try rig.apply(&.{ .model_served = .{ .requested = "requested", .served = "served" } });
+    try rig.apply(&.{ .text = "discard-after" });
+    try rig.apply(&.{ .tail_discarded = 1 });
+    try rig.end(&.{ .stopped = .complete });
+    const painted = try rig.paintPlain(80);
+    defer std.testing.allocator.free(painted);
+    try testing.expectContains(painted, "prompt");
+    try std.testing.expect(std.mem.find(u8, painted, "discard-before") == null);
+    try std.testing.expect(std.mem.find(u8, painted, "discard-after") == null);
+}
+
+test "thinking after a model notice keeps its counter and terminal status" {
+    const gpa = std.testing.allocator;
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    rig.screen.toggleTranscript();
+    try rig.start("prompt");
+    rig.time.awake_ms = 1_000;
+    try rig.apply(&.reasoning_started);
+    try rig.apply(&.{ .reasoning = "aaa" });
+    rig.time.awake_ms = 2_000;
+    try rig.apply(&.{ .model_served = .{ .requested = "requested", .served = "served" } });
+    rig.time.awake_ms = 3_000;
+    try rig.apply(&.{ .reasoning = "bbbb" });
+    rig.time.awake_ms = 5_000;
+    try rig.end(&.canceled);
+    const painted = try rig.paintPlain(80);
+    defer gpa.free(painted);
+    try expectSummary(painted, &.{ "Thinking: complete", "Received: 3 B · Time: 2s" });
+    try expectSummary(painted, &.{ "Thinking: canceled", "Received: 4 B · Time: 2s" });
+}
+
+test "a discarded thinking block no longer contributes to its compact summary" {
+    const gpa = std.testing.allocator;
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    rig.screen.toggleTranscript();
+    try rig.start("prompt");
+    try rig.apply(&.reasoning_started);
+    try rig.apply(&.{ .reasoning = "a" });
+    rig.time.awake_ms = 2_000;
+    try rig.apply(&.reasoning_started);
+    try rig.apply(&.{ .reasoning = "discard" });
+    const active = try rig.paintPlain(80);
+    defer gpa.free(active);
+    try testing.expectContains(active, "Received: 8 B");
+    try rig.apply(&.{ .tail_discarded = 1 });
+    rig.time.awake_ms = 8_000;
+    try rig.end(&.{ .stopped = .complete });
+    rig.screen.toggleTranscript();
+    rig.screen.toggleTranscript();
+    const complete = try rig.paintPlain(80);
+    defer gpa.free(complete);
+    try expectSummary(complete, &.{ "Thinking: complete", "Received: 1 B · Time: 2s" });
+}
+
 test "a tool call streams as a row, runs with its subject and timer, and ends as a block" {
     const gpa = std.testing.allocator;
     var rig: Rig = undefined;
@@ -1097,7 +1660,7 @@ test "a tool call streams as a row, runs with its subject and timer, and ends as
     try rig.apply(&.{ .tool_call_arguments = "\"zig build\"}" });
     const streamed = try rig.paintPlain(80);
     defer gpa.free(streamed);
-    try testing.expectContains(streamed, "Tool: bash · Received: 23 B · Status: Streaming");
+    try testing.expectContains(streamed, "Tool: bash · Received: 23 B · Status: streaming");
 
     rig.time.awake_ms = 1_000;
     try rig.apply(&.{ .tool_started = .{
@@ -1128,7 +1691,7 @@ test "a tool call streams as a row, runs with its subject and timer, and ends as
     try std.testing.expect(!block.failed);
     const done = try rig.paintPlain(80);
     defer gpa.free(done);
-    try std.testing.expect(std.mem.find(u8, done, "Status: Streaming") == null);
+    try std.testing.expect(std.mem.find(u8, done, "Status: streaming") == null);
 
     try rig.apply(&.committed);
     try rig.end(&.{ .stopped = .complete });
@@ -1181,15 +1744,15 @@ test "queued calls read as queued until each one runs" {
     try rig.apply(&.{ .tool_call_started = "write" });
     const two = try rig.paintPlain(80);
     defer gpa.free(two);
-    try testing.expectContains(two, "Tool: read · Received: 2 B · Status: Queued");
-    try testing.expectContains(two, "Tool: write · Received: 0 B · Status: Streaming");
+    try testing.expectContains(two, "Tool: read · Received: 2 B · Status: queued");
+    try testing.expectContains(two, "Tool: write · Received: 0 B · Status: streaming");
 
     try rig.apply(&.{ .tool_started = .{ .id = "c1", .name = "read", .arguments = "{}" } });
     const one = try rig.paintPlain(80);
     defer gpa.free(one);
     try testing.expectContains(one, "Tool: read ");
     try std.testing.expect(std.mem.find(u8, one, "Tool: read ·") == null);
-    try testing.expectContains(one, "Tool: write · Received: 0 B · Status: Queued");
+    try testing.expectContains(one, "Tool: write · Received: 0 B · Status: queued");
     try rig.apply(&.{ .tool_result = .{
         .call = .{ .id = "c1", .name = "read", .arguments = "{}" },
         .output = .{ .content = "x" },
@@ -1204,7 +1767,34 @@ test "queued calls read as queued until each one runs" {
     try rig.end(&.{ .stopped = .complete });
 }
 
-test "a discarded tail leaves the screen with its rows, and a cancel keeps the rest" {
+test "a reasoning discard keeps a retained call result that arrived after the reasoning" {
+    for ([_]ui.Block.Mode{ .full, .compact }) |mode| {
+        var rig: Rig = undefined;
+        rig.init();
+        defer rig.deinit();
+        if (mode == .compact) rig.screen.toggleTranscript();
+        try rig.start("prompt");
+        try rig.apply(&.reasoning_started);
+        try rig.apply(&.{ .tool_call_started = "write" });
+        try rig.apply(&.reasoning_started);
+        try rig.apply(&.{ .tool_call_started = "read" });
+        const call: core.Tool.Call = .{ .id = "first", .name = "write", .arguments = "{}" };
+        try rig.apply(&.{ .tool_started = call });
+        try rig.apply(&.{ .tool_result = .{
+            .call = call,
+            .output = .{ .content = "done" },
+        } });
+        try rig.apply(&.{ .tail_discarded = 2 });
+        try rig.apply(&.committed);
+        try rig.end(&.canceled);
+        const painted = try rig.paintPlain(80);
+        defer std.testing.allocator.free(painted);
+        try testing.expectContains(painted, "Tool: write");
+        try std.testing.expect(std.mem.find(u8, painted, "Tool: read") == null);
+    }
+}
+
+test "a cancel preserves thinking from its discarded tail and the committed blocks" {
     const gpa = std.testing.allocator;
     var rig: Rig = undefined;
     rig.init();
@@ -1232,9 +1822,12 @@ test "a discarded tail leaves the screen with its rows, and a cancel keeps the r
 
     try rig.apply(&.committed);
     try rig.end(&.canceled);
-    try rig.expectKinds(&.{ .user, .model, .tool_result, .event });
-    try std.testing.expectEqualStrings("You canceled the turn.", rig.eventText(3));
+    try rig.expectKinds(&.{ .user, .model, .tool_result, .thinking, .event });
+    try std.testing.expectEqualStrings("You canceled the turn.", rig.eventText(4));
     try std.testing.expectEqualStrings("I read ", rig.blocks()[1].content.model.items);
+    const canceled = try rig.paintPlain(80);
+    defer gpa.free(canceled);
+    try testing.expectContains(canceled, "afterthought");
 }
 
 test "a rejected attempt drops its tail, records the retry, and the retry survives the discard" {

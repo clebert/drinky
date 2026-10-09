@@ -113,9 +113,23 @@ fn writeCommands(writer: *std.Io.Writer) !void {
     }
     try writer.writeAll(
         "\nA command refuses text after its name unless its row names trailing text. " ++
-            "Drinky refuses every command while a turn runs, and the draft stays.\n",
+            "The /compact command also works while a turn runs. " ++
+            "Drinky refuses other commands during a turn, and the draft stays.\n",
     );
     try writer.writeAll(
+        \\
+        \\`/compact` toggles Full and Compact transcript modes for the current session.
+        \\Each toggle clears terminal scrollback and repaints the complete transcript without a
+        \\warning.
+        \\Full mode shows thinking text and keeps the padding inside boxes.
+        \\Compact mode removes that padding and keeps the gaps between transcript blocks.
+        \\Consecutive thinking blocks share one summary box, with received bytes and elapsed time.
+        \\The final status is `complete`, `canceled`, `failed`, or `truncated`.
+        \\The original thinking text stays available in Full mode.
+        \\The transcript keeps thinking after a cancellation or failure.
+        \\This does not change the model conversation.
+        \\Compact mode also preserves the complete transcript when an update requires a terminal
+        \\reset.
         \\
         \\`/rewind` lists the prompts of the conversation, with the oldest prompt first. A row
         \\holds the typed line of a message or a skill command. A retry gets no row. Enter drops
@@ -157,8 +171,9 @@ fn writeKeys(writer: *std.Io.Writer, options: *const Options) !void {
         \\
         \\A running turn takes these keys:
         \\
-        \\- Enter sends no message. Drinky shows the notice `Drinky sends no message while a turn
-        \\  runs. The draft stays.` and keeps the line. A slash command gets its refusal instead.
+        \\- Enter runs `/compact` and clears its command line. Other slash commands get a refusal.
+        \\  Enter sends no message. Drinky shows the notice `Drinky sends no message while a turn
+        \\  runs. The draft stays.` and keeps the line.
         \\- Esc cancels the turn. Esc with a draft warns first and cancels on the second press.
         \\- When a notice other than that warning replaces the status line, Esc first clears the
         \\  notice.

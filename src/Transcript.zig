@@ -49,6 +49,44 @@ pub fn beginRun(self: *Transcript, kind: ui.Block.Kind) void {
     self.held.clearRetainingCapacity();
 }
 
+pub fn beginThinking(self: *Transcript, thinking: *const ui.Block.Thinking) !usize {
+    self.beginRun(.thinking);
+    const index = try self.openRun(.thinking);
+    self.current.?.index = index;
+    self.block_list.items[index].thinking = thinking.*;
+    return index;
+}
+
+pub fn present(self: *Transcript, mode: ui.Block.Mode, now_ms: i64) void {
+    for (self.block_list.items) |*block| block.present(mode);
+    if (mode == .full) return;
+    var index: usize = 0;
+    while (index < self.block_list.items.len) {
+        const first = &self.block_list.items[index];
+        if (first.thinking == null) {
+            index += 1;
+            continue;
+        }
+        var summary: ui.Block.Thinking.Summary = .{
+            .bytes = first.content.thinking.items.len,
+            .elapsed_ms = first.thinking.?.elapsed(now_ms),
+            .status = first.thinking.?.status,
+        };
+        var end = index + 1;
+        while (end < self.block_list.items.len) : (end += 1) {
+            const block = &self.block_list.items[end];
+            const thinking = block.thinking orelse break;
+            if (!thinking.joins_previous) break;
+            summary.bytes += block.content.thinking.items.len;
+            summary.elapsed_ms += thinking.elapsed(now_ms);
+            summary.status = thinking.status;
+            block.presentThinking(null);
+        }
+        first.presentThinking(&summary);
+        index = end;
+    }
+}
+
 pub fn runIndex(self: *const Transcript) ?usize {
     const run = self.current orelse return null;
     return run.index;
@@ -93,6 +131,22 @@ pub fn remove(self: *Transcript, range: Range) void {
     self.endMessage();
     for (self.block_list.items[range.start..range.end]) |*block| block.deinit(self.gpa);
     self.block_list.replaceRangeAssumeCapacity(range.start, range.end - range.start, &.{});
+}
+
+pub fn takeThinking(
+    self: *Transcript,
+    block_count: usize,
+    held: *std.ArrayList(ui.Block),
+) error{OutOfMemory}!void {
+    const tail = self.block_list.items[block_count..];
+    var count: usize = 0;
+    for (tail) |block| count += @intFromBool(block.thinking != null);
+    try held.ensureUnusedCapacity(self.gpa, count);
+    for (tail) |*block| {
+        if (block.thinking == null) continue;
+        held.appendAssumeCapacity(block.*);
+        block.* = .{ .content = .{ .thinking = .empty }, .thinking = .{} };
+    }
 }
 
 pub fn discard(self: *Transcript, block_count: usize) void {
