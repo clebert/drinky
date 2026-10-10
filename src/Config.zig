@@ -223,8 +223,8 @@ const keys = [_]Key{
     },
     .{
         .path = "interface.verbose",
-        .description = "Show complete thinking text and bash commands at startup. " ++
-            "The value false selects thinking summaries and command previews. " ++
+        .description = "Show complete thinking text, tool rows, and bash commands at startup. " ++
+            "The value false folds each run of thinking and tool calls into one work row. " ++
             "The /verbose command changes only the current session.",
     },
     .{

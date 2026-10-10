@@ -14,6 +14,13 @@ pub const Range = struct {
     end: usize,
 };
 
+pub const Run = struct {
+    end: usize,
+    started_ms: i64,
+    tools: usize,
+    received_bytes: usize,
+};
+
 pub fn init(gpa: std.mem.Allocator) Transcript {
     return .{
         .gpa = gpa,
@@ -49,42 +56,81 @@ pub fn beginRun(self: *Transcript, kind: ui.Block.Kind) void {
     self.held.clearRetainingCapacity();
 }
 
-pub fn beginThinking(self: *Transcript, thinking: *const ui.Block.Thinking) !usize {
+pub fn beginThinking(self: *Transcript, started_ms: i64) !usize {
     self.beginRun(.thinking);
     const index = try self.openRun(.thinking);
     self.current.?.index = index;
-    self.block_list.items[index].thinking = thinking.*;
+    self.block_list.items[index].work = .{ .started_ms = started_ms };
     return index;
 }
 
-pub fn present(self: *Transcript, verbose: bool, now_ms: i64) void {
+pub fn closeWork(self: *Transcript, end: *const ui.Block.Work.End) void {
+    std.debug.assert(end.status != .running);
+    var index = self.block_list.items.len;
+    while (index > 0) {
+        index -= 1;
+        const block = &self.block_list.items[index];
+        if (block.content == .user) return;
+        const work = if (block.work) |*work| work else continue;
+        if (work.end == null) work.end = end.*;
+        return;
+    }
+}
+
+pub fn present(self: *Transcript, verbose: bool) void {
     for (self.block_list.items) |*block| block.present(verbose);
     if (verbose) return;
+    const items = self.block_list.items;
     var index: usize = 0;
-    while (index < self.block_list.items.len) {
-        const first = &self.block_list.items[index];
-        if (first.thinking == null) {
+    while (index < items.len) {
+        if (items[index].work == null) {
             index += 1;
             continue;
         }
-        var summary: ui.Block.Thinking.Summary = .{
-            .bytes = first.content.thinking.items.len,
-            .elapsed_ms = first.thinking.?.elapsed(now_ms),
-            .status = first.thinking.?.status,
-        };
-        var end = index + 1;
-        while (end < self.block_list.items.len) : (end += 1) {
-            const block = &self.block_list.items[end];
-            const thinking = block.thinking orelse break;
-            if (!thinking.joins_previous) break;
-            summary.bytes += block.content.thinking.items.len;
-            summary.elapsed_ms += thinking.elapsed(now_ms);
-            summary.status = thinking.status;
-            block.presentThinking(null);
+        const run = runAt(items, index);
+        for (items[index + 1 .. run.end]) |*block| block.presentWork(null);
+        if (items[run.end - 1].work.?.end) |closed| {
+            items[index].presentWork(&.{
+                .elapsed_ms = closed.time_ms - run.started_ms,
+                .tools = run.tools,
+                .received_bytes = run.received_bytes,
+                .status = closed.status,
+            });
+        } else {
+            items[index].presentWork(null);
         }
-        first.presentThinking(&summary);
-        index = end;
+        index = run.end;
     }
+}
+
+pub fn openWork(self: *const Transcript) ?Run {
+    const items = self.block_list.items;
+    var start = items.len;
+    while (start > 0 and items[start - 1].work != null) start -= 1;
+    if (start == items.len or items[items.len - 1].work.?.end != null) return null;
+    return runAt(items, start);
+}
+
+fn runAt(items: []const ui.Block, start: usize) Run {
+    var run: Run = .{
+        .end = start,
+        .started_ms = items[start].work.?.started_ms,
+        .tools = 0,
+        .received_bytes = 0,
+    };
+    while (run.end < items.len and items[run.end].work != null) : (run.end += 1) {
+        const block = &items[run.end];
+        run.started_ms = @min(run.started_ms, block.work.?.started_ms);
+        switch (block.content) {
+            .thinking => |list| run.received_bytes += list.items.len,
+            .tool_result => |*result| {
+                run.tools += 1;
+                run.received_bytes += result.received_bytes;
+            },
+            .intro, .user, .user_note, .model, .event => unreachable,
+        }
+    }
+    return run;
 }
 
 pub fn runIndex(self: *const Transcript) ?usize {
@@ -140,12 +186,12 @@ pub fn takeThinking(
 ) error{OutOfMemory}!void {
     const tail = self.block_list.items[block_count..];
     var count: usize = 0;
-    for (tail) |block| count += @intFromBool(block.thinking != null);
+    for (tail) |*block| count += @intFromBool(block.content == .thinking);
     try held.ensureUnusedCapacity(self.gpa, count);
     for (tail) |*block| {
-        if (block.thinking == null) continue;
+        if (block.content != .thinking) continue;
         held.appendAssumeCapacity(block.*);
-        block.* = .{ .content = .{ .thinking = .empty }, .thinking = .{} };
+        block.* = .{ .content = .{ .thinking = .empty } };
     }
 }
 

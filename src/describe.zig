@@ -130,7 +130,7 @@ fn writeCommands(writer: *std.Io.Writer) !void {
         \\User messages use purple text at normal brightness.
         \\They preserve blank lines and source indentation.
         \\Picker selection highlights stay outside the transcript.
-        \\The complete `Tool: name (state)` and `Agent: thinking (state)` identities use dim text.
+        \\The complete `Tool: name (state)` and `Agent: work (state)` identities use dim text.
         \\Each identity takes the status color.
         \\Secondary metadata and command text use dim text with the default foreground color.
         \\Tool error sentences use dim text with the default foreground color.
@@ -138,17 +138,23 @@ fn writeCommands(writer: *std.Io.Writer) !void {
         \\The `limited`, `truncated`, and `canceled` statuses use yellow.
         \\The `queued`, `streaming`, and `running` statuses use cyan.
         \\
-        \\Verbose on shows complete thinking text and wraps complete bash commands.
+        \\Verbose on shows complete thinking text, a row for each tool call, and complete bash
+        \\commands.
         \\Complete commands keep their source line breaks.
-        \\Verbose off shows thinking summaries and one-row command previews.
-        \\Consecutive thinking blocks share one summary with elapsed time, received bytes, and the
-        \\terminal status.
+        \\Verbose off folds each run of thinking and tool calls into one work row.
+        \\Agent text, a session event, or a user note ends a run. A new model step does not end it.
+        \\The work row shows the time of the run, the count of finished tool calls, and the received
+        \\bytes.
+        \\The received bytes count the thinking text and the tool arguments.
+        \\The status is `running` while the run is open.
+        \\The open run stays below the transcript.
+        \\Its `Now` segment names the active thinking and each tool call that has not finished.
+        \\The row omits the `Now` segment while the model prepares its next step.
         \\The final status is `complete`, `canceled`, `failed`, or `truncated`.
         \\The transcript keeps thinking after a cancellation or failure.
         \\A toggle changes no stored text and does not change the model conversation.
-        \\An ellipsis marks command text that the terminal width or additional source lines hide.
         \\
-        \\Both verbosity states keep tool metadata on one row, with the tool name and state first.
+        \\Tool metadata stays on one row, with the tool name and state first.
         \\The row removes lower-priority segments as the viewport narrows.
         \\It never removes the first segment, and it truncates that segment only when necessary.
         \\Time has the next priority, followed by the bash exit code, file or pattern, limit
@@ -157,17 +163,17 @@ fn writeCommands(writer: *std.Io.Writer) !void {
         \\Only `bash`, `find`, and `grep` show time.
         \\Successful tools with partial results show `limited`.
         \\Bash commands and complete tool error sentences appear below the metadata.
-        \\Every detail row aligns under the first optional metadata field in both verbosity states.
+        \\Every detail row aligns under the first optional metadata field.
         \\The indent uses the complete identity width plus the separator width, measured in
         \\terminal columns.
         \\The indent stays available when the header hides all optional metadata fields.
         \\The indent applies only when at least 13 columns remain after it.
         \\Otherwise, every detail row for that call starts at the left edge.
         \\Source indentation stays in addition to the detail indent.
-        \\Command previews can truncate at widths narrower than their label.
-        \\Complete tool error sentences wrap in both verbosity states, even at very small widths.
-        \\Thinking summaries start with `Agent: thinking (state)`.
-        \\They use the same reduction rule, with time before received bytes.
+        \\Complete tool error sentences wrap, even at very small widths.
+        \\Work rows start with `Agent: work (state)`.
+        \\They use the same reduction rule, in this order: time, the tool count, received bytes,
+        \\and `Now`.
         \\The intro and user notes use one row.
         \\Session events can use multiple rows.
         \\User and model messages keep their complete text.

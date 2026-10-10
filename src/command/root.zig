@@ -44,7 +44,7 @@ const commands = [_]Entry{
     .{ .name = system.name, .summary = system.summary, .run = system.run },
     .{
         .name = "verbose",
-        .summary = "Toggle thinking text and complete bash commands",
+        .summary = "Toggle thinking text, tool rows, and complete bash commands",
         .run = runVerbose,
         .during_turn = true,
     },
@@ -351,7 +351,7 @@ test "a line without a name opens its list, and a command row runs its command" 
         const last = pick.options.len - 1;
         try std.testing.expectEqualStrings("/verbose", pick.options[last].name);
         try std.testing.expectEqualStrings(
-            "Toggle thinking text and complete bash commands.",
+            "Toggle thinking text, tool rows, and complete bash commands.",
             pick.options[last].extra.?,
         );
         try std.testing.expect((try testing.selectRow(&pick, &context, last)) == .toggle_verbose);

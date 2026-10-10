@@ -81,7 +81,6 @@ const BoxRow = struct {
     role: role.Name = .text,
     segment_ends: ?[]const usize = null,
     marks: []const Mark = &.{},
-    preview: bool = false,
     indent: usize = 0,
 };
 
@@ -113,7 +112,6 @@ pub const Placement = struct {
 
 pub const Box = struct {
     text: []const u8,
-    verbose: bool = true,
     segment_ends: ?[]const usize = null,
     status: ?Mark = null,
     command: ?Range = null,
@@ -122,47 +120,32 @@ pub const Box = struct {
 };
 
 const BoxLines = struct {
-    text: []const u8,
     lines: std.mem.SplitIterator(u8, .scalar),
     offset: usize = 0,
     command: ?Box.Range,
-    verbose: bool,
 
     const Line = struct {
         text: []const u8,
         offset: usize,
-        command: bool = false,
-        preview: bool = false,
+        command: bool,
     };
 
     fn init(body: *const Box) BoxLines {
         return .{
-            .text = body.text,
             .lines = std.mem.splitScalar(u8, body.text, '\n'),
             .command = body.command,
-            .verbose = body.verbose,
         };
     }
 
     fn next(self: *BoxLines) ?Line {
-        while (self.lines.next()) |source| {
-            const offset = self.offset;
-            self.offset += source.len + 1;
-            if (self.command) |command| {
-                if (!self.verbose and offset == command.start) return .{
-                    .text = self.text[command.start..command.end],
-                    .offset = offset,
-                    .command = true,
-                    .preview = true,
-                };
-                if (offset >= command.start and offset <= command.end) {
-                    if (!self.verbose) continue;
-                    return .{ .text = lineText(source), .offset = offset, .command = true };
-                }
-            }
-            return .{ .text = lineText(source), .offset = offset };
-        }
-        return null;
+        const source = self.lines.next() orelse return null;
+        const offset = self.offset;
+        self.offset += source.len + 1;
+        const command = if (self.command) |range|
+            offset >= range.start and offset <= range.end
+        else
+            false;
+        return .{ .text = lineText(source), .offset = offset, .command = command };
     }
 };
 
@@ -358,7 +341,7 @@ pub fn boxRows(body: *const Box, columns: usize) usize {
     const indent = boxIndent(body, columns);
     var lines = BoxLines.init(body);
     while (lines.next()) |line| {
-        count += if (line.preview or (line.offset == 0 and body.segment_ends != null))
+        count += if (line.offset == 0 and body.segment_ends != null)
             1
         else
             terminal.width.rows(line.text, columns - indent);
@@ -507,13 +490,6 @@ pub fn box(placement: *const Placement, name: role.Name, body: *const Box) !void
                 .segment_ends = body.segment_ends,
                 .marks = if (plain) &marks else &.{},
             });
-        } else if (source.preview) {
-            try boxRow(placement, &line, &.{
-                .content = content,
-                .role = if (plain) .muted else base_role,
-                .preview = true,
-                .indent = indent,
-            });
         } else {
             var iterator = terminal.width.wrapper(content, placement.columns - indent);
             while (iterator.nextSpan()) |span| {
@@ -543,10 +519,6 @@ fn boxRowCells(sink: *terminal.View.Sink, columns: usize, row: *const BoxRow) !v
         const shown = segmentCut(row.content, room, ends);
         try boxRowText(sink, shown.kept, row);
         if (shown.shortened and row.marks.len > 0) try markStyle(sink, &row.marks[0]);
-        try shown.writeEllipsis(sink);
-    } else if (row.preview) {
-        const shown = headCut(row.content, room);
-        try boxRowText(sink, shown.kept, row);
         try shown.writeEllipsis(sink);
     } else {
         try boxRowText(sink, terminal.width.truncate(row.content, room), row);
@@ -851,17 +823,16 @@ test "tool details retain alignment only with thirteen available columns" {
         defer gpa.free(text);
         const body: Box = .{
             .text = text,
-            .verbose = false,
             .segment_ends = &.{identity.len},
             .status = .{ .start = 0, .end = identity.len, .role = .success, .dim = true },
             .command = .{ .start = identity.len + 1, .end = identity.len + 1 + command.len },
         };
-        const cases = [_]struct { columns: usize, indent: usize }{
-            .{ .columns = 40, .indent = 24 },
-            .{ .columns = 37, .indent = 24 },
-            .{ .columns = 36, .indent = 0 },
-            .{ .columns = 25, .indent = 0 },
-            .{ .columns = 24, .indent = 0 },
+        const cases = [_]struct { columns: usize, indent: usize, first: []const u8 }{
+            .{ .columns = 40, .indent = 24, .first = "Command: git" },
+            .{ .columns = 37, .indent = 24, .first = "Command: git" },
+            .{ .columns = 36, .indent = 0, .first = command },
+            .{ .columns = 25, .indent = 0, .first = command },
+            .{ .columns = 24, .indent = 0, .first = "Command: git diff" },
         };
         for (cases) |case| {
             var rig: testing.Rig = undefined;
@@ -872,16 +843,13 @@ test "tool details retain alignment only with thirteen available columns" {
             const plain = try rig.plain();
             var lines = std.mem.splitSequence(u8, plain, "\r\n");
             _ = lines.next().?;
-            const preview = lines.next().?;
-            try std.testing.expect(std.mem.allEqual(u8, preview[0..case.indent], ' '));
-            try std.testing.expect(std.mem.startsWith(u8, preview[case.indent..], "Command: "));
-            if (case.columns == 37)
-                try std.testing.expectEqualStrings("Command: git…", preview[case.indent..]);
-            if (case.columns == 36)
-                try std.testing.expectEqualStrings(command, std.mem.trimEnd(u8, preview, " "));
+            const first = lines.next().?;
+            const shown = std.mem.trimEnd(u8, first, " ");
+            try std.testing.expectEqualStrings(case.first, shown[case.indent..]);
+            try std.testing.expect(std.mem.allEqual(u8, first[0..case.indent], ' '));
             while (lines.next()) |row| {
                 try std.testing.expect(std.mem.allEqual(u8, row[0..case.indent], ' '));
-                try std.testing.expect(std.mem.startsWith(u8, row[case.indent..], "Error: bad."));
+                try std.testing.expect(row[case.indent] != ' ');
             }
             try std.testing.expectEqual(boxRows(&body, case.columns), testing.paintedRows(
                 try rig.painted(),
@@ -891,7 +859,7 @@ test "tool details retain alignment only with thirteen available columns" {
 }
 
 test "transcript rows preserve message whitespace without padding" {
-    const body: Box = .{ .text = "first\n\nlast", .verbose = false };
+    const body: Box = .{ .text = "first\n\nlast" };
     var rig: testing.Rig = undefined;
     rig.init(std.testing.allocator);
     defer rig.deinit();
@@ -900,37 +868,6 @@ test "transcript rows preserve message whitespace without padding" {
     try std.testing.expectEqual(@as(usize, 3), boxRows(&body, 20));
     try std.testing.expectEqual(@as(usize, 3), testing.paintedRows(try rig.painted()));
     try testing.expectShows(try rig.plain(), &.{ "first", "last" });
-}
-
-test "command previews count and render one Unicode row at every width" {
-    const gpa = std.testing.allocator;
-    const identity = "Tool: bash (running)";
-    const head = identity ++ " · Time: 0s";
-    const command = "Command: echo 你好👩‍💻abcdefghijklmnopqrstuvwxyz\nlast-line\n";
-    const detail = "Error: Drinky could not run the command because of error AccessDenied.";
-    const body: Box = .{
-        .text = head ++ "\n" ++ command ++ "\n" ++ detail,
-        .verbose = false,
-        .segment_ends = &.{ identity.len, head.len },
-        .status = .{ .start = 0, .end = identity.len, .role = .activity, .dim = true },
-        .command = .{ .start = head.len + 1, .end = head.len + 1 + command.len },
-    };
-    for (1..65) |columns| {
-        var rig: testing.Rig = undefined;
-        rig.init(gpa);
-        defer rig.deinit();
-        const placement = try rig.begin(&.{ .columns = columns, .rows = 100, .pages = 8 });
-        try box(&placement, .text, &body);
-        const room = if (columns >= 36) columns - 23 else columns;
-        const expected = 2 + terminal.width.rows(detail, room);
-        try std.testing.expectEqual(expected, boxRows(&body, columns));
-        try std.testing.expectEqual(expected, testing.paintedRows(try rig.painted()));
-        const plain = try rig.plain();
-        try testing.expectHides(plain, &.{"last-line"});
-        var rows = std.mem.splitSequence(u8, plain, "\r\n");
-        while (rows.next()) |row| try std.testing.expect(terminal.width.ofText(row) <= columns);
-        try testing.expectHides(try rig.painted(), &.{"\x1b[7m"});
-    }
 }
 
 test "a box breaks its rows between words" {

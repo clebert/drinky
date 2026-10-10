@@ -2596,8 +2596,8 @@ test "startup verbosity selects thinking text or summaries at the terminal bound
         });
         defer rig.deinit();
         try rig.keys("hello\r");
-        const shown = if (case.verbose) "visible thinking" else "Agent: thinking (complete)";
-        const hidden = if (case.verbose) "Agent: thinking" else "visible thinking";
+        const shown = if (case.verbose) "visible thinking" else "Agent: work (complete)";
+        const hidden = if (case.verbose) "Agent: work" else "visible thinking";
         try rig.waitFor(&.{
             .{ .rows = &.{ "hello", shown, "done" } },
             .{ .absent = hidden },
@@ -2615,7 +2615,7 @@ test "startup verbosity selects thinking text or summaries at the terminal bound
         try rig.keys("\r");
         try rig.waitFor(&.{
             .{ .absent = "visible thinking" },
-            .{ .absent = "Agent: thinking" },
+            .{ .absent = "Agent: work" },
             .{ .absent = "done" },
             .{ .editor = "hello" },
         });
