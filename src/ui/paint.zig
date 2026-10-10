@@ -18,8 +18,11 @@ pub const NoticeStyle = struct {
     role: role.Name,
     prefix: []const u8 = "",
     fit: Fit = .wrap,
+    segment_ends: ?[]const usize = null,
 
-    pub const note: NoticeStyle = .{ .role = .user_note, .prefix = "→ " };
+    const Fit = enum { wrap, head };
+
+    pub const note: NoticeStyle = .{ .role = .user_note, .prefix = "→ ", .fit = .head };
 
     pub fn of(severity: Message.Severity) NoticeStyle {
         return switch (severity) {
@@ -75,9 +78,9 @@ const Wrap = struct {
 
 const BoxRow = struct {
     content: []const u8,
-    fit: Fit,
     run: Run = .{},
     role: role.Name = .text,
+    segment_ends: ?[]const usize = null,
 };
 
 const Run = struct { start: usize = 0, end: usize = 0 };
@@ -107,16 +110,11 @@ pub const Placement = struct {
     }
 };
 
-pub const Fit = enum {
-    wrap,
-    head,
-};
-
 pub const Box = struct {
     text: []const u8,
-    fit: Fit = .wrap,
     emphasis: Emphasis = .none,
     compact: bool = false,
+    segment_ends: ?[]const usize = null,
 
     const Emphasis = enum {
         none,
@@ -326,18 +324,25 @@ pub fn boxRows(body: *const Box, columns: usize) usize {
     var lines = std.mem.splitScalar(u8, body.text, '\n');
     var first = true;
     while (lines.next()) |line| {
-        count += switch (boxFit(body, first)) {
-            .wrap => terminal.width.rows(lineText(line), columns),
-            .head => 1,
-        };
+        count += if (first and body.segment_ends != null)
+            1
+        else
+            terminal.width.rows(lineText(line), columns);
         first = false;
     }
     return count;
 }
 
-fn boxFit(body: *const Box, first: bool) Fit {
-    if (body.compact and !first) return .wrap;
-    return body.fit;
+fn segmentCut(text: []const u8, columns: usize, ends: []const usize) Cut {
+    if (ends.len == 0) return headCut(text, columns);
+    const first = text[0..ends[0]];
+    if (terminal.width.ofText(first) > columns) return cut(first, columns);
+    var end = ends[0];
+    for (ends[1..]) |next| {
+        if (terminal.width.ofText(text[0..next]) > columns) break;
+        end = next;
+    }
+    return .{ .kept = text[0..end], .shortened = false };
 }
 
 pub fn activityChanged(activity: *const Activity, columns: usize) bool {
@@ -401,11 +406,19 @@ pub fn headCut(text: []const u8, columns_max: usize) Cut {
     return .{ .kept = terminal.width.truncate(line, columns_max -| 1), .shortened = true };
 }
 
-fn headRow(parts: *const struct { label: []const u8, text: []const u8, columns: usize }) Head {
+fn headRow(parts: *const struct {
+    label: []const u8,
+    text: []const u8,
+    columns: usize,
+    segment_ends: ?[]const usize = null,
+}) Head {
     const columns = parts.columns;
     const shown_label = terminal.width.truncate(parts.label, columns);
     const room = columns -| terminal.width.ofText(shown_label);
-    const shown = headCut(parts.text, room);
+    const shown = if (parts.segment_ends) |ends|
+        segmentCut(parts.text, room, ends)
+    else
+        headCut(parts.text, room);
     if (room > 0 or !shown.shortened) return .{ .label = shown_label, .shown = shown };
     return .{
         .label = terminal.width.truncate(shown_label, columns -| 1),
@@ -415,7 +428,12 @@ fn headRow(parts: *const struct { label: []const u8, text: []const u8, columns: 
 
 fn noticeHead(placement: *const Placement, style: *const NoticeStyle, text: []const u8) !void {
     if (!placement.begin(placement.base)) return;
-    const row = headRow(&.{ .label = style.prefix, .text = text, .columns = placement.columns });
+    const row = headRow(&.{
+        .label = style.prefix,
+        .text = text,
+        .columns = placement.columns,
+        .segment_ends = style.segment_ends,
+    });
     try noticePrefix(placement.sink, style, row.label);
     try noticeBody(placement.sink, style, row.shown.kept, row.label.len > 0);
     try row.shown.writeEllipsis(placement.sink);
@@ -435,24 +453,22 @@ pub fn box(placement: *const Placement, name: role.Name, body: *const Box) !void
     while (lines.next()) |source| {
         defer offset += source.len + 1;
         const content = lineText(source);
-        switch (boxFit(body, offset == 0)) {
-            .wrap => {
-                var iterator = terminal.width.wrapper(content, placement.columns);
-                while (iterator.nextSpan()) |span| {
-                    try boxRow(placement, &line, &.{
-                        .content = terminal.width.rowText(content[span.start..span.end]),
-                        .fit = .wrap,
-                        .run = rowRun(run, offset + span.start),
-                        .role = name,
-                    });
-                }
-            },
-            .head => try boxRow(placement, &line, &.{
+        if (offset == 0 and body.segment_ends != null) {
+            try boxRow(placement, &line, &.{
                 .content = content,
-                .fit = .head,
                 .run = rowRun(run, offset),
                 .role = name,
-            }),
+                .segment_ends = body.segment_ends,
+            });
+        } else {
+            var iterator = terminal.width.wrapper(content, placement.columns);
+            while (iterator.nextSpan()) |span| {
+                try boxRow(placement, &line, &.{
+                    .content = terminal.width.rowText(content[span.start..span.end]),
+                    .run = rowRun(run, offset + span.start),
+                    .role = name,
+                });
+            }
         }
     }
     if (!body.compact) try boxEdge(placement, &line, name);
@@ -481,13 +497,12 @@ fn boxRow(placement: *const Placement, line: *usize, row: *const BoxRow) !void {
 }
 
 fn boxRowCells(sink: *terminal.View.Sink, columns: usize, row: *const BoxRow) !void {
-    switch (row.fit) {
-        .wrap => try boxRowText(sink, terminal.width.truncate(row.content, columns), row),
-        .head => {
-            const shown = cut(row.content, columns);
-            try boxRowText(sink, shown.kept, row);
-            try shown.writeEllipsis(sink);
-        },
+    if (row.segment_ends) |ends| {
+        const shown = segmentCut(row.content, columns, ends);
+        try boxRowText(sink, shown.kept, row);
+        try shown.writeEllipsis(sink);
+    } else {
+        try boxRowText(sink, terminal.width.truncate(row.content, columns), row);
     }
     try sink.spaces(columns -| sink.columns_written);
 }
@@ -773,33 +788,6 @@ fn writeFrameGlyph(
     }
 }
 
-test "compact summaries keep each line on its own row and every detail on narrow screens" {
-    const body: Box = .{
-        .text = "Tool: read\nLines: 20 · Time: 2s",
-        .fit = .head,
-        .emphasis = .first_value,
-        .compact = true,
-    };
-    const cases = [_]struct { columns: usize, rows: usize }{
-        .{ .columns = 80, .rows = 2 },
-        .{ .columns = 20, .rows = 2 },
-        .{ .columns = 12, .rows = 3 },
-    };
-    for (cases) |case| {
-        var rig: testing.Rig = undefined;
-        rig.init(std.testing.allocator);
-        defer rig.deinit();
-        const placement = try rig.begin(&.{ .columns = case.columns, .rows = 10 });
-        try box(&placement, .tool_success, &body);
-        const painted = try rig.painted();
-        try std.testing.expectEqual(case.rows, boxRows(&body, case.columns));
-        try std.testing.expectEqual(case.rows, testing.paintedRows(painted));
-        const plain = try rig.plain();
-        try testing.expectShows(plain, &.{ "Tool: read", "Lines: 20", "Time: 2s" });
-        try std.testing.expect(std.mem.find(u8, plain, "Tool: read ·") == null);
-    }
-}
-
 test "compact boxes remove their edge rows without changing message whitespace" {
     const body: Box = .{ .text = "first\n\nlast", .compact = true };
     var rig: testing.Rig = undefined;
@@ -847,83 +835,73 @@ test "a box row sheds the carriage return of a CRLF break" {
     try testing.expectHides(painted, &.{"\u{FFFD}"});
 }
 
-test "a fitted box holds one row per line" {
-    const gpa = std.testing.allocator;
-    const columns = 20;
-    const text = "Tool: write · File: src/App.zig\nLines: 1";
-    var rig: testing.Rig = undefined;
-    rig.init(gpa);
-    defer rig.deinit();
-
-    const body: Box = .{ .text = text, .fit = .head };
-    const placement = try rig.begin(&.{ .columns = columns, .rows = 8 });
-    try box(&placement, .tool_pending, &body);
-
-    const painted = try rig.painted();
-    try std.testing.expectEqual(@as(usize, 4), boxRows(&body, columns));
-    try testing.expectShows(painted, &.{"Tool: write · File:\u{2026}"});
-    try testing.expectShows(painted, &.{"Lines: 1"});
-}
-
 test "a box emphasizes the value of its first key" {
     const gpa = std.testing.allocator;
     var rig: testing.Rig = undefined;
     rig.init(gpa);
     defer rig.deinit();
 
-    const columns = 40;
+    const columns = 48;
+    const identity = "Tool: read (complete)";
+    const file = identity ++ " · File: a.zig";
+    const text = file ++ " · Lines: 3";
     const body: Box = .{
-        .text = "Tool: read \u{00B7} File: a.zig\nLines: 3",
-        .fit = .head,
+        .text = text,
         .emphasis = .first_value,
+        .segment_ends = &.{ identity.len, file.len, text.len },
     };
     const placement = try rig.begin(&.{ .columns = columns, .rows = 8 });
     try box(&placement, .tool_success, &body);
 
     const painted = try rig.painted();
     const head = comptime "Tool: \x1b[1mread\x1b[0m" ++ role.sequence(.tool_success) ++
-        " \u{00B7} File: a.zig";
+        " (complete) · File: a.zig";
     try testing.expectShows(painted, &.{head});
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, painted, "\x1b[1m"));
 
     const plain = try rig.plain();
-    try testing.expectShows(plain, &.{"Tool: read \u{00B7} File: a.zig"});
-    try testing.expectShows(plain, &.{"Lines: 3"});
+    try testing.expectShows(plain, &.{text});
 }
 
-test "a narrow box cuts its run and carries the rest to the next row" {
+test "a narrow metadata row truncates its emphasized value" {
     const gpa = std.testing.allocator;
     var rig: testing.Rig = undefined;
     rig.init(gpa);
     defer rig.deinit();
 
     const columns = 12;
+    const identity = "Tool: describe_drinky (streaming)";
+    const text = identity ++ " · Received: 1 B";
     const body: Box = .{
-        .text = "Tool: read_the_file \u{00B7} File: a",
+        .text = text,
         .emphasis = .first_value,
+        .segment_ends = &.{ identity.len, text.len },
     };
     const placement = try rig.begin(&.{ .columns = columns, .rows = 8 });
     try box(&placement, .tool_pending, &body);
 
     const painted = try rig.painted();
-    const opened = comptime role.sequence(.tool_pending) ++ "\x1b[1mread_the_fil";
-    const carried = comptime "\x1b[1me\x1b[0m" ++ role.sequence(.tool_pending) ++
-        " \u{00B7} File: a";
-    try testing.expectShows(painted, &.{opened});
-    try testing.expectShows(painted, &.{carried});
+    const shortened = comptime "Tool: \x1b[1mdescr\x1b[0m" ++
+        role.sequence(.tool_pending) ++ "…";
+    try testing.expectShows(painted, &.{shortened});
+    try testing.expectHides(painted, &.{ "Received:", "ibe_drinky" });
 
     const plain = try rig.plain();
     var rows = std.mem.splitSequence(u8, plain, "\r\n");
     var count: usize = 0;
     while (rows.next()) |row| : (count += 1)
         try std.testing.expectEqual(columns, terminal.width.ofText(row));
+    try std.testing.expectEqual(@as(usize, 3), count);
     try std.testing.expectEqual(boxRows(&body, columns), count);
 }
 
 test "the emphasized run covers the first value alone" {
     const gpa = std.testing.allocator;
     const cases = [_]struct { text: []const u8, bold: ?[]const u8 }{
-        .{ .text = "Tool: describe_drinky", .bold = "Tool: \x1b[1mdescribe_drinky\x1b[0m" },
+        .{
+            .text = "Tool: describe_drinky (complete)",
+            .bold = "Tool: \x1b[1mdescribe_drinky\x1b[0m",
+        },
         .{ .text = "please read a.zig", .bold = null },
     };
     for (cases) |case| {
@@ -933,8 +911,8 @@ test "the emphasized run covers the first value alone" {
         const placement = try rig.begin(&.{ .columns = 40, .rows = 8 });
         try box(&placement, .tool_success, &.{
             .text = case.text,
-            .fit = .head,
             .emphasis = .first_value,
+            .segment_ends = &.{case.text.len},
         });
         const painted = try rig.painted();
         if (case.bold) |bold|

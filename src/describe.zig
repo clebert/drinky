@@ -36,7 +36,8 @@ const key_head =
     \\
     \\## Key bindings
     \\
-    \\The intro line of every session shows these keys:
+    \\The intro keeps one row and removes controls from right to left as the viewport narrows.
+    \\The complete list of intro keys follows:
     \\
     \\
 ;
@@ -130,6 +131,22 @@ fn writeCommands(writer: *std.Io.Writer) !void {
         \\This does not change the model conversation.
         \\Compact mode also preserves the complete transcript when an update requires a terminal
         \\reset.
+        \\
+        \\Both modes keep tool metadata on one row, with the tool name and state first.
+        \\The row removes lower-priority segments as the viewport narrows.
+        \\It never removes the first segment, and it truncates that segment only when necessary.
+        \\Time has the next priority, followed by the bash exit code, file or pattern, limit
+        \\details, counts, and secondary measures.
+        \\Received bytes and timeout values have the lowest priority.
+        \\Only `bash`, `find`, and `grep` show time.
+        \\Successful tools with partial results show `limited`.
+        \\The bash command and complete tool error sentences appear below the metadata and wrap.
+        \\Commands keep their original line breaks.
+        \\Compact thinking summaries start with `Agent: thinking (state)`.
+        \\They use the same reduction rule, with time before received bytes.
+        \\The intro and user notes use one row.
+        \\Session events can use multiple rows.
+        \\User and model messages keep their complete text.
         \\
         \\`/rewind` lists the prompts of the conversation, with the oldest prompt first. A row
         \\holds the typed line of a message or a skill command. A retry gets no row. Enter drops

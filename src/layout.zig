@@ -432,8 +432,8 @@ test "a turn tail stacks tool boxes above the active editor" {
     defer rig.deinit();
 
     const tools = [_]ui.paint.Box{
-        .{ .text = "readbox" },
-        .{ .text = "grepbox", .fit = .head },
+        .{ .text = "readbox", .segment_ends = &.{} },
+        .{ .text = "grepbox", .segment_ends = &.{} },
     };
     const scene = rig.turn(&.{ .tools = &tools });
     const painted = try projected(gpa, .{ .columns = 40, .rows = 24 }, &scene);
@@ -688,7 +688,7 @@ test "a tool box that changes above the window forces a reset" {
     for (&tools, 0..) |*box, index| {
         var buffer: [16]u8 = undefined;
         const text = try std.mem.print(&buffer, "tool{d}", .{index});
-        box.* = .{ .text = try gpa.dupe(u8, text), .fit = .head };
+        box.* = .{ .text = try gpa.dupe(u8, text), .segment_ends = &.{} };
     }
     defer for (tools) |box| gpa.free(box.text);
     var tracks: [tools.len]Track = @splat(.{});

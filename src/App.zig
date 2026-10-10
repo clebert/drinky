@@ -3401,7 +3401,7 @@ test "a resize repaints the frame at the new width" {
         .window = .{ .columns = 80, .rows = 24 },
     });
     defer rig.deinit();
-    try rig.waitFor(&.{ .{ .text = "/help: Commands" }, .{ .absent = intro_text } });
+    try rig.waitFor(&.{ .{ .text = "Drinky · Enter: Send" }, .{ .absent = "/help: Commands" } });
     try rig.device.resize(.{ .columns = 120, .rows = 24 });
     try rig.waitFor(&.{.{ .text = intro_text }});
 }

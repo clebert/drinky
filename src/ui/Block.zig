@@ -17,6 +17,7 @@ content: Content,
 cache: Cache = .{},
 mode: Mode = .full,
 thinking: ?Thinking = null,
+segment_ends: std.ArrayList(usize) = .empty,
 
 pub const Mode = enum { full, compact };
 
@@ -29,6 +30,7 @@ pub const Thinking = struct {
     summary: [128]u8 = undefined,
     summary_length: usize = 0,
     summary_status: Status = .complete,
+    summary_ends: [3]usize = .{ 0, 0, 0 },
 
     pub const Status = enum { streaming, complete, canceled, failed, truncated };
 
@@ -58,23 +60,27 @@ pub const Kind = std.meta.Tag(Content);
 pub const Source = union(Kind) {
     intro: []const u8,
     user: []const u8,
-    user_note: []const u8,
+    user_note: Note,
     thinking: []const u8,
     model: []const u8,
     tool_result: ToolResult.Payload,
     event: Event.Payload,
 };
 
+pub const Note = struct {
+    text: []const u8,
+    segment_ends: []const usize = &.{},
+};
+
 const ToolResult = struct {
     text: std.ArrayList(u8),
     failed: bool,
-    fit: paint.Fit,
     survives_discard: bool = false,
 
     const Payload = struct {
         text: []const u8,
         failed: bool = false,
-        fit: paint.Fit = .head,
+        segment_ends: []const usize = &.{},
     };
 };
 
@@ -142,15 +148,26 @@ const Cache = struct {
 };
 
 pub fn init(gpa: std.mem.Allocator, source: *const Source) !Block {
-    return .{ .thinking = if (source.* == .thinking) .{} else null, .content = switch (source.*) {
-        .tool_result => |*result| .{ .tool_result = .{
-            .text = try copy(gpa, result.text),
-            .failed = result.failed,
-            .fit = result.fit,
-        } },
-        .event => |*event| .{ .event = try Event.init(gpa, event) },
-        inline else => |text, tag| @unionInit(Content, @tagName(tag), try copy(gpa, text)),
-    } };
+    var ends: std.ArrayList(usize) = .empty;
+    errdefer ends.deinit(gpa);
+    switch (source.*) {
+        .tool_result => |*result| try ends.appendSlice(gpa, result.segment_ends),
+        .user_note => |*note| try ends.appendSlice(gpa, note.segment_ends),
+        .intro, .user, .thinking, .model, .event => {},
+    }
+    return .{
+        .thinking = if (source.* == .thinking) .{} else null,
+        .segment_ends = ends,
+        .content = switch (source.*) {
+            .tool_result => |*result| .{ .tool_result = .{
+                .text = try copy(gpa, result.text),
+                .failed = result.failed,
+            } },
+            .user_note => |*note| .{ .user_note = try copy(gpa, note.text) },
+            .event => |*event| .{ .event = try Event.init(gpa, event) },
+            inline else => |text, tag| @unionInit(Content, @tagName(tag), try copy(gpa, text)),
+        },
+    };
 }
 
 fn copy(gpa: std.mem.Allocator, text: []const u8) !std.ArrayList(u8) {
@@ -166,6 +183,7 @@ pub fn deinit(self: *Block, gpa: std.mem.Allocator) void {
         .event => |*event| event.text.deinit(gpa),
     }
     self.cache.deinit(gpa);
+    self.segment_ends.deinit(gpa);
 }
 
 pub fn appendText(self: *Block, gpa: std.mem.Allocator, delta: []const u8) !void {
@@ -224,12 +242,18 @@ pub fn presentThinking(self: *Block, maybe_summary: ?*const Thinking.Summary) vo
     var bytes_buffer: [16]u8 = undefined;
     var time_buffer: [24]u8 = undefined;
     var buffer: [128]u8 = undefined;
-    const text = std.mem.print(&buffer, "Thinking: {s}\nReceived: {s} · Time: {s}", .{
-        @tagName(summary.status),
-        format.bytes(&bytes_buffer, summary.bytes),
-        format.durationSeconds(&time_buffer, summary.elapsed_ms, .down),
-    }) catch unreachable;
+    const time = format.durationSeconds(&time_buffer, summary.elapsed_ms, .down);
+    const bytes = format.bytes(&bytes_buffer, summary.bytes);
+    const state = @tagName(summary.status);
+    const text = std.mem.print(
+        &buffer,
+        "Agent: thinking ({s}) · Time: {s} · Received: {s}",
+        .{ state, time, bytes },
+    ) catch unreachable;
     if (std.mem.eql(u8, thinking.summary[0..thinking.summary_length], text)) return;
+    const first_end = "Agent: thinking ()".len + state.len;
+    const second_end = first_end + paint.separator.len + "Time: ".len + time.len;
+    thinking.summary_ends = .{ first_end, second_end, text.len };
     @memcpy(thinking.summary[0..text.len], text);
     thinking.summary_length = text.len;
     self.cache.invalidate();
@@ -238,12 +262,24 @@ pub fn presentThinking(self: *Block, maybe_summary: ?*const Thinking.Summary) vo
 fn look(self: *const Block) Look {
     const compact = self.mode == .compact;
     return switch (self.content) {
-        .intro => |list| .{ .caption = .{ .title = "Drinky", .controls = list.items } },
+        .intro => |list| .{ .caption = .{
+            .title = "Drinky",
+            .controls = list.items,
+            .rows_max = 1,
+        } },
         .user => |list| .{ .box = .{
             .role = .user,
             .body = .{ .text = list.items, .compact = compact },
         } },
-        .user_note => |list| .{ .notice = .{ .style = .note, .text = list.items } },
+        .user_note => |list| .{ .notice = .{
+            .style = .{
+                .role = paint.NoticeStyle.note.role,
+                .prefix = paint.NoticeStyle.note.prefix,
+                .fit = .head,
+                .segment_ends = self.segment_ends.items,
+            },
+            .text = list.items,
+        } },
         .thinking => |list| if (compact) .{ .box = .{
             .role = switch (self.thinking.?.summary_status) {
                 .streaming, .canceled => .tool_pending,
@@ -252,7 +288,7 @@ fn look(self: *const Block) Look {
             },
             .body = .{
                 .text = self.thinking.?.summary[0..self.thinking.?.summary_length],
-                .fit = .head,
+                .segment_ends = &self.thinking.?.summary_ends,
                 .compact = true,
                 .emphasis = .first_value,
             },
@@ -262,7 +298,7 @@ fn look(self: *const Block) Look {
             .role = if (result.failed) .tool_error else .tool_success,
             .body = .{
                 .text = result.text.items,
-                .fit = result.fit,
+                .segment_ends = self.segment_ends.items,
                 .emphasis = .first_value,
                 .compact = compact,
             },
@@ -344,7 +380,9 @@ test "each block variant renders exactly the rows it counts" {
         .{ .event = .{ .text = "boom", .severity = .failure } },
         .{ .user = "a user message long enough to wrap across the narrow test width more " ++
             "than once" },
-        .{ .user_note = "Skill: zig-style · File: .agents/skills/zig-style/SKILL.md" },
+        .{ .user_note = .{
+            .text = "Skill: zig-style · File: .agents/skills/zig-style/SKILL.md",
+        } },
         .{ .model = "model reply\nwith a blank\n\nthen a long paragraph that must wrap " ++
             "several rows" },
         .{ .thinking = "reasoning that runs on\n\nlong enough to wrap across the narrow " ++
@@ -352,9 +390,8 @@ test "each block variant renders exactly the rows it counts" {
         .{ .model = markdown_reply },
         .{ .thinking = markdown_reply },
         .{ .tool_result = .{
-            .text = "read foo.zig\n→ no such file",
+            .text = "Tool: read (failed)\nError: Drinky could not read foo.zig.",
             .failed = true,
-            .fit = .wrap,
         } },
         .{ .tool_result = .{
             .text = "Tool: bash · Command: ls\nTime: 400ms · Exit code: 1",
@@ -492,32 +529,28 @@ test "no box carries a pad, so a copy of the rows lines up" {
     try expectRowOpensOnText(painted, "reasoning that wraps");
 }
 
-test "a tool box wraps a sentence and cuts a line of measures" {
+test "a tool box removes optional metadata and wraps its complete error in both modes" {
     const gpa = std.testing.allocator;
     const columns = 20;
-    const head = "Tool: edit · File: a.zig";
+    const identity = "Tool: edit (failed)";
+    const head = identity ++ " · File: a.zig";
     const detail = "Error: Drinky found old_text more than once. Add more text around it.";
-    const text = head ++ "\n" ++ detail;
-
-    var wrapped = try Block.init(gpa, &.{ .tool_result = .{
-        .text = text,
-        .failed = true,
-        .fit = .wrap,
-    } });
-    defer wrapped.deinit(gpa);
-    var cut = try Block.init(gpa, &.{ .tool_result = .{ .text = text, .failed = true } });
-    defer cut.deinit(gpa);
-
-    try std.testing.expectEqual(@as(usize, 4), cut.rows(columns));
-    try std.testing.expect(wrapped.rows(columns) > cut.rows(columns));
-
-    var rig: testing.Rig = undefined;
-    rig.init(gpa);
-    defer rig.deinit();
-    const placement = try rig.begin(&.{ .columns = columns, .rows = 24, .pages = 8 });
-    try wrapped.render(gpa, &placement);
-    try testing.expectShows(try rig.painted(), &.{"around it."});
-    try testing.expectHides(try rig.painted(), &.{"\u{2026}"});
+    for ([_]Mode{ .full, .compact }) |mode| {
+        var block = try Block.init(gpa, &.{ .tool_result = .{
+            .text = head ++ "\n" ++ detail,
+            .failed = true,
+            .segment_ends = &.{ identity.len, head.len },
+        } });
+        defer block.deinit(gpa);
+        block.present(mode);
+        const painted = try rendered(gpa, &block, columns, 0);
+        defer gpa.free(painted);
+        const plain = try terminal.testing.plainText(gpa, painted);
+        defer gpa.free(plain);
+        try testing.expectShows(plain, &.{ identity, "around it." });
+        try testing.expectHides(plain, &.{ "File:", "\u{2026}" });
+        try std.testing.expectEqual(block.rows(columns), testing.paintedRows(painted));
+    }
 }
 
 fn expectRowOpensOnText(painted: []const u8, row: []const u8) !void {
@@ -595,7 +628,7 @@ test "each block kind paints in the role of its kind" {
     const gpa = std.testing.allocator;
     const pinned = [_]Pinned{
         .{ .source = .{ .intro = "one line" }, .role = .accent },
-        .{ .source = .{ .user_note = "one line" }, .role = .user_note },
+        .{ .source = .{ .user_note = .{ .text = "one line" } }, .role = .user_note },
         .{ .source = .{ .event = .{ .text = "one line" } }, .role = .accent },
         .{
             .source = .{ .event = .{ .text = "one line", .severity = .warning } },
@@ -650,7 +683,7 @@ test "the intro block paints the Drinky caption" {
     try testing.expectHides(painted, &.{"\x1b[1m"});
     try testing.expectShows(painted, &.{legend});
 
-    try std.testing.expectEqual(@as(usize, 3), intro.rows(14));
+    try std.testing.expectEqual(@as(usize, 1), intro.rows(14));
 }
 
 test "each notice paints the symbol of its kind in its role" {
@@ -667,7 +700,7 @@ test "each notice paints the symbol of its kind in its role" {
     defer warning.deinit(gpa);
     var information = try Block.init(gpa, &.{ .event = .{ .text = "all good" } });
     defer information.deinit(gpa);
-    var note = try Block.init(gpa, &.{ .user_note = "Skill: zig-style" });
+    var note = try Block.init(gpa, &.{ .user_note = .{ .text = "Skill: zig-style" } });
     defer note.deinit(gpa);
 
     var placement = try rig.begin(&.{ .columns = 40, .rows = 100, .pages = 8 });
@@ -698,6 +731,107 @@ test "each notice paints the symbol of its kind in its role" {
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, painted, warning_sequence));
     try testing.expectHides(painted, &.{"Event: "});
     try testing.expectHides(painted, &.{"Error: "});
+}
+
+test "thinking summaries keep time before bytes and reduce to one row" {
+    const gpa = std.testing.allocator;
+    var block = try Block.init(gpa, &.{ .thinking = "original thinking" });
+    defer block.deinit(gpa);
+    block.present(.compact);
+    block.presentThinking(&.{ .bytes = 1024, .elapsed_ms = 3_000, .status = .complete });
+    const cases = [_]struct { columns: usize, expected: []const u8 }{
+        .{
+            .columns = 80,
+            .expected = "Agent: thinking (complete) · Time: 3s · Received: 1.0 KiB",
+        },
+        .{ .columns = 37, .expected = "Agent: thinking (complete) · Time: 3s" },
+        .{ .columns = 30, .expected = "Agent: thinking (complete)" },
+        .{ .columns = 26, .expected = "Agent: thinking (complete)" },
+        .{ .columns = 19, .expected = "Agent: thinking (c…" },
+        .{ .columns = 1, .expected = "…" },
+    };
+    for (cases) |case| {
+        const painted = try rendered(gpa, &block, case.columns, 0);
+        defer gpa.free(painted);
+        const plain = try terminal.testing.plainText(gpa, painted);
+        defer gpa.free(plain);
+        try std.testing.expectEqualStrings(case.expected, std.mem.trimEnd(u8, plain, " "));
+        try std.testing.expectEqual(@as(usize, 1), block.rows(case.columns));
+        try std.testing.expectEqual(@as(usize, 1), testing.paintedRows(painted));
+    }
+}
+
+test "user notes keep one row while session events can use multiple rows" {
+    const gpa = std.testing.allocator;
+    const identity = "Skill: zig-style";
+    const text = identity ++ " · File: a long path · with a separator/SKILL.md";
+    var note = try Block.init(gpa, &.{ .user_note = .{
+        .text = text,
+        .segment_ends = &.{ identity.len, text.len },
+    } });
+    defer note.deinit(gpa);
+    var sentence = try Block.init(gpa, &.{ .user_note = .{
+        .text = "Drinky asked the model to continue from the committed work.",
+    } });
+    defer sentence.deinit(gpa);
+    var event = try Block.init(gpa, &.{ .event = .{
+        .text = "Drinky could not complete the request. Details: a complete final-word.",
+        .severity = .failure,
+    } });
+    defer event.deinit(gpa);
+    for ([_]Mode{ .full, .compact }) |mode| {
+        note.present(mode);
+        sentence.present(mode);
+        event.present(mode);
+        const painted = try rendered(gpa, &note, 40, 0);
+        defer gpa.free(painted);
+        const plain = try terminal.testing.plainText(gpa, painted);
+        defer gpa.free(plain);
+        try std.testing.expectEqualStrings("→ Skill: zig-style", plain);
+        try std.testing.expectEqual(@as(usize, 1), note.rows(40));
+        const sentence_paint = try rendered(gpa, &sentence, 30, 0);
+        defer gpa.free(sentence_paint);
+        try testing.expectShows(sentence_paint, &.{"…"});
+        try std.testing.expectEqual(@as(usize, 1), sentence.rows(30));
+        const event_paint = try rendered(gpa, &event, 30, 0);
+        defer gpa.free(event_paint);
+        try testing.expectShows(event_paint, &.{"final-word."});
+        try std.testing.expect(event.rows(30) > 1);
+    }
+}
+
+test "metadata truncates only its mandatory segment across narrow Unicode widths" {
+    const gpa = std.testing.allocator;
+    const identity = "Tool: 読む (complete)";
+    const file = identity ++ " · File: a · b.zig";
+    const text = file ++ " · Lines: 3";
+    var block = try Block.init(gpa, &.{ .tool_result = .{
+        .text = text,
+        .segment_ends = &.{ identity.len, file.len, text.len },
+    } });
+    defer block.deinit(gpa);
+    block.present(.compact);
+    for (1..80) |columns| {
+        const painted = try rendered(gpa, &block, columns, 0);
+        defer gpa.free(painted);
+        const plain = try terminal.testing.plainText(gpa, painted);
+        defer gpa.free(plain);
+        try std.testing.expectEqual(@as(usize, 1), block.rows(columns));
+        try std.testing.expectEqual(@as(usize, 1), testing.paintedRows(painted));
+        const maybe_expected: ?[]const u8 = if (terminal.width.ofText(text) <= columns)
+            text
+        else if (terminal.width.ofText(file) <= columns)
+            file
+        else if (terminal.width.ofText(identity) <= columns)
+            identity
+        else
+            null;
+        if (maybe_expected) |expected| {
+            try std.testing.expectEqualStrings(expected, std.mem.trimEnd(u8, plain, " "));
+        } else {
+            try std.testing.expect(std.mem.endsWith(u8, std.mem.trimEnd(u8, plain, " "), "…"));
+        }
+    }
 }
 
 test "a clipped block streams into a warmed frame without allocating" {

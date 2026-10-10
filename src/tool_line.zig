@@ -8,93 +8,146 @@ const ui = @import("ui/root.zig");
 
 const mebibyte = 1024 * 1024;
 
-const Line = union(enum) {
-    measures: []u8,
-    sentence: []const u8,
-    none,
+pub const Line = struct {
+    text: []u8,
+    segment_ends: []usize,
 
     pub fn deinit(self: *const Line, gpa: std.mem.Allocator) void {
-        switch (self.*) {
-            .measures => |text| gpa.free(text),
-            .sentence, .none => {},
-        }
+        gpa.free(self.text);
+        gpa.free(self.segment_ends);
     }
+};
+
+pub const Phase = enum { streaming, queued, running };
+
+pub const Options = struct {
+    name: []const u8,
+    phase: Phase = .running,
+    subject: []const u8 = "",
+    subject_kind: ?tools.Registry.Description.Kind = null,
+    output: ?*const core.Tool.Output = null,
+    elapsed_ms: ?i64 = null,
+    timeout_ms: ?u64 = null,
+    received_bytes: ?usize = null,
 };
 
 const Parts = struct {
+    gpa: std.mem.Allocator,
     writer: *std.Io.Writer,
-    count: usize = 0,
+    segment_ends: *std.ArrayList(usize),
 
     fn print(self: *Parts, comptime template: []const u8, args: anytype) !void {
-        if (self.count > 0) try self.writer.writeAll(ui.paint.separator);
+        if (self.segment_ends.items.len > 0) try self.writer.writeAll(ui.paint.separator);
         try self.writer.print(template, args);
-        self.count += 1;
+        try self.segment_ends.append(self.gpa, self.writer.buffered().len);
     }
 };
 
-pub fn head(
+pub fn subject(
     gpa: std.mem.Allocator,
-    name: []const u8,
     description: *const tools.Registry.Description,
     roots: *const format.Roots,
 ) error{OutOfMemory}![]u8 {
-    const subject = description.subject orelse return gpa.print("Tool: {s}", .{name});
-    const shown = switch (subject.kind) {
-        .path => try format.path(gpa, subject.text, roots),
-        .pattern, .command => try gpa.dupe(u8, subject.text),
+    const value = description.subject orelse return gpa.dupe(u8, "");
+    if (value.kind == .command) return gpa.print("Command: {s}", .{value.text});
+    const shown = switch (value.kind) {
+        .path => try format.path(gpa, value.text, roots),
+        .pattern => try gpa.dupe(u8, value.text),
+        .command => unreachable,
     };
     defer gpa.free(shown);
     const line = ui.paint.singleLine(shown);
-    if (line.len == 0) return gpa.print("Tool: {s}", .{name});
-    return gpa.print("Tool: {s} · {s}: {s}", .{ name, label(subject.kind), line });
+    if (line.len == 0) return gpa.dupe(u8, "");
+    return gpa.print("{s}: {s}", .{
+        switch (value.kind) {
+            .path => "File",
+            .pattern => "Pattern",
+            .command => unreachable,
+        },
+        line,
+    });
 }
 
-fn label(kind: tools.Registry.Description.Kind) []const u8 {
-    return switch (kind) {
-        .path => "File",
-        .pattern => "Pattern",
-        .command => "Command",
-    };
-}
-
-pub fn render(gpa: std.mem.Allocator, output: *const core.Tool.Output) error{OutOfMemory}!Line {
-    if (output.measures.count() > 0) return .{ .measures = try measures(gpa, output) };
-    if (output.hasFailure()) return .{ .sentence = output.content };
-    return .none;
-}
-
-fn measures(gpa: std.mem.Allocator, output: *const core.Tool.Output) error{OutOfMemory}![]u8 {
+pub fn render(gpa: std.mem.Allocator, options: *const Options) error{OutOfMemory}!Line {
     var out: std.Io.Writer.Allocating = .init(gpa);
-    errdefer out.deinit();
-    write(&out.writer, output) catch return error.OutOfMemory;
-    return out.toOwnedSlice();
+    defer out.deinit();
+    var ends: std.ArrayList(usize) = .empty;
+    defer ends.deinit(gpa);
+    var parts: Parts = .{ .gpa = gpa, .writer = &out.writer, .segment_ends = &ends };
+    write(&parts, options) catch return error.OutOfMemory;
+    const text = try out.toOwnedSlice();
+    errdefer gpa.free(text);
+    return .{ .text = text, .segment_ends = try ends.toOwnedSlice(gpa) };
 }
 
-fn write(writer: *std.Io.Writer, output: *const core.Tool.Output) !void {
-    var parts: Parts = .{ .writer = writer };
-    if (output.measures.get(.duration_ms)) |duration_ms| {
+fn write(parts: *Parts, options: *const Options) !void {
+    const state: []const u8 = if (options.output) |output| state: {
+        if (output.hasFailure()) break :state "failed";
+        const lines_total = output.measures.get(.lines_total) orelse 0;
+        const lines = output.measures.get(.lines) orelse lines_total;
+        const omitted = output.measures.get(.matches_omitted) orelse 0;
+        const limited = output.conditions.count() > 0 or omitted > 0 or lines < lines_total;
+        break :state if (limited) "limited" else "complete";
+    } else @tagName(options.phase);
+    const name = try parts.gpa.dupe(u8, options.name);
+    defer parts.gpa.free(name);
+    try parts.print("Tool: {s} ({s})", .{ ui.paint.singleLine(name), state });
+    if (options.elapsed_ms) |elapsed_ms| {
         var buffer: [24]u8 = undefined;
-        try parts.print("Time: {s}", .{tools.format.duration(&buffer, @intCast(duration_ms))});
+        try parts.print("Time: {s}", .{format.durationSeconds(&buffer, elapsed_ms, .down)});
+    } else if (options.output) |output| {
+        if (output.measures.get(.duration_ms)) |duration_ms| {
+            var buffer: [24]u8 = undefined;
+            try parts.print("Time: {s}", .{tools.format.duration(&buffer, @intCast(duration_ms))});
+        }
     }
-    if (output.measures.get(.exit_code)) |code| try parts.print("Exit code: {d}", .{code});
-    if (output.conditions.contains(.terminated)) try parts.print("Status: terminated", .{});
-    if (output.conditions.contains(.timed_out)) try parts.print("Status: timed out", .{});
-    if (output.conditions.contains(.overflowed)) try parts.print("Status: output limit", .{});
-    if (output.measures.get(.matches)) |count| try parts.print("Matches: {d}", .{count});
-    try writeLines(&parts, output);
-    if (output.conditions.contains(.time_limit_reached)) try parts.print("Search: timed out", .{});
-    if (output.conditions.contains(.match_limit_reached)) try parts.print("Limit: reached", .{});
-    if (output.conditions.contains(.byte_limit_reached)) {
-        const bytes = output.measures.get(.bytes) orelse 0;
-        try parts.print("Stopped at: {d} MiB", .{@divFloor(bytes, mebibyte)});
+    if (options.output) |output| {
+        if (output.measures.get(.exit_code)) |code| try parts.print("Exit code: {d}", .{code});
     }
-    if (output.conditions.contains(.incomplete)) try parts.print("Search: incomplete", .{});
-    if (output.measures.get(.matches_omitted)) |count| {
-        try parts.print("Omitted matches: {d}", .{count});
+    const command = options.subject_kind == .command;
+    if (!command and options.subject.len > 0) try parts.print("{s}", .{options.subject});
+    if (options.output) |output| {
+        if (output.conditions.contains(.terminated)) try parts.print("Status: terminated", .{});
+        if (output.conditions.contains(.timed_out)) try parts.print("Status: timed out", .{});
+        if (output.conditions.contains(.overflowed)) try parts.print("Status: output limit", .{});
+        if (output.conditions.contains(.time_limit_reached)) {
+            try parts.print("Search: timed out", .{});
+        }
+        if (output.conditions.contains(.match_limit_reached)) {
+            try parts.print("Limit: reached", .{});
+        }
+        if (output.conditions.contains(.byte_limit_reached)) {
+            const bytes = output.measures.get(.bytes) orelse 0;
+            try parts.print("Stopped at: {d} MiB", .{@divFloor(bytes, mebibyte)});
+        }
+        if (output.conditions.contains(.incomplete)) try parts.print("Search: incomplete", .{});
+        if (output.conditions.contains(.line_truncated)) try parts.print("Line: truncated", .{});
+        if (output.conditions.contains(.lines_truncated)) try parts.print("Lines: truncated", .{});
+        if (output.conditions.contains(.output_truncated)) {
+            try parts.print("Output: truncated", .{});
+        }
+        if (output.measures.get(.matches)) |count| try parts.print("Matches: {d}", .{count});
+        try writeLines(parts, output);
+        if (output.measures.get(.matches_omitted)) |count| {
+            try parts.print("Omitted matches: {d}", .{count});
+        }
     }
-    if (output.conditions.contains(.line_truncated)) try parts.print("Line: truncated", .{});
-    if (output.conditions.contains(.lines_truncated)) try parts.print("Lines: truncated", .{});
-    if (output.conditions.contains(.output_truncated)) try parts.print("Output: truncated", .{});
+    if (options.received_bytes) |bytes| {
+        var buffer: [16]u8 = undefined;
+        try parts.print("Received: {s}", .{format.bytes(&buffer, bytes)});
+    }
+    if (options.timeout_ms) |timeout_ms| {
+        var buffer: [24]u8 = undefined;
+        try parts.print("Timeout: {s}", .{
+            format.durationSeconds(&buffer, @intCast(timeout_ms), .up),
+        });
+    }
+    if (command) try parts.writer.print("\n{s}", .{options.subject});
+    if (options.output) |output| {
+        if (output.hasFailure() and output.measures.count() == 0) {
+            try parts.writer.print("\nError: {s}", .{output.content});
+        }
+    }
 }
 
 fn writeLines(parts: *Parts, output: *const core.Tool.Output) !void {
@@ -114,10 +167,12 @@ fn writeLines(parts: *Parts, output: *const core.Tool.Output) !void {
 test "a read names its window, and a whole file or an empty file its count alone" {
     try expectLine(&.{
         .measures = &.{ .{ .lines, 1 }, .{ .line_first, 1 }, .{ .lines_total, 3 } },
+        .state = "limited",
         .expected = "Lines: 1\u{2013}1 of 3",
     });
     try expectLine(&.{
         .measures = &.{ .{ .lines, 50 }, .{ .line_first, 1 }, .{ .lines_total, 300 } },
+        .state = "limited",
         .expected = "Lines: 1\u{2013}50 of 300",
     });
     try expectLine(&.{
@@ -131,11 +186,14 @@ test "a read names its window, and a whole file or an empty file its count alone
     try expectLine(&.{
         .measures = &.{ .{ .lines, 2 }, .{ .line_first, 2 }, .{ .lines_total, 3 } },
         .conditions = &.{.line_truncated},
-        .expected = "Lines: 2\u{2013}3 of 3 \u{00B7} Line: truncated",
+        .state = "limited",
+        .expected = "Line: truncated \u{00B7} Lines: 2\u{2013}3 of 3",
     });
 }
 
 const Case = struct {
+    name: []const u8 = "read",
+    state: []const u8 = "complete",
     measures: []const struct { core.Tool.Measure, u64 } = &.{},
     conditions: []const core.Tool.Condition = &.{},
     expected: []const u8,
@@ -146,9 +204,15 @@ fn expectLine(case: *const Case) !void {
     var output: core.Tool.Output = .{};
     for (case.measures) |measure| output.measures.put(measure[0], measure[1]);
     for (case.conditions) |condition| output.conditions.insert(condition);
-    const line = try render(gpa, &output);
+    const line = try render(gpa, &.{ .name = case.name, .output = &output });
     defer line.deinit(gpa);
-    try std.testing.expectEqualStrings(case.expected, line.measures);
+    const expected = try gpa.print("Tool: {s} ({s}) · {s}", .{
+        case.name,
+        case.state,
+        case.expected,
+    });
+    defer gpa.free(expected);
+    try std.testing.expectEqualStrings(expected, line.text);
 }
 
 test "a write counts its lines, and an edit the removed and the added ones" {
@@ -166,22 +230,29 @@ test "a write counts its lines, and an edit the removed and the added ones" {
 test "a search reports its time, its matches, and every reached limit" {
     try expectLine(&.{
         .measures = &.{ .{ .duration_ms, 1500 }, .{ .matches, 1 }, .{ .matches_omitted, 2 } },
+        .name = "grep",
         .conditions = &.{.time_limit_reached},
-        .expected = "Time: 1.5s \u{00B7} Matches: 1 \u{00B7} Search: timed out \u{00B7} " ++
+        .state = "limited",
+        .expected = "Time: 1.5s \u{00B7} Search: timed out \u{00B7} Matches: 1 \u{00B7} " ++
             "Omitted matches: 2",
     });
     try expectLine(&.{
         .measures = &.{ .{ .duration_ms, 0 }, .{ .matches, 0 } },
+        .name = "find",
         .conditions = &.{.incomplete},
-        .expected = "Time: 0ms \u{00B7} Matches: 0 \u{00B7} Search: incomplete",
+        .state = "limited",
+        .expected = "Time: 0ms \u{00B7} Search: incomplete \u{00B7} Matches: 0",
     });
     try expectLine(&.{
         .measures = &.{ .{ .duration_ms, 42 }, .{ .matches, 2 }, .{ .bytes, 300 * mebibyte } },
+        .name = "grep",
         .conditions = &.{ .match_limit_reached, .byte_limit_reached, .lines_truncated },
-        .expected = "Time: 42ms \u{00B7} Matches: 2 \u{00B7} Limit: reached \u{00B7} " ++
-            "Stopped at: 300 MiB \u{00B7} Lines: truncated",
+        .state = "limited",
+        .expected = "Time: 42ms \u{00B7} Limit: reached \u{00B7} " ++
+            "Stopped at: 300 MiB \u{00B7} Lines: truncated \u{00B7} Matches: 2",
     });
     try expectLine(&.{
+        .name = "find",
         .measures = &.{ .{ .duration_ms, 42 }, .{ .matches, 0 }, .{ .bytes, 5 } },
         .expected = "Time: 42ms \u{00B7} Matches: 0",
     });
@@ -190,46 +261,59 @@ test "a search reports its time, its matches, and every reached limit" {
 test "a command reports its time, its exit code or its status, and its output" {
     try expectLine(&.{
         .measures = &.{ .{ .duration_ms, 1500 }, .{ .exit_code, 0 }, .{ .lines, 3 } },
+        .name = "bash",
         .conditions = &.{.output_truncated},
-        .expected = "Time: 1.5s \u{00B7} Exit code: 0 \u{00B7} Lines: 3 \u{00B7} Output: truncated",
+        .state = "limited",
+        .expected = "Time: 1.5s \u{00B7} Exit code: 0 \u{00B7} Output: truncated \u{00B7} Lines: 3",
     });
     try expectLine(&.{
         .measures = &.{ .{ .duration_ms, 10 }, .{ .exit_code, 3 }, .{ .lines, 1 } },
+        .name = "bash",
         .conditions = &.{.failed},
+        .state = "failed",
         .expected = "Time: 10ms \u{00B7} Exit code: 3 \u{00B7} Lines: 1",
     });
     try expectLine(&.{
         .measures = &.{ .{ .duration_ms, 120_000 }, .{ .lines, 1 } },
+        .name = "bash",
         .conditions = &.{.timed_out},
+        .state = "failed",
         .expected = "Time: 2m 0s \u{00B7} Status: timed out \u{00B7} Lines: 1",
     });
     try expectLine(&.{
         .measures = &.{.{ .duration_ms, 5 }},
+        .name = "bash",
         .conditions = &.{.terminated},
+        .state = "failed",
         .expected = "Time: 5ms \u{00B7} Status: terminated",
     });
     try expectLine(&.{
         .measures = &.{.{ .duration_ms, 5 }},
+        .name = "bash",
         .conditions = &.{.overflowed},
+        .state = "failed",
         .expected = "Time: 5ms \u{00B7} Status: output limit",
     });
 }
 
-test "a failed output without measures shows its sentence, and a bare output no line" {
+test "a failed output keeps its error sentence and a bare output only its completed identity" {
     const gpa = std.testing.allocator;
     var failed: core.Tool.Output = .{ .content = "Drinky could not read a.txt." };
     failed.conditions.insert(.path_missing);
-    const sentence = try render(gpa, &failed);
+    const sentence = try render(gpa, &.{ .name = "read", .output = &failed });
     defer sentence.deinit(gpa);
-    try std.testing.expectEqualStrings("Drinky could not read a.txt.", sentence.sentence);
+    try std.testing.expectEqualStrings(
+        "Tool: read (failed)\nError: Drinky could not read a.txt.",
+        sentence.text,
+    );
 
     const bare: core.Tool.Output = .{ .content = "# Drinky" };
-    const none = try render(gpa, &bare);
-    defer none.deinit(gpa);
-    try std.testing.expect(none == .none);
+    const line = try render(gpa, &.{ .name = "describe_drinky", .output = &bare });
+    defer line.deinit(gpa);
+    try std.testing.expectEqualStrings("Tool: describe_drinky (complete)", line.text);
 }
 
-test "a head names the subject of a call on one line" {
+test "a tool names its subject and preserves each command line below its metadata" {
     const gpa = std.testing.allocator;
     const roots: format.Roots = .{
         .working_directory = "/home/you/work",
@@ -243,42 +327,52 @@ test "a head names the subject of a call on one line" {
         .{
             .name = "read",
             .subject = .{ .kind = .path, .text = "/home/you/work/src/App.zig" },
-            .expected = "Tool: read · File: src/App.zig",
+            .expected = "Tool: read (running) · File: src/App.zig",
         },
         .{
             .name = "write",
             .subject = .{ .kind = .path, .text = "/home/you/.drinky/notes.md" },
-            .expected = "Tool: write · File: ~/.drinky/notes.md",
+            .expected = "Tool: write (running) · File: ~/.drinky/notes.md",
         },
         .{
             .name = "edit",
             .subject = .{ .kind = .path, .text = "/etc/hosts" },
-            .expected = "Tool: edit · File: /etc/hosts",
+            .expected = "Tool: edit (running) · File: /etc/hosts",
         },
         .{
             .name = "find",
             .subject = .{ .kind = .pattern, .text = "/home/you/work/**/*.zig" },
-            .expected = "Tool: find · Pattern: /home/you/work/**/*.zig",
+            .expected = "Tool: find (running) · Pattern: /home/you/work/**/*.zig",
         },
         .{
             .name = "bash",
             .subject = .{ .kind = .command, .text = "cat <<'EOF'\n  one\n\n  two\nEOF" },
-            .expected = "Tool: bash · Command: cat <<'EOF' one two EOF",
+            .expected = "Tool: bash (running)\nCommand: cat <<'EOF'\n  one\n\n  two\nEOF",
         },
         .{
             .name = "grep",
             .subject = .{ .kind = .pattern, .text = " \t " },
-            .expected = "Tool: grep",
+            .expected = "Tool: grep (running)",
         },
-        .{ .name = "describe_drinky", .subject = null, .expected = "Tool: describe_drinky" },
+        .{
+            .name = "describe_drinky",
+            .subject = null,
+            .expected = "Tool: describe_drinky (running)",
+        },
     };
     for (cases) |case| {
         const description: tools.Registry.Description = .{
             .subject = case.subject,
             .timeout_ms = null,
         };
-        const text = try head(gpa, case.name, &description, &roots);
-        defer gpa.free(text);
-        try std.testing.expectEqualStrings(case.expected, text);
+        const shown = try subject(gpa, &description, &roots);
+        defer gpa.free(shown);
+        const line = try render(gpa, &.{
+            .name = case.name,
+            .subject = shown,
+            .subject_kind = if (case.subject) |value| value.kind else null,
+        });
+        defer line.deinit(gpa);
+        try std.testing.expectEqualStrings(case.expected, line.text);
     }
 }

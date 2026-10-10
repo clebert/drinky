@@ -175,7 +175,7 @@ const Turn = struct {
             if (call.phase == .done) continue;
             try self.box_view.append(gpa, .{
                 .text = try call.text(gpa, options.now_ms),
-                .fit = .head,
+                .segment_ends = call.line.?.segment_ends,
                 .emphasis = .first_value,
                 .compact = options.compact,
             });
@@ -221,10 +221,12 @@ const Call = struct {
     id: []const u8,
     phase: Phase,
     bytes: usize,
-    box: std.ArrayList(u8),
+    subject: std.ArrayList(u8),
+    subject_kind: ?tools.Registry.Description.Kind,
     started_ms: i64,
     timeout_ms: ?u64,
-    rows: std.ArrayList(u8),
+    line: ?tool_line.Line,
+    elapsed_seconds: ?i64,
 
     const Phase = enum { streaming, queued, running, done };
 
@@ -234,10 +236,12 @@ const Call = struct {
             .id = "",
             .phase = .streaming,
             .bytes = 0,
-            .box = .empty,
+            .subject = .empty,
+            .subject_kind = null,
             .started_ms = 0,
             .timeout_ms = null,
-            .rows = .empty,
+            .line = null,
+            .elapsed_seconds = null,
         };
         errdefer call.deinit(gpa);
         try call.refresh(gpa);
@@ -247,36 +251,39 @@ const Call = struct {
     fn deinit(self: *Call, gpa: std.mem.Allocator) void {
         gpa.free(self.name);
         gpa.free(self.id);
-        self.box.deinit(gpa);
-        self.rows.deinit(gpa);
+        self.subject.deinit(gpa);
+        if (self.line) |*line| line.deinit(gpa);
     }
 
     fn refresh(self: *Call, gpa: std.mem.Allocator) !void {
-        var bytes_buffer: [16]u8 = undefined;
-        self.box.clearRetainingCapacity();
-        try self.box.print(gpa, "Tool: {s} · Received: {s} · Status: {s}", .{
-            self.name,
-            format.bytes(&bytes_buffer, self.bytes),
-            switch (self.phase) {
-                .streaming, .queued => @tagName(self.phase),
-                .running, .done => unreachable,
+        const line = try tool_line.render(gpa, &.{
+            .name = self.name,
+            .phase = switch (self.phase) {
+                .streaming => .streaming,
+                .queued => .queued,
+                .running => .running,
+                .done => unreachable,
             },
+            .subject = self.subject.items,
+            .subject_kind = self.subject_kind,
+            .elapsed_ms = if (self.elapsed_seconds) |seconds| seconds * std.time.ms_per_s else null,
+            .timeout_ms = if (self.phase == .running) self.timeout_ms else null,
+            .received_bytes = if (self.phase == .running) null else self.bytes,
         });
+        if (self.line) |*previous| previous.deinit(gpa);
+        self.line = line;
     }
 
     fn text(self: *Call, gpa: std.mem.Allocator, now_ms: i64) ![]const u8 {
-        if (self.phase != .running) return self.box.items;
-        const timeout_ms = self.timeout_ms orelse return self.box.items;
-        var elapsed_buffer: [24]u8 = undefined;
-        var limit_buffer: [24]u8 = undefined;
-        const limit = format.durationSeconds(&limit_buffer, @intCast(timeout_ms), .up);
-        self.rows.clearRetainingCapacity();
-        try self.rows.print(gpa, "{s}\nTime: {s} · Timeout: {s}", .{
-            self.box.items,
-            format.durationSeconds(&elapsed_buffer, now_ms - self.started_ms, .down),
-            limit,
-        });
-        return self.rows.items;
+        if (self.phase == .running and self.timeout_ms != null) {
+            const seconds = @divFloor(@max(now_ms - self.started_ms, 0), std.time.ms_per_s);
+            if (self.elapsed_seconds != seconds) {
+                self.elapsed_seconds = seconds;
+                errdefer self.elapsed_seconds = null;
+                try self.refresh(gpa);
+            }
+        }
+        return self.line.?.text;
     }
 };
 
@@ -637,6 +644,7 @@ fn runCall(self: *Screen, turn: *Turn, started: *const core.Tool.Call, time: Tim
     call.id = id;
     call.phase = .running;
     call.started_ms = time.awake_ms;
+    try call.refresh(self.gpa);
     while (turn.firstCall(&.{.streaming})) |later| {
         later.call.?.phase = .queued;
         try later.call.?.refresh(self.gpa);
@@ -650,49 +658,43 @@ fn settleCall(self: *Screen, turn: *Turn, result: *const core.Session.Event.Tool
     const call = &block.call.?;
     if (call.phase != .running) try self.describeCall(call, &result.call);
     call.phase = .done;
-    block.transcript_index = try self.appendToolBlock(call.box.items, &result.output);
+    block.transcript_index = try self.appendToolBlock(&.{
+        .name = call.name,
+        .subject = call.subject.items,
+        .subject_kind = call.subject_kind,
+        .output = &result.output,
+    });
 }
 
 fn describeCall(self: *Screen, call: *Call, tool_call: *const core.Tool.Call) !void {
     const description = try tools.Registry.describe(self.gpa, tool_call, self.bash_timeout_ms);
     defer description.deinit(self.gpa);
-    const head = try tool_line.head(self.gpa, tool_call.name, &description, &self.display_roots);
-    defer self.gpa.free(head);
-    call.box.clearRetainingCapacity();
-    try call.box.appendSlice(self.gpa, head);
+    const subject = try tool_line.subject(self.gpa, &description, &self.display_roots);
+    defer self.gpa.free(subject);
+    if (!std.mem.eql(u8, call.name, tool_call.name)) {
+        const name = try self.gpa.dupe(u8, tool_call.name);
+        self.gpa.free(call.name);
+        call.name = name;
+    }
+    call.subject.clearRetainingCapacity();
+    try call.subject.appendSlice(self.gpa, subject);
+    call.subject_kind = if (description.subject) |value| value.kind else null;
     call.timeout_ms = description.timeout_ms;
 }
 
 fn appendUnknownResult(self: *Screen, result: *const core.Session.Event.ToolResult) !void {
-    const head = try self.gpa.print("Tool: {s}", .{result.call.name});
-    defer self.gpa.free(head);
-    _ = try self.appendToolBlock(head, &result.output);
+    _ = try self.appendToolBlock(&.{ .name = result.call.name, .output = &result.output });
 }
 
-fn appendToolBlock(self: *Screen, head: []const u8, output: *const core.Tool.Output) !usize {
-    const failed = output.hasFailure();
-    const line = try tool_line.render(self.gpa, output);
+fn appendToolBlock(self: *Screen, options: *const tool_line.Options) !usize {
+    const output = options.output.?;
+    const line = try tool_line.render(self.gpa, options);
     defer line.deinit(self.gpa);
-    switch (line) {
-        .none => try self.transcript.append(&.{ .tool_result = .{
-            .text = head,
-            .failed = failed,
-        } }),
-        .measures => |detail| {
-            const text = try self.gpa.print("{s}\n{s}", .{ head, detail });
-            defer self.gpa.free(text);
-            try self.transcript.append(&.{ .tool_result = .{ .text = text, .failed = failed } });
-        },
-        .sentence => |sentence| {
-            const text = try self.gpa.print("{s}\nError: {s}", .{ head, sentence });
-            defer self.gpa.free(text);
-            try self.transcript.append(&.{ .tool_result = .{
-                .text = text,
-                .failed = failed,
-                .fit = .wrap,
-            } });
-        },
-    }
+    try self.transcript.append(&.{ .tool_result = .{
+        .text = line.text,
+        .failed = output.hasFailure(),
+        .segment_ends = line.segment_ends,
+    } });
     return self.transcript.blocks().len - 1;
 }
 
@@ -830,13 +832,22 @@ pub fn appendUser(self: *Screen, text: []const u8) !void {
 pub fn appendSkillNote(self: *Screen, skill: *const core.Session.Event.SkillLoaded) !void {
     const path = try format.path(self.gpa, skill.source, &self.display_roots);
     defer self.gpa.free(path);
-    const text = try self.gpa.print("Skill: {s} · File: {s}", .{ skill.name, path });
+    const name = try self.gpa.dupe(u8, skill.name);
+    defer self.gpa.free(name);
+    const shown_name = ui.paint.singleLine(name);
+    const text = try self.gpa.print("Skill: {s} · File: {s}", .{
+        shown_name,
+        ui.paint.singleLine(path),
+    });
     defer self.gpa.free(text);
-    try self.appendNote(text);
+    try self.transcript.append(&.{ .user_note = .{
+        .text = text,
+        .segment_ends = &.{ "Skill: ".len + shown_name.len, text.len },
+    } });
 }
 
 pub fn appendNote(self: *Screen, text: []const u8) !void {
-    try self.transcript.append(&.{ .user_note = text });
+    try self.transcript.append(&.{ .user_note = .{ .text = text } });
 }
 
 pub fn appendIntro(self: *Screen, text: []const u8) !void {
@@ -1238,19 +1249,209 @@ const Rig = struct {
 
 const no_caption: ?ui.Caption = null;
 
-fn expectSummary(painted: []const u8, rows: *const [2][]const u8) !void {
-    var lines = std.mem.splitScalar(u8, painted, '\n');
-    var previous: []const u8 = "";
-    while (lines.next()) |line| {
-        const row = std.mem.trim(u8, line, "\r ");
-        if (std.mem.eql(u8, previous, rows[0]) and std.mem.eql(u8, row, rows[1])) return;
-        previous = row;
+test "tool metadata keeps its state and removes whole segments in both modes" {
+    const gpa = std.testing.allocator;
+    for ([_]ui.Block.Mode{ .full, .compact }) |mode| {
+        var rig: Rig = undefined;
+        rig.init();
+        defer rig.deinit();
+        if (mode == .compact) rig.screen.toggleTranscript();
+        try rig.start("prompt");
+        const call: core.Tool.Call = .{
+            .id = "read",
+            .name = "read",
+            .arguments = "{\"path\":\"a very long path with a · separator.zig\"}",
+        };
+        try rig.apply(&.{ .tool_call_started = call.name });
+        try rig.apply(&.{ .tool_call_arguments = call.arguments });
+        const streamed = try rig.paintPlain(80);
+        defer gpa.free(streamed);
+        try testing.expectContains(streamed, "Tool: read (streaming) · Received:");
+        try rig.apply(&.{ .tool_started = call });
+        const running = try rig.paintPlain(30);
+        defer gpa.free(running);
+        try testing.expectContains(running, "Tool: read (running)");
+        try std.testing.expect(std.mem.find(u8, running, "File:") == null);
+        var output: core.Tool.Output = .{};
+        output.measures.put(.lines, 120);
+        try rig.apply(&.{ .tool_result = .{ .call = call, .output = output } });
+        try rig.apply(&.committed);
+        try rig.end(&.{ .stopped = .complete });
+        for ([_]usize{ 40, 60 }) |columns| {
+            const narrow = try rig.paintPlain(columns);
+            defer gpa.free(narrow);
+            try testing.expectContains(narrow, "Tool: read (complete)");
+            try std.testing.expect(std.mem.find(u8, narrow, "File:") == null);
+            try std.testing.expect(std.mem.find(u8, narrow, "Lines:") == null);
+            try std.testing.expect(std.mem.find(u8, narrow, "Time:") == null);
+            try std.testing.expectEqual(
+                @as(usize, if (mode == .compact) 1 else 3),
+                rig.blocks()[1].rows(columns),
+            );
+        }
+        const wide = try rig.paintPlain(120);
+        defer gpa.free(wide);
+        try testing.expectContains(wide, "Tool: read (complete) · File: " ++
+            "a very long path with a · separator.zig · Lines: 120");
     }
-    std.debug.print("expected the rows \"{s}\" and \"{s}\" in:\n{s}\n", .{
-        rows[0],
-        rows[1],
-        painted,
+}
+
+test "bash commands preserve line breaks and wrap before and after completion" {
+    const gpa = std.testing.allocator;
+    for ([_]ui.Block.Mode{ .full, .compact }) |mode| {
+        var rig: Rig = undefined;
+        rig.init();
+        defer rig.deinit();
+        if (mode == .compact) rig.screen.toggleTranscript();
+        rig.screen.bash_timeout_ms = 120_000;
+        try rig.start("prompt");
+        const call: core.Tool.Call = .{
+            .id = "bash",
+            .name = "bash",
+            .arguments = "{\"command\":\"cat <<'EOF'\\n  first\\n\\n" ++
+                "a long command line that must wrap and keep its final-word\\nEOF\"}",
+        };
+        try rig.apply(&.{ .tool_call_started = call.name });
+        try rig.apply(&.{ .tool_started = call });
+        rig.time.awake_ms = 3_000;
+        for (0..2) |stage| {
+            const painted = try rig.paintPlain(40);
+            defer gpa.free(painted);
+            try testing.expectContains(painted, "Command: cat <<'EOF'");
+            var rows = std.mem.splitSequence(u8, painted, "\r\n");
+            var first_kept = false;
+            while (rows.next()) |row| {
+                if (!std.mem.eql(u8, std.mem.trimEnd(u8, row, " "), "  first")) continue;
+                try std.testing.expect(ui.paint.isBlank(rows.next().?));
+                first_kept = true;
+                break;
+            }
+            try std.testing.expect(first_kept);
+            try testing.expectContains(painted, "final-word");
+            try testing.expectContains(painted, "EOF");
+            if (stage == 0) {
+                var output: core.Tool.Output = .{};
+                output.measures.put(.duration_ms, 3_000);
+                output.measures.put(.exit_code, 0);
+                output.measures.put(.lines, 1);
+                try rig.apply(&.{ .tool_result = .{ .call = call, .output = output } });
+                try rig.apply(&.committed);
+                try rig.end(&.{ .stopped = .complete });
+            }
+        }
+    }
+}
+
+test "a running tool uses the final call name instead of the streamed name" {
+    const gpa = std.testing.allocator;
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    try rig.start("prompt");
+    try rig.apply(&.{ .tool_call_started = "partial" });
+    try rig.apply(&.{ .tool_started = .{
+        .id = "call",
+        .name = "write",
+        .arguments = "{\"path\":\"a.zig\",\"content\":\"text\"}",
+    } });
+    const painted = try rig.paintPlain(80);
+    defer gpa.free(painted);
+    try testing.expectContains(painted, "Tool: write (running) · File: a.zig");
+    try std.testing.expect(std.mem.find(u8, painted, "Tool: partial") == null);
+}
+
+test "limited results retain their outcome and put limits before counts" {
+    const gpa = std.testing.allocator;
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    rig.screen.toggleTranscript();
+    try rig.start("prompt");
+    const call: core.Tool.Call = .{
+        .id = "grep",
+        .name = "grep",
+        .arguments = "{\"pattern\":\"needle\"}",
+    };
+    try rig.apply(&.{ .tool_call_started = call.name });
+    try rig.apply(&.{ .tool_started = call });
+    var output: core.Tool.Output = .{};
+    output.measures.put(.duration_ms, 500);
+    output.measures.put(.matches, 8);
+    output.conditions.insert(.time_limit_reached);
+    try rig.apply(&.{ .tool_result = .{ .call = call, .output = output } });
+    try rig.apply(&.committed);
+    try rig.end(&.{ .stopped = .complete });
+    const wide = try rig.paintPlain(120);
+    defer gpa.free(wide);
+    try testing.expectContains(wide, "Tool: grep (limited) · Time: 500ms · Pattern: needle · " ++
+        "Search: timed out · Matches: 8");
+    const narrow = try rig.paintPlain(25);
+    defer gpa.free(narrow);
+    try testing.expectContains(narrow, "Tool: grep (limited)");
+    try std.testing.expect(std.mem.find(u8, narrow, "Search:") == null);
+}
+
+test "omitted find matches retain a limited outcome without a condition" {
+    var output: core.Tool.Output = .{};
+    output.measures.put(.duration_ms, 0);
+    output.measures.put(.matches, 1);
+    output.measures.put(.matches_omitted, 1);
+    try expectLimitedResult(&.{
+        .id = "find",
+        .name = "find",
+        .arguments = "{\"pattern\":\"*.zig\",\"limit\":1}",
+    }, &output);
+}
+
+test "a partial read window retains a limited outcome without a condition" {
+    var output: core.Tool.Output = .{};
+    output.measures.put(.lines, 50);
+    output.measures.put(.line_first, 1);
+    output.measures.put(.lines_total, 300);
+    try expectLimitedResult(&.{
+        .id = "read",
+        .name = "read",
+        .arguments = "{\"path\":\"a.zig\"}",
+    }, &output);
+}
+
+fn expectLimitedResult(call: *const core.Tool.Call, output: *const core.Tool.Output) !void {
+    const gpa = std.testing.allocator;
+    const expected = try gpa.print("Tool: {s} (limited)", .{call.name});
+    defer gpa.free(expected);
+    for ([_]ui.Block.Mode{ .full, .compact }) |mode| {
+        var rig: Rig = undefined;
+        rig.init();
+        defer rig.deinit();
+        if (mode == .compact) rig.screen.toggleTranscript();
+        try rig.start("prompt");
+        try rig.apply(&.{ .tool_call_started = call.name });
+        try rig.apply(&.{ .tool_started = call.* });
+        try rig.apply(&.{ .tool_result = .{ .call = call.*, .output = output.* } });
+        try rig.apply(&.committed);
+        try rig.end(&.{ .stopped = .complete });
+        const narrow = try rig.paintPlain(25);
+        defer gpa.free(narrow);
+        try testing.expectContains(narrow, expected);
+        try std.testing.expect(std.mem.find(u8, narrow, "Lines:") == null);
+        try std.testing.expect(std.mem.find(u8, narrow, "Matches:") == null);
+    }
+}
+
+fn expectSummary(painted: []const u8, parts: *const [2][]const u8) !void {
+    const separator = " · Time: ";
+    const split = std.mem.find(u8, parts[1], separator).?;
+    var buffer: [160]u8 = undefined;
+    const expected = try std.mem.print(&buffer, "{s} · Time: {s} · {s}", .{
+        parts[0],
+        parts[1][split + separator.len ..],
+        parts[1][0..split],
     });
+    var lines = std.mem.splitScalar(u8, painted, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.eql(u8, std.mem.trim(u8, line, "\r "), expected)) return;
+    }
+    std.debug.print("expected the row \"{s}\" in:\n{s}\n", .{ expected, painted });
     return error.TestExpectedSummary;
 }
 
@@ -1305,6 +1506,60 @@ test "compact reasoning and tool events free each partial allocation" {
     );
 }
 
+test "tool commands and metadata release each partial allocation" {
+    try std.testing.checkAllAllocationFailures(
+        core.testing.no_resize_allocator,
+        checkToolAllocations,
+        .{},
+    );
+}
+
+fn checkToolAllocations(gpa: std.mem.Allocator) error{OutOfMemory}!void {
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var screen = Screen.init(gpa, &out.writer, .high);
+    defer screen.deinit();
+    screen.toggleTranscript();
+    try screen.appendUser("prompt");
+    screen.beginTurn();
+    const call: core.Tool.Call = .{
+        .id = "bash",
+        .name = "bash",
+        .arguments = "{\"command\":\"printf first\\n  printf a-long-final-word\"}",
+    };
+    const events = [_]core.Session.Event{
+        .{ .tool_call_started = "bash" },
+        .{ .tool_call_arguments = call.arguments },
+        .{ .tool_call_started = "read" },
+        .{ .tool_started = call },
+    };
+    var time: Time = .{ .awake_ms = 0, .boot_ms = 0 };
+    for (&events) |*event| _ = try screen.apply(event, time);
+    for ([_]usize{ 80, 20 }) |columns| {
+        time.awake_ms += 1_000;
+        screen.paint(.{ .columns = columns, .rows = 24 }, time, &no_caption) catch
+            return error.OutOfMemory;
+    }
+    var output: core.Tool.Output = .{};
+    output.measures.put(.duration_ms, 2_000);
+    output.measures.put(.exit_code, 0);
+    output.conditions.insert(.output_truncated);
+    _ = try screen.apply(&.{ .tool_result = .{ .call = call, .output = output } }, time);
+    const read: core.Tool.Call = .{
+        .id = "read",
+        .name = "read",
+        .arguments = "{\"path\":\"a · b.zig\"}",
+    };
+    _ = try screen.apply(&.{ .tool_started = read }, time);
+    var failure: core.Tool.Output = .{ .content = "Drinky could not read the complete file." };
+    failure.conditions.insert(.path_missing);
+    _ = try screen.apply(&.{ .tool_result = .{ .call = read, .output = failure } }, time);
+    try screen.appendSkillNote(&.{ .name = "zig-style", .source = "a · b/SKILL.md" });
+    screen.toggleTranscript();
+    screen.paint(.{ .columns = 30, .rows = 24 }, time, &no_caption) catch
+        return error.OutOfMemory;
+}
+
 test "an active thinking summary above the frame keeps its current measurements and final status" {
     const gpa = std.testing.allocator;
     const size: terminal.View.Size = .{ .columns = 80, .rows = 2 };
@@ -1326,23 +1581,29 @@ test "an active thinking summary above the frame keeps its current measurements 
     const first = try device.snapshot(arena.allocator());
     try expectSummary(
         try std.mem.join(arena.allocator(), "\n", first.rows),
-        &.{ "Thinking: streaming", "Received: 3 B · Time: 0s" },
+        &.{ "Agent: thinking (streaming)", "Received: 3 B · Time: 0s" },
     );
     time.awake_ms = 3_000;
     _ = try screen.apply(&.{ .reasoning = "def" }, time);
     try screen.paint(size, time, &no_caption);
     const active = try device.snapshot(arena.allocator());
     const active_rows = try std.mem.join(arena.allocator(), "\n", active.rows);
-    try expectSummary(active_rows, &.{ "Thinking: streaming", "Received: 6 B · Time: 3s" });
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, active_rows, "Thinking:"));
+    try expectSummary(active_rows, &.{
+        "Agent: thinking (streaming)",
+        "Received: 6 B · Time: 3s",
+    });
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, active_rows, "Agent: thinking"));
     time.awake_ms = 4_000;
     _ = try screen.apply(&.committed, time);
     _ = try screen.apply(&.{ .turn_ended = .{ .stopped = .complete } }, time);
     try screen.paint(size, time, &no_caption);
     const complete = try device.snapshot(arena.allocator());
     const complete_rows = try std.mem.join(arena.allocator(), "\n", complete.rows);
-    try expectSummary(complete_rows, &.{ "Thinking: complete", "Received: 6 B · Time: 4s" });
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, complete_rows, "Thinking:"));
+    try expectSummary(complete_rows, &.{
+        "Agent: thinking (complete)",
+        "Received: 6 B · Time: 4s",
+    });
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, complete_rows, "Agent: thinking"));
 }
 
 test "a thinking update inside the frame keeps all history above the visible screen" {
@@ -1382,7 +1643,7 @@ test "a thinking update inside the frame keeps all history above the visible scr
     try std.testing.expectEqual(@as(usize, 100), active_count);
     try expectSummary(
         try std.mem.join(arena.allocator(), "\n", active.rows),
-        &.{ "Thinking: streaming", "Received: 6 B · Time: 3s" },
+        &.{ "Agent: thinking (streaming)", "Received: 6 B · Time: 3s" },
     );
 }
 
@@ -1425,7 +1686,7 @@ test "compact thinking joins consecutive blocks and keeps its text and final tim
     rig.time.awake_ms = 2_000;
     const empty = try rig.paintPlain(80);
     defer gpa.free(empty);
-    try expectSummary(empty, &.{ "Thinking: streaming", "Received: 0 B · Time: 2s" });
+    try expectSummary(empty, &.{ "Agent: thinking (streaming)", "Received: 0 B · Time: 2s" });
 
     try rig.apply(&.{ .reasoning = "alpha" });
     rig.time.awake_ms = 3_000;
@@ -1436,8 +1697,8 @@ test "compact thinking joins consecutive blocks and keeps its text and final tim
     rig.screen.toggleTranscript();
     const active = try rig.paintPlain(80);
     defer gpa.free(active);
-    try expectSummary(active, &.{ "Thinking: streaming", "Received: 10 B · Time: 6s" });
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, active, "Thinking:"));
+    try expectSummary(active, &.{ "Agent: thinking (streaming)", "Received: 10 B · Time: 6s" });
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, active, "Agent: thinking"));
     try std.testing.expect(std.mem.find(u8, active, "alpha") == null);
     try std.testing.expect(std.mem.find(u8, active, "βeta") == null);
 
@@ -1451,7 +1712,7 @@ test "compact thinking joins consecutive blocks and keeps its text and final tim
     rig.screen.toggleTranscript();
     const complete = try rig.paintPlain(80);
     defer gpa.free(complete);
-    try expectSummary(complete, &.{ "Thinking: complete", "Received: 10 B · Time: 7s" });
+    try expectSummary(complete, &.{ "Agent: thinking (complete)", "Received: 10 B · Time: 7s" });
     try testing.expectContains(complete, "answer");
 
     rig.screen.toggleTranscript();
@@ -1459,7 +1720,7 @@ test "compact thinking joins consecutive blocks and keeps its text and final tim
     defer gpa.free(full);
     try testing.expectContains(full, "alpha");
     try testing.expectContains(full, "βeta");
-    try std.testing.expect(std.mem.find(u8, full, "Thinking:") == null);
+    try std.testing.expect(std.mem.find(u8, full, "Agent: thinking") == null);
 }
 
 test "full mode adds no rows for thinking without visible text" {
@@ -1518,7 +1779,7 @@ test "thinking reports each terminal outcome and freezes its measurements" {
         rig.time.awake_ms = 50_000;
         const painted = try rig.paintPlain(80);
         defer std.testing.allocator.free(painted);
-        const expected = try std.testing.allocator.print("Thinking: {s}", .{status});
+        const expected = try std.testing.allocator.print("Agent: thinking ({s})", .{status});
         defer std.testing.allocator.free(expected);
         try expectSummary(painted, &.{ expected, "Received: 3 B · Time: 3s" });
     }
@@ -1554,9 +1815,9 @@ test "a retry keeps the failed thinking summary separate from the new attempt" {
     try rig.end(&.{ .stopped = .complete });
     const painted = try rig.paintPlain(80);
     defer gpa.free(painted);
-    try expectSummary(painted, &.{ "Thinking: failed", "Received: 11 B · Time: 2s" });
-    try expectSummary(painted, &.{ "Thinking: complete", "Received: 3 B · Time: 2s" });
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, painted, "Thinking:"));
+    try expectSummary(painted, &.{ "Agent: thinking (failed)", "Received: 11 B · Time: 2s" });
+    try expectSummary(painted, &.{ "Agent: thinking (complete)", "Received: 3 B · Time: 2s" });
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, painted, "Agent: thinking"));
 }
 
 test "thinking groups stop at committed attempts and tool calls" {
@@ -1577,9 +1838,9 @@ test "thinking groups stop at committed attempts and tool calls" {
     try rig.apply(&.{ .tool_call_started = "read" });
     const painted = try rig.paintPlain(80);
     defer gpa.free(painted);
-    try expectSummary(painted, &.{ "Thinking: complete", "Received: 1 B · Time: 2s" });
-    try expectSummary(painted, &.{ "Thinking: complete", "Received: 2 B · Time: 1s" });
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, painted, "Thinking:"));
+    try expectSummary(painted, &.{ "Agent: thinking (complete)", "Received: 1 B · Time: 2s" });
+    try expectSummary(painted, &.{ "Agent: thinking (complete)", "Received: 2 B · Time: 1s" });
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, painted, "Agent: thinking"));
 }
 
 test "a discard removes every part of a text run that a model notice split" {
@@ -1618,8 +1879,8 @@ test "thinking after a model notice keeps its counter and terminal status" {
     try rig.end(&.canceled);
     const painted = try rig.paintPlain(80);
     defer gpa.free(painted);
-    try expectSummary(painted, &.{ "Thinking: complete", "Received: 3 B · Time: 2s" });
-    try expectSummary(painted, &.{ "Thinking: canceled", "Received: 4 B · Time: 2s" });
+    try expectSummary(painted, &.{ "Agent: thinking (complete)", "Received: 3 B · Time: 2s" });
+    try expectSummary(painted, &.{ "Agent: thinking (canceled)", "Received: 4 B · Time: 2s" });
 }
 
 test "a discarded thinking block no longer contributes to its compact summary" {
@@ -1644,7 +1905,7 @@ test "a discarded thinking block no longer contributes to its compact summary" {
     rig.screen.toggleTranscript();
     const complete = try rig.paintPlain(80);
     defer gpa.free(complete);
-    try expectSummary(complete, &.{ "Thinking: complete", "Received: 1 B · Time: 2s" });
+    try expectSummary(complete, &.{ "Agent: thinking (complete)", "Received: 1 B · Time: 2s" });
 }
 
 test "a tool call streams as a row, runs with its subject and timer, and ends as a block" {
@@ -1660,7 +1921,7 @@ test "a tool call streams as a row, runs with its subject and timer, and ends as
     try rig.apply(&.{ .tool_call_arguments = "\"zig build\"}" });
     const streamed = try rig.paintPlain(80);
     defer gpa.free(streamed);
-    try testing.expectContains(streamed, "Tool: bash · Received: 23 B · Status: streaming");
+    try testing.expectContains(streamed, "Tool: bash (streaming) · Received: 23 B");
 
     rig.time.awake_ms = 1_000;
     try rig.apply(&.{ .tool_started = .{
@@ -1671,8 +1932,8 @@ test "a tool call streams as a row, runs with its subject and timer, and ends as
     rig.time.awake_ms = 13_400;
     const running = try rig.paintPlain(80);
     defer gpa.free(running);
-    try testing.expectContains(running, "Tool: bash · Command: zig build");
-    try testing.expectContains(running, "Time: 12s · Timeout: 2m 0s");
+    try testing.expectContains(running, "Tool: bash (running) · Time: 12s · Timeout: 2m 0s");
+    try testing.expectContains(running, "Command: zig build");
 
     var output: core.Tool.Output = .{ .content = "ok\n" };
     output.measures.put(.duration_ms, 1500);
@@ -1685,13 +1946,13 @@ test "a tool call streams as a row, runs with its subject and timer, and ends as
     try rig.expectKinds(&.{ .user, .tool_result });
     const block = rig.blocks()[1].content.tool_result;
     try std.testing.expectEqualStrings(
-        "Tool: bash · Command: zig build\nTime: 1.5s · Exit code: 0 · Lines: 1",
+        "Tool: bash (complete) · Time: 1.5s · Exit code: 0 · Lines: 1\nCommand: zig build",
         block.text.items,
     );
     try std.testing.expect(!block.failed);
     const done = try rig.paintPlain(80);
     defer gpa.free(done);
-    try std.testing.expect(std.mem.find(u8, done, "Status: streaming") == null);
+    try std.testing.expect(std.mem.find(u8, done, "(streaming)") == null);
 
     try rig.apply(&.committed);
     try rig.end(&.{ .stopped = .complete });
@@ -1715,18 +1976,17 @@ test "a failed tool result keeps its sentence below the call row" {
     try rig.apply(&.{ .tool_result = .{ .call = call, .output = output } });
     const block = rig.blocks()[1].content.tool_result;
     try std.testing.expectEqualStrings(
-        "Tool: read · File: a.txt\nError: " ++ sentence,
+        "Tool: read (failed) · File: a.txt\nError: " ++ sentence,
         block.text.items,
     );
     try std.testing.expect(block.failed);
-    try std.testing.expectEqual(ui.paint.Fit.wrap, block.fit);
 
     try rig.apply(&.{ .tool_call_started = "describe_drinky" });
     const describe: core.Tool.Call = .{ .id = "c2", .name = "describe_drinky", .arguments = "{}" };
     try rig.apply(&.{ .tool_started = describe });
     try rig.apply(&.{ .tool_result = .{ .call = describe, .output = .{ .content = "# Drinky" } } });
     try std.testing.expectEqualStrings(
-        "Tool: describe_drinky",
+        "Tool: describe_drinky (complete)",
         rig.blocks()[2].content.tool_result.text.items,
     );
     try rig.apply(&.committed);
@@ -1744,15 +2004,15 @@ test "queued calls read as queued until each one runs" {
     try rig.apply(&.{ .tool_call_started = "write" });
     const two = try rig.paintPlain(80);
     defer gpa.free(two);
-    try testing.expectContains(two, "Tool: read · Received: 2 B · Status: queued");
-    try testing.expectContains(two, "Tool: write · Received: 0 B · Status: streaming");
+    try testing.expectContains(two, "Tool: read (queued) · Received: 2 B");
+    try testing.expectContains(two, "Tool: write (streaming) · Received: 0 B");
 
     try rig.apply(&.{ .tool_started = .{ .id = "c1", .name = "read", .arguments = "{}" } });
     const one = try rig.paintPlain(80);
     defer gpa.free(one);
-    try testing.expectContains(one, "Tool: read ");
-    try std.testing.expect(std.mem.find(u8, one, "Tool: read ·") == null);
-    try testing.expectContains(one, "Tool: write · Received: 0 B · Status: queued");
+    try testing.expectContains(one, "Tool: read (running)");
+    try std.testing.expect(std.mem.find(u8, one, "Tool: read (running) ·") == null);
+    try testing.expectContains(one, "Tool: write (queued) · Received: 0 B");
     try rig.apply(&.{ .tool_result = .{
         .call = .{ .id = "c1", .name = "read", .arguments = "{}" },
         .output = .{ .content = "x" },
