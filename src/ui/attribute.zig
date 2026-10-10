@@ -8,6 +8,7 @@ const testing = @import("testing.zig");
 const Name = enum {
     reset,
     bold,
+    dim,
     italic,
     underline,
     double_underline,
@@ -18,6 +19,7 @@ pub fn sequence(comptime name: Name) []const u8 {
     return switch (name) {
         .reset => "\x1b[0m",
         .bold => "\x1b[1m",
+        .dim => "\x1b[2m",
         .italic => "\x1b[3m",
         .underline => "\x1b[4m",
         .double_underline => "\x1b[21m",

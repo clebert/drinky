@@ -32,12 +32,6 @@ const skill_prefix = skill.name ++ ":";
 const help_opener: Context.Outcome.Opener = .{ .open = reopenHelp };
 
 const commands = [_]Entry{
-    .{
-        .name = "compact",
-        .summary = "Toggle the transcript between Full and Compact modes",
-        .run = runCompact,
-        .during_turn = true,
-    },
     .{ .name = effort.name, .summary = effort.summary, .run = effort.run },
     .{ .name = help_name, .summary = help_summary, .run = runHelp },
     .{ .name = login.name, .summary = login.summary, .run = login.run },
@@ -48,6 +42,12 @@ const commands = [_]Entry{
     .{ .name = skill.name, .summary = skill.summary, .run = skill.run },
     .{ .name = sources.name, .summary = sources.summary, .run = sources.run },
     .{ .name = system.name, .summary = system.summary, .run = system.run },
+    .{
+        .name = "verbose",
+        .summary = "Toggle thinking text and complete bash commands",
+        .run = runVerbose,
+        .during_turn = true,
+    },
 };
 
 comptime {
@@ -124,9 +124,9 @@ fn lookup(name: []const u8) ?*const Entry {
     return null;
 }
 
-fn runCompact(context: *Context) Context.Error!Context.Outcome {
+fn runVerbose(context: *Context) Context.Error!Context.Outcome {
     _ = context;
-    return .toggle_compact;
+    return .toggle_verbose;
 }
 
 fn runHelp(context: *Context) Context.Error!Context.Outcome {
@@ -208,22 +208,27 @@ fn unknownSkill(gpa: std.mem.Allocator, name: []const u8) !Message {
     return Message.print(gpa, .warning, "Drinky does not recognize the skill {s}.", .{name});
 }
 
-test "compact is the only display command that can run during a turn" {
+test "verbose is the only display command that can run during a turn" {
     var rig: testing.Rig = undefined;
     try rig.init(&.{});
     defer rig.deinit();
     var context = rig.context();
 
-    const checked = try check(&context, "/compact");
+    const checked = try check(&context, "/verbose");
     defer if (checked) |message| message.deinit(context.gpa);
     try std.testing.expect(checked == null);
-    const running = try checkDuringTurn(&context, "/compact");
+    const running = try checkDuringTurn(&context, "/verbose");
     defer if (running) |message| message.deinit(context.gpa);
     try std.testing.expect(running == null);
-    const argument = (try checkDuringTurn(&context, "/compact extra")).?;
+    const argument = (try checkDuringTurn(&context, "/verbose extra")).?;
     try testing.expectMessage(&argument, .warning, "takes no argument");
-    const alias = (try check(&context, "/c")).?;
-    try testing.expectMessage(&alias, .warning, "does not recognize the command");
+    const removed = (try check(&context, "/compact")).?;
+    try testing.expectMessage(&removed, .warning, "does not recognize the command");
+    try testing.expectRefusal(
+        (try run(&context, "/compact")).?,
+        .warning,
+        "does not recognize the command",
+    );
     const other = (try checkDuringTurn(&context, "/model")).?;
     try testing.expectMessage(&other, .warning, "cannot run while a turn runs");
 }
@@ -342,17 +347,18 @@ test "a line without a name opens its list, and a command row runs its command" 
         try std.testing.expectEqualStrings("Command", pick.title);
         try testing.expectReopen(&context, &pick);
         try std.testing.expectEqual(commands.len - 1, pick.options.len);
-        try std.testing.expectEqualStrings("/compact", pick.options[0].name);
-        try std.testing.expectEqualStrings(
-            "Toggle the transcript between Full and Compact modes.",
-            pick.options[0].extra.?,
-        );
-        try std.testing.expect((try testing.selectRow(&pick, &context, 0)) == .toggle_compact);
-        try std.testing.expectEqualStrings("/system", pick.options[pick.options.len - 1].name);
-        for (pick.options) |*option|
-            try std.testing.expect(!std.mem.startsWith(u8, option.name, "/help"));
+        try std.testing.expectEqualStrings("/effort", pick.options[0].name);
         const last = pick.options.len - 1;
-        try std.testing.expect((try testing.selectRow(&pick, &context, last)) == .page);
+        try std.testing.expectEqualStrings("/verbose", pick.options[last].name);
+        try std.testing.expectEqualStrings(
+            "Toggle thinking text and complete bash commands.",
+            pick.options[last].extra.?,
+        );
+        try std.testing.expect((try testing.selectRow(&pick, &context, last)) == .toggle_verbose);
+        for (pick.options) |*option|
+            try std.testing.expect(!std.mem.startsWith(u8, option.name, "/help") and
+                !std.mem.eql(u8, option.name, "/compact"));
+        try std.testing.expect((try testing.selectRow(&pick, &context, last - 1)) == .page);
     }
 
     for ([_][]const u8{ "/skill", "/skill:" }) |line| {

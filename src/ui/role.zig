@@ -12,14 +12,12 @@ pub const Name = enum {
     code,
     link,
     warning,
+    success,
     @"error",
     user,
     user_note,
     input_frame,
     activity,
-    tool_pending,
-    tool_success,
-    tool_error,
     selection,
 };
 
@@ -32,14 +30,12 @@ pub fn sequence(comptime name: Name) []const u8 {
         .code => "\x1b[32m",
         .link => "\x1b[34m",
         .warning => "\x1b[33m",
+        .success => "\x1b[32m",
         .@"error" => "\x1b[31m",
-        .user => "\x1b[35;7m",
+        .user => "\x1b[35m",
         .user_note => "\x1b[35m",
         .input_frame => "\x1b[35m",
         .activity => "\x1b[36m",
-        .tool_pending => "\x1b[36;7m",
-        .tool_success => "\x1b[32;7m",
-        .tool_error => "\x1b[31;7m",
         .selection => "\x1b[7m",
     };
 }
@@ -92,6 +88,6 @@ test "a role reaches the row as one SGR sequence, and the text role as none" {
     sink.end(.{ .id = 0, .line = 1 });
 
     const painted = try rig.painted();
-    try testing.expectShows(painted, &.{"\x1b[35;7mtitle"});
+    try testing.expectShows(painted, &.{"\x1b[35mtitle"});
     try testing.expectShows(painted, &.{"title\r\nplain"});
 }

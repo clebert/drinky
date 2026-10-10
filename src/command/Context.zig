@@ -34,7 +34,7 @@ pub const Outcome = union(enum) {
     logout: usize,
     fetch: usize,
     new_conversation,
-    toggle_compact,
+    toggle_verbose,
     rewind: usize,
 
     pub const Prompt = struct {

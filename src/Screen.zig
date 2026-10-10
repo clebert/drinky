@@ -42,7 +42,7 @@ bash_timeout_ms: u64,
 window_pages: usize,
 gauge: ui.status.Gauge,
 display_roots: format.Roots,
-transcript_mode: ui.Block.Mode = .full,
+verbose: bool = true,
 repaint_transcript: bool = false,
 thinking_active: ?usize = null,
 thinking_joinable: bool = false,
@@ -167,7 +167,7 @@ const Turn = struct {
     fn boxes(
         self: *Turn,
         gpa: std.mem.Allocator,
-        options: struct { now_ms: i64, compact: bool },
+        options: struct { now_ms: i64, verbose: bool },
     ) ![]const ui.paint.Box {
         self.box_view.clearRetainingCapacity();
         for (self.blocks.items) |*block| {
@@ -176,8 +176,9 @@ const Turn = struct {
             try self.box_view.append(gpa, .{
                 .text = try call.text(gpa, options.now_ms),
                 .segment_ends = call.line.?.segment_ends,
-                .emphasis = .first_value,
-                .compact = options.compact,
+                .verbose = options.verbose,
+                .status = call.line.?.status,
+                .command = call.line.?.command,
             });
         }
         return self.box_view.items;
@@ -386,11 +387,8 @@ pub fn deinit(self: *Screen) void {
     self.editor.deinit();
 }
 
-pub fn toggleTranscript(self: *Screen) void {
-    self.transcript_mode = switch (self.transcript_mode) {
-        .full => .compact,
-        .compact => .full,
-    };
+pub fn toggleVerbose(self: *Screen) void {
+    self.verbose = !self.verbose;
     self.repaint_transcript = true;
 }
 
@@ -687,13 +685,13 @@ fn appendUnknownResult(self: *Screen, result: *const core.Session.Event.ToolResu
 }
 
 fn appendToolBlock(self: *Screen, options: *const tool_line.Options) !usize {
-    const output = options.output.?;
     const line = try tool_line.render(self.gpa, options);
     defer line.deinit(self.gpa);
     try self.transcript.append(&.{ .tool_result = .{
         .text = line.text,
-        .failed = output.hasFailure(),
         .segment_ends = line.segment_ends,
+        .status = line.status,
+        .command = line.command,
     } });
     return self.transcript.blocks().len - 1;
 }
@@ -1018,7 +1016,7 @@ pub fn paint(
         else => {},
     }
 
-    self.transcript.present(self.transcript_mode, time.awake_ms);
+    self.transcript.present(self.verbose, time.awake_ms);
     const status = self.statusInfo(time.boot_ms);
 
     const tail: layout.Tail = switch (self.widget) {
@@ -1035,7 +1033,7 @@ pub fn paint(
             self.editor.reflow(size);
             const boxes = try turn.boxes(self.gpa, .{
                 .now_ms = time.awake_ms,
-                .compact = self.transcript_mode == .compact,
+                .verbose = self.verbose,
             });
             const tracks = try turn.trackBoxes(self.gpa);
             break :turn .{
@@ -1059,7 +1057,6 @@ pub fn paint(
     const scene: layout.Scene = .{ .conversation = .{
         .window_pages = self.window_pages,
         .repaint = self.repaint_transcript,
-        .mode = self.transcript_mode,
         .transcript = self.transcript.block_list.items,
         .tail = tail,
         .status = &status,
@@ -1249,13 +1246,13 @@ const Rig = struct {
 
 const no_caption: ?ui.Caption = null;
 
-test "tool metadata keeps its state and removes whole segments in both modes" {
+test "tool metadata keeps its state and removes whole segments in both verbosity states" {
     const gpa = std.testing.allocator;
-    for ([_]ui.Block.Mode{ .full, .compact }) |mode| {
+    for ([_]bool{ true, false }) |verbose| {
         var rig: Rig = undefined;
         rig.init();
         defer rig.deinit();
-        if (mode == .compact) rig.screen.toggleTranscript();
+        if (!verbose) rig.screen.toggleVerbose();
         try rig.start("prompt");
         const call: core.Tool.Call = .{
             .id = "read",
@@ -1285,7 +1282,7 @@ test "tool metadata keeps its state and removes whole segments in both modes" {
             try std.testing.expect(std.mem.find(u8, narrow, "Lines:") == null);
             try std.testing.expect(std.mem.find(u8, narrow, "Time:") == null);
             try std.testing.expectEqual(
-                @as(usize, if (mode == .compact) 1 else 3),
+                @as(usize, 1),
                 rig.blocks()[1].rows(columns),
             );
         }
@@ -1296,48 +1293,51 @@ test "tool metadata keeps its state and removes whole segments in both modes" {
     }
 }
 
-test "bash commands preserve line breaks and wrap before and after completion" {
+test "verbose commands preserve line breaks and wrap before and after completion" {
     const gpa = std.testing.allocator;
-    for ([_]ui.Block.Mode{ .full, .compact }) |mode| {
-        var rig: Rig = undefined;
-        rig.init();
-        defer rig.deinit();
-        if (mode == .compact) rig.screen.toggleTranscript();
-        rig.screen.bash_timeout_ms = 120_000;
-        try rig.start("prompt");
-        const call: core.Tool.Call = .{
-            .id = "bash",
-            .name = "bash",
-            .arguments = "{\"command\":\"cat <<'EOF'\\n  first\\n\\n" ++
-                "a long command line that must wrap and keep its final-word\\nEOF\"}",
-        };
-        try rig.apply(&.{ .tool_call_started = call.name });
-        try rig.apply(&.{ .tool_started = call });
-        rig.time.awake_ms = 3_000;
-        for (0..2) |stage| {
-            const painted = try rig.paintPlain(40);
-            defer gpa.free(painted);
-            try testing.expectContains(painted, "Command: cat <<'EOF'");
-            var rows = std.mem.splitSequence(u8, painted, "\r\n");
-            var first_kept = false;
-            while (rows.next()) |row| {
-                if (!std.mem.eql(u8, std.mem.trimEnd(u8, row, " "), "  first")) continue;
-                try std.testing.expect(ui.paint.isBlank(rows.next().?));
-                first_kept = true;
-                break;
-            }
-            try std.testing.expect(first_kept);
-            try testing.expectContains(painted, "final-word");
-            try testing.expectContains(painted, "EOF");
-            if (stage == 0) {
-                var output: core.Tool.Output = .{};
-                output.measures.put(.duration_ms, 3_000);
-                output.measures.put(.exit_code, 0);
-                output.measures.put(.lines, 1);
-                try rig.apply(&.{ .tool_result = .{ .call = call, .output = output } });
-                try rig.apply(&.committed);
-                try rig.end(&.{ .stopped = .complete });
-            }
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    rig.screen.bash_timeout_ms = 120_000;
+    try rig.start("prompt");
+    const call: core.Tool.Call = .{
+        .id = "bash",
+        .name = "bash",
+        .arguments = "{\"command\":\"cat <<'EOF'\\n  first\\n\\n" ++
+            "a long command line that must wrap and keep its final-word\\nEOF\"}",
+    };
+    try rig.apply(&.{ .tool_call_started = call.name });
+    try rig.apply(&.{ .tool_started = call });
+    rig.time.awake_ms = 3_000;
+    for (0..2) |stage| {
+        const painted = try rig.paintPlain(48);
+        defer gpa.free(painted);
+        try testing.expectContains(painted, "Command: cat <<'EOF'");
+        var rows = std.mem.splitSequence(u8, painted, "\r\n");
+        var first_kept = false;
+        while (rows.next()) |row| {
+            const indent: usize = if (stage == 0) 23 else 24;
+            const expected = if (stage == 0)
+                "                         first"
+            else
+                "                          first";
+            if (!std.mem.eql(u8, std.mem.trimEnd(u8, row, " "), expected)) continue;
+            try std.testing.expect(std.mem.allEqual(u8, row[0..indent], ' '));
+            try std.testing.expect(ui.paint.isBlank(rows.next().?));
+            first_kept = true;
+            break;
+        }
+        try std.testing.expect(first_kept);
+        try testing.expectContains(painted, "final-word");
+        try testing.expectContains(painted, "EOF");
+        if (stage == 0) {
+            var output: core.Tool.Output = .{};
+            output.measures.put(.duration_ms, 3_000);
+            output.measures.put(.exit_code, 0);
+            output.measures.put(.lines, 1);
+            try rig.apply(&.{ .tool_result = .{ .call = call, .output = output } });
+            try rig.apply(&.committed);
+            try rig.end(&.{ .stopped = .complete });
         }
     }
 }
@@ -1365,7 +1365,7 @@ test "limited results retain their outcome and put limits before counts" {
     var rig: Rig = undefined;
     rig.init();
     defer rig.deinit();
-    rig.screen.toggleTranscript();
+    rig.screen.toggleVerbose();
     try rig.start("prompt");
     const call: core.Tool.Call = .{
         .id = "grep",
@@ -1419,11 +1419,11 @@ fn expectLimitedResult(call: *const core.Tool.Call, output: *const core.Tool.Out
     const gpa = std.testing.allocator;
     const expected = try gpa.print("Tool: {s} (limited)", .{call.name});
     defer gpa.free(expected);
-    for ([_]ui.Block.Mode{ .full, .compact }) |mode| {
+    for ([_]bool{ true, false }) |verbose| {
         var rig: Rig = undefined;
         rig.init();
         defer rig.deinit();
-        if (mode == .compact) rig.screen.toggleTranscript();
+        if (!verbose) rig.screen.toggleVerbose();
         try rig.start("prompt");
         try rig.apply(&.{ .tool_call_started = call.name });
         try rig.apply(&.{ .tool_started = call.* });
@@ -1455,12 +1455,12 @@ fn expectSummary(painted: []const u8, parts: *const [2][]const u8) !void {
     return error.TestExpectedSummary;
 }
 
-fn checkCompactAllocations(gpa: std.mem.Allocator) error{OutOfMemory}!void {
+fn checkThinkingAllocations(gpa: std.mem.Allocator) error{OutOfMemory}!void {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     var screen = Screen.init(gpa, &out.writer, .high);
     defer screen.deinit();
-    screen.toggleTranscript();
+    screen.toggleVerbose();
     try screen.appendUser("prompt");
     screen.beginTurn();
     const call: core.Tool.Call = .{
@@ -1495,13 +1495,13 @@ fn checkCompactAllocations(gpa: std.mem.Allocator) error{OutOfMemory}!void {
         .{ .turn_ended = .canceled },
     };
     for (&canceled) |*event| _ = try screen.apply(event, .{ .awake_ms = 4_000, .boot_ms = 4_000 });
-    screen.toggleTranscript();
+    screen.toggleVerbose();
 }
 
-test "compact reasoning and tool events free each partial allocation" {
+test "thinking summaries and tool events free each partial allocation" {
     try std.testing.checkAllAllocationFailures(
         core.testing.no_resize_allocator,
-        checkCompactAllocations,
+        checkThinkingAllocations,
         .{},
     );
 }
@@ -1519,7 +1519,7 @@ fn checkToolAllocations(gpa: std.mem.Allocator) error{OutOfMemory}!void {
     defer out.deinit();
     var screen = Screen.init(gpa, &out.writer, .high);
     defer screen.deinit();
-    screen.toggleTranscript();
+    screen.toggleVerbose();
     try screen.appendUser("prompt");
     screen.beginTurn();
     const call: core.Tool.Call = .{
@@ -1555,7 +1555,7 @@ fn checkToolAllocations(gpa: std.mem.Allocator) error{OutOfMemory}!void {
     failure.conditions.insert(.path_missing);
     _ = try screen.apply(&.{ .tool_result = .{ .call = read, .output = failure } }, time);
     try screen.appendSkillNote(&.{ .name = "zig-style", .source = "a · b/SKILL.md" });
-    screen.toggleTranscript();
+    screen.toggleVerbose();
     screen.paint(.{ .columns = 30, .rows = 24 }, time, &no_caption) catch
         return error.OutOfMemory;
 }
@@ -1569,7 +1569,7 @@ test "an active thinking summary above the frame keeps its current measurements 
     var screen = Screen.init(gpa, device.device().writer(), .high);
     defer screen.deinit();
     screen.window_pages = 1;
-    screen.toggleTranscript();
+    screen.toggleVerbose();
     try screen.appendUser("prompt");
     screen.beginTurn();
     var time: Time = .{ .awake_ms = 0, .boot_ms = 0 };
@@ -1624,7 +1624,7 @@ test "a thinking update inside the frame keeps all history above the visible scr
     var time: Time = .{ .awake_ms = 0, .boot_ms = 0 };
     _ = try screen.apply(&.reasoning_started, time);
     _ = try screen.apply(&.{ .reasoning = "abc" }, time);
-    screen.toggleTranscript();
+    screen.toggleVerbose();
     try screen.paint(size, time, &no_caption);
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
@@ -1647,7 +1647,7 @@ test "a thinking update inside the frame keeps all history above the visible scr
     );
 }
 
-test "a mode toggle repaints the complete transcript beyond the window limit" {
+test "a verbosity toggle repaints the complete transcript beyond the window limit" {
     const gpa = std.testing.allocator;
     var rig: Rig = undefined;
     rig.init();
@@ -1662,7 +1662,7 @@ test "a mode toggle repaints the complete transcript beyond the window limit" {
     defer gpa.free(recent);
     try std.testing.expect(std.mem.find(u8, recent, "message-0") == null);
     for (0..2) |_| {
-        rig.screen.toggleTranscript();
+        rig.screen.toggleVerbose();
         const repainted = try rig.paintPlain(80);
         defer gpa.free(repainted);
         try std.testing.expectEqual(@as(usize, 60), std.mem.count(u8, repainted, "message-"));
@@ -1675,26 +1675,31 @@ test "a mode toggle repaints the complete transcript beyond the window limit" {
     try std.testing.expectEqual(@as(usize, 1), rig.screen.window_pages);
 }
 
-test "compact thinking joins consecutive blocks and keeps its text and final timer" {
+test "thinking summaries join consecutive blocks and keep their text and final timer" {
     const gpa = std.testing.allocator;
     var rig: Rig = undefined;
     rig.init();
     defer rig.deinit();
-    rig.screen.toggleTranscript();
+    rig.screen.toggleVerbose();
     try rig.start("prompt");
     try rig.apply(&.reasoning_started);
     rig.time.awake_ms = 2_000;
     const empty = try rig.paintPlain(80);
     defer gpa.free(empty);
     try expectSummary(empty, &.{ "Agent: thinking (streaming)", "Received: 0 B · Time: 2s" });
+    try testing.expectContains(
+        rig.out.written(),
+        "\x1b[36m\x1b[2mAgent: thinking (streaming)\x1b[0m",
+    );
+    try std.testing.expect(std.mem.find(u8, rig.out.written(), "\x1b[36;7m") == null);
 
     try rig.apply(&.{ .reasoning = "alpha" });
     rig.time.awake_ms = 3_000;
     try rig.apply(&.reasoning_started);
     try rig.apply(&.{ .reasoning = "βeta" });
     rig.time.awake_ms = 6_000;
-    rig.screen.toggleTranscript();
-    rig.screen.toggleTranscript();
+    rig.screen.toggleVerbose();
+    rig.screen.toggleVerbose();
     const active = try rig.paintPlain(80);
     defer gpa.free(active);
     try expectSummary(active, &.{ "Agent: thinking (streaming)", "Received: 10 B · Time: 6s" });
@@ -1708,14 +1713,14 @@ test "compact thinking joins consecutive blocks and keeps its text and final tim
     try rig.apply(&.committed);
     try rig.end(&.{ .stopped = .complete });
     rig.time.awake_ms = 90_000;
-    rig.screen.toggleTranscript();
-    rig.screen.toggleTranscript();
+    rig.screen.toggleVerbose();
+    rig.screen.toggleVerbose();
     const complete = try rig.paintPlain(80);
     defer gpa.free(complete);
     try expectSummary(complete, &.{ "Agent: thinking (complete)", "Received: 10 B · Time: 7s" });
     try testing.expectContains(complete, "answer");
 
-    rig.screen.toggleTranscript();
+    rig.screen.toggleVerbose();
     const full = try rig.paintPlain(80);
     defer gpa.free(full);
     try testing.expectContains(full, "alpha");
@@ -1723,7 +1728,7 @@ test "compact thinking joins consecutive blocks and keeps its text and final tim
     try std.testing.expect(std.mem.find(u8, full, "Agent: thinking") == null);
 }
 
-test "full mode adds no rows for thinking without visible text" {
+test "verbose on adds no rows for thinking without visible text" {
     const gpa = std.testing.allocator;
     var expected: ?[]u8 = null;
     defer if (expected) |text| gpa.free(text);
@@ -1759,11 +1764,12 @@ test "thinking reports each terminal outcome and freezes its measurements" {
         .{ .stopped = .truncated },
     };
     const statuses = [_][]const u8{ "complete", "canceled", "failed", "failed", "truncated" };
-    for (&outcomes, statuses) |*outcome, status| {
+    const colors = [_][]const u8{ "\x1b[32m", "\x1b[33m", "\x1b[31m", "\x1b[31m", "\x1b[33m" };
+    for (&outcomes, statuses, colors) |*outcome, status, color| {
         var rig: Rig = undefined;
         rig.init();
         defer rig.deinit();
-        rig.screen.toggleTranscript();
+        rig.screen.toggleVerbose();
         try rig.start("prompt");
         rig.time.awake_ms = 1_000;
         try rig.apply(&.reasoning_started);
@@ -1782,6 +1788,20 @@ test "thinking reports each terminal outcome and freezes its measurements" {
         const expected = try std.testing.allocator.print("Agent: thinking ({s})", .{status});
         defer std.testing.allocator.free(expected);
         try expectSummary(painted, &.{ expected, "Received: 3 B · Time: 3s" });
+        const colored = try std.testing.allocator.print(
+            "{s}\x1b[2mAgent: thinking ({s})\x1b[0m",
+            .{ color, status },
+        );
+        defer std.testing.allocator.free(colored);
+        try testing.expectContains(rig.out.written(), colored);
+        try std.testing.expect(std.mem.find(u8, rig.out.written(), "\x1b[32;7m") == null);
+        try std.testing.expect(std.mem.find(u8, rig.out.written(), "\x1b[31;7m") == null);
+        try std.testing.expect(std.mem.find(u8, rig.out.written(), "\x1b[36;7m") == null);
+        rig.screen.toggleVerbose();
+        const thinking = try rig.paintPlain(80);
+        defer std.testing.allocator.free(thinking);
+        try testing.expectContains(thinking, "abc");
+        try std.testing.expect(std.mem.find(u8, thinking, "Agent: thinking") == null);
     }
 }
 
@@ -1790,7 +1810,7 @@ test "a retry keeps the failed thinking summary separate from the new attempt" {
     var rig: Rig = undefined;
     rig.init();
     defer rig.deinit();
-    rig.screen.toggleTranscript();
+    rig.screen.toggleVerbose();
     try rig.start("prompt");
     try rig.apply(&.reasoning_started);
     try rig.apply(&.{ .reasoning = "first" });
@@ -1825,7 +1845,7 @@ test "thinking groups stop at committed attempts and tool calls" {
     var rig: Rig = undefined;
     rig.init();
     defer rig.deinit();
-    rig.screen.toggleTranscript();
+    rig.screen.toggleVerbose();
     try rig.start("prompt");
     try rig.apply(&.reasoning_started);
     try rig.apply(&.{ .reasoning = "a" });
@@ -1866,7 +1886,7 @@ test "thinking after a model notice keeps its counter and terminal status" {
     var rig: Rig = undefined;
     rig.init();
     defer rig.deinit();
-    rig.screen.toggleTranscript();
+    rig.screen.toggleVerbose();
     try rig.start("prompt");
     rig.time.awake_ms = 1_000;
     try rig.apply(&.reasoning_started);
@@ -1883,12 +1903,12 @@ test "thinking after a model notice keeps its counter and terminal status" {
     try expectSummary(painted, &.{ "Agent: thinking (canceled)", "Received: 4 B · Time: 2s" });
 }
 
-test "a discarded thinking block no longer contributes to its compact summary" {
+test "a discarded thinking block no longer contributes to its thinking summary" {
     const gpa = std.testing.allocator;
     var rig: Rig = undefined;
     rig.init();
     defer rig.deinit();
-    rig.screen.toggleTranscript();
+    rig.screen.toggleVerbose();
     try rig.start("prompt");
     try rig.apply(&.reasoning_started);
     try rig.apply(&.{ .reasoning = "a" });
@@ -1901,8 +1921,8 @@ test "a discarded thinking block no longer contributes to its compact summary" {
     try rig.apply(&.{ .tail_discarded = 1 });
     rig.time.awake_ms = 8_000;
     try rig.end(&.{ .stopped = .complete });
-    rig.screen.toggleTranscript();
-    rig.screen.toggleTranscript();
+    rig.screen.toggleVerbose();
+    rig.screen.toggleVerbose();
     const complete = try rig.paintPlain(80);
     defer gpa.free(complete);
     try expectSummary(complete, &.{ "Agent: thinking (complete)", "Received: 1 B · Time: 2s" });
@@ -1949,7 +1969,7 @@ test "a tool call streams as a row, runs with its subject and timer, and ends as
         "Tool: bash (complete) · Time: 1.5s · Exit code: 0 · Lines: 1\nCommand: zig build",
         block.text.items,
     );
-    try std.testing.expect(!block.failed);
+    try std.testing.expect(block.status.role == .success);
     const done = try rig.paintPlain(80);
     defer gpa.free(done);
     try std.testing.expect(std.mem.find(u8, done, "(streaming)") == null);
@@ -1979,7 +1999,7 @@ test "a failed tool result keeps its sentence below the call row" {
         "Tool: read (failed) · File: a.txt\nError: " ++ sentence,
         block.text.items,
     );
-    try std.testing.expect(block.failed);
+    try std.testing.expect(block.status.role == .@"error");
 
     try rig.apply(&.{ .tool_call_started = "describe_drinky" });
     const describe: core.Tool.Call = .{ .id = "c2", .name = "describe_drinky", .arguments = "{}" };
@@ -1991,6 +2011,272 @@ test "a failed tool result keeps its sentence below the call row" {
     );
     try rig.apply(&.committed);
     try rig.end(&.{ .stopped = .complete });
+}
+
+test "pending and completed calls keep the draft and share the detail threshold" {
+    const gpa = std.testing.allocator;
+    for ([_]bool{ true, false }) |verbose| {
+        var rig: Rig = undefined;
+        rig.init();
+        defer rig.deinit();
+        if (!verbose) rig.screen.toggleVerbose();
+        try rig.screen.setDraft("draft");
+        try rig.start("prompt");
+        const call: core.Tool.Call = .{
+            .id = "bash",
+            .name = "bash",
+            .arguments = "{\"command\":\"git diff --check\\n  second\\n\\nlast-line\"}",
+        };
+        try rig.apply(&.{ .tool_call_started = call.name });
+        try rig.apply(&.{ .tool_started = call });
+        for (0..2) |stage| {
+            const desired: usize = if (stage == 0) 23 else 24;
+            for ([_]usize{ 40, 37, 36, 35, 25, 24 }) |columns| {
+                const indent = if (columns -| desired >= 13) desired else 0;
+                const painted = try rig.paintPlain(columns);
+                defer gpa.free(painted);
+                var lines = std.mem.splitSequence(u8, painted, "\r\n");
+                var command_seen = false;
+                while (lines.next()) |row| {
+                    if (std.mem.find(u8, row, "Command:") == null) continue;
+                    try std.testing.expect(std.mem.allEqual(u8, row[0..indent], ' '));
+                    try std.testing.expect(std.mem.startsWith(u8, row[indent..], "Command:"));
+                    command_seen = true;
+                    break;
+                }
+                try std.testing.expect(command_seen);
+                if (verbose) {
+                    try testing.expectContains(painted, "last-line");
+                } else {
+                    try std.testing.expect(std.mem.find(u8, painted, "last-line") == null);
+                }
+            }
+            rig.screen.toggleVerbose();
+            rig.screen.toggleVerbose();
+            const draft = try rig.screen.editor.expanded();
+            defer gpa.free(draft);
+            try std.testing.expectEqualStrings("draft", draft);
+            if (stage == 0) {
+                try std.testing.expect(rig.screen.widget == .turn);
+                try rig.apply(&.{ .tool_result = .{ .call = call, .output = .{} } });
+                try rig.apply(&.committed);
+                try rig.end(&.{ .stopped = .complete });
+            }
+        }
+    }
+}
+
+test "command previews follow the metadata column during and after a call" {
+    const gpa = std.testing.allocator;
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    rig.screen.toggleVerbose();
+    try rig.start("prompt");
+    const call: core.Tool.Call = .{
+        .id = "bash",
+        .name = "bash",
+        .arguments = "{\"command\":\"git status --short && sh scripts/check.sh\"}",
+    };
+    try rig.apply(&.{ .tool_call_started = "bash" });
+    try rig.apply(&.{ .tool_started = call });
+    const running = try rig.paintPlain(80);
+    defer gpa.free(running);
+    try testing.expectContains(
+        running,
+        "                       Command: git status --short && sh scripts/check.sh",
+    );
+    const running_narrow = try rig.paintPlain(40);
+    defer gpa.free(running_narrow);
+    try testing.expectContains(running_narrow, "                       Command: git sta…");
+
+    var output: core.Tool.Output = .{};
+    output.measures.put(.duration_ms, 2100);
+    output.measures.put(.exit_code, 0);
+    output.measures.put(.lines, 29);
+    try rig.apply(&.{ .tool_result = .{ .call = call, .output = output } });
+    try rig.apply(&.committed);
+    try rig.end(&.{ .stopped = .complete });
+    const complete = try rig.paintPlain(80);
+    defer gpa.free(complete);
+    try testing.expectContains(
+        complete,
+        "                        Command: git status --short && sh scripts/check.sh",
+    );
+    const complete_narrow = try rig.paintPlain(40);
+    defer gpa.free(complete_narrow);
+    try testing.expectContains(complete_narrow, "                        Command: git st…");
+
+    rig.screen.toggleVerbose();
+    const full = try rig.paintPlain(80);
+    defer gpa.free(full);
+    var rows = std.mem.splitSequence(u8, full, "\r\n");
+    var command_seen = false;
+    while (rows.next()) |row| {
+        if (!std.mem.startsWith(u8, row, "                        Command:")) continue;
+        try std.testing.expectEqualStrings(
+            "                        Command: git status --short && sh scripts/check.sh",
+            std.mem.trimEnd(u8, row, " "),
+        );
+        command_seen = true;
+    }
+    try std.testing.expect(command_seen);
+}
+
+test "command previews use one preview row and keep their complete text with verbose on" {
+    const gpa = std.testing.allocator;
+    const cases = [_]struct {
+        arguments: []const u8,
+        running_preview: []const u8,
+        preview: []const u8,
+        hidden: []const u8,
+    }{
+        .{
+            .arguments = "{\"command\":\"echo abcdefghijklmnopqrstuvwxyz0123456789\"}",
+            .running_preview = "Command: echo abcdefghijklmnopqr…",
+            .preview = "Command: echo abcdefghijklmnopqrs…",
+            .hidden = "rstuvwxyz0123456789",
+        },
+        .{
+            .arguments = "{\"command\":\"echo first\\nError: command text\\nlast-line\\n\"}",
+            .running_preview = "Command: echo first…",
+            .preview = "Command: echo first…",
+            .hidden = "last-line",
+        },
+        .{
+            .arguments = "{\"command\":\"echo 你好\\r\\nlast-line\"}",
+            .running_preview = "Command: echo 你好…",
+            .preview = "Command: echo 你好…",
+            .hidden = "last-line",
+        },
+    };
+    const sentence = "Drinky could not run the command because of error AccessDenied.";
+    for (cases) |case| {
+        var rig: Rig = undefined;
+        rig.init();
+        defer rig.deinit();
+        rig.screen.toggleVerbose();
+        try rig.start("prompt");
+        try rig.apply(&.{ .tool_call_started = "bash" });
+        const call: core.Tool.Call = .{
+            .id = "bash",
+            .name = "bash",
+            .arguments = case.arguments,
+        };
+        try rig.apply(&.{ .tool_started = call });
+        const running = try rig.paintPlain(56);
+        defer gpa.free(running);
+        try testing.expectContains(running, case.running_preview);
+        try std.testing.expect(std.mem.find(u8, running, case.hidden) == null);
+        try std.testing.expect(std.mem.find(u8, running, "Error: command text") == null);
+
+        var output: core.Tool.Output = .{ .content = sentence };
+        output.conditions.insert(.failed);
+        try rig.apply(&.{ .tool_result = .{ .call = call, .output = output } });
+        try rig.apply(&.committed);
+        try rig.end(&.{ .stopped = .complete });
+        const complete = try rig.paintPlain(56);
+        defer gpa.free(complete);
+        try testing.expectContains(complete, case.preview);
+        try testing.expectContains(complete, "AccessDenied.");
+        try std.testing.expect(std.mem.find(u8, complete, case.hidden) == null);
+        try std.testing.expect(std.mem.find(u8, complete, "Error: command text") == null);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, complete, "Command:"));
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, complete, "Error:"));
+        try testing.expectContains(rig.out.written(), "\x1b[2;39mCommand:");
+        try testing.expectContains(
+            rig.out.written(),
+            "\x1b[0m\r\n                      \x1b[2;39mError: Drinky",
+        );
+
+        rig.screen.toggleVerbose();
+        const full = try rig.paintPlain(100);
+        defer gpa.free(full);
+        try testing.expectContains(full, case.hidden);
+        try testing.expectContains(full, sentence);
+        try std.testing.expect(std.mem.find(u8, full, "…") == null);
+        try testing.expectContains(rig.out.written(), "\x1b[31m\x1b[2mTool: bash (failed)");
+        try testing.expectContains(rig.out.written(), "\x1b[2;39mCommand:");
+        try std.testing.expect(std.mem.find(u8, rig.out.written(), "\x1b[7m") == null);
+        if (std.mem.find(u8, case.arguments, "Error:") != null)
+            try testing.expectContains(rig.out.written(), "\x1b[2;39mError: command text");
+
+        rig.screen.toggleVerbose();
+        const restored = try rig.paintPlain(56);
+        defer gpa.free(restored);
+        try testing.expectContains(restored, case.preview);
+        try std.testing.expect(std.mem.find(u8, restored, case.hidden) == null);
+    }
+}
+
+test "tool results dim and color their complete identities and mute their metadata" {
+    const cases = [_]struct {
+        condition: ?core.Tool.Condition,
+        state: []const u8,
+        color: []const u8,
+    }{
+        .{ .condition = null, .state = "complete", .color = "\x1b[32m" },
+        .{ .condition = .incomplete, .state = "limited", .color = "\x1b[33m" },
+        .{ .condition = .failed, .state = "failed", .color = "\x1b[31m" },
+    };
+    for (cases) |case| {
+        var rig: Rig = undefined;
+        rig.init();
+        defer rig.deinit();
+        rig.screen.toggleVerbose();
+        try rig.start("prompt");
+        try rig.apply(&.{ .tool_call_started = "read" });
+        const call: core.Tool.Call = .{
+            .id = "read",
+            .name = "read",
+            .arguments = "{\"path\":\"a.zig\"}",
+        };
+        try rig.apply(&.{ .tool_started = call });
+        var output: core.Tool.Output = .{};
+        output.measures.put(.lines, 1);
+        if (case.condition) |condition| output.conditions.insert(condition);
+        try rig.apply(&.{ .tool_result = .{ .call = call, .output = output } });
+        try rig.apply(&.committed);
+        try rig.end(&.{ .stopped = .complete });
+        const plain = try rig.paintPlain(80);
+        defer std.testing.allocator.free(plain);
+        const identity = try std.testing.allocator.print(
+            "{s}\x1b[2mTool: read ({s})\x1b[0m",
+            .{ case.color, case.state },
+        );
+        defer std.testing.allocator.free(identity);
+        try testing.expectContains(rig.out.written(), identity);
+        try testing.expectContains(rig.out.written(), "\x1b[2;39m · File: a.zig");
+        try std.testing.expect(std.mem.find(u8, rig.out.written(), "\x1b[32;7m") == null);
+        try std.testing.expect(std.mem.find(u8, rig.out.written(), "\x1b[31;7m") == null);
+
+        const narrow = try rig.paintPlain(1);
+        defer std.testing.allocator.free(narrow);
+        const ellipsis = try std.testing.allocator.print("{s}\x1b[2m…", .{case.color});
+        defer std.testing.allocator.free(ellipsis);
+        try testing.expectContains(rig.out.written(), ellipsis);
+    }
+}
+
+test "active calls dim and color their complete identities" {
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    rig.screen.toggleVerbose();
+    try rig.start("prompt");
+    try rig.apply(&.{ .tool_call_started = "read" });
+    try rig.apply(&.{ .tool_call_arguments = "{}" });
+    try rig.apply(&.{ .tool_call_started = "write" });
+    const queued = try rig.paintPlain(80);
+    defer std.testing.allocator.free(queued);
+    try testing.expectContains(rig.out.written(), "\x1b[36m\x1b[2mTool: read (queued)\x1b[0m");
+    try testing.expectContains(rig.out.written(), "\x1b[36m\x1b[2mTool: write (streaming)\x1b[0m");
+    try std.testing.expect(std.mem.find(u8, rig.out.written(), "\x1b[36;7m") == null);
+    try rig.apply(&.{ .tool_started = .{ .id = "read", .name = "read", .arguments = "{}" } });
+    const running = try rig.paintPlain(80);
+    defer std.testing.allocator.free(running);
+    try testing.expectContains(rig.out.written(), "\x1b[36m\x1b[2mTool: read (running)\x1b[0m");
+    try std.testing.expect(std.mem.find(u8, rig.out.written(), "\x1b[36;7m") == null);
 }
 
 test "queued calls read as queued until each one runs" {
@@ -2028,11 +2314,11 @@ test "queued calls read as queued until each one runs" {
 }
 
 test "a reasoning discard keeps a retained call result that arrived after the reasoning" {
-    for ([_]ui.Block.Mode{ .full, .compact }) |mode| {
+    for ([_]bool{ true, false }) |verbose| {
         var rig: Rig = undefined;
         rig.init();
         defer rig.deinit();
-        if (mode == .compact) rig.screen.toggleTranscript();
+        if (!verbose) rig.screen.toggleVerbose();
         try rig.start("prompt");
         try rig.apply(&.reasoning_started);
         try rig.apply(&.{ .tool_call_started = "write" });

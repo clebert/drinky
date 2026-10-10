@@ -11,6 +11,8 @@ const mebibyte = 1024 * 1024;
 pub const Line = struct {
     text: []u8,
     segment_ends: []usize,
+    status: ui.paint.Mark,
+    command: ?ui.paint.Box.Range,
 
     pub fn deinit(self: *const Line, gpa: std.mem.Allocator) void {
         gpa.free(self.text);
@@ -19,6 +21,8 @@ pub const Line = struct {
 };
 
 pub const Phase = enum { streaming, queued, running };
+
+const State = enum { streaming, queued, running, complete, limited, failed };
 
 pub const Options = struct {
     name: []const u8,
@@ -35,6 +39,8 @@ const Parts = struct {
     gpa: std.mem.Allocator,
     writer: *std.Io.Writer,
     segment_ends: *std.ArrayList(usize),
+    status: ui.paint.Mark = undefined,
+    command: ?ui.paint.Box.Range = null,
 
     fn print(self: *Parts, comptime template: []const u8, args: anytype) !void {
         if (self.segment_ends.items.len > 0) try self.writer.writeAll(ui.paint.separator);
@@ -77,21 +83,42 @@ pub fn render(gpa: std.mem.Allocator, options: *const Options) error{OutOfMemory
     write(&parts, options) catch return error.OutOfMemory;
     const text = try out.toOwnedSlice();
     errdefer gpa.free(text);
-    return .{ .text = text, .segment_ends = try ends.toOwnedSlice(gpa) };
+    return .{
+        .text = text,
+        .segment_ends = try ends.toOwnedSlice(gpa),
+        .status = parts.status,
+        .command = parts.command,
+    };
 }
 
 fn write(parts: *Parts, options: *const Options) !void {
-    const state: []const u8 = if (options.output) |output| state: {
-        if (output.hasFailure()) break :state "failed";
+    const state: State = if (options.output) |output| state: {
+        if (output.hasFailure()) break :state .failed;
         const lines_total = output.measures.get(.lines_total) orelse 0;
         const lines = output.measures.get(.lines) orelse lines_total;
         const omitted = output.measures.get(.matches_omitted) orelse 0;
         const limited = output.conditions.count() > 0 or omitted > 0 or lines < lines_total;
-        break :state if (limited) "limited" else "complete";
-    } else @tagName(options.phase);
+        break :state if (limited) .limited else .complete;
+    } else switch (options.phase) {
+        .streaming => .streaming,
+        .queued => .queued,
+        .running => .running,
+    };
     const name = try parts.gpa.dupe(u8, options.name);
     defer parts.gpa.free(name);
-    try parts.print("Tool: {s} ({s})", .{ ui.paint.singleLine(name), state });
+    const shown_name = ui.paint.singleLine(name);
+    try parts.print("Tool: {s} ({s})", .{ shown_name, @tagName(state) });
+    parts.status = .{
+        .start = 0,
+        .end = parts.writer.buffered().len,
+        .dim = true,
+        .role = switch (state) {
+            .streaming, .queued, .running => .activity,
+            .complete => .success,
+            .limited => .warning,
+            .failed => .@"error",
+        },
+    };
     if (options.elapsed_ms) |elapsed_ms| {
         var buffer: [24]u8 = undefined;
         try parts.print("Time: {s}", .{format.durationSeconds(&buffer, elapsed_ms, .down)});
@@ -142,7 +169,11 @@ fn write(parts: *Parts, options: *const Options) !void {
             format.durationSeconds(&buffer, @intCast(timeout_ms), .up),
         });
     }
-    if (command) try parts.writer.print("\n{s}", .{options.subject});
+    if (command) {
+        const start = parts.writer.buffered().len + 1;
+        try parts.writer.print("\n{s}", .{options.subject});
+        parts.command = .{ .start = start, .end = parts.writer.buffered().len };
+    }
     if (options.output) |output| {
         if (output.hasFailure() and output.measures.count() == 0) {
             try parts.writer.print("\nError: {s}", .{output.content});

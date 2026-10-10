@@ -57,9 +57,9 @@ pub fn beginThinking(self: *Transcript, thinking: *const ui.Block.Thinking) !usi
     return index;
 }
 
-pub fn present(self: *Transcript, mode: ui.Block.Mode, now_ms: i64) void {
-    for (self.block_list.items) |*block| block.present(mode);
-    if (mode == .full) return;
+pub fn present(self: *Transcript, verbose: bool, now_ms: i64) void {
+    for (self.block_list.items) |*block| block.present(verbose);
+    if (verbose) return;
     var index: usize = 0;
     while (index < self.block_list.items.len) {
         const first = &self.block_list.items[index];

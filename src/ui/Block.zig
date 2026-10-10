@@ -15,11 +15,9 @@ const Block = @This();
 
 content: Content,
 cache: Cache = .{},
-mode: Mode = .full,
+verbose: bool = true,
 thinking: ?Thinking = null,
 segment_ends: std.ArrayList(usize) = .empty,
-
-pub const Mode = enum { full, compact };
 
 pub const Thinking = struct {
     started_ms: i64 = 0,
@@ -74,13 +72,15 @@ pub const Note = struct {
 
 const ToolResult = struct {
     text: std.ArrayList(u8),
-    failed: bool,
+    status: paint.Mark,
+    command: ?paint.Box.Range,
     survives_discard: bool = false,
 
     const Payload = struct {
         text: []const u8,
-        failed: bool = false,
         segment_ends: []const usize = &.{},
+        status: paint.Mark = .{ .start = 0, .end = 0, .role = .text },
+        command: ?paint.Box.Range = null,
     };
 };
 
@@ -161,7 +161,8 @@ pub fn init(gpa: std.mem.Allocator, source: *const Source) !Block {
         .content = switch (source.*) {
             .tool_result => |*result| .{ .tool_result = .{
                 .text = try copy(gpa, result.text),
-                .failed = result.failed,
+                .status = result.status,
+                .command = result.command,
             } },
             .user_note => |*note| .{ .user_note = try copy(gpa, note.text) },
             .event => |*event| .{ .event = try Event.init(gpa, event) },
@@ -226,9 +227,9 @@ pub fn survivesDiscard(self: *const Block) bool {
     };
 }
 
-pub fn present(self: *Block, mode: Mode) void {
-    if (self.mode == mode) return;
-    self.mode = mode;
+pub fn present(self: *Block, verbose: bool) void {
+    if (self.verbose == verbose) return;
+    self.verbose = verbose;
     self.cache.forget();
 }
 
@@ -260,7 +261,6 @@ pub fn presentThinking(self: *Block, maybe_summary: ?*const Thinking.Summary) vo
 }
 
 fn look(self: *const Block) Look {
-    const compact = self.mode == .compact;
     return switch (self.content) {
         .intro => |list| .{ .caption = .{
             .title = "Drinky",
@@ -269,7 +269,7 @@ fn look(self: *const Block) Look {
         } },
         .user => |list| .{ .box = .{
             .role = .user,
-            .body = .{ .text = list.items, .compact = compact },
+            .body = .{ .text = list.items },
         } },
         .user_note => |list| .{ .notice = .{
             .style = .{
@@ -280,27 +280,33 @@ fn look(self: *const Block) Look {
             },
             .text = list.items,
         } },
-        .thinking => |list| if (compact) .{ .box = .{
-            .role = switch (self.thinking.?.summary_status) {
-                .streaming, .canceled => .tool_pending,
-                .complete => .tool_success,
-                .failed, .truncated => .tool_error,
-            },
+        .thinking => |list| if (!self.verbose) .{ .box = .{
+            .role = .text,
             .body = .{
                 .text = self.thinking.?.summary[0..self.thinking.?.summary_length],
                 .segment_ends = &self.thinking.?.summary_ends,
-                .compact = true,
-                .emphasis = .first_value,
+                .status = .{
+                    .start = 0,
+                    .end = self.thinking.?.summary_ends[0],
+                    .dim = true,
+                    .role = switch (self.thinking.?.summary_status) {
+                        .streaming => .activity,
+                        .complete => .success,
+                        .canceled, .truncated => .warning,
+                        .failed => .@"error",
+                    },
+                },
             },
         } } else .{ .markdown = .{ .role = .muted, .text = trimBlank(list.items) } },
         .model => |list| .{ .markdown = .{ .role = null, .text = trimBlank(list.items) } },
         .tool_result => |*result| .{ .box = .{
-            .role = if (result.failed) .tool_error else .tool_success,
+            .role = .text,
             .body = .{
                 .text = result.text.items,
                 .segment_ends = self.segment_ends.items,
-                .emphasis = .first_value,
-                .compact = compact,
+                .verbose = self.verbose,
+                .status = result.status,
+                .command = result.command,
             },
         } },
         .event => |*event| .{ .notice = .{
@@ -312,10 +318,10 @@ fn look(self: *const Block) Look {
 
 fn isHidden(self: *const Block) bool {
     if (self.thinking == null) return false;
-    return switch (self.mode) {
-        .full => paint.isBlank(self.content.thinking.items),
-        .compact => self.thinking.?.hidden,
-    };
+    return if (self.verbose)
+        paint.isBlank(self.content.thinking.items)
+    else
+        self.thinking.?.hidden;
 }
 
 pub fn rows(self: *const Block, columns: usize) usize {
@@ -391,11 +397,9 @@ test "each block variant renders exactly the rows it counts" {
         .{ .thinking = markdown_reply },
         .{ .tool_result = .{
             .text = "Tool: read (failed)\nError: Drinky could not read foo.zig.",
-            .failed = true,
         } },
         .{ .tool_result = .{
             .text = "Tool: bash · Command: ls\nTime: 400ms · Exit code: 1",
-            .failed = true,
         } },
         .{ .tool_result = .{ .text = "Tool: describe_drinky" } },
         .{ .user = "你好世界" },
@@ -505,7 +509,114 @@ test "a streamed block keeps the indentation of the first line it shows" {
     try std.testing.expectEqualStrings("    - nested item", plain);
 }
 
-test "no box carries a pad, so a copy of the rows lines up" {
+test "user messages preserve blank lines and indentation in normal purple text" {
+    const gpa = std.testing.allocator;
+    for ([_]bool{ true, false }) |verbose| {
+        var block = try Block.init(gpa, &.{ .user = "\n  first\n\n    last\n" });
+        defer block.deinit(gpa);
+        block.present(verbose);
+        const painted = try rendered(gpa, &block, 20, 0);
+        defer gpa.free(painted);
+        const plain = try terminal.testing.plainText(gpa, painted);
+        defer gpa.free(plain);
+        var lines = std.mem.splitSequence(u8, plain, "\r\n");
+        for ([_][]const u8{ "", "  first", "", "    last", "" }) |expected|
+            try std.testing.expectEqualStrings(expected, std.mem.trimEnd(u8, lines.next().?, " "));
+        try std.testing.expect(lines.next() == null);
+        try testing.expectShows(painted, &.{"\x1b[35m  first"});
+        try testing.expectHides(painted, &.{ "\x1b[7m", "\x1b[2m", "\x1b[2;39m" });
+        try std.testing.expectEqual(@as(usize, 5), block.rows(20));
+    }
+}
+
+test "command ranges keep every detail aligned through wrapping replay and clipping" {
+    const gpa = std.testing.allocator;
+    const command = "Command: git diff --check\n  你好👩‍💻 tail\n\nError: command text\nlast-line\n";
+    const detail = "Error: Drinky could not run the command because of error AccessDenied.";
+    for ([_]bool{ true, false }) |verbose| {
+        for ([_][]const u8{ "Tool: bash (complete)", "Tool: 読む (complete)" }) |identity| {
+            const head = try gpa.print("{s} · File: a/very/long/path.zig", .{identity});
+            defer gpa.free(head);
+            const text = try gpa.print("{s}\n{s}\n{s}", .{ head, command, detail });
+            defer gpa.free(text);
+            var block = try Block.init(gpa, &.{ .tool_result = .{
+                .text = text,
+                .segment_ends = &.{ identity.len, head.len },
+                .status = .{ .start = 0, .end = identity.len, .role = .success, .dim = true },
+                .command = .{ .start = head.len + 1, .end = head.len + 1 + command.len },
+            } });
+            defer block.deinit(gpa);
+            block.present(verbose);
+            for ([_]usize{ 100, 40, 37, 36, 25, 24, 9, 1 }) |columns| {
+                const indent: usize = if (columns >= 37) 24 else 0;
+                const room = columns - indent;
+                const command_rows = if (verbose) terminal.width.rows(command, room) else 1;
+                const expected_rows = 1 + command_rows + terminal.width.rows(detail, room);
+                const painted = try rendered(gpa, &block, columns, 0);
+                defer gpa.free(painted);
+                try std.testing.expectEqual(expected_rows, block.rows(columns));
+                try std.testing.expectEqual(expected_rows, testing.paintedRows(painted));
+                var styled = std.mem.splitSequence(u8, painted, "\r\n");
+                _ = styled.next().?;
+                while (styled.next()) |row|
+                    try testing.expectShows(row, &.{"\x1b[2;39m"});
+                const plain = try terminal.testing.plainText(gpa, painted);
+                defer gpa.free(plain);
+                var lines = std.mem.splitSequence(u8, plain, "\r\n");
+                const header = lines.next().?;
+                if (columns == 37) try testing.expectHides(header, &.{"File:"});
+                var restored_error: std.ArrayList(u8) = .empty;
+                defer restored_error.deinit(gpa);
+                var index: usize = 0;
+                while (lines.next()) |row| : (index += 1) {
+                    try std.testing.expect(std.mem.allEqual(u8, row[0..indent], ' '));
+                    try std.testing.expect(terminal.width.ofText(row) <= columns);
+                    if (index < command_rows) continue;
+                    for (row[indent..]) |byte|
+                        if (byte != ' ') try restored_error.append(gpa, byte);
+                }
+                try std.testing.expectEqualStrings(
+                    "Error:DrinkycouldnotrunthecommandbecauseoferrorAccessDenied.",
+                    restored_error.items,
+                );
+                if (columns == 100) {
+                    try testing.expectShows(painted, &.{"\x1b[2;39mCommand:"});
+                    try testing.expectShows(painted, &.{
+                        "\x1b[0m\r\n                        \x1b[2;39mError: Drinky",
+                    });
+                    if (verbose) {
+                        try testing.expectShows(painted, &.{
+                            "\x1b[2;39m  你好👩‍💻 tail",
+                            "\x1b[2;39mError: command text",
+                            "\x1b[2;39mlast-line",
+                        });
+                    } else {
+                        try testing.expectHides(plain, &.{ "Error: command text", "last-line" });
+                    }
+                }
+                const replayed = try rendered(gpa, &block, columns, 0);
+                defer gpa.free(replayed);
+                try std.testing.expectEqualStrings(painted, replayed);
+                const clipped = try rendered(gpa, &block, columns, 2);
+                defer gpa.free(clipped);
+                try std.testing.expectEqual(expected_rows - 2, testing.paintedRows(clipped));
+                var fresh = try Block.init(gpa, &.{ .tool_result = .{
+                    .text = text,
+                    .segment_ends = &.{ identity.len, head.len },
+                    .status = .{ .start = 0, .end = identity.len, .role = .success, .dim = true },
+                    .command = .{ .start = head.len + 1, .end = head.len + 1 + command.len },
+                } });
+                defer fresh.deinit(gpa);
+                fresh.present(verbose);
+                const clipped_fresh = try rendered(gpa, &fresh, columns, 2);
+                defer gpa.free(clipped_fresh);
+                try std.testing.expectEqualStrings(clipped_fresh, clipped);
+            }
+        }
+    }
+}
+
+test "user and thinking rows start at the left edge" {
     const gpa = std.testing.allocator;
     var rig: testing.Rig = undefined;
     rig.init(gpa);
@@ -529,20 +640,19 @@ test "no box carries a pad, so a copy of the rows lines up" {
     try expectRowOpensOnText(painted, "reasoning that wraps");
 }
 
-test "a tool box removes optional metadata and wraps its complete error in both modes" {
+test "a tool box removes optional metadata and wraps its complete error in both verbosity states" {
     const gpa = std.testing.allocator;
     const columns = 20;
     const identity = "Tool: edit (failed)";
     const head = identity ++ " · File: a.zig";
     const detail = "Error: Drinky found old_text more than once. Add more text around it.";
-    for ([_]Mode{ .full, .compact }) |mode| {
+    for ([_]bool{ true, false }) |verbose| {
         var block = try Block.init(gpa, &.{ .tool_result = .{
             .text = head ++ "\n" ++ detail,
-            .failed = true,
             .segment_ends = &.{ identity.len, head.len },
         } });
         defer block.deinit(gpa);
-        block.present(mode);
+        block.present(verbose);
         const painted = try rendered(gpa, &block, columns, 0);
         defer gpa.free(painted);
         const plain = try terminal.testing.plainText(gpa, painted);
@@ -550,6 +660,61 @@ test "a tool box removes optional metadata and wraps its complete error in both 
         try testing.expectShows(plain, &.{ identity, "around it." });
         try testing.expectHides(plain, &.{ "File:", "\u{2026}" });
         try std.testing.expectEqual(block.rows(columns), testing.paintedRows(painted));
+    }
+}
+
+test "tool errors stay dim with red identities and complete text across terminal widths" {
+    const gpa = std.testing.allocator;
+    const detail = "Error: Drinky could not read the file because of error AccessDenied.";
+    for ([_]bool{ true, false }) |verbose| {
+        for ([_][]const u8{ "Tool: read (failed)", "Tool: 読む (failed)" }) |identity| {
+            const head = try gpa.print("{s} · File: src/App.zig", .{identity});
+            defer gpa.free(head);
+            const text = try gpa.print("{s}\n{s}", .{ head, detail });
+            defer gpa.free(text);
+            var block = try Block.init(gpa, &.{ .tool_result = .{
+                .text = text,
+                .segment_ends = &.{ identity.len, head.len },
+                .status = .{ .start = 0, .end = identity.len, .role = .@"error", .dim = true },
+            } });
+            defer block.deinit(gpa);
+            block.present(verbose);
+            const widths = [_]usize{ 80, 40, 35, 34, 25, 23, 22, 20, 1 };
+            for (widths) |columns| {
+                const indent: usize = if (columns >= 35) 22 else 0;
+                const painted = try rendered(gpa, &block, columns, 0);
+                defer gpa.free(painted);
+                var styled = std.mem.splitSequence(u8, painted, "\r\n");
+                try testing.expectShows(styled.next().?, &.{"\x1b[31m\x1b[2m"});
+                while (styled.next()) |row|
+                    try testing.expectShows(row, &.{"\x1b[2;39m"});
+                const plain = try terminal.testing.plainText(gpa, painted);
+                defer gpa.free(plain);
+                if (columns == 80) try testing.expectShows(plain, &.{
+                    "                      Error: Drinky",
+                });
+                var restored: std.ArrayList(u8) = .empty;
+                defer restored.deinit(gpa);
+                var lines = std.mem.splitSequence(u8, plain, "\r\n");
+                _ = lines.next().?;
+                while (lines.next()) |row| {
+                    try std.testing.expect(row.len >= indent);
+                    try std.testing.expect(std.mem.allEqual(u8, row[0..indent], ' '));
+                    try std.testing.expect(terminal.width.ofText(row) <= columns);
+                    for (row[indent..]) |byte| if (byte != ' ') try restored.append(gpa, byte);
+                }
+                try std.testing.expectEqualStrings(
+                    "Error:DrinkycouldnotreadthefilebecauseoferrorAccessDenied.",
+                    restored.items,
+                );
+                const expected_rows = 1 + terminal.width.rows(detail, columns - indent);
+                try std.testing.expectEqual(expected_rows, block.rows(columns));
+                try std.testing.expectEqual(expected_rows, testing.paintedRows(painted));
+                const clipped = try rendered(gpa, &block, columns, 2);
+                defer gpa.free(clipped);
+                try std.testing.expectEqual(expected_rows - 2, testing.paintedRows(clipped));
+            }
+        }
     }
 }
 
@@ -639,10 +804,10 @@ test "each block kind paints in the role of its kind" {
             .role = .@"error",
         },
         .{ .source = .{ .user = "one line" }, .role = .user },
-        .{ .source = .{ .tool_result = .{ .text = "one line" } }, .role = .tool_success },
+        .{ .source = .{ .tool_result = .{ .text = "one line" } }, .role = .text },
         .{
-            .source = .{ .tool_result = .{ .text = "one line", .failed = true } },
-            .role = .tool_error,
+            .source = .{ .tool_result = .{ .text = "one line" } },
+            .role = .text,
         },
         .{ .source = .{ .thinking = "one line" }, .role = .muted },
         .{ .source = .{ .model = "one line" }, .role = null },
@@ -737,7 +902,7 @@ test "thinking summaries keep time before bytes and reduce to one row" {
     const gpa = std.testing.allocator;
     var block = try Block.init(gpa, &.{ .thinking = "original thinking" });
     defer block.deinit(gpa);
-    block.present(.compact);
+    block.present(false);
     block.presentThinking(&.{ .bytes = 1024, .elapsed_ms = 3_000, .status = .complete });
     const cases = [_]struct { columns: usize, expected: []const u8 }{
         .{
@@ -756,6 +921,11 @@ test "thinking summaries keep time before bytes and reduce to one row" {
         const plain = try terminal.testing.plainText(gpa, painted);
         defer gpa.free(plain);
         try std.testing.expectEqualStrings(case.expected, std.mem.trimEnd(u8, plain, " "));
+        if (case.columns == 1) {
+            try testing.expectShows(painted, &.{"\x1b[32m\x1b[2m…"});
+        } else {
+            try testing.expectShows(painted, &.{"\x1b[32m\x1b[2mAgent: thinking"});
+        }
         try std.testing.expectEqual(@as(usize, 1), block.rows(case.columns));
         try std.testing.expectEqual(@as(usize, 1), testing.paintedRows(painted));
     }
@@ -779,10 +949,10 @@ test "user notes keep one row while session events can use multiple rows" {
         .severity = .failure,
     } });
     defer event.deinit(gpa);
-    for ([_]Mode{ .full, .compact }) |mode| {
-        note.present(mode);
-        sentence.present(mode);
-        event.present(mode);
+    for ([_]bool{ true, false }) |verbose| {
+        note.present(verbose);
+        sentence.present(verbose);
+        event.present(verbose);
         const painted = try rendered(gpa, &note, 40, 0);
         defer gpa.free(painted);
         const plain = try terminal.testing.plainText(gpa, painted);
@@ -810,7 +980,7 @@ test "metadata truncates only its mandatory segment across narrow Unicode widths
         .segment_ends = &.{ identity.len, file.len, text.len },
     } });
     defer block.deinit(gpa);
-    block.present(.compact);
+    block.present(false);
     for (1..80) |columns| {
         const painted = try rendered(gpa, &block, columns, 0);
         defer gpa.free(painted);

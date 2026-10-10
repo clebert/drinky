@@ -52,9 +52,8 @@ Drinky is not affiliated with the providers.
 
 ## Transcript
 
-Full mode shows the thinking text. Compact mode shows `Agent: thinking (state)` summaries and
-removes box padding. Use `/compact` to switch modes. Tool metadata fits the terminal width. Bash
-commands and tool error sentences wrap below it.
+The transcript uses one style without backgrounds. Use `/verbose` to toggle thinking text and
+complete bash commands. Verbose starts on by default.
 
 The status line shows context use and estimated session cost. The estimate uses public rates or the
 charge that the provider reports. The estimate is not a bill.

@@ -20,7 +20,6 @@ pub const Scene = union(enum) {
     const Conversation = struct {
         window_pages: usize,
         repaint: bool = false,
-        mode: ui.Block.Mode = .full,
         transcript: []ui.Block,
         tail: Tail,
         status: *const ui.status.Info,
@@ -108,7 +107,7 @@ const Component = union(enum) {
     ) !void {
         switch (self.*) {
             .block => |block| try block.render(gpa, placement),
-            .tool_box => |box| try ui.paint.box(placement, .tool_pending, &box),
+            .tool_box => |box| try ui.paint.box(placement, .text, &box),
             .status => |info| try ui.status.render(placement, info),
             .editor => |presentation| try presentation.render(placement, viewport_rows),
             .picker => |picking| try picking.picker.render(placement, &.{
@@ -173,10 +172,10 @@ fn projectConversation(
     var repaint = scene.repaint;
     const epoch = view.resetEpoch();
     for (0..start) |index| if (slotRewritten(scene, index, epoch)) {
-        if (scene.mode == .compact) repaint = true else view.resetScreen();
+        repaint = true;
     };
     if (skip > 0 and slotRewritten(scene, start, epoch)) {
-        if (scene.mode == .compact) repaint = true else view.resetScreen();
+        repaint = true;
     }
     var measured_all = scene.repaint;
     for (0..2) |_| {
@@ -212,7 +211,7 @@ fn projectConversation(
             }
             try slot.component.render(gpa, &placement, size.rows);
         }
-        if (scene.mode == .compact and !repaint and view.repaintRequired()) {
+        if (!repaint and view.repaintRequired()) {
             repaint = true;
             continue;
         }
@@ -321,13 +320,12 @@ test "projection stacks the transcript above the tail, newest at the bottom" {
     try std.testing.expect(ui.testing.paintedRows(painted) < 24);
 }
 
-test "compact user boxes keep the gap before a model answer" {
+test "user messages keep the gap before a model answer" {
     const gpa = std.testing.allocator;
     var rig: Rig = .init();
     defer rig.deinit();
     try rig.add(&.{ .user = "prompt" });
     try rig.add(&.{ .model = "answer" });
-    for (rig.blocks.items) |*block| block.present(.compact);
     const scene = rig.prompt(&.{});
     const painted = try projected(gpa, .{ .columns = 20, .rows = 24 }, &scene);
     defer gpa.free(painted);
@@ -610,7 +608,7 @@ fn resetSince(written: []const u8, painted: usize) bool {
     return std.mem.find(u8, written[painted..], terminal.escape.screen_reset) != null;
 }
 
-test "a block that changes above the window forces a reset" {
+test "a block rewrite above the window repaints the complete transcript" {
     const gpa = std.testing.allocator;
     var rig: Rig = .init();
     defer rig.deinit();
@@ -645,7 +643,8 @@ test "a block that changes above the window forces a reset" {
     try rig.blocks.items[0].replaceEvent(gpa, &.{ .text = "changed again" });
     painted = screen.out.written().len;
     try project(gpa, &screen.view, size, &slid);
-    try std.testing.expect(!resetSince(screen.out.written(), painted));
+    try std.testing.expect(resetSince(screen.out.written(), painted));
+    try ui.testing.expectShows(screen.out.written()[painted..], &.{ "changed again", "block0" });
 
     var reply = try ui.testing.numberedLines(gpa, 20);
     defer reply.deinit(gpa);
@@ -679,7 +678,7 @@ test "a block that changes above the window forces a reset" {
     try std.testing.expect(!resetSince(fresh_screen.out.written(), painted));
 }
 
-test "a tool box that changes above the window forces a reset" {
+test "a tool rewrite above the window repaints the complete transcript" {
     const gpa = std.testing.allocator;
     var rig: Rig = .init();
     defer rig.deinit();
@@ -715,6 +714,7 @@ test "a tool box that changes above the window forces a reset" {
     painted = screen.out.written().len;
     try project(gpa, &screen.view, size, &scene);
     try std.testing.expect(resetSince(screen.out.written(), painted));
+    tracks[0].changed = false;
     for (0..3) |_| {
         painted = screen.out.written().len;
         try project(gpa, &screen.view, size, &scene);

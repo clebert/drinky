@@ -325,7 +325,7 @@ pub fn init(self: *App, gpa: std.mem.Allocator, io: std.Io, options: *const Opti
     errdefer self.screen.deinit();
     self.screen.bash_timeout_ms = harness.config.bash.timeout_ms;
     self.screen.window_pages = harness.config.window_pages;
-    self.screen.transcript_mode = harness.config.transcript_mode;
+    self.screen.verbose = harness.config.verbose;
     self.screen.gauge = harness.config.gauge;
     self.screen.display_roots = .{
         .working_directory = cwd,
@@ -981,7 +981,7 @@ fn applySubmittedCommand(
 ) !void {
     switch (outcome.*) {
         .prompt => |*prompt| return self.submitSkill(prompt, line),
-        .toggle_compact => {
+        .toggle_verbose => {
             try self.applyOutcome(outcome);
             self.screen.editor.clear();
             return;
@@ -1402,18 +1402,11 @@ fn applyOutcome(self: *App, outcome: *const command.Context.Outcome) !void {
             self.screen.clearConversation();
             try self.screen.appendIntro(intro_text);
         },
-        .toggle_compact => {
-            const next: ui.Block.Mode = switch (self.screen.transcript_mode) {
-                .full => .compact,
-                .compact => .full,
-            };
-            try self.reportNotice(.information, "{s} transcript mode is active.", .{
-                switch (next) {
-                    .full => "Full",
-                    .compact => "Compact",
-                },
+        .toggle_verbose => {
+            try self.reportNotice(.information, "Verbose output is {s}.", .{
+                if (self.screen.verbose) "off" else "on",
             });
-            self.screen.toggleTranscript();
+            self.screen.toggleVerbose();
             return;
         },
         .rewind => |turn| try self.rewind(turn),
@@ -2581,29 +2574,79 @@ test "/new clears the conversation, and the next request starts fresh" {
     try expectRequested(&rig, "\"text\":\"second\"");
 }
 
-test "compact uses the startup config and toggles during a turn without sending a message" {
+test "startup verbosity selects thinking text or summaries at the terminal boundary" {
+    const body = "data: {\"type\":\"response.reasoning_summary_text.delta\"," ++
+        "\"item_id\":\"rs_1\",\"summary_index\":0,\"delta\":\"visible thinking\"}\n\n" ++
+        "data: {\"type\":\"response.output_item.done\",\"item\":" ++
+        "{\"type\":\"reasoning\",\"id\":\"rs_1\",\"summary\":[{\"type\":\"summary_text\"," ++
+        "\"text\":\"visible thinking\"}],\"encrypted_content\":\"proof\"}}\n\n" ++
+        providers.testing.reply_stream;
+    const cases = [_]struct { config: []const u8, verbose: bool }{
+        .{ .config = "{}", .verbose = true },
+        .{ .config = "{\"interface\":{\"verbose\":true}}", .verbose = true },
+        .{ .config = "{\"interface\":{\"verbose\":false}}", .verbose = false },
+    };
+    for (cases) |case| {
+        var rig: Rig = undefined;
+        try rig.init(&.{
+            .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+            .config = case.config,
+            .replies = &.{.{ .body = body }},
+            .model = "gpt-5.6-sol",
+        });
+        defer rig.deinit();
+        try rig.keys("hello\r");
+        const shown = if (case.verbose) "visible thinking" else "Agent: thinking (complete)";
+        const hidden = if (case.verbose) "Agent: thinking" else "visible thinking";
+        try rig.waitFor(&.{
+            .{ .rows = &.{ "hello", shown, "done" } },
+            .{ .absent = hidden },
+            .{ .activity = false },
+        });
+        try rig.keys("/verbose\r");
+        try rig.waitFor(&.{
+            .{ .rows = &.{ "hello", hidden, "done" } },
+            .{ .absent = shown },
+            .{ .editor = "" },
+            .{ .activity = false },
+        });
+        try rig.keys("/rewind\r");
+        try rig.waitFor(&.{.{ .text = rewind_picker }});
+        try rig.keys("\r");
+        try rig.waitFor(&.{
+            .{ .absent = "visible thinking" },
+            .{ .absent = "Agent: thinking" },
+            .{ .absent = "done" },
+            .{ .editor = "hello" },
+        });
+        try std.testing.expectEqual(@as(usize, 1), rig.transport.requests.items.len);
+    }
+}
+
+test "verbose uses the startup config and toggles during a turn without sending a message" {
     var hold: providers.testing.FakeTransport.Hold = .{ .io = std.testing.io };
     var rig: Rig = undefined;
     try rig.init(&.{
         .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
-        .config = "{\"interface\":{\"transcript_mode\":\"compact\"}}",
+        .config = "{\"interface\":{\"verbose\":false}}",
         .replies = &.{.{ .body = providers.testing.reply_stream, .hold = &hold }},
         .model = "gpt-5.6-sol",
     });
     defer rig.deinit();
-    try rig.keys("/compact\r");
-    try rig.waitFor(&.{ .{ .status = "Full transcript mode is active." }, .{ .editor = "" } });
+    defer hold.released.set(std.testing.io);
+    try rig.keys("/verbose\r");
+    try rig.waitFor(&.{ .{ .status = "Verbose output is on." }, .{ .editor = "" } });
     try rig.keys("hello\r");
     try hold.reached.wait(std.testing.io);
-    try rig.keys("/compact extra\r");
+    try rig.keys("/verbose extra\r");
     try rig.waitFor(&.{
-        .{ .status = "The command /compact takes no argument." },
-        .{ .editor = "/compact extra" },
+        .{ .status = "The command /verbose takes no argument." },
+        .{ .editor = "/verbose extra" },
         .{ .activity = true },
     });
-    try rig.keys("\x03/compact\r");
+    try rig.keys("\x03/verbose\r");
     try rig.waitFor(&.{
-        .{ .status = "Compact transcript mode is active." },
+        .{ .status = "Verbose output is off." },
         .{ .editor = "" },
         .{ .activity = true },
     });
@@ -2613,16 +2656,16 @@ test "compact uses the startup config and toggles during a turn without sending 
         .{ .editor = "/model" },
         .{ .activity = true },
     });
-    try rig.keys("\x03/compact\r");
+    try rig.keys("\x03/verbose\r");
     try rig.waitFor(&.{
-        .{ .status = "Full transcript mode is active." },
+        .{ .status = "Verbose output is on." },
         .{ .editor = "" },
         .{ .activity = true },
     });
     hold.released.set(std.testing.io);
     try rig.waitFor(&.{ .{ .rows = &.{ "hello", "done" } }, .{ .activity = false } });
     try std.testing.expectEqual(@as(usize, 1), rig.transport.requests.items.len);
-    try std.testing.expect(std.mem.find(u8, rig.lastRequest(), "\"text\":\"/compact\"") == null);
+    try std.testing.expect(std.mem.find(u8, rig.lastRequest(), "\"text\":\"/verbose\"") == null);
     const configured = try rig.tmp.dir.readFileAlloc(
         rig.clock.io(),
         ".drinky/config.json",
@@ -2631,7 +2674,7 @@ test "compact uses the startup config and toggles during a turn without sending 
     );
     defer std.testing.allocator.free(configured);
     try std.testing.expectEqualStrings(
-        "{\"interface\":{\"transcript_mode\":\"compact\"}}",
+        "{\"interface\":{\"verbose\":false}}",
         configured,
     );
 }

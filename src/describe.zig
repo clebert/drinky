@@ -114,25 +114,41 @@ fn writeCommands(writer: *std.Io.Writer) !void {
     }
     try writer.writeAll(
         "\nA command refuses text after its name unless its row names trailing text. " ++
-            "The /compact command also works while a turn runs. " ++
+            "The /verbose command also works while a turn runs. " ++
             "Drinky refuses other commands during a turn, and the draft stays.\n",
     );
     try writer.writeAll(
         \\
-        \\`/compact` toggles Full and Compact transcript modes for the current session.
+        \\`/verbose` toggles the displayed detail for the current session, even during a turn.
+        \\Verbose starts on by default. The config key `interface.verbose` can change that default.
+        \\The command changes no config file and sends no model message.
         \\Each toggle clears terminal scrollback and repaints the complete transcript without a
         \\warning.
-        \\Full mode shows thinking text and keeps the padding inside boxes.
-        \\Compact mode removes that padding and keeps the gaps between transcript blocks.
-        \\Consecutive thinking blocks share one summary box, with received bytes and elapsed time.
-        \\The final status is `complete`, `canceled`, `failed`, or `truncated`.
-        \\The original thinking text stays available in Full mode.
-        \\The transcript keeps thinking after a cancellation or failure.
-        \\This does not change the model conversation.
-        \\Compact mode also preserves the complete transcript when an update requires a terminal
-        \\reset.
+        \\A terminal reset also repaints the complete transcript.
+        \\Both verbosity states use one transcript style without backgrounds or box padding.
+        \\The gaps between transcript blocks stay the same.
+        \\User messages use purple text at normal brightness.
+        \\They preserve blank lines and source indentation.
+        \\Picker selection highlights stay outside the transcript.
+        \\The complete `Tool: name (state)` and `Agent: thinking (state)` identities use dim text.
+        \\Each identity takes the status color.
+        \\Secondary metadata and command text use dim text with the default foreground color.
+        \\Tool error sentences use dim text with the default foreground color.
+        \\The `complete` status uses green, and `failed` uses red.
+        \\The `limited`, `truncated`, and `canceled` statuses use yellow.
+        \\The `queued`, `streaming`, and `running` statuses use cyan.
         \\
-        \\Both modes keep tool metadata on one row, with the tool name and state first.
+        \\Verbose on shows complete thinking text and wraps complete bash commands.
+        \\Complete commands keep their source line breaks.
+        \\Verbose off shows thinking summaries and one-row command previews.
+        \\Consecutive thinking blocks share one summary with elapsed time, received bytes, and the
+        \\terminal status.
+        \\The final status is `complete`, `canceled`, `failed`, or `truncated`.
+        \\The transcript keeps thinking after a cancellation or failure.
+        \\A toggle changes no stored text and does not change the model conversation.
+        \\An ellipsis marks command text that the terminal width or additional source lines hide.
+        \\
+        \\Both verbosity states keep tool metadata on one row, with the tool name and state first.
         \\The row removes lower-priority segments as the viewport narrows.
         \\It never removes the first segment, and it truncates that segment only when necessary.
         \\Time has the next priority, followed by the bash exit code, file or pattern, limit
@@ -140,9 +156,17 @@ fn writeCommands(writer: *std.Io.Writer) !void {
         \\Received bytes and timeout values have the lowest priority.
         \\Only `bash`, `find`, and `grep` show time.
         \\Successful tools with partial results show `limited`.
-        \\The bash command and complete tool error sentences appear below the metadata and wrap.
-        \\Commands keep their original line breaks.
-        \\Compact thinking summaries start with `Agent: thinking (state)`.
+        \\Bash commands and complete tool error sentences appear below the metadata.
+        \\Every detail row aligns under the first optional metadata field in both verbosity states.
+        \\The indent uses the complete identity width plus the separator width, measured in
+        \\terminal columns.
+        \\The indent stays available when the header hides all optional metadata fields.
+        \\The indent applies only when at least 13 columns remain after it.
+        \\Otherwise, every detail row for that call starts at the left edge.
+        \\Source indentation stays in addition to the detail indent.
+        \\Command previews can truncate at widths narrower than their label.
+        \\Complete tool error sentences wrap in both verbosity states, even at very small widths.
+        \\Thinking summaries start with `Agent: thinking (state)`.
         \\They use the same reduction rule, with time before received bytes.
         \\The intro and user notes use one row.
         \\Session events can use multiple rows.
@@ -188,7 +212,7 @@ fn writeKeys(writer: *std.Io.Writer, options: *const Options) !void {
         \\
         \\A running turn takes these keys:
         \\
-        \\- Enter runs `/compact` and clears its command line. Other slash commands get a refusal.
+        \\- Enter runs `/verbose` and clears its command line. Other slash commands get a refusal.
         \\  Enter sends no message. Drinky shows the notice `Drinky sends no message while a turn
         \\  runs. The draft stays.` and keeps the line.
         \\- Esc cancels the turn. Esc with a draft warns first and cancels on the second press.
