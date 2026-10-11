@@ -32,7 +32,7 @@ pub fn sequence(comptime name: Name) []const u8 {
         .warning => "\x1b[33m",
         .success => "\x1b[32m",
         .@"error" => "\x1b[31m",
-        .user => "\x1b[35m",
+        .user => "\x1b[35;7m",
         .user_note => "\x1b[35m",
         .input_frame => "\x1b[35m",
         .activity => "\x1b[36m",
@@ -88,6 +88,6 @@ test "a role reaches the row as one SGR sequence, and the text role as none" {
     sink.end(.{ .id = 0, .line = 1 });
 
     const painted = try rig.painted();
-    try testing.expectShows(painted, &.{"\x1b[35mtitle"});
+    try testing.expectShows(painted, &.{"\x1b[35;7mtitle"});
     try testing.expectShows(painted, &.{"title\r\nplain"});
 }

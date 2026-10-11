@@ -332,9 +332,8 @@ test "user messages keep the gap before a model answer" {
     const plain = try terminal.testing.plainText(gpa, painted);
     defer gpa.free(plain);
     var rows = std.mem.splitScalar(u8, plain, '\n');
-    try std.testing.expectEqualStrings("prompt", std.mem.trim(u8, rows.next().?, "\r "));
-    try std.testing.expectEqualStrings("", std.mem.trim(u8, rows.next().?, "\r "));
-    try std.testing.expectEqualStrings("answer", std.mem.trim(u8, rows.next().?, "\r "));
+    for ([_][]const u8{ "", "prompt", "", "", "answer" }) |expected|
+        try std.testing.expectEqualStrings(expected, std.mem.trim(u8, rows.next().?, "\r "));
 }
 
 const test_status: ui.status.Info = .{

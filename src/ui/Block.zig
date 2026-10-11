@@ -331,7 +331,7 @@ fn look(self: *const Block) Look {
         } },
         .user => |list| .{ .box = .{
             .role = .user,
-            .body = .{ .text = list.items },
+            .body = .{ .text = list.items, .padded = true },
         } },
         .user_note => |list| .{ .notice = .{
             .style = .{
@@ -550,7 +550,7 @@ test "a streamed block keeps the indentation of the first line it shows" {
     try std.testing.expectEqualStrings("    - nested item", plain);
 }
 
-test "user messages preserve blank lines and indentation in normal purple text" {
+test "user messages preserve blank lines and indentation in a padded purple box" {
     const gpa = std.testing.allocator;
     for ([_]bool{ true, false }) |verbose| {
         var block = try Block.init(gpa, &.{ .user = "\n  first\n\n    last\n" });
@@ -561,12 +561,12 @@ test "user messages preserve blank lines and indentation in normal purple text" 
         const plain = try terminal.testing.plainText(gpa, painted);
         defer gpa.free(plain);
         var lines = std.mem.splitSequence(u8, plain, "\r\n");
-        for ([_][]const u8{ "", "  first", "", "    last", "" }) |expected|
+        for ([_][]const u8{ "", "", "  first", "", "    last", "", "" }) |expected|
             try std.testing.expectEqualStrings(expected, std.mem.trimEnd(u8, lines.next().?, " "));
         try std.testing.expect(lines.next() == null);
-        try testing.expectShows(painted, &.{"\x1b[35m  first"});
+        try testing.expectShows(painted, &.{"\x1b[35;7m  first"});
         try testing.expectHides(painted, &.{ "\x1b[7m", "\x1b[2m", "\x1b[2;39m" });
-        try std.testing.expectEqual(@as(usize, 5), block.rows(20));
+        try std.testing.expectEqual(@as(usize, 7), block.rows(20));
     }
 }
 

@@ -112,6 +112,7 @@ pub const Placement = struct {
 
 pub const Box = struct {
     text: []const u8,
+    padded: bool = false,
     segment_ends: ?[]const usize = null,
     status: ?Mark = null,
     command: ?Range = null,
@@ -337,7 +338,7 @@ fn noticeWrap(style: *const NoticeStyle, text: []const u8, columns: usize) Wrap 
 }
 
 pub fn boxRows(body: *const Box, columns: usize) usize {
-    var count: usize = 0;
+    var count: usize = if (body.padded) 2 else 0;
     const indent = boxIndent(body, columns);
     var lines = BoxLines.init(body);
     while (lines.next()) |line| {
@@ -467,6 +468,7 @@ fn noticeHead(placement: *const Placement, style: *const NoticeStyle, text: []co
 
 pub fn box(placement: *const Placement, name: role.Name, body: *const Box) !void {
     var line = placement.base;
+    if (body.padded) try boxEdge(placement, &line, name);
     const plain = body.status != null;
     const base_role: role.Name = if (plain) .text else name;
     const indent = boxIndent(body, placement.columns);
@@ -501,6 +503,16 @@ pub fn box(placement: *const Placement, name: role.Name, body: *const Box) !void
             }
         }
     }
+    if (body.padded) try boxEdge(placement, &line, name);
+}
+
+fn boxEdge(placement: *const Placement, line: *usize, name: role.Name) !void {
+    defer line.* += 1;
+    if (!placement.begin(line.*)) return;
+    try role.apply(placement.sink, name);
+    try placement.sink.spaces(placement.columns);
+    try attribute.apply(placement.sink, .reset);
+    placement.end(line.*);
 }
 
 fn boxRow(placement: *const Placement, line: *usize, row: *const BoxRow) !void {
@@ -858,16 +870,27 @@ test "tool details retain alignment only with thirteen available columns" {
     }
 }
 
-test "transcript rows preserve message whitespace without padding" {
-    const body: Box = .{ .text = "first\n\nlast" };
-    var rig: testing.Rig = undefined;
-    rig.init(std.testing.allocator);
-    defer rig.deinit();
-    const placement = try rig.begin(&.{ .columns = 20, .rows = 10 });
-    try box(&placement, .user, &body);
-    try std.testing.expectEqual(@as(usize, 3), boxRows(&body, 20));
-    try std.testing.expectEqual(@as(usize, 3), testing.paintedRows(try rig.painted()));
-    try testing.expectShows(try rig.plain(), &.{ "first", "last" });
+test "box rows preserve message whitespace, and padding adds a full-width role row on each side" {
+    const user = comptime role.sequence(.user);
+    const edge = user ++ core.text.repeat(" ", 20) ++ comptime attribute.sequence(.reset);
+    for ([_]bool{ false, true }) |padded| {
+        const body: Box = .{ .text = "first\n\nlast", .padded = padded };
+        var rig: testing.Rig = undefined;
+        rig.init(std.testing.allocator);
+        defer rig.deinit();
+        const placement = try rig.begin(&.{ .columns = 20, .rows = 10 });
+        try box(&placement, .user, &body);
+        const painted = try rig.painted();
+        const rows: usize = if (padded) 5 else 3;
+        try std.testing.expectEqual(rows, boxRows(&body, 20));
+        try std.testing.expectEqual(rows, testing.paintedRows(painted));
+        try testing.expectShows(try rig.plain(), &.{ "first", "last" });
+        try testing.expectShows(painted, &.{user ++ "first" ++ core.text.repeat(" ", 15)});
+        const first_end = std.mem.find(u8, painted, "\r\n").?;
+        const last_start = std.mem.findLast(u8, painted, "\r\n").? + 2;
+        try std.testing.expectEqual(padded, std.mem.endsWith(u8, painted[0..first_end], edge));
+        try std.testing.expectEqual(padded, std.mem.startsWith(u8, painted[last_start..], edge));
+    }
 }
 
 test "a box breaks its rows between words" {

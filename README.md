@@ -52,9 +52,10 @@ Drinky is not affiliated with the providers.
 
 ## Transcript
 
-The transcript uses one style without backgrounds. Use `/verbose` to toggle thinking text, tool
-rows, and complete bash commands. Verbose off folds each run of thinking and tool calls into one
-work row. The row of the open run names the work that runs now. Verbose starts on by default.
+Drinky shows a user message on a purple background with one padding row above and below. Use
+`/verbose` to toggle thinking text, tool rows, and complete bash commands. Both verbosity states use
+one transcript style. Verbose off folds each run of thinking and tool calls into one work row. The
+row of the open run names the work that runs now. Verbose starts on by default.
 
 The status line shows context use and estimated session cost. The estimate uses public rates or the
 charge that the provider reports. The estimate is not a bill.

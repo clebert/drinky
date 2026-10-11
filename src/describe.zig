@@ -125,9 +125,9 @@ fn writeCommands(writer: *std.Io.Writer) !void {
         \\Each toggle clears terminal scrollback and repaints the complete transcript without a
         \\warning.
         \\A terminal reset also repaints the complete transcript.
-        \\Both verbosity states use one transcript style without backgrounds or box padding.
+        \\Both verbosity states use one transcript style.
         \\The gaps between transcript blocks stay the same.
-        \\User messages use purple text at normal brightness.
+        \\User messages use a purple background with one padding row above and below.
         \\They preserve blank lines and source indentation.
         \\Picker selection highlights stay outside the transcript.
         \\The complete `Tool: name (state)` and `Agent: work (state)` identities use dim text.
