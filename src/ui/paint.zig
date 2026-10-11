@@ -81,6 +81,7 @@ const BoxRow = struct {
     role: role.Name = .text,
     segment_ends: ?[]const usize = null,
     identity_value: ?Box.Range = null,
+    status: ?Mark = null,
     marks: []const Mark = &.{},
     indent: usize = 0,
 };
@@ -117,6 +118,7 @@ pub const Box = struct {
     segment_ends: ?[]const usize = null,
     identity_value: ?Range = null,
     status: ?Mark = null,
+    qualifiers: []const Mark = &.{},
     command: ?Range = null,
 
     pub const Range = struct { start: usize, end: usize };
@@ -495,28 +497,19 @@ pub fn box(placement: *const Placement, name: role.Name, body: *const Box) !void
     var line = placement.base;
     if (body.padded) try boxEdge(placement, &line, name);
     const plain = body.status != null;
-    const base_role: role.Name = if (plain) .text else name;
+    const base_role: role.Name = if (plain) .muted else name;
     const indent = boxIndent(body, placement.columns);
     var lines = BoxLines.init(body);
     while (lines.next()) |source| {
         const content = source.text;
         if (source.offset == 0 and body.segment_ends != null) {
-            var marks: [2]Mark = undefined;
-            if (plain) {
-                marks[0] = body.status.?;
-                const ends = body.segment_ends.?;
-                marks[1] = .{
-                    .start = if (ends.len > 0) ends[0] else content.len,
-                    .end = content.len,
-                    .role = .muted,
-                };
-            }
             try boxRow(placement, &line, &.{
                 .content = content,
                 .role = base_role,
                 .segment_ends = body.segment_ends,
                 .identity_value = body.identity_value,
-                .marks = if (plain) &marks else &.{},
+                .status = body.status,
+                .marks = body.qualifiers,
             });
         } else {
             var iterator = terminal.width.wrapper(content, placement.columns - indent);
@@ -556,7 +549,12 @@ fn boxRowCells(sink: *terminal.View.Sink, columns: usize, row: *const BoxRow) !v
     if (row.segment_ends) |ends| {
         const shown = segmentCut(row.content, room, ends, row.identity_value);
         try boxRowText(sink, shown.kept, row);
-        if (shown.shortened and row.marks.len > 0) try markStyle(sink, &row.marks[0]);
+        if (shown.shortened) {
+            if (row.status) |status| {
+                if (shown.kept.len >= status.start and shown.kept.len < status.end)
+                    try markStyle(sink, &status);
+            }
+        }
         try shown.writeEllipsis(sink);
     } else {
         try boxRowText(sink, terminal.width.truncate(row.content, room), row);
@@ -565,11 +563,19 @@ fn boxRowCells(sink: *terminal.View.Sink, columns: usize, row: *const BoxRow) !v
 }
 
 fn boxRowText(sink: *terminal.View.Sink, text: []const u8, row: *const BoxRow) !void {
-    if (row.marks.len > 0) return markedText(sink, text, &.{
+    var end: usize = 0;
+    if (row.status) |status| {
+        end = @min(status.end, text.len);
+        try markedText(sink, text[0..end], &.{
+            .role = row.role,
+            .marks = &.{status},
+        });
+    }
+    try markedText(sink, text[end..], &.{
+        .offset = end,
         .role = row.role,
         .marks = row.marks,
     });
-    try sink.text(text);
 }
 
 const frame_edge_rows = 2;

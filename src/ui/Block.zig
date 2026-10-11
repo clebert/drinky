@@ -128,6 +128,7 @@ pub const Note = struct {
 const ToolResult = struct {
     text: std.ArrayList(u8),
     status: paint.Mark,
+    qualifiers: std.ArrayList(paint.Mark),
     command: ?paint.Box.Range,
     received_bytes: usize,
     survives_discard: bool = false,
@@ -136,6 +137,7 @@ const ToolResult = struct {
         text: []const u8,
         segment_ends: []const usize = &.{},
         status: paint.Mark = .{ .start = 0, .end = 0, .role = .text },
+        qualifiers: []const paint.Mark = &.{},
         command: ?paint.Box.Range = null,
         started_ms: i64 = 0,
         received_bytes: usize = 0,
@@ -208,8 +210,13 @@ const Cache = struct {
 pub fn init(gpa: std.mem.Allocator, source: *const Source) !Block {
     var ends: std.ArrayList(usize) = .empty;
     errdefer ends.deinit(gpa);
+    var qualifiers: std.ArrayList(paint.Mark) = .empty;
+    errdefer qualifiers.deinit(gpa);
     switch (source.*) {
-        .tool_result => |*result| try ends.appendSlice(gpa, result.segment_ends),
+        .tool_result => |*result| {
+            try ends.appendSlice(gpa, result.segment_ends);
+            try qualifiers.appendSlice(gpa, result.qualifiers);
+        },
         .user_note => |*note| try ends.appendSlice(gpa, note.segment_ends),
         .intro, .user, .thinking, .model, .event => {},
     }
@@ -224,6 +231,7 @@ pub fn init(gpa: std.mem.Allocator, source: *const Source) !Block {
             .tool_result => |*result| .{ .tool_result = .{
                 .text = try copy(gpa, result.text),
                 .status = result.status,
+                .qualifiers = qualifiers,
                 .command = result.command,
                 .received_bytes = result.received_bytes,
             } },
@@ -243,7 +251,10 @@ fn copy(gpa: std.mem.Allocator, text: []const u8) !std.ArrayList(u8) {
 pub fn deinit(self: *Block, gpa: std.mem.Allocator) void {
     switch (self.content) {
         .intro, .user, .user_note, .thinking, .model => |*text| text.deinit(gpa),
-        .tool_result => |*result| result.text.deinit(gpa),
+        .tool_result => |*result| {
+            result.text.deinit(gpa);
+            result.qualifiers.deinit(gpa);
+        },
         .event => |*event| event.text.deinit(gpa),
     }
     self.cache.deinit(gpa);
@@ -354,6 +365,7 @@ fn look(self: *const Block) Look {
                 .text = result.text.items,
                 .segment_ends = self.segment_ends.items,
                 .status = result.status,
+                .qualifiers = result.qualifiers.items,
                 .command = result.command,
             },
         } },

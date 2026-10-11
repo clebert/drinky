@@ -12,17 +12,19 @@ pub const Line = struct {
     text: []u8,
     segment_ends: []usize,
     status: ui.paint.Mark,
+    qualifiers: []ui.paint.Mark,
     command: ?ui.paint.Box.Range,
 
     pub fn deinit(self: *const Line, gpa: std.mem.Allocator) void {
         gpa.free(self.text);
         gpa.free(self.segment_ends);
+        gpa.free(self.qualifiers);
     }
 };
 
 pub const Phase = enum { streaming, queued, running };
 
-const State = enum { streaming, queued, running, complete, limited, failed };
+const State = enum { streaming, queued, running, complete, failed };
 
 pub const Options = struct {
     name: []const u8,
@@ -39,6 +41,7 @@ const Parts = struct {
     gpa: std.mem.Allocator,
     writer: *std.Io.Writer,
     segment_ends: *std.ArrayList(usize),
+    qualifiers: *std.ArrayList(ui.paint.Mark),
     status: ui.paint.Mark = undefined,
     command: ?ui.paint.Box.Range = null,
 
@@ -46,6 +49,18 @@ const Parts = struct {
         if (self.segment_ends.items.len > 0) try self.writer.writeAll(ui.paint.separator);
         try self.writer.print(template, args);
         try self.segment_ends.append(self.gpa, self.writer.buffered().len);
+    }
+
+    fn warn(self: *Parts, comptime template: []const u8, args: anytype) !void {
+        const start = self.writer.buffered().len +
+            if (self.segment_ends.items.len > 0) ui.paint.separator.len else 0;
+        try self.print(template, args);
+        try self.qualifiers.append(self.gpa, .{
+            .start = start,
+            .end = self.writer.buffered().len,
+            .role = .warning,
+            .dim = true,
+        });
     }
 };
 
@@ -79,27 +94,32 @@ pub fn render(gpa: std.mem.Allocator, options: *const Options) error{OutOfMemory
     defer out.deinit();
     var ends: std.ArrayList(usize) = .empty;
     defer ends.deinit(gpa);
-    var parts: Parts = .{ .gpa = gpa, .writer = &out.writer, .segment_ends = &ends };
+    var qualifiers: std.ArrayList(ui.paint.Mark) = .empty;
+    defer qualifiers.deinit(gpa);
+    var parts: Parts = .{
+        .gpa = gpa,
+        .writer = &out.writer,
+        .segment_ends = &ends,
+        .qualifiers = &qualifiers,
+    };
     write(&parts, options) catch return error.OutOfMemory;
     const text = try out.toOwnedSlice();
     errdefer gpa.free(text);
+    const segment_ends = try ends.toOwnedSlice(gpa);
+    errdefer gpa.free(segment_ends);
     return .{
         .text = text,
-        .segment_ends = try ends.toOwnedSlice(gpa),
+        .segment_ends = segment_ends,
         .status = parts.status,
+        .qualifiers = try qualifiers.toOwnedSlice(gpa),
         .command = parts.command,
     };
 }
 
 fn write(parts: *Parts, options: *const Options) !void {
-    const state: State = if (options.output) |output| state: {
-        if (output.hasFailure()) break :state .failed;
-        const lines_total = output.measures.get(.lines_total) orelse 0;
-        const lines = output.measures.get(.lines) orelse lines_total;
-        const omitted = output.measures.get(.matches_omitted) orelse 0;
-        const limited = output.conditions.count() > 0 or omitted > 0 or lines < lines_total;
-        break :state if (limited) .limited else .complete;
-    } else switch (options.phase) {
+    const state: State = if (options.output) |output|
+        if (output.hasFailure()) .failed else .complete
+    else switch (options.phase) {
         .streaming => .streaming,
         .queued => .queued,
         .running => .running,
@@ -115,7 +135,6 @@ fn write(parts: *Parts, options: *const Options) !void {
         .role = switch (state) {
             .streaming, .queued, .running => .activity,
             .complete => .success,
-            .limited => .warning,
             .failed => .@"error",
         },
     };
@@ -138,16 +157,16 @@ fn write(parts: *Parts, options: *const Options) !void {
         if (output.conditions.contains(.timed_out)) try parts.print("Status: timed out", .{});
         if (output.conditions.contains(.overflowed)) try parts.print("Status: output limit", .{});
         if (output.conditions.contains(.time_limit_reached)) {
-            try parts.print("Search: timed out", .{});
+            try parts.warn("Search: timed out", .{});
         }
         if (output.conditions.contains(.match_limit_reached)) {
-            try parts.print("Limit: reached", .{});
+            try parts.warn("Limit: reached", .{});
         }
         if (output.conditions.contains(.byte_limit_reached)) {
             const bytes = output.measures.get(.bytes) orelse 0;
-            try parts.print("Stopped at: {d} MiB", .{@divFloor(bytes, mebibyte)});
+            try parts.warn("Stopped at: {d} MiB", .{@divFloor(bytes, mebibyte)});
         }
-        if (output.conditions.contains(.incomplete)) try parts.print("Search: incomplete", .{});
+        if (output.conditions.contains(.incomplete)) try parts.warn("Search: incomplete", .{});
         if (output.conditions.contains(.line_truncated)) try parts.print("Line: truncated", .{});
         if (output.conditions.contains(.lines_truncated)) try parts.print("Lines: truncated", .{});
         if (output.conditions.contains(.output_truncated)) {
@@ -198,12 +217,10 @@ fn writeLines(parts: *Parts, output: *const core.Tool.Output) !void {
 test "a read names its window, and a whole file or an empty file its count alone" {
     try expectLine(&.{
         .measures = &.{ .{ .lines, 1 }, .{ .line_first, 1 }, .{ .lines_total, 3 } },
-        .state = "limited",
         .expected = "Lines: 1\u{2013}1 of 3",
     });
     try expectLine(&.{
         .measures = &.{ .{ .lines, 50 }, .{ .line_first, 1 }, .{ .lines_total, 300 } },
-        .state = "limited",
         .expected = "Lines: 1\u{2013}50 of 300",
     });
     try expectLine(&.{
@@ -217,7 +234,6 @@ test "a read names its window, and a whole file or an empty file its count alone
     try expectLine(&.{
         .measures = &.{ .{ .lines, 2 }, .{ .line_first, 2 }, .{ .lines_total, 3 } },
         .conditions = &.{.line_truncated},
-        .state = "limited",
         .expected = "Line: truncated \u{00B7} Lines: 2\u{2013}3 of 3",
     });
 }
@@ -247,12 +263,14 @@ fn expectLine(case: *const Case) !void {
 }
 
 test "a write counts its lines, and an edit the removed and the added ones" {
-    try expectLine(&.{ .measures = &.{.{ .lines, 3 }}, .expected = "Lines: 3" });
+    try expectLine(&.{ .name = "write", .measures = &.{.{ .lines, 3 }}, .expected = "Lines: 3" });
     try expectLine(&.{
+        .name = "edit",
         .measures = &.{ .{ .lines_removed, 2 }, .{ .lines_added, 1 } },
         .expected = "Lines: -2 +1",
     });
     try expectLine(&.{
+        .name = "edit",
         .measures = &.{ .{ .lines_removed, 1 }, .{ .lines_added, 0 } },
         .expected = "Lines: -1 +0",
     });
@@ -263,7 +281,6 @@ test "a search reports its time, its matches, and every reached limit" {
         .measures = &.{ .{ .duration_ms, 1500 }, .{ .matches, 1 }, .{ .matches_omitted, 2 } },
         .name = "grep",
         .conditions = &.{.time_limit_reached},
-        .state = "limited",
         .expected = "Time: 1.5s \u{00B7} Search: timed out \u{00B7} Matches: 1 \u{00B7} " ++
             "Omitted matches: 2",
     });
@@ -271,14 +288,12 @@ test "a search reports its time, its matches, and every reached limit" {
         .measures = &.{ .{ .duration_ms, 0 }, .{ .matches, 0 } },
         .name = "find",
         .conditions = &.{.incomplete},
-        .state = "limited",
         .expected = "Time: 0ms \u{00B7} Search: incomplete \u{00B7} Matches: 0",
     });
     try expectLine(&.{
         .measures = &.{ .{ .duration_ms, 42 }, .{ .matches, 2 }, .{ .bytes, 300 * mebibyte } },
         .name = "grep",
         .conditions = &.{ .match_limit_reached, .byte_limit_reached, .lines_truncated },
-        .state = "limited",
         .expected = "Time: 42ms \u{00B7} Limit: reached \u{00B7} " ++
             "Stopped at: 300 MiB \u{00B7} Lines: truncated \u{00B7} Matches: 2",
     });
@@ -294,7 +309,6 @@ test "a command reports its time, its exit code or its status, and its output" {
         .measures = &.{ .{ .duration_ms, 1500 }, .{ .exit_code, 0 }, .{ .lines, 3 } },
         .name = "bash",
         .conditions = &.{.output_truncated},
-        .state = "limited",
         .expected = "Time: 1.5s \u{00B7} Exit code: 0 \u{00B7} Output: truncated \u{00B7} Lines: 3",
     });
     try expectLine(&.{

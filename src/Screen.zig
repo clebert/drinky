@@ -177,6 +177,7 @@ const Turn = struct {
                 .text = try call.text(gpa, now_ms),
                 .segment_ends = call.line.?.segment_ends,
                 .status = call.line.?.status,
+                .qualifiers = call.line.?.qualifiers,
                 .command = call.line.?.command,
             });
         }
@@ -748,6 +749,7 @@ fn appendToolBlock(
         .text = line.text,
         .segment_ends = line.segment_ends,
         .status = line.status,
+        .qualifiers = line.qualifiers,
         .command = line.command,
         .started_ms = work.started_ms,
         .received_bytes = work.received_bytes,
@@ -1398,7 +1400,7 @@ test "a running tool uses the final call name instead of the streamed name" {
     try std.testing.expect(std.mem.find(u8, painted, "Tool: partial") == null);
 }
 
-test "limited results retain their outcome and put limits before counts" {
+test "incomplete searches report completion and put limits before counts" {
     const gpa = std.testing.allocator;
     var rig: Rig = undefined;
     rig.init();
@@ -1420,41 +1422,41 @@ test "limited results retain their outcome and put limits before counts" {
     try rig.end(&.{ .stopped = .complete });
     const wide = try rig.paintPlain(120);
     defer gpa.free(wide);
-    try testing.expectContains(wide, "Tool: grep (limited) · Time: 500ms · Pattern: needle · " ++
+    try testing.expectContains(wide, "Tool: grep (complete) · Time: 500ms · Pattern: needle · " ++
         "Search: timed out · Matches: 8");
     const narrow = try rig.paintPlain(25);
     defer gpa.free(narrow);
-    try testing.expectContains(narrow, "Tool: grep (limited)");
+    try testing.expectContains(narrow, "Tool: grep (complete)");
     try std.testing.expect(std.mem.find(u8, narrow, "Search:") == null);
 }
 
-test "omitted find matches retain a limited outcome without a condition" {
+test "omitted find matches keep a complete outcome without a condition" {
     var output: core.Tool.Output = .{};
     output.measures.put(.duration_ms, 0);
     output.measures.put(.matches, 1);
     output.measures.put(.matches_omitted, 1);
-    try expectLimitedResult(&.{
+    try expectCompleteResult(&.{
         .id = "find",
         .name = "find",
         .arguments = "{\"pattern\":\"*.zig\",\"limit\":1}",
     }, &output);
 }
 
-test "a partial read window retains a limited outcome without a condition" {
+test "a partial read window keeps a complete outcome without a condition" {
     var output: core.Tool.Output = .{};
     output.measures.put(.lines, 50);
     output.measures.put(.line_first, 1);
     output.measures.put(.lines_total, 300);
-    try expectLimitedResult(&.{
+    try expectCompleteResult(&.{
         .id = "read",
         .name = "read",
         .arguments = "{\"path\":\"a.zig\"}",
     }, &output);
 }
 
-fn expectLimitedResult(call: *const core.Tool.Call, output: *const core.Tool.Output) !void {
+fn expectCompleteResult(call: *const core.Tool.Call, output: *const core.Tool.Output) !void {
     const gpa = std.testing.allocator;
-    const expected = try gpa.print("Tool: {s} (limited)", .{call.name});
+    const expected = try gpa.print("Tool: {s} (complete)", .{call.name});
     defer gpa.free(expected);
     var rig: Rig = undefined;
     rig.init();
@@ -1580,6 +1582,19 @@ fn checkToolAllocations(gpa: std.mem.Allocator) error{OutOfMemory}!void {
     var failure: core.Tool.Output = .{ .content = "Drinky could not read the complete file." };
     failure.conditions.insert(.path_missing);
     _ = try screen.apply(&.{ .tool_result = .{ .call = read, .output = failure } }, time);
+    const grep: core.Tool.Call = .{
+        .id = "grep",
+        .name = "grep",
+        .arguments = "{\"pattern\":\"needle\"}",
+    };
+    _ = try screen.apply(&.{ .tool_call_started = grep.name }, time);
+    _ = try screen.apply(&.{ .tool_started = grep }, time);
+    var partial: core.Tool.Output = .{};
+    partial.conditions.insert(.time_limit_reached);
+    partial.conditions.insert(.match_limit_reached);
+    partial.conditions.insert(.byte_limit_reached);
+    partial.conditions.insert(.incomplete);
+    _ = try screen.apply(&.{ .tool_result = .{ .call = grep, .output = partial } }, time);
     try screen.appendSkillNote(&.{ .name = "zig-style", .source = "a · b/SKILL.md" });
     screen.toggleVerbose();
     screen.paint(.{ .columns = 30, .rows = 24 }, time, &no_caption) catch
@@ -2455,14 +2470,138 @@ test "verbose off hides each command, and verbose on keeps its complete text" {
     }
 }
 
-test "tool results dim and color their complete identities and mute their metadata" {
+test "verbose tools color complete identities and separate outcomes from output coverage" {
+    const gpa = std.testing.allocator;
+    const cases = [_]struct {
+        name: []const u8,
+        conditions: []const core.Tool.Condition = &.{},
+        measures: []const struct { core.Tool.Measure, u64 } = &.{},
+        status: []const u8 = "complete",
+        qualifier: []const u8,
+        warning: bool = false,
+    }{
+        .{
+            .name = "read",
+            .measures = &.{ .{ .lines, 50 }, .{ .line_first, 1 }, .{ .lines_total, 300 } },
+            .qualifier = "Lines: 1–50 of 300",
+        },
+        .{
+            .name = "bash",
+            .conditions = &.{.output_truncated},
+            .measures = &.{ .{ .exit_code, 0 }, .{ .lines, 3 } },
+            .qualifier = "Output: truncated",
+        },
+        .{ .name = "read", .conditions = &.{.line_truncated}, .qualifier = "Line: truncated" },
+        .{ .name = "grep", .conditions = &.{.lines_truncated}, .qualifier = "Lines: truncated" },
+        .{
+            .name = "find",
+            .measures = &.{ .{ .matches, 1 }, .{ .matches_omitted, 2 } },
+            .qualifier = "Omitted matches: 2",
+        },
+        .{
+            .name = "grep",
+            .conditions = &.{.incomplete},
+            .qualifier = "Search: incomplete",
+            .warning = true,
+        },
+        .{
+            .name = "find",
+            .conditions = &.{.time_limit_reached},
+            .qualifier = "Search: timed out",
+            .warning = true,
+        },
+        .{
+            .name = "grep",
+            .conditions = &.{.match_limit_reached},
+            .qualifier = "Limit: reached",
+            .warning = true,
+        },
+        .{
+            .name = "grep",
+            .conditions = &.{.byte_limit_reached},
+            .measures = &.{.{ .bytes, 300 * 1024 * 1024 }},
+            .qualifier = "Stopped at: 300 MiB",
+            .warning = true,
+        },
+        .{
+            .name = "grep",
+            .conditions = &.{
+                .time_limit_reached,
+                .match_limit_reached,
+                .byte_limit_reached,
+                .incomplete,
+            },
+            .qualifier = "Search: incomplete",
+            .warning = true,
+        },
+        .{
+            .name = "bash",
+            .conditions = &.{.failed},
+            .measures = &.{.{ .exit_code, 2 }},
+            .status = "failed",
+            .qualifier = "Exit code: 2",
+        },
+        .{
+            .name = "grep",
+            .conditions = &.{ .failed, .incomplete },
+            .measures = &.{.{ .matches, 0 }},
+            .status = "failed",
+            .qualifier = "Search: incomplete",
+            .warning = true,
+        },
+    };
+    for (cases) |case| {
+        var rig: Rig = undefined;
+        rig.init();
+        defer rig.deinit();
+        try rig.start("prompt");
+        const call: core.Tool.Call = .{ .id = "c1", .name = case.name, .arguments = "{}" };
+        try rig.apply(&.{ .tool_call_started = call.name });
+        try rig.apply(&.{ .tool_started = call });
+        var output: core.Tool.Output = .{};
+        for (case.conditions) |condition| output.conditions.insert(condition);
+        for (case.measures) |measure| output.measures.put(measure[0], measure[1]);
+        try rig.apply(&.{ .tool_result = .{ .call = call, .output = output } });
+        try rig.apply(&.committed);
+        try rig.end(&.{ .stopped = .complete });
+        const color = if (std.mem.eql(u8, case.status, "failed")) "\x1b[31m" else "\x1b[32m";
+        for ([_]usize{ 120, 8, 1, 120 }) |columns| {
+            const plain = try rig.paintPlain(columns);
+            defer gpa.free(plain);
+            if (columns <= 8) {
+                const shortened = try gpa.print("{s}\x1b[2m{s}", .{
+                    color,
+                    if (columns == 1) "…" else "Tool:",
+                });
+                defer gpa.free(shortened);
+                try testing.expectContains(rig.out.written(), shortened);
+                try std.testing.expect(std.mem.find(u8, rig.out.written(), "\x1b[33m") == null);
+                continue;
+            }
+            const identity = try gpa.print("Tool: {s} ({s})", .{ case.name, case.status });
+            defer gpa.free(identity);
+            try testing.expectContains(plain, identity);
+            try testing.expectContains(plain, case.qualifier);
+            const colored = try gpa.print("{s}\x1b[2m{s}\x1b[0m", .{ color, identity });
+            defer gpa.free(colored);
+            try testing.expectContains(rig.out.written(), colored);
+            if (case.warning) {
+                const qualifier = try gpa.print("\x1b[33m\x1b[2m{s}", .{case.qualifier});
+                defer gpa.free(qualifier);
+                try testing.expectContains(rig.out.written(), qualifier);
+            } else try std.testing.expect(std.mem.find(u8, rig.out.written(), "\x1b[33m") == null);
+        }
+    }
+}
+
+test "tool results keep file metadata neutral across terminal widths" {
     const cases = [_]struct {
         condition: ?core.Tool.Condition,
         state: []const u8,
         color: []const u8,
     }{
         .{ .condition = null, .state = "complete", .color = "\x1b[32m" },
-        .{ .condition = .incomplete, .state = "limited", .color = "\x1b[33m" },
+        .{ .condition = .incomplete, .state = "complete", .color = "\x1b[32m" },
         .{ .condition = .failed, .state = "failed", .color = "\x1b[31m" },
     };
     for (cases) |case| {
@@ -2503,7 +2642,7 @@ test "tool results dim and color their complete identities and mute their metada
     }
 }
 
-test "active calls dim and color their complete identities" {
+test "active calls color their complete identities" {
     var rig: Rig = undefined;
     rig.init();
     defer rig.deinit();
