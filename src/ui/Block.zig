@@ -29,6 +29,8 @@ pub const Work = struct {
     summary_ends: [Summary.segments_max]usize = @splat(0),
     summary_ends_length: usize = 0,
 
+    const identity_prefix = "Agent: work (";
+
     pub const Status = enum { running, complete, canceled, failed, truncated };
 
     pub const End = struct {
@@ -42,15 +44,19 @@ pub const Work = struct {
         received_bytes: usize,
         status: Status,
 
-        pub const segments_max = 5;
+        pub const segments_max = 4;
 
         pub fn write(
             self: *const Summary,
             writer: *std.Io.Writer,
-            options: *const struct { now: []const u8, ends: *[segments_max]usize },
+            options: *const struct { activity: []const u8, ends: *[segments_max]usize },
         ) std.Io.Writer.Error!usize {
             var count: usize = 0;
-            try writer.print("Agent: work ({s})", .{@tagName(self.status)});
+            const value = if (self.status == .running)
+                if (options.activity.len > 0) options.activity else "waiting"
+            else
+                @tagName(self.status);
+            try writer.print("{s}{s})", .{ identity_prefix, value });
             options.ends[count] = writer.buffered().len;
             count += 1;
             var time_buffer: [24]u8 = undefined;
@@ -58,16 +64,13 @@ pub const Work = struct {
             try writer.print("{s}Time: {s}", .{ paint.separator, time });
             options.ends[count] = writer.buffered().len;
             count += 1;
-            try writer.print("{s}Tools: {d}", .{ paint.separator, self.tools });
-            options.ends[count] = writer.buffered().len;
-            count += 1;
-            var bytes_buffer: [16]u8 = undefined;
-            const bytes = format.bytes(&bytes_buffer, self.received_bytes);
-            try writer.print("{s}Received: {s}", .{ paint.separator, bytes });
-            options.ends[count] = writer.buffered().len;
-            count += 1;
-            if (options.now.len > 0) {
-                try writer.print("{s}Now: {s}", .{ paint.separator, options.now });
+            if (self.status != .running) {
+                try writer.print("{s}Tools: {d}", .{ paint.separator, self.tools });
+                options.ends[count] = writer.buffered().len;
+                count += 1;
+                var bytes_buffer: [16]u8 = undefined;
+                const bytes = format.bytes(&bytes_buffer, self.received_bytes);
+                try writer.print("{s}Received: {s}", .{ paint.separator, bytes });
                 options.ends[count] = writer.buffered().len;
                 count += 1;
             }
@@ -79,6 +82,7 @@ pub const Work = struct {
         return .{
             .text = text,
             .segment_ends = ends,
+            .identity_value = .{ .start = identity_prefix.len, .end = ends[0] - 1 },
             .status = .{
                 .start = 0,
                 .end = ends[0],
@@ -301,7 +305,7 @@ pub fn presentWork(self: *Block, maybe_summary: ?*const Work.Summary) void {
     var buffer: [work.summary.len]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buffer);
     var ends: [Work.Summary.segments_max]usize = undefined;
-    const count = summary.write(&writer, &.{ .now = "", .ends = &ends }) catch unreachable;
+    const count = summary.write(&writer, &.{ .activity = "", .ends = &ends }) catch unreachable;
     const text = writer.buffered();
     if (std.mem.eql(u8, work.summary[0..work.summary_length], text)) return;
     @memcpy(work.summary[0..text.len], text);
@@ -941,7 +945,7 @@ test "work summaries keep time before tools and bytes and reduce to one row" {
         .{ .columns = 43, .expected = "Agent: work (complete) · Time: 3s" },
         .{ .columns = 32, .expected = "Agent: work (complete)" },
         .{ .columns = 22, .expected = "Agent: work (complete)" },
-        .{ .columns = 15, .expected = "Agent: work (c…" },
+        .{ .columns = 15, .expected = "Agent: work (…)" },
         .{ .columns = 1, .expected = "…" },
     };
     for (cases) |case| {
@@ -966,10 +970,10 @@ test "work summaries keep time before tools and bytes and reduce to one row" {
     const plain = try terminal.testing.plainText(gpa, running);
     defer gpa.free(plain);
     try std.testing.expectEqualStrings(
-        "Agent: work (running) · Time: 0s · Tools: 0 · Received: 0 B",
+        "Agent: work (waiting) · Time: 0s",
         std.mem.trimEnd(u8, plain, " "),
     );
-    try testing.expectShows(running, &.{"\x1b[36m\x1b[2mAgent: work (running)"});
+    try testing.expectShows(running, &.{"\x1b[36m\x1b[2mAgent: work (waiting)"});
 }
 
 test "user notes keep one row while session events can use multiple rows" {

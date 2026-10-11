@@ -80,6 +80,7 @@ const BoxRow = struct {
     content: []const u8,
     role: role.Name = .text,
     segment_ends: ?[]const usize = null,
+    identity_value: ?Box.Range = null,
     marks: []const Mark = &.{},
     indent: usize = 0,
 };
@@ -114,6 +115,7 @@ pub const Box = struct {
     text: []const u8,
     padded: bool = false,
     segment_ends: ?[]const usize = null,
+    identity_value: ?Range = null,
     status: ?Mark = null,
     command: ?Range = null,
 
@@ -159,9 +161,11 @@ pub const Activity = struct {
 const Cut = struct {
     kept: []const u8,
     shortened: bool,
+    suffix: []const u8 = "",
 
     pub fn writeEllipsis(self: *const Cut, sink: *terminal.View.Sink) !void {
         if (self.shortened) try sink.text(ellipsis);
+        try sink.text(self.suffix);
     }
 };
 
@@ -358,10 +362,30 @@ fn boxIndent(body: *const Box, columns: usize) usize {
     return if (columns -| indent >= 13) indent else 0;
 }
 
-fn segmentCut(text: []const u8, columns: usize, ends: []const usize) Cut {
+fn segmentCut(
+    text: []const u8,
+    columns: usize,
+    ends: []const usize,
+    maybe_value: ?Box.Range,
+) Cut {
     if (ends.len == 0) return headCut(text, columns);
     const first = text[0..ends[0]];
-    if (terminal.width.ofText(first) > columns) return cut(first, columns);
+    if (terminal.width.ofText(first) > columns) {
+        if (maybe_value) |value| {
+            const prefix = first[0..value.start];
+            const suffix = first[value.end..];
+            const fixed_columns = terminal.width.ofText(prefix) + terminal.width.ofText(suffix);
+            if (columns > fixed_columns) {
+                const shown = cut(first[value.start..value.end], columns - fixed_columns);
+                return .{
+                    .kept = first[0 .. value.start + shown.kept.len],
+                    .shortened = shown.shortened,
+                    .suffix = suffix,
+                };
+            }
+        }
+        return cut(first, columns);
+    }
     var end = ends[0];
     for (ends[1..]) |next| {
         if (terminal.width.ofText(text[0..next]) > columns) break;
@@ -381,7 +405,8 @@ pub const ellipsis = "…";
 
 pub fn cut(text: []const u8, columns_max: usize) Cut {
     const shown = terminal.width.truncate(text, columns_max);
-    if (shown.len == text.len) return .{ .kept = shown, .shortened = false };
+    if (shown.len == text.len and terminal.width.ofText(shown) <= columns_max)
+        return .{ .kept = shown, .shortened = false };
     const room = columns_max -| 1;
     const kept = terminal.width.truncate(text, room);
     if (terminal.width.ofText(kept) > room) return .{ .kept = "", .shortened = true };
@@ -441,7 +466,7 @@ fn headRow(parts: *const struct {
     const shown_label = terminal.width.truncate(parts.label, columns);
     const room = columns -| terminal.width.ofText(shown_label);
     const shown = if (parts.segment_ends) |ends|
-        segmentCut(parts.text, room, ends)
+        segmentCut(parts.text, room, ends, null)
     else
         headCut(parts.text, room);
     if (room > 0 or !shown.shortened) return .{ .label = shown_label, .shown = shown };
@@ -490,6 +515,7 @@ pub fn box(placement: *const Placement, name: role.Name, body: *const Box) !void
                 .content = content,
                 .role = base_role,
                 .segment_ends = body.segment_ends,
+                .identity_value = body.identity_value,
                 .marks = if (plain) &marks else &.{},
             });
         } else {
@@ -528,7 +554,7 @@ fn boxRow(placement: *const Placement, line: *usize, row: *const BoxRow) !void {
 fn boxRowCells(sink: *terminal.View.Sink, columns: usize, row: *const BoxRow) !void {
     const room = columns - row.indent;
     if (row.segment_ends) |ends| {
-        const shown = segmentCut(row.content, room, ends);
+        const shown = segmentCut(row.content, room, ends, row.identity_value);
         try boxRowText(sink, shown.kept, row);
         if (shown.shortened and row.marks.len > 0) try markStyle(sink, &row.marks[0]);
         try shown.writeEllipsis(sink);
