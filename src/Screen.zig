@@ -101,7 +101,7 @@ const Turn = struct {
     box_hashes: std.ArrayList(u64),
     box_tracks: std.ArrayList(layout.Track),
     work_line: std.ArrayList(u8),
-    work_ends: [ui.Block.Work.Summary.segments_max]usize,
+    work_ends: [ui.Block.Work.Summary.segment_count]usize,
 
     fn init(committed: usize) Turn {
         return .{
@@ -197,7 +197,11 @@ const Turn = struct {
             .received_bytes = 0,
             .status = .running,
         };
-        if (options.open) |run| started_ms = run.started_ms;
+        if (options.open) |run| {
+            started_ms = run.started_ms;
+            summary.tools = run.tools;
+            summary.received_bytes = run.received_bytes;
+        }
         var activity_text: std.ArrayList(u8) = .empty;
         defer activity_text.deinit(gpa);
         if (options.thinking) try activity_text.appendSlice(gpa, "thinking");
@@ -216,13 +220,13 @@ const Turn = struct {
         self.work_line.clearRetainingCapacity();
         var out: std.Io.Writer.Allocating = .fromArrayList(gpa, &self.work_line);
         defer self.work_line = out.toArrayList();
-        const count = summary.write(&out.writer, &.{
+        summary.write(&out.writer, &.{
             .activity = activity_text.items,
             .ends = &self.work_ends,
         }) catch return error.OutOfMemory;
         try self.box_view.append(
             gpa,
-            ui.Block.Work.box(out.written(), self.work_ends[0..count], .running),
+            ui.Block.Work.box(out.written(), &self.work_ends, .running),
         );
         return self.box_view.items;
     }
@@ -1622,7 +1626,7 @@ test "a work row in a small window keeps its current measurements and final stat
     const first = try device.snapshot(arena.allocator());
     try expectSummary(
         try std.mem.join(arena.allocator(), "\n", first.rows),
-        "Agent: work (thinking) · Time: 0s",
+        "Agent: work (thinking) · Time: 0s · Tools: 0 · Received: 3 B",
     );
     time.awake_ms = 3_000;
     _ = try screen.apply(&.{ .reasoning = "def" }, time);
@@ -1631,7 +1635,7 @@ test "a work row in a small window keeps its current measurements and final stat
     const active_rows = try std.mem.join(arena.allocator(), "\n", active.rows);
     try expectSummary(
         active_rows,
-        "Agent: work (thinking) · Time: 3s",
+        "Agent: work (thinking) · Time: 3s · Tools: 0 · Received: 6 B",
     );
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, active_rows, "Agent: work"));
     time.awake_ms = 4_000;
@@ -1684,7 +1688,7 @@ test "a work update inside the frame keeps all history above the visible screen"
     try std.testing.expectEqual(@as(usize, 100), active_count);
     try expectSummary(
         try std.mem.join(arena.allocator(), "\n", active.rows),
-        "Agent: work (thinking) · Time: 3s",
+        "Agent: work (thinking) · Time: 3s · Tools: 0 · Received: 6 B",
     );
 }
 
@@ -1729,7 +1733,7 @@ test "a work summary joins consecutive thinking blocks and keeps their text and 
     defer gpa.free(empty);
     try expectSummary(
         empty,
-        "Agent: work (thinking) · Time: 2s",
+        "Agent: work (thinking) · Time: 2s · Tools: 0 · Received: 0 B",
     );
     try testing.expectContains(rig.out.written(), "\x1b[36m\x1b[2mAgent: work (thinking)\x1b[0m");
     try std.testing.expect(std.mem.find(u8, rig.out.written(), "\x1b[36;7m") == null);
@@ -1745,7 +1749,7 @@ test "a work summary joins consecutive thinking blocks and keeps their text and 
     defer gpa.free(active);
     try expectSummary(
         active,
-        "Agent: work (thinking) · Time: 6s",
+        "Agent: work (thinking) · Time: 6s · Tools: 0 · Received: 10 B",
     );
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, active, "Agent: work"));
     try std.testing.expect(std.mem.find(u8, active, "alpha") == null);
@@ -1920,7 +1924,7 @@ test "a work row folds thinking and finished calls across steps until agent text
     defer gpa.free(running);
     try expectSummary(
         running,
-        "Agent: work (bash) · Time: 4s",
+        "Agent: work (bash) · Time: 4s · Tools: 1 · Received: 20 B",
     );
     try std.testing.expect(std.mem.find(u8, running, "Tool:") == null);
 
@@ -1971,7 +1975,7 @@ test "verbose off names the work that runs now and hides the rows of running cal
     defer gpa.free(streamed);
     try expectSummary(
         streamed,
-        "Agent: work (read, grep) · Time: 2s",
+        "Agent: work (read, grep) · Time: 2s · Tools: 0 · Received: 0 B",
     );
     try std.testing.expect(std.mem.find(u8, streamed, "Tool:") == null);
 
@@ -1988,7 +1992,7 @@ test "verbose off names the work that runs now and hides the rows of running cal
     rig.time.awake_ms = 4_000;
     const waiting = try rig.paintPlain(80);
     defer gpa.free(waiting);
-    try expectSummary(waiting, "Agent: work (waiting) · Time: 3s");
+    try expectSummary(waiting, "Agent: work (waiting) · Time: 3s · Tools: 3 · Received: 6 B");
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, waiting, "Agent: work"));
 
     try rig.apply(&.reasoning_started);
@@ -1997,12 +2001,12 @@ test "verbose off names the work that runs now and hides the rows of running cal
     defer gpa.free(thinking);
     try expectSummary(
         thinking,
-        "Agent: work (thinking) · Time: 3s",
+        "Agent: work (thinking) · Time: 3s · Tools: 3 · Received: 10 B",
     );
     try rig.apply(&.committed);
     const prepared = try rig.paintPlain(80);
     defer gpa.free(prepared);
-    try expectSummary(prepared, "Agent: work (waiting) · Time: 3s");
+    try expectSummary(prepared, "Agent: work (waiting) · Time: 3s · Tools: 3 · Received: 10 B");
     try rig.end(&.canceled);
     const canceled = try rig.paintPlain(80);
     defer gpa.free(canceled);
@@ -2027,36 +2031,34 @@ test "work activities keep unfinished tools, isolate thinking, and wait between 
     }
     const streamed = try rig.paintPlain(80);
     defer gpa.free(streamed);
-    try expectSummary(streamed, "Agent: work (read, grep) · Time: 0s");
+    try expectSummary(streamed, "Agent: work (read, grep) · Time: 0s · Tools: 0 · Received: 0 B");
     try std.testing.expect(std.mem.find(u8, streamed, "Now:") == null);
-    try std.testing.expect(std.mem.find(u8, streamed, "Tools:") == null);
-    try std.testing.expect(std.mem.find(u8, streamed, "Received:") == null);
 
     try rig.apply(&.reasoning_started);
     try rig.apply(&.{ .reasoning = "plan" });
     const thinking = try rig.paintPlain(80);
     defer gpa.free(thinking);
-    try expectSummary(thinking, "Agent: work (thinking) · Time: 0s");
+    try expectSummary(thinking, "Agent: work (thinking) · Time: 0s · Tools: 0 · Received: 4 B");
     for (&calls) |*call| try rig.apply(&.{ .tool_started = call.* });
     const running = try rig.paintPlain(80);
     defer gpa.free(running);
-    try expectSummary(running, "Agent: work (read, grep) · Time: 0s");
+    try expectSummary(running, "Agent: work (read, grep) · Time: 0s · Tools: 0 · Received: 4 B");
 
     for ([_]usize{ 0, 2 }) |index| {
         try rig.apply(&.{ .tool_result = .{ .call = calls[index], .output = .{} } });
         const active = try rig.paintPlain(80);
         defer gpa.free(active);
         try expectSummary(active, if (index == 0)
-            "Agent: work (grep, read) · Time: 0s"
+            "Agent: work (grep, read) · Time: 0s · Tools: 1 · Received: 6 B"
         else
-            "Agent: work (grep) · Time: 0s");
+            "Agent: work (grep) · Time: 0s · Tools: 2 · Received: 8 B");
     }
     try rig.apply(&.{ .tool_result = .{ .call = calls[1], .output = .{} } });
     try rig.apply(&.committed);
     rig.time.awake_ms = 1_000;
     const waiting = try rig.paintPlain(80);
     defer gpa.free(waiting);
-    try expectSummary(waiting, "Agent: work (waiting) · Time: 1s");
+    try expectSummary(waiting, "Agent: work (waiting) · Time: 1s · Tools: 3 · Received: 10 B");
     try rig.end(&.{ .stopped = .complete });
     const complete = try rig.paintPlain(80);
     defer gpa.free(complete);
@@ -2109,7 +2111,8 @@ test "work activities keep complete Unicode graphemes and the closing parenthesi
     try rig.start("prompt");
     try rig.apply(&.{ .tool_call_started = "読む👩‍💻" });
     const cases = [_]struct { columns: usize, expected: []const u8 }{
-        .{ .columns = 80, .expected = "Agent: work (読む👩‍💻) · Time: 0s" },
+        .{ .columns = 80, .expected = "Agent: work (読む👩‍💻) · Time: 0s · Tools: 0 · Received: 0 B" },
+        .{ .columns = 31, .expected = "Agent: work (読む👩‍💻) · Time: 0s" },
         .{ .columns = 20, .expected = "Agent: work (読む👩‍💻)" },
         .{ .columns = 19, .expected = "Agent: work (読む…)" },
         .{ .columns = 18, .expected = "Agent: work (読…)" },
@@ -2257,7 +2260,7 @@ test "a discarded thinking block no longer contributes to its work summary" {
     try rig.apply(&.{ .reasoning = "discard" });
     const active = try rig.paintPlain(80);
     defer gpa.free(active);
-    try expectSummary(active, "Agent: work (thinking) · Time: 2s");
+    try expectSummary(active, "Agent: work (thinking) · Time: 2s · Tools: 0 · Received: 8 B");
     try rig.apply(&.{ .tail_discarded = 1 });
     rig.time.awake_ms = 8_000;
     try rig.end(&.{ .stopped = .complete });
@@ -2266,6 +2269,27 @@ test "a discarded thinking block no longer contributes to its work summary" {
     const complete = try rig.paintPlain(80);
     defer gpa.free(complete);
     try expectSummary(complete, "Agent: work (complete) · Time: 8s · Tools: 0 · Received: 1 B");
+}
+
+test "a canceled run that drops a streaming call keeps the received bytes of its open row" {
+    const gpa = std.testing.allocator;
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    rig.screen.toggleVerbose();
+    try rig.start("prompt");
+    try rig.apply(&.reasoning_started);
+    try rig.apply(&.{ .reasoning = "abc" });
+    try rig.apply(&.{ .tool_call_started = "read" });
+    try rig.apply(&.{ .tool_call_arguments = "{\"path\":\"a\"}" });
+    const open = try rig.paintPlain(80);
+    defer gpa.free(open);
+    try expectSummary(open, "Agent: work (read) · Time: 0s · Tools: 0 · Received: 3 B");
+    try rig.apply(&.{ .tail_discarded = 2 });
+    try rig.end(&.canceled);
+    const canceled = try rig.paintPlain(80);
+    defer gpa.free(canceled);
+    try expectSummary(canceled, "Agent: work (canceled) · Time: 0s · Tools: 0 · Received: 3 B");
 }
 
 test "a tool call streams as a row, runs with its subject and timer, and ends as a block" {
@@ -2431,7 +2455,7 @@ test "verbose off hides each command, and verbose on keeps its complete text" {
         try rig.apply(&.{ .tool_started = call });
         const running = try rig.paintPlain(80);
         defer gpa.free(running);
-        try expectSummary(running, "Agent: work (bash) · Time: 0s");
+        try expectSummary(running, "Agent: work (bash) · Time: 0s · Tools: 0 · Received: 0 B");
         try std.testing.expect(std.mem.find(u8, running, "Command:") == null);
         try std.testing.expect(std.mem.find(u8, running, case.hidden) == null);
 

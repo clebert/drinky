@@ -26,8 +26,7 @@ pub const Work = struct {
     summary: [128]u8 = undefined,
     summary_length: usize = 0,
     summary_status: Status = .running,
-    summary_ends: [Summary.segments_max]usize = @splat(0),
-    summary_ends_length: usize = 0,
+    summary_ends: [Summary.segment_count]usize = @splat(0),
 
     const identity_prefix = "Agent: work (";
 
@@ -44,37 +43,29 @@ pub const Work = struct {
         received_bytes: usize,
         status: Status,
 
-        pub const segments_max = 4;
+        pub const segment_count = 4;
 
         pub fn write(
             self: *const Summary,
             writer: *std.Io.Writer,
-            options: *const struct { activity: []const u8, ends: *[segments_max]usize },
-        ) std.Io.Writer.Error!usize {
-            var count: usize = 0;
+            options: *const struct { activity: []const u8, ends: *[segment_count]usize },
+        ) std.Io.Writer.Error!void {
             const value = if (self.status == .running)
                 if (options.activity.len > 0) options.activity else "waiting"
             else
                 @tagName(self.status);
             try writer.print("{s}{s})", .{ identity_prefix, value });
-            options.ends[count] = writer.buffered().len;
-            count += 1;
+            options.ends[0] = writer.buffered().len;
             var time_buffer: [24]u8 = undefined;
             const time = format.durationSeconds(&time_buffer, self.elapsed_ms, .down);
             try writer.print("{s}Time: {s}", .{ paint.separator, time });
-            options.ends[count] = writer.buffered().len;
-            count += 1;
-            if (self.status != .running) {
-                try writer.print("{s}Tools: {d}", .{ paint.separator, self.tools });
-                options.ends[count] = writer.buffered().len;
-                count += 1;
-                var bytes_buffer: [16]u8 = undefined;
-                const bytes = format.bytes(&bytes_buffer, self.received_bytes);
-                try writer.print("{s}Received: {s}", .{ paint.separator, bytes });
-                options.ends[count] = writer.buffered().len;
-                count += 1;
-            }
-            return count;
+            options.ends[1] = writer.buffered().len;
+            try writer.print("{s}Tools: {d}", .{ paint.separator, self.tools });
+            options.ends[2] = writer.buffered().len;
+            var bytes_buffer: [16]u8 = undefined;
+            const bytes = format.bytes(&bytes_buffer, self.received_bytes);
+            try writer.print("{s}Received: {s}", .{ paint.separator, bytes });
+            options.ends[3] = writer.buffered().len;
         }
     };
 
@@ -315,15 +306,14 @@ pub fn presentWork(self: *Block, maybe_summary: ?*const Work.Summary) void {
     const summary = maybe_summary orelse return;
     var buffer: [work.summary.len]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buffer);
-    var ends: [Work.Summary.segments_max]usize = undefined;
-    const count = summary.write(&writer, &.{ .activity = "", .ends = &ends }) catch unreachable;
+    var ends: [Work.Summary.segment_count]usize = undefined;
+    summary.write(&writer, &.{ .activity = "", .ends = &ends }) catch unreachable;
     const text = writer.buffered();
     if (std.mem.eql(u8, work.summary[0..work.summary_length], text)) return;
     @memcpy(work.summary[0..text.len], text);
     work.summary_length = text.len;
     work.summary_status = summary.status;
     work.summary_ends = ends;
-    work.summary_ends_length = count;
     self.cache.invalidate();
 }
 
@@ -333,7 +323,7 @@ fn look(self: *const Block) Look {
             .role = .text,
             .body = Work.box(
                 work.summary[0..work.summary_length],
-                work.summary_ends[0..work.summary_ends_length],
+                &work.summary_ends,
                 work.summary_status,
             ),
         } };
@@ -976,13 +966,13 @@ test "work summaries keep time before tools and bytes and reduce to one row" {
         try std.testing.expectEqual(@as(usize, 1), testing.paintedRows(painted));
     }
 
-    block.presentWork(&.{ .elapsed_ms = 0, .tools = 0, .received_bytes = 0, .status = .running });
+    block.presentWork(&.{ .elapsed_ms = 0, .tools = 1, .received_bytes = 5, .status = .running });
     const running = try rendered(gpa, &block, 80, 0);
     defer gpa.free(running);
     const plain = try terminal.testing.plainText(gpa, running);
     defer gpa.free(plain);
     try std.testing.expectEqualStrings(
-        "Agent: work (waiting) · Time: 0s",
+        "Agent: work (waiting) · Time: 0s · Tools: 1 · Received: 5 B",
         std.mem.trimEnd(u8, plain, " "),
     );
     try testing.expectShows(running, &.{"\x1b[36m\x1b[2mAgent: work (waiting)"});

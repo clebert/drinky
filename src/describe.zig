@@ -147,6 +147,9 @@ fn writeCommands(writer: *std.Io.Writer) !void {
         \\Verbose off folds each run of thinking and tool calls into one work row.
         \\Agent text, a session event, or a user note ends a run. A new model step does not end it.
         \\The open work row shows the activity in parentheses and the time of the run.
+        \\Each work row shows the count of finished tool calls and the received bytes.
+        \\The open work row updates these values while the run continues.
+        \\The received bytes count the thinking text and the arguments of finished tool calls.
         \\The activity is `thinking` while thinking is active.
         \\Otherwise, it lists each unfinished tool name once, without a call count.
         \\The list includes calls that stream, wait in the queue, or run.
@@ -154,8 +157,6 @@ fn writeCommands(writer: *std.Io.Writer) !void {
         \\The row reserves no activity width and adds no activity padding.
         \\The open run stays below the transcript.
         \\The final status is `complete`, `canceled`, `failed`, or `truncated`.
-        \\A finished work row adds the count of finished tool calls and the received bytes.
-        \\The received bytes count the thinking text and the tool arguments.
         \\The transcript keeps thinking after a cancellation or failure.
         \\A toggle changes no stored text and does not change the model conversation.
         \\
@@ -179,8 +180,7 @@ fn writeCommands(writer: *std.Io.Writer) !void {
         \\Complete tool error sentences wrap, even at very small widths.
         \\Work rows start with `Agent: work (activity)` while open and `Agent: work (status)` after
         \\completion.
-        \\The time has the next priority, followed by the tool count and received bytes after
-        \\completion.
+        \\The time has the next priority, followed by the tool count and the received bytes.
         \\A work row truncates the value in parentheses only when its complete identity
         \\does not fit.
         \\It keeps the complete prefix and closing parenthesis when at least 15 columns remain.
