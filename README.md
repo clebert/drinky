@@ -9,9 +9,8 @@ Drinky supports Anthropic, OpenAI, xAI, OpenRouter, DeepSeek, and Gemini Enterpr
 (Vertex AI). It learns models from the providers and uses public metadata for prices and model
 capabilities.
 
-Drinky is a single Zig program. It needs no Node.js runtime or third-party packages. Instruction
-files and skills define how the agent works. The model can read the command, config, and key
-reference through the `describe_drinky` tool.
+Drinky is a single Zig program. Instruction files and skills define how the agent works. The model
+can read the command, config, and key reference through the `describe_drinky` tool.
 
 ## Build and run
 
@@ -24,9 +23,6 @@ zig build -Doptimize=safe
 ```
 
 ## Accounts
-
-An account reads `vendor-product`, and a model under it reads `account/model`. A `-key` suffix marks
-an account that reads its credential from an environment variable.
 
 | Account              | Credential                                                   |
 | -------------------- | ------------------------------------------------------------ |
@@ -42,15 +38,7 @@ an account that reads its credential from an environment variable.
 | `deepseek-api-key`   | `DEEPSEEK_API_KEY`                                           |
 | `google-cloud-key`   | `GOOGLE_APPLICATION_CREDENTIALS` and `GOOGLE_CLOUD_LOCATION` |
 
-Use `/login` to sign in or switch accounts. Use `/model` to select a model. Set the environment
-variables for a `-key` account before the start of Drinky.
-
-Drinky can renew a refresh credential and retry an unauthorized request once. In a terminal session,
-Drinky signs out an account when its refresh credential fails permanently and no replacement exists.
-A temporary failure keeps the credentials.
-
-For `google-cloud-key`, set `GOOGLE_APPLICATION_CREDENTIALS` to the file that holds the service
-account key. Set `GOOGLE_CLOUD_LOCATION` to `eu`, `us`, or `global`.
+Use `/login` to sign in or switch accounts. Use `/model` to select a model.
 
 Drinky is not affiliated with the providers.
 
@@ -58,9 +46,6 @@ Drinky is not affiliated with the providers.
 
 Use `drinky run` to answer a prompt without a terminal. A run reads the prompt from stdin and writes
 the final reply to stdout. It uses the instructions and tools of a terminal session.
-
-If a refresh credential fails permanently, `drinky run` reports the failure and keeps the saved
-credentials.
 
 ```sh
 ./zig-out/bin/drinky run --model openai-plan/gpt-5.5 --effort high <<'EOF'
