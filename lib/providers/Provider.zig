@@ -209,7 +209,7 @@ fn credentialFailed(self: *Provider, err: Credential.Error) core.Provider.Error!
         }),
         error.Network => try self.fail(.{
             .reason = .network,
-            .message = "The credential refresh did not reach the server.",
+            .message = "Drinky could not refresh the credential.",
         }),
     }
 }
@@ -473,7 +473,7 @@ test "a renewal that fails after a 401 reports the failure of the credential" {
         },
         .{
             .failure = error.Network,
-            .trace = "failed:network|-|The credential refresh did not reach the server.\n",
+            .trace = "failed:network|-|Drinky could not refresh the credential.\n",
         },
     };
     for (cases) |case| {
@@ -648,7 +648,7 @@ test "a credential that cannot be a header value or that fails never reaches the
     offline.init(std.testing.io, &.{ .replies = &.{.{ .body = complete_body }} });
     offline.credential.token_fail = error.Network;
     defer offline.deinit();
-    try offline.expectTrace("failed:network|-|The credential refresh did not reach the server.\n");
+    try offline.expectTrace("failed:network|-|Drinky could not refresh the credential.\n");
     try std.testing.expectEqual(@as(usize, 0), offline.transport.requests.items.len);
 }
 

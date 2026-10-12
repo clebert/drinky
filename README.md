@@ -45,6 +45,10 @@ an account that reads its credential from an environment variable.
 Use `/login` to sign in or switch accounts. Use `/model` to select a model. Set the environment
 variables for a `-key` account before the start of Drinky.
 
+Drinky can renew a refresh credential and retry an unauthorized request once. In a terminal session,
+Drinky signs out an account when its refresh credential fails permanently and no replacement exists.
+A temporary failure keeps the credentials.
+
 For `google-cloud-key`, set `GOOGLE_APPLICATION_CREDENTIALS` to the file that holds the service
 account key. Set `GOOGLE_CLOUD_LOCATION` to `eu`, `us`, or `global`.
 
@@ -54,6 +58,9 @@ Drinky is not affiliated with the providers.
 
 Use `drinky run` to answer a prompt without a terminal. A run reads the prompt from stdin and writes
 the final reply to stdout. It uses the instructions and tools of a terminal session.
+
+If a refresh credential fails permanently, `drinky run` reports the failure and keeps the saved
+credentials.
 
 ```sh
 ./zig-out/bin/drinky run --model openai-plan/gpt-5.5 --effort high <<'EOF'

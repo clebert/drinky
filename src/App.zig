@@ -1063,7 +1063,13 @@ fn endTurn(self: *App, outcome: *const core.Session.Outcome) !void {
         },
         .failed => |*failure| {
             try self.offerRetry(failure);
-            if (failure.reason == .unauthorized) try self.rejectCredential();
+            if (failure.reason == .unauthorized) {
+                const account = self.choice.account orelse return;
+                if (try self.rejectCredential(account)) try self.reportCredentialStep(
+                    account,
+                    "Drinky reloaded the refresh credential that another Drinky instance saved. ",
+                );
+            }
         },
     }
 }
@@ -1074,31 +1080,34 @@ fn offerRetry(self: *App, failure: *const core.Provider.Failure) !void {
     self.offer = .{ .retry = try self.gpa.print(retry_request, .{text}) };
 }
 
-fn rejectCredential(self: *App) !void {
-    const account = self.choice.account orelse return;
+fn rejectCredential(self: *App, account: usize) !bool {
     var maybe_removal_error: ?accounts.oauth.store.Error = null;
     const recovered = self.account_registry.invalidate(account) catch |err| switch (err) {
-        error.AccountHasNoRefreshCredential => return,
+        error.AccountHasNoRefreshCredential => return false,
         else => |removal_error| failure: {
             maybe_removal_error = removal_error;
             break :failure false;
         },
     };
-    self.clients.close();
+    const active = self.choice.isActive(account);
+    if (active) self.clients.close();
     if (recovered) {
-        try self.sync();
-        try self.reportCredentialStep(
-            account,
-            "Drinky reloaded the refresh credential that another Drinky instance saved. ",
-        );
+        if (active) try self.sync();
     } else {
         if (maybe_removal_error) |removal_error| try self.recordEvent(
             .failure,
             "Drinky could not remove the rejected credential for {s} because of error {s}.",
             .{ accounts.Account.table[account].id, @errorName(removal_error) },
         );
-        try self.handOff(account);
+        if (active) {
+            try self.handOff(account);
+        } else try self.recordEvent(
+            .information,
+            "Drinky signed out of {s}. Use /login to sign in again.",
+            .{accounts.Account.table[account].id},
+        );
     }
+    return recovered;
 }
 
 fn reportCredentialStep(self: *App, account: usize, comptime lead: []const u8) !void {
@@ -1328,6 +1337,10 @@ fn finishFetch(self: *App, ended: *const accounts.Registry.Event.FetchEnd) !void
         else => return,
     };
     if (fetch.account != ended.account) return;
+    if (self.choice.isActive(fetch.account)) {
+        self.clients.close();
+        try self.sync();
+    }
     if (fetch.exit) |exit| switch (exit) {
         .command => return self.cancelPicker(),
         .step => {
@@ -1342,6 +1355,13 @@ fn finishFetch(self: *App, ended: *const accounts.Registry.Event.FetchEnd) !void
         fetch.account,
         &ended.refresh,
     ));
+    const err = ended.refresh.models_error orelse return;
+    if (err != error.TokenGrantRejected and err != error.ModelListUnauthorized) return;
+    if (try self.rejectCredential(fetch.account)) try self.reportModelStep(
+        fetch.account,
+        "Drinky reloaded the refresh credential that another Drinky instance saved. ",
+        .{},
+    );
 }
 
 fn reopenStep(self: *App) !void {
@@ -3089,6 +3109,321 @@ test "a rejected plan credential leaves the store and hands the session to the n
         "Drinky signed out of openai-plan. Select an account to sign in.",
         &.{ .text = "Sign in · ↑/↓" },
     );
+}
+
+test "a rejected refresh during a model fetch opens sign-in without a manual logout" {
+    const replies = [_]providers.testing.FakeTransport.Reply{
+        .{ .status = .unauthorized, .body = "{\"error\":{\"code\":\"refresh_token_reused\"}}" },
+        .{ .body = "{\"data\":[]}" },
+    };
+    var rig: Rig = undefined;
+    try rig.init(&.{
+        .store = expired_plan_store,
+        .replies = &replies,
+        .model = "gpt-5.6-sol",
+        .model_accounts = &.{accounts.testing.openai_plan},
+    });
+    defer rig.deinit();
+
+    try rig.keys("/model\r");
+    try rig.waitFor(&.{.{ .text = "Model: openai-plan · " }});
+    try rig.keys("\x1b[A\r");
+    try rig.waitFor(&.{
+        .{ .text = "Drinky signed out of openai-plan. Select an account to sign in." },
+        .{ .text = "Sign in · ↑/↓" },
+    });
+    try std.testing.expect(!rig.app.account_registry.isAuthenticated(accounts.testing.openai_plan));
+    try rig.startLoginOf(accounts.testing.openai_plan);
+}
+
+const expired_plan_store =
+    "{\"openai-plan\":{\"access\":\"access-first\",\"refresh\":\"refresh-first\"," ++
+    "\"expires_ms\":0,\"account_id\":\"account-1\"}}";
+const plan_models_body =
+    "{\"models\":[{\"slug\":\"gpt-next\",\"visibility\":\"list\",\"context_window\":400000}]}";
+
+fn planRefreshBody(gpa: std.mem.Allocator) error{OutOfMemory}![]u8 {
+    const access = try accounts.testing.fakeJwt(gpa, "{\"exp\":4102444800}");
+    defer gpa.free(access);
+    return gpa.print("{{\"access_token\":\"{s}\",\"refresh_token\":\"refresh-next\"}}", .{access});
+}
+
+test "a model fetch renews a rejected access token once and opens the model list" {
+    const gpa = std.testing.allocator;
+    const refresh_body = try planRefreshBody(gpa);
+    defer gpa.free(refresh_body);
+    var rig: Rig = undefined;
+    try rig.init(&.{
+        .store = planStore("first"),
+        .replies = &.{
+            rejected_reply,
+            .{ .body = refresh_body },
+            .{ .body = plan_models_body },
+            .{ .body = "{\"data\":[]}" },
+        },
+        .model = "gpt-5.6-sol",
+        .model_accounts = &.{accounts.testing.openai_plan},
+    });
+    defer rig.deinit();
+
+    try rig.keys("/model\r");
+    try rig.waitFor(&.{.{ .text = "Model: openai-plan · " }});
+    try rig.keys("\x1b[A\r");
+    try rig.waitFor(&.{
+        .{ .text = "Model: openai-plan · " },
+        .{ .text = "gpt-next" },
+        .{ .absent = fetch_wait_text },
+    });
+    try std.testing.expectEqual(@as(usize, 4), rig.transport.requests.items.len);
+    try expectRequestHolds(&rig, 0, "authorization: Bearer access-first\n");
+    try expectRequestHolds(&rig, 1, "\"refresh_token\":\"refresh-first\"");
+    try std.testing.expect(std.mem.find(
+        u8,
+        rig.transport.requests.items[2],
+        "authorization: Bearer access-first\n",
+    ) == null);
+    try expectRequestHolds(&rig, 2, "authorization: Bearer e30.");
+    try std.testing.expect(rig.app.account_registry.isAuthenticated(accounts.testing.openai_plan));
+}
+
+test "a model fetch replacement updates the account id of the next turn after every outcome" {
+    const replacement_store =
+        "{\"openai-plan\":{\"access\":\"access-second\",\"refresh\":\"refresh-second\"," ++
+        "\"expires_ms\":4102444800000,\"account_id\":\"account-2\"}}";
+    const Outcome = enum { complete, failed, canceled };
+    for ([_]Outcome{ .complete, .failed, .canceled }) |outcome| {
+        var stall: providers.testing.FakeTransport.Stall = .{ .io = std.testing.io };
+        const list_reply: providers.testing.FakeTransport.Reply = switch (outcome) {
+            .complete => .{ .body = plan_models_body },
+            .failed => .{ .status = .bad_request },
+            .canceled => .{ .stall = &stall },
+        };
+        const replies = [_]providers.testing.FakeTransport.Reply{
+            rejected_reply,
+            list_reply,
+            .{ .body = if (outcome == .canceled)
+                providers.testing.reply_stream
+            else
+                "{\"data\":[]}" },
+            .{ .body = providers.testing.reply_stream },
+        };
+        const replies_count: usize = if (outcome == .canceled) 3 else 4;
+        var rig: Rig = undefined;
+        try rig.init(&.{
+            .store = planStore("first"),
+            .replies = replies[0..replies_count],
+            .model = "gpt-5.6-sol",
+            .model_accounts = &.{accounts.testing.openai_plan},
+        });
+        defer rig.deinit();
+        try accounts.testing.writeStore(rig.clock.io(), &rig.tmp, replacement_store);
+
+        try rig.keys("/model\r");
+        try rig.waitFor(&.{.{ .text = "Model: openai-plan · " }});
+        try rig.keys("\x1b[A\r");
+        switch (outcome) {
+            .complete => {
+                try rig.waitFor(&.{
+                    .{ .text = "Model: openai-plan · " },
+                    .{ .text = "gpt-next" },
+                    .{ .absent = fetch_wait_text },
+                });
+                try rig.keys("\x03");
+            },
+            .failed => try rig.waitFor(&.{
+                .{ .text = "Drinky could not fetch the model list of openai-plan because of " ++
+                    "error ModelListRequestFailed." },
+                .{ .absent = fetch_wait_text },
+            }),
+            .canceled => {
+                try stall.reached.wait(std.testing.io);
+                try rig.keys("\x1b");
+                try rig.waitFor(&.{
+                    .{ .text = "Model: openai-plan · " },
+                    .{ .status = "You canceled the model fetch." },
+                });
+                try std.testing.expect(stall.canceled);
+                try rig.keys("\x03");
+            },
+        }
+        try expectRequestHolds(&rig, 1, "chatgpt-account-id: account-2\n");
+        try rig.keys("hello\r");
+        try rig.waitFor(&.{
+            .{ .rows = &.{ "hello", "done" } },
+            .{ .activity = false },
+            .{ .status = "Model: openai-plan/gpt-5.6-sol" },
+        });
+        try std.testing.expectEqual(replies_count, rig.transport.requests.items.len);
+        try expectRequestHolds(&rig, replies_count - 1, "authorization: Bearer access-second\n");
+        try expectRequestHolds(&rig, replies_count - 1, "chatgpt-account-id: account-2\n");
+        try std.testing.expect(
+            rig.app.account_registry.isAuthenticated(accounts.testing.openai_plan),
+        );
+    }
+}
+
+test "a model fetch that rejects the renewed token opens sign-in without another renewal" {
+    const gpa = std.testing.allocator;
+    const refresh_body = try planRefreshBody(gpa);
+    defer gpa.free(refresh_body);
+    var rig: Rig = undefined;
+    try rig.init(&.{
+        .store = planStore("first"),
+        .replies = &.{
+            rejected_reply,
+            .{ .body = refresh_body },
+            rejected_reply,
+            .{ .body = "{\"data\":[]}" },
+        },
+        .model = "gpt-5.6-sol",
+        .model_accounts = &.{accounts.testing.openai_plan},
+    });
+    defer rig.deinit();
+
+    try rig.keys("/model\r");
+    try rig.waitFor(&.{.{ .text = "Model: openai-plan · " }});
+    try rig.keys("\x1b[A\r");
+    try rig.waitFor(&.{
+        .{ .text = "Drinky signed out of openai-plan. Select an account to sign in." },
+        .{ .text = "Sign in · ↑/↓" },
+    });
+    try std.testing.expectEqual(@as(usize, 4), rig.transport.requests.items.len);
+    try std.testing.expect(!rig.app.account_registry.isAuthenticated(accounts.testing.openai_plan));
+}
+
+test "an uncertain model-fetch refresh failure keeps the account and a later fetch recovers" {
+    const gpa = std.testing.allocator;
+    const refresh_body = try planRefreshBody(gpa);
+    defer gpa.free(refresh_body);
+    for ([_]std.http.Status{ .bad_request, .service_unavailable }) |status| {
+        var rig: Rig = undefined;
+        try rig.init(&.{
+            .store = expired_plan_store,
+            .replies = &.{
+                .{ .status = status, .body = "{\"error\":\"unknown\"}" },
+                .{ .body = "{\"data\":[]}" },
+                .{ .body = refresh_body },
+                .{ .body = plan_models_body },
+                .{ .body = "{\"data\":[]}" },
+            },
+            .model = "gpt-5.6-sol",
+            .model_accounts = &.{accounts.testing.openai_plan},
+        });
+        defer rig.deinit();
+
+        try rig.keys("/model\r");
+        try rig.waitFor(&.{.{ .text = "Model: openai-plan · " }});
+        try rig.keys("\x1b[A\r");
+        try rig.waitFor(&.{
+            .{ .text = "Drinky could not fetch the model list of openai-plan because of error " },
+            .{ .absent = fetch_wait_text },
+            .{ .status = "Model: openai-plan/gpt-5.6-sol" },
+        });
+        try std.testing.expect(
+            rig.app.account_registry.isAuthenticated(accounts.testing.openai_plan),
+        );
+        try rig.keys("/model\r");
+        try rig.waitFor(&.{.{ .text = "Model: openai-plan · " }});
+        try rig.keys("\x1b[A\r");
+        try rig.waitFor(&.{
+            .{ .text = "Model: openai-plan · " },
+            .{ .text = "gpt-next" },
+            .{ .absent = fetch_wait_text },
+        });
+        try std.testing.expectEqual(@as(usize, 5), rig.transport.requests.items.len);
+        try std.testing.expect(
+            rig.app.account_registry.isAuthenticated(accounts.testing.openai_plan),
+        );
+    }
+}
+
+test "a rejected model fetch of another account keeps the active account usable" {
+    var rig: Rig = undefined;
+    try rig.init(&.{
+        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .store = expired_plan_store,
+        .replies = &.{
+            .{ .status = .bad_request, .body = "{\"error\":\"invalid_grant\"}" },
+            .{ .body = "{\"data\":[]}" },
+            .{ .body = providers.testing.reply_stream },
+        },
+        .model = "gpt-5.6-sol",
+        .model_accounts = &.{ accounts.testing.openai_plan, accounts.testing.openai_api_key },
+    });
+    defer rig.deinit();
+
+    try rig.keys("/login\r");
+    try rig.waitFor(&.{.{ .text = "Sign in · ↑/↓" }});
+    try rig.keys("\x1b[B\r");
+    try rig.waitFor(&.{.{ .status = "Model: openai-api-key/gpt-5.6-sol" }});
+    try rig.keys("/model\r");
+    try rig.waitFor(&.{.{ .text = "Account · ↑/↓" }});
+    try rig.keys("\x1b[A\r");
+    try rig.waitFor(&.{.{ .text = "Model: openai-plan · " }});
+    try rig.keys("\x1b[A\r");
+    try rig.waitFor(&.{
+        .{ .text = "Drinky signed out of openai-plan. Use /login to sign in again." },
+        .{ .status = "Model: openai-api-key/gpt-5.6-sol" },
+        .{ .absent = "Sign in · ↑/↓" },
+    });
+    try std.testing.expect(!rig.app.account_registry.isAuthenticated(accounts.testing.openai_plan));
+    try rig.keys("hello\r");
+    try rig.waitFor(&.{ .{ .rows = &.{ "hello", "done" } }, .{ .activity = false } });
+    try expectRequestHolds(&rig, 2, "authorization: Bearer sk-openai\n");
+}
+
+test "a rejected model fetch adopts a credential that another instance saved meanwhile" {
+    var hold: providers.testing.FakeTransport.Hold = .{ .io = std.testing.io };
+    var rig: Rig = undefined;
+    try rig.init(&.{
+        .store = expired_plan_store,
+        .replies = &.{
+            .{ .status = .bad_request, .body = "{\"error\":\"invalid_grant\"}" },
+            .{ .body = "{\"data\":[]}", .hold = &hold },
+        },
+        .model = "gpt-5.6-sol",
+        .model_accounts = &.{accounts.testing.openai_plan},
+    });
+    defer rig.deinit();
+
+    try rig.keys("/model\r");
+    try rig.waitFor(&.{.{ .text = "Model: openai-plan · " }});
+    try rig.keys("\x1b[A\r");
+    try hold.reached.wait(std.testing.io);
+    try accounts.testing.writeStore(rig.clock.io(), &rig.tmp, planStore("second"));
+    hold.released.set(std.testing.io);
+    try rig.waitFor(&.{
+        .{ .text = "Drinky reloaded the refresh credential that another Drinky instance saved. " ++
+            "Fetch the model list of openai-plan with /model." },
+        .{ .status = "Model: openai-plan/gpt-5.6-sol" },
+        .{ .absent = "Sign in · ↑/↓" },
+    });
+    try std.testing.expect(rig.app.account_registry.isAuthenticated(accounts.testing.openai_plan));
+}
+
+test "a cancel ends the credential renewal of a model fetch and keeps the account" {
+    var stall: providers.testing.FakeTransport.Stall = .{ .io = std.testing.io };
+    var rig: Rig = undefined;
+    try rig.init(&.{
+        .store = planStore("first"),
+        .replies = &.{ rejected_reply, .{ .stall = &stall } },
+        .model = "gpt-5.6-sol",
+        .model_accounts = &.{accounts.testing.openai_plan},
+    });
+    defer rig.deinit();
+
+    try rig.keys("/model\r");
+    try rig.waitFor(&.{.{ .text = "Model: openai-plan · " }});
+    try rig.keys("\x1b[A\r");
+    try stall.reached.wait(std.testing.io);
+    try rig.keys("\x1b");
+    try rig.waitFor(&.{
+        .{ .text = "Model: openai-plan · " },
+        .{ .status = "You canceled the model fetch." },
+    });
+    try std.testing.expect(stall.canceled);
+    try expectRequestHolds(&rig, 1, "https://auth.openai.com/oauth/token\n");
+    try std.testing.expect(rig.app.account_registry.isAuthenticated(accounts.testing.openai_plan));
 }
 
 test "a rejected key credential keeps its account" {

@@ -820,6 +820,33 @@ fn fetchModels(
     index: usize,
     deadline: *const core.timeout.Deadline,
 ) FetchError![]Model {
+    for (0..2) |attempt| {
+        if (self.requestModels(index, deadline)) |models| {
+            return models;
+        } else |err| {
+            if (err != error.ModelListUnauthorized or attempt != 0) return err;
+            const found = self.credential(index).?;
+            const renewed = deadline.run(
+                self.io,
+                providers.Credential.renew,
+                .{found},
+                null,
+            ) catch |failure| return switch (failure) {
+                error.Rejected => error.TokenGrantRejected,
+                error.Network => error.TokenServiceUnavailable,
+                else => |other| other,
+            };
+            if (!renewed) return err;
+        }
+    }
+    unreachable;
+}
+
+fn requestModels(
+    self: *Registry,
+    index: usize,
+    deadline: *const core.timeout.Deadline,
+) FetchError![]Model {
     const row = &Account.table[index];
     const slot = &self.slots[index];
     var secrets: std.heap.ArenaAllocator = .init(self.gpa);

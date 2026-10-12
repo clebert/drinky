@@ -12,6 +12,7 @@ pub const Error = providers.Http.FetchError || error{
     Timeout,
     ConcurrencyUnavailable,
     BadModelListCredentials,
+    ModelListUnauthorized,
     ModelListRequestFailed,
     BadModelList,
 };

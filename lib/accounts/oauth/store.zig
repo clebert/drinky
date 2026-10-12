@@ -95,21 +95,22 @@ fn credentialError(failure: TokenError) providers.Credential.Error {
         error.TokenGrantRejected,
         error.KeyRejected,
         error.BadPrivateKey,
-        error.TokenRequestFailed,
-        error.TokenResponseTooLarge,
-        error.BadTokenResponse,
         error.BadDeviceResponse,
-        error.MissingAccessToken,
-        error.MissingRefreshToken,
-        error.MissingExpiry,
-        error.MissingAccountId,
         error.MissingApiKey,
         error.AuthorizationPending,
         error.SlowDown,
         error.AuthorizationDenied,
         error.DeviceCodeExpired,
         => error.Rejected,
-        error.TokenServiceUnavailable => error.Network,
+        error.TokenRequestFailed,
+        error.TokenServiceUnavailable,
+        error.TokenResponseTooLarge,
+        error.BadTokenResponse,
+        error.MissingAccessToken,
+        error.MissingRefreshToken,
+        error.MissingExpiry,
+        error.MissingAccountId,
+        => error.Network,
         inline else => |cause| network: {
             comptime core.error_set.requireMember(providers.Transport.Error, cause);
             break :network error.Network;
@@ -451,7 +452,7 @@ pub fn Store(comptime Flow: type) type {
     };
 }
 
-test "a credential failure is a rejection only when the token service answered" {
+test "a credential keeps uncertain token failures separate from rejected grants" {
     const gpa = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -465,13 +466,13 @@ test "a credential failure is a rejection only when the token service answered" 
         .{ error.Canceled, error.Canceled },
         .{ error.OutOfMemory, error.OutOfMemory },
         .{ error.TokenGrantRejected, error.Rejected },
-        .{ error.TokenRequestFailed, error.Rejected },
-        .{ error.TokenResponseTooLarge, error.Rejected },
-        .{ error.BadTokenResponse, error.Rejected },
-        .{ error.MissingAccessToken, error.Rejected },
-        .{ error.MissingRefreshToken, error.Rejected },
-        .{ error.MissingExpiry, error.Rejected },
-        .{ error.MissingAccountId, error.Rejected },
+        .{ error.TokenRequestFailed, error.Network },
+        .{ error.TokenResponseTooLarge, error.Network },
+        .{ error.BadTokenResponse, error.Network },
+        .{ error.MissingAccessToken, error.Network },
+        .{ error.MissingRefreshToken, error.Network },
+        .{ error.MissingExpiry, error.Network },
+        .{ error.MissingAccountId, error.Network },
         .{ error.TokenServiceUnavailable, error.Network },
         .{ error.ConnectionRefused, error.Network },
         .{ error.NameServerFailure, error.Network },

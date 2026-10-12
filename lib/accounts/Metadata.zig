@@ -46,7 +46,9 @@ fn request(gpa: std.mem.Allocator, io: std.Io, transport: ?providers.Transport) 
         .user_agent = providers.Transport.client_name,
         .headers = &.{net.accept_json},
     }, body_bytes_max) catch |err| switch (err) {
-        error.ModelListRequestFailed => return error.MetadataRequestFailed,
+        error.ModelListUnauthorized,
+        error.ModelListRequestFailed,
+        => return error.MetadataRequestFailed,
         else => |other| return other,
     };
     defer gpa.free(body);

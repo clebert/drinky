@@ -91,6 +91,9 @@ const Fetch = struct {
 
 const Code = enum {
     invalid_grant,
+    refresh_token_expired,
+    refresh_token_reused,
+    refresh_token_invalidated,
     authorization_pending,
     slow_down,
     access_denied,
@@ -289,7 +292,11 @@ fn checkResponse(
     if (maybe_code) |code| {
         const device = error_body == .device;
         switch (code) {
-            .invalid_grant => return error.TokenGrantRejected,
+            .invalid_grant,
+            .refresh_token_expired,
+            .refresh_token_reused,
+            .refresh_token_invalidated,
+            => return error.TokenGrantRejected,
             .authorization_pending => if (device) return error.AuthorizationPending,
             .slow_down => if (device) return error.SlowDown,
             .access_denied, .authorization_denied => if (device) return error.AuthorizationDenied,
@@ -305,7 +312,11 @@ fn errorCode(gpa: std.mem.Allocator, body: []const u8) error{OutOfMemory}!?Code 
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     const object = (try providers.json.parseObject(arena.allocator(), body)) orelse return null;
-    const code = providers.json.string(object.getPtr("error")) orelse return null;
+    const maybe_error = object.getPtr("error");
+    const maybe_detail = providers.json.object(maybe_error);
+    const code = providers.json.string(maybe_error) orelse
+        (if (maybe_detail) |detail| providers.json.string(detail.getPtr("code")) else null) orelse
+        providers.json.string(object.getPtr("code")) orelse return null;
     return std.meta.stringToEnum(Code, code);
 }
 
@@ -340,6 +351,42 @@ test "an OAuth response reads its error before it classifies the status" {
         error.TokenServiceUnavailable,
         checkResponse(gpa, .service_unavailable, "", .oauth),
     );
+}
+
+test "a token request recognizes permanent refresh codes in each response shape" {
+    const gpa = std.testing.allocator;
+    const codes = [_][]const u8{
+        "invalid_grant",
+        "refresh_token_expired",
+        "refresh_token_reused",
+        "refresh_token_invalidated",
+    };
+    const shapes = [_][]const u8{
+        "{{\"error\":\"{s}\"}}",
+        "{{\"error\":{{\"code\":\"{s}\",\"message\":\"Sign in again.\"}}}}",
+        "{{\"code\":\"{s}\"}}",
+    };
+    for (codes) |code| {
+        inline for (shapes) |shape| {
+            const body = try gpa.print(shape, .{code});
+            defer gpa.free(body);
+            var transport: providers.testing.FakeTransport = .{
+                .gpa = gpa,
+                .replies = &.{.{ .status = .unauthorized, .body = body }},
+            };
+            defer transport.deinit();
+            try std.testing.expectError(error.TokenGrantRejected, post(
+                gpa,
+                std.testing.io,
+                &.{ .transport = transport.transport() },
+                &.{
+                    .url = "https://auth.openai.com/oauth/token",
+                    .content_type = "application/json",
+                    .body = "{}",
+                },
+            ));
+        }
+    }
 }
 
 test "a device response reads the poll answers of its grant" {

@@ -61,11 +61,14 @@ pub fn getBody(
     transport: ?providers.Transport,
     request: *const providers.Transport.Request,
     bytes_max: usize,
-) (providers.Http.FetchError || error{ModelListRequestFailed})![]u8 {
+) (providers.Http.FetchError || error{ ModelListUnauthorized, ModelListRequestFailed })![]u8 {
     const response = try providers.Http.fetch(gpa, io, transport, request, bytes_max);
     if (response.status == .ok) return response.body;
     gpa.free(response.body);
-    return error.ModelListRequestFailed;
+    return if (response.status == .unauthorized)
+        error.ModelListUnauthorized
+    else
+        error.ModelListRequestFailed;
 }
 
 test "getJson refuses a credential that cannot be a header before it opens" {
