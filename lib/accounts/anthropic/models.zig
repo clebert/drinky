@@ -119,7 +119,7 @@ test "the list sends the identity of the Messages wire" {
     try std.testing.expectEqualStrings(
         "GET https://api.anthropic.com/v1/models?limit=100\n" ++
             "authorization: Bearer oauth-token\n" ++
-            "user-agent: claude-cli/2.1.75\n" ++
+            "user-agent: claude-cli/2.1.280\n" ++
             "accept: application/json\n" ++
             "anthropic-version: 2023-06-01\n" ++
             "anthropic-beta: claude-code-20250219,oauth-2025-04-20\n" ++

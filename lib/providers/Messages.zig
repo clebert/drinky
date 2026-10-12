@@ -13,7 +13,7 @@ const endpoint = "https://api.anthropic.com/v1/messages";
 const anthropic_version = "2023-06-01";
 const streaming_beta = "fine-grained-tool-streaming-2025-05-14";
 const subscription_beta = "claude-code-20250219,oauth-2025-04-20";
-const user_agent = "claude-cli/2.1.75";
+const user_agent = "claude-cli/2.1.280";
 const tokens_max_fallback = 4096;
 const system_header = "You are Claude Code, Anthropic's official CLI for Claude.";
 const redacted_notice = "[redacted thinking]";
@@ -1077,7 +1077,7 @@ test "prepare forks the headers by identity and every identity streams tool inpu
     const plan = try subscription.dialect().prepare(arena.allocator(), &empty, "tok");
     try std.testing.expectEqualStrings(endpoint, plan.url);
     try std.testing.expectEqualStrings("Bearer tok", plan.authorization.?);
-    try std.testing.expectEqualStrings(user_agent, plan.user_agent.?);
+    try std.testing.expectEqualStrings("claude-cli/2.1.280", plan.user_agent.?);
     try std.testing.expectEqual(@as(usize, 3), plan.headers.len);
     try std.testing.expectEqualStrings("anthropic-version", plan.headers[0].name);
     try std.testing.expectEqualStrings(anthropic_version, plan.headers[0].value);
