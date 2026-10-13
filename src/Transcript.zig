@@ -214,6 +214,18 @@ pub fn blocks(self: *const Transcript) []const ui.Block {
     return self.block_list.items;
 }
 
+pub fn lastAnswer(self: *const Transcript) ?[]const u8 {
+    var index = self.block_list.items.len;
+    while (index > 0) {
+        index -= 1;
+        switch (self.block_list.items[index].content) {
+            .model => |text| return text.items,
+            .intro, .user, .user_note, .thinking, .tool_result, .event => {},
+        }
+    }
+    return null;
+}
+
 test "streamed deltas collect into one block until a discrete block ends the run" {
     const gpa = std.testing.allocator;
     var transcript = Transcript.init(gpa);
@@ -344,6 +356,24 @@ test "a discard preserves only marked events after its checkpoint" {
         kept[0].content.event.text.items,
     );
     try std.testing.expectEqualStrings("keep retry", kept[1].content.event.text.items);
+}
+
+test "the last answer is the newest model text, even before later blocks of other kinds" {
+    const gpa = std.testing.allocator;
+    var transcript = Transcript.init(gpa);
+    defer transcript.deinit();
+
+    try transcript.append(&.{ .intro = "intro" });
+    try std.testing.expect(transcript.lastAnswer() == null);
+    try transcript.append(&.{ .user = "first" });
+    try transcript.appendStream(.model, "progress note");
+    try transcript.appendStream(.thinking, "weigh it");
+    try transcript.appendStream(.model, "final text");
+    try std.testing.expectEqualStrings("final text", transcript.lastAnswer().?);
+
+    try transcript.append(&.{ .user = "second" });
+    try transcript.append(&.{ .event = .{ .text = "The provider failed." } });
+    try std.testing.expectEqualStrings("final text", transcript.lastAnswer().?);
 }
 
 test "reasoning collects into a thinking block that the answer run does not extend" {

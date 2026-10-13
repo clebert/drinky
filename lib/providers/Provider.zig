@@ -226,21 +226,11 @@ fn errorBody(self: *Provider, reader: *std.Io.Reader) core.Provider.Error![]cons
         error.Canceled => return error.Canceled,
         error.ReadFailed, error.Timeout, error.ConcurrencyUnavailable => 0,
     };
-    return self.arena.allocator().dupe(u8, validPrefix(buffer[0..length]));
+    return self.arena.allocator().dupe(u8, core.text.validPrefix(buffer[0..length]));
 }
 
 fn readShort(reader: *std.Io.Reader, buffer: []u8) std.Io.Reader.ShortError!usize {
     return reader.readSliceShort(buffer);
-}
-
-fn validPrefix(bytes: []const u8) []const u8 {
-    var length = bytes.len;
-    for (0..4) |_| {
-        if (std.unicode.utf8ValidateSlice(bytes[0..length])) return bytes[0..length];
-        if (length == 0) break;
-        length -= 1;
-    }
-    return bytes;
 }
 
 fn nowSeconds(self: *const Provider) i64 {
@@ -293,13 +283,6 @@ fn release(self: *Provider) void {
     _ = self.arena.reset(.retain_capacity);
     self.clearFrame();
     self.ended = false;
-}
-
-test "a cut body keeps its valid UTF-8 prefix" {
-    try std.testing.expectEqualStrings("abc", validPrefix("abc"));
-    try std.testing.expectEqualStrings("a", validPrefix("a\xe2\x82"));
-    try std.testing.expectEqualStrings("a€", validPrefix("a€"));
-    try std.testing.expectEqualStrings("\x80\x80\x80\x80\x80", validPrefix("\x80\x80\x80\x80\x80"));
 }
 
 const complete_body =

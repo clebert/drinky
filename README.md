@@ -55,6 +55,11 @@ EOF
 
 Use `drinky models` to list the saved models of signed-in accounts.
 
+## Short answers
+
+On a Mac with Apple Intelligence, `/tldr` shortens the last answer with the local Apple Foundation
+Model through the `fm` command. The short version opens on its own page and changes no conversation.
+
 ## Config file
 
 The optional `~/.drinky/config.json` file controls instructions, request limits, and interface

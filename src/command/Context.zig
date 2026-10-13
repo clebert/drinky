@@ -19,6 +19,7 @@ skill_registry: *const discovery.skills.Registry,
 system_prompt: []const u8,
 sources_page: []const u8,
 turns: *const Turns,
+answer: ?[]const u8,
 
 pub const Error = error{OutOfMemory};
 
@@ -36,6 +37,7 @@ pub const Outcome = union(enum) {
     new_conversation,
     toggle_verbose,
     rewind: usize,
+    shorten: []const u8,
 
     pub const Prompt = struct {
         name: []const u8,

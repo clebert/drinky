@@ -55,6 +55,7 @@ pub const Rig = struct {
             .system_prompt = "",
             .sources_page = "",
             .turns = &self.turns,
+            .answer = null,
         };
     }
 };
@@ -190,6 +191,14 @@ fn release(outcome: *const Context.Outcome) void {
         .pick => |*pick| pick.deinit(gpa),
         .prompt => |*prompt| prompt.deinit(gpa),
         .editor_text => |text| gpa.free(text),
-        .page, .login, .logout, .fetch, .new_conversation, .toggle_verbose, .rewind => {},
+        .page,
+        .login,
+        .logout,
+        .fetch,
+        .new_conversation,
+        .toggle_verbose,
+        .rewind,
+        .shorten,
+        => {},
     }
 }

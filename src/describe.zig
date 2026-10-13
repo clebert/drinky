@@ -195,6 +195,12 @@ fn writeCommands(writer: *std.Io.Writer) !void {
         \\editor as editable text. Tool changes and the cost stay. When a turn that the rewind
         \\drops ran `write`, `edit`, or `bash`, Enter warns first and rewinds on the second press.
         \\
+        \\`/tldr` shortens the last answer with the local Apple Foundation Model through the `fm`
+        \\command. It opens a page and streams the short version into it. The transcript and the
+        \\model conversation stay unchanged. Esc closes the page and stops the local model.
+        \\Drinky keeps the short version of one answer, so the next `/tldr` for the same answer
+        \\shows it at once. When `fm` or its model is not available, the page shows the failure.
+        \\
     );
 }
 

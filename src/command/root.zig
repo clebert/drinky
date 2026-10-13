@@ -17,6 +17,7 @@ const skill = @import("skill.zig");
 const sources = @import("sources.zig");
 const system = @import("system.zig");
 const testing = @import("testing.zig");
+const tldr = @import("tldr.zig");
 
 const Entry = struct {
     name: []const u8,
@@ -42,6 +43,7 @@ const commands = [_]Entry{
     .{ .name = skill.name, .summary = skill.summary, .run = skill.run },
     .{ .name = sources.name, .summary = sources.summary, .run = sources.run },
     .{ .name = system.name, .summary = system.summary, .run = system.run },
+    .{ .name = tldr.name, .summary = tldr.summary, .run = tldr.run },
     .{
         .name = "verbose",
         .summary = "Toggle thinking text, tool rows, and complete bash commands",
@@ -358,7 +360,7 @@ test "a line without a name opens its list, and a command row runs its command" 
         for (pick.options) |*option|
             try std.testing.expect(!std.mem.startsWith(u8, option.name, "/help") and
                 !std.mem.eql(u8, option.name, "/compact"));
-        try std.testing.expect((try testing.selectRow(&pick, &context, last - 1)) == .page);
+        try std.testing.expect((try testing.selectRow(&pick, &context, last - 2)) == .page);
     }
 
     for ([_][]const u8{ "/skill", "/skill:" }) |line| {

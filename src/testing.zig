@@ -4,6 +4,7 @@ const accounts = @import("accounts");
 const core = @import("core");
 
 const Herdr = @import("Herdr.zig");
+const Shortener = @import("Shortener.zig");
 
 pub const Clock = struct {
     threaded: std.Io.Threaded,
@@ -258,5 +259,49 @@ pub const FakeHerdr = struct {
     pub fn drained(self: *FakeHerdr) !bool {
         var taken: [1][]u8 = undefined;
         return try self.lines.get(self.io, &taken, 0) == 0;
+    }
+};
+
+pub const FakeLocalModel = struct {
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    chunks: []const []const u8 = &.{},
+    outcome: Shortener.Outcome = .finished,
+    stalls: usize = 0,
+    texts_after_cancel: usize = 0,
+    reached: std.Io.Event = .unset,
+    canceled: std.Io.Event = .unset,
+    answers: std.ArrayList([]u8) = .empty,
+
+    const vtable: Shortener.Model.VTable = .{ .shorten = shorten };
+
+    pub fn deinit(self: *FakeLocalModel) void {
+        for (self.answers.items) |answer| self.gpa.free(answer);
+        self.answers.deinit(self.gpa);
+    }
+
+    pub fn model(self: *FakeLocalModel) Shortener.Model {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn shorten(ptr: *anyopaque, answer: []const u8, sink: Shortener.Model.Sink) Shortener.Outcome {
+        const self: *FakeLocalModel = @ptrCast(@alignCast(ptr));
+        const call = self.answers.items.len;
+        const copy = self.gpa.dupe(u8, answer) catch return .canceled;
+        self.answers.append(self.gpa, copy) catch {
+            self.gpa.free(copy);
+            return .canceled;
+        };
+        for (self.chunks) |chunk| sink.emit(self.io, &chunk);
+        if (call >= self.stalls) return self.outcome;
+        self.reached.set(self.io);
+        var never: std.Io.Event = .unset;
+        never.wait(self.io) catch {
+            const late: []const u8 = "late";
+            for (0..self.texts_after_cancel) |_| sink.emit(self.io, &late);
+            self.canceled.set(self.io);
+            return .canceled;
+        };
+        unreachable;
     }
 };

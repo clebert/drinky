@@ -15,13 +15,14 @@ const controls_source = "Esc: Close · M: Render · " ++ hint;
 
 gpa: std.mem.Allocator,
 title: []const u8,
-content: []const u8,
+content: std.ArrayList(u8),
 scroll: usize,
 source_offset: ?usize,
 presentation: Presentation,
 layout_columns: usize,
 layout_presentation: Presentation,
 layout_rows: usize,
+layout_bytes: usize,
 
 pub const Presentation = enum { markdown, source };
 
@@ -33,7 +34,8 @@ pub const Options = struct {
 pub fn init(gpa: std.mem.Allocator, options: *const Options) !Page {
     const title = try gpa.dupe(u8, options.title);
     errdefer gpa.free(title);
-    const content = try gpa.dupe(u8, options.content);
+    var content: std.ArrayList(u8) = .empty;
+    try content.appendSlice(gpa, options.content);
     return .{
         .gpa = gpa,
         .title = title,
@@ -44,21 +46,32 @@ pub fn init(gpa: std.mem.Allocator, options: *const Options) !Page {
         .layout_columns = 0,
         .layout_presentation = .markdown,
         .layout_rows = 0,
+        .layout_bytes = 0,
     };
 }
 
 pub fn deinit(self: *Page) void {
     self.gpa.free(self.title);
-    self.gpa.free(self.content);
+    self.content.deinit(self.gpa);
+}
+
+pub fn text(self: *const Page) []const u8 {
+    return self.content.items;
+}
+
+pub fn append(self: *Page, addition: []const u8) error{OutOfMemory}!void {
+    try self.content.appendSlice(self.gpa, addition);
 }
 
 pub fn reflow(self: *Page, size: terminal.View.Size) void {
     const layout_changed = size.columns != self.layout_columns or
-        self.presentation != self.layout_presentation;
+        self.presentation != self.layout_presentation or
+        self.text().len != self.layout_bytes;
     if (layout_changed) {
         const source_offset = self.sourceOffset();
         self.layout_columns = size.columns;
         self.layout_presentation = self.presentation;
+        self.layout_bytes = self.text().len;
         self.layout_rows = self.totalRows();
         self.scroll = self.rowAtSource(source_offset);
         self.source_offset = source_offset;
@@ -160,7 +173,7 @@ fn renderMarkdown(
     var body_placement = placement.*;
     body_placement.base = body_base;
     body_placement.skip = body_base + self.scroll;
-    try markdown.renderWindow(&body_placement, self.content, &.{
+    try markdown.renderWindow(&body_placement, self.text(), &.{
         .rows_max = size.rows - head_rows,
     });
 }
@@ -172,7 +185,7 @@ fn renderSource(
     head_rows: usize,
 ) !void {
     const visible_rows = size.rows - head_rows;
-    var iterator = terminal.width.wrapper(self.content, size.columns);
+    var iterator = terminal.width.wrapper(self.text(), size.columns);
     var source_index: usize = 0;
     var shown: usize = 0;
     while (iterator.next()) |row| : (source_index += 1) {
@@ -192,8 +205,8 @@ fn bodyRows(self: *const Page, size: terminal.View.Size) usize {
 
 fn totalRows(self: *const Page) usize {
     return switch (self.layout_presentation) {
-        .markdown => markdown.rows(self.content, self.layout_columns),
-        .source => terminal.width.rows(self.content, self.layout_columns),
+        .markdown => markdown.rows(self.text(), self.layout_columns),
+        .source => terminal.width.rows(self.text(), self.layout_columns),
     };
 }
 
@@ -215,7 +228,7 @@ fn sourceOffset(self: *const Page) usize {
 
 fn sourceAtRow(self: *const Page, row: usize) usize {
     return switch (self.layout_presentation) {
-        .markdown => markdown.sourceAtRow(self.content, &.{
+        .markdown => markdown.sourceAtRow(self.text(), &.{
             .columns = self.layout_columns,
             .row = row,
         }),
@@ -225,7 +238,7 @@ fn sourceAtRow(self: *const Page, row: usize) usize {
 
 fn rowAtSource(self: *const Page, source_offset: usize) usize {
     return switch (self.layout_presentation) {
-        .markdown => markdown.rowAtSource(self.content, &.{
+        .markdown => markdown.rowAtSource(self.text(), &.{
             .columns = self.layout_columns,
             .source_offset = source_offset,
         }),
@@ -234,8 +247,8 @@ fn rowAtSource(self: *const Page, source_offset: usize) usize {
 }
 
 fn sourceRowAtOffset(self: *const Page, source_offset: usize) usize {
-    const target = @min(source_offset, self.content.len);
-    var iterator = terminal.width.wrapper(self.content, self.layout_columns);
+    const target = @min(source_offset, self.text().len);
+    var iterator = terminal.width.wrapper(self.text(), self.layout_columns);
     var result: usize = 0;
     var index: usize = 0;
     while (iterator.nextSpan()) |span| : (index += 1) {
@@ -246,12 +259,12 @@ fn sourceRowAtOffset(self: *const Page, source_offset: usize) usize {
 }
 
 fn sourceOffsetAtRow(self: *const Page, target: usize) usize {
-    var iterator = terminal.width.wrapper(self.content, self.layout_columns);
+    var iterator = terminal.width.wrapper(self.text(), self.layout_columns);
     var index: usize = 0;
     while (iterator.nextSpan()) |span| : (index += 1) {
         if (index == target) return span.start;
     }
-    return self.content.len;
+    return self.text().len;
 }
 
 test "source navigation scrolls by wrapped body rows and clamps at both ends" {
@@ -426,4 +439,24 @@ test "a one-row page renders only its caption" {
     try testing.expectHides(painted, &.{paint.ellipsis});
     try testing.expectHides(painted, &.{"Hidden"});
     try std.testing.expectEqual(@as(usize, 0), std.mem.count(u8, painted, "\r\n"));
+}
+
+test "appended text extends the page at the same width and keeps the scroll" {
+    const gpa = std.testing.allocator;
+    var page = try Page.init(gpa, &.{ .title = "Test page", .content = "" });
+    defer page.deinit();
+    const size: terminal.View.Size = .{ .columns = 80, .rows = 4 };
+    page.toggleSource(size);
+    try page.append("L0\nL1");
+    page.reflow(size);
+    try expectTopRow(&page, size, "L0");
+
+    try page.append("\nL2\nL3");
+    page.moveEnd(size);
+    try expectTopRow(&page, size, "L2");
+    try page.append("\nL4");
+    page.reflow(size);
+    try expectTopRow(&page, size, "L2");
+    page.moveEnd(size);
+    try expectTopRow(&page, size, "L3");
 }

@@ -22,18 +22,21 @@ pub const empty_request: core.Provider.Request = .{
     .cache_key = "",
 };
 
-pub const reply_stream =
-    "data: {\"type\":\"response.output_text.delta\"," ++
-    "\"item_id\":\"msg_1\",\"delta\":\"done\"}\n" ++
-    "\n" ++
-    "data: {\"type\":\"response.output_item.done\",\"item\":{" ++
-    "\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\"," ++
-    "\"content\":[{\"type\":\"output_text\",\"text\":\"done\"}]}}\n" ++
-    "\n" ++
-    "data: {\"type\":\"response.completed\"," ++
-    "\"response\":{\"status\":\"completed\",\"usage\":" ++
-    "{\"input_tokens\":10,\"output_tokens\":2}}}\n" ++
-    "\n";
+pub const reply_stream = replyStream("done");
+
+pub fn replyStream(comptime text: []const u8) []const u8 {
+    return "data: {\"type\":\"response.output_text.delta\"," ++
+        "\"item_id\":\"msg_1\",\"delta\":\"" ++ text ++ "\"}\n" ++
+        "\n" ++
+        "data: {\"type\":\"response.output_item.done\",\"item\":{" ++
+        "\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\"," ++
+        "\"content\":[{\"type\":\"output_text\",\"text\":\"" ++ text ++ "\"}]}}\n" ++
+        "\n" ++
+        "data: {\"type\":\"response.completed\"," ++
+        "\"response\":{\"status\":\"completed\",\"usage\":" ++
+        "{\"input_tokens\":10,\"output_tokens\":2}}}\n" ++
+        "\n";
+}
 
 pub const FakeTransport = struct {
     gpa: std.mem.Allocator,

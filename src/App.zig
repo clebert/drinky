@@ -16,6 +16,7 @@ const Message = @import("Message.zig");
 const project = @import("project.zig");
 const Reports = @import("Reports.zig");
 const Screen = @import("Screen.zig");
+const Shortener = @import("Shortener.zig");
 const sources = @import("sources.zig");
 const testing = @import("testing.zig");
 const tool_environment = @import("tool_environment.zig");
@@ -49,6 +50,8 @@ const removal_caption: ui.Caption = .{
 };
 const removal_warning = "Press Ctrl+N again to remove the canceled turn. Tool changes stay.";
 const rewind_warning = "Press Enter again to rewind. Tool changes stay.";
+
+const short_answer_title = "Short answer";
 
 const intro_text = blk: {
     var line: []const u8 = "";
@@ -101,6 +104,11 @@ resize_future: ?std.Io.Future(void),
 tick_future: ?std.Io.Future(void),
 frame_grid: FrameGrid,
 herdr: Herdr,
+fm: Shortener.Fm,
+shortener: Shortener,
+shortening: ?Shortening,
+short_answer: ?ShortAnswer,
+shortening_requests: u64,
 
 const Options = struct {
     working_directory: []const u8,
@@ -112,6 +120,7 @@ const Options = struct {
     transport: ?providers.Transport = null,
     browser: ?accounts.oauth.login.Browser = null,
     loopback: ?accounts.oauth.callback.Loopback = null,
+    local_model: ?Shortener.Model = null,
 };
 
 const FrameGrid = struct {
@@ -133,6 +142,7 @@ const UiEvent = union(enum) {
     keys: []u8,
     session: core.Session.Event,
     accounts: accounts.Registry.Event,
+    shortener: Shortener.Event,
     tick,
     resize,
 
@@ -141,9 +151,20 @@ const UiEvent = union(enum) {
             .keys => |bytes| gpa.free(bytes),
             .session => |*event| event.deinit(gpa),
             .accounts => |*event| event.deinit(gpa),
+            .shortener => |*event| event.deinit(gpa),
             .tick, .resize => {},
         }
     }
+};
+
+const Shortening = struct {
+    request: u64,
+    answer: []u8,
+};
+
+const ShortAnswer = struct {
+    answer: []u8,
+    text: []u8,
 };
 
 const Mode = union(enum) {
@@ -210,6 +231,7 @@ const TurnStart = struct {
 
 const session_sink_vtable: core.Session.Sink.VTable = .{ .emit = emitSessionEvent };
 const accounts_sink_vtable: accounts.Registry.Sink.VTable = .{ .emit = emitAccountsEvent };
+const shortener_sink_vtable: Shortener.Sink.VTable = .{ .emit = emitShortenerEvent };
 
 fn emitSessionEvent(ptr: *anyopaque, event: *const core.Session.Event) void {
     const self: *App = @ptrCast(@alignCast(ptr));
@@ -221,6 +243,12 @@ fn emitAccountsEvent(ptr: *anyopaque, event: *const accounts.Registry.Event) voi
     const self: *App = @ptrCast(@alignCast(ptr));
     const owned = event.dupe(self.gpa) catch return;
     self.keep(.{ .accounts = owned });
+}
+
+fn emitShortenerEvent(ptr: *anyopaque, event: *const Shortener.Event) void {
+    const self: *App = @ptrCast(@alignCast(ptr));
+    const owned = event.dupe(self.gpa) catch return;
+    self.keep(.{ .shortener = owned });
 }
 
 fn keep(self: *App, event: UiEvent) void {
@@ -313,6 +341,11 @@ pub fn init(self: *App, gpa: std.mem.Allocator, io: std.Io, options: *const Opti
     errdefer self.clients.deinit();
     self.session = harness.session(gpa, io, .{ .ptr = self, .vtable = &session_sink_vtable });
     errdefer self.session.deinit();
+    self.shortener = .init(gpa, io, &.{
+        .model = options.local_model orelse self.fm.model(),
+        .sink = .{ .ptr = self, .vtable = &shortener_sink_vtable },
+    });
+    errdefer self.shortener.deinit();
 
     self.choice.effort = self.state.start.effort orelse
         harness.config.effort_default orelse Harness.effort_default;
@@ -336,6 +369,7 @@ pub fn init(self: *App, gpa: std.mem.Allocator, io: std.Io, options: *const Opti
     errdefer self.closeQueue();
     try self.session.start();
     try self.account_registry.start();
+    try self.shortener.start();
     try self.sync();
     try self.reportStart();
     self.herdr.start(options.herdr) catch |err| try self.recordEvent(
@@ -348,6 +382,9 @@ pub fn init(self: *App, gpa: std.mem.Allocator, io: std.Io, options: *const Opti
 pub fn deinit(self: *App) void {
     self.closeQueue();
     self.herdr.deinit();
+    self.shortener.deinit();
+    self.forgetShortening();
+    self.dropShortAnswer();
     self.dropOffer();
     self.turns.deinit();
     self.screen.deinit();
@@ -427,6 +464,11 @@ fn initFields(self: *App, gpa: std.mem.Allocator, io: std.Io, device: terminal.D
         .tick_future = null,
         .frame_grid = .reset(0),
         .herdr = .init(io),
+        .fm = .{ .gpa = gpa, .io = io },
+        .shortener = undefined,
+        .shortening = null,
+        .short_answer = null,
+        .shortening_requests = 0,
     };
     self.queue = std.Io.Queue(UiEvent).init(&self.queue_buffer);
 }
@@ -551,6 +593,10 @@ fn applyBatch(self: *App, events: []const UiEvent) !bool {
                 defer accounts_event.deinit(self.gpa);
                 try self.applyAccountsEvent(accounts_event);
                 self.assertWidget();
+            },
+            .shortener => |*shortener_event| {
+                defer shortener_event.deinit(self.gpa);
+                try self.applyShortenerEvent(shortener_event);
             },
         }
     }
@@ -1387,6 +1433,7 @@ fn commandContext(self: *App) command.Context {
         .system_prompt = self.harness.system,
         .sources_page = self.sources_page,
         .turns = &self.turns,
+        .answer = self.screen.transcript.lastAnswer(),
     };
 }
 
@@ -1430,6 +1477,7 @@ fn applyOutcome(self: *App, outcome: *const command.Context.Outcome) !void {
             return;
         },
         .rewind => |turn| try self.rewind(turn),
+        .shorten => |answer| try self.openShortAnswer(answer),
         .login => |account| return self.startLogin(account),
         .logout => |account| try self.logoutAccount(account),
         .fetch => |account| return self.startFetch(account),
@@ -1458,8 +1506,56 @@ fn openPage(self: *App, options: *const ui.Page.Options) !void {
 }
 
 fn closePage(self: *App) void {
+    if (self.shortening != null) self.shortener.cancel();
+    self.forgetShortening();
     self.screen.closePage();
     self.setMode(.prompt);
+}
+
+fn openShortAnswer(self: *App, answer: []const u8) !void {
+    if (self.short_answer) |*kept| {
+        if (std.mem.eql(u8, kept.answer, answer))
+            return self.openPage(&.{ .title = short_answer_title, .content = kept.text });
+    }
+    const owned = try self.gpa.dupe(u8, answer);
+    errdefer self.gpa.free(owned);
+    try self.openPage(&.{ .title = short_answer_title, .content = "" });
+    self.shortening_requests += 1;
+    try self.shortener.shorten(self.shortening_requests, answer);
+    self.shortening = .{ .request = self.shortening_requests, .answer = owned };
+}
+
+fn applyShortenerEvent(self: *App, event: *const Shortener.Event) !void {
+    const shortening = if (self.shortening) |*shortening| shortening else return;
+    if (shortening.request != event.request) return;
+    const page = self.screen.activePage().?;
+    switch (event.content) {
+        .text => |text| try page.append(text),
+        .failed => |message| {
+            self.forgetShortening();
+            if (page.text().len > 0) try page.append("\n\n");
+            try page.append(message);
+        },
+        .finished => {
+            const text = try self.gpa.dupe(u8, page.text());
+            self.dropShortAnswer();
+            self.short_answer = .{ .answer = shortening.answer, .text = text };
+            self.shortening = null;
+        },
+    }
+}
+
+fn forgetShortening(self: *App) void {
+    const shortening = self.shortening orelse return;
+    self.gpa.free(shortening.answer);
+    self.shortening = null;
+}
+
+fn dropShortAnswer(self: *App) void {
+    const kept = self.short_answer orelse return;
+    self.gpa.free(kept.answer);
+    self.gpa.free(kept.text);
+    self.short_answer = null;
 }
 
 fn openLoginPicker(self: *App) !void {
@@ -1656,6 +1752,7 @@ const Rig = struct {
     transport: providers.testing.FakeTransport,
     browser: accounts.testing.FakeBrowser,
     loopback: accounts.testing.FakeLoopback,
+    local_model: testing.FakeLocalModel,
     clock: testing.Clock,
     device: terminal.testing.FakeDevice,
     app: App,
@@ -1715,6 +1812,8 @@ const Rig = struct {
         errdefer self.transport.deinit();
         self.browser = .{};
         self.loopback = .{ .io = io };
+        self.local_model = .{ .gpa = gpa, .io = io };
+        errdefer self.local_model.deinit();
         try self.device.init(gpa, io, options.window);
         errdefer self.device.deinit();
 
@@ -1727,6 +1826,7 @@ const Rig = struct {
             .transport = self.transport.transport(),
             .browser = self.browser.browser(),
             .loopback = self.loopback.loopback(),
+            .local_model = self.local_model.model(),
         });
         errdefer self.app.deinit();
         self.run_future = try io.concurrent(runThenStop, .{self});
@@ -1776,6 +1876,7 @@ const Rig = struct {
         }
         self.app.deinit();
         self.device.deinit();
+        self.local_model.deinit();
         self.transport.deinit();
         self.environment.deinit();
         std.testing.allocator.free(self.directory);
@@ -3704,6 +3805,107 @@ test "a page on the alternate screen scrolls, toggles the source, and closes on 
         .{ .text = "/help: Commands" },
         .{ .absent = "System prompt" },
     });
+}
+
+const short_answer_caption = short_answer_title ++ " · Esc: Close";
+
+test "/tldr streams the last answer through the local model into a page and keeps that answer" {
+    var rig: Rig = undefined;
+    try rig.init(&.{
+        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .replies = &.{
+            .{ .body = providers.testing.reply_stream },
+            .{ .body = providers.testing.replyStream("later") },
+        },
+        .model = "gpt-5.6-sol",
+    });
+    defer rig.deinit();
+    rig.local_model.chunks = &.{ "- Short ", "version." };
+
+    try rig.keys("/tldr\r");
+    try rig.waitFor(&.{.{ .status = "No answer is in the conversation." }});
+    try rig.keys("\x03hello\r");
+    try rig.waitFor(&.{ .{ .rows = &.{ "hello", "done" } }, .{ .activity = false } });
+    try rig.keys("/tldr\r");
+    try rig.waitFor(&.{
+        .{ .alternate_screen = true },
+        .{ .text = short_answer_caption },
+        .{ .text = "Short version." },
+    });
+    try rig.keys("\x1b");
+    try rig.waitFor(&.{
+        .{ .alternate_screen = false },
+        .{ .rows = &.{ "hello", "done" } },
+        .{ .absent = "Short version." },
+    });
+
+    try rig.keys("/tldr\r");
+    try rig.waitFor(&.{ .{ .alternate_screen = true }, .{ .text = "Short version." } });
+    try rig.keys("\x1b");
+    try rig.waitFor(&.{.{ .alternate_screen = false }});
+    try std.testing.expectEqual(@as(usize, 1), rig.local_model.answers.items.len);
+    try std.testing.expectEqualStrings("done", rig.local_model.answers.items[0]);
+
+    try rig.keys("again\r");
+    try rig.waitFor(&.{ .{ .rows = &.{ "again", "later" } }, .{ .activity = false } });
+    try rig.keys("/tldr\r");
+    try rig.waitFor(&.{ .{ .alternate_screen = true }, .{ .text = "Short version." } });
+    try std.testing.expectEqual(@as(usize, 2), rig.local_model.answers.items.len);
+    try std.testing.expectEqualStrings("later", rig.local_model.answers.items[1]);
+}
+
+test "Esc stops the local model, a failure shows after the streamed text, and neither stays kept" {
+    var rig: Rig = undefined;
+    try rig.init(&.{
+        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .replies = &.{.{ .body = providers.testing.reply_stream }},
+        .model = "gpt-5.6-sol",
+    });
+    defer rig.deinit();
+    rig.local_model.chunks = &.{"partial"};
+    rig.local_model.stalls = 1;
+
+    try rig.keys("hello\r");
+    try rig.waitFor(&.{ .{ .rows = &.{ "hello", "done" } }, .{ .activity = false } });
+    try rig.keys("/tldr\r");
+    try rig.local_model.reached.wait(std.testing.io);
+    try rig.waitFor(&.{ .{ .text = short_answer_caption }, .{ .text = "partial" } });
+    try rig.keys("\x1b");
+    try rig.waitFor(&.{ .{ .alternate_screen = false }, .{ .rows = &.{ "hello", "done" } } });
+    try rig.local_model.canceled.wait(std.testing.io);
+
+    rig.local_model.outcome = .{ .failed = .print("The local model failed.", .{}) };
+    try rig.keys("/tldr\r");
+    try rig.waitFor(&.{
+        .{ .alternate_screen = true },
+        .{ .rows = &.{ "partial", "The local model failed." } },
+    });
+    try rig.keys("\x1b");
+    try rig.waitFor(&.{.{ .alternate_screen = false }});
+    try rig.keys("/tldr\r");
+    try rig.waitFor(&.{ .{ .alternate_screen = true }, .{ .text = "The local model failed." } });
+    try std.testing.expectEqual(@as(usize, 3), rig.local_model.answers.items.len);
+}
+
+test "Esc ends a short answer while the local model fills the queue during the cancel" {
+    var rig: Rig = undefined;
+    try rig.init(&.{
+        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .replies = &.{.{ .body = providers.testing.reply_stream }},
+        .model = "gpt-5.6-sol",
+    });
+    defer rig.deinit();
+    rig.local_model.stalls = 1;
+    rig.local_model.texts_after_cancel = queue_capacity + 1;
+
+    try rig.keys("hello\r");
+    try rig.waitFor(&.{ .{ .rows = &.{ "hello", "done" } }, .{ .activity = false } });
+    try rig.keys("/tldr\r");
+    try rig.local_model.reached.wait(std.testing.io);
+    try rig.waitFor(&.{.{ .text = short_answer_caption }});
+    try rig.keys("\x1b");
+    try rig.waitFor(&.{ .{ .alternate_screen = false }, .{ .absent = "late" } });
+    try rig.local_model.canceled.wait(std.testing.io);
 }
 
 test "Herdr hears working during a turn, blocked at a retry offer, and idle after Esc" {
