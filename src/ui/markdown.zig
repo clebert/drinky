@@ -332,11 +332,13 @@ const Prefix = struct {
     indent: []const u8 = "",
     marker: []const u8 = "",
     look: Look = .{},
+    continuation: []const u8 = "",
 };
+
+const code_prefix: Prefix = .{ .marker = "  ", .continuation = "↪ " };
 
 const PlainRow = struct {
     columns: usize,
-    indent: []const u8 = "",
     look: *const Look,
     bytes: []const u8,
 };
@@ -472,12 +474,11 @@ fn walk(comptime Emitter: type, emitter: *Emitter, text: []const u8, columns: us
                     .bytes = block.line,
                 });
             },
-            .fence_line => try plainRow(Emitter, emitter, &.{
-                .columns = columns,
-                .indent = blank(2),
-                .look = &code_look,
-                .bytes = block.line,
-            }),
+            .fence_line => {
+                var flow = Flow(Emitter).init(emitter, columns, &code_prefix);
+                try flow.write(&code_look, block.line);
+                try flow.finish();
+            },
             .blank => {
                 emitter.begin();
                 emitter.end();
@@ -617,9 +618,15 @@ fn Flow(comptime Emitter: type) type {
 
         const Form = enum { whole, alone };
 
+        const Lead = struct { marker: []const u8, look: Look };
+
         fn init(emitter: *Emitter, columns: usize, prefix: *const Prefix) @This() {
             var shown = prefix.*;
             shown.marker = terminal.width.truncate(prefix.marker, prefixRoom(columns));
+            shown.continuation = terminal.width.truncate(
+                prefix.continuation,
+                terminal.width.ofText(shown.marker),
+            );
             const left = prefixRoom(columns) -| terminal.width.ofText(shown.marker);
             shown.indent = terminal.width.truncate(prefix.indent, left);
             return .{
@@ -635,11 +642,17 @@ fn Flow(comptime Emitter: type) type {
                 const room = self.row.room();
                 const run = self.row.wordRun(rest);
                 if (run == 0) {
-                    if (self.row.used > 0) {
+                    if (self.row.painted > 0) {
                         try self.closeRow();
                         continue;
                     }
                     const cut = terminal.width.truncate(rest, room);
+                    const fits = cut.len > 0 and terminal.width.ofText(cut) <= room;
+                    const keeps_indentation = fits and self.prefix.continuation.len > 0;
+                    if (self.row.used > 0 and !keeps_indentation) {
+                        self.row.reset();
+                        continue;
+                    }
                     std.debug.assert(cut.len > 0);
                     try self.place(look, cut);
                     rest = rest[cut.len..];
@@ -671,19 +684,23 @@ fn Flow(comptime Emitter: type) type {
         fn payPrefix(self: *@This(), form: Form) !void {
             if (!self.prefix_owed) return;
             self.prefix_owed = false;
-            const marker = if (self.first)
-                self.prefix.marker
-            else
-                blank(terminal.width.ofText(self.prefix.marker));
-            const look: Look = if (self.first) self.prefix.look else .{};
+            const lead = self.nextLead();
             self.first = false;
             const shown = switch (form) {
-                .whole => marker,
-                .alone => terminal.width.rowText(marker),
+                .whole => lead.marker,
+                .alone => terminal.width.rowText(lead.marker),
             };
             if (form == .alone and shown.len == 0) return;
             try self.row.emitter.span(&.{}, self.prefix.indent);
-            try self.row.emitter.span(&look, shown);
+            try self.row.emitter.span(&lead.look, shown);
+        }
+
+        fn nextLead(self: *const @This()) Lead {
+            if (self.first) return .{ .marker = self.prefix.marker, .look = self.prefix.look };
+            if (self.prefix.continuation.len > 0) {
+                return .{ .marker = self.prefix.continuation, .look = muted_look };
+            }
+            return .{ .marker = blank(terminal.width.ofText(self.prefix.marker)), .look = .{} };
         }
 
         fn closeRow(self: *@This()) !void {
@@ -703,15 +720,10 @@ fn prefixColumns(prefix: *const Prefix) usize {
 }
 
 fn plainRow(comptime Emitter: type, emitter: *Emitter, row: *const PlainRow) !void {
-    const shown = terminal.width.truncate(row.indent, prefixRoom(row.columns));
-    const room = row.columns -| terminal.width.ofText(shown);
-    std.debug.assert(room > 0);
-    const content = paint.cut(row.bytes, room);
+    std.debug.assert(row.columns > 0);
+    const content = paint.cut(row.bytes, row.columns);
     emitter.begin();
-    if (content.kept.len > 0) {
-        try emitter.span(&.{}, shown);
-        try emitter.span(row.look, content.kept);
-    }
+    try emitter.span(row.look, content.kept);
     if (content.shortened) try emitter.span(row.look, paint.ellipsis);
     emitter.end();
 }
@@ -1189,23 +1201,59 @@ test "a cell wraps at a look boundary when the column fills" {
     });
 }
 
-test "a narrow code row marks its cut" {
+test "a code line wraps between words, cuts an overlong word, and marks each continuation row" {
     const gpa = std.testing.allocator;
     const text =
-        \\```zig
-        \\const a = 1;
+        \\```sh
+        \\fm respond --instructions "Write at most six bullet points."
+        \\    return a_very_long_identifier_name;
         \\```
     ;
-    try expectPlainRows(gpa, text, 6, &.{ "```zig", "  con…", "```" });
-    try expectPlainRows(gpa, text, 3, &.{ "``…", "…", "```" });
-    try expectPlainRows(gpa, text, 1, &.{ "…", "…", "…" });
+    try expectPlainRows(gpa, text, 24, &.{
+        "```sh",
+        "  fm respond",
+        "↪ --instructions \"Write",
+        "↪ at most six bullet",
+        "↪ points.\"",
+        "      return",
+        "↪ a_very_long_identifier",
+        "↪ _name;",
+        "```",
+    });
 
-    const wide =
-        \\```zig
-        \\你x = 1;
-        \\```
-    ;
-    try expectPlainRows(gpa, wide, 4, &.{ "```…", "…", "```" });
+    const bytes = try painted(gpa, text, 24, null, 0);
+    defer gpa.free(bytes);
+    try testing.expectShows(bytes, &.{comptime role.sequence(.muted) ++ "↪ "});
+}
+
+test "the first row of an indented code line holds code and no continuation mark" {
+    const gpa = std.testing.allocator;
+    try expectPlainRows(gpa, "```\n    a_very_long_identifier_name;\n```", 24, &.{
+        "```",
+        "      a_very_long_identi",
+        "↪ fier_name;",
+        "```",
+    });
+    try expectPlainRows(gpa, "```\n            xyz abc\n```", 8, &.{
+        "```",
+        "  xyz",
+        "↪ abc",
+        "```",
+    });
+}
+
+test "a narrow code block marks a fence cut, shrinks its code marks, and keeps a wide glyph whole" {
+    const gpa = std.testing.allocator;
+    try expectPlainRows(gpa, "```zig\na\n```", 3, &.{ "``…", "  a", "```" });
+    try expectPlainRows(gpa, "```\nab c\n```", 2, &.{ "`…", " a", "↪b", "↪c", "`…" });
+    try expectPlainRows(gpa, "```zig\n你x = 1;\n```", 4, &.{
+        "```…",
+        "  你",
+        "↪ x",
+        "↪ =",
+        "↪ 1;",
+        "```",
+    });
 }
 
 test "a table draws every grid row to one width" {
@@ -1356,6 +1404,13 @@ test "a block breaks its rows between words" {
     try expectPlainRows(gpa, "ab abcdefghijkl", 6, &.{ "ab", "abcdef", "ghijkl" });
 
     try expectPlainRows(gpa, "one **two** three four", 12, &.{ "one two", "three four" });
+}
+
+test "an indented text line drops its indentation before a word that does not fit after it" {
+    const gpa = std.testing.allocator;
+    const text = "- item\n  continued text here";
+    try expectPlainRows(gpa, text, 12, &.{ "- item", "  continued", "text here" });
+    try expectPlainRows(gpa, text, 10, &.{ "- item", "continued", "text here" });
 }
 
 test "a row never ends on the blank it breaks at" {
