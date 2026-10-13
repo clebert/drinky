@@ -121,7 +121,7 @@ fn writeCommands(writer: *std.Io.Writer) !void {
     try writer.writeAll(
         \\
         \\`/verbose` toggles the displayed detail for the current session, even during a turn.
-        \\Verbose starts on by default. The config key `interface.verbose` can change that default.
+        \\Verbose starts off by default. The config key `interface.verbose` can change that default.
         \\The command changes no config file and sends no model message.
         \\Each toggle clears terminal scrollback and repaints the complete transcript without a
         \\warning.
@@ -355,6 +355,11 @@ test "the document orders sections and states each command, key hint, window, li
         defer gpa.free(row);
         try std.testing.expect(std.mem.find(u8, text[commands..configuration], row) != null);
     }
+    try std.testing.expect(std.mem.find(
+        u8,
+        text[commands..configuration],
+        "Verbose starts off by default.",
+    ) != null);
     const tool_color = "The complete `Tool: name (state)` identity uses dim text " ++
         "and takes the status color.";
     try std.testing.expect(std.mem.find(u8, text[commands..configuration], tool_color) != null);

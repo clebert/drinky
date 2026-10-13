@@ -2746,7 +2746,7 @@ test "startup verbosity selects thinking text or summaries at the terminal bound
         "\"text\":\"visible thinking\"}],\"encrypted_content\":\"proof\"}}\n\n" ++
         providers.testing.reply_stream;
     const cases = [_]struct { config: []const u8, verbose: bool }{
-        .{ .config = "{}", .verbose = true },
+        .{ .config = "{}", .verbose = false },
         .{ .config = "{\"interface\":{\"verbose\":true}}", .verbose = true },
         .{ .config = "{\"interface\":{\"verbose\":false}}", .verbose = false },
     };

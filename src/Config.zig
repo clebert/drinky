@@ -18,7 +18,7 @@ timeouts: accounts.Registry.Timeouts = accounts.Registry.timeouts_default,
 retry: core.Retry = .{},
 bash: tools.Context.Bash = .{},
 window_pages: usize = layout.window_pages_default,
-verbose: bool = true,
+verbose: bool = false,
 gauge: ui.status.Gauge = .{},
 effort_default: ?core.Provider.Effort = null,
 user_instructions: discovery.instructions.Result,
@@ -88,7 +88,7 @@ const File = struct {
 
     const Interface = struct {
         window_pages: usize = layout.window_pages_default,
-        verbose: bool = true,
+        verbose: bool = false,
         gauge_percent_warning: f64 = gauge_default.percent_warning,
         gauge_percent_error: f64 = gauge_default.percent_error,
     };
@@ -223,7 +223,8 @@ const keys = [_]Key{
     },
     .{
         .path = "interface.verbose",
-        .description = "Show complete thinking text, tool rows, and bash commands at startup. " ++
+        .description = "The value true shows complete thinking text, tool rows, " ++
+            "and bash commands at startup. " ++
             "The value false folds each run of thinking and tool calls into one work row. " ++
             "The /verbose command changes only the current session.",
     },
@@ -940,21 +941,20 @@ test "load reads the interface section" {
     try std.testing.expect(empty.gauge_dropped == null);
 }
 
-test "verbosity defaults to on and accepts both boolean values" {
-    for ([_]bool{ true, false }) |verbose| {
-        const data = try std.testing.allocator.print(
-            "{{\"interface\":{{\"verbose\":{}}}}}",
-            .{verbose},
-        );
-        defer std.testing.allocator.free(data);
-        var config = try loadDataForTest(data);
+test "verbosity defaults to off and accepts both boolean values" {
+    const cases = [_]struct { data: []const u8, verbose: bool }{
+        .{ .data = "{}", .verbose = false },
+        .{ .data = "{\"interface\":{}}", .verbose = false },
+        .{ .data = "{\"interface\":{\"window_pages\":3}}", .verbose = false },
+        .{ .data = "{\"interface\":{\"verbose\":true}}", .verbose = true },
+        .{ .data = "{\"interface\":{\"verbose\":false}}", .verbose = false },
+    };
+    for (cases) |case| {
+        var config = try loadDataForTest(case.data);
         defer config.deinit(std.testing.allocator);
-        try std.testing.expectEqual(verbose, config.verbose);
+        try std.testing.expectEqual(case.verbose, config.verbose);
         try std.testing.expectEqual(@as(usize, 0), config.unknown_keys.len);
     }
-    var empty = try loadDataForTest("{}");
-    defer empty.deinit(std.testing.allocator);
-    try std.testing.expect(empty.verbose);
 }
 
 test "the removed transcript setting reports an unknown key without migration" {
@@ -962,7 +962,7 @@ test "the removed transcript setting reports an unknown key without migration" {
         "{\"interface\":{\"transcript_mode\":\"compact\",\"window_pages\":3}}",
     );
     defer config.deinit(std.testing.allocator);
-    try std.testing.expect(config.verbose);
+    try std.testing.expect(!config.verbose);
     try std.testing.expectEqual(@as(usize, 3), config.window_pages);
     try std.testing.expectEqualStrings("interface.transcript_mode", config.unknown_keys[0]);
     var report = try config.reports(std.testing.allocator, .{
@@ -1272,6 +1272,7 @@ test "the config document names the file, each key, and each limit, and its exam
             .{bash_default.timeout_ms},
         ),
         "- `default_effort` — string, default: unset.",
+        "- `interface.verbose` — boolean, default: false.",
         "- `user_instructions[].path` — string, required.",
     };
     for (stated_keys) |line| try std.testing.expect(std.mem.find(u8, text, line) != null);
@@ -1384,6 +1385,7 @@ test "an absent config file loads the built-in defaults" {
     );
     try std.testing.expectEqual(@as(usize, 0), config.user_instructions.files().len);
     try std.testing.expectEqual(@as(usize, 0), config.user_instructions.reports.messages().len);
+    try std.testing.expect(!config.verbose);
 }
 
 test "a file that Drinky cannot parse keeps every default and its error" {
@@ -1406,6 +1408,7 @@ test "a file that Drinky cannot parse keeps every default and its error" {
         defer config.deinit(gpa);
         try std.testing.expectEqual(@as(?LoadError, case.err), config.load_error);
         try std.testing.expectEqual(bash_default.timeout_ms, config.bash.timeout_ms);
+        try std.testing.expect(!config.verbose);
         try std.testing.expect(std.mem.endsWith(u8, config.path, "config.json"));
     }
 }
