@@ -196,11 +196,16 @@ fn writeCommands(writer: *std.Io.Writer) !void {
         \\editor as editable text. Tool changes and the cost stay. When a turn that the rewind
         \\drops ran `write`, `edit`, or `bash`, Enter warns first and rewinds on the second press.
         \\
-        \\`/tldr` shortens the last answer with the local Apple Foundation Model through the `fm`
-        \\command. It opens a page and streams the short version into it. The transcript and the
-        \\model conversation stay unchanged. Esc closes the page and stops the local model.
-        \\Drinky keeps the short version of one answer, so the next `/tldr` for the same answer
-        \\shows it at once. When `fm` or its model is not available, the page shows the failure.
+        \\`/tldr` shortens the last answer with the current model. The request holds only that
+        \\answer. It asks for the medium effort level, or the nearest level that the model takes.
+        \\It opens a page and streams the short version into it. Until the first text arrives,
+        \\the page shows a wait note or the last failed attempt. The wait and retry notes use dim
+        \\text. A failure note uses red text. An incomplete reply note uses yellow text. The notes
+        \\stay separate from the model text in both page presentations. The transcript and the model
+        \\conversation stay unchanged. The cost of the request joins the session cost. Esc
+        \\stops the request and closes the page. Drinky keeps the short version of one answer,
+        \\so the next `/tldr` for the same answer shows it at once. When the request fails, the
+        \\page shows the failure.
         \\
     );
 }

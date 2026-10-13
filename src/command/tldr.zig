@@ -5,7 +5,7 @@ const Context = @import("Context.zig");
 const testing = @import("testing.zig");
 
 pub const name = "tldr";
-pub const summary = "Shorten the last answer with the local model";
+pub const summary = "Shorten the last answer with the current model";
 
 pub fn run(context: *Context) Context.Error!Context.Outcome {
     const answer = context.answer orelse return .{ .refusal = try Message.print(

@@ -26,6 +26,10 @@ when the user drops it.
   allocator can consume a pending cancel. Without the strip, two cancel tests of `Session` fail in
   about one of three runs. A Debug build of Drinky records stacks through the same allocator, so it
   can hang or lose a cancel too. Trigger: a Zig release that fixes both defects.
+- An unauthorized failure of `/tldr` does not reject the credential. The page only shows the
+  failure, and the next turn rejects the credential. When a turn fails as unauthorized, the client
+  calls `rejectCredential`, which can sign out and open the login picker. A page cannot hold a
+  picker, so `/tldr` needs a design for a sign-out while its page is open first.
 - Drinky calls `std.unicode.utf8Decode` at six sites. Zig 0.17.0 deprecates the function but names
   no successor, and the standard library still calls it. Trigger: a Zig release that names a
   successor or removes the function.

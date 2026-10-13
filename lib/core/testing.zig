@@ -396,6 +396,14 @@ pub const Harness = struct {
         try self.session.send(&.{ .prompt = text });
     }
 
+    pub fn ask(self: *Harness, text: []const u8) !void {
+        try self.session.send(&.{ .aside = .{
+            .system = "Be brief.",
+            .text = text,
+            .effort = .medium,
+        } });
+    }
+
     pub fn expect(self: *Harness, expected: []const u8) !void {
         try self.recorder.expect(expected);
     }
@@ -542,6 +550,20 @@ fn writeEvent(writer: *std.Io.Writer, event: *const Session.Event) std.Io.Writer
         .setup_dropped => try writer.writeAll("setup_dropped"),
         .text_started => try writer.writeAll("text_started"),
         .text => |delta| try writer.print("text:{s}", .{delta}),
+        .aside_text => |delta| try writer.print("aside_text:{s}", .{delta}),
+        .aside_attempt_failed => |attempt| try writer.print(
+            "aside_attempt_failed:{d}:{s}:{s}:{d}",
+            .{
+                attempt.attempt,
+                @tagName(attempt.failure.reason),
+                attempt.failure.message,
+                attempt.delay_ms,
+            },
+        ),
+        .aside_ended => |*outcome| {
+            try writer.writeAll("aside_ended:");
+            try writeOutcome(writer, outcome);
+        },
         .reasoning_started => try writer.writeAll("reasoning_started"),
         .reasoning => |delta| try writer.print("reasoning:{s}", .{delta}),
         .tool_call_started => |name| try writer.print("tool_call_started:{s}", .{name}),
@@ -581,14 +603,23 @@ fn writeEvent(writer: *std.Io.Writer, event: *const Session.Event) std.Io.Writer
             skill.name,
             skill.source,
         }),
-        .turn_ended => |outcome| switch (outcome) {
-            .stopped => |reason| try writer.print("turn_ended:{s}", .{@tagName(reason)}),
-            .canceled => try writer.writeAll("turn_ended:canceled"),
-            .exhausted => try writer.writeAll("turn_ended:exhausted"),
-            .failed => |failure| try writer.print("turn_ended:failed:{s}:{s}", .{
-                @tagName(failure.reason),
-                failure.message,
-            }),
+        .turn_ended => |*outcome| {
+            try writer.writeAll("turn_ended:");
+            try writeOutcome(writer, outcome);
         },
+    }
+}
+
+fn writeOutcome(
+    writer: *std.Io.Writer,
+    outcome: *const Session.Outcome,
+) std.Io.Writer.Error!void {
+    switch (outcome.*) {
+        .stopped => |reason| try writer.writeAll(@tagName(reason)),
+        .canceled, .exhausted => try writer.writeAll(@tagName(outcome.*)),
+        .failed => |failure| try writer.print("failed:{s}:{s}", .{
+            @tagName(failure.reason),
+            failure.message,
+        }),
     }
 }

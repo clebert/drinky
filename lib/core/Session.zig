@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const actor = @import("actor.zig");
+const Aside = @import("Aside.zig");
 const Conversation = @import("Conversation.zig");
 const Provider = @import("Provider.zig");
 const Retry = @import("Retry.zig");
@@ -23,6 +24,7 @@ setup: ?Setup,
 next_setup: ?Setup,
 clear_pending: bool,
 measured: ?Turn.Measured,
+aside: ?Aside.Request,
 mailbox: actor.Mailbox(Mail, mail_capacity),
 loop: ?std.Io.Future(void),
 
@@ -77,6 +79,7 @@ pub const Setup = struct {
 
 pub const Command = union(enum) {
     prompt: []const u8,
+    aside: Aside.Request,
     cancel,
     configure: Setup,
     clear,
@@ -85,6 +88,7 @@ pub const Command = union(enum) {
     fn dupe(self: *const Command, gpa: std.mem.Allocator) error{OutOfMemory}!Command {
         return switch (self.*) {
             .prompt => |text| .{ .prompt = try gpa.dupe(u8, text) },
+            .aside => |*request| .{ .aside = try request.dupe(gpa) },
             .configure => |*setup| .{ .configure = try setup.dupe(gpa) },
             .cancel, .clear, .rewind => self.*,
         };
@@ -93,6 +97,7 @@ pub const Command = union(enum) {
     fn deinit(self: *const Command, gpa: std.mem.Allocator) void {
         switch (self.*) {
             .prompt => |text| gpa.free(text),
+            .aside => |*request| request.deinit(gpa),
             .configure => |*setup| setup.deinit(gpa),
             .cancel, .clear, .rewind => {},
         }
@@ -103,6 +108,9 @@ pub const Event = union(enum) {
     setup_dropped: Provider,
     text_started,
     text: []const u8,
+    aside_text: []const u8,
+    aside_attempt_failed: Attempt,
+    aside_ended: Outcome,
     reasoning_started,
     reasoning: []const u8,
     tool_call_started: []const u8,
@@ -134,6 +142,14 @@ pub const Event = union(enum) {
         attempt: u32,
         failure: Provider.Failure,
         delay_ms: u64,
+
+        fn dupe(self: *const Attempt, gpa: std.mem.Allocator) Attempt {
+            return .{
+                .attempt = self.attempt,
+                .failure = self.failure.dupe(gpa),
+                .delay_ms = self.delay_ms,
+            };
+        }
     };
 
     pub const SkillLoaded = struct {
@@ -144,6 +160,8 @@ pub const Event = union(enum) {
     pub fn dupe(self: *const Event, gpa: std.mem.Allocator) error{OutOfMemory}!Event {
         return switch (self.*) {
             .text => |delta| .{ .text = try gpa.dupe(u8, delta) },
+            .aside_text => |delta| .{ .aside_text = try gpa.dupe(u8, delta) },
+            .aside_ended => |*outcome| .{ .aside_ended = outcome.dupe(gpa) },
             .reasoning => |delta| .{ .reasoning = try gpa.dupe(u8, delta) },
             .tool_call_started => |name| .{ .tool_call_started = try gpa.dupe(u8, name) },
             .tool_call_arguments => |delta| .{ .tool_call_arguments = try gpa.dupe(u8, delta) },
@@ -161,11 +179,8 @@ pub const Event = union(enum) {
                     .served = try gpa.dupe(u8, served.served),
                 } };
             },
-            .attempt_failed => |*attempt| .{ .attempt_failed = .{
-                .attempt = attempt.attempt,
-                .failure = attempt.failure.dupe(gpa),
-                .delay_ms = attempt.delay_ms,
-            } },
+            .attempt_failed => |*attempt| .{ .attempt_failed = attempt.dupe(gpa) },
+            .aside_attempt_failed => |*attempt| .{ .aside_attempt_failed = attempt.dupe(gpa) },
             .skill_loaded => |skill| {
                 const name = try gpa.dupe(u8, skill.name);
                 errdefer gpa.free(name);
@@ -190,7 +205,13 @@ pub const Event = union(enum) {
 
     pub fn deinit(self: *const Event, gpa: std.mem.Allocator) void {
         switch (self.*) {
-            .text, .reasoning, .tool_call_started, .tool_call_arguments => |bytes| gpa.free(bytes),
+            .text,
+            .aside_text,
+            .reasoning,
+            .tool_call_started,
+            .tool_call_arguments,
+            => |bytes| gpa.free(bytes),
+            .aside_ended => |*outcome| outcome.deinit(gpa),
             .tool_started => |*call| call.deinit(gpa),
             .tool_result => |*result| {
                 result.call.deinit(gpa);
@@ -200,7 +221,7 @@ pub const Event = union(enum) {
                 gpa.free(served.requested);
                 gpa.free(served.served);
             },
-            .attempt_failed => |*attempt| attempt.failure.deinit(gpa),
+            .attempt_failed, .aside_attempt_failed => |*attempt| attempt.failure.deinit(gpa),
             .skill_loaded => |skill| {
                 gpa.free(skill.name);
                 gpa.free(skill.source);
@@ -244,11 +265,13 @@ pub const Outcome = union(enum) {
 const Mail = union(enum) {
     command: Command,
     ended: Turn.End,
+    aside_ended: Outcome,
 
     pub fn deinit(self: *const Mail, gpa: std.mem.Allocator) void {
         switch (self.*) {
             .command => |*command| command.deinit(gpa),
             .ended => |*ended| ended.deinit(gpa),
+            .aside_ended => |*outcome| outcome.deinit(gpa),
         }
     }
 };
@@ -265,6 +288,7 @@ pub fn init(gpa: std.mem.Allocator, io: std.Io, options: *const Options) Session
         .next_setup = null,
         .clear_pending = false,
         .measured = null,
+        .aside = null,
         .mailbox = .init,
         .loop = null,
     };
@@ -282,6 +306,7 @@ pub fn deinit(self: *Session) void {
     if (self.setup) |*setup| setup.deinit(self.gpa);
     if (self.next_setup) |*setup| setup.deinit(self.gpa);
     if (self.measured) |*measured| measured.deinit(self.gpa);
+    self.dropAside();
     self.turn_starts.deinit(self.gpa);
     self.conversation.deinit(self.gpa);
 }
@@ -303,6 +328,7 @@ fn serve(self: *Session) actor.Mailbox(Mail, mail_capacity).Error!void {
         switch (try self.mailbox.receive(self.io)) {
             .command => |command| self.handle(command),
             .ended => |ended| self.end(ended),
+            .aside_ended => |outcome| self.endAside(outcome),
         }
     }
 }
@@ -310,6 +336,7 @@ fn serve(self: *Session) actor.Mailbox(Mail, mail_capacity).Error!void {
 fn handle(self: *Session, command: Command) void {
     switch (command) {
         .prompt => |text| self.prompt(text),
+        .aside => |request| self.ask(request),
         .cancel => self.mailbox.cancel(self.io),
         .configure => |setup| self.configure(setup),
         .clear => self.requestClear(),
@@ -349,6 +376,32 @@ fn appendPrompt(self: *Session, turn: usize, text: []const u8) error{OutOfMemory
 fn runTurn(lent: Turn) Mail {
     var turn = lent;
     return .{ .ended = turn.run() };
+}
+
+fn ask(self: *Session, request: Aside.Request) void {
+    std.debug.assert(!self.mailbox.busy());
+    std.debug.assert(self.setup != null);
+    self.aside = request;
+    const aside: Aside = .{
+        .gpa = self.gpa,
+        .io = self.io,
+        .options = self.options,
+        .setup = &self.setup.?,
+        .request = &self.aside.?,
+    };
+    self.mailbox.start(self.io, runAside, .{aside}) catch {
+        self.dropAside();
+        self.emit(&.{ .aside_ended = .{ .failed = .{ .reason = .out_of_memory } } });
+    };
+}
+
+fn runAside(aside: Aside) Mail {
+    return .{ .aside_ended = aside.run() };
+}
+
+fn dropAside(self: *Session) void {
+    if (self.aside) |*request| request.deinit(self.gpa);
+    self.aside = null;
 }
 
 fn configure(self: *Session, setup: Setup) void {
@@ -410,6 +463,20 @@ fn end(self: *Session, ended: Turn.End) void {
         if (self.measured) |*previous| previous.deinit(self.gpa);
         self.measured = measured;
     }
+    self.settle();
+    self.emit(&.{ .turn_ended = ended.outcome });
+    ended.outcome.deinit(self.gpa);
+}
+
+fn endAside(self: *Session, outcome: Outcome) void {
+    self.mailbox.reap(self.io);
+    self.dropAside();
+    self.settle();
+    self.emit(&.{ .aside_ended = outcome });
+    outcome.deinit(self.gpa);
+}
+
+fn settle(self: *Session) void {
     if (self.next_setup) |setup| {
         self.next_setup = null;
         self.apply(setup);
@@ -418,8 +485,6 @@ fn end(self: *Session, ended: Turn.End) void {
         self.clear_pending = false;
         self.clear();
     }
-    self.emit(&.{ .turn_ended = ended.outcome });
-    ended.outcome.deinit(self.gpa);
 }
 
 fn contextShown(self: *const Session) ?u64 {
@@ -1016,6 +1081,118 @@ test "a quota and the credits of a reply reach the sink as they stream" {
         \\committed
         \\turn_ended:complete
     , try harness.turn("hi"));
+}
+
+test "an aside streams its reply outside the conversation with its own system text and effort" {
+    var harness: testing.Harness = undefined;
+    try harness.init(std.testing.allocator, std.testing.io, &.{});
+    defer harness.deinit();
+
+    harness.provider.load(&.{
+        .{ .done = &.{ fixture.message("ok"), fixture.stop_complete } },
+        .{ .done = &.{
+            .reasoning_started,
+            .{ .reasoning = "Weigh it" },
+            .{ .text = "Short " },
+            .{ .text = "version." },
+            fixture.message("Short version."),
+            .{ .usage = .{ .input = 30, .output = 5 } },
+            .{ .quota = .{ .primary = .{ .used_percent = 42 } } },
+            fixture.stop_complete,
+        } },
+        .{ .done = &.{ fixture.message("Only the message."), fixture.stop_complete } },
+        .{ .done = &.{ fixture.message("two"), fixture.stop_complete } },
+    });
+    _ = try harness.turn("hi");
+    try harness.ask("The long answer.");
+    try std.testing.expectEqualStrings(
+        \\aside_text:Short 
+        \\aside_text:version.
+        \\quota:42
+        \\usage:30/5/0/0
+        \\aside_ended:complete
+    , try harness.until("aside_ended"));
+    try harness.ask("Another answer.");
+    try std.testing.expectEqualStrings(
+        \\aside_text:Only the message.
+        \\aside_ended:complete
+    , try harness.until("aside_ended"));
+    _ = try harness.turn("next");
+
+    const provider = &harness.provider;
+    try std.testing.expectEqualStrings("model-a|user:The long answer.", provider.requests.items[1]);
+    try std.testing.expectEqualStrings("Be brief.||4096|medium", provider.settings.items[1]);
+    try std.testing.expectEqualStrings(
+        "model-a|user:hi|assistant:ok|user:next",
+        provider.requests.items[3],
+    );
+}
+
+test "an aside repeats a failed attempt before its first text and ends at a failure after it" {
+    var harness: testing.Harness = undefined;
+    try harness.init(std.testing.allocator, std.testing.io, &.{
+        .retry = .{ .attempts_max = 3, .backoff = .{ .delay_ms_initial = 0, .delay_ms_max = 0 } },
+    });
+    defer harness.deinit();
+
+    harness.provider.load(&.{
+        .{ .done = &.{ .{ .usage = .{ .input = 7 } }, .{ .failed = .{ .reason = .overloaded } } } },
+        .{ .done = &.{
+            .{ .text = "Short" },
+            .{ .failed = .{ .reason = .overloaded, .message = "The model is busy." } },
+        } },
+    });
+    try harness.ask("The long answer.");
+    try std.testing.expectEqualStrings(
+        \\usage:7/0/0/0
+        \\aside_attempt_failed:1:overloaded::0
+        \\aside_text:Short
+        \\aside_ended:failed:overloaded:The model is busy.
+    , try harness.until("aside_ended"));
+    try std.testing.expectEqual(@as(usize, 2), harness.provider.requests.items.len);
+}
+
+test "an aside whose task cannot start fails as out of memory and sends no request" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{
+        .concurrent_limit = .limited(1),
+    });
+    defer threaded.deinit();
+    var harness: testing.Harness = undefined;
+    try harness.init(std.testing.allocator, threaded.io(), &.{});
+    defer harness.deinit();
+
+    harness.provider.load(&.{.{ .done = &.{ fixture.message("ok"), fixture.stop_complete } }});
+    try harness.ask("The long answer.");
+    try harness.expect("aside_ended:failed:out_of_memory:");
+    try std.testing.expectEqual(@as(usize, 0), harness.provider.requests.items.len);
+}
+
+test "a cancel ends an aside, and a setup that arrives during it applies at its end" {
+    var harness: testing.Harness = undefined;
+    try harness.init(std.testing.allocator, std.testing.io, &.{});
+    defer harness.deinit();
+
+    harness.provider.load(&.{
+        .{ .done = &.{ fixture.message("one"), fixture.stop_complete } },
+        .{ .open = &.{.{ .text = "Short" }} },
+    });
+    harness.other.load(&.{.{ .done = &.{ fixture.message("two"), fixture.stop_complete } }});
+    _ = try harness.turn("a");
+    try harness.ask("one");
+    try harness.expect("aside_text:Short");
+    try harness.configure(&harness.other, "model-b");
+    try harness.session.send(&.cancel);
+    try std.testing.expectEqualStrings(
+        \\setup_dropped
+        \\context:none
+        \\aside_ended:canceled
+    , try harness.until("aside_ended"));
+    try std.testing.expectEqual(@as(u32, 1), harness.provider.canceled);
+    _ = try harness.turn("b");
+    try std.testing.expectEqualStrings(
+        "model-b|user:a|assistant:one|user:b",
+        harness.other.requests.items[0],
+    );
 }
 
 test "a served model that differs from the request arrives with every reply" {
@@ -1722,6 +1899,8 @@ test "a copy of each event owns its bytes, and a failed copy leaks nothing" {
         .{ .model_served = .{ .requested = "a", .served = "b" } },
         .{ .skill_loaded = .{ .name = "zig-style", .source = "SKILL.md" } },
         .{ .turn_ended = .canceled },
+        .{ .aside_text = "delta" },
+        .{ .aside_ended = .canceled },
         .committed,
     };
     try testing.checkCopyAllocationFailures(Event, &events);
@@ -1735,7 +1914,9 @@ test "a failure keeps its reason and its wait when the copy of its message fails
     };
     const events = [_]Event{
         .{ .attempt_failed = .{ .attempt = 1, .failure = failure, .delay_ms = 0 } },
+        .{ .aside_attempt_failed = .{ .attempt = 1, .failure = failure, .delay_ms = 0 } },
         .{ .turn_ended = .{ .failed = failure } },
+        .{ .aside_ended = .{ .failed = failure } },
     };
     for (&events) |*event| {
         const owned = try event.dupe(std.testing.allocator);
@@ -1757,8 +1938,8 @@ test "a failure keeps its reason and its wait when the copy of its message fails
 
 fn failureOf(event: *const Event) Provider.Failure {
     return switch (event.*) {
-        .attempt_failed => |attempt| attempt.failure,
-        .turn_ended => |outcome| outcome.failed,
+        .attempt_failed, .aside_attempt_failed => |attempt| attempt.failure,
+        .turn_ended, .aside_ended => |outcome| outcome.failed,
         else => unreachable,
     };
 }

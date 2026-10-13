@@ -17,6 +17,7 @@ pub const VTable = struct {
 pub const Error = error{ Canceled, OutOfMemory };
 
 pub const amount_usd_max: f64 = 1_000_000_000;
+pub const reply_events_max: usize = 1 << 20;
 
 pub const Effort = enum { low, medium, high, xhigh, max };
 

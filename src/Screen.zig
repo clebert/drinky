@@ -509,7 +509,7 @@ pub fn apply(
 ) !?core.Session.Outcome {
     const turn = self.activeTurn() orelse return self.applyIdle(event, time);
     switch (event.*) {
-        .setup_dropped => unreachable,
+        .setup_dropped, .aside_text, .aside_attempt_failed, .aside_ended => unreachable,
         .text_started => {
             self.finishThinking();
             try self.beginText(turn);
@@ -618,6 +618,10 @@ fn applyIdle(
 ) !?core.Session.Outcome {
     switch (event.*) {
         .context => |tokens| self.statistics.context_tokens = tokens,
+        .usage => |usage| {
+            self.statistics.attempt_usage = usage;
+            self.statistics.charge(self.chosenModel());
+        },
         .quota => |quota| {
             self.statistics.quota = quota;
             self.statistics.quota_seen_ms = time.boot_ms;
@@ -837,7 +841,10 @@ fn recordOutcome(self: *Screen, outcome: *const core.Session.Outcome) !void {
     }
 }
 
-fn attemptText(gpa: std.mem.Allocator, attempt: *const core.Session.Event.Attempt) ![]u8 {
+pub fn attemptText(
+    gpa: std.mem.Allocator,
+    attempt: *const core.Session.Event.Attempt,
+) ![]u8 {
     var buffer: [24]u8 = undefined;
     const delay = tools.format.duration(&buffer, @intCast(@min(
         attempt.delay_ms,
@@ -2965,6 +2972,22 @@ test "the cost takes a reported charge over the estimate, skips an unpriced mode
     try rig.apply(&.{ .usage = .{ .input = 1, .cost_usd = 5 } });
     try rig.end(&.canceled);
     try std.testing.expectEqual(core.Provider.amount_usd_max, rig.screen.statusInfo(0).cost);
+}
+
+test "a usage between turns adds its cost at once and keeps the cache figure of the last turn" {
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    try rig.start("hi");
+    try rig.apply(&.{ .usage = .{ .input = 10, .cache_read = 90 } });
+    try rig.apply(&.committed);
+    try rig.end(&.{ .stopped = .complete });
+    const cost = rig.screen.statusInfo(0).cost;
+
+    try rig.apply(&.{ .usage = .{ .input = 1_000_000 } });
+    const info = rig.screen.statusInfo(0);
+    try std.testing.expectApproxEqAbs(cost + 3, info.cost, 1e-9);
+    try std.testing.expectEqual(@as(u64, 90), info.cache_usage.cache_read);
 }
 
 test "an account switch keeps every block and the scrollback" {

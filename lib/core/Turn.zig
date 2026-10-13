@@ -12,7 +12,6 @@ const Turn = @This();
 pub const tool_calls_max: usize = 64;
 pub const read_only_calls_max: usize = 32;
 pub const rounds_max: usize = 1000;
-const events_max: usize = 1 << 20;
 const skills_max: usize = 64;
 
 gpa: std.mem.Allocator,
@@ -416,7 +415,7 @@ fn reply(self: *Turn, staging: *Staging) Reply {
 fn read(self: *Turn, staging: *Staging, provider: Provider) Read {
     var invalid = false;
     var tool_calls: usize = 0;
-    for (0..events_max) |_| {
+    for (0..Provider.reply_events_max) |_| {
         const maybe_event = provider.next() catch |err| return switch (err) {
             error.Canceled => .canceled,
             error.OutOfMemory => .{ .failed = .{ .reason = .out_of_memory } },
