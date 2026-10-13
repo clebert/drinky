@@ -52,6 +52,17 @@ const commands = [_]Entry{
     },
 };
 
+const during_turn_notice = blk: {
+    var text: []const u8 = "Commands during a turn:";
+    var separator: []const u8 = " ";
+    for (commands) |entry| {
+        if (!entry.during_turn) continue;
+        text = text ++ separator ++ "/" ++ entry.name;
+        separator = ", ";
+    }
+    break :blk text ++ ".";
+};
+
 comptime {
     for (commands[1..], 0..) |entry, index| {
         if (!std.mem.lessThan(u8, commands[index].name, entry.name))
@@ -187,7 +198,12 @@ pub fn run(context: *Context, line: []const u8) !?Context.Outcome {
 pub fn checkDuringTurn(context: *Context, line: []const u8) !?Message {
     const name = parse(line) orelse return null;
     if (try check(context, line)) |refusal| return refusal;
-    if (!loadsSkill(name) and lookup(name).?.during_turn) return null;
+    if (!loadsSkill(name)) {
+        const entry = lookup(name).?;
+        if (entry.during_turn) return null;
+        if (std.mem.eql(u8, entry.name, help_name))
+            return try Message.print(context.gpa, .information, during_turn_notice, .{});
+    }
     return try Message.print(
         context.gpa,
         .warning,
@@ -275,6 +291,18 @@ test "a command line during a turn gets a refusal, and a message line gets none"
     );
     const unknown = (try checkDuringTurn(&context, "/nope")).?;
     try testing.expectMessage(&unknown, .warning, "Drinky does not recognize the command /nope.");
+}
+
+test "a command list line during a turn names the commands that run during a turn" {
+    var rig: testing.Rig = undefined;
+    try rig.init(&.{});
+    defer rig.deinit();
+    var context = rig.context();
+
+    for ([_][]const u8{ "/", "/help" }) |line| {
+        const listing = (try checkDuringTurn(&context, line)).?;
+        try testing.expectMessage(&listing, .information, "Commands during a turn: /verbose.");
+    }
 }
 
 test "a line without a leading slash is not dispatched" {

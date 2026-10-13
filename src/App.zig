@@ -951,7 +951,7 @@ fn submitDuringTurn(self: *App) !void {
     const text = try self.screen.editor.expanded();
     defer self.gpa.free(text);
     var context = self.commandContext();
-    if (try command.checkDuringTurn(&context, text)) |refusal| return self.setNotice(refusal);
+    if (try command.checkDuringTurn(&context, text)) |notice| return self.setNotice(notice);
     if (try command.run(&context, text)) |outcome|
         return self.applySubmittedCommand(&outcome, text);
     try self.reportNotice(.information, turn_message_notice, .{});
@@ -2759,25 +2759,13 @@ test "verbose uses the startup config and toggles during a turn without sending 
     try rig.waitFor(&.{ .{ .status = "Verbose output is on." }, .{ .editor = "" } });
     try rig.keys("hello\r");
     try hold.reached.wait(std.testing.io);
-    try rig.keys("/verbose extra\r");
-    try rig.waitFor(&.{
-        .{ .status = "The command /verbose takes no argument." },
-        .{ .editor = "/verbose extra" },
-        .{ .activity = true },
-    });
-    try rig.keys("\x03/verbose\r");
+    try rig.keys("/verbose\r");
     try rig.waitFor(&.{
         .{ .status = "Verbose output is off." },
         .{ .editor = "" },
         .{ .activity = true },
     });
-    try rig.keys("/model\r");
-    try rig.waitFor(&.{
-        .{ .status = "The command /model cannot run while a turn runs." },
-        .{ .editor = "/model" },
-        .{ .activity = true },
-    });
-    try rig.keys("\x03/verbose\r");
+    try rig.keys("/verbose\r");
     try rig.waitFor(&.{
         .{ .status = "Verbose output is on." },
         .{ .editor = "" },
@@ -2798,6 +2786,38 @@ test "verbose uses the startup config and toggles during a turn without sending 
         "{\"interface\":{\"verbose\":false}}",
         configured,
     );
+}
+
+test "command lines during a turn get a notice and keep the draft" {
+    var hold: providers.testing.FakeTransport.Hold = .{ .io = std.testing.io };
+    var rig: Rig = undefined;
+    try rig.init(&.{
+        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .replies = &.{.{ .body = providers.testing.reply_stream, .hold = &hold }},
+        .model = "gpt-5.6-sol",
+    });
+    defer rig.deinit();
+    defer hold.released.set(std.testing.io);
+    try rig.keys("hello\r");
+    try hold.reached.wait(std.testing.io);
+    try rig.keys("/verbose extra\r");
+    try rig.waitFor(&.{
+        .{ .status = "The command /verbose takes no argument." },
+        .{ .editor = "/verbose extra" },
+        .{ .activity = true },
+    });
+    try rig.keys("\x03/model\r");
+    try rig.waitFor(&.{
+        .{ .status = "The command /model cannot run while a turn runs." },
+        .{ .editor = "/model" },
+        .{ .activity = true },
+    });
+    try rig.keys("\x03/\r");
+    try rig.waitFor(&.{
+        .{ .status = "Commands during a turn: /verbose." },
+        .{ .editor = "/" },
+        .{ .activity = true },
+    });
 }
 
 test "Enter during a turn keeps the text, and Ctrl+D with a draft warns before it quits" {

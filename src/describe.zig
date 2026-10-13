@@ -115,7 +115,8 @@ fn writeCommands(writer: *std.Io.Writer) !void {
     try writer.writeAll(
         "\nA command refuses text after its name unless its row names trailing text. " ++
             "The /verbose command also works while a turn runs. " ++
-            "Drinky refuses other commands during a turn, and the draft stays.\n",
+            "During a turn, the line `/` or `/help` lists the commands that work during a turn. " ++
+            "Drinky refuses other commands during a turn. The draft stays in both cases.\n",
     );
     try writer.writeAll(
         \\
@@ -235,9 +236,10 @@ fn writeKeys(writer: *std.Io.Writer, options: *const Options) !void {
         \\
         \\A running turn takes these keys:
         \\
-        \\- Enter runs `/verbose` and clears its command line. Other slash commands get a refusal.
-        \\  Enter sends no message. Drinky shows the notice `Drinky sends no message while a turn
-        \\  runs. The draft stays.` and keeps the line.
+        \\- Enter runs `/verbose` and clears its command line. Enter on `/` or `/help` lists the
+        \\  commands that work during a turn and keeps the line. Other slash commands get a
+        \\  refusal. Enter sends no message. Drinky shows the notice `Drinky sends no message
+        \\  while a turn runs. The draft stays.` and keeps the line.
         \\- Esc cancels the turn. Esc with a draft warns first and cancels on the second press.
         \\- When a notice other than that warning replaces the status line, Esc first clears the
         \\  notice.
