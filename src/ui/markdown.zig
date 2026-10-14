@@ -335,7 +335,7 @@ const Prefix = struct {
     continuation: []const u8 = "",
 };
 
-const code_prefix: Prefix = .{ .marker = "  ", .continuation = "↪ " };
+const code_prefix: Prefix = .{ .marker = "  ", .continuation = paint.continuation_marker };
 
 const PlainRow = struct {
     columns: usize,

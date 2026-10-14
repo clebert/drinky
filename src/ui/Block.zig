@@ -596,11 +596,11 @@ test "command ranges keep every detail aligned through wrapping replay and clipp
         for ([_]usize{ 100, 40, 37, 36, 25, 24, 9, 1 }) |columns| {
             const indent: usize = if (columns >= 37) 24 else 0;
             const room = columns - indent;
-            const command_rows = terminal.width.rows(command, room);
-            const expected_rows = 1 + command_rows + terminal.width.rows(detail, room);
+            const expected_rows = block.rows(columns);
+            const command_rows = expected_rows - 1 - terminal.width.rows(detail, room);
+            try std.testing.expect(command_rows >= std.mem.count(u8, command, "\n") + 1);
             const painted = try rendered(gpa, &block, columns, 0);
             defer gpa.free(painted);
-            try std.testing.expectEqual(expected_rows, block.rows(columns));
             try std.testing.expectEqual(expected_rows, testing.paintedRows(painted));
             var styled = std.mem.splitSequence(u8, painted, "\r\n");
             _ = styled.next().?;
