@@ -423,6 +423,7 @@ fn reply(self: *Turn, staging: *Staging) Reply {
 }
 
 fn read(self: *Turn, staging: *Staging, provider: Provider) Read {
+    defer if (staging.usage) |usage| self.emit(&.{ .usage = usage });
     var invalid = false;
     var tool_calls: usize = 0;
     for (0..Provider.reply_events_max) |_| {
@@ -471,10 +472,7 @@ fn read(self: *Turn, staging: *Staging, provider: Provider) Read {
             },
             .tool_call_started => |name| self.startCall(staging, name),
             .tool_call_arguments => |delta| self.emit(&.{ .tool_call_arguments = delta }),
-            .usage => |usage| {
-                staging.usage = usage;
-                self.emit(&.{ .usage = usage });
-            },
+            .usage => |usage| staging.usage = usage,
             .quota => |quota| self.emit(&.{ .quota = quota }),
             .credits => |credits| self.emit(&.{ .credits = credits }),
         }
@@ -529,6 +527,7 @@ fn answer(self: *Turn, staging: *Staging) AnswerError!void {
                 &pending.call,
                 self.history(),
                 self.setup.variables,
+                self.runnerSink(),
             );
             self.settle(staging, calls[position], output);
             position += 1;
@@ -554,7 +553,9 @@ fn answerBatch(
     for (calls[batch.start..batch.end]) |index| {
         const pending = staging.pendingAt(index);
         const call = &pending.call;
-        const arguments = .{ self.options.runner, self.gpa, call, items, self.setup.variables };
+        const arguments = .{
+            self.options.runner, self.gpa, call, items, self.setup.variables, self.runnerSink(),
+        };
         futures[spawned] = self.io.concurrent(runCall, arguments) catch break;
         spawned += 1;
         pending.started = true;
@@ -579,8 +580,22 @@ fn runCall(
     call: *const Tool.Call,
     items: []const Conversation.Item,
     variables: []const Runner.Variable,
+    sink: Runner.Sink,
 ) Runner.Error!Tool.Output {
-    return runner.run(gpa, call, items, variables);
+    return runner.run(gpa, call, items, variables, sink);
+}
+
+const runner_sink_vtable: Runner.Sink.VTable = .{ .emit = emitRunnerEvent };
+
+fn runnerSink(self: *Turn) Runner.Sink {
+    return .{ .ptr = self, .vtable = &runner_sink_vtable };
+}
+
+fn emitRunnerEvent(ptr: *anyopaque, event: *const Runner.Event) void {
+    const self: *Turn = @ptrCast(@alignCast(ptr));
+    switch (event.*) {
+        .cost => |amount| self.emit(&.{ .cost = amount }),
+    }
 }
 
 fn history(self: *const Turn) []const Conversation.Item {

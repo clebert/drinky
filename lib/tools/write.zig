@@ -55,7 +55,11 @@ pub fn run(context: *const Context, input_json: []const u8) Context.Error!core.T
 test "write creates a file with the given contents" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = io } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = io },
+    };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var input_buffer: [128]u8 = undefined;
@@ -74,7 +78,11 @@ test "write creates a file with the given contents" {
 test "write overwrites an existing file entirely" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = io } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = io },
+    };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "f.txt", .data = "old contents" });
@@ -93,7 +101,11 @@ test "write overwrites an existing file entirely" {
 test "a write through a dangling link creates the target and keeps the link" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = io } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = io },
+    };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.symLink(io, "AGENTS.md", "CLAUDE.md", .{});
@@ -116,7 +128,11 @@ test "a write through a dangling link creates the target and keeps the link" {
 test "a write through a link cycle fails and keeps both links" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = io } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = io },
+    };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.symLink(io, "b.md", "a.md", .{});
@@ -139,7 +155,11 @@ test "a write through a link cycle fails and keeps both links" {
 
 test "write to a missing directory reports an error" {
     const gpa = std.testing.allocator;
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = std.testing.io } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = std.testing.io },
+    };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var input_buffer: [128]u8 = undefined;
@@ -164,7 +184,11 @@ test "write canceled mid-write propagates and leaves the file untouched" {
         \\{{"path":".zig-cache/tmp/{s}/f.txt","content":"new"}}
     , .{tmp.sub_path});
     var cancel: testing.CancelIo = .init(.file_write);
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = cancel.io() } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = cancel.io() },
+    };
     try std.testing.expectError(error.Canceled, run(&context, input));
     const data = try tmp.dir.readFileAlloc(io, "f.txt", gpa, .limited(64));
     defer gpa.free(data);
@@ -183,6 +207,8 @@ test "a write that the time limit stops says that the file can hold either conte
         stall.init(gpa, case.target);
         defer stall.deinit();
         const context: Context = .{
+            .sink = testing.discard_sink,
+
             .gpa = gpa,
             .host = .{ .io = stall.io() },
             .deadline = .start(stall.io(), fs.timeout_ms),
@@ -216,7 +242,11 @@ test "a write that the time limit stops says that the file can hold either conte
 test "write measures the lines of what it wrote" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = io } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = io },
+    };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var input_buffer: [160]u8 = undefined;

@@ -13,8 +13,10 @@ when the user drops it.
 
 ## Open items
 
-- `drinky run` reports no usage. The parent agent and the user see neither the tokens nor the cost
-  of a run.
+- `drinky run` shows no token totals or per-run cost. Internal cost reports update only the parent
+  session total.
+- A run that outlives its bash invocation cannot report later costs. Keep the invocation open with
+  `wait` to collect them.
 - A failed test shows no stack trace, because `build.zig` sets `strip = true` for each test module.
   It also sets the strip for the generators of `zig build unicode` and `zig build commonmark`.
   Without it, a generator hangs at its first allocation. Two defects of Zig 0.17.0 block the removal

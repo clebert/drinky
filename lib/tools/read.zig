@@ -137,12 +137,20 @@ pub fn run(context: *const Context, input_json: []const u8) Context.Error!core.T
 }
 
 test "read rejects invalid input" {
-    const context: Context = .{ .gpa = std.testing.allocator, .host = .{ .io = std.testing.io } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = std.testing.allocator,
+        .host = .{ .io = std.testing.io },
+    };
     try std.testing.expectError(error.InvalidArguments, run(&context, "{}"));
 }
 
 test "read of missing file reports an error" {
-    const context: Context = .{ .gpa = std.testing.allocator, .host = .{ .io = std.testing.io } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = std.testing.allocator,
+        .host = .{ .io = std.testing.io },
+    };
     const result = try run(&context,
         \\{"path":"/definitely/not/here.txt"}
     );
@@ -153,7 +161,11 @@ test "read of missing file reports an error" {
 
 test "read paginates and points at the next offset" {
     const gpa = std.testing.allocator;
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = std.testing.io } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = std.testing.io },
+    };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "f.txt", .data = "one\ntwo\nthree" });
@@ -176,7 +188,11 @@ test "read paginates and points at the next offset" {
 
 test "read measures a fully shown file" {
     const gpa = std.testing.allocator;
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = std.testing.io } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = std.testing.io },
+    };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "f.txt", .data = "one\ntwo\nthree" });
@@ -196,7 +212,11 @@ test "read measures a fully shown file" {
 
 test "read does not count a trailing newline as an empty line" {
     const gpa = std.testing.allocator;
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = std.testing.io } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = std.testing.io },
+    };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "f.txt", .data = "one\n" });
@@ -216,7 +236,11 @@ test "read does not count a trailing newline as an empty line" {
 
 test "read measures an empty file as zero lines" {
     const gpa = std.testing.allocator;
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = std.testing.io } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = std.testing.io },
+    };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "f.txt", .data = "" });
@@ -236,7 +260,11 @@ test "read measures an empty file as zero lines" {
 
 test "read rejects an offset past the end of the file and names its line count" {
     const gpa = std.testing.allocator;
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = std.testing.io } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = std.testing.io },
+    };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "two.txt", .data = "one\ntwo" });
@@ -259,7 +287,11 @@ test "read rejects an offset past the end of the file and names its line count" 
 
 test "read rejects a zero limit" {
     const gpa = std.testing.allocator;
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = std.testing.io } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = std.testing.io },
+    };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "f.txt", .data = "one" });
@@ -274,7 +306,11 @@ test "read rejects a zero limit" {
 
 test "read rejects a binary or non-UTF-8 file" {
     const gpa = std.testing.allocator;
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = std.testing.io } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = std.testing.io },
+    };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "bin.dat", .data = "a\x00b" });
@@ -295,7 +331,11 @@ test "read rejects a binary or non-UTF-8 file" {
 
 test "read rejects an oversized file" {
     const gpa = std.testing.allocator;
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = std.testing.io } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = std.testing.io },
+    };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const data = try gpa.alloc(u8, fs.file_bytes_max + 1);
@@ -314,7 +354,11 @@ test "read rejects an oversized file" {
 
 test "read stops at the byte cap with a next-offset hint" {
     const gpa = std.testing.allocator;
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = std.testing.io } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = std.testing.io },
+    };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const data = try gpa.alloc(u8, 60 * 1024);
@@ -342,7 +386,11 @@ test "read stops at the byte cap with a next-offset hint" {
 
 test "read truncates to the line cap by default" {
     const gpa = std.testing.allocator;
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = std.testing.io } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = std.testing.io },
+    };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const data = try gpa.alloc(u8, (lines_max + 100) * 2);
@@ -374,7 +422,11 @@ test "read canceled while opening propagates" {
         \\{{"path":".zig-cache/tmp/{s}/f.txt"}}
     , .{tmp.sub_path});
     var cancel: testing.CancelIo = .init(.file_open);
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = cancel.io() } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = cancel.io() },
+    };
     try std.testing.expectError(error.Canceled, run(&context, input));
 }
 
@@ -384,6 +436,8 @@ test "a read whose file never opens fails at the time limit" {
     stall.init(gpa, .{ .open_file = "f.txt" });
     defer stall.deinit();
     const context: Context = .{
+        .sink = testing.discard_sink,
+
         .gpa = gpa,
         .host = .{ .io = stall.io() },
         .deadline = .start(stall.io(), fs.timeout_ms),
@@ -412,7 +466,11 @@ test "a read whose file never opens fails at the time limit" {
 
 test "read truncates a single line longer than the byte cap" {
     const gpa = std.testing.allocator;
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = std.testing.io } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = std.testing.io },
+    };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const line = try gpa.alloc(u8, bytes_max + 100);
@@ -438,7 +496,11 @@ test "read truncates a single line longer than the byte cap" {
 
 test "read clamps an explicit limit to the line cap" {
     const gpa = std.testing.allocator;
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = std.testing.io } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = std.testing.io },
+    };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const data = try gpa.alloc(u8, (lines_max + 100) * 2);

@@ -3,7 +3,9 @@ const std = @import("std");
 const accounts = @import("accounts");
 const core = @import("core");
 const providers = @import("providers");
+const tools = @import("tools");
 
+const billing = @import("billing.zig");
 const command_line = @import("command_line.zig");
 const escape = @import("escape.zig");
 const Harness = @import("Harness.zig");
@@ -47,6 +49,9 @@ const Found = union(enum) {
 const Listener = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
+    model: *const accounts.Model,
+    reporter: ?tools.CostPipe.Writer,
+    cost_error: ?tools.CostPipe.Error = null,
     mutex: std.Io.Mutex = .init,
     blocks: std.ArrayList(std.ArrayList(u8)) = .empty,
     final: std.ArrayList(u8) = .empty,
@@ -72,6 +77,7 @@ const Listener = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         switch (event.*) {
+            .usage => |usage| self.charge(&usage),
             .turn_ended => |*outcome| {
                 self.outcome = outcome.dupe(self.gpa);
                 self.ended.set(self.io);
@@ -80,6 +86,14 @@ const Listener = struct {
                 self.lost = true;
             },
         }
+    }
+
+    fn charge(self: *Listener, usage: *const core.Provider.Usage) void {
+        const reporter = self.reporter orelse return;
+        const amount = billing.cost(usage, self.model) orelse return;
+        reporter.send(amount) catch |err| {
+            self.cost_error = err;
+        };
     }
 
     fn apply(self: *Listener, event: *const core.Session.Event) error{OutOfMemory}!void {
@@ -119,21 +133,23 @@ const Listener = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         if (self.lost) return refuseFailure(self.gpa, options, &.{ .reason = .out_of_memory });
-        switch (self.outcome.?) {
-            .stopped => |reason| {
+        const succeeded = switch (self.outcome.?) {
+            .stopped => |reason| stopped: {
                 try self.writeFinal(options.stdout);
-                return switch (reason) {
+                break :stopped switch (reason) {
                     .complete => true,
-                    .truncated => refuse(options.stderr, turn_text.truncated),
+                    .truncated => try refuse(options.stderr, turn_text.truncated),
                 };
             },
-            .exhausted => {
+            .exhausted => exhausted: {
                 try self.writeFinal(options.stdout);
-                return refuse(options.stderr, turn_text.exhausted);
+                break :exhausted try refuse(options.stderr, turn_text.exhausted);
             },
-            .failed => |*failure| return refuseFailure(self.gpa, options, failure),
+            .failed => |*failure| try refuseFailure(self.gpa, options, failure),
             .canceled => unreachable,
-        }
+        };
+        if (self.cost_error) |err| return refuseCostReport(options.stderr, err);
+        return succeeded;
     }
 
     fn writeFinal(self: *const Listener, writer: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -157,8 +173,15 @@ pub fn run(
     if (std.mem.trim(u8, request.prompt, &std.ascii.whitespace).len == 0)
         return refuse(stderr, prompt_missing);
 
+    const reporter = if (options.environment.get(tools.CostPipe.environment)) |value|
+        tools.CostPipe.Writer.fromEnvironment(io, value) catch |err|
+            return refuseCostReport(stderr, err)
+    else
+        null;
+
     var environment = try options.environment.clone(gpa);
     defer environment.deinit();
+    _ = environment.swapRemove(tools.CostPipe.environment);
     try environment.put(tool_environment.nested, "1");
     const block = try environment.createPosixBlock(gpa, .{});
     defer block.deinit(gpa);
@@ -186,7 +209,12 @@ pub fn run(
     };
     defer client.deinit();
 
-    var listener: Listener = .{ .gpa = gpa, .io = io };
+    var listener: Listener = .{
+        .gpa = gpa,
+        .io = io,
+        .model = &target.model,
+        .reporter = reporter,
+    };
     defer listener.deinit();
     var session = harness.session(gpa, io, listener.sink());
     defer session.deinit();
@@ -262,6 +290,16 @@ fn refuse(writer: *std.Io.Writer, sentence: []const u8) std.Io.Writer.Error!bool
     return false;
 }
 
+fn refuseCostReport(
+    writer: *std.Io.Writer,
+    err: tools.CostPipe.Error,
+) std.Io.Writer.Error!bool {
+    try writer.print("Drinky could not report the run cost because of error {s}.\n", .{
+        @errorName(err),
+    });
+    return false;
+}
+
 fn refuseFailure(
     gpa: std.mem.Allocator,
     options: *const Options,
@@ -325,6 +363,126 @@ test "a run gives its tools its three variables and writes only the final reply 
     try std.testing.expectEqual(@as(usize, 2), requests.len);
     try testing.expectContains(requests[1], "marker:1:openai-api-key/gpt-5.6-sol:max");
 }
+
+test "a run reports its charge internally and keeps its answer output unchanged" {
+    var rig: Rig = undefined;
+    try rig.init(&.{ .replies = &.{.{ .body = charged_stream }} });
+    defer rig.deinit();
+    var pipe = try tools.CostPipe.init();
+    defer pipe.deinit(std.testing.io);
+    try rig.reportTo(&pipe);
+
+    try std.testing.expect(try rig.ask(.high, "openai-api-key/gpt-5.6-sol", "check"));
+    try std.testing.expectEqualStrings("done\n", rig.stdout.written());
+    try std.testing.expectEqualStrings("", rig.stderr.written());
+    try expectCosts(&pipe, &.{0.42});
+}
+
+test "a run reports a failed attempt before the next attempt ends" {
+    const io = std.testing.io;
+    var hold: providers.testing.FakeTransport.Hold = .{ .io = io };
+    var rig: Rig = undefined;
+    try rig.init(&.{ .replies = &.{
+        .{ .body = charged_empty_stream },
+        .{ .body = charged_stream, .hold = &hold },
+    } });
+    defer rig.deinit();
+    var pipe = try tools.CostPipe.init();
+    defer pipe.deinit(io);
+    try rig.reportTo(&pipe);
+    var future = try io.concurrent(Rig.ask, .{
+        &rig, .high, "openai-api-key/gpt-5.6-sol", "check",
+    });
+    var joined = false;
+    defer if (!joined) {
+        hold.released.set(io);
+        _ = future.await(io) catch {};
+    };
+    try hold.reached.wait(io);
+    try expectCosts(&pipe, &.{0.1});
+    try std.testing.expectEqualStrings("", rig.stdout.written());
+    hold.released.set(io);
+    const succeeded = future.await(io);
+    joined = true;
+    try std.testing.expect(try succeeded);
+    try expectCosts(&pipe, &.{0.42});
+    try std.testing.expectEqualStrings("done\n", rig.stdout.written());
+}
+
+test "a failed run keeps every reported attempt charge" {
+    var rig: Rig = undefined;
+    try rig.init(&.{ .replies = &.{
+        .{ .body = charged_empty_stream },
+        .{ .body = charged_empty_stream },
+    } });
+    defer rig.deinit();
+    var pipe = try tools.CostPipe.init();
+    defer pipe.deinit(std.testing.io);
+    try rig.reportTo(&pipe);
+    try std.testing.expect(!try rig.ask(.high, "openai-api-key/gpt-5.6-sol", "check"));
+    try expectCosts(&pipe, &.{ 0.1, 0.1 });
+    try std.testing.expectEqualStrings("", rig.stdout.written());
+    try std.testing.expect(rig.stderr.written().len > 0);
+}
+
+test "a run estimates each charge from its own model prices and skips unknown prices" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_]?accounts.Model.Price{
+        null,
+        .{ .input = 2, .output = 4, .cache_read = 0, .cache_write = 0 },
+        .{ .input = 8, .output = 6, .cache_read = 0, .cache_write = 0 },
+    }, [_]?f64{ null, 0.000028, 0.000092 }) |price, expected| {
+        var rig: Rig = undefined;
+        try rig.init(&.{ .replies = &.{.{ .body = providers.testing.reply_stream }} });
+        defer rig.deinit();
+        var catalog: accounts.testing.Rig = undefined;
+        try catalog.init(gpa, io, &.{ .home = rig.directory });
+        defer catalog.deinit();
+        var model = try accounts.Model.init("priced-child");
+        model.context_window = 1000;
+        model.price = price;
+        try catalog.registry.catalog.setAccount(accounts.testing.openai_api_key, &.{model});
+        var pipe = try tools.CostPipe.init();
+        defer pipe.deinit(io);
+        try rig.reportTo(&pipe);
+        try std.testing.expect(try rig.ask(.high, "openai-api-key/priced-child", "check"));
+        if (expected) |amount| {
+            try expectCosts(&pipe, &.{amount});
+        } else try expectCosts(&pipe, &.{});
+    }
+}
+
+test "an invalid cost channel refuses the run before it sends a request" {
+    var rig: Rig = undefined;
+    try rig.init(&.{});
+    defer rig.deinit();
+    try rig.environment.put(tools.CostPipe.environment, "2");
+    try std.testing.expect(!try rig.ask(.high, "openai-api-key/gpt-5.6-sol", "check"));
+    try testing.expectContains(rig.stderr.written(), "error InvalidCostReport.");
+    try std.testing.expectEqual(@as(usize, 0), rig.transport.requests.items.len);
+}
+
+fn expectCosts(pipe: *tools.CostPipe, expected: []const f64) !void {
+    var costs: tools.testing.Costs = .{};
+    defer costs.deinit();
+    var decoder: tools.CostPipe.Decoder = .{ .sink = costs.sink() };
+    try pipe.drain(std.testing.io, &decoder);
+    try decoder.finish();
+    try costs.expect(expected);
+}
+
+const charged_empty_stream = frame(
+    \\{"type":"response.completed","response":{"status":"completed","usage":{"cost":0.1}}}
+);
+
+const charged_stream = frame(
+    \\{"type":"response.output_item.done","item":{"id":"msg_1","type":"message",
+    \\"role":"assistant","content":[{"type":"output_text","text":"done"}]}}
+) ++ frame(
+    \\{"type":"response.completed","response":{"status":"completed","usage":{
+    \\"input_tokens":1000000,"output_tokens":1000000,"cost":0.42}}}
+);
 
 const Rig = struct {
     tmp: std.testing.TmpDir,
@@ -402,6 +560,12 @@ const Rig = struct {
 
     fn listModels(self: *Rig) !bool {
         return models(std.testing.allocator, std.testing.io, &self.setup());
+    }
+
+    fn reportTo(self: *Rig, pipe: *const tools.CostPipe) !void {
+        const value = try std.testing.allocator.print("{d}", .{pipe.writer.?.handle});
+        defer std.testing.allocator.free(value);
+        try self.environment.put(tools.CostPipe.environment, value);
     }
 };
 

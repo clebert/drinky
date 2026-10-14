@@ -120,6 +120,7 @@ pub const Event = union(enum) {
     committed,
     tail_discarded: usize,
     usage: Provider.Usage,
+    cost: f64,
     quota: Provider.Quota,
     credits: Provider.Credits,
     context: ?u64,
@@ -196,6 +197,7 @@ pub const Event = union(enum) {
             .committed,
             .tail_discarded,
             .usage,
+            .cost,
             .quota,
             .credits,
             .context,
@@ -233,6 +235,7 @@ pub const Event = union(enum) {
             .committed,
             .tail_discarded,
             .usage,
+            .cost,
             .quota,
             .credits,
             .context,
@@ -534,6 +537,62 @@ test "a turn streams the reply and keeps what the model completed" {
     );
 }
 
+test "tool charges reach the client before the result and survive cancellation" {
+    var harness: testing.Harness = undefined;
+    try harness.init(std.testing.allocator, std.testing.io, &.{});
+    defer harness.deinit();
+    harness.runner.charges = &.{ 0.25, 0.5 };
+    harness.runner.hook = .{
+        .session = &harness.session,
+        .command = .cancel,
+        .after_cancel = .fail,
+    };
+    harness.provider.load(&.{.{ .done = &.{
+        fixture.toolCall(fixture.write_call),
+        fixture.stop_complete,
+    } }});
+    const expected = "tool_call_started:write\ntool_started:w1\ncost:0.25\ncost:0.5\n" ++
+        "tool_result:w1:" ++ fixture.canceled_text ++ ":canceled\ncommitted\nturn_ended:canceled";
+    try std.testing.expectEqualStrings(expected, try harness.turn("hi"));
+}
+
+test "a turn reports only the last usage of each attempt before it runs tools" {
+    var harness: testing.Harness = undefined;
+    try harness.init(std.testing.allocator, std.testing.io, &.{
+        .retry = .{ .attempts_max = 2, .backoff = .{ .delay_ms_initial = 0 } },
+    });
+    defer harness.deinit();
+
+    harness.provider.load(&.{
+        .{ .done = &.{
+            .{ .usage = .{ .input = 1 } },
+            .{ .usage = .{ .input = 2 } },
+            .{ .failed = .{ .reason = .overloaded } },
+        } },
+        .{ .done = &.{
+            .{ .usage = .{ .input = 3 } },
+            fixture.toolCall(fixture.call),
+            .{ .usage = .{ .input = 4 } },
+            fixture.stop_complete,
+        } },
+        .{ .done = &.{ fixture.message("ok"), fixture.stop_complete } },
+    });
+    try std.testing.expectEqualStrings(
+        \\usage:2/0/0/0
+        \\attempt_failed:1:overloaded::0
+        \\tool_call_started:read
+        \\usage:4/0/0/0
+        \\context:4
+        \\tool_started:c1
+        \\tool_result:c1:done
+        \\committed
+        \\text_started
+        \\text:ok
+        \\committed
+        \\turn_ended:complete
+    , try harness.turn("hi"));
+}
+
 const fixture = struct {
     const proof: Conversation.Proof = .{ .account = "account-a", .payload = "p1" };
     const call: Tool.Call = .{ .id = "c1", .name = "read", .arguments = "{\"path\":\"a.txt\"}" };
@@ -639,8 +698,8 @@ test "a canceled turn keeps the partial answer on the screen and in the conversa
             .reasoning_started,
             .{ .reasoning = "Read the file" },
             .{ .output = .{ .reasoning = fixture.proof } },
-            .{ .text = "I read " },
             .{ .usage = .{ .input = 1200 } },
+            .{ .text = "I read " },
         } },
         .{ .done = &.{ fixture.message("ok"), fixture.stop_complete } },
     });
@@ -649,9 +708,9 @@ test "a canceled turn keeps the partial answer on the screen and in the conversa
     try harness.expect("reasoning:Read the file");
     try harness.expect("text_started");
     try harness.expect("text:I read ");
-    try harness.expect("usage:1200/0/0/0");
     try harness.session.send(&.cancel);
     try std.testing.expectEqualStrings(
+        \\usage:1200/0/0/0
         \\committed
         \\turn_ended:canceled
     , try harness.until("turn_ended"));

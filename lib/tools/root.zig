@@ -1,6 +1,7 @@
 const std = @import("std");
 
 pub const Context = @import("Context.zig");
+pub const CostPipe = @import("CostPipe.zig");
 pub const format = @import("format.zig");
 pub const fs = @import("fs.zig");
 pub const read = @import("read.zig");

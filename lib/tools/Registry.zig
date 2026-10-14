@@ -124,6 +124,7 @@ fn run(
     call: *const core.Tool.Call,
     items: []const core.Conversation.Item,
     variables: []const core.Runner.Variable,
+    sink: core.Runner.Sink,
 ) core.Runner.Error!core.Tool.Output {
     const self: *Registry = @ptrCast(@alignCast(ptr));
     const entry = entryNamed(call.name) orelse return output.failure(
@@ -140,6 +141,7 @@ fn run(
         .gpa = gpa,
         .host = self.host,
         .variables = variables,
+        .sink = sink,
         .deadline = deadline,
     };
     const guard = self.skill_guard orelse return runEntry(&context, entry, call);
@@ -310,6 +312,7 @@ test "an unknown tool and invalid arguments come back as failed outputs" {
         &.{ .id = "1", .name = "nope", .arguments = "{}" },
         &.{},
         &.{},
+        testing.discard_sink,
     );
     defer unknown.deinit(gpa);
     try testing.expectConditions(&unknown, &.{.unknown_tool});
@@ -320,6 +323,7 @@ test "an unknown tool and invalid arguments come back as failed outputs" {
         &.{ .id = "2", .name = "read", .arguments = "{}" },
         &.{},
         &.{},
+        testing.discard_sink,
     );
     defer invalid.deinit(gpa);
     try testing.expectConditions(&invalid, &.{.invalid_arguments});
@@ -335,7 +339,7 @@ test "the runner hands a call to its tool with the state of the host" {
         .id = "1",
         .name = "describe_drinky",
         .arguments = "{}",
-    }, &.{}, &.{});
+    }, &.{}, &.{}, testing.discard_sink);
     defer described.deinit(gpa);
     try std.testing.expectEqualStrings("# Drinky\n", described.content);
 
@@ -351,6 +355,7 @@ test "the runner hands a call to its tool with the state of the host" {
         &.{ .id = "2", .name = "read", .arguments = arguments },
         &.{},
         &.{},
+        testing.discard_sink,
     );
     defer shown.deinit(gpa);
     try std.testing.expectEqualStrings("one\ntwo\n", shown.content);
@@ -381,7 +386,7 @@ test "a command gets the variables of its call in place of the same names of the
         .arguments =
         \\{"command":"env | grep -E '^(SHARED|ADDED|KEPT)=' | sort"}
         ,
-    }, &.{}, &variables);
+    }, &.{}, &variables, testing.discard_sink);
     defer result.deinit(gpa);
     try std.testing.expect(!result.hasFailure());
     try std.testing.expectEqualStrings("ADDED=call\nKEPT=host\nSHARED=call\n", result.content);
@@ -411,7 +416,7 @@ test "a guarded change waits for its skill, which a round boundary delivers and 
         .{ .id = "2", .name = "edit", .arguments = edit_arguments },
     };
     for (&calls) |*call| {
-        const refused = try tools.run(gpa, call, &.{}, &.{});
+        const refused = try tools.run(gpa, call, &.{}, &.{}, testing.discard_sink);
         defer refused.deinit(gpa);
         try testing.expectConditions(&refused, &.{.skill_required});
     }
@@ -434,7 +439,7 @@ test "a guarded change waits for its skill, which a round boundary delivers and 
     };
     try std.testing.expect((try tools.takeSkill(gpa, &history)) == null);
     for (&calls) |*call| {
-        const changed = try tools.run(gpa, call, &history, &.{});
+        const changed = try tools.run(gpa, call, &history, &.{}, testing.discard_sink);
         defer changed.deinit(gpa);
         try std.testing.expect(!changed.hasFailure());
     }
@@ -445,11 +450,11 @@ test "a guarded change waits for its skill, which a round boundary delivers and 
     defer gpa.free(edited);
     try std.testing.expectEqualStrings("const x = 2;\n", edited);
 
-    const proven = try tools.run(gpa, &calls[0], &.{}, &.{});
+    const proven = try tools.run(gpa, &calls[0], &.{}, &.{}, testing.discard_sink);
     defer proven.deinit(gpa);
     try std.testing.expect(!proven.hasFailure());
     tools.reset();
-    const forgotten = try tools.run(gpa, &calls[0], &.{}, &.{});
+    const forgotten = try tools.run(gpa, &calls[0], &.{}, &.{}, testing.discard_sink);
     defer forgotten.deinit(gpa);
     try testing.expectConditions(&forgotten, &.{.skill_required});
 }
@@ -479,7 +484,7 @@ test "a guarded call holds one time limit across every skill file that it reads"
         .id = "1",
         .name = "write",
         .arguments = arguments,
-    }, &.{}, &.{});
+    }, &.{}, &.{}, testing.discard_sink);
     defer refused.deinit(gpa);
     try testing.expectConditions(&refused, &.{.skill_required});
     try std.testing.expect(std.mem.find(u8, refused.content, "error Timeout") != null);
@@ -505,7 +510,7 @@ test "a read of a guarded file queues its skill, and a failed read queues none" 
         .id = "1",
         .name = "read",
         .arguments = missing_arguments,
-    }, &.{}, &.{});
+    }, &.{}, &.{}, testing.discard_sink);
     defer missing.deinit(gpa);
     try testing.expectConditions(&missing, &.{.path_missing});
     try std.testing.expect((try tools.takeSkill(gpa, &.{})) == null);
@@ -517,6 +522,7 @@ test "a read of a guarded file queues its skill, and a failed read queues none" 
         &.{ .id = "2", .name = "read", .arguments = arguments },
         &.{},
         &.{},
+        testing.discard_sink,
     );
     defer shown.deinit(gpa);
     try std.testing.expectEqualStrings("const x = 1;\n", shown.content);

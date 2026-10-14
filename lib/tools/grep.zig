@@ -301,7 +301,11 @@ fn writeOversized(writer: *std.Io.Writer, files_oversized: usize) !void {
 
 test "grep finds a literal substring with a glob filter" {
     const gpa = std.testing.allocator;
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = std.testing.io } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = std.testing.io },
+    };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "a.zig", .data = "nope\nneedle here\n" });
@@ -330,7 +334,11 @@ fn expectMatches(result: *const core.Tool.Output, matches: u64) !void {
 
 test "grep searches a single file given as the path" {
     const gpa = std.testing.allocator;
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = std.testing.io } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = std.testing.io },
+    };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "a.zig", .data = "nope\nneedle here\n" });
@@ -352,7 +360,11 @@ test "grep searches a single file given as the path" {
 
 test "grep ignores the glob when the path is a single file" {
     const gpa = std.testing.allocator;
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = std.testing.io } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = std.testing.io },
+    };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "a.zig", .data = "needle here\n" });
@@ -383,6 +395,8 @@ test "grep treats an empty path as the working directory" {
     stall.init(gpa, .{ .open_directory = "." });
     defer stall.deinit();
     const context: Context = .{
+        .sink = testing.discard_sink,
+
         .gpa = gpa,
         .host = .{ .io = stall.io() },
         .deadline = .start(stall.io(), search.timeout_ms),
@@ -400,7 +414,11 @@ test "grep treats an empty path as the working directory" {
 
 test "grep rejects an empty pattern" {
     const gpa = std.testing.allocator;
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = std.testing.io } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = std.testing.io },
+    };
     const result = try run(&context,
         \\{"pattern":""}
     );
@@ -419,7 +437,11 @@ test "grep replaces invalid UTF-8 in matched lines" {
         \\{{"pattern":"caf","path":".zig-cache/tmp/{s}"}}
     , .{tmp.sub_path});
 
-    const context: Context = .{ .gpa = std.testing.allocator, .host = .{ .io = io } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = std.testing.allocator,
+        .host = .{ .io = io },
+    };
     const result = try run(&context, input);
     defer result.deinit(std.testing.allocator);
     try std.testing.expect(!result.hasFailure());
@@ -431,7 +453,11 @@ test "grep replaces invalid UTF-8 in matched lines" {
 
 test "grep is case-insensitive when asked" {
     const gpa = std.testing.allocator;
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = std.testing.io } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = std.testing.io },
+    };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "a.txt", .data = "Needle Here\n" });
@@ -447,7 +473,11 @@ test "grep is case-insensitive when asked" {
 
 test "grep stops at the result limit and reports it" {
     const gpa = std.testing.allocator;
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = std.testing.io } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = std.testing.io },
+    };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{
@@ -475,7 +505,11 @@ test "grep stops at the result limit and reports it" {
 
 test "grep skips binary and oversized files" {
     const gpa = std.testing.allocator;
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = std.testing.io } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = std.testing.io },
+    };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "bin.dat", .data = "hit\x00\n" });
@@ -505,7 +539,11 @@ test "grep skips binary and oversized files" {
 
 test "grep finds no match in an oversized file and names the file it did not search" {
     const gpa = std.testing.allocator;
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = std.testing.io } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = std.testing.io },
+    };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const big = try gpa.alloc(u8, file_bytes_max + 1);
@@ -533,7 +571,11 @@ test "grep finds no match in an oversized file and names the file it did not sea
 test "grep marks a search incomplete when it cannot read a file" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = io } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = io },
+    };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "hit\n" });
@@ -576,6 +618,8 @@ test "grep stops at the byte cap and states it" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const context: Context = .{
+        .sink = testing.discard_sink,
+
         .gpa = gpa,
         .host = .{ .io = io, .search = .{ .bytes_read_max = 1 << 20 } },
     };
@@ -624,6 +668,8 @@ test "grep states a file tree that is too large to scan" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const context: Context = .{
+        .sink = testing.discard_sink,
+
         .gpa = gpa,
         .host = .{ .io = io, .search = .{ .entries_max = 2 } },
     };
@@ -648,7 +694,11 @@ test "grep states a file tree that is too large to scan" {
 
 test "grep caps the reported line length" {
     const gpa = std.testing.allocator;
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = std.testing.io } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = std.testing.io },
+    };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const line = "hit" ++ core.text.repeat("a", 397);
@@ -673,7 +723,11 @@ test "grep caps the reported line length" {
 
 test "grep refuses a zero limit" {
     const gpa = std.testing.allocator;
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = std.testing.io } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = std.testing.io },
+    };
     const result = try run(&context,
         \\{"pattern":"hit","limit":0}
     );
@@ -685,7 +739,11 @@ test "grep refuses a zero limit" {
 
 test "grep reports no matches of a complete search" {
     const gpa = std.testing.allocator;
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = std.testing.io } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = std.testing.io },
+    };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "f.txt", .data = "hit\n" });
@@ -704,7 +762,11 @@ test "grep reports no matches of a complete search" {
 test "grep reports skipped noise after an empty search" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = io } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = io },
+    };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var dependency = try tmp.dir.createDirPathOpen(io, "node_modules/pkg", .{});
@@ -734,6 +796,8 @@ test "grep reports a search that ran out of time" {
     stall.init(gpa, .{ .open_file = "b.txt" });
     defer stall.deinit();
     const context: Context = .{
+        .sink = testing.discard_sink,
+
         .gpa = gpa,
         .host = .{ .io = stall.io() },
         .deadline = .start(stall.io(), search.timeout_ms),
@@ -765,6 +829,8 @@ test "grep keeps the matches it found before the time limit" {
     stall.init(gpa, .{ .open_file = "b.txt" });
     defer stall.deinit();
     const context: Context = .{
+        .sink = testing.discard_sink,
+
         .gpa = gpa,
         .host = .{ .io = stall.io() },
         .deadline = .start(stall.io(), search.timeout_ms),
@@ -801,6 +867,8 @@ test "grep fails at the time limit when its single file never opens" {
     stall.init(gpa, .{ .open_file = "a.txt" });
     defer stall.deinit();
     const context: Context = .{
+        .sink = testing.discard_sink,
+
         .gpa = gpa,
         .host = .{ .io = stall.io() },
         .deadline = .start(stall.io(), search.timeout_ms),
@@ -831,6 +899,8 @@ test "grep stops at the time limit when a directory never opens" {
     stall.init(gpa, .{ .open_directory = "stuck" });
     defer stall.deinit();
     const context: Context = .{
+        .sink = testing.discard_sink,
+
         .gpa = gpa,
         .host = .{ .io = stall.io() },
         .deadline = .start(stall.io(), search.timeout_ms),
@@ -862,6 +932,10 @@ test "grep canceled while reading a file propagates" {
         \\{{"pattern":"hit","path":".zig-cache/tmp/{s}"}}
     , .{tmp.sub_path});
     var cancel: testing.CancelIo = .init(.file_open);
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = cancel.io() } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = cancel.io() },
+    };
     try std.testing.expectError(error.Canceled, run(&context, input));
 }

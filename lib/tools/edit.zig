@@ -131,7 +131,11 @@ test applyEdit {
 test "edit rewrites the file on disk" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = io } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = io },
+    };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "f.txt", .data = "one two three" });
@@ -151,7 +155,11 @@ test "edit rewrites the file on disk" {
 test "an edit through a link changes the target, and an edited file keeps its mode" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = io } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = io },
+    };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "AGENTS.md", .data = "one two three" });
@@ -186,7 +194,11 @@ test "an edit through a link changes the target, and an edited file keeps its mo
 test "edit measures the lines it took out and put in" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = io } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = io },
+    };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "f.txt", .data = "one\ntwo\nthree\nfour\n" });
@@ -213,7 +225,11 @@ test "edit measures the lines it took out and put in" {
 test "a missing or ambiguous old_text names its condition" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = io } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = io },
+    };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "f.txt", .data = "one two two" });
@@ -247,7 +263,11 @@ test "edit canceled while reading propagates" {
         \\{{"path":".zig-cache/tmp/{s}/f.txt","old_text":"two","new_text":"2"}}
     , .{tmp.sub_path});
     var cancel: testing.CancelIo = .init(.file_open);
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = cancel.io() } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = cancel.io() },
+    };
     try std.testing.expectError(error.Canceled, run(&context, input));
 }
 
@@ -262,7 +282,11 @@ test "edit canceled mid-write propagates and leaves the file untouched" {
         \\{{"path":".zig-cache/tmp/{s}/f.txt","old_text":"two","new_text":"2"}}
     , .{tmp.sub_path});
     var cancel: testing.CancelIo = .init(.file_write);
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = cancel.io() } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = cancel.io() },
+    };
     try std.testing.expectError(error.Canceled, run(&context, input));
     const data = try tmp.dir.readFileAlloc(io, "f.txt", gpa, .limited(64));
     defer gpa.free(data);
@@ -271,7 +295,11 @@ test "edit canceled mid-write propagates and leaves the file untouched" {
 
 test "edit rejects an oversized file" {
     const gpa = std.testing.allocator;
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = std.testing.io } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = std.testing.io },
+    };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const data = try gpa.alloc(u8, fs.file_bytes_max + 1);

@@ -5,6 +5,7 @@ const core = @import("core");
 const terminal = @import("terminal");
 const tools = @import("tools");
 
+const billing = @import("billing.zig");
 const Choice = @import("Choice.zig");
 const command = @import("command/root.zig");
 const format = @import("format.zig");
@@ -58,12 +59,10 @@ const Statistics = struct {
     quota: ?core.Provider.Quota = null,
     quota_seen_ms: i64 = 0,
     credits: ?core.Provider.Credits = null,
-    attempt_usage: ?core.Provider.Usage = null,
 
     fn forgetTurnEvidence(self: *Statistics) void {
         self.cache_usage = .{};
         self.quota_seen_ms = 0;
-        self.attempt_usage = null;
         self.forgetBilling();
     }
 
@@ -72,12 +71,18 @@ const Statistics = struct {
         self.credits = null;
     }
 
-    fn charge(self: *Statistics, maybe_model: ?*const accounts.Model) void {
-        const usage = self.attempt_usage orelse return;
-        self.attempt_usage = null;
-        const model = maybe_model orelse return;
-        const cost = usage.cost_usd orelse model.cost(&usage) orelse return;
-        self.cost = @min(self.cost + cost, core.Provider.amount_usd_max);
+    fn charge(
+        self: *Statistics,
+        usage: *const core.Provider.Usage,
+        maybe_model: ?*const accounts.Model,
+    ) void {
+        const amount = billing.cost(usage, maybe_model) orelse return;
+        self.addCost(amount);
+    }
+
+    fn addCost(self: *Statistics, amount: f64) void {
+        std.debug.assert(std.math.isFinite(amount) and amount >= 0);
+        self.cost = @min(self.cost + amount, core.Provider.amount_usd_max);
     }
 };
 
@@ -551,7 +556,6 @@ pub fn apply(
         },
         .committed => {
             self.finishThinking();
-            self.statistics.charge(self.chosenModel());
             self.transcript.endMessage();
             turn.committed = self.transcript.blocks().len;
             turn.releaseBlocks(self.gpa, 0);
@@ -559,8 +563,9 @@ pub fn apply(
         .tail_discarded => |count| try self.discardTail(turn, count),
         .usage => |usage| {
             self.statistics.cache_usage = usage;
-            self.statistics.attempt_usage = usage;
+            self.statistics.charge(&usage, self.chosenModel());
         },
+        .cost => |amount| self.statistics.addCost(amount),
         .quota => |quota| {
             self.statistics.quota = quota;
             self.statistics.quota_seen_ms = time.boot_ms;
@@ -571,7 +576,6 @@ pub fn apply(
         .attempt_failed => |*attempt| {
             self.finishThinking();
             try self.restoreThinking(turn);
-            self.statistics.charge(self.chosenModel());
             self.transcript.endMessage();
             const uncommitted = self.transcript.blocks()[turn.committed..];
             const status: ui.Block.Work.Status = for (uncommitted) |*block| {
@@ -599,7 +603,6 @@ pub fn apply(
             };
             self.finishThinking();
             if (status != .complete) try self.restoreThinking(turn);
-            self.statistics.charge(self.chosenModel());
             self.transcript.endMessage();
             try self.recordOutcome(&outcome);
             self.transcript.closeWork(&.{ .time_ms = time.awake_ms, .status = status });
@@ -619,9 +622,9 @@ fn applyIdle(
     switch (event.*) {
         .context => |tokens| self.statistics.context_tokens = tokens,
         .usage => |usage| {
-            self.statistics.attempt_usage = usage;
-            self.statistics.charge(self.chosenModel());
+            self.statistics.charge(&usage, self.chosenModel());
         },
+        .cost => |amount| self.statistics.addCost(amount),
         .quota => |quota| {
             self.statistics.quota = quota;
             self.statistics.quota_seen_ms = time.boot_ms;
@@ -1216,7 +1219,7 @@ test "a turn streams reasoning and text into blocks, commits them, and ends at t
     try rig.expectKinds(&.{ .user, .thinking, .model });
     try std.testing.expectEqualStrings("weigh it", rig.blocks()[1].content.thinking.items);
     try std.testing.expectEqualStrings("hello", rig.blocks()[2].content.model.items);
-    try std.testing.expectEqual(@as(f64, 0), rig.screen.statusInfo(0).cost);
+    try std.testing.expectApproxEqAbs(@as(f64, 18), rig.screen.statusInfo(0).cost, 1e-9);
 
     try rig.apply(&.committed);
     try std.testing.expectApproxEqAbs(@as(f64, 18), rig.screen.statusInfo(0).cost, 1e-9);
@@ -3020,6 +3023,53 @@ test "the cost takes a reported charge over the estimate, skips an unpriced mode
     try rig.apply(&.{ .usage = .{ .input = 1, .cost_usd = 5 } });
     try rig.end(&.canceled);
     try std.testing.expectEqual(core.Provider.amount_usd_max, rig.screen.statusInfo(0).cost);
+}
+
+test "a child charge changes only the session cost and adds no transcript block" {
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    try rig.start("hi");
+    try rig.apply(&.{ .context = 123 });
+    try rig.apply(&.{ .usage = .{ .input = 10, .cache_read = 90 } });
+    try rig.apply(&.text_started);
+    try rig.apply(&.{ .text = "answer" });
+    const before = rig.screen.statusInfo(0);
+    const count = rig.blocks().len;
+
+    try rig.apply(&.{ .cost = 2.5 });
+    const after = rig.screen.statusInfo(0);
+    try std.testing.expectApproxEqAbs(before.cost + 2.5, after.cost, 1e-9);
+    try std.testing.expectEqual(before.context_tokens, after.context_tokens);
+    try std.testing.expectEqualDeep(before.cache_usage, after.cache_usage);
+    try std.testing.expectEqualStrings(before.model.?, after.model.?);
+    try std.testing.expectEqual(count, rig.blocks().len);
+    try rig.apply(&.committed);
+    try rig.end(&.canceled);
+    try std.testing.expectApproxEqAbs(after.cost, rig.screen.statusInfo(0).cost, 1e-9);
+    try rig.apply(&.{ .cost = core.Provider.amount_usd_max });
+    try std.testing.expectEqual(core.Provider.amount_usd_max, rig.screen.statusInfo(0).cost);
+}
+
+test "a reported charge does not require model prices or a selected model" {
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    rig.screen.showChoice(&.{ .effort = .high });
+    try rig.apply(&.{ .usage = .{ .cost_usd = 0.42 } });
+    try std.testing.expectApproxEqAbs(@as(f64, 0.42), rig.screen.statusInfo(0).cost, 1e-9);
+}
+
+test "a finished attempt adds its cost before tools and charges it only once" {
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    try rig.start("hi");
+    try rig.apply(&.{ .usage = .{ .input = 1_000_000 } });
+    try std.testing.expectApproxEqAbs(@as(f64, 3), rig.screen.statusInfo(0).cost, 1e-9);
+    try rig.apply(&.committed);
+    try rig.end(&.canceled);
+    try std.testing.expectApproxEqAbs(@as(f64, 3), rig.screen.statusInfo(0).cost, 1e-9);
 }
 
 test "a usage between turns adds its cost at once and keeps the cache figure of the last turn" {

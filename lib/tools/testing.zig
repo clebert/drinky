@@ -4,6 +4,59 @@ const core = @import("core");
 
 const SkillGuard = @import("SkillGuard.zig");
 
+pub const discard_sink: core.Runner.Sink = .{
+    .ptr = @constCast(&discard_vtable),
+    .vtable = &discard_vtable,
+};
+
+const discard_vtable: core.Runner.Sink.VTable = .{ .emit = discardEvent };
+
+fn discardEvent(_: *anyopaque, _: *const core.Runner.Event) void {}
+
+pub const Costs = struct {
+    io: std.Io = std.testing.io,
+    mutex: std.Io.Mutex = .init,
+    events: [64]core.Runner.Event = undefined,
+    count: usize = 0,
+    overflowed: bool = false,
+    arrived: std.Io.Event = .unset,
+
+    const vtable: core.Runner.Sink.VTable = .{ .emit = emit };
+
+    pub fn sink(self: *Costs) core.Runner.Sink {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    pub fn deinit(self: *Costs) void {
+        for (self.events[0..self.count]) |*event| event.deinit();
+    }
+
+    pub fn wait(self: *Costs) !void {
+        try self.arrived.wait(self.io);
+    }
+
+    pub fn expect(self: *Costs, expected: []const f64) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        try std.testing.expect(!self.overflowed);
+        try std.testing.expectEqual(expected.len, self.count);
+        for (expected, self.events[0..self.count]) |amount, event| {
+            try std.testing.expectApproxEqAbs(amount, event.cost, 1e-9);
+        }
+    }
+
+    fn emit(ptr: *anyopaque, event: *const core.Runner.Event) void {
+        const self: *Costs = @ptrCast(@alignCast(ptr));
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.count < self.events.len) {
+            self.events[self.count] = event.dupe();
+            self.count += 1;
+        } else self.overflowed = true;
+        self.arrived.set(self.io);
+    }
+};
+
 const Measured = struct { core.Tool.Measure, u64 };
 
 pub const CancelIo = struct {

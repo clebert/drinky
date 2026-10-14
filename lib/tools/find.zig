@@ -159,7 +159,11 @@ pub fn run(context: *const Context, input_json: []const u8) Context.Error!core.T
 
 test "find matches files by glob under a directory" {
     const gpa = std.testing.allocator;
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = std.testing.io } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = std.testing.io },
+    };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "a.zig", .data = "" });
@@ -181,7 +185,11 @@ test "find matches files by glob under a directory" {
 
 test "find keeps one slash after a search directory with a trailing slash" {
     const gpa = std.testing.allocator;
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = std.testing.io } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = std.testing.io },
+    };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "a.zig", .data = "" });
@@ -200,7 +208,11 @@ test "find keeps one slash after a search directory with a trailing slash" {
 test "find lists a link to a file and follows no link to a directory" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = io } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = io },
+    };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "AGENTS.md", .data = "" });
@@ -231,7 +243,11 @@ test "find lists a link to a file and follows no link to a directory" {
 
 test "find reports how many more matched beyond the limit" {
     const gpa = std.testing.allocator;
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = std.testing.io } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = std.testing.io },
+    };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     for ([_][]const u8{ "a.txt", "b.txt", "c.txt" }) |name| {
@@ -269,6 +285,8 @@ test "find reports a search that reached the entry cap" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     const context: Context = .{
+        .sink = testing.discard_sink,
+
         .gpa = gpa,
         .host = .{ .io = io, .search = .{ .entries_max = 2 } },
     };
@@ -310,7 +328,11 @@ test "find reports a search that reached the entry cap" {
 test "find marks a search incomplete when it cannot read a directory" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = io } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = io },
+    };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "a.md", .data = "" });
@@ -359,6 +381,8 @@ test "find treats an empty path as the working directory" {
     stall.init(gpa, .{ .open_directory = "." });
     defer stall.deinit();
     const context: Context = .{
+        .sink = testing.discard_sink,
+
         .gpa = gpa,
         .host = .{ .io = stall.io() },
         .deadline = .start(stall.io(), search.timeout_ms),
@@ -376,7 +400,11 @@ test "find treats an empty path as the working directory" {
 
 test "find refuses a zero limit" {
     const gpa = std.testing.allocator;
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = std.testing.io } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = std.testing.io },
+    };
     const result = try run(&context,
         \\{"pattern":"**/*.zig","limit":0}
     );
@@ -388,7 +416,11 @@ test "find refuses a zero limit" {
 
 test "find reports when no files match" {
     const gpa = std.testing.allocator;
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = std.testing.io } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = std.testing.io },
+    };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "a.txt", .data = "" });
@@ -405,7 +437,11 @@ test "find reports when no files match" {
 
 test "find reports a missing base directory as a failure" {
     const gpa = std.testing.allocator;
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = std.testing.io } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = std.testing.io },
+    };
     const result = try run(&context,
         \\{"pattern":"**/*.zig","path":"/definitely/not/here"}
     );
@@ -421,6 +457,8 @@ test "find reports a search that ran out of time" {
     stall.init(gpa, .directory_end);
     defer stall.deinit();
     const context: Context = .{
+        .sink = testing.discard_sink,
+
         .gpa = gpa,
         .host = .{ .io = stall.io() },
         .deadline = .start(stall.io(), search.timeout_ms),
@@ -452,6 +490,8 @@ test "find keeps the matches it found before the time limit" {
     stall.init(gpa, .directory_end);
     defer stall.deinit();
     const context: Context = .{
+        .sink = testing.discard_sink,
+
         .gpa = gpa,
         .host = .{ .io = stall.io() },
         .deadline = .start(stall.io(), search.timeout_ms),
@@ -489,6 +529,8 @@ test "find measures the matches that it omitted when the time limit stops the se
     stall.init(gpa, .directory_end);
     defer stall.deinit();
     const context: Context = .{
+        .sink = testing.discard_sink,
+
         .gpa = gpa,
         .host = .{ .io = stall.io() },
         .deadline = .start(stall.io(), search.timeout_ms),
@@ -518,6 +560,8 @@ test "find fails at the time limit when its base directory never opens" {
     stall.init(gpa, .{ .open_directory = &tmp.sub_path });
     defer stall.deinit();
     const context: Context = .{
+        .sink = testing.discard_sink,
+
         .gpa = gpa,
         .host = .{ .io = stall.io() },
         .deadline = .start(stall.io(), search.timeout_ms),
@@ -545,6 +589,8 @@ test "find stops at the time limit when a directory never opens" {
     stall.init(gpa, .{ .open_directory = "stuck" });
     defer stall.deinit();
     const context: Context = .{
+        .sink = testing.discard_sink,
+
         .gpa = gpa,
         .host = .{ .io = stall.io() },
         .deadline = .start(stall.io(), search.timeout_ms),
@@ -569,7 +615,11 @@ test "find stops at the time limit when a directory never opens" {
 test "find reports skipped noise after an empty search" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = io } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = io },
+    };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var dependency = try tmp.dir.createDirPathOpen(io, "node_modules/pkg", .{});

@@ -4,6 +4,7 @@ const builtin = @import("builtin");
 const core = @import("core");
 
 const Context = @import("Context.zig");
+const CostPipe = @import("CostPipe.zig");
 const format = @import("format.zig");
 const output = @import("output.zig");
 const parse = @import("parse.zig");
@@ -69,6 +70,7 @@ const ChildSetup = struct {
     in_handle: std.posix.fd_t,
     out_handle: std.posix.fd_t,
     error_handle: std.posix.fd_t,
+    cost_handle: std.posix.fd_t,
     argv: [*:null]const ?[*:0]const u8,
     environ: [*:null]const ?[*:0]const u8,
     path: []const u8,
@@ -132,11 +134,15 @@ fn runWithTimeout(
     return render(gpa, text, limits, stop, elapsed_ms);
 }
 
+const CollectError = std.process.SpawnError || std.process.Child.WaitError ||
+    std.Io.Threaded.PipeError || std.Io.File.ReadStreamingError || std.Io.ConcurrentError ||
+    CostPipe.Error || error{ StreamTooLong, ReadFailed };
+
 fn collect(
     context: *const Context,
     command: []const u8,
     captured: *std.Io.Writer.Allocating,
-) !std.process.Child.Term {
+) CollectError!std.process.Child.Term {
     const io = context.host.io;
     const handles = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true });
     const output_files = [2]std.Io.File{
@@ -145,23 +151,50 @@ fn collect(
     };
     var pipe_owned = true;
     defer if (pipe_owned) std.Io.File.closeMany(io, &output_files);
+    var costs = try CostPipe.init();
+    defer costs.deinit(io);
 
-    var child = try spawnCommand(context, command, output_files[1]);
+    var child = try spawnCommand(context, command, .{
+        .output = output_files[1],
+        .cost = costs.writer.?,
+    });
     const process_group = child.id.?;
-    errdefer stopAndReap(&child, io, process_group);
-
     output_files[1].close(io);
     defer output_files[0].close(io);
     pipe_owned = false;
+    costs.closeWriter(io);
+
+    var decoder: CostPipe.Decoder = .{ .sink = context.sink };
+    var reports: ?std.Io.Future((std.Io.File.ReadStreamingError || CostPipe.Error)!void) = null;
+    var phase: enum { running, reaped, complete } = .running;
+    defer {
+        if (phase == .running) stopAndReap(&child, io, process_group);
+        if (reports) |*future| _ = future.cancel(io) catch {};
+        if (phase != .complete) costs.drain(io, &decoder) catch {};
+    }
+    reports = try io.concurrent(CostPipe.collect, .{ &costs, io, &decoder });
 
     var read_buffer: [read_buffer_bytes]u8 = undefined;
     var reader = std.Io.File.Reader.initStreaming(output_files[0], io, &read_buffer);
     while (captured.written().len <= capture_bytes_max) {
         const chunk = reader.interface.peekGreedy(1) catch |err| switch (err) {
-            error.EndOfStream => return child.wait(io),
+            error.EndOfStream => {
+                const term = try child.wait(io);
+                phase = .reaped;
+                const reported = reports.?.cancel(io);
+                reports = null;
+                reported catch |known| switch (known) {
+                    error.Canceled => {},
+                    else => return known,
+                };
+                try costs.drain(io, &decoder);
+                try decoder.finish();
+                phase = .complete;
+                return term;
+            },
             error.ReadFailed => return reader.err orelse error.ReadFailed,
         };
-        try captured.writer.writeAll(chunk);
+        captured.writer.writeAll(chunk) catch return error.OutOfMemory;
         reader.interface.toss(chunk.len);
     }
     return error.StreamTooLong;
@@ -170,8 +203,8 @@ fn collect(
 fn spawnCommand(
     context: *const Context,
     command: []const u8,
-    output_file: std.Io.File,
-) !std.process.Child {
+    files: struct { output: std.Io.File, cost: std.Io.File },
+) (std.process.SpawnError || std.Io.File.ReadStreamingError)!std.process.Child {
     const io = context.host.io;
     var dev_null = try std.Io.Dir.openFileAbsolute(io, "/dev/null", .{ .mode = .read_write });
     defer dev_null.close(io);
@@ -179,7 +212,7 @@ fn spawnCommand(
     defer arena.deinit();
     const command_z = try arena.allocator().dupeSentinel(u8, command, 0);
     const argv = [_:null]?[*:0]const u8{ "bash", "-c", command_z.ptr };
-    const environ = try commandEnviron(arena.allocator(), context);
+    const environ = try commandEnviron(arena.allocator(), context, files.cost.handle);
     const path = context.host.environ.getPosix("PATH") orelse std.Io.Threaded.default_PATH;
 
     const error_handles = try std.Io.Threaded.pipe2(.{ .CLOEXEC = true });
@@ -192,8 +225,9 @@ fn spawnCommand(
 
     const setup: ChildSetup = .{
         .in_handle = dev_null.handle,
-        .out_handle = output_file.handle,
+        .out_handle = files.output.handle,
         .error_handle = error_files[1].handle,
+        .cost_handle = files.cost.handle,
         .argv = &argv,
         .environ = environ.ptr,
         .path = path,
@@ -234,12 +268,16 @@ fn spawnCommand(
 fn commandEnviron(
     arena: std.mem.Allocator,
     context: *const Context,
+    cost_handle: std.posix.fd_t,
 ) error{OutOfMemory}![:null]const ?[*:0]const u8 {
     const inherited = context.host.environ.block.slice;
     const variables = context.variables;
     var entries: std.ArrayList(?[*:0]const u8) =
-        try .initCapacity(arena, variables.len + inherited.len + 1);
+        try .initCapacity(arena, variables.len + inherited.len + 2);
+    const report = try arena.printSentinel("{s}={d}", .{ CostPipe.environment, cost_handle }, 0);
+    entries.appendAssumeCapacity(report.ptr);
     for (variables) |variable| {
+        if (std.mem.eql(u8, variable.name, CostPipe.environment)) continue;
         const entry = try arena.printSentinel("{s}={s}", .{
             variable.name,
             variable.value,
@@ -249,6 +287,7 @@ fn commandEnviron(
     for (inherited) |maybe_entry| {
         const entry = maybe_entry.?;
         const name = std.mem.sliceTo(entry, '=');
+        if (std.mem.eql(u8, name, CostPipe.environment)) continue;
         const replaced = for (variables) |variable| {
             if (std.mem.eql(u8, variable.name, name)) break true;
         } else false;
@@ -265,6 +304,7 @@ fn runCommandChild(setup: *const ChildSetup) noreturn {
     };
     for (duplications) |handles| duplicateCommandHandle(handles) catch |err|
         failCommandChild(setup.error_handle, err);
+    CostPipe.inherit(setup.cost_handle) catch |err| failCommandChild(setup.error_handle, err);
     createCommandSession() catch |err| failCommandChild(setup.error_handle, err);
     failCommandChild(setup.error_handle, execCommand(setup));
 }
@@ -583,7 +623,11 @@ fn tailStart(text: []const u8, limits: *const Context.Bash) usize {
 
 test "bash runs a command and returns its output" {
     const gpa = std.testing.allocator;
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = std.testing.io } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = std.testing.io },
+    };
     const result = try run(&context,
         \\{"command":"echo hello"}
     );
@@ -592,9 +636,162 @@ test "bash runs a command and returns its output" {
     try std.testing.expectEqualStrings("hello\n", result.content);
 }
 
+const charge_command =
+    \\printf 'drinky\000\001\000\000\000\000\000\000\004\100' >&"$DRINKY_COST_FD"
+;
+
+test "bash reports parallel child charges apart from failed or truncated output" {
+    const gpa = std.testing.allocator;
+    const inherited = [_:null]?[*:0]const u8{"DRINKY_COST_FD=1"};
+    for ([_]bool{ false, true }) |truncate| {
+        var costs: testing.Costs = .{};
+        defer costs.deinit();
+        const context: Context = .{
+            .gpa = gpa,
+            .host = .{
+                .io = std.testing.io,
+                .environ = .{ .block = .{ .slice = &inherited } },
+                .bash = .{ .bytes_max = if (truncate) 1 else 1024 },
+            },
+            .variables = &.{.{ .name = CostPipe.environment, .value = "2" }},
+            .sink = costs.sink(),
+        };
+        const input = try std.json.Stringify.valueAlloc(gpa, .{
+            .command = "(" ++ charge_command ++ ") & (" ++ charge_command ++
+                ") & wait; printf hello; exit 7",
+        }, .{});
+        defer gpa.free(input);
+        const result = try run(&context, input);
+        defer result.deinit(gpa);
+        try costs.expect(&.{ 2.5, 2.5 });
+        try std.testing.expectEqual(@as(?u64, 7), result.measures.get(.exit_code));
+        try std.testing.expect(result.hasFailure());
+        if (!truncate) try std.testing.expectEqualStrings(
+            "hello\n\n[The command exited with code 7.]",
+            result.content,
+        );
+        try std.testing.expectEqual(truncate, result.conditions.contains(.output_truncated));
+    }
+}
+
+test "a malformed cost report fails the tool after the shell ends without another reap" {
+    const gpa = std.testing.allocator;
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = std.testing.io },
+    };
+    const result = try run(&context,
+        \\{"command":"printf 'malformed record' >&$DRINKY_COST_FD; echo done"}
+    );
+    defer result.deinit(gpa);
+    try std.testing.expect(result.hasFailure());
+    try std.testing.expect(std.mem.find(u8, result.content, "InvalidCostReport") != null);
+}
+
+test "bash retains received child charges when cancellation stops the command" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var costs: testing.Costs = .{};
+    defer costs.deinit();
+    const context: Context = .{ .gpa = gpa, .host = .{ .io = io }, .sink = costs.sink() };
+    const input = try std.json.Stringify.valueAlloc(gpa, .{
+        .command = charge_command ++ "; kill -STOP $$",
+    }, .{});
+    defer gpa.free(input);
+    var future = try io.concurrent(run, .{ &context, input });
+    var joined = false;
+    defer if (!joined) {
+        const result = future.cancel(io) catch null;
+        if (result) |output_value| output_value.deinit(gpa);
+    };
+    try costs.wait();
+    const result = future.cancel(io);
+    joined = true;
+    try std.testing.expectError(error.Canceled, result);
+    try costs.expect(&.{2.5});
+}
+
+test "bash drains queued child charges when its time limit stops the command" {
+    const gpa = std.testing.allocator;
+    var clock: OutputClock = undefined;
+    clock.init(gpa, &.{ .marker = "armed\n" });
+    defer clock.deinit();
+    var costs: testing.Costs = .{ .io = clock.io() };
+    defer costs.deinit();
+    const context: Context = .{
+        .gpa = gpa,
+        .host = .{ .io = clock.io(), .bash = .{ .timeout_ms = 1000 } },
+        .sink = costs.sink(),
+    };
+    const input = try std.json.Stringify.valueAlloc(gpa, .{
+        .command = charge_command ++ "; echo armed; kill -STOP $$",
+    }, .{});
+    defer gpa.free(input);
+    const result = try run(&context, input);
+    defer result.deinit(gpa);
+    try testing.expectConditions(&result, &.{.timed_out});
+    try costs.expect(&.{2.5});
+    try std.testing.expectEqualSlices(u64, &.{1000}, clock.slept());
+}
+
+test "a completed command does not wait for a background process to close the cost pipe" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    defer {
+        const process_id = readProcessId(gpa, io, &tmp) catch 0;
+        if (process_id > 0) std.posix.kill(process_id, .KILL) catch {};
+    }
+    var clock: OutputClock = undefined;
+    clock.init(gpa, &.{ .marker = "The command sends no such marker." });
+    defer clock.deinit();
+    const command = try gpa.print(
+        "/bin/sh -c 'kill -STOP $$' drinky-cost-background >/dev/null 2>&1 & " ++
+            "echo $! > .zig-cache/tmp/{s}/pid; echo done",
+        .{tmp.sub_path},
+    );
+    defer gpa.free(command);
+    const input = try std.json.Stringify.valueAlloc(gpa, .{ .command = command }, .{});
+    defer gpa.free(input);
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = clock.io() },
+    };
+    const result = try run(&context, input);
+    defer result.deinit(gpa);
+    try std.testing.expect(!result.hasFailure());
+    try std.testing.expectEqualStrings("done\n", result.content);
+    const process_id = try readProcessId(gpa, io, &tmp);
+    try std.posix.kill(process_id, @fromBackingInt(0));
+}
+
+test "bash reports unavailable concurrency when its cost reader cannot start" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{ .concurrent_limit = .limited(2) });
+    defer threaded.deinit();
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = threaded.io() },
+    };
+    const result = try run(&context,
+        \\{"command":"kill -STOP $$"}
+    );
+    defer result.deinit(gpa);
+    try std.testing.expect(result.hasFailure());
+    try std.testing.expect(std.mem.find(u8, result.content, "ConcurrencyUnavailable") != null);
+}
+
 test "bash preserves stdout and stderr order" {
     const gpa = std.testing.allocator;
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = std.testing.io } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = std.testing.io },
+    };
     const result = try run(&context,
         \\{"command":"printf out1; printf err1 >&2; printf out2; printf err2 >&2"}
     );
@@ -605,7 +802,11 @@ test "bash preserves stdout and stderr order" {
 
 test "bash starts a command in a separate session" {
     const gpa = std.testing.allocator;
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = std.testing.io } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = std.testing.io },
+    };
     const result = try run(&context,
         \\{"command":"case $(ps -o stat= -p $$) in *s*) exit 0;; *) exit 1;; esac"}
     );
@@ -621,6 +822,8 @@ test "bash hands the environment of its host to the command" {
         "DRINKY_BASH_TEST=inherited",
     };
     const context: Context = .{
+        .sink = testing.discard_sink,
+
         .gpa = gpa,
         .host = .{ .io = std.testing.io, .environ = .{ .block = .{ .slice = &entries } } },
     };
@@ -646,6 +849,8 @@ test "bash skips a directory with the executable name in PATH" {
     defer gpa.free(path_entry);
     const entries = [_:null]?[*:0]const u8{path_entry.ptr};
     const context: Context = .{
+        .sink = testing.discard_sink,
+
         .gpa = gpa,
         .host = .{ .io = io, .environ = .{ .block = .{ .slice = &entries } } },
     };
@@ -671,6 +876,8 @@ test "bash reports an executable search failure as a tool error" {
     defer gpa.free(path_entry);
     const entries = [_:null]?[*:0]const u8{path_entry.ptr};
     const context: Context = .{
+        .sink = testing.discard_sink,
+
         .gpa = gpa,
         .host = .{ .io = io, .environ = .{ .block = .{ .slice = &entries } } },
     };
@@ -685,7 +892,11 @@ test "bash reports an executable search failure as a tool error" {
 
 test "bash reports a non-zero exit as an error" {
     const gpa = std.testing.allocator;
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = std.testing.io } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = std.testing.io },
+    };
     const result = try run(&context,
         \\{"command":"echo boom; exit 3"}
     );
@@ -699,7 +910,11 @@ test "bash reports a non-zero exit as an error" {
 
 test "a command reads its standard input from an empty source" {
     const gpa = std.testing.allocator;
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = std.testing.io } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = std.testing.io },
+    };
     const result = try run(&context,
         \\{"command":"cat"}
     );
@@ -710,7 +925,11 @@ test "a command reads its standard input from an empty source" {
 
 test "bash reports empty successful output" {
     const gpa = std.testing.allocator;
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = std.testing.io } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = std.testing.io },
+    };
     const result = try run(&context,
         \\{"command":"true"}
     );
@@ -722,7 +941,11 @@ test "bash reports empty successful output" {
 }
 
 test "bash rejects invalid input" {
-    const context: Context = .{ .gpa = std.testing.allocator, .host = .{ .io = std.testing.io } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = std.testing.allocator,
+        .host = .{ .io = std.testing.io },
+    };
     try std.testing.expectError(error.InvalidArguments, run(&context, "{}"));
 }
 
@@ -815,6 +1038,7 @@ const OutputClock = struct {
     threaded: std.Io.Threaded,
     backend: *const std.Io.VTable,
     vtable: std.Io.VTable,
+    mutex: std.Io.Mutex,
     marker: []const u8,
     fire_at: FireAt,
     seen: [seen_bytes_max]u8,
@@ -839,6 +1063,7 @@ const OutputClock = struct {
         self.vtable = self.backend.*;
         self.vtable.sleep = sleep;
         self.vtable.operate = operate;
+        self.mutex = .init;
         self.marker = options.marker;
         self.fire_at = options.fire_at;
         self.seen_len = 0;
@@ -896,6 +1121,8 @@ const OutputClock = struct {
         read: *const std.Io.Operation.FileReadStreaming,
         result: std.Io.Operation.FileReadStreaming.Result,
     ) void {
+        self.mutex.lockUncancelable(self.backendIo());
+        defer self.mutex.unlock(self.backendIo());
         const count = result catch |err| {
             const at_end = err == error.EndOfStream and self.fire_at == .end_after_marker;
             if (at_end and self.marker_handle == read.file.handle) self.fired.set(self.backendIo());
@@ -920,7 +1147,11 @@ test "a timed-out command keeps its output and states the stop" {
     var clock: OutputClock = undefined;
     clock.init(gpa, &.{ .marker = "started\n" });
     defer clock.deinit();
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = clock.io() } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = clock.io() },
+    };
     const result = try runWithTimeout(&context, "echo started; sleep 5", test_timeout_ms);
     defer result.deinit(gpa);
     try std.testing.expect(result.hasFailure());
@@ -938,7 +1169,11 @@ test "bash timeout is absolute while output arrives" {
     var clock: OutputClock = undefined;
     clock.init(gpa, &.{ .marker = "tick\n" });
     defer clock.deinit();
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = clock.io() } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = clock.io() },
+    };
     const result = try runWithTimeout(
         &context,
         "while true; do echo tick; sleep 0.01; done",
@@ -962,7 +1197,11 @@ test "bash timeout reaps a command after output closes" {
     var clock: OutputClock = undefined;
     clock.init(gpa, &.{ .marker = "closing\n", .fire_at = .end_after_marker });
     defer clock.deinit();
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = clock.io() } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = clock.io() },
+    };
     const result = try runWithTimeout(&context, command, test_timeout_ms);
     defer result.deinit(gpa);
     try std.testing.expect(result.hasFailure());
@@ -987,7 +1226,11 @@ test "bash timeout kills descendant processes" {
     var clock: OutputClock = undefined;
     clock.init(gpa, &.{ .marker = "started\n" });
     defer clock.deinit();
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = clock.io() } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = clock.io() },
+    };
     const result = try runWithTimeout(&context, command, test_timeout_ms);
     defer result.deinit(gpa);
     try std.testing.expect(result.hasFailure());
@@ -1015,7 +1258,11 @@ fn readProcessId(gpa: std.mem.Allocator, io: std.Io, tmp: *std.testing.TmpDir) !
 
 test "an oversized command keeps its output tail and states the stop" {
     const gpa = std.testing.allocator;
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = std.testing.io } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = std.testing.io },
+    };
     var command_buffer: [160]u8 = undefined;
     const input = try std.mem.print(
         &command_buffer,

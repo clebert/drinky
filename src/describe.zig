@@ -286,6 +286,11 @@ fn writeHeadless(writer: *std.Io.Writer) !void {
         \\can start it through the `bash` tool. A run can review your work as a second agent.
         \\
         \\- A run reads the prompt from stdin and writes the text of its final reply to stdout.
+        \\- A run through the `bash` tool adds its available costs to the parent session total.
+        \\  Each model attempt reports its cost when it ends, including a failed attempt with usage.
+        \\  A run uses its own model prices unless the provider reports a charge.
+        \\  A run adds no summary to the transcript or tool output.
+        \\  Keep the bash invocation open with `wait` for background runs.
         \\- The `--model` flag and the `--effort` flag are required.
         \\- The `--model` flag takes an `account/model` value. The command `drinky models` lists
         \\  the values of each signed-in account with a saved model list. The user fetches a list
@@ -388,4 +393,6 @@ test "the document orders sections and states each command, key hint, window, li
     );
     const headless = text[headless_index..repository_index];
     try std.testing.expect(std.mem.find(u8, headless, command_line.effort_levels) != null);
+    try std.testing.expect(std.mem.find(u8, headless, "available costs") != null);
+    try std.testing.expect(std.mem.find(u8, headless, "no summary") != null);
 }

@@ -120,6 +120,7 @@ const FakeRunner = struct {
     timed_out: bool = false,
     canceled: u32 = 0,
     resets: u32 = 0,
+    charges: []const f64 = &.{},
 
     const Hook = struct {
         session: *Session,
@@ -157,8 +158,10 @@ const FakeRunner = struct {
         call: *const Tool.Call,
         items: []const Conversation.Item,
         variables: []const Runner.Variable,
+        sink: Runner.Sink,
     ) Runner.Error!Tool.Output {
         const self: *FakeRunner = @ptrCast(@alignCast(ptr));
+        for (self.charges) |amount| sink.emit(self.io, &.{ .cost = amount });
         const recorded = try self.record(call, items.len, variables);
         if (recorded.fired) |hook| {
             if (hook.command == .cancel) try self.awaitCancel(hook.after_cancel);
@@ -591,6 +594,7 @@ fn writeEvent(writer: *std.Io.Writer, event: *const Session.Event) std.Io.Writer
             usage.cache_read,
             usage.cache_write,
         }),
+        .cost => |amount| try writer.print("cost:{d}", .{amount}),
         .quota => |quota| try writer.print("quota:{d}", .{
             if (quota.primary) |window| window.used_percent else -1,
         }),

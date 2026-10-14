@@ -1,5 +1,6 @@
 const std = @import("std");
 
+const actor = @import("actor.zig");
 const Conversation = @import("Conversation.zig");
 const Tool = @import("Tool.zig");
 
@@ -15,6 +16,7 @@ pub const VTable = struct {
         call: *const Tool.Call,
         items: []const Conversation.Item,
         variables: []const Variable,
+        sink: Sink,
     ) Error!Tool.Output,
     takeSkill: *const fn (
         ptr: *anyopaque,
@@ -25,6 +27,20 @@ pub const VTable = struct {
 };
 
 pub const Error = error{ Canceled, OutOfMemory };
+
+pub const Sink = actor.Sink(Event);
+
+pub const Event = union(enum) {
+    cost: f64,
+
+    pub fn dupe(self: *const Event) Event {
+        return self.*;
+    }
+
+    pub fn deinit(self: *const Event) void {
+        _ = self;
+    }
+};
 
 pub const Variable = struct {
     name: []const u8,
@@ -78,8 +94,9 @@ pub fn run(
     call: *const Tool.Call,
     items: []const Conversation.Item,
     variables: []const Variable,
+    sink: Sink,
 ) Error!Tool.Output {
-    return self.vtable.run(self.ptr, gpa, call, items, variables);
+    return self.vtable.run(self.ptr, gpa, call, items, variables, sink);
 }
 
 pub fn takeSkill(

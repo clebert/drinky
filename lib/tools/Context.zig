@@ -4,6 +4,7 @@ const core = @import("core");
 
 gpa: std.mem.Allocator,
 host: Host,
+sink: core.Runner.Sink,
 variables: []const core.Runner.Variable = &.{},
 deadline: core.timeout.Deadline = .unbounded,
 

@@ -20,8 +20,9 @@ every library. `lib/providers` and `lib/tools` import `lib/core`, and `lib/accou
   names no vendor: an account is an opaque id, and a reasoning proof is that id with opaque payload
   bytes. The session is an actor. One task runs its command loop and owns its state. A client sends
   commands and receives events through a sink, and a turn runs as a child task. An aside also runs
-  as a child task. It sends a request outside the conversation. The actor shell holds the generic
-  sink and the mailbox that starts, cancels, and reaps one child task.
+  as a child task. It sends a request outside the conversation. A turn and an aside report the final
+  available usage of each model attempt. The runner reports tool costs through its own sink. The
+  actor shell holds the generic sink and the mailbox that starts, cancels, and reaps one child task.
 - `lib/providers` implements the provider seam of the core. It holds the transport seam with its
   HTTP implementation, the SSE line engine, the JSON accessors, the credential seam, and one dialect
   per wire: Responses, Messages, and Gemini. A dialect builds the request, classifies a failure, and
@@ -29,7 +30,8 @@ every library. `lib/providers` and `lib/tools` import `lib/core`, and `lib/accou
 - `lib/tools` implements the tool seam of the core. Its registry runs `read`, `write`, `edit`,
   `find`, `grep`, `bash`, and `describe_drinky`. It holds the skill guard that a call proves a skill
   against. An output is content for the model with the conditions and the measures that the client
-  shows.
+  shows. A private pipe reports child costs through the runner sink. The pipe ends with the bash
+  invocation.
 - `lib/accounts` holds the account table with its eleven rows, the credentials behind the credential
   seam, and the sign-in flows. It also holds the model catalog with the public metadata, the usage
   sources, and the state store. `Client` builds the provider of one row and reports its usage source
@@ -44,10 +46,12 @@ every library. `lib/providers` and `lib/tools` import `lib/core`, and `lib/accou
   discovery under `src/discovery/`. It holds the widgets under `src/ui/` and Herdr too. The UI fits
   and paints the Markdown syntax from `lib/markdown` through one shared layout walk. `turn_text.zig`
   holds the outcome text that the terminal and headless clients share. `headless.zig` answers
-  `drinky run` and `drinky models` without a terminal. `Harness.zig` holds the setup that the client
-  and the headless mode share: the config, the discovery, the system prompt, and the tools. `/tldr`
-  streams the short version of the last answer into a page through an aside of the session. `src`
-  names no vendor, wire, or account row. It reads each such fact from `lib/accounts`.
+  `drinky run` and `drinky models` without a terminal. A run reports costs through the private pipe.
+  `billing.zig` applies the charge rule that the terminal and headless clients share. `Harness.zig`
+  holds the setup that the client and the headless mode share: the config, the discovery, the system
+  prompt, and the tools. `/tldr` streams the short version of the last answer into a page through an
+  aside of the session. `src` names no vendor, wire, or account row. It reads each such fact from
+  `lib/accounts`.
 - `src/ui/role.zig` maps a role to terminal colors. A widget names a role and writes no color of its
   own. `Message.zig` holds the severity that a notice and an event share.
 

@@ -31,6 +31,8 @@ pub fn run(context: *const Context, input_json: []const u8) Context.Error!core.T
 
 test "the tool returns the injected document and measures nothing" {
     const context: Context = .{
+        .sink = testing.discard_sink,
+
         .gpa = std.testing.allocator,
         .host = .{ .io = std.testing.io, .document = "# Drinky\n" },
     };
@@ -43,7 +45,11 @@ test "the tool returns the injected document and measures nothing" {
 }
 
 test "a host without a document reports an error" {
-    const context: Context = .{ .gpa = std.testing.allocator, .host = .{ .io = std.testing.io } };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = std.testing.allocator,
+        .host = .{ .io = std.testing.io },
+    };
     const result = try run(&context, "{}");
     defer result.deinit(std.testing.allocator);
     try testing.expectConditions(&result, &.{.failed});

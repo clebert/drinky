@@ -53,6 +53,10 @@ Review the uncommitted changes.
 EOF
 ```
 
+A run through the bash tool adds its available costs to the parent session total after each model
+attempt. It adds no transcript summary. Keep the bash invocation open with `wait` for background
+runs.
+
 Use `drinky models` to list the saved models of signed-in accounts.
 
 ## Config file
