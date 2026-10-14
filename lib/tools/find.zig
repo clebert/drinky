@@ -146,10 +146,13 @@ pub fn run(context: *const Context, input_json: []const u8) Context.Error!core.T
     result.measures.put(.matches, shown);
     switch (matches.stop) {
         .none => {},
-        .entries => result.conditions.insert(.incomplete),
+        .entries => result.conditions.insert(.tree_limit_reached),
         .time => result.conditions.insert(.time_limit_reached),
     }
-    if (entries_unread > 0) result.conditions.insert(.incomplete);
+    if (entries_unread > 0) {
+        result.conditions.insert(.incomplete);
+        result.measures.put(.entries_unread, entries_unread);
+    }
     if (matches.matched > shown) result.measures.put(.matches_omitted, matches.matched - shown);
     return result;
 }
@@ -288,7 +291,7 @@ test "find reports a search that reached the entry cap" {
             "the first 2 matches in path order. Use a narrower path or pattern.]",
     );
     try testing.expectTimed(&found, &.{.{ .matches, 2 }});
-    try testing.expectConditions(&found, &.{.incomplete});
+    try testing.expectConditions(&found, &.{.tree_limit_reached});
 
     const missed_input = try std.mem.print(&input_buffer,
         \\{{"pattern":"*.md","path":".zig-cache/tmp/{s}"}}
@@ -301,7 +304,7 @@ test "find reports a search that reached the entry cap" {
         missed.content,
     );
     try testing.expectTimed(&missed, &.{.{ .matches, 0 }});
-    try testing.expectConditions(&missed, &.{.incomplete});
+    try testing.expectConditions(&missed, &.{.tree_limit_reached});
 }
 
 test "find marks a search incomplete when it cannot read a directory" {
@@ -329,7 +332,7 @@ test "find marks a search incomplete when it cannot read a directory" {
         .{tmp.sub_path},
     );
     try std.testing.expectEqualStrings(expected, found.content);
-    try testing.expectTimed(&found, &.{.{ .matches, 1 }});
+    try testing.expectTimed(&found, &.{ .{ .matches, 1 }, .{ .entries_unread, 1 } });
     try testing.expectConditions(&found, &.{.incomplete});
 
     const missed_input = try std.mem.print(&input_buffer,
@@ -341,7 +344,7 @@ test "find marks a search incomplete when it cannot read a directory" {
         "No files match **/*.zig in the part that Drinky searched. Drinky could not read 1 entry.",
         missed.content,
     );
-    try testing.expectTimed(&missed, &.{.{ .matches, 0 }});
+    try testing.expectTimed(&missed, &.{ .{ .matches, 0 }, .{ .entries_unread, 1 } });
     try testing.expectConditions(&missed, &.{.incomplete});
 }
 

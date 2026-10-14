@@ -709,13 +709,16 @@ fn settleCall(
         turn.firstCall(&.{ .running, .queued, .streaming }) orelse
         return self.appendUnknownResult(result, now_ms);
     const call = &block.call.?;
-    if (call.phase != .running) try self.describeCall(call, &result.call);
+    const ran = call.phase == .running;
+    if (!ran) try self.describeCall(call, &result.call);
     call.phase = .done;
+    const canceled = result.output.conditions.contains(.canceled);
     block.transcript_index = try self.appendToolBlock(&.{
         .name = call.name,
         .subject = call.subject.items,
         .subject_kind = call.subject_kind,
         .output = &result.output,
+        .elapsed_ms = if (ran and canceled) now_ms - call.started_ms else null,
     }, .{ .started_ms = call.opened_ms, .received_bytes = result.call.arguments.len });
 }
 
@@ -1414,7 +1417,40 @@ test "a running tool uses the final call name instead of the streamed name" {
     try std.testing.expect(std.mem.find(u8, painted, "Tool: partial") == null);
 }
 
-test "incomplete searches report completion and put limits before counts" {
+test "a canceled call shows the time that it ran, and a call that never ran shows none" {
+    const gpa = std.testing.allocator;
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    try rig.start("prompt");
+    const grep: core.Tool.Call = .{
+        .id = "grep",
+        .name = "grep",
+        .arguments = "{\"pattern\":\"needle\"}",
+    };
+    const read: core.Tool.Call = .{
+        .id = "read",
+        .name = "read",
+        .arguments = "{\"path\":\"a.zig\"}",
+    };
+    try rig.apply(&.{ .tool_call_started = grep.name });
+    try rig.apply(&.{ .tool_call_started = read.name });
+    try rig.apply(&.{ .tool_started = grep });
+    rig.time.awake_ms += 4_200;
+    for ([_]core.Tool.Call{ grep, read }) |call| {
+        try rig.apply(&.{ .tool_result = .{
+            .call = call,
+            .output = .{ .content = "x", .conditions = .initOne(.canceled) },
+        } });
+    }
+    const painted = try rig.paintPlain(80);
+    defer gpa.free(painted);
+    try testing.expectContains(painted, "Tool: grep (canceled) · Time: 4.2s · Pattern: needle");
+    try testing.expectContains(painted, "Tool: read (canceled) · File: a.zig");
+    try std.testing.expect(std.mem.find(u8, painted, "Tool: read (canceled) · Time") == null);
+}
+
+test "a search that stops early reads as partial and puts its limit before its counts" {
     const gpa = std.testing.allocator;
     var rig: Rig = undefined;
     rig.init();
@@ -1436,12 +1472,12 @@ test "incomplete searches report completion and put limits before counts" {
     try rig.end(&.{ .stopped = .complete });
     const wide = try rig.paintPlain(120);
     defer gpa.free(wide);
-    try testing.expectContains(wide, "Tool: grep (complete) · Time: 500ms · Pattern: needle · " ++
-        "Search: timed out · Matches: 8");
+    try testing.expectContains(wide, "Tool: grep (partial) · Time: 500ms · Pattern: needle · " ++
+        "Stopped: time limit · Matches: 8");
     const narrow = try rig.paintPlain(25);
     defer gpa.free(narrow);
-    try testing.expectContains(narrow, "Tool: grep (complete)");
-    try std.testing.expect(std.mem.find(u8, narrow, "Search:") == null);
+    try testing.expectContains(narrow, "Tool: grep (partial)");
+    try std.testing.expect(std.mem.find(u8, narrow, "Stopped:") == null);
 }
 
 test "omitted find matches keep a complete outcome without a condition" {
@@ -2504,7 +2540,7 @@ test "verbose off hides each command, and verbose on keeps its complete text" {
     }
 }
 
-test "verbose tools color complete identities and separate outcomes from output coverage" {
+test "verbose tools color each identity by its status and mark search limits in yellow" {
     const gpa = std.testing.allocator;
     const cases = [_]struct {
         name: []const u8,
@@ -2535,26 +2571,30 @@ test "verbose tools color complete identities and separate outcomes from output 
         .{
             .name = "grep",
             .conditions = &.{.incomplete},
-            .qualifier = "Search: incomplete",
+            .measures = &.{.{ .entries_unread, 2 }},
+            .status = "partial",
+            .qualifier = "Unreadable: 2 entries",
             .warning = true,
         },
         .{
             .name = "find",
             .conditions = &.{.time_limit_reached},
-            .qualifier = "Search: timed out",
+            .status = "partial",
+            .qualifier = "Stopped: time limit",
             .warning = true,
         },
         .{
             .name = "grep",
             .conditions = &.{.match_limit_reached},
-            .qualifier = "Limit: reached",
+            .status = "partial",
+            .qualifier = "Stopped: match limit",
             .warning = true,
         },
         .{
             .name = "grep",
             .conditions = &.{.byte_limit_reached},
-            .measures = &.{.{ .bytes, 300 * 1024 * 1024 }},
-            .qualifier = "Stopped at: 300 MiB",
+            .status = "partial",
+            .qualifier = "Stopped: byte limit",
             .warning = true,
         },
         .{
@@ -2565,7 +2605,8 @@ test "verbose tools color complete identities and separate outcomes from output 
                 .byte_limit_reached,
                 .incomplete,
             },
-            .qualifier = "Search: incomplete",
+            .status = "partial",
+            .qualifier = "Stopped: time limit, byte limit, match limit",
             .warning = true,
         },
         .{
@@ -2578,9 +2619,9 @@ test "verbose tools color complete identities and separate outcomes from output 
         .{
             .name = "grep",
             .conditions = &.{ .failed, .incomplete },
-            .measures = &.{.{ .matches, 0 }},
+            .measures = &.{ .{ .matches, 0 }, .{ .entries_unread, 1 } },
             .status = "failed",
-            .qualifier = "Search: incomplete",
+            .qualifier = "Unreadable: 1 entry",
             .warning = true,
         },
     };
@@ -2598,7 +2639,10 @@ test "verbose tools color complete identities and separate outcomes from output 
         try rig.apply(&.{ .tool_result = .{ .call = call, .output = output } });
         try rig.apply(&.committed);
         try rig.end(&.{ .stopped = .complete });
-        const color = if (std.mem.eql(u8, case.status, "failed")) "\x1b[31m" else "\x1b[32m";
+        const partial = std.mem.eql(u8, case.status, "partial");
+        const color = if (std.mem.eql(u8, case.status, "failed"))
+            "\x1b[31m"
+        else if (partial) "\x1b[33m" else "\x1b[32m";
         for ([_]usize{ 120, 8, 1, 120 }) |columns| {
             const plain = try rig.paintPlain(columns);
             defer gpa.free(plain);
@@ -2609,7 +2653,8 @@ test "verbose tools color complete identities and separate outcomes from output 
                 });
                 defer gpa.free(shortened);
                 try testing.expectContains(rig.out.written(), shortened);
-                try std.testing.expect(std.mem.find(u8, rig.out.written(), "\x1b[33m") == null);
+                if (!partial)
+                    try std.testing.expect(std.mem.find(u8, rig.out.written(), "\x1b[33m") == null);
                 continue;
             }
             const identity = try gpa.print("Tool: {s} ({s})", .{ case.name, case.status });
@@ -2635,7 +2680,7 @@ test "tool results keep file metadata neutral across terminal widths" {
         color: []const u8,
     }{
         .{ .condition = null, .state = "complete", .color = "\x1b[32m" },
-        .{ .condition = .incomplete, .state = "complete", .color = "\x1b[32m" },
+        .{ .condition = .incomplete, .state = "partial", .color = "\x1b[33m" },
         .{ .condition = .failed, .state = "failed", .color = "\x1b[31m" },
     };
     for (cases) |case| {

@@ -417,8 +417,12 @@ pub fn collect(io: std.Io, gpa: std.mem.Allocator, options: *const Options) !Mat
 pub fn writeUnread(writer: *std.Io.Writer, entries_unread: usize) !void {
     try writer.print("Drinky could not read {d} {s}.", .{
         entries_unread,
-        if (entries_unread == 1) "entry" else "entries",
+        entryNoun(entries_unread),
     });
+}
+
+pub fn entryNoun(count: usize) []const u8 {
+    return if (count == 1) "entry" else "entries";
 }
 
 fn noiseIndex(basename: []const u8) ?usize {

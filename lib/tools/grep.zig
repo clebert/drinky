@@ -190,12 +190,13 @@ pub fn run(context: *const Context, input_json: []const u8) Context.Error!core.T
     var result: core.Tool.Output = .{ .content = try out.toOwnedSlice() };
     result.measures.put(.duration_ms, @intCast(@max(elapsed_ms, 0)));
     result.measures.put(.matches, count);
-    result.measures.put(.bytes, state.bytes_read);
+    if (entries_unread > 0) result.measures.put(.entries_unread, entries_unread);
+    if (files_oversized > 0) result.measures.put(.files_oversized, files_oversized);
     if (timed_out) result.conditions.insert(.time_limit_reached);
+    if (files_unsearched) result.conditions.insert(.tree_limit_reached);
     if (line_capped) result.conditions.insert(.match_limit_reached);
     if (bytes_capped) result.conditions.insert(.byte_limit_reached);
-    if (files_unsearched or files_oversized > 0 or entries_unread > 0)
-        result.conditions.insert(.incomplete);
+    if (files_oversized > 0 or entries_unread > 0) result.conditions.insert(.incomplete);
     if (state.lines_truncated) result.conditions.insert(.lines_truncated);
     return result;
 }
@@ -320,15 +321,11 @@ test "grep finds a literal substring with a glob filter" {
     );
     try std.testing.expectEqualStrings(expected, result.content);
     try expectMatches(&result, 1);
-    try std.testing.expectEqual(@as(?u64, 17), result.measures.get(.bytes));
     try testing.expectConditions(&result, &.{});
 }
 
 fn expectMatches(result: *const core.Tool.Output, matches: u64) !void {
-    try std.testing.expect(result.measures.get(.duration_ms) != null);
-    try std.testing.expect(result.measures.get(.bytes) != null);
-    try std.testing.expectEqual(@as(?u64, matches), result.measures.get(.matches));
-    try std.testing.expectEqual(@as(usize, 3), result.measures.count());
+    try testing.expectTimed(result, &.{.{ .matches, matches }});
 }
 
 test "grep searches a single file given as the path" {
@@ -529,7 +526,7 @@ test "grep finds no match in an oversized file and names the file it did not sea
             "Drinky did not search 1 file larger than 4 MiB.",
         result.content,
     );
-    try expectMatches(&result, 0);
+    try testing.expectTimed(&result, &.{ .{ .matches, 0 }, .{ .files_oversized, 1 } });
     try testing.expectConditions(&result, &.{.incomplete});
 }
 
@@ -557,7 +554,7 @@ test "grep marks a search incomplete when it cannot read a file" {
         .{tmp.sub_path},
     );
     try std.testing.expectEqualStrings(expected, found.content);
-    try expectMatches(&found, 1);
+    try testing.expectTimed(&found, &.{ .{ .matches, 1 }, .{ .entries_unread, 1 } });
     try testing.expectConditions(&found, &.{.incomplete});
 
     const single_input = try std.mem.print(&input_buffer,
@@ -571,7 +568,7 @@ test "grep marks a search incomplete when it cannot read a file" {
             "Drinky could not read 1 entry.",
         single.content,
     );
-    try expectMatches(&single, 0);
+    try testing.expectTimed(&single, &.{ .{ .matches, 0 }, .{ .entries_unread, 1 } });
     try testing.expectConditions(&single, &.{.incomplete});
 }
 
@@ -621,6 +618,32 @@ test "grep stops at the byte cap and states it" {
     );
     try expectMatches(&missed, 0);
     try testing.expectConditions(&missed, &.{.byte_limit_reached});
+}
+
+test "grep states a file tree that is too large to scan" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const context: Context = .{
+        .gpa = gpa,
+        .host = .{ .io = io, .search = .{ .entries_max = 2 } },
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_][]const u8{ "a.txt", "b.txt", "c.txt" }) |name| {
+        try tmp.dir.writeFile(io, .{ .sub_path = name, .data = "hit\n" });
+    }
+    var base_buffer: [128]u8 = undefined;
+    const base = try std.mem.print(&base_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+
+    const result = try runIn(&context, "{{\"pattern\":\"hit\",\"path\":\"{s}\"}}", base);
+    defer result.deinit(gpa);
+    try std.testing.expect(!result.hasFailure());
+    try std.testing.expectStringEndsWith(
+        result.content,
+        ".txt:1:hit\n[Drinky could not scan the full file tree. Drinky did not search some files.]",
+    );
+    try expectMatches(&result, 2);
+    try testing.expectConditions(&result, &.{.tree_limit_reached});
 }
 
 test "grep caps the reported line length" {

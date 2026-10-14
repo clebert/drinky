@@ -6,8 +6,6 @@ const tools = @import("tools");
 const format = @import("format.zig");
 const ui = @import("ui/root.zig");
 
-const mebibyte = 1024 * 1024;
-
 pub const Line = struct {
     text: []u8,
     segment_ends: []usize,
@@ -24,7 +22,7 @@ pub const Line = struct {
 
 pub const Phase = enum { streaming, queued, running };
 
-const State = enum { streaming, queued, running, complete, canceled, failed };
+const State = enum { streaming, queued, running, complete, partial, canceled, failed };
 
 pub const Options = struct {
     name: []const u8,
@@ -120,7 +118,9 @@ fn write(parts: *Parts, options: *const Options) !void {
     const state: State = if (options.output) |output|
         if (output.conditions.contains(.canceled))
             .canceled
-        else if (output.hasFailure()) .failed else .complete
+        else if (output.hasFailure())
+            .failed
+        else if (partial(output)) .partial else .complete
     else switch (options.phase) {
         .streaming => .streaming,
         .queued => .queued,
@@ -137,13 +137,17 @@ fn write(parts: *Parts, options: *const Options) !void {
         .role = switch (state) {
             .streaming, .queued, .running => .activity,
             .complete => .success,
-            .canceled => .warning,
+            .partial, .canceled => .warning,
             .failed => .@"error",
         },
     };
     if (options.elapsed_ms) |elapsed_ms| {
         var buffer: [24]u8 = undefined;
-        try parts.print("Time: {s}", .{format.durationSeconds(&buffer, elapsed_ms, .down)});
+        const shown = if (options.output == null)
+            format.durationSeconds(&buffer, elapsed_ms, .down)
+        else
+            tools.format.duration(&buffer, elapsed_ms);
+        try parts.print("Time: {s}", .{shown});
     } else if (options.output) |output| {
         if (output.measures.get(.duration_ms)) |duration_ms| {
             var buffer: [24]u8 = undefined;
@@ -159,17 +163,15 @@ fn write(parts: *Parts, options: *const Options) !void {
         if (output.conditions.contains(.terminated)) try parts.print("Status: terminated", .{});
         if (output.conditions.contains(.timed_out)) try parts.print("Status: timed out", .{});
         if (output.conditions.contains(.overflowed)) try parts.print("Status: output limit", .{});
-        if (output.conditions.contains(.time_limit_reached)) {
-            try parts.warn("Search: timed out", .{});
-        }
-        if (output.conditions.contains(.match_limit_reached)) {
-            try parts.warn("Limit: reached", .{});
-        }
-        if (output.conditions.contains(.byte_limit_reached)) {
-            const bytes = output.measures.get(.bytes) orelse 0;
-            try parts.warn("Stopped at: {d} MiB", .{@divFloor(bytes, mebibyte)});
-        }
-        if (output.conditions.contains(.incomplete)) try parts.warn("Search: incomplete", .{});
+        try writeStops(parts, output);
+        if (output.measures.get(.entries_unread)) |count| try parts.warn(
+            "Unreadable: {d} {s}",
+            .{ count, tools.walk.entryNoun(count) },
+        );
+        if (output.measures.get(.files_oversized)) |count| try parts.warn(
+            "Skipped: {d} large file{s}",
+            .{ count, core.text.pluralSuffix(count) },
+        );
         if (output.conditions.contains(.line_truncated)) try parts.print("Line: truncated", .{});
         if (output.conditions.contains(.lines_truncated)) try parts.print("Lines: truncated", .{});
         if (output.conditions.contains(.output_truncated)) {
@@ -201,6 +203,32 @@ fn write(parts: *Parts, options: *const Options) !void {
             try parts.writer.print("\nError: {s}", .{output.content});
         }
     }
+}
+
+const stops = [_]struct { condition: core.Tool.Condition, name: []const u8 }{
+    .{ .condition = .time_limit_reached, .name = "time limit" },
+    .{ .condition = .tree_limit_reached, .name = "tree limit" },
+    .{ .condition = .byte_limit_reached, .name = "byte limit" },
+    .{ .condition = .match_limit_reached, .name = "match limit" },
+};
+
+fn partial(output: *const core.Tool.Output) bool {
+    if (output.conditions.contains(.incomplete)) return true;
+    for (stops) |stop| {
+        if (output.conditions.contains(stop.condition)) return true;
+    }
+    return false;
+}
+
+fn writeStops(parts: *Parts, output: *const core.Tool.Output) !void {
+    var buffer: [64]u8 = undefined;
+    var names: std.Io.Writer = .fixed(&buffer);
+    for (stops) |stop| {
+        if (!output.conditions.contains(stop.condition)) continue;
+        if (names.buffered().len > 0) names.writeAll(", ") catch unreachable;
+        names.writeAll(stop.name) catch unreachable;
+    }
+    if (names.buffered().len > 0) try parts.warn("Stopped: {s}", .{names.buffered()});
 }
 
 fn writeLines(parts: *Parts, output: *const core.Tool.Output) !void {
@@ -283,28 +311,66 @@ test "a search reports its time, its matches, and every reached limit" {
     try expectLine(&.{
         .measures = &.{ .{ .duration_ms, 1500 }, .{ .matches, 1 }, .{ .matches_omitted, 2 } },
         .name = "grep",
+        .state = "partial",
         .conditions = &.{.time_limit_reached},
-        .expected = "Time: 1.5s \u{00B7} Search: timed out \u{00B7} Matches: 1 \u{00B7} " ++
+        .expected = "Time: 1.5s \u{00B7} Stopped: time limit \u{00B7} Matches: 1 \u{00B7} " ++
             "Omitted matches: 2",
     });
     try expectLine(&.{
         .measures = &.{ .{ .duration_ms, 0 }, .{ .matches, 0 } },
         .name = "find",
-        .conditions = &.{.incomplete},
-        .expected = "Time: 0ms \u{00B7} Search: incomplete \u{00B7} Matches: 0",
+        .state = "partial",
+        .conditions = &.{.tree_limit_reached},
+        .expected = "Time: 0ms \u{00B7} Stopped: tree limit \u{00B7} Matches: 0",
     });
     try expectLine(&.{
-        .measures = &.{ .{ .duration_ms, 42 }, .{ .matches, 2 }, .{ .bytes, 300 * mebibyte } },
+        .measures = &.{ .{ .duration_ms, 42 }, .{ .matches, 2 } },
         .name = "grep",
+        .state = "partial",
         .conditions = &.{ .match_limit_reached, .byte_limit_reached, .lines_truncated },
-        .expected = "Time: 42ms \u{00B7} Limit: reached \u{00B7} " ++
-            "Stopped at: 300 MiB \u{00B7} Lines: truncated \u{00B7} Matches: 2",
+        .expected = "Time: 42ms \u{00B7} Stopped: byte limit, match limit \u{00B7} " ++
+            "Lines: truncated \u{00B7} Matches: 2",
+    });
+    try expectLine(&.{
+        .measures = &.{
+            .{ .duration_ms, 42 },
+            .{ .matches, 0 },
+            .{ .entries_unread, 1 },
+            .{ .files_oversized, 2 },
+        },
+        .name = "grep",
+        .state = "partial",
+        .conditions = &.{.incomplete},
+        .expected = "Time: 42ms \u{00B7} Unreadable: 1 entry \u{00B7} " ++
+            "Skipped: 2 large files \u{00B7} Matches: 0",
     });
     try expectLine(&.{
         .name = "find",
-        .measures = &.{ .{ .duration_ms, 42 }, .{ .matches, 0 }, .{ .bytes, 5 } },
+        .measures = &.{ .{ .duration_ms, 42 }, .{ .matches, 0 } },
         .expected = "Time: 42ms \u{00B7} Matches: 0",
     });
+}
+
+test "a search that stops early names its state in yellow" {
+    const gpa = std.testing.allocator;
+    var stopped: core.Tool.Output = .{ .content = "Drinky stopped the search." };
+    stopped.measures.put(.duration_ms, 10_000);
+    stopped.measures.put(.matches, 0);
+    stopped.measures.put(.entries_unread, 3);
+    stopped.conditions.insert(.time_limit_reached);
+    stopped.conditions.insert(.incomplete);
+    const line = try render(gpa, &.{
+        .name = "grep",
+        .subject = "Pattern: foobar",
+        .output = &stopped,
+    });
+    defer line.deinit(gpa);
+    try std.testing.expectEqualStrings(
+        "Tool: grep (partial) · Time: 10.0s · Pattern: foobar · Stopped: time limit · " ++
+            "Unreadable: 3 entries · Matches: 0",
+        line.text,
+    );
+    try std.testing.expectEqual(.warning, line.status.role);
 }
 
 test "a command reports its time, its exit code or its status, and its output" {

@@ -132,14 +132,15 @@ fn writeCommands(writer: *std.Io.Writer) !void {
         \\They preserve blank lines and source indentation.
         \\Picker selection highlights stay outside the transcript.
         \\The complete `Tool: name (state)` identity uses dim text and takes the status color.
-        \\Search qualifiers for time, match, byte, or coverage limits use dim yellow text.
+        \\The `Stopped`, `Unreadable`, and `Skipped` details of a search use dim yellow text.
         \\File windows, omitted matches, and truncated output use neutral metadata.
         \\The complete `Agent: work (activity or status)` identity uses dim text.
         \\An open work identity uses cyan, and a finished work identity takes the status color.
         \\Other metadata and command text use dim text with the default foreground color.
         \\Tool error sentences use dim text with the default foreground color.
         \\The `complete` status uses green, and `failed` uses red.
-        \\The tool status `canceled` and the work statuses `truncated` and `canceled` use yellow.
+        \\The tool statuses `partial` and `canceled` use yellow.
+        \\The work statuses `truncated` and `canceled` use yellow too.
         \\The `queued`, `streaming`, and `running` statuses use cyan.
         \\
         \\Verbose on shows complete thinking text, a row for each tool call, and complete bash
@@ -171,9 +172,11 @@ fn writeCommands(writer: *std.Io.Writer) !void {
         \\details, counts, and secondary measures.
         \\Received bytes and timeout values have the lowest priority.
         \\A running call with a time limit shows its time and the limit.
-        \\After the call, only `bash`, `find`, and `grep` show time.
-        \\A successful tool shows `complete`, even with a file window or truncated output.
-        \\The tool status records the operation outcome, not the output completeness.
+        \\After the call, the time comes from the tool.
+        \\`bash`, `find`, and `grep` measure it, except after an early failure.
+        \\A canceled call that started shows the time until the cancel.
+        \\A search that stops at a limit or skips entries shows `partial`.
+        \\A file window or truncated output still shows `complete`.
         \\Bash commands and complete tool error sentences appear below the metadata.
         \\Every detail row aligns under the first optional metadata field.
         \\The indent uses the complete identity width plus the separator width, measured in
