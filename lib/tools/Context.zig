@@ -5,6 +5,7 @@ const core = @import("core");
 gpa: std.mem.Allocator,
 host: Host,
 variables: []const core.Runner.Variable = &.{},
+deadline: core.timeout.Deadline = .unbounded,
 
 pub const Error = error{ Canceled, OutOfMemory, WriteFailed, InvalidArguments };
 

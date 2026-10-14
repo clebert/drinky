@@ -3,6 +3,7 @@ const std = @import("std");
 const core = @import("core");
 
 const format = @import("format.zig");
+const fs = @import("fs.zig");
 const glob = @import("glob.zig");
 const output = @import("output.zig");
 const skill_file = @import("skill_file.zig");
@@ -32,6 +33,7 @@ const Demand = struct {
 pub const CheckOptions = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
+    deadline: core.timeout.Deadline,
     path: []const u8,
     history: []const core.Conversation.Item,
 };
@@ -98,13 +100,14 @@ fn demand(self: *SkillGuard, options: *const CheckOptions) core.Runner.Error!?De
             .resolved = resolved,
             .relative = maybe_relative,
         })) continue;
-        const content = skill_file.read(gpa, options.io, rule.source) catch |err| switch (err) {
-            error.Canceled, error.OutOfMemory => |known| return known,
-            else => |failure| {
-                if (first == null) first = .{ .rule = rule, .failure = failure };
-                continue;
-            },
-        };
+        const content = skill_file.read(gpa, options.io, &options.deadline, rule.source) catch |err|
+            switch (err) {
+                error.Canceled, error.OutOfMemory => |known| return known,
+                else => |failure| {
+                    if (first == null) first = .{ .rule = rule, .failure = failure };
+                    continue;
+                },
+            };
         defer gpa.free(content);
         if (carries(options.history, content)) {
             rule.loaded.store(true, .monotonic);
@@ -123,10 +126,12 @@ pub fn takeQueued(
     io: std.Io,
     history: []const core.Conversation.Item,
 ) core.Runner.Error!?core.Runner.Skill {
+    const deadline: core.timeout.Deadline = .start(io, fs.timeout_ms);
     for (self.rule_items[0..self.rule_count]) |*rule| {
         if (!rule.queued.load(.monotonic)) continue;
+        if (deadline.expired(io)) break;
         rule.queued.store(false, .monotonic);
-        const content = skill_file.read(gpa, io, rule.source) catch |err| switch (err) {
+        const content = skill_file.read(gpa, io, &deadline, rule.source) catch |err| switch (err) {
             error.Canceled, error.OutOfMemory => |known| return known,
             else => continue,
         };
@@ -224,6 +229,7 @@ fn refusalOf(
     return fixture.guard.refusal(&.{
         .gpa = gpa,
         .io = std.testing.io,
+        .deadline = .unbounded,
         .path = "src/App.zig",
         .history = history,
     });
@@ -237,6 +243,7 @@ test "a read of a matching path queues the skill file, and the delivery carries 
     try fixture.guard.queue(&.{
         .gpa = gpa,
         .io = std.testing.io,
+        .deadline = .unbounded,
         .path = "src/App.zig",
         .history = &.{},
     });
@@ -259,6 +266,7 @@ test "a read of a matching path queues the skill file, and the delivery carries 
     try fixture.guard.queue(&.{
         .gpa = gpa,
         .io = std.testing.io,
+        .deadline = .unbounded,
         .path = "README.md",
         .history = &.{},
     });
@@ -273,6 +281,7 @@ test "a forget drops a queued skill, so a new conversation receives none" {
     try fixture.guard.queue(&.{
         .gpa = gpa,
         .io = std.testing.io,
+        .deadline = .unbounded,
         .path = "src/App.zig",
         .history = &.{},
     });
@@ -281,6 +290,62 @@ test "a forget drops a queued skill, so a new conversation receives none" {
     const maybe_skill = try fixture.guard.takeQueued(gpa, std.testing.io, &.{});
     defer if (maybe_skill) |skill| skill.deinit(gpa);
     try std.testing.expect(maybe_skill == null);
+}
+
+test "the delivery of a queued skill stops at the time limit when its file never opens" {
+    const gpa = std.testing.allocator;
+    var fixture: testing.SkillFixture = try .init(gpa);
+    defer fixture.deinit(gpa);
+    try fixture.guard.queue(&.{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .deadline = .unbounded,
+        .path = "src/App.zig",
+        .history = &.{},
+    });
+    var stall: testing.StallIo = undefined;
+    stall.init(gpa, .{ .open_file = "SKILL.md" });
+    defer stall.deinit();
+
+    const maybe_skill = try fixture.guard.takeQueued(gpa, stall.io(), &.{});
+    defer if (maybe_skill) |skill| skill.deinit(gpa);
+    try std.testing.expect(maybe_skill == null);
+    try std.testing.expect(stall.canceled.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), stall.slept().len);
+}
+
+test "a stalled skill file leaves the later queued skills for the next delivery" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var fixture: testing.SkillFixture = try .init(gpa);
+    defer fixture.deinit(gpa);
+    try fixture.tmp.dir.writeFile(io, .{
+        .sub_path = "extra.md",
+        .data = "---\nname: extra\n---\nUse tabs.\n",
+    });
+    const extra = try std.Io.Dir.path.join(gpa, &.{ fixture.root, "extra.md" });
+    defer gpa.free(extra);
+    try fixture.guard.add(.{ .glob = "**/*.zig", .skill = "extra", .source = extra });
+    try fixture.guard.queue(&.{
+        .gpa = gpa,
+        .io = io,
+        .deadline = .unbounded,
+        .path = "src/App.zig",
+        .history = &.{},
+    });
+    var stall: testing.StallIo = undefined;
+    stall.init(gpa, .{ .open_file = "SKILL.md" });
+    defer stall.deinit();
+
+    const maybe_stalled = try fixture.guard.takeQueued(gpa, stall.io(), &.{});
+    defer if (maybe_stalled) |stalled| stalled.deinit(gpa);
+    try std.testing.expect(maybe_stalled == null);
+    try std.testing.expect(stall.canceled.load(.acquire));
+
+    const maybe_delivered = try fixture.guard.takeQueued(gpa, io, &.{});
+    defer if (maybe_delivered) |delivered| delivered.deinit(gpa);
+    try std.testing.expect(maybe_delivered != null);
+    try std.testing.expectEqualStrings("extra", maybe_delivered.?.name);
 }
 
 test "two rules that share one skill file deliver it once" {
@@ -296,6 +361,7 @@ test "two rules that share one skill file deliver it once" {
     try fixture.guard.queue(&.{
         .gpa = gpa,
         .io = std.testing.io,
+        .deadline = .unbounded,
         .path = "src/App.zig",
         .history = &.{},
     });
@@ -311,6 +377,7 @@ test "two rules that share one skill file deliver it once" {
     try std.testing.expect((try fixture.guard.refusal(&.{
         .gpa = gpa,
         .io = std.testing.io,
+        .deadline = .unbounded,
         .path = "src/data.json",
         .history = &.{},
     })) == null);
@@ -326,6 +393,7 @@ test "a rule never guards its own skill file" {
     try guard.queue(&.{
         .gpa = gpa,
         .io = std.testing.io,
+        .deadline = .unbounded,
         .path = fixture.source,
         .history = &.{},
     });
@@ -334,6 +402,7 @@ test "a rule never guards its own skill file" {
     try std.testing.expect((try guard.refusal(&.{
         .gpa = gpa,
         .io = std.testing.io,
+        .deadline = .unbounded,
         .path = fixture.source,
         .history = &.{},
     })) == null);
@@ -343,6 +412,7 @@ test "a rule never guards its own skill file" {
     const refused = (try guard.refusal(&.{
         .gpa = gpa,
         .io = std.testing.io,
+        .deadline = .unbounded,
         .path = other,
         .history = &.{},
     })).?;
@@ -357,6 +427,7 @@ test "a skill file that vanished leaves the queue silently" {
     try fixture.guard.queue(&.{
         .gpa = gpa,
         .io = std.testing.io,
+        .deadline = .unbounded,
         .path = "src/App.zig",
         .history = &.{},
     });
@@ -427,6 +498,7 @@ test "a glob measures against the working directory, and against the absolute pa
     const refused = (try rooted.refusal(&.{
         .gpa = gpa,
         .io = std.testing.io,
+        .deadline = .unbounded,
         .path = inside,
         .history = &.{},
     })).?;
@@ -435,6 +507,7 @@ test "a glob measures against the working directory, and against the absolute pa
     try std.testing.expect((try rooted.refusal(&.{
         .gpa = gpa,
         .io = std.testing.io,
+        .deadline = .unbounded,
         .path = "/other/src/App.zig",
         .history = &.{},
     })) == null);
@@ -442,6 +515,7 @@ test "a glob measures against the working directory, and against the absolute pa
     const outside = (try fixture.guard.refusal(&.{
         .gpa = gpa,
         .io = std.testing.io,
+        .deadline = .unbounded,
         .path = "/other/src/App.zig",
         .history = &.{},
     })).?;
@@ -453,6 +527,7 @@ test "a glob measures against the working directory, and against the absolute pa
     const hosts = (try operations.refusal(&.{
         .gpa = gpa,
         .io = std.testing.io,
+        .deadline = .unbounded,
         .path = "/etc/hosts",
         .history = &.{},
     })).?;
@@ -467,6 +542,7 @@ test "an empty guard blocks nothing and the rule count is capped" {
     try std.testing.expect((try guard.refusal(&.{
         .gpa = gpa,
         .io = std.testing.io,
+        .deadline = .unbounded,
         .path = "src/App.zig",
         .history = &.{},
     })) == null);

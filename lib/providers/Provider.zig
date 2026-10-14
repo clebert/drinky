@@ -803,7 +803,7 @@ test "a cancel during a blocked read ends the request as Canceled, also with a z
 
 fn sessionOwns(reason: core.Provider.Failure.Reason) bool {
     return switch (reason) {
-        .empty_reply, .too_many_tool_calls, .out_of_memory => true,
+        .empty_reply, .too_many_tool_calls, .concurrency_unavailable, .out_of_memory => true,
         .unauthorized,
         .rate_limited,
         .quota_exhausted,

@@ -24,7 +24,7 @@ pub const Line = struct {
 
 pub const Phase = enum { streaming, queued, running };
 
-const State = enum { streaming, queued, running, complete, failed };
+const State = enum { streaming, queued, running, complete, canceled, failed };
 
 pub const Options = struct {
     name: []const u8,
@@ -118,7 +118,9 @@ pub fn render(gpa: std.mem.Allocator, options: *const Options) error{OutOfMemory
 
 fn write(parts: *Parts, options: *const Options) !void {
     const state: State = if (options.output) |output|
-        if (output.hasFailure()) .failed else .complete
+        if (output.conditions.contains(.canceled))
+            .canceled
+        else if (output.hasFailure()) .failed else .complete
     else switch (options.phase) {
         .streaming => .streaming,
         .queued => .queued,
@@ -135,6 +137,7 @@ fn write(parts: *Parts, options: *const Options) !void {
         .role = switch (state) {
             .streaming, .queued, .running => .activity,
             .complete => .success,
+            .canceled => .warning,
             .failed => .@"error",
         },
     };
@@ -194,7 +197,7 @@ fn write(parts: *Parts, options: *const Options) !void {
         parts.command = .{ .start = start, .end = parts.writer.buffered().len };
     }
     if (options.output) |output| {
-        if (output.hasFailure() and output.measures.count() == 0) {
+        if (state == .failed and output.measures.count() == 0) {
             try parts.writer.print("\nError: {s}", .{output.content});
         }
     }
@@ -339,6 +342,20 @@ test "a command reports its time, its exit code or its status, and its output" {
         .state = "failed",
         .expected = "Time: 5ms \u{00B7} Status: output limit",
     });
+}
+
+test "a canceled call names its state in yellow and shows no error sentence" {
+    const gpa = std.testing.allocator;
+    var canceled: core.Tool.Output = .{ .content = "The user canceled the call." };
+    canceled.conditions.insert(.canceled);
+    const line = try render(gpa, &.{
+        .name = "grep",
+        .subject = "Pattern: x",
+        .output = &canceled,
+    });
+    defer line.deinit(gpa);
+    try std.testing.expectEqualStrings("Tool: grep (canceled) · Pattern: x", line.text);
+    try std.testing.expectEqual(.warning, line.status.role);
 }
 
 test "a failed output keeps its error sentence and a bare output only its completed identity" {

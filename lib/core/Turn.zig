@@ -13,6 +13,9 @@ pub const tool_calls_max: usize = 64;
 pub const read_only_calls_max: usize = 32;
 pub const rounds_max: usize = 1000;
 const skills_max: usize = 64;
+const canceled_call_text = "The user canceled the call before Drinky received its result. " ++
+    "The call can have completed some or all of its work.";
+const unstarted_call_text = "Drinky did not run the call because the user canceled the turn.";
 
 gpa: std.mem.Allocator,
 io: std.Io,
@@ -71,6 +74,8 @@ const Batch = struct {
     end: usize,
 };
 
+const AnswerError = Runner.Error || std.Io.ConcurrentError;
+
 const Staging = struct {
     gpa: std.mem.Allocator,
     entries: std.ArrayList(Entry),
@@ -106,6 +111,7 @@ const Staging = struct {
     const Pending = struct {
         call: Tool.Call,
         output: ?Tool.Output,
+        started: bool,
     };
 
     const Block = enum { text, reasoning, call };
@@ -236,7 +242,7 @@ const Staging = struct {
                 const copy = try source.dupe(self.gpa);
                 errdefer copy.deinit(self.gpa);
                 try self.entries.append(self.gpa, .{
-                    .kind = .{ .call = .{ .call = copy, .output = null } },
+                    .kind = .{ .call = .{ .call = copy, .output = null, .started = false } },
                     .block_end = self.blocks,
                 });
                 self.closeBlock(.call);
@@ -323,10 +329,14 @@ fn rounds(self: *Turn) Session.Outcome {
             return .exhausted;
         }
         if (calls) self.answer(&staging) catch |err| {
+            if (err == error.Canceled) self.answerCanceled(&staging);
             self.commit(&staging) catch return outOfMemory();
             return switch (err) {
                 error.Canceled => .canceled,
                 error.OutOfMemory => outOfMemory(),
+                error.ConcurrencyUnavailable => .{
+                    .failed = .{ .reason = .concurrency_unavailable },
+                },
             };
         };
         self.commit(&staging) catch return outOfMemory();
@@ -504,7 +514,7 @@ fn measure(self: *Turn, tokens: u64, setup: *const Session.Setup) void {
     self.emit(&.{ .context = tokens });
 }
 
-fn answer(self: *Turn, staging: *Staging) Runner.Error!void {
+fn answer(self: *Turn, staging: *Staging) AnswerError!void {
     var buffer: [tool_calls_max]usize = undefined;
     const calls = staging.callIndexes(&buffer);
     var position: usize = 0;
@@ -512,6 +522,7 @@ fn answer(self: *Turn, staging: *Staging) Runner.Error!void {
         try self.io.checkCancel();
         const pending = staging.pendingAt(calls[position]);
         if (Tool.mutating(self.options.tools, pending.call.name)) {
+            pending.started = true;
             self.emit(&.{ .tool_started = pending.call });
             const output = try self.options.runner.run(
                 self.gpa,
@@ -536,21 +547,24 @@ fn answerBatch(
     staging: *Staging,
     calls: []const usize,
     batch: Batch,
-) Runner.Error!usize {
+) AnswerError!usize {
     var futures: [read_only_calls_max]std.Io.Future(Runner.Error!Tool.Output) = undefined;
     var spawned: usize = 0;
     const items = self.history();
     for (calls[batch.start..batch.end]) |index| {
-        const call = &staging.pendingAt(index).call;
+        const pending = staging.pendingAt(index);
+        const call = &pending.call;
         const arguments = .{ self.options.runner, self.gpa, call, items, self.setup.variables };
         futures[spawned] = self.io.concurrent(runCall, arguments) catch break;
         spawned += 1;
+        pending.started = true;
         self.emit(&.{ .tool_started = call.* });
     }
-    if (spawned == 0) return error.OutOfMemory;
+    if (spawned == 0) return error.ConcurrencyUnavailable;
     var joined: usize = 0;
-    defer for (futures[joined..spawned]) |*future| {
-        if (future.cancel(self.io)) |output| output.deinit(self.gpa) else |_| {}
+    defer for (futures[joined..spawned], joined..) |*future, position| {
+        const output = future.cancel(self.io) catch continue;
+        self.settle(staging, calls[batch.start + position], output);
     };
     while (joined < spawned) : (joined += 1) {
         const output = try futures[joined].await(self.io);
@@ -577,6 +591,17 @@ fn settle(self: *Turn, staging: *Staging, index: usize, output: Tool.Output) voi
     const pending = staging.pendingAt(index);
     pending.output = output;
     self.emit(&.{ .tool_result = .{ .call = pending.call, .output = output } });
+}
+
+fn answerCanceled(self: *Turn, staging: *Staging) void {
+    var buffer: [tool_calls_max]usize = undefined;
+    for (staging.callIndexes(&buffer)) |index| {
+        const pending = staging.pendingAt(index);
+        if (pending.output != null) continue;
+        const text = if (pending.started) canceled_call_text else unstarted_call_text;
+        const content = self.gpa.dupe(u8, text) catch return;
+        self.settle(staging, index, .{ .content = content, .conditions = .initOne(.canceled) });
+    }
 }
 
 fn loadSkills(self: *Turn) Runner.Error!bool {

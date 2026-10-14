@@ -1407,7 +1407,10 @@ test "a running tool uses the final call name instead of the streamed name" {
     } });
     const painted = try rig.paintPlain(80);
     defer gpa.free(painted);
-    try testing.expectContains(painted, "Tool: write (running) · File: a.zig");
+    try testing.expectContains(
+        painted,
+        "Tool: write (running) · Time: 0s · File: a.zig · Timeout: 10s",
+    );
     try std.testing.expect(std.mem.find(u8, painted, "Tool: partial") == null);
 }
 
@@ -2710,8 +2713,8 @@ test "queued calls read as queued until each one runs" {
     try rig.apply(&.{ .tool_started = .{ .id = "c1", .name = "read", .arguments = "{}" } });
     const one = try rig.paintPlain(80);
     defer gpa.free(one);
-    try testing.expectContains(one, "Tool: read (running)");
-    try std.testing.expect(std.mem.find(u8, one, "Tool: read (running) ·") == null);
+    try testing.expectContains(one, "Tool: read (running) · Time: 0s · Timeout: 10s");
+    try std.testing.expect(std.mem.find(u8, one, "Received: 2 B") == null);
     try testing.expectContains(one, "Tool: write (queued) · Received: 0 B");
     try rig.apply(&.{ .tool_result = .{
         .call = .{ .id = "c1", .name = "read", .arguments = "{}" },

@@ -20,6 +20,7 @@ pub fn failureSentence(reason: core.Provider.Failure.Reason) []const u8 {
             "refusal, a pause, or an unsupported result.",
         .too_many_tool_calls => "Drinky stopped the reply because it asked for too many tool " ++
             "calls.",
+        .concurrency_unavailable => "Drinky could not start a task.",
         .out_of_memory => "Drinky ran out of memory.",
     };
 }

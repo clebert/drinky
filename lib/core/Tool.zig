@@ -96,6 +96,7 @@ pub const Condition = enum {
     timed_out,
     terminated,
     overflowed,
+    canceled,
     failed,
 
     fn isFailure(self: Condition) bool {
@@ -120,6 +121,7 @@ pub const Condition = enum {
             .timed_out,
             .terminated,
             .overflowed,
+            .canceled,
             .failed,
             => true,
         };

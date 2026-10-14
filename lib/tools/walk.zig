@@ -3,7 +3,6 @@ const std = @import("std");
 const core = @import("core");
 
 const glob = @import("glob.zig");
-const search = @import("search.zig");
 
 const version_control_directories = [_][]const u8{
     ".bzr",
@@ -76,7 +75,6 @@ const Options = struct {
     pattern: []const u8,
     retain: usize,
     entries_max: usize,
-    timer: ?search.Timer = null,
     noise_pruning: NoisePruning = .enabled,
     links: Links = .files,
     skips_max: usize = 0,
@@ -263,116 +261,157 @@ const Visited = struct {
     }
 };
 
-pub fn collect(io: std.Io, gpa: std.mem.Allocator, options: *const Options) !Match {
-    std.debug.assert(options.retain > 0);
-    var dir = try std.Io.Dir.cwd().openDir(io, options.base, .{ .iterate = true });
-    defer dir.close(io);
+pub const Collector = struct {
+    options: Options,
+    keeper: Keeper,
+    skips: Skips,
+    noise_skipped: [noise_directories.len]bool,
+    stop: Match.Stop,
+    opened: bool,
 
-    var walker = try dir.walkSelectively(gpa);
-    defer walker.deinit();
-    defer while (walker.stack.items.len > 0) walker.leave(io);
+    pub const Error = std.Io.Dir.OpenError || error{OutOfMemory};
 
-    var keeper: Keeper = .{ .base = options.base, .retain = options.retain };
-    defer keeper.deinit(gpa);
-    var skips: Skips = .{ .max = options.skips_max };
-    defer skips.deinit(gpa);
-    var visited: Visited = .{};
-    defer visited.deinit(gpa);
-    if (options.links == .files_and_directories) _ = try visited.seen(gpa, io, dir, ".");
-
-    const noise_pruning = options.noise_pruning == .enabled and !baseNamesNoise(options.base);
-    var noise_skipped: [noise_directories.len]bool = @splat(false);
-    var stop: Match.Stop = .none;
-    for (0..options.entries_max + 1) |attempt| {
-        const maybe_entry = walker.next(io) catch |err| switch (err) {
-            error.Canceled, error.OutOfMemory => |known| return known,
-            else => {
-                try skips.add(gpa, &.{ .kind = .entry, .path = "", .error_name = @errorName(err) });
-                if (attempt == options.entries_max) stop = .entries;
-                continue;
-            },
+    pub fn init(options: *const Options) Collector {
+        std.debug.assert(options.retain > 0);
+        return .{
+            .options = options.*,
+            .keeper = .{ .base = options.base, .retain = options.retain },
+            .skips = .{ .max = options.skips_max },
+            .noise_skipped = @splat(false),
+            .stop = .none,
+            .opened = false,
         };
-        const entry = maybe_entry orelse break;
-        if (attempt == options.entries_max) {
-            stop = .entries;
-            break;
-        }
-        const out_of_time = attempt > 0 and if (options.timer) |timer| timer.spent() else false;
-        if (out_of_time) {
-            stop = .time;
-            break;
-        }
-        switch (entry.kind) {
-            .directory => {
-                if (noise_pruning) {
-                    if (noiseIndex(entry.basename)) |noise_index| {
-                        if (noise_index >= version_control_directories.len) {
-                            noise_skipped[noise_index] = true;
+    }
+
+    pub fn deinit(self: *Collector, gpa: std.mem.Allocator) void {
+        self.keeper.deinit(gpa);
+        self.skips.deinit(gpa);
+    }
+
+    pub fn run(self: *Collector, io: std.Io, gpa: std.mem.Allocator) Error!void {
+        const options = &self.options;
+        var dir = try std.Io.Dir.cwd().openDir(io, options.base, .{ .iterate = true });
+        defer dir.close(io);
+        self.opened = true;
+
+        var walker = try dir.walkSelectively(gpa);
+        defer walker.deinit();
+        defer while (walker.stack.items.len > 0) walker.leave(io);
+
+        var visited: Visited = .{};
+        defer visited.deinit(gpa);
+        if (options.links == .files_and_directories) _ = try visited.seen(gpa, io, dir, ".");
+
+        const noise_pruning = options.noise_pruning == .enabled and !baseNamesNoise(options.base);
+        for (0..options.entries_max + 1) |attempt| {
+            const maybe_entry = walker.next(io) catch |err| switch (err) {
+                error.Canceled, error.OutOfMemory => |known| return known,
+                else => {
+                    try self.skips.add(gpa, &.{
+                        .kind = .entry,
+                        .path = "",
+                        .error_name = @errorName(err),
+                    });
+                    if (attempt == options.entries_max) self.stop = .entries;
+                    continue;
+                },
+            };
+            const entry = maybe_entry orelse break;
+            if (attempt == options.entries_max) {
+                self.stop = .entries;
+                break;
+            }
+            switch (entry.kind) {
+                .directory => {
+                    if (noise_pruning) {
+                        if (noiseIndex(entry.basename)) |noise_index| {
+                            if (noise_index >= version_control_directories.len) {
+                                self.noise_skipped[noise_index] = true;
+                            }
+                            continue;
                         }
-                        continue;
                     }
-                }
-                walker.enter(io, entry) catch |err| switch (err) {
+                    walker.enter(io, entry) catch |err| switch (err) {
+                        error.Canceled, error.OutOfMemory => |known| return known,
+                        else => try self.skips.add(gpa, &.{
+                            .kind = .directory,
+                            .path = entry.path,
+                            .error_name = @errorName(err),
+                        }),
+                    };
+                },
+                .file => if (glob.match(&.{ .pattern = options.pattern, .path = entry.path })) {
+                    try self.keeper.offer(gpa, entry.path);
+                },
+                .sym_link => try self.followLink(io, gpa, &.{
+                    .walker = &walker,
+                    .visited = &visited,
+                    .entry = entry,
+                }),
+                else => {},
+            }
+        }
+    }
+
+    pub fn match(self: *Collector, gpa: std.mem.Allocator) error{OutOfMemory}!Match {
+        var result: Match = .{
+            .paths = &.{},
+            .matched = self.keeper.matched,
+            .stop = self.stop,
+            .skipped_noise = .{ .names = &.{} },
+            .skips = &.{},
+            .entries_unread = self.skips.count,
+        };
+        errdefer result.deinit(gpa);
+        result.skipped_noise = try .init(gpa, &self.noise_skipped);
+        result.skips = try self.skips.items.toOwnedSlice(gpa);
+        result.paths = try self.keeper.toOwnedSorted(gpa);
+        return result;
+    }
+
+    fn followLink(self: *Collector, io: std.Io, gpa: std.mem.Allocator, link: *const struct {
+        walker: *std.Io.Dir.SelectiveWalker,
+        visited: *Visited,
+        entry: std.Io.Dir.Walker.Entry,
+    }) Error!void {
+        const options = &self.options;
+        const entry = link.entry;
+        const matched = glob.match(&.{ .pattern = options.pattern, .path = entry.path });
+        if (!matched and options.links == .files) return;
+        const stat = entry.dir.statFile(io, entry.basename, .{}) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            error.FileNotFound => return,
+            else => return self.skips.add(gpa, &.{
+                .kind = .link,
+                .path = entry.path,
+                .error_name = @errorName(err),
+            }),
+        };
+        switch (stat.kind) {
+            .file => if (matched) try self.keeper.offer(gpa, entry.path),
+            .directory => if (options.links == .files_and_directories) {
+                if (try link.visited.seen(gpa, io, entry.dir, entry.basename)) return;
+                var directory = entry;
+                directory.kind = .directory;
+                link.walker.enter(io, directory) catch |err| switch (err) {
                     error.Canceled, error.OutOfMemory => |known| return known,
-                    else => try skips.add(gpa, &.{
-                        .kind = .directory,
+                    else => try self.skips.add(gpa, &.{
+                        .kind = .followed_link,
                         .path = entry.path,
                         .error_name = @errorName(err),
                     }),
                 };
             },
-            .file => if (glob.match(&.{ .pattern = options.pattern, .path = entry.path })) {
-                try keeper.offer(gpa, entry.path);
-            },
-            .sym_link => {
-                const matched = glob.match(&.{ .pattern = options.pattern, .path = entry.path });
-                if (!matched and options.links == .files) continue;
-                const stat = entry.dir.statFile(io, entry.basename, .{}) catch |err| switch (err) {
-                    error.Canceled => return error.Canceled,
-                    error.FileNotFound => continue,
-                    else => {
-                        try skips.add(gpa, &.{
-                            .kind = .link,
-                            .path = entry.path,
-                            .error_name = @errorName(err),
-                        });
-                        continue;
-                    },
-                };
-                switch (stat.kind) {
-                    .file => if (matched) try keeper.offer(gpa, entry.path),
-                    .directory => if (options.links == .files_and_directories) {
-                        if (try visited.seen(gpa, io, entry.dir, entry.basename)) continue;
-                        var link = entry;
-                        link.kind = .directory;
-                        walker.enter(io, link) catch |err| switch (err) {
-                            error.Canceled, error.OutOfMemory => |known| return known,
-                            else => try skips.add(gpa, &.{
-                                .kind = .followed_link,
-                                .path = entry.path,
-                                .error_name = @errorName(err),
-                            }),
-                        };
-                    },
-                    else => {},
-                }
-            },
             else => {},
         }
     }
-    var match: Match = .{
-        .paths = &.{},
-        .matched = keeper.matched,
-        .stop = stop,
-        .skipped_noise = .{ .names = &.{} },
-        .skips = &.{},
-        .entries_unread = skips.count,
-    };
-    errdefer match.deinit(gpa);
-    match.skipped_noise = try .init(gpa, &noise_skipped);
-    match.skips = try skips.items.toOwnedSlice(gpa);
-    match.paths = try keeper.toOwnedSorted(gpa);
-    return match;
+};
+
+pub fn collect(io: std.Io, gpa: std.mem.Allocator, options: *const Options) !Match {
+    var collector: Collector = .init(options);
+    defer collector.deinit(gpa);
+    try collector.run(io, gpa);
+    return collector.match(gpa);
 }
 
 pub fn writeUnread(writer: *std.Io.Writer, entries_unread: usize) !void {
@@ -680,30 +719,6 @@ test "collect stops at the entry-visit work cap" {
     try std.testing.expect(matches.paths.len <= 10);
 }
 
-test "collect stops when the search runs out of time" {
-    const io = std.testing.io;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try makeTree(io, tmp.dir, .{ .directories = 20, .files = 10 });
-    var base_buffer: [128]u8 = undefined;
-    const base = try std.mem.print(&base_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-
-    var clock: core.testing.StepClock = undefined;
-    clock.init(std.testing.allocator, search.timeout_ms);
-    defer clock.deinit();
-    var matches = try collect(clock.io(), std.testing.allocator, &.{
-        .base = base,
-        .pattern = "**",
-        .retain = 1000,
-        .entries_max = entries_max,
-        .timer = .start(clock.io()),
-    });
-    defer matches.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(Match.Stop.time, matches.stop);
-    try std.testing.expect(matches.matched < 200);
-}
-
 test "collect reports no stop for a tree it read whole" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -712,15 +727,11 @@ test "collect reports no stop for a tree it read whole" {
     var base_buffer: [128]u8 = undefined;
     const base = try std.mem.print(&base_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
 
-    var clock: core.testing.StepClock = undefined;
-    clock.init(std.testing.allocator, search.timeout_ms);
-    defer clock.deinit();
-    var matches = try collect(clock.io(), std.testing.allocator, &.{
+    var matches = try collect(io, std.testing.allocator, &.{
         .base = base,
         .pattern = "**",
         .retain = 1000,
         .entries_max = entries_max,
-        .timer = .start(clock.io()),
     });
     defer matches.deinit(std.testing.allocator);
 

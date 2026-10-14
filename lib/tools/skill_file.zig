@@ -1,12 +1,19 @@
 const std = @import("std");
 
+const core = @import("core");
+
 const format = @import("format.zig");
 const fs = @import("fs.zig");
 
-pub const ReadError = std.Io.Dir.ReadFileAllocError || error{InvalidSkillText};
+pub const ReadError = fs.ReadError || error{InvalidSkillText};
 
-pub fn read(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ReadError![]u8 {
-    const content = try fs.readFile(gpa, io, path);
+pub fn read(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    deadline: *const core.timeout.Deadline,
+    path: []const u8,
+) ReadError![]u8 {
+    const content = try fs.readFile(gpa, io, deadline, path);
     errdefer gpa.free(content);
     if (content.len == 0 or !format.isText(content)) return error.InvalidSkillText;
     return content;
@@ -38,10 +45,10 @@ test "a skill file must hold text" {
         const path = try tmp.dir.realPathFileAlloc(io, "SKILL.md", gpa);
         defer gpa.free(path);
         if (!case.valid) {
-            try std.testing.expectError(error.InvalidSkillText, read(gpa, io, path));
+            try std.testing.expectError(error.InvalidSkillText, read(gpa, io, &.unbounded, path));
             continue;
         }
-        const content = try read(gpa, io, path);
+        const content = try read(gpa, io, &.unbounded, path);
         defer gpa.free(content);
         try std.testing.expectEqualStrings(case.data, content);
     }

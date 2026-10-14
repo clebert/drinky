@@ -139,7 +139,7 @@ fn writeCommands(writer: *std.Io.Writer) !void {
         \\Other metadata and command text use dim text with the default foreground color.
         \\Tool error sentences use dim text with the default foreground color.
         \\The `complete` status uses green, and `failed` uses red.
-        \\The work statuses `truncated` and `canceled` use yellow.
+        \\The tool status `canceled` and the work statuses `truncated` and `canceled` use yellow.
         \\The `queued`, `streaming`, and `running` statuses use cyan.
         \\
         \\Verbose on shows complete thinking text, a row for each tool call, and complete bash
@@ -159,6 +159,9 @@ fn writeCommands(writer: *std.Io.Writer) !void {
         \\The open run stays below the transcript.
         \\The final status is `complete`, `canceled`, `failed`, or `truncated`.
         \\The transcript keeps thinking after a cancellation or failure.
+        \\A cancel while tools run keeps the tool calls of the reply in the transcript and in the
+        \\model conversation. Each call that did not complete gets the status `canceled`.
+        \\A cancel while the model streams removes each tool call of the unfinished reply.
         \\A toggle changes no stored text and does not change the model conversation.
         \\
         \\Tool metadata stays on one row, with the tool name and state first.
@@ -167,7 +170,8 @@ fn writeCommands(writer: *std.Io.Writer) !void {
         \\Time has the next priority, followed by the bash exit code, file or pattern, limit
         \\details, counts, and secondary measures.
         \\Received bytes and timeout values have the lowest priority.
-        \\Only `bash`, `find`, and `grep` show time.
+        \\A running call with a time limit shows its time and the limit.
+        \\After the call, only `bash`, `find`, and `grep` show time.
         \\A successful tool shows `complete`, even with a file window or truncated output.
         \\The tool status records the operation outcome, not the output completeness.
         \\Bash commands and complete tool error sentences appear below the metadata.

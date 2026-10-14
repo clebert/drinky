@@ -50,7 +50,8 @@ pub const Skill = struct {
         io: std.Io,
         arguments: []const u8,
     ) tools.skill_file.ReadError![]u8 {
-        const data = try tools.skill_file.read(gpa, io, self.path);
+        const deadline: core.timeout.Deadline = .start(io, tools.fs.timeout_ms);
+        const data = try tools.skill_file.read(gpa, io, &deadline, self.path);
         defer gpa.free(data);
 
         var output: std.Io.Writer.Allocating = .init(gpa);
@@ -674,6 +675,30 @@ test "explicit invocation loads the full file and appends arguments" {
     try std.testing.expect(std.mem.find(u8, prompt, skill.path) != null);
     try std.testing.expect(std.mem.find(u8, prompt, source) != null);
     try std.testing.expect(std.mem.endsWith(u8, prompt, "\napply it to report.pdf"));
+}
+
+test "an explicit invocation stops at the time limit when the skill file never opens" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tree: testing.Tree = try .init();
+    defer tree.deinit();
+    try tree.skill("user/invoke", &.{ .name = "invoke", .description = "invocation test" });
+    try tree.directory("work");
+    var registry = try discover(gpa, io, &.{
+        .user_root = try tree.path("user"),
+        .project_start = try tree.path("work"),
+        .project_root = null,
+    });
+    defer registry.deinit();
+    var stall: tools.testing.StallIo = undefined;
+    stall.init(gpa, .{ .open_file = "SKILL.md" });
+    defer stall.deinit();
+
+    try std.testing.expectError(
+        error.Timeout,
+        registry.get("invoke").?.invoke(gpa, stall.io(), "apply it"),
+    );
+    try std.testing.expect(stall.canceled.load(.acquire));
 }
 
 test "discovery follows directory symlinks once and skips cycles" {

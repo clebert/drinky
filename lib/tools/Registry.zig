@@ -7,6 +7,7 @@ const Context = @import("Context.zig");
 const describe_drinky = @import("describe_drinky.zig");
 const edit = @import("edit.zig");
 const find = @import("find.zig");
+const fs = @import("fs.zig");
 const grep = @import("grep.zig");
 const output = @import("output.zig");
 const read = @import("read.zig");
@@ -66,9 +67,24 @@ pub const Description = struct {
 };
 
 const entries = [_]Entry{
-    .{ .tool = read.spec, .run = read.run, .subject = .{ .argument = "path", .kind = .path } },
-    .{ .tool = write.spec, .run = write.run, .subject = .{ .argument = "path", .kind = .path } },
-    .{ .tool = edit.spec, .run = edit.run, .subject = .{ .argument = "path", .kind = .path } },
+    .{
+        .tool = read.spec,
+        .run = read.run,
+        .subject = .{ .argument = "path", .kind = .path },
+        .timeout = .{ .fixed = fs.timeout_ms },
+    },
+    .{
+        .tool = write.spec,
+        .run = write.run,
+        .subject = .{ .argument = "path", .kind = .path },
+        .timeout = .{ .fixed = fs.timeout_ms },
+    },
+    .{
+        .tool = edit.spec,
+        .run = edit.run,
+        .subject = .{ .argument = "path", .kind = .path },
+        .timeout = .{ .fixed = fs.timeout_ms },
+    },
     .{
         .tool = find.spec,
         .run = find.run,
@@ -116,7 +132,16 @@ fn run(
         "Drinky does not recognize the tool {s}.",
         .{call.name},
     );
-    const context: Context = .{ .gpa = gpa, .host = self.host, .variables = variables };
+    const deadline: core.timeout.Deadline = switch (entry.timeout) {
+        .fixed => |timeout_ms| .start(self.host.io, timeout_ms),
+        .none, .argument => .unbounded,
+    };
+    const context: Context = .{
+        .gpa = gpa,
+        .host = self.host,
+        .variables = variables,
+        .deadline = deadline,
+    };
     const guard = self.skill_guard orelse return runEntry(&context, entry, call);
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
@@ -125,6 +150,7 @@ fn run(
     const check: SkillGuard.CheckOptions = .{
         .gpa = gpa,
         .io = self.host.io,
+        .deadline = deadline,
         .path = path,
         .history = items,
     };
@@ -428,6 +454,39 @@ test "a guarded change waits for its skill, which a round boundary delivers and 
     try testing.expectConditions(&forgotten, &.{.skill_required});
 }
 
+test "a guarded call holds one time limit across every skill file that it reads" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var fixture: testing.SkillFixture = try .init(gpa);
+    defer fixture.deinit(gpa);
+    var other = try fixture.tmp.dir.createDirPathOpen(io, "other", .{});
+    defer other.close(io);
+    try other.writeFile(io, .{ .sub_path = "SKILL.md", .data = "---\nname: zig-extra\n---\n" });
+    const other_source = try std.Io.Dir.path.join(gpa, &.{ fixture.root, "other", "SKILL.md" });
+    defer gpa.free(other_source);
+    try fixture.guard.add(.{ .glob = "**/*.zig", .skill = "zig-extra", .source = other_source });
+    var stall: testing.StallIo = undefined;
+    stall.init(gpa, .{ .open_file = "SKILL.md" });
+    defer stall.deinit();
+    var registry: Registry = .{ .host = .{ .io = stall.io() }, .skill_guard = &fixture.guard };
+    const arguments = try gpa.print(
+        "{{\"path\":\"{s}/new.zig\",\"content\":\"x\"}}",
+        .{fixture.root},
+    );
+    defer gpa.free(arguments);
+
+    const refused = try registry.runner().run(gpa, &.{
+        .id = "1",
+        .name = "write",
+        .arguments = arguments,
+    }, &.{}, &.{});
+    defer refused.deinit(gpa);
+    try testing.expectConditions(&refused, &.{.skill_required});
+    try std.testing.expect(std.mem.find(u8, refused.content, "error Timeout") != null);
+    try std.testing.expectEqual(@as(usize, 1), stall.slept().len);
+    try std.testing.expect(stall.canceled.load(.acquire));
+}
+
 test "a read of a guarded file queues its skill, and a failed read queues none" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -549,7 +608,8 @@ test "a described call reports the timeout it runs under" {
             .input = "{\"pattern\":\"x\",\"timeout_seconds\":5}",
             .expected = search.timeout_ms,
         },
-        .{ .name = "read", .input = "{\"path\":\"a\"}", .expected = null },
+        .{ .name = "read", .input = "{\"path\":\"a\"}", .expected = fs.timeout_ms },
+        .{ .name = "describe_drinky", .input = "{}", .expected = null },
         .{ .name = "nonesuch", .input = "{}", .expected = null },
         .{ .name = "bash", .input = "{\"comm", .expected = 120_000 },
         .{

@@ -27,6 +27,7 @@ pub fn delay(self: *const Retry, attempt: u32, failure: *const Provider.Failure)
         .context_overflow,
         .unsupported_reply,
         .too_many_tool_calls,
+        .concurrency_unavailable,
         .out_of_memory,
         => return null,
     }

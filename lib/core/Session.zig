@@ -363,7 +363,7 @@ fn prompt(self: *Session, text: []const u8) void {
         .measured = null,
     };
     self.mailbox.start(self.io, runTurn, .{turn}) catch
-        self.emit(&.{ .turn_ended = .{ .failed = .{ .reason = .out_of_memory } } });
+        self.emit(&.{ .turn_ended = .{ .failed = .{ .reason = .concurrency_unavailable } } });
 }
 
 fn appendPrompt(self: *Session, turn: usize, text: []const u8) error{OutOfMemory}!void {
@@ -391,7 +391,7 @@ fn ask(self: *Session, request: Aside.Request) void {
     };
     self.mailbox.start(self.io, runAside, .{aside}) catch {
         self.dropAside();
-        self.emit(&.{ .aside_ended = .{ .failed = .{ .reason = .out_of_memory } } });
+        self.emit(&.{ .aside_ended = .{ .failed = .{ .reason = .concurrency_unavailable } } });
     };
 }
 
@@ -544,6 +544,9 @@ const fixture = struct {
     };
     const write_call: Tool.Call = .{ .id = "w1", .name = "write", .arguments = "{}" };
     const stop_complete: Provider.Event = .{ .stopped = .{} };
+    const canceled_text = "The user canceled the call before Drinky received its result. " ++
+        "The call can have completed some or all of its work.";
+    const unstarted_text = "Drinky did not run the call because the user canceled the turn.";
 
     fn message(text: []const u8) Provider.Event {
         return .{ .output = .{ .message = text } };
@@ -693,7 +696,7 @@ test "a cut reasoning block leaves the screen and the conversation with the bloc
     );
 }
 
-test "a cancel while a tool call runs leaves the next call unanswered" {
+test "a cancel while a tool call runs answers the next call as a call that did not run" {
     var harness: testing.Harness = undefined;
     try harness.init(std.testing.allocator, std.testing.io, &.{});
     defer harness.deinit();
@@ -714,7 +717,7 @@ test "a cancel while a tool call runs leaves the next call unanswered" {
         \\tool_call_started:read
         \\tool_started:w1
         \\tool_result:w1:done
-        \\tail_discarded:1
+        \\tool_result:c1:Drinky did not run the call because the user canceled the turn.:canceled
         \\committed
         \\turn_ended:canceled
     , try harness.turn("hi"));
@@ -722,12 +725,13 @@ test "a cancel while a tool call runs leaves the next call unanswered" {
     try std.testing.expectEqual(@as(usize, 1), harness.runner.calls.items.len);
     _ = try harness.turn("next");
     try std.testing.expectEqualStrings(
-        "model-a|user:hi|call:w1:write:{}|result:w1:done|user:next",
+        "model-a|user:hi|call:w1:write:{}|call:c1:read:{\"path\":\"a.txt\"}|result:w1:done|" ++
+            "result:c1:Drinky did not run the call because the user canceled the turn.|user:next",
         harness.provider.requests.items[1],
     );
 }
 
-test "a cancel ends a running read-only call, and the call stays unanswered" {
+test "a cancel ends a running read-only call, and the call keeps a canceled result" {
     var harness: testing.Harness = undefined;
     try harness.init(std.testing.allocator, std.testing.io, &.{});
     defer harness.deinit();
@@ -746,15 +750,113 @@ test "a cancel ends a running read-only call, and the call stays unanswered" {
         .after_cancel = .fail,
     };
     try std.testing.expectEqualStrings(
-        \\tool_call_started:read
-        \\tool_started:c1
-        \\tail_discarded:1
-        \\turn_ended:canceled
-    , try harness.turn("hi"));
+        "tool_call_started:read\ntool_started:c1\ntool_result:c1:" ++ fixture.canceled_text ++
+            ":canceled\ncommitted\nturn_ended:canceled",
+        try harness.turn("hi"),
+    );
     try std.testing.expectEqual(@as(u32, 1), harness.runner.canceled);
     _ = try harness.turn("next");
     try std.testing.expectEqualStrings(
+        "model-a|user:hi|call:c1:read:{\"path\":\"a.txt\"}|result:c1:" ++ fixture.canceled_text ++
+            "|user:next",
+        harness.provider.requests.items[1],
+    );
+}
+
+test "a cancel during a write answers the write as started and the next call as not run" {
+    var harness: testing.Harness = undefined;
+    try harness.init(std.testing.allocator, std.testing.io, &.{});
+    defer harness.deinit();
+
+    harness.provider.load(&.{
+        .{ .done = &.{
+            .{ .tool_call_started = "write" },
+            fixture.toolCall(fixture.write_call),
+            .{ .tool_call_started = "read" },
+            fixture.toolCall(fixture.call),
+            fixture.stop_complete,
+        } },
+        .{ .done = &.{ fixture.message("ok"), fixture.stop_complete } },
+    });
+    harness.runner.hook = .{
+        .session = &harness.session,
+        .command = .cancel,
+        .after_cancel = .fail,
+    };
+    try std.testing.expectEqualStrings(
+        "tool_call_started:write\ntool_call_started:read\ntool_started:w1\ntool_result:w1:" ++
+            fixture.canceled_text ++ ":canceled\ntool_result:c1:" ++ fixture.unstarted_text ++
+            ":canceled\ncommitted\nturn_ended:canceled",
+        try harness.turn("hi"),
+    );
+    try std.testing.expectEqual(@as(u32, 1), harness.runner.canceled);
+    _ = try harness.turn("next");
+    try std.testing.expectEqualStrings(
+        "model-a|user:hi|call:w1:write:{}|call:c1:read:{\"path\":\"a.txt\"}|result:w1:" ++
+            fixture.canceled_text ++ "|result:c1:" ++ fixture.unstarted_text ++ "|user:next",
+        harness.provider.requests.items[1],
+    );
+}
+
+test "a cancel while the model streams removes the tool calls of the unfinished reply" {
+    var harness: testing.Harness = undefined;
+    try harness.init(std.testing.allocator, std.testing.io, &.{});
+    defer harness.deinit();
+
+    harness.provider.load(&.{
+        .{ .open = &.{
+            .{ .tool_call_started = "read" },
+            fixture.toolCall(fixture.call),
+            .{ .text = "more" },
+        } },
+        .{ .done = &.{ fixture.message("ok"), fixture.stop_complete } },
+    });
+    try harness.prompt("hi");
+    try harness.expect("tool_call_started:read");
+    try harness.expect("text_started");
+    try harness.expect("text:more");
+    try harness.session.send(&.cancel);
+    try std.testing.expectEqualStrings(
+        \\tail_discarded:2
+        \\turn_ended:canceled
+    , try harness.until("turn_ended"));
+    try std.testing.expectEqual(@as(usize, 0), harness.runner.calls.items.len);
+    _ = try harness.turn("next");
+    try std.testing.expectEqualStrings(
         "model-a|user:hi|user:next",
+        harness.provider.requests.items[1],
+    );
+}
+
+test "a cancel keeps the result of a read-only call that completed before the cancel" {
+    var harness: testing.Harness = undefined;
+    try harness.init(std.testing.allocator, std.testing.io, &.{});
+    defer harness.deinit();
+
+    harness.provider.load(&.{
+        .{ .done = &.{
+            fixture.toolCall(fixture.call),
+            fixture.toolCall(fixture.next_call),
+            fixture.stop_complete,
+        } },
+        .{ .done = &.{ fixture.message("ok"), fixture.stop_complete } },
+    });
+    harness.runner.hook = .{
+        .session = &harness.session,
+        .command = .cancel,
+        .after_cancel = .fail,
+        .maybe_call_id = fixture.call.id,
+    };
+    try std.testing.expectEqualStrings(
+        "tool_call_started:read\ntool_call_started:read\ntool_started:c1\ntool_started:c2\n" ++
+            "tool_result:c2:done\ntool_result:c1:" ++ fixture.canceled_text ++
+            ":canceled\ncommitted\nturn_ended:canceled",
+        try harness.turn("hi"),
+    );
+    _ = try harness.turn("next");
+    try std.testing.expectEqualStrings(
+        "model-a|user:hi|call:c1:read:{\"path\":\"a.txt\"}|call:c2:read:{\"path\":\"b.txt\"}|" ++
+            "result:c1:" ++ fixture.canceled_text ++ "|result:c2:done|user:next",
         harness.provider.requests.items[1],
     );
 }
@@ -1152,7 +1254,7 @@ test "an aside repeats a failed attempt before its first text and ends at a fail
     try std.testing.expectEqual(@as(usize, 2), harness.provider.requests.items.len);
 }
 
-test "an aside whose task cannot start fails as out of memory and sends no request" {
+test "an aside whose task cannot start fails as unavailable concurrency and sends no request" {
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{
         .concurrent_limit = .limited(1),
     });
@@ -1163,7 +1265,7 @@ test "an aside whose task cannot start fails as out of memory and sends no reque
 
     harness.provider.load(&.{.{ .done = &.{ fixture.message("ok"), fixture.stop_complete } }});
     try harness.ask("The long answer.");
-    try harness.expect("aside_ended:failed:out_of_memory:");
+    try harness.expect("aside_ended:failed:concurrency_unavailable:");
     try std.testing.expectEqual(@as(usize, 0), harness.provider.requests.items.len);
 }
 
@@ -1463,12 +1565,12 @@ test "a read-only call whose task cannot start fails the turn and stays unanswer
     try std.testing.expectEqualStrings(
         \\tool_call_started:read
         \\tail_discarded:1
-        \\turn_ended:failed:out_of_memory:
+        \\turn_ended:failed:concurrency_unavailable:
     , try harness.turn("hi"));
     try std.testing.expectEqual(@as(usize, 0), harness.runner.calls.items.len);
 }
 
-test "a turn whose task cannot start fails as out of memory and sends no request" {
+test "a turn whose task cannot start fails as unavailable concurrency and sends no request" {
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{
         .concurrent_limit = .limited(1),
     });
@@ -1479,7 +1581,7 @@ test "a turn whose task cannot start fails as out of memory and sends no request
 
     harness.provider.load(&.{.{ .done = &.{ fixture.message("ok"), fixture.stop_complete } }});
     try std.testing.expectEqualStrings(
-        "turn_ended:failed:out_of_memory:",
+        "turn_ended:failed:concurrency_unavailable:",
         try harness.turn("hi"),
     );
     try std.testing.expectEqual(@as(usize, 0), harness.provider.requests.items.len);
@@ -1757,8 +1859,12 @@ test "a reply keeps its reasoning and tool calls in stream order" {
 }
 
 test "a reasoning item whose own call stays unanswered leaves with the call" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{
+        .concurrent_limit = .limited(2),
+    });
+    defer threaded.deinit();
     var harness: testing.Harness = undefined;
-    try harness.init(std.testing.allocator, std.testing.io, &.{});
+    try harness.init(std.testing.allocator, threaded.io(), &.{});
     defer harness.deinit();
 
     const second_proof: Conversation.Proof = .{ .account = "account-a", .payload = "p2" };
@@ -1776,7 +1882,6 @@ test "a reasoning item whose own call stays unanswered leaves with the call" {
         } },
         .{ .done = &.{ fixture.message("ok"), fixture.stop_complete } },
     });
-    harness.runner.hook = .{ .session = &harness.session, .command = .cancel };
     try std.testing.expectEqualStrings(
         \\reasoning_started
         \\tool_call_started:write
@@ -1786,9 +1891,8 @@ test "a reasoning item whose own call stays unanswered leaves with the call" {
         \\tool_result:w1:done
         \\tail_discarded:2
         \\committed
-        \\turn_ended:canceled
+        \\turn_ended:failed:concurrency_unavailable:
     , try harness.turn("hi"));
-    try std.testing.expectEqual(@as(u32, 1), harness.runner.canceled);
     _ = try harness.turn("next");
     try std.testing.expectEqualStrings(
         "model-a|user:hi|reasoning:account-a:p1|call:w1:write:{}|result:w1:done|user:next",

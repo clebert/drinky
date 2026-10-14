@@ -54,19 +54,27 @@ pub fn run(context: *const Context, input_json: []const u8) Context.Error!core.T
     if (parsed.value.limit == 0)
         return output.failure(gpa, .invalid_arguments, "Set limit to 1 or more.", .{});
     const input = &parsed.value;
-    const timer: search.Timer = .start(context.host.io);
+    const io = context.host.io;
+    const timer: search.Timer = .start(io);
     const pattern = input.pattern;
     const base = if (input.path.len == 0) "." else input.path;
     const limit = input.limit;
 
-    var matches = walk.collect(context.host.io, gpa, &.{
+    var collector: walk.Collector = .init(&.{
         .base = base,
         .pattern = pattern,
         .retain = limit,
         .entries_max = context.host.search.entries_max,
-        .timer = timer,
-    }) catch |err|
-        return output.cannot(gpa, err, "search", base);
+    });
+    defer collector.deinit(gpa);
+    context.deadline.run(io, walk.Collector.run, .{ &collector, io, gpa }, null) catch |err|
+        switch (err) {
+            error.Timeout => collector.stop = .time,
+            error.Canceled, error.OutOfMemory => |known| return known,
+            else => |failure| return output.cannot(gpa, failure, "search", base),
+        };
+    if (collector.stop == .time and !collector.opened) return search.unanswered(gpa, base);
+    var matches = try collector.match(gpa);
     defer matches.deinit(gpa);
 
     const elapsed_ms = timer.elapsedMs();
@@ -342,17 +350,25 @@ fn runIn(context: *const Context, comptime input: []const u8, base: []const u8) 
     return run(context, try std.mem.print(&buffer, input, .{base}));
 }
 
-test "find accepts an empty path" {
+test "find treats an empty path as the working directory" {
     const gpa = std.testing.allocator;
-    var clock: core.testing.StepClock = undefined;
-    clock.init(gpa, search.timeout_ms);
-    defer clock.deinit();
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = clock.io() } };
+    var stall: testing.StallIo = undefined;
+    stall.init(gpa, .{ .open_directory = "." });
+    defer stall.deinit();
+    const context: Context = .{
+        .gpa = gpa,
+        .host = .{ .io = stall.io() },
+        .deadline = .start(stall.io(), search.timeout_ms),
+    };
     const result = try run(&context,
         \\{"pattern":"**/*.zig","path":""}
     );
     defer result.deinit(gpa);
-    try std.testing.expect(!result.hasFailure());
+    try std.testing.expectEqualStrings(
+        "Drinky could not search . because the file system did not respond within 10 seconds.",
+        result.content,
+    );
+    try std.testing.expect(stall.canceled.load(.acquire));
 }
 
 test "find refuses a zero limit" {
@@ -398,10 +414,14 @@ test "find reports a missing base directory as a failure" {
 test "find reports a search that ran out of time" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    var clock: core.testing.StepClock = undefined;
-    clock.init(gpa, search.timeout_ms);
-    defer clock.deinit();
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = clock.io() } };
+    var stall: testing.StallIo = undefined;
+    stall.init(gpa, .directory_end);
+    defer stall.deinit();
+    const context: Context = .{
+        .gpa = gpa,
+        .host = .{ .io = stall.io() },
+        .deadline = .start(stall.io(), search.timeout_ms),
+    };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "" });
@@ -412,20 +432,27 @@ test "find reports a search that ran out of time" {
     const result = try runIn(&context, "{{\"pattern\":\"**/*.zig\",\"path\":\"{s}\"}}", base);
     defer result.deinit(gpa);
     try std.testing.expect(!result.hasFailure());
-    try std.testing.expect(
-        std.mem.find(u8, result.content, "Drinky stopped the search after") != null,
+    try std.testing.expectStringStartsWith(
+        result.content,
+        "No files match **/*.zig in the part that Drinky searched. Drinky stopped the search " ++
+            "after ",
     );
     try testing.expectTimed(&result, &.{.{ .matches, 0 }});
     try testing.expectConditions(&result, &.{.time_limit_reached});
+    try std.testing.expect(stall.canceled.load(.acquire));
 }
 
-test "find keeps the matches it found before the clock ran out" {
+test "find keeps the matches it found before the time limit" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    var clock: core.testing.StepClock = undefined;
-    clock.init(gpa, search.timeout_ms);
-    defer clock.deinit();
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = clock.io() } };
+    var stall: testing.StallIo = undefined;
+    stall.init(gpa, .directory_end);
+    defer stall.deinit();
+    const context: Context = .{
+        .gpa = gpa,
+        .host = .{ .io = stall.io() },
+        .deadline = .start(stall.io(), search.timeout_ms),
+    };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "a.zig", .data = "" });
@@ -436,22 +463,33 @@ test "find keeps the matches it found before the clock ran out" {
     const result = try runIn(&context, "{{\"pattern\":\"**/*.zig\",\"path\":\"{s}\"}}", base);
     defer result.deinit(gpa);
     try std.testing.expect(!result.hasFailure());
-    try std.testing.expect(std.mem.find(u8, result.content, ".zig\n[Drinky ") != null);
+    var expected_buffer: [128]u8 = undefined;
+    const expected = try std.mem.print(
+        &expected_buffer,
+        "{s}/a.zig\n{s}/b.zig\n[Drinky stopped the search after ",
+        .{ base, base },
+    );
+    try std.testing.expectStringStartsWith(result.content, expected);
     try std.testing.expectStringEndsWith(
         result.content,
-        ". Drinky shows the first 1 match in path order. Use a narrower path or pattern.]",
+        ". Drinky shows the first 2 matches in path order. Use a narrower path or pattern.]",
     );
-    try testing.expectTimed(&result, &.{.{ .matches, 1 }});
+    try testing.expectTimed(&result, &.{.{ .matches, 2 }});
     try testing.expectConditions(&result, &.{.time_limit_reached});
+    try std.testing.expect(stall.canceled.load(.acquire));
 }
 
-test "find measures the matches that it omitted when the clock stops the search" {
+test "find measures the matches that it omitted when the time limit stops the search" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    var clock: core.testing.StepClock = undefined;
-    clock.init(gpa, search.timeout_ms - 1);
-    defer clock.deinit();
-    const context: Context = .{ .gpa = gpa, .host = .{ .io = clock.io() } };
+    var stall: testing.StallIo = undefined;
+    stall.init(gpa, .directory_end);
+    defer stall.deinit();
+    const context: Context = .{
+        .gpa = gpa,
+        .host = .{ .io = stall.io() },
+        .deadline = .start(stall.io(), search.timeout_ms),
+    };
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     for ([_][]const u8{ "a.zig", "b.zig", "c.zig" }) |name| {
@@ -464,8 +502,65 @@ test "find measures the matches that it omitted when the clock stops the search"
     const result = try runIn(&context, input, base);
     defer result.deinit(gpa);
     try std.testing.expect(!result.hasFailure());
-    try testing.expectTimed(&result, &.{ .{ .matches, 1 }, .{ .matches_omitted, 1 } });
+    try testing.expectTimed(&result, &.{ .{ .matches, 1 }, .{ .matches_omitted, 2 } });
     try testing.expectConditions(&result, &.{.time_limit_reached});
+    try std.testing.expect(stall.canceled.load(.acquire));
+}
+
+test "find fails at the time limit when its base directory never opens" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var stall: testing.StallIo = undefined;
+    stall.init(gpa, .{ .open_directory = &tmp.sub_path });
+    defer stall.deinit();
+    const context: Context = .{
+        .gpa = gpa,
+        .host = .{ .io = stall.io() },
+        .deadline = .start(stall.io(), search.timeout_ms),
+    };
+    var base_buffer: [128]u8 = undefined;
+    const base = try std.mem.print(&base_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+
+    const result = try runIn(&context, "{{\"pattern\":\"**/*.zig\",\"path\":\"{s}\"}}", base);
+    defer result.deinit(gpa);
+    var expected_buffer: [160]u8 = undefined;
+    const expected = try std.mem.print(
+        &expected_buffer,
+        "Drinky could not search {s} because the file system did not respond within 10 seconds.",
+        .{base},
+    );
+    try std.testing.expectEqualStrings(expected, result.content);
+    try testing.expectConditions(&result, &.{.timed_out});
+    try std.testing.expect(stall.canceled.load(.acquire));
+}
+
+test "find stops at the time limit when a directory never opens" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var stall: testing.StallIo = undefined;
+    stall.init(gpa, .{ .open_directory = "stuck" });
+    defer stall.deinit();
+    const context: Context = .{
+        .gpa = gpa,
+        .host = .{ .io = stall.io() },
+        .deadline = .start(stall.io(), search.timeout_ms),
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "stuck", .default_dir);
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.zig", .data = "" });
+    var base_buffer: [128]u8 = undefined;
+    const base = try std.mem.print(&base_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+
+    const result = try runIn(&context, "{{\"pattern\":\"**/*.zig\",\"path\":\"{s}\"}}", base);
+    defer result.deinit(gpa);
+    try std.testing.expect(!result.hasFailure());
+    try std.testing.expect(
+        std.mem.find(u8, result.content, "Drinky stopped the search after") != null,
+    );
+    try testing.expectConditions(&result, &.{.time_limit_reached});
+    try std.testing.expect(stall.canceled.load(.acquire));
 }
 
 test "find reports skipped noise after an empty search" {

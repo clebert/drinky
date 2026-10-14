@@ -40,8 +40,9 @@ pub fn run(context: *const Context, input_json: []const u8) Context.Error!core.T
     const path = parsed.value.path;
     const content = parsed.value.content;
 
-    fs.writeFile(gpa, context.host.io, &.{ .path = path, .data = content }) catch |err|
-        return output.cannot(gpa, err, "write", path);
+    const io = context.host.io;
+    fs.writeFile(gpa, io, &context.deadline, &.{ .path = path, .data = content }) catch |err|
+        return fs.writeFailure(gpa, err, path);
     var result = try output.sentence(gpa, "Drinky wrote {d} byte{s} to {s}.", .{
         content.len,
         core.text.pluralSuffix(content.len),
@@ -168,6 +169,48 @@ test "write canceled mid-write propagates and leaves the file untouched" {
     const data = try tmp.dir.readFileAlloc(io, "f.txt", gpa, .limited(64));
     defer gpa.free(data);
     try std.testing.expectEqualStrings("old", data);
+}
+
+test "a write that the time limit stops says that the file can hold either content" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const cases = [_]struct { target: testing.StallIo.Target, kept: []const u8 }{
+        .{ .target = .write, .kept = "old" },
+        .{ .target = .rename_after_cancel, .kept = "new" },
+    };
+    for (cases) |case| {
+        var stall: testing.StallIo = undefined;
+        stall.init(gpa, case.target);
+        defer stall.deinit();
+        const context: Context = .{
+            .gpa = gpa,
+            .host = .{ .io = stall.io() },
+            .deadline = .start(stall.io(), fs.timeout_ms),
+        };
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.writeFile(io, .{ .sub_path = "f.txt", .data = "old" });
+        var input_buffer: [128]u8 = undefined;
+        const input = try std.mem.print(&input_buffer,
+            \\{{"path":".zig-cache/tmp/{s}/f.txt","content":"new"}}
+        , .{tmp.sub_path});
+
+        const result = try run(&context, input);
+        defer result.deinit(gpa);
+        var expected_buffer: [224]u8 = undefined;
+        const expected = try std.mem.print(
+            &expected_buffer,
+            "Drinky stopped the write of .zig-cache/tmp/{s}/f.txt after 10 seconds because the " ++
+                "file system did not respond. The file can hold the old or the new content.",
+            .{tmp.sub_path},
+        );
+        try std.testing.expectEqualStrings(expected, result.content);
+        try testing.expectConditions(&result, &.{.timed_out});
+        try std.testing.expect(stall.canceled.load(.acquire));
+        const data = try tmp.dir.readFileAlloc(io, "f.txt", gpa, .limited(64));
+        defer gpa.free(data);
+        try std.testing.expectEqualStrings(case.kept, data);
+    }
 }
 
 test "write measures the lines of what it wrote" {

@@ -30,6 +30,10 @@ when the user drops it.
   failure, and the next turn rejects the credential. When a turn fails as unauthorized, the client
   calls `rejectCredential`, which can sign out and open the login picker. A page cannot hold a
   picker, so `/tldr` needs a design for a sign-out while its page is open first.
+- The start of Drinky reads the config file and the instruction files and scans the skill
+  directories without a time limit. A file system call that does not return stops the start. A
+  pending macOS privacy prompt causes such a call. The tools and the skill file reads already stop
+  such a call after their time limit when the call accepts a cancel.
 - Drinky calls `std.unicode.utf8Decode` at six sites. Zig 0.17.0 deprecates the function but names
   no successor, and the standard library still calls it. Trigger: a Zig release that names a
   successor or removes the function.

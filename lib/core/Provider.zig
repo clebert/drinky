@@ -116,6 +116,7 @@ pub const Failure = struct {
         empty_reply,
         unsupported_reply,
         too_many_tool_calls,
+        concurrency_unavailable,
         out_of_memory,
     };
 

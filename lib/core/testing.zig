@@ -125,8 +125,14 @@ const FakeRunner = struct {
         session: *Session,
         command: Session.Command,
         after_cancel: AfterCancel = .finish,
+        maybe_call_id: ?[]const u8 = null,
 
         const AfterCancel = enum { finish, fail };
+
+        fn fires(self: *const Hook, call: *const Tool.Call) bool {
+            const call_id = self.maybe_call_id orelse return true;
+            return std.mem.eql(u8, call_id, call.id);
+        }
     };
 
     const Recorded = struct {
@@ -186,10 +192,13 @@ const FakeRunner = struct {
         const text = try rendered.toOwnedSlice();
         errdefer self.gpa.free(text);
         try self.calls.append(self.gpa, text);
-        const fired = self.hook;
-        if (fired) |hook| {
-            self.hook = null;
-            hook.session.send(&hook.command) catch {};
+        var fired: ?Hook = null;
+        if (self.hook) |hook| {
+            if (hook.fires(call)) {
+                fired = hook;
+                self.hook = null;
+                hook.session.send(&hook.command) catch {};
+            }
         }
         defer self.started += 1;
         return .{ .sequence = self.started, .fired = fired };
@@ -569,10 +578,11 @@ fn writeEvent(writer: *std.Io.Writer, event: *const Session.Event) std.Io.Writer
         .tool_call_started => |name| try writer.print("tool_call_started:{s}", .{name}),
         .tool_call_arguments => |delta| try writer.print("tool_call_arguments:{s}", .{delta}),
         .tool_started => |call| try writer.print("tool_started:{s}", .{call.id}),
-        .tool_result => |result| try writer.print("tool_result:{s}:{s}", .{
-            result.call.id,
-            result.output.content,
-        }),
+        .tool_result => |result| {
+            try writer.print("tool_result:{s}:{s}", .{ result.call.id, result.output.content });
+            var conditions = result.output.conditions.iterator();
+            while (conditions.next()) |condition| try writer.print(":{t}", .{condition});
+        },
         .committed => try writer.writeAll("committed"),
         .tail_discarded => |blocks| try writer.print("tail_discarded:{d}", .{blocks}),
         .usage => |usage| try writer.print("usage:{d}/{d}/{d}/{d}", .{

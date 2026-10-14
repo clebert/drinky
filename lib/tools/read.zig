@@ -54,7 +54,7 @@ pub fn run(context: *const Context, input_json: []const u8) Context.Error!core.T
     const offset = parsed.value.offset;
     const limit = parsed.value.limit;
 
-    const data = fs.readFile(gpa, context.host.io, path) catch |err|
+    const data = fs.readFile(gpa, context.host.io, &context.deadline, path) catch |err|
         return fs.readFailure(gpa, err, "read", path);
     defer gpa.free(data);
 
@@ -376,6 +376,38 @@ test "read canceled while opening propagates" {
     var cancel: testing.CancelIo = .init(.file_open);
     const context: Context = .{ .gpa = gpa, .host = .{ .io = cancel.io() } };
     try std.testing.expectError(error.Canceled, run(&context, input));
+}
+
+test "a read whose file never opens fails at the time limit" {
+    const gpa = std.testing.allocator;
+    var stall: testing.StallIo = undefined;
+    stall.init(gpa, .{ .open_file = "f.txt" });
+    defer stall.deinit();
+    const context: Context = .{
+        .gpa = gpa,
+        .host = .{ .io = stall.io() },
+        .deadline = .start(stall.io(), fs.timeout_ms),
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "f.txt", .data = "one" });
+    var input_buffer: [128]u8 = undefined;
+    const input = try std.mem.print(&input_buffer,
+        \\{{"path":".zig-cache/tmp/{s}/f.txt"}}
+    , .{tmp.sub_path});
+
+    const result = try run(&context, input);
+    defer result.deinit(gpa);
+    var expected_buffer: [192]u8 = undefined;
+    const expected = try std.mem.print(
+        &expected_buffer,
+        "Drinky could not read .zig-cache/tmp/{s}/f.txt because the file system did not " ++
+            "respond within 10 seconds.",
+        .{tmp.sub_path},
+    );
+    try std.testing.expectEqualStrings(expected, result.content);
+    try testing.expectConditions(&result, &.{.timed_out});
+    try std.testing.expect(stall.canceled.load(.acquire));
 }
 
 test "read truncates a single line longer than the byte cap" {

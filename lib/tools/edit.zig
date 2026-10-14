@@ -50,7 +50,9 @@ pub fn run(context: *const Context, input_json: []const u8) Context.Error!core.T
     const old = parsed.value.old_text;
     const new = parsed.value.new_text;
 
-    const data = fs.readFile(gpa, context.host.io, path) catch |err|
+    const io = context.host.io;
+    const deadline = &context.deadline;
+    const data = fs.readFile(gpa, io, deadline, path) catch |err|
         return fs.readFailure(gpa, err, "edit", path);
     defer gpa.free(data);
 
@@ -79,8 +81,8 @@ pub fn run(context: *const Context, input_json: []const u8) Context.Error!core.T
         };
     defer gpa.free(updated);
 
-    fs.writeFile(gpa, context.host.io, &.{ .path = path, .data = updated }) catch |err|
-        return output.cannot(gpa, err, "write", path);
+    fs.writeFile(gpa, io, deadline, &.{ .path = path, .data = updated }) catch |err|
+        return fs.writeFailure(gpa, err, path);
     var result = try output.sentence(gpa, "Drinky edited {s}.", .{path});
     result.measures.put(.lines_removed, format.lines(old));
     result.measures.put(.lines_added, format.lines(new));
