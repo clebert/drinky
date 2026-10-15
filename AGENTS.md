@@ -20,9 +20,12 @@ every library. `lib/providers` and `lib/tools` import `lib/core`, and `lib/accou
   names no vendor: an account is an opaque id, and a reasoning proof is that id with opaque payload
   bytes. The session is an actor. One task runs its command loop and owns its state. A client sends
   commands and receives events through a sink, and a turn runs as a child task. An aside also runs
-  as a child task. It sends a request outside the conversation. A turn and an aside report the final
-  available usage of each model attempt. The runner reports tool costs through its own sink. The
-  actor shell holds the generic sink and the mailbox that starts, cancels, and reaps one child task.
+  as a child task. It sends one request outside the conversation, with no tools and the model and
+  the effort of a turn. It can put each user prompt and the final answer of its turn before its own
+  text. It reports its reasoning text and streams its reply text. A turn and an aside report the
+  final available usage of each model attempt to the client, which adds the cost to the session
+  total. The runner reports tool costs through its own sink. The actor shell holds the generic sink
+  and the mailbox that starts, cancels, and reaps one child task.
 - `lib/providers` implements the provider seam of the core. It holds the transport seam with its
   HTTP implementation, the SSE line engine, the JSON accessors, the credential seam, and one dialect
   per wire: Responses, Messages, and Gemini. A dialect builds the request, classifies a failure, and
@@ -50,7 +53,9 @@ every library. `lib/providers` and `lib/tools` import `lib/core`, and `lib/accou
   `billing.zig` applies the charge rule that the terminal and headless clients share. `Harness.zig`
   holds the setup that the client and the headless mode share: the config, the discovery, the system
   prompt, and the tools. `/tldr` streams the short version of the last answer into a page through an
-  aside of the session. `src` names no vendor, wire, or account row. It reads each such fact from
+  aside of the session. `/handoff` uses an aside over the user prompts and final answers to prepare
+  a task handoff in a read-only page. Apply starts a fresh conversation with the handoff as a normal
+  user message. `src` names no vendor, wire, or account row. It reads each such fact from
   `lib/accounts`.
 - `src/ui/role.zig` maps a role to terminal colors. A widget names a role and writes no color of its
   own. `Message.zig` holds the severity that a notice and an event share.
@@ -62,6 +67,8 @@ returns its result with its end. A lock guards state that the tasks of two actor
 
 These rules outrank existing behavior and repository precedent.
 
+- Equivalent UI elements must share a semantic renderer across the transcript, pages, and status
+  surfaces. The shared renderer must own the roles, symbols, metadata order, and width reductions.
 - An exit ends one thing. An exit is Esc, Ctrl+C, or Ctrl+D. No exit reaches past the step, the
   page, or the turn that holds it.
 - Drinky destroys nothing without a decision. If a key press has another meaning, Drinky warns
@@ -70,7 +77,7 @@ These rules outrank existing behavior and repository precedent.
   repaints the complete transcript without a warning.
 - A failure is not a decision. Every draft and user message survives a failure.
 - `user_note` is the role of a message that Drinky writes for the user. An event reports session
-  state. A user message holds typed text alone.
+  state. A user message holds typed text or a handoff that the user applied.
 
 ## Code
 
@@ -105,6 +112,8 @@ These rules outrank existing behavior and repository precedent.
 ## Tests
 
 - Write a test for a contract at a module boundary, for a bug, or for a decision table.
+- Test equivalent UI elements across surfaces, severities, and narrow widths. Compare the roles,
+  symbols, metadata order, and width reductions.
 - Write no test for what the compiler proves or for a framework.
 - For a bug, write the regression test first and watch it fail. Then fix the bug.
 - Test through commands and events with a hand-written fake. Use no network and no sleep. A test

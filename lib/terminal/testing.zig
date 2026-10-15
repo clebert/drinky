@@ -27,6 +27,7 @@ pub const FakeDevice = struct {
     resize_delivered: usize,
     stopped: bool,
     pending: std.ArrayList(u8),
+    output_log: std.ArrayList(u8),
     output: std.Io.Writer,
     keys: std.Io.Queue(u8),
     keys_buffer: [4096]u8,
@@ -73,6 +74,7 @@ pub const FakeDevice = struct {
             .resize_delivered = 0,
             .stopped = false,
             .pending = .empty,
+            .output_log = .empty,
             .output = .{ .vtable = &.{ .drain = drain, .flush = flush }, .buffer = &.{} },
             .keys = undefined,
             .keys_buffer = undefined,
@@ -84,6 +86,7 @@ pub const FakeDevice = struct {
     }
 
     pub fn deinit(self: *FakeDevice) void {
+        self.output_log.deinit(self.gpa);
         self.pending.deinit(self.gpa);
         self.page.deinit();
         self.conversation.deinit();
@@ -151,6 +154,12 @@ pub const FakeDevice = struct {
         const rows = try arena.alloc([]const u8, document.len);
         for (rows, document) |*row, source| row.* = try arena.dupe(u8, source.items);
         return .{ .rows = rows, .alternate = self.alternate };
+    }
+
+    pub fn outputBytes(self: *FakeDevice, gpa: std.mem.Allocator) error{OutOfMemory}![]u8 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return gpa.dupe(u8, self.output_log.items);
     }
 
     fn screen(self: *FakeDevice) *Emulator {
@@ -291,6 +300,7 @@ pub const FakeDevice = struct {
         defer self.pending.clearRetainingCapacity();
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        self.output_log.appendSlice(self.gpa, self.pending.items) catch return error.WriteFailed;
         self.screen().feed(self.pending.items) catch return error.WriteFailed;
         self.frame_count += std.mem.count(u8, self.pending.items, escape.sync_reset);
         self.notify();

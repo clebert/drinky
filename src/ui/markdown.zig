@@ -44,10 +44,6 @@ const SourceOptions = struct {
     source_offset: usize,
 };
 
-const WindowOptions = struct {
-    rows_max: usize,
-};
-
 const Counter = struct {
     count: usize = 0,
 
@@ -97,13 +93,12 @@ const Painter = struct {
     placement: *const paint.Placement,
     tint: ?role.Name,
     line: usize,
-    line_end: usize = std.math.maxInt(usize),
     hidden: bool = false,
 
     fn source(_: *Painter, _: usize) void {}
 
     fn begin(self: *Painter) void {
-        self.hidden = self.line >= self.line_end or !self.placement.begin(self.line);
+        self.hidden = !self.placement.begin(self.line);
     }
 
     fn span(self: *Painter, look: *const Look, bytes: []const u8) !void {
@@ -445,20 +440,6 @@ pub fn rowAtSource(text: []const u8, options: *const SourceOptions) usize {
 
 pub fn render(placement: *const paint.Placement, tint: ?role.Name, text: []const u8) !void {
     var painter: Painter = .{ .placement = placement, .tint = tint, .line = placement.base };
-    try walk(Painter, &painter, text, placement.columns);
-}
-
-pub fn renderWindow(
-    placement: *const paint.Placement,
-    text: []const u8,
-    options: *const WindowOptions,
-) !void {
-    var painter: Painter = .{
-        .placement = placement,
-        .tint = null,
-        .line = placement.base,
-        .line_end = placement.skip +| options.rows_max,
-    };
     try walk(Painter, &painter, text, placement.columns);
 }
 
@@ -896,12 +877,13 @@ fn paintedWindow(
     var rig: testing.Rig = undefined;
     rig.init(gpa);
     defer rig.deinit();
-    const placement = try rig.begin(&.{
+    var placement = try rig.begin(&.{
         .columns = options.columns,
         .rows = options.rows_max,
         .skip = options.skip,
     });
-    try renderWindow(&placement, text, &.{ .rows_max = options.rows_max });
+    placement.rows_max = options.rows_max;
+    try render(&placement, null, text);
     return gpa.dupe(u8, try rig.painted());
 }
 
@@ -1369,8 +1351,9 @@ test "the column fit matches a cell-by-cell shrink" {
 
         rig.out.clearRetainingCapacity();
         rig.view.forget();
-        const placement = try rig.begin(&.{ .columns = columns, .rows = 1 });
-        try renderWindow(&placement, text.items, &.{ .rows_max = 1 });
+        var placement = try rig.begin(&.{ .columns = columns, .rows = 1 });
+        placement.rows_max = 1;
+        try render(&placement, null, text.items);
         const border = try terminal.testing.plainText(gpa, try rig.painted());
         defer gpa.free(border);
         const inner = border["┌".len .. border.len - "┐".len];

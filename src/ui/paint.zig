@@ -31,6 +31,39 @@ pub const NoticeStyle = struct {
             .failure => .{ .role = .@"error", .prefix = "⚠ " },
         };
     }
+
+    pub fn sourceAtRow(self: *const NoticeStyle, text: []const u8, options: *const struct {
+        columns: usize,
+        row: usize,
+    }) usize {
+        std.debug.assert(self.fit == .wrap);
+        var wrap = noticeWrap(self, text, options.columns);
+        var index: usize = 0;
+        while (!wrap.done) : (index += 1) {
+            const offset = if (index == 0) 0 else self.prefix.len + text.len - wrap.rest.len;
+            _ = wrap.next() orelse break;
+            if (index == options.row) return offset;
+        }
+        return self.prefix.len + text.len;
+    }
+
+    pub fn rowAtSource(self: *const NoticeStyle, text: []const u8, options: *const struct {
+        columns: usize,
+        source_offset: usize,
+    }) usize {
+        std.debug.assert(self.fit == .wrap);
+        const target = @min(options.source_offset, self.prefix.len + text.len);
+        var wrap = noticeWrap(self, text, options.columns);
+        var result: usize = 0;
+        var index: usize = 0;
+        while (!wrap.done) : (index += 1) {
+            const offset = if (index == 0) 0 else self.prefix.len + text.len - wrap.rest.len;
+            _ = wrap.next() orelse break;
+            if (offset > target) break;
+            result = index;
+        }
+        return result;
+    }
 };
 
 pub const separator = " \u{00B7} ";
@@ -103,9 +136,10 @@ pub const Placement = struct {
     columns: usize,
     base: usize,
     skip: usize,
+    rows_max: usize = std.math.maxInt(usize),
 
     pub fn begin(self: *const Placement, line: usize) bool {
-        if (line < self.skip) return false;
+        if (line < self.skip or line - self.skip >= self.rows_max) return false;
         self.sink.begin();
         return true;
     }
@@ -460,6 +494,7 @@ pub fn notice(placement: *const Placement, style: *const NoticeStyle, text: []co
     var index: usize = 0;
     while (wrap.next()) |row| : (index += 1) {
         const line = placement.base + index;
+        if (line >= placement.skip +| placement.rows_max) break;
         if (!placement.begin(line)) continue;
         if (index == 0) try noticePrefix(placement.sink, style, shown_prefix);
         try noticeBody(placement.sink, style, row.kept, index == 0 and shown_prefix.len > 0);

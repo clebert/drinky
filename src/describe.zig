@@ -26,8 +26,8 @@ const head =
     \\
     \\The user types a command line into the editor, and that line reaches no model. Drinky runs
     \\it locally. You cannot run a slash command, so name the line that the user must type.
-    \\Drinky refuses an unknown command, an unknown skill, and a command with an argument. A
-    \\second Enter then sends the refused line to the model as a message.
+    \\Drinky refuses an unknown command, an unknown skill, and an argument that a command does
+    \\not accept. A second Enter sends the refused line to the model as a message.
     \\
     \\
 ;
@@ -198,21 +198,47 @@ fn writeCommands(writer: *std.Io.Writer) !void {
         \\User and model messages keep their complete text.
         \\
         \\`/rewind` lists the prompts of the conversation, with the oldest prompt first. A row
-        \\holds the typed line of a message or a skill command. A retry gets no row. Enter drops
-        \\the turn of the chosen prompt and every later turn, and it returns the line to the
-        \\editor as editable text. Tool changes and the cost stay. When a turn that the rewind
+        \\holds a user message or the typed line of a skill command. A retry gets no row.
+        \\Enter drops the chosen turn and every later turn. It returns the line to the editor
+        \\as editable text. Tool changes and the cost stay. When a turn that the rewind
         \\drops ran `write`, `edit`, or `bash`, Enter warns first and rewinds on the second press.
         \\
+        \\`/handoff` prepares a concise handoff for the current task with the current model.
+        \\The request holds each user prompt and the final answer of its turn. It omits tool
+        \\calls, tool results, reasoning, and intermediate texts, so it stays small and can work
+        \\after a context overflow. It offers no tools and uses the effort of normal turns. A last
+        \\user message asks for the handoff, and an optional instruction after the command joins
+        \\it. The command leaves the conversation unchanged and streams the handoff into a
+        \\read-only page.
+        \\Enter applies a complete handoff. Drinky clears the conversation as /new does and sends
+        \\the handoff as a normal user message. The model resumes the task and asks for any user
+        \\decision that still blocks it. Normal rewind, retry, and canceled-turn edit behavior
+        \\applies.
+        \\Rewind cannot recover the old conversation after Apply.
+        \\Esc, Ctrl+C, and Ctrl+D cancel generation or discard the preview. Each exit closes only
+        \\the page and restores the original command with its instruction to the editor.
+        \\Drinky cannot apply a failed or truncated handoff.
+        \\Every invocation generates a fresh preview.
+        \\The handoff has no fixed word count. It preserves the goal, constraints, decisions,
+        \\completed work, verification results, remaining work, and pending user decisions.
+        \\
         \\`/tldr` shortens the last answer with the current model. The request holds only that
-        \\answer. It asks for the medium effort level, or the nearest level that the model takes.
+        \\answer. It uses the effort of normal turns.
         \\It opens a page and streams the short version into it. Until the first text arrives,
-        \\the page shows a wait note or the last failed attempt. The wait and retry notes use dim
-        \\text. A failure note uses red text. An incomplete reply note uses yellow text. The notes
-        \\stay separate from the model text in both page presentations. The transcript and the model
-        \\conversation stay unchanged. The cost of the request joins the session cost. Esc
-        \\stops the request and closes the page. Drinky keeps the short version of one answer,
-        \\so the next `/tldr` for the same answer shows it at once. When the request fails, the
-        \\page shows the failure.
+        \\the page shows a wait line as `Agent: work (waiting) · Time: 0s · Received: 0 B`. The
+        \\time ticks every second. The state changes to thinking when reasoning text arrives, and
+        \\Received counts its bytes. A failed attempt adds its note below the line. `/handoff`
+        \\shows the same wait line. The wait line uses the transcript work-row layout.
+        \\It stays on one row and removes Received before Time as the terminal narrows.
+        \\It shortens the identity only when the identity cannot fit.
+        \\The complete identity uses dim cyan text. Metadata uses dim default foreground text.
+        \\The notes use the transcript symbols and severity colors. A retry note uses cyan with ℹ.
+        \\A failure note or an incomplete reply note uses red with ⚠.
+        \\The notes stay separate from the model text in both page presentations.
+        \\The transcript and the model conversation stay unchanged.
+        \\The cost of the request joins the session cost. Esc stops the request and closes the page.
+        \\Drinky keeps the short version of one answer, so the next `/tldr` for the same answer
+        \\shows it at once. When the request fails, the page shows the failure.
         \\
     );
 }

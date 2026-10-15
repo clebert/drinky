@@ -16,6 +16,10 @@ pub fn print(
     return .{ .content = try gpa.print(format, args), .severity = severity };
 }
 
+pub fn dupe(self: *const Message, gpa: std.mem.Allocator) error{OutOfMemory}!Message {
+    return .{ .content = try gpa.dupe(u8, self.content), .severity = self.severity };
+}
+
 pub fn deinit(self: *const Message, gpa: std.mem.Allocator) void {
     gpa.free(self.content);
 }

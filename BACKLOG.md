@@ -28,10 +28,10 @@ when the user drops it.
   allocator can consume a pending cancel. Without the strip, two cancel tests of `Session` fail in
   about one of three runs. A Debug build of Drinky records stacks through the same allocator, so it
   can hang or lose a cancel too. Trigger: a Zig release that fixes both defects.
-- An unauthorized failure of `/tldr` does not reject the credential. The page only shows the
-  failure, and the next turn rejects the credential. When a turn fails as unauthorized, the client
-  calls `rejectCredential`, which can sign out and open the login picker. A page cannot hold a
-  picker, so `/tldr` needs a design for a sign-out while its page is open first.
+- An unauthorized failure of `/handoff` or `/tldr` does not reject the credential. The page only
+  shows the failure, and the next turn rejects the credential. When a turn fails as unauthorized,
+  the client calls `rejectCredential`, which can sign out and open the login picker. A page cannot
+  hold a picker, so both commands need a design for a sign-out while their page is open first.
 - The start of Drinky reads the config file and the instruction files and scans the skill
   directories without a time limit. A file system call that does not return stops the start. A
   pending macOS privacy prompt causes such a call. The tools and the skill file reads already stop

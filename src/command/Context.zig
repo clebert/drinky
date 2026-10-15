@@ -38,6 +38,7 @@ pub const Outcome = union(enum) {
     toggle_verbose,
     rewind: usize,
     shorten: []const u8,
+    handoff: []const u8,
 
     pub const Prompt = struct {
         name: []const u8,

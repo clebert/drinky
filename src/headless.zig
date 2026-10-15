@@ -138,7 +138,7 @@ const Listener = struct {
                 try self.writeFinal(options.stdout);
                 break :stopped switch (reason) {
                     .complete => true,
-                    .truncated => try refuse(options.stderr, turn_text.truncated),
+                    .truncated => try refuse(options.stderr, turn_text.truncated.content),
                 };
             },
             .exhausted => exhausted: {
@@ -635,7 +635,7 @@ test "a truncated final reply reaches stdout, and its event reaches stderr as a 
 
     try std.testing.expect(!try rig.ask(.high, "openai-api-key/gpt-5.6-sol", "review"));
     try std.testing.expectEqualStrings("partial\n", rig.stdout.written());
-    try std.testing.expectEqualStrings(turn_text.truncated ++ "\n", rig.stderr.written());
+    try std.testing.expectEqualStrings(turn_text.truncated.content ++ "\n", rig.stderr.written());
 }
 
 test "a failed turn writes its failure to stderr and nothing to stdout" {

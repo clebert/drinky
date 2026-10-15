@@ -199,6 +199,7 @@ fn release(outcome: *const Context.Outcome) void {
         .toggle_verbose,
         .rewind,
         .shorten,
+        .handoff,
         => {},
     }
 }

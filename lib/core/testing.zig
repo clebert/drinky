@@ -409,11 +409,7 @@ pub const Harness = struct {
     }
 
     pub fn ask(self: *Harness, text: []const u8) !void {
-        try self.session.send(&.{ .aside = .{
-            .system = "Be brief.",
-            .text = text,
-            .effort = .medium,
-        } });
+        try self.session.send(&.{ .aside = .{ .system = "Be brief.", .text = text } });
     }
 
     pub fn expect(self: *Harness, expected: []const u8) !void {
@@ -563,6 +559,7 @@ fn writeEvent(writer: *std.Io.Writer, event: *const Session.Event) std.Io.Writer
         .text_started => try writer.writeAll("text_started"),
         .text => |delta| try writer.print("text:{s}", .{delta}),
         .aside_text => |delta| try writer.print("aside_text:{s}", .{delta}),
+        .aside_reasoning => |delta| try writer.print("aside_reasoning:{s}", .{delta}),
         .aside_attempt_failed => |attempt| try writer.print(
             "aside_attempt_failed:{d}:{s}:{s}:{d}",
             .{

@@ -23,10 +23,7 @@ pub const Work = struct {
     started_ms: i64,
     end: ?End = null,
     hidden: bool = false,
-    summary: [128]u8 = undefined,
-    summary_length: usize = 0,
-    summary_status: Status = .running,
-    summary_ends: [Summary.segment_count]usize = @splat(0),
+    summary: Row = .{},
 
     const identity_prefix = "Agent: work (";
 
@@ -39,7 +36,7 @@ pub const Work = struct {
 
     pub const Summary = struct {
         elapsed_ms: i64,
-        tools: usize,
+        tools: ?usize,
         received_bytes: usize,
         status: Status,
 
@@ -60,12 +57,38 @@ pub const Work = struct {
             const time = format.durationSeconds(&time_buffer, self.elapsed_ms, .down);
             try writer.print("{s}Time: {s}", .{ paint.separator, time });
             options.ends[1] = writer.buffered().len;
-            try writer.print("{s}Tools: {d}", .{ paint.separator, self.tools });
+            if (self.tools) |tools| try writer.print("{s}Tools: {d}", .{ paint.separator, tools });
             options.ends[2] = writer.buffered().len;
             var bytes_buffer: [16]u8 = undefined;
             const bytes = format.bytes(&bytes_buffer, self.received_bytes);
             try writer.print("{s}Received: {s}", .{ paint.separator, bytes });
             options.ends[3] = writer.buffered().len;
+        }
+
+        pub fn row(self: *const Summary, options: *const struct { thinking: bool }) Row {
+            var result: Row = .{ .status = self.status };
+            var writer: std.Io.Writer = .fixed(&result.buffer);
+            self.write(&writer, &.{
+                .activity = if (options.thinking) "thinking" else "",
+                .ends = &result.ends,
+            }) catch unreachable;
+            result.length = writer.buffered().len;
+            return result;
+        }
+    };
+
+    pub const Row = struct {
+        buffer: [128]u8 = undefined,
+        length: usize = 0,
+        ends: [Summary.segment_count]usize = @splat(0),
+        status: Status = .running,
+
+        fn text(self: *const Row) []const u8 {
+            return self.buffer[0..self.length];
+        }
+
+        pub fn box(self: *const Row) paint.Box {
+            return Work.box(self.text(), &self.ends, self.status);
         }
     };
 
@@ -304,16 +327,9 @@ pub fn presentWork(self: *Block, maybe_summary: ?*const Work.Summary) void {
     if (hidden != work.hidden) self.cache.invalidate();
     work.hidden = hidden;
     const summary = maybe_summary orelse return;
-    var buffer: [work.summary.len]u8 = undefined;
-    var writer: std.Io.Writer = .fixed(&buffer);
-    var ends: [Work.Summary.segment_count]usize = undefined;
-    summary.write(&writer, &.{ .activity = "", .ends = &ends }) catch unreachable;
-    const text = writer.buffered();
-    if (std.mem.eql(u8, work.summary[0..work.summary_length], text)) return;
-    @memcpy(work.summary[0..text.len], text);
-    work.summary_length = text.len;
-    work.summary_status = summary.status;
-    work.summary_ends = ends;
+    const row = summary.row(&.{ .thinking = false });
+    if (std.mem.eql(u8, work.summary.text(), row.text())) return;
+    work.summary = row;
     self.cache.invalidate();
 }
 
@@ -321,11 +337,7 @@ fn look(self: *const Block) Look {
     if (!self.verbose) {
         if (self.work) |*work| return .{ .box = .{
             .role = .text,
-            .body = Work.box(
-                work.summary[0..work.summary_length],
-                &work.summary_ends,
-                work.summary_status,
-            ),
+            .body = work.summary.box(),
         } };
     }
     return switch (self.content) {

@@ -24,6 +24,7 @@ const Entry = struct {
     summary: []const u8,
     run: *const fn (*Context) Context.Error!Context.Outcome,
     during_turn: bool = false,
+    tail: []const u8 = "",
 };
 
 const help_name = "help";
@@ -34,6 +35,12 @@ const help_opener: Context.Outcome.Opener = .{ .open = reopenHelp };
 
 const commands = [_]Entry{
     .{ .name = effort.name, .summary = effort.summary, .run = effort.run },
+    .{
+        .name = "handoff",
+        .summary = "Prepare a handoff for the current task",
+        .run = runHandoff,
+        .tail = "an optional instruction",
+    },
     .{ .name = help_name, .summary = help_summary, .run = runHelp },
     .{ .name = login.name, .summary = login.summary, .run = login.run },
     .{ .name = logout.name, .summary = logout.summary, .run = logout.run },
@@ -83,6 +90,7 @@ pub const summaries = blk: {
         .name = entry.name,
         .summary = entry.summary,
         .alias = aliasOf(entry.name),
+        .tail = entry.tail,
     };
     list[commands.len] = .{
         .name = skill_prefix ++ "name",
@@ -137,6 +145,11 @@ fn lookup(name: []const u8) ?*const Entry {
     return null;
 }
 
+fn runHandoff(context: *Context) Context.Error!Context.Outcome {
+    _ = context;
+    return .{ .handoff = "" };
+}
+
 fn runVerbose(context: *Context) Context.Error!Context.Outcome {
     _ = context;
     return .toggle_verbose;
@@ -175,8 +188,8 @@ fn selectCommand(
 pub fn check(context: *Context, line: []const u8) !?Message {
     const name = parse(line) orelse return null;
     if (loadsSkill(name)) return checkSkill(context, name);
-    if (lookup(name) == null) return try unknownCommand(context.gpa, name);
-    if (tail(line, name).len > 0) return try Message.print(
+    const entry = lookup(name) orelse return try unknownCommand(context.gpa, name);
+    if (entry.tail.len == 0 and tail(line, name).len > 0) return try Message.print(
         context.gpa,
         .warning,
         "The command /{s} takes no argument.",
@@ -192,7 +205,11 @@ pub fn run(context: *Context, line: []const u8) !?Context.Outcome {
         const target = context.skill_registry.get(name[skill_prefix.len..]).?;
         return try skill.load(context, target, tail(line, name));
     }
-    return try lookup(name).?.run(context);
+    const outcome = try lookup(name).?.run(context);
+    return switch (outcome) {
+        .handoff => .{ .handoff = tail(line, name) },
+        else => outcome,
+    };
 }
 
 pub fn checkDuringTurn(context: *Context, line: []const u8) !?Message {
@@ -249,6 +266,20 @@ test "verbose is the only display command that can run during a turn" {
     );
     const other = (try checkDuringTurn(&context, "/model")).?;
     try testing.expectMessage(&other, .warning, "cannot run while a turn runs");
+}
+
+test "handoff accepts an optional instruction but cannot run during a turn" {
+    var rig: testing.Rig = undefined;
+    try rig.init(&.{});
+    defer rig.deinit();
+    var context = rig.context();
+    const line = "/handoff Keep decisions.\nPreserve the checks.";
+    try std.testing.expect((try check(&context, line)) == null);
+    const outcome = (try run(&context, line)).?;
+    try std.testing.expectEqualStrings("Keep decisions.\nPreserve the checks.", outcome.handoff);
+    try std.testing.expectEqualStrings("", (try run(&context, "/handoff")).?.handoff);
+    const refusal = (try checkDuringTurn(&context, line)).?;
+    try testing.expectMessage(&refusal, .warning, "cannot run while a turn runs");
 }
 
 test "check reports only what keeps a line unrunnable" {

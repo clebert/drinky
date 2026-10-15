@@ -2,7 +2,12 @@ const std = @import("std");
 
 const core = @import("core");
 
-pub const truncated = "The reply is incomplete. The model reached an output or context limit.";
+const Message = @import("Message.zig");
+
+pub const truncated: Message = .{
+    .content = "The reply is incomplete. The model reached an output or context limit.",
+    .severity = .failure,
+};
 pub const exhausted = "The turn reached the limit for tool rounds.";
 
 pub fn failureSentence(reason: core.Provider.Failure.Reason) []const u8 {

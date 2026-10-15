@@ -37,7 +37,7 @@ pub const Options = struct {
 
 pub const Sink = actor.Sink(Event);
 
-const TurnStart = struct {
+pub const TurnStart = struct {
     turn: usize,
     item: usize,
 };
@@ -109,6 +109,7 @@ pub const Event = union(enum) {
     text_started,
     text: []const u8,
     aside_text: []const u8,
+    aside_reasoning: []const u8,
     aside_attempt_failed: Attempt,
     aside_ended: Outcome,
     reasoning_started,
@@ -162,6 +163,7 @@ pub const Event = union(enum) {
         return switch (self.*) {
             .text => |delta| .{ .text = try gpa.dupe(u8, delta) },
             .aside_text => |delta| .{ .aside_text = try gpa.dupe(u8, delta) },
+            .aside_reasoning => |delta| .{ .aside_reasoning = try gpa.dupe(u8, delta) },
             .aside_ended => |*outcome| .{ .aside_ended = outcome.dupe(gpa) },
             .reasoning => |delta| .{ .reasoning = try gpa.dupe(u8, delta) },
             .tool_call_started => |name| .{ .tool_call_started = try gpa.dupe(u8, name) },
@@ -209,6 +211,7 @@ pub const Event = union(enum) {
         switch (self.*) {
             .text,
             .aside_text,
+            .aside_reasoning,
             .reasoning,
             .tool_call_started,
             .tool_call_arguments,
@@ -391,6 +394,8 @@ fn ask(self: *Session, request: Aside.Request) void {
         .options = self.options,
         .setup = &self.setup.?,
         .request = &self.aside.?,
+        .conversation = &self.conversation,
+        .turn_starts = self.turn_starts.items,
     };
     self.mailbox.start(self.io, runAside, .{aside}) catch {
         self.dropAside();
@@ -606,6 +611,11 @@ const fixture = struct {
     const canceled_text = "The user canceled the call before Drinky received its result. " ++
         "The call can have completed some or all of its work.";
     const unstarted_text = "Drinky did not run the call because the user canceled the turn.";
+    const handoff: Aside.Request = .{
+        .system = "Summarize the task.",
+        .text = "Prepare a handoff.",
+        .include_dialogue = true,
+    };
 
     fn message(text: []const u8) Provider.Event {
         return .{ .output = .{ .message = text } };
@@ -1244,7 +1254,7 @@ test "a quota and the credits of a reply reach the sink as they stream" {
     , try harness.turn("hi"));
 }
 
-test "an aside streams its reply outside the conversation with its own system text and effort" {
+test "an aside streams its reply outside the conversation with its system text and setup effort" {
     var harness: testing.Harness = undefined;
     try harness.init(std.testing.allocator, std.testing.io, &.{});
     defer harness.deinit();
@@ -1267,6 +1277,7 @@ test "an aside streams its reply outside the conversation with its own system te
     _ = try harness.turn("hi");
     try harness.ask("The long answer.");
     try std.testing.expectEqualStrings(
+        \\aside_reasoning:Weigh it
         \\aside_text:Short 
         \\aside_text:version.
         \\quota:42
@@ -1282,11 +1293,86 @@ test "an aside streams its reply outside the conversation with its own system te
 
     const provider = &harness.provider;
     try std.testing.expectEqualStrings("model-a|user:The long answer.", provider.requests.items[1]);
-    try std.testing.expectEqualStrings("Be brief.||4096|medium", provider.settings.items[1]);
+    try std.testing.expectEqualStrings("Be brief.||4096|high", provider.settings.items[1]);
+    try std.testing.expectEqualStrings("", provider.keys.items[1]);
     try std.testing.expectEqualStrings(
         "model-a|user:hi|assistant:ok|user:next",
         provider.requests.items[3],
     );
+}
+
+test "a handoff aside sends each prompt with the final answer of its turn and no tools" {
+    var harness: testing.Harness = undefined;
+    try harness.init(std.testing.allocator, std.testing.io, &.{});
+    defer harness.deinit();
+    harness.runner.skills = &.{
+        .{ .name = "zig-style", .source = "skills/zig/SKILL.md", .text = "Follow the style." },
+    };
+    harness.provider.load(&.{
+        .{ .done = &.{
+            .{ .text = "Let me check." },
+            fixture.message("Let me check."),
+            fixture.toolCall(fixture.call),
+            fixture.stop_complete,
+        } },
+        .{ .done = &.{
+            .{ .output = .{ .reasoning = fixture.proof } },
+            fixture.message("Checked."),
+            .{ .output = .{ .reasoning = fixture.proof } },
+            fixture.message("Done."),
+            fixture.stop_complete,
+        } },
+        .{ .done = &.{.{ .failed = .{ .reason = .network } }} },
+        .{ .done = &.{ fixture.message("Handoff."), fixture.stop_complete } },
+        .{ .done = &.{ fixture.message("Next."), fixture.stop_complete } },
+    });
+    _ = try harness.turn("a");
+    try std.testing.expect(std.mem.endsWith(u8, try harness.turn("b"), "failed:network:"));
+    try harness.session.send(&.{ .aside = fixture.handoff });
+    try std.testing.expectEqualStrings(
+        \\aside_text:Handoff.
+        \\aside_ended:complete
+    , try harness.until("aside_ended"));
+    _ = try harness.turn("c");
+
+    const provider = &harness.provider;
+    try std.testing.expectEqualStrings(
+        "model-a|user:a|assistant:Checked.|assistant:Done.|user:b|user:Prepare a handoff.",
+        provider.requests.items[3],
+    );
+    try std.testing.expectEqualStrings(
+        "Summarize the task.||4096|high",
+        provider.settings.items[3],
+    );
+    try std.testing.expectEqualStrings("", provider.keys.items[3]);
+    try std.testing.expectEqualStrings(
+        "model-a|user:a|assistant:Let me check.|call:c1:read:{\"path\":\"a.txt\"}|" ++
+            "result:c1:done|user:Follow the style.|reasoning:account-a:p1|assistant:Checked.|" ++
+            "reasoning:account-a:p1|assistant:Done.|user:b|user:c",
+        provider.requests.items[4],
+    );
+    const requests = [_]Aside.Request{
+        fixture.handoff,
+        .{ .system = "Be brief.", .text = "The long answer." },
+    };
+    try testing.checkCopyAllocationFailures(Aside.Request, &requests);
+}
+
+test "an aside rejects a reply that contains only whitespace" {
+    var harness: testing.Harness = undefined;
+    try harness.init(std.testing.allocator, std.testing.io, &.{});
+    defer harness.deinit();
+    harness.provider.load(&.{.{ .done = &.{
+        .{ .text = " \n" },
+        fixture.message(" \n"),
+        fixture.stop_complete,
+    } }});
+    try harness.ask("Summarize.");
+    try std.testing.expect(std.mem.endsWith(
+        u8,
+        try harness.until("aside_ended"),
+        "aside_ended:failed:empty_reply:",
+    ));
 }
 
 test "an aside repeats a failed attempt before its first text and ends at a failure after it" {
@@ -2063,6 +2149,7 @@ test "a copy of each event owns its bytes, and a failed copy leaks nothing" {
         .{ .skill_loaded = .{ .name = "zig-style", .source = "SKILL.md" } },
         .{ .turn_ended = .canceled },
         .{ .aside_text = "delta" },
+        .{ .aside_reasoning = "delta" },
         .{ .aside_ended = .canceled },
         .committed,
     };
