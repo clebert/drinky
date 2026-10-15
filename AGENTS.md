@@ -1,6 +1,6 @@
 # Drinky
 
-Drinky is a dependency-free Zig coding agent that keeps the conversation in the terminal scrollback.
+Drinky is a Zig coding agent that keeps the conversation in the terminal scrollback.
 
 ## Layers
 
@@ -15,17 +15,13 @@ every library. `lib/providers` and `lib/tools` import `lib/core`, and `lib/accou
   CommonMark test corpus and its license notice.
 - `lib/core` imports `std` alone. It holds the neutral conversation, the provider seam, the tool
   seam, the retry policy, and the session. It also holds the parts that the libraries share: the
-  actor shell, the timeout race over `std.Io`, the compile-time check of an error set, the plural
-  suffix of a count, the valid UTF-8 prefix of a text, and the compile-time repetition of a text. It
-  names no vendor: an account is an opaque id, and a reasoning proof is that id with opaque payload
-  bytes. The session is an actor. One task runs its command loop and owns its state. A client sends
-  commands and receives events through a sink, and a turn runs as a child task. An aside also runs
-  as a child task. It sends one request outside the conversation, with no tools and the model and
-  the effort of a turn. It can put each user prompt and the final answer of its turn before its own
-  text. It reports its reasoning text and streams its reply text. A turn and an aside report the
-  final available usage of each model attempt to the client, which adds the cost to the session
-  total. The runner reports tool costs through its own sink. The actor shell holds the generic sink
-  and the mailbox that starts, cancels, and reaps one child task.
+  actor shell, the timeout race over `std.Io`, the compile-time error-set check, and the text
+  helpers. It names no vendor: an account is an opaque id, and a reasoning proof is that id with
+  opaque payload bytes. The session is an actor. One task runs its command loop and owns its state.
+  A client sends commands and receives events through a sink, and a turn runs as a child task. An
+  aside also runs as a child task. It sends one request outside the conversation, with no tools and
+  the model and the effort of a turn. The actor shell holds the generic sink and the mailbox that
+  starts, cancels, and reaps one child task.
 - `lib/providers` implements the provider seam of the core. It holds the transport seam with its
   HTTP implementation, the SSE line engine, the JSON accessors, the credential seam, and one dialect
   per wire: Responses, Messages, and Gemini. A dialect builds the request, classifies a failure, and
@@ -33,35 +29,33 @@ every library. `lib/providers` and `lib/tools` import `lib/core`, and `lib/accou
 - `lib/tools` implements the tool seam of the core. Its registry runs `read`, `write`, `edit`,
   `find`, `grep`, `bash`, and `describe_drinky`. It holds the skill guard that a call proves a skill
   against. An output is content for the model with the conditions and the measures that the client
-  shows. A private pipe reports child costs through the runner sink. The pipe ends with the bash
-  invocation.
-- `lib/accounts` holds the account table with its eleven rows, the credentials behind the credential
-  seam, and the sign-in flows. It also holds the model catalog with the public metadata, the usage
-  sources, and the state store. `Client` builds the provider of one row and reports its usage source
-  before the stop of every reply. The account registry `Registry` runs a sign-in or a model fetch as
-  a child task behind a command loop and a sink, like the session. A row is an index into the table.
+  shows.
+- `lib/accounts` holds the account table, the credentials behind the credential seam, and the
+  sign-in flows. It also holds the model catalog with the public metadata, the usage sources, and
+  the state store. `Client` builds the provider of one row and reports its usage source before the
+  stop of every reply. The account registry `Registry` runs a sign-in or a model fetch as a child
+  task behind a command loop and a sink, like the session. A row is an index into the table.
 - `src` is the client. `App.zig` holds the client loop, the input mode, and the key handling. A key
   becomes a command to the session or the account registry. An event becomes a change of
   `Screen.zig`, and `Screen.zig` paints the widgets that it holds. The client reads no session
-  state, and `Choice.zig` holds the account, the model, and the effort that the client chose.
-  `Turns.zig` holds the turns that the client started. A rewind names a turn by its index in that
-  list. `src` also holds the slash commands under `src/command/` and the instruction and skill
-  discovery under `src/discovery/`. It holds the widgets under `src/ui/` and Herdr too. The UI fits
-  and paints the Markdown syntax from `lib/markdown` through one shared layout walk. `turn_text.zig`
-  holds the outcome text that the terminal and headless clients share. `headless.zig` answers
-  `drinky run` and `drinky models` without a terminal. A run reports costs through the private pipe.
-  `billing.zig` applies the charge rule that the terminal and headless clients share. `Harness.zig`
-  holds the setup that the client and the headless mode share: the config, the discovery, the system
-  prompt, and the tools. `/tldr` streams the short version of the last answer into a page through an
-  aside of the session. `/handoff` uses an aside over the user prompts and final answers to prepare
-  a task handoff in a read-only page. Apply starts a fresh conversation with the handoff as a normal
-  user message. `src` names no vendor, wire, or account row. It reads each such fact from
-  `lib/accounts`.
+  state. `Choice.zig` holds the account, the model, and the effort that the client chose, and
+  `Turns.zig` holds the turns that the client started. `src` also holds the slash commands under
+  `src/command/`, the instruction and skill discovery under `src/discovery/`, and the widgets under
+  `src/ui/`. The UI fits and paints the Markdown syntax from `lib/markdown` through one shared
+  layout walk. `Harness.zig` holds the setup that the terminal and headless clients share: the
+  config, the discovery, the system prompt, and the tools. `turn_text.zig` holds the outcome text
+  that the two clients share. `/tldr` and `/handoff` run through an aside of the session. `src`
+  names no vendor, wire, or account row. It reads each such fact from `lib/accounts`.
 - `src/ui/role.zig` maps a role to terminal colors. A widget names a role and writes no color of its
-  own. `Message.zig` holds the severity that a notice and an event share.
+  own. `src/Message.zig` holds the severity that a notice and an event share.
 
 A loop task lends state to its child task and touches none of it until the child ends. The child
 returns its result with its end. A lock guards state that the tasks of two actors share.
+
+A turn and an aside report the final available usage of each model attempt to the client. The client
+adds each cost to the session total, and `billing.zig` holds the charge rule of the two clients. The
+runner reports tool costs through its own sink. A `drinky run` under the `bash` tool reports its
+costs through a private pipe to that sink. The pipe ends with the `bash` invocation.
 
 ## Interface
 
@@ -85,8 +79,7 @@ These rules outrank existing behavior and repository precedent.
 - Write no comment. A name or a test carries the intent, and a fact that matters goes into a test, a
   name, or the chat.
 - Less code is better. Delete code without a caller. Add a seam, a pointer with a vtable in the
-  shape of `std.mem.Allocator`, only when a second implementation or a test fake exists. A control
-  that a user sets is no such code.
+  shape of `std.mem.Allocator`, only when a second implementation or a test fake exists.
 - Before you write a helper, search the modules that the build lets the module import. Move a second
   copy to the lowest module that both callers import.
 - Production code holds no option, entry point, mode, or global that only a test uses. A test fakes
@@ -116,18 +109,15 @@ These rules outrank existing behavior and repository precedent.
   symbols, metadata order, and width reductions.
 - Write no test for what the compiler proves or for a framework.
 - For a bug, write the regression test first and watch it fail. Then fix the bug.
-- Test through commands and events with a hand-written fake. Use no network and no sleep. A test
-  that needs a clock hands in an `Io` that controls it.
-- A test takes `std.testing.io`. Build an `Io` only to set a limit or to control the clock.
-- Run `std.testing.checkAllAllocationFailures` on `core.testing.no_resize_allocator`. The test
-  allocator resizes in place only while its block has room. So the allocation count can change
-  between runs, and the check can fail on one platform alone.
+- A test reaches a state through commands, events, keys, and options, with a hand-written fake. It
+  reads the state through public functions.
+- Use no network and no sleep. A test takes `std.testing.io`. Build an `Io` only to set a limit or
+  to control the clock.
+- Run `std.testing.checkAllAllocationFailures` on `core.testing.no_resize_allocator`.
 - A fake that waits for a cancel waits on an event that no task sets. The test checks that the
   cancel ended the wait.
 - A test that changes with every implementation change tests the implementation. Delete it or move
   it to the boundary.
-- A test reaches a state through commands, events, keys, and options. It reads the state through
-  public functions.
 - A test calls a private pure function only when its input and its output are facts outside the
   code. A vendor date and its epoch seconds are such facts. A model before the catalog merge is not
   such a fact. Every other test calls the public function that gives the same fact.
@@ -215,12 +205,9 @@ identifier. A model under an account reads `account/model`.
 
 ## Checks
 
-Run `sh scripts/check.sh` after a change. CI runs the same script and nothing else. The script
-builds the binary and checks the format of the Zig code and of the documents. It fails on a code
-comment, on a Zig line over 100 columns, and on an allocation-failure check without
-`core.testing.no_resize_allocator`. It runs the tests with the reachability count. Its summary
-prints the runtime of each test binary. The document check needs `npx`, which fetches Prettier once
-into its cache.
+Run `sh scripts/check.sh` after a change. CI runs the same script and nothing else. Its summary
+prints the runtime of each test binary. The script needs `npx`, which fetches Prettier once into its
+cache.
 
 `zig run scripts/comment_scan.zig -- --fix build.zig build.zig.zon src lib scripts` removes every
 comment, and `zig fmt build.zig build.zig.zon src lib scripts` formats the Zig code.
