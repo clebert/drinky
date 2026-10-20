@@ -2,6 +2,8 @@
 
 A dependency-free terminal coding agent.
 
+<img src="www/drinky.png" alt="Drinky" width="400">
+
 Drinky can read, search, and change files or run commands in the working directory. The conversation
 stays in the terminal scrollback. Drinky saves no conversation to resume.
 
