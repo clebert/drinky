@@ -120,6 +120,7 @@ fn runWithTimeout(
     const elapsed_ms = std.Io.Timestamp.now(io, .awake).toMilliseconds() - started_ms;
     const stop: Stop = if (collected) |term| .{ .completed = term } else |err| switch (err) {
         error.Canceled => return error.Canceled,
+        error.OutOfMemory => return error.OutOfMemory,
         error.Timeout => .{ .timed_out = timeout_ms },
         error.StreamTooLong => .oversized,
         else => return output.failure(

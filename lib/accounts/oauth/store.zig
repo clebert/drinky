@@ -211,7 +211,10 @@ pub fn Store(comptime Flow: type) type {
             if (self.save_pending) {
                 const protection = self.io.swapCancelProtection(.blocked);
                 defer _ = self.io.swapCancelProtection(protection);
-                self.save() catch {};
+                self.save() catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => {},
+                };
             }
             if (self.tokens == null) return error.NotAuthenticated;
             if (self.expired()) try self.refresh();
@@ -237,7 +240,7 @@ pub fn Store(comptime Flow: type) type {
             try self.mutex.lock(self.io);
             defer self.mutex.unlock(self.io);
             if (self.tokens == null) return false;
-            if (self.adoptStored()) return true;
+            if (try self.adoptStored()) return true;
             try self.refresh();
             return true;
         }
@@ -326,6 +329,7 @@ pub fn Store(comptime Flow: type) type {
                 &self.tokens.?,
             ) catch |first_error| switch (first_error) {
                 error.Canceled => return error.Canceled,
+                error.OutOfMemory => return error.OutOfMemory,
                 else => try self.refreshFromStore(first_error),
             };
             const fresh = maybe_fresh orelse return;
@@ -333,21 +337,27 @@ pub fn Store(comptime Flow: type) type {
             defer _ = self.io.swapCancelProtection(protection);
             self.tokens.?.deinit(self.gpa);
             self.tokens = fresh;
-            self.save() catch {};
+            self.save() catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => {},
+            };
         }
 
         fn refreshFromStore(self: *Self, first_error: wire.Error) wire.Error!?Tokens {
-            if (!self.adoptStored()) return first_error;
+            if (!try self.adoptStored()) return first_error;
             if (!self.expired()) return null;
             return try Flow.refresh(self.gpa, self.io, &self.link, &self.tokens.?);
         }
 
-        fn adoptStored(self: *Self) bool {
+        fn adoptStored(self: *Self) error{OutOfMemory}!bool {
             var stored = self.*;
             stored.mutex = .init;
             stored.tokens = null;
             defer stored.clear();
-            const loaded = stored.load() catch return false;
+            const loaded = stored.load() catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return false,
+            };
             if (!loaded) return false;
             if (std.mem.eql(u8, self.tokens.?.refresh, stored.tokens.?.refresh)) return false;
             self.clear();
@@ -422,10 +432,13 @@ pub fn Store(comptime Flow: type) type {
             defer self.mutex.unlock(self.io);
             if (self.tokens) |old| old.deinit(self.gpa);
             self.tokens = tokens;
-            self.save() catch |save_error| return .{ .memory_only = .{
-                .path = self.path,
-                .save_error = save_error,
-            } };
+            self.save() catch |save_error| switch (save_error) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return .{ .memory_only = .{
+                    .path = self.path,
+                    .save_error = save_error,
+                } },
+            };
             return .{ .saved = self.path };
         }
 
@@ -1016,6 +1029,25 @@ test "a rejected access token takes the credential another instance saved" {
     try std.testing.expect(try subject.credential().renew());
     try expectField("refresh", "saved", &subject);
     try expectAccess("saved_access", &subject);
+}
+
+test "a refresh that runs out of memory returns the failure before it adopts a stored credential" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    test_refresh = .{ .fail = error.OutOfMemory };
+    var subject = try signedInSubject(io, &tmp, &.{
+        .access = "expired",
+        .refresh = "old",
+        .expires_ms = 0,
+    });
+    defer subject.deinit();
+    try saveTokens(io, &tmp, &.{
+        .access = "saved_access",
+        .refresh = "saved",
+        .expires_ms = std.math.maxInt(i64),
+    });
+    try std.testing.expectError(error.OutOfMemory, subject.accessToken(std.testing.allocator));
 }
 
 test "a renewal whose refresh fails takes the credential that landed meanwhile" {

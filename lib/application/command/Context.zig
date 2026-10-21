@@ -5,8 +5,9 @@ const accounts = @import("accounts");
 const Choice = @import("../Choice.zig");
 const discovery = @import("../discovery/root.zig");
 const Message = @import("../Message.zig");
+const Page = @import("../Page.zig");
+const Picker = @import("../Picker.zig");
 const Turns = @import("../Turns.zig");
-const ui = @import("../ui/root.zig");
 
 const Context = @This();
 
@@ -30,7 +31,7 @@ pub const Outcome = union(enum) {
     pick: Pick,
     prompt: Prompt,
     editor_text: []const u8,
-    page: ui.Page.Options,
+    page: Page.Options,
     login: usize,
     logout: usize,
     fetch: usize,
@@ -58,7 +59,7 @@ pub const Outcome = union(enum) {
         select: *const fn (*Context, Selection) Error!Outcome,
         title: []const u8,
         cancellation_message: []const u8,
-        options: []const ui.Picker.Option,
+        options: []const Picker.Option,
         current: ?usize,
         preselected: ?usize = null,
         payload: usize = 0,
@@ -92,14 +93,14 @@ pub const Outcome = union(enum) {
 
     pub const Options = struct {
         gpa: std.mem.Allocator,
-        rows: std.ArrayList(ui.Picker.Option) = .empty,
+        rows: std.ArrayList(Picker.Option) = .empty,
 
         pub fn deinit(self: *Options) void {
             for (self.rows.items) |*row| row.deinit(self.gpa);
             self.rows.deinit(self.gpa);
         }
 
-        fn add(self: *Options, option: ui.Picker.Option) !void {
+        fn add(self: *Options, option: Picker.Option) !void {
             try self.rows.append(self.gpa, option);
         }
 
@@ -149,7 +150,7 @@ pub const Outcome = union(enum) {
             try self.add(.{ .name = name_copy, .tag = tag_copy, .tag_pressure = row.tag_pressure });
         }
 
-        pub fn toOwnedSlice(self: *Options) ![]const ui.Picker.Option {
+        pub fn toOwnedSlice(self: *Options) ![]const Picker.Option {
             return self.rows.toOwnedSlice(self.gpa);
         }
     };

@@ -1,13 +1,10 @@
 const std = @import("std");
+const application = @import("application");
 
 const terminal = @import("terminal");
 
+const Transcript = @import("Transcript.zig");
 const ui = @import("ui/root.zig");
-
-pub const window_pages_default: usize = 8;
-
-pub const window_pages_min: usize = 1;
-pub const window_pages_max: usize = 64;
 
 const id_page = std.math.maxInt(usize);
 const id_input = id_page - 1;
@@ -156,8 +153,8 @@ fn projectConversation(
     size: terminal.View.Size,
     scene: *const Scene.Conversation,
 ) !void {
-    std.debug.assert(scene.window_pages >= window_pages_min);
-    std.debug.assert(scene.window_pages <= window_pages_max);
+    std.debug.assert(scene.window_pages >= application.Settings.window_pages_min);
+    std.debug.assert(scene.window_pages <= application.Settings.window_pages_max);
     const total = scene.transcript.len + tailCount(&scene.tail) + 1;
     const capacity = size.rows * scene.window_pages;
 
@@ -362,34 +359,35 @@ fn projected(gpa: std.mem.Allocator, size: terminal.View.Size, scene: *const Sce
 
 const Rig = struct {
     editor: ui.Editor,
-    blocks: std.ArrayList(ui.Block),
+    transcript: Transcript,
 
     const PromptOptions = struct {
-        window_pages: usize = window_pages_default,
+        window_pages: usize = application.Settings.window_pages_default,
         caption: ?ui.Caption = null,
     };
 
     const TurnOptions = struct {
-        window_pages: usize = window_pages_default,
+        window_pages: usize = application.Settings.window_pages_default,
         tools: []const ui.paint.Box = &.{},
         tracks: []Track = &.{},
     };
 
     fn init() Rig {
-        return .{ .editor = .init(std.testing.allocator), .blocks = .empty };
+        const gpa = std.testing.allocator;
+        return .{ .editor = .init(gpa), .transcript = .init(gpa) };
     }
 
     fn deinit(self: *Rig) void {
-        for (self.blocks.items) |*block| block.deinit(std.testing.allocator);
-        self.blocks.deinit(std.testing.allocator);
+        self.transcript.deinit();
         self.editor.deinit();
     }
 
     fn add(self: *Rig, source: *const ui.Block.Source) !void {
-        const gpa = std.testing.allocator;
-        var block: ui.Block = try .init(gpa, source);
-        errdefer block.deinit(gpa);
-        try self.blocks.append(gpa, block);
+        try self.transcript.append(source);
+    }
+
+    fn replace(self: *Rig, index: usize, source: *const ui.Block.Source) !void {
+        self.transcript.replace(index, try .init(std.testing.allocator, source));
     }
 
     fn addModels(self: *Rig, first: usize, end: usize) !void {
@@ -402,7 +400,7 @@ const Rig = struct {
     fn prompt(self: *Rig, options: *const PromptOptions) Scene {
         return .{ .conversation = .{
             .window_pages = options.window_pages,
-            .transcript = self.blocks.items,
+            .transcript = self.transcript.block_list.items,
             .tail = .{ .prompt = .{ .caption = options.caption, .editor = &self.editor } },
             .status = &test_status,
         } };
@@ -411,7 +409,7 @@ const Rig = struct {
     fn turn(self: *Rig, options: *const TurnOptions) Scene {
         return .{ .conversation = .{
             .window_pages = options.window_pages,
-            .transcript = self.blocks.items,
+            .transcript = self.transcript.block_list.items,
             .tail = .{ .turn = .{
                 .tools = options.tools,
                 .tracks = options.tracks,
@@ -537,7 +535,10 @@ test "projection clips the oldest block to fill the window exactly" {
     const painted = try projected(gpa, .{ .columns = 40, .rows = rows }, &scene);
     defer gpa.free(painted);
 
-    try std.testing.expectEqual(rows * window_pages_default, ui.testing.paintedRows(painted));
+    try std.testing.expectEqual(
+        rows * application.Settings.window_pages_default,
+        ui.testing.paintedRows(painted),
+    );
     try ui.testing.expectShows(painted, &.{"L59"});
     try ui.testing.expectHides(painted, &.{"L0"});
     try ui.testing.expectShows(painted, &.{"footerqq"});
@@ -559,7 +560,7 @@ test "a repeated projection composes the rows of the first one" {
 
     try project(gpa, &screen.view, size, &scene);
     const composed = screen.out.written().len;
-    for (rig.blocks.items) |*block| {
+    for (rig.transcript.block_list.items) |*block| {
         try std.testing.expectEqual(size.columns, block.cache.columns);
         try std.testing.expect(block.cache.lines.count() > 0);
     }
@@ -570,7 +571,7 @@ test "a repeated projection composes the rows of the first one" {
     try ui.testing.expectHides(replayed, &.{"replyzz"});
 
     const streamed = screen.out.written().len;
-    try rig.blocks.items[1].appendText(gpa, "\n\ngrownxx");
+    try rig.transcript.block_list.items[1].appendText(gpa, "\n\ngrownxx");
     try project(gpa, &screen.view, size, &scene);
     const grown = screen.out.written()[streamed..];
     try ui.testing.expectShows(grown, &.{"grownxx"});
@@ -586,16 +587,18 @@ test "a block outside the window releases the rows it retained" {
 
     const tall = rig.prompt(&.{});
     gpa.free(try projected(gpa, .{ .columns = 40, .rows = 24 }, &tall));
-    for (rig.blocks.items) |*block| try std.testing.expect(block.cache.lines.count() > 0);
+    for (rig.transcript.block_list.items) |*block|
+        try std.testing.expect(block.cache.lines.count() > 0);
 
-    const short = rig.prompt(&.{ .window_pages = window_pages_min });
+    const short = rig.prompt(&.{ .window_pages = application.Settings.window_pages_min });
     const painted = try projected(gpa, .{ .columns = 40, .rows = 8 }, &short);
     defer gpa.free(painted);
 
     try ui.testing.expectHides(painted, &.{"block0"});
-    try std.testing.expectEqual(@as(usize, 0), rig.blocks.items[0].cache.lines.count());
-    try std.testing.expect(rig.blocks.lastPtr().?.cache.lines.count() > 0);
-    for (rig.blocks.items, 0..) |*block, index| {
+    const first = &rig.transcript.block_list.items[0];
+    try std.testing.expectEqual(@as(usize, 0), first.cache.lines.count());
+    try std.testing.expect(rig.transcript.block_list.lastPtr().?.cache.lines.count() > 0);
+    for (rig.transcript.block_list.items, 0..) |*block, index| {
         var buffer: [16]u8 = undefined;
         const text = try std.mem.print(&buffer, "block{d}", .{index});
         if (std.mem.find(u8, painted, text) != null) continue;
@@ -619,19 +622,19 @@ test "a block rewrite above the window repaints the complete transcript" {
     var screen: ui.testing.Rig = undefined;
     screen.init(gpa);
     defer screen.deinit();
-    const scene = rig.prompt(&.{ .window_pages = window_pages_min });
+    const scene = rig.prompt(&.{ .window_pages = application.Settings.window_pages_min });
     try project(gpa, &screen.view, size, &scene);
     try ui.testing.expectShows(screen.out.written(), &.{"waiting"});
 
     try rig.addModels(1, 7);
-    const slid = rig.prompt(&.{ .window_pages = window_pages_min });
+    const slid = rig.prompt(&.{ .window_pages = application.Settings.window_pages_min });
     var painted = screen.out.written().len;
     try project(gpa, &screen.view, size, &slid);
     try ui.testing.expectShows(screen.out.written()[painted..], &.{"block6"});
     try ui.testing.expectHides(screen.out.written()[painted..], &.{"block0"});
     try std.testing.expect(!resetSince(screen.out.written(), painted));
 
-    try rig.blocks.items[0].replaceEvent(gpa, &.{ .text = "changed above" });
+    try rig.replace(0, &.{ .event = .{ .text = "changed above" } });
     painted = screen.out.written().len;
     try project(gpa, &screen.view, size, &slid);
     try std.testing.expect(resetSince(screen.out.written(), painted));
@@ -639,7 +642,7 @@ test "a block rewrite above the window repaints the complete transcript" {
     try project(gpa, &screen.view, size, &slid);
     try std.testing.expect(!resetSince(screen.out.written(), painted));
 
-    try rig.blocks.items[0].replaceEvent(gpa, &.{ .text = "changed again" });
+    try rig.replace(0, &.{ .event = .{ .text = "changed again" } });
     painted = screen.out.written().len;
     try project(gpa, &screen.view, size, &slid);
     try std.testing.expect(resetSince(screen.out.written(), painted));
@@ -648,10 +651,10 @@ test "a block rewrite above the window repaints the complete transcript" {
     var reply = try ui.testing.numberedLines(gpa, 20);
     defer reply.deinit(gpa);
     try rig.add(&.{ .model = reply.items });
-    const streaming = rig.prompt(&.{ .window_pages = window_pages_min });
+    const streaming = rig.prompt(&.{ .window_pages = application.Settings.window_pages_min });
     try project(gpa, &screen.view, size, &streaming);
     for (0..4) |_| {
-        try rig.blocks.lastPtr().?.appendText(gpa, "\nmore");
+        try rig.transcript.block_list.lastPtr().?.appendText(gpa, "\nmore");
         painted = screen.out.written().len;
         try project(gpa, &screen.view, size, &streaming);
         try ui.testing.expectShows(screen.out.written()[painted..], &.{"more"});
@@ -664,14 +667,14 @@ test "a block rewrite above the window repaints the complete transcript" {
     var fresh_rig: Rig = .init();
     defer fresh_rig.deinit();
     try fresh_rig.add(&.{ .event = .{ .text = "unseen" } });
-    for (rig.blocks.items[1..]) |*block| {
+    for (rig.transcript.block_list.items[1..]) |*block| {
         const text = block.content.model.items;
         try fresh_rig.add(&.{ .model = text });
     }
-    const hidden = fresh_rig.prompt(&.{ .window_pages = window_pages_min });
+    const hidden = fresh_rig.prompt(&.{ .window_pages = application.Settings.window_pages_min });
     try project(gpa, &fresh_screen.view, size, &hidden);
     try ui.testing.expectHides(fresh_screen.out.written(), &.{"unseen"});
-    try fresh_rig.blocks.items[0].replaceEvent(gpa, &.{ .text = "changed unseen" });
+    try fresh_rig.replace(0, &.{ .event = .{ .text = "changed unseen" } });
     painted = fresh_screen.out.written().len;
     try project(gpa, &fresh_screen.view, size, &hidden);
     try std.testing.expect(!resetSince(fresh_screen.out.written(), painted));
@@ -696,7 +699,11 @@ test "a tool rewrite above the window repaints the complete transcript" {
     defer screen.deinit();
     const size: terminal.View.Size = .{ .columns = 40, .rows = 12 };
     const scene = rig.turn(
-        &.{ .window_pages = window_pages_min, .tools = &tools, .tracks = &tracks },
+        &.{
+            .window_pages = application.Settings.window_pages_min,
+            .tools = &tools,
+            .tracks = &tracks,
+        },
     );
     for (&tracks) |*track| track.epoch = screen.view.resetEpoch();
     try project(gpa, &screen.view, size, &scene);
@@ -736,7 +743,7 @@ test "the retained window follows the configured page count" {
     try rig.add(&.{ .model = text.items });
 
     const rows: usize = 4;
-    for ([_]usize{ window_pages_min, 3, 12 }) |pages| {
+    for ([_]usize{ application.Settings.window_pages_min, 3, 12 }) |pages| {
         const scene = rig.prompt(&.{ .window_pages = pages });
         const painted = try projected(gpa, .{ .columns = 40, .rows = rows }, &scene);
         defer gpa.free(painted);

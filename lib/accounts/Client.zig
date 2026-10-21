@@ -144,7 +144,7 @@ fn close(ptr: *anyopaque) void {
     self.inner.provider().close();
 }
 
-fn usage(self: *Client) error{Canceled}!?core.Provider.Event {
+fn usage(self: *Client) core.Provider.Error!?core.Provider.Event {
     const url = switch (self.account.usage) {
         .none, .head => return null,
         .xai_billing, .openrouter_credits, .deepseek_balance => |url| url,
@@ -157,30 +157,35 @@ fn usage(self: *Client) error{Canceled}!?core.Provider.Event {
     }))) orelse return null;
     defer self.gpa.free(body);
     return switch (self.account.usage) {
-        .xai_billing => quotaEvent(xai.quota.parse(
+        .xai_billing => try quotaEvent(xai.quota.parse(
             self.gpa,
             body,
             std.Io.Timestamp.now(self.io, .real).toMilliseconds(),
         )),
-        .openrouter_credits => creditsEvent(openrouter.credits.parse(self.gpa, body)),
-        .deepseek_balance => creditsEvent(deepseek.balance.parse(self.gpa, body)),
+        .openrouter_credits => try creditsEvent(openrouter.credits.parse(self.gpa, body)),
+        .deepseek_balance => try creditsEvent(deepseek.balance.parse(self.gpa, body)),
         .none, .head => unreachable,
     };
 }
 
-fn quotaEvent(parsed: error{OutOfMemory}!?core.Provider.Quota) ?core.Provider.Event {
-    const quota = (parsed catch return null) orelse return null;
+fn quotaEvent(
+    parsed: error{OutOfMemory}!?core.Provider.Quota,
+) error{OutOfMemory}!?core.Provider.Event {
+    const quota = try parsed orelse return null;
     return .{ .quota = quota };
 }
 
-fn creditsEvent(parsed: error{OutOfMemory}!?core.Provider.Credits) ?core.Provider.Event {
-    const credits = (parsed catch return null) orelse return null;
+fn creditsEvent(
+    parsed: error{OutOfMemory}!?core.Provider.Credits,
+) error{OutOfMemory}!?core.Provider.Event {
+    const credits = try parsed orelse return null;
     return .{ .credits = credits };
 }
 
-fn settle(fetched: anytype) error{Canceled}!@typeInfo(@TypeOf(fetched)).error_union.payload {
+fn settle(fetched: anytype) core.Provider.Error!@typeInfo(@TypeOf(fetched)).error_union.payload {
     return fetched catch |err| switch (err) {
         error.Canceled => error.Canceled,
+        error.OutOfMemory => error.OutOfMemory,
         else => null,
     };
 }

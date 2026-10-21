@@ -1,4 +1,5 @@
 const std = @import("std");
+const application = @import("application");
 
 const core = @import("core");
 const terminal = @import("terminal");
@@ -23,7 +24,7 @@ const unbounded = std.math.maxInt(usize);
 
 gpa: std.mem.Allocator,
 title: []const u8,
-options: []const Option,
+options: []const application.Picker.Option,
 cursor: usize,
 current: ?usize,
 content: std.ArrayList(u8),
@@ -45,20 +46,6 @@ const Start = struct {
     preselected: ?usize = null,
     position: ?Position = null,
     can_step_back: bool = false,
-};
-
-pub const Option = struct {
-    name: []const u8,
-    extra: ?[]const u8 = null,
-    extra_pressure: bool = false,
-    tag: ?[]const u8 = null,
-    tag_pressure: bool = false,
-
-    pub fn deinit(self: *const Option, gpa: std.mem.Allocator) void {
-        gpa.free(self.name);
-        if (self.extra) |extra| gpa.free(extra);
-        if (self.tag) |tag| gpa.free(tag);
-    }
 };
 
 const Range = struct {
@@ -89,7 +76,7 @@ const Tag = struct {
 pub fn init(
     gpa: std.mem.Allocator,
     title: []const u8,
-    options: []const Option,
+    options: []const application.Picker.Option,
     start: *const Start,
 ) !Picker {
     const index_max = options.len -| 1;
@@ -146,8 +133,10 @@ fn freeOptions(self: *Picker) void {
     self.gpa.free(self.options);
 }
 
-pub fn position(self: *const Picker) Position {
-    return .{ .cursor = self.cursor, .scroll = self.window.scroll };
+pub fn restorePosition(self: *Picker, previous: *const Picker) !void {
+    self.cursor = @min(previous.cursor, self.options.len -| 1);
+    self.window.scroll = previous.window.scroll;
+    try self.compose();
 }
 
 pub fn moveUp(self: *Picker) !void {
@@ -273,7 +262,7 @@ fn compose(self: *Picker) !void {
     }
 }
 
-fn appendExtra(self: *Picker, option: *const Option) !?Range {
+fn appendExtra(self: *Picker, option: *const application.Picker.Option) !?Range {
     const extra = option.extra orelse return null;
     const start = self.content.items.len;
     try self.content.appendSlice(self.gpa, paint.separator);
@@ -281,14 +270,14 @@ fn appendExtra(self: *Picker, option: *const Option) !?Range {
     return .{ .start = start, .end = self.content.items.len };
 }
 
-fn tagColumns(current: bool, option: *const Option) usize {
+fn tagColumns(current: bool, option: *const application.Picker.Option) usize {
     if (current) return terminal.width.ofText(tag_current);
     const inner = option.tag orelse return 0;
     return terminal.width.ofText(tag_open) + terminal.width.ofText(inner) +
         terminal.width.ofText(tag_close);
 }
 
-fn appendTag(self: *Picker, current: bool, option: *const Option) !?Tag {
+fn appendTag(self: *Picker, current: bool, option: *const application.Picker.Option) !?Tag {
     const start = self.content.items.len;
     if (current) {
         try self.content.appendSlice(self.gpa, tag_current);
@@ -342,19 +331,25 @@ test "navigation rolls over at both ends and the cursor tracks the selection" {
     defer picker.deinit();
 
     try picker.moveUp();
-    try std.testing.expectEqual(@as(usize, 1), picker.position().cursor);
+    try std.testing.expectEqual(@as(usize, 1), picker.cursor);
     try picker.moveDown();
-    try std.testing.expectEqual(@as(usize, 0), picker.position().cursor);
+    try std.testing.expectEqual(@as(usize, 0), picker.cursor);
     try picker.moveDown();
-    try std.testing.expectEqual(@as(usize, 1), picker.position().cursor);
+    try std.testing.expectEqual(@as(usize, 1), picker.cursor);
     try picker.moveDown();
-    try std.testing.expectEqual(@as(usize, 0), picker.position().cursor);
+    try std.testing.expectEqual(@as(usize, 0), picker.cursor);
 }
 
 fn testPicker(gpa: std.mem.Allocator, labels: []const []const u8, start: *const Start) !Picker {
-    const options = try gpa.alloc(Option, labels.len);
-    for (labels, options) |label, *option| option.* = .{ .name = try gpa.dupe(u8, label) };
-    return Picker.init(gpa, "Pick", options, start);
+    const options = try gpa.alloc(application.Picker.Option, labels.len);
+    errdefer gpa.free(options);
+    var count: usize = 0;
+    errdefer for (options[0..count]) |*option| option.deinit(gpa);
+    for (labels, options) |label, *option| {
+        option.* = .{ .name = try gpa.dupe(u8, label) };
+        count += 1;
+    }
+    return try Picker.init(gpa, "Pick", options, start);
 }
 
 test "the frame holds the option rows alone and the caption stays above it" {
@@ -393,7 +388,7 @@ test "the frame holds the option rows alone and the caption stays above it" {
 
 test "a current name is underlined, an extra is muted, and pressure is warning" {
     const gpa = std.testing.allocator;
-    const options = try gpa.alloc(Option, 4);
+    const options = try gpa.alloc(application.Picker.Option, 4);
     options[0] = .{ .name = try gpa.dupe(u8, "high") };
     options[1] = .{
         .name = try gpa.dupe(u8, "medium"),
@@ -430,7 +425,7 @@ test "option text is not extra or tag chrome" {
         "Notes · The output limit is unknown.",
         "google-cloud-key (Not loaded)",
     };
-    const options = try gpa.alloc(Option, labels.len);
+    const options = try gpa.alloc(application.Picker.Option, labels.len);
     for (labels, options) |label, *option| option.* = .{ .name = try gpa.dupe(u8, label) };
     var picker = try Picker.init(gpa, "Skill", options, &.{});
     defer picker.deinit();
@@ -453,23 +448,18 @@ fn renderForTest(
     return gpa.dupe(u8, try rig.painted());
 }
 
-test "a wait that cannot compose keeps no borrowed text" {
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
-    const gpa = failing.allocator();
-    var picker = try testPicker(gpa, &.{"row"}, &.{ .current = 0 });
+test "a picker and its wait release every partial allocation" {
+    try std.testing.checkAllAllocationFailures(
+        core.testing.no_resize_allocator,
+        checkWaitAllocations,
+        .{},
+    );
+}
+
+fn checkWaitAllocations(gpa: std.mem.Allocator) !void {
+    var picker = try testPicker(gpa, &.{ "first", "second" }, &.{ .current = 0 });
     defer picker.deinit();
-
-    const text = core.text.repeat("x", 4096);
-    failing.fail_index = failing.alloc_index;
-    failing.resize_fail_index = failing.resize_index;
-    try std.testing.expectError(error.OutOfMemory, picker.beginWait(text));
-    failing.fail_index = std.math.maxInt(usize);
-    failing.resize_fail_index = std.math.maxInt(usize);
-
-    const painted = try renderForTest(gpa, &picker, .{ .columns = 80, .rows = 24 });
-    defer gpa.free(painted);
-    try testing.expectShows(painted, &.{"Esc: Cancel"});
-    try testing.expectHides(painted, &.{ "xxxx", "row" });
+    try picker.beginWait(core.text.repeat("x", 4096));
 }
 
 test "a list that waits drops its rows, states the wait, and moves its frame edges" {
@@ -484,12 +474,12 @@ test "a list that waits drops its rows, states the wait, and moves its frame edg
 
     try picker.beginWait("Drinky fetches the model list.");
     try picker.reflow(size);
-    try std.testing.expectEqual(@as(usize, 0), picker.position().cursor);
+    try std.testing.expectEqual(@as(usize, 0), picker.cursor);
     try std.testing.expectEqual(@as(usize, 4), picker.rows(size));
 
     try picker.moveDown();
     try picker.moveUp();
-    try std.testing.expectEqual(@as(usize, 0), picker.position().cursor);
+    try std.testing.expectEqual(@as(usize, 0), picker.cursor);
 
     const painted = try renderForTest(gpa, &picker, size);
     defer gpa.free(painted);
@@ -546,8 +536,8 @@ test "the opening row applies the preselection, current value, and saved positio
     }) |case| {
         var picker = try testPicker(gpa, &labels, &case.start);
         defer picker.deinit();
-        try std.testing.expectEqual(case.cursor, picker.position().cursor);
-        try std.testing.expectEqual(case.scroll, picker.position().scroll);
+        try std.testing.expectEqual(case.cursor, picker.cursor);
+        try std.testing.expectEqual(case.scroll, picker.window.scroll);
         const size: terminal.View.Size = .{ .columns = 80, .rows = 24 };
         try picker.reflow(size);
         const painted = try renderForTest(gpa, &picker, size);
@@ -562,7 +552,7 @@ test "the opening row applies the preselection, current value, and saved positio
 
     var empty = try testPicker(gpa, &.{}, &.{ .position = .{ .cursor = 4 } });
     defer empty.deinit();
-    try std.testing.expectEqual(@as(usize, 0), empty.position().cursor);
+    try std.testing.expectEqual(@as(usize, 0), empty.cursor);
 }
 
 test "the key hint states the step above a later step" {
@@ -650,14 +640,15 @@ test "a tall option list scrolls the window to keep the selection in view" {
     const size: terminal.View.Size = .{ .columns = 80, .rows = 20 };
 
     try picker.reflow(size);
-    try std.testing.expectEqual(@as(usize, 0), picker.position().scroll);
+    try std.testing.expectEqual(@as(usize, 0), picker.window.scroll);
     try std.testing.expectEqual(@as(usize, 9), picker.rows(size));
 
     for (0..19) |_| {
         try picker.moveDown();
         try picker.reflow(size);
     }
-    try std.testing.expectEqual(Position{ .cursor = 19, .scroll = 14 }, picker.position());
+    try std.testing.expectEqual(@as(usize, 19), picker.cursor);
+    try std.testing.expectEqual(@as(usize, 14), picker.window.scroll);
 
     const bottom = try renderForTest(gpa, &picker, size);
     defer gpa.free(bottom);
@@ -672,7 +663,8 @@ test "a tall option list scrolls the window to keep the selection in view" {
         try picker.moveUp();
         try picker.reflow(size);
     }
-    try std.testing.expectEqual(Position{ .cursor = 0, .scroll = 0 }, picker.position());
+    try std.testing.expectEqual(@as(usize, 0), picker.cursor);
+    try std.testing.expectEqual(@as(usize, 0), picker.window.scroll);
 
     const top = try renderForTest(gpa, &picker, size);
     defer gpa.free(top);
@@ -685,5 +677,6 @@ test "a tall option list scrolls the window to keep the selection in view" {
 
     try picker.moveUp();
     try picker.reflow(size);
-    try std.testing.expectEqual(Position{ .cursor = 19, .scroll = 14 }, picker.position());
+    try std.testing.expectEqual(@as(usize, 19), picker.cursor);
+    try std.testing.expectEqual(@as(usize, 14), picker.window.scroll);
 }

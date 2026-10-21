@@ -29,6 +29,7 @@ pub fn cannot(
     path: []const u8,
 ) error{ Canceled, OutOfMemory }!core.Tool.Output {
     if (err == error.Canceled) return error.Canceled;
+    if (err == error.OutOfMemory) return error.OutOfMemory;
     const shown = if (path.len == 0) "an empty path" else path;
     return failure(
         gpa,

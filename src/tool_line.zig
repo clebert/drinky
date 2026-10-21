@@ -1,9 +1,9 @@
 const std = @import("std");
+const application = @import("application");
 
 const core = @import("core");
 const tools = @import("tools");
 
-const format = @import("format.zig");
 const ui = @import("ui/root.zig");
 
 pub const Line = struct {
@@ -28,8 +28,8 @@ pub const Options = struct {
     name: []const u8,
     phase: Phase = .running,
     subject: []const u8 = "",
-    subject_kind: ?tools.Registry.Description.Kind = null,
-    output: ?*const core.Tool.Output = null,
+    subject_kind: ?application.ToolDescription.Kind = null,
+    output: ?*const application.ToolOutput = null,
     elapsed_ms: ?i64 = null,
     timeout_ms: ?u64 = null,
     received_bytes: ?usize = null,
@@ -64,18 +64,18 @@ const Parts = struct {
 
 pub fn subject(
     gpa: std.mem.Allocator,
-    description: *const tools.Registry.Description,
-    roots: *const format.Roots,
+    description: *const application.ToolDescription,
+    roots: *const application.support.format.Roots,
 ) error{OutOfMemory}![]u8 {
     const value = description.subject orelse return gpa.dupe(u8, "");
     if (value.kind == .command) return gpa.print("Command: {s}", .{value.text});
     const shown = switch (value.kind) {
-        .path => try format.path(gpa, value.text, roots),
+        .path => try application.support.format.path(gpa, value.text, roots),
         .pattern => try gpa.dupe(u8, value.text),
         .command => unreachable,
     };
     defer gpa.free(shown);
-    const line = ui.paint.singleLine(shown);
+    const line = application.reference.singleLine(shown);
     if (line.len == 0) return gpa.dupe(u8, "");
     return gpa.print("{s}: {s}", .{
         switch (value.kind) {
@@ -128,7 +128,7 @@ fn write(parts: *Parts, options: *const Options) !void {
     };
     const name = try parts.gpa.dupe(u8, options.name);
     defer parts.gpa.free(name);
-    const shown_name = ui.paint.singleLine(name);
+    const shown_name = application.reference.singleLine(name);
     try parts.print("Tool: {s} ({s})", .{ shown_name, @tagName(state) });
     parts.status = .{
         .start = 0,
@@ -144,14 +144,17 @@ fn write(parts: *Parts, options: *const Options) !void {
     if (options.elapsed_ms) |elapsed_ms| {
         var buffer: [24]u8 = undefined;
         const shown = if (options.output == null)
-            format.durationSeconds(&buffer, elapsed_ms, .down)
+            application.support.format.durationSeconds(&buffer, elapsed_ms, .down)
         else
-            tools.format.duration(&buffer, elapsed_ms);
+            application.support.duration(&buffer, elapsed_ms);
         try parts.print("Time: {s}", .{shown});
     } else if (options.output) |output| {
         if (output.measures.get(.duration_ms)) |duration_ms| {
             var buffer: [24]u8 = undefined;
-            try parts.print("Time: {s}", .{tools.format.duration(&buffer, @intCast(duration_ms))});
+            try parts.print(
+                "Time: {s}",
+                .{application.support.duration(&buffer, @intCast(duration_ms))},
+            );
         }
     }
     if (options.output) |output| {
@@ -166,11 +169,11 @@ fn write(parts: *Parts, options: *const Options) !void {
         try writeStops(parts, output);
         if (output.measures.get(.entries_unread)) |count| try parts.warn(
             "Unreadable: {d} {s}",
-            .{ count, tools.walk.entryNoun(count) },
+            .{ count, application.support.entryNoun(count) },
         );
         if (output.measures.get(.files_oversized)) |count| try parts.warn(
             "Skipped: {d} large file{s}",
-            .{ count, core.text.pluralSuffix(count) },
+            .{ count, application.support.pluralSuffix(count) },
         );
         if (output.conditions.contains(.line_truncated)) try parts.print("Line: truncated", .{});
         if (output.conditions.contains(.lines_truncated)) try parts.print("Lines: truncated", .{});
@@ -185,12 +188,12 @@ fn write(parts: *Parts, options: *const Options) !void {
     }
     if (options.received_bytes) |bytes| {
         var buffer: [16]u8 = undefined;
-        try parts.print("Received: {s}", .{format.bytes(&buffer, bytes)});
+        try parts.print("Received: {s}", .{application.support.format.bytes(&buffer, bytes)});
     }
     if (options.timeout_ms) |timeout_ms| {
         var buffer: [24]u8 = undefined;
         try parts.print("Timeout: {s}", .{
-            format.durationSeconds(&buffer, @intCast(timeout_ms), .up),
+            application.support.format.durationSeconds(&buffer, @intCast(timeout_ms), .up),
         });
     }
     if (command) {
@@ -205,14 +208,14 @@ fn write(parts: *Parts, options: *const Options) !void {
     }
 }
 
-const stops = [_]struct { condition: core.Tool.Condition, name: []const u8 }{
+const stops = [_]struct { condition: application.ToolCondition, name: []const u8 }{
     .{ .condition = .time_limit_reached, .name = "time limit" },
     .{ .condition = .tree_limit_reached, .name = "tree limit" },
     .{ .condition = .byte_limit_reached, .name = "byte limit" },
     .{ .condition = .match_limit_reached, .name = "match limit" },
 };
 
-fn partial(output: *const core.Tool.Output) bool {
+fn partial(output: *const application.ToolOutput) bool {
     if (output.conditions.contains(.incomplete)) return true;
     for (stops) |stop| {
         if (output.conditions.contains(stop.condition)) return true;
@@ -220,7 +223,7 @@ fn partial(output: *const core.Tool.Output) bool {
     return false;
 }
 
-fn writeStops(parts: *Parts, output: *const core.Tool.Output) !void {
+fn writeStops(parts: *Parts, output: *const application.ToolOutput) !void {
     var buffer: [64]u8 = undefined;
     var names: std.Io.Writer = .fixed(&buffer);
     for (stops) |stop| {
@@ -231,7 +234,7 @@ fn writeStops(parts: *Parts, output: *const core.Tool.Output) !void {
     if (names.buffered().len > 0) try parts.warn("Stopped: {s}", .{names.buffered()});
 }
 
-fn writeLines(parts: *Parts, output: *const core.Tool.Output) !void {
+fn writeLines(parts: *Parts, output: *const application.ToolOutput) !void {
     const removed = output.measures.get(.lines_removed);
     const added = output.measures.get(.lines_added);
     if (removed != null or added != null) {
@@ -443,7 +446,7 @@ test "a failed output keeps its error sentence and a bare output only its comple
 
 test "a tool names its subject and preserves each command line below its metadata" {
     const gpa = std.testing.allocator;
-    const roots: format.Roots = .{
+    const roots: application.support.format.Roots = .{
         .working_directory = "/home/you/work",
         .home_directory = "/home/you",
     };

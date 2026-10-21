@@ -21,17 +21,7 @@ system: []const u8,
 document: []const u8,
 tool_registry: tools.Registry,
 
-pub const effort_default: core.Provider.Effort = .xhigh;
-
-pub const key_hints = [_][]const u8{
-    "Enter: Send",
-    "Shift+Enter: New line",
-    "Esc: Cancel",
-    "Ctrl+C: Clear",
-    "Ctrl+D: Quit",
-};
-
-pub const repeat_window_ms = 500;
+const reference = @import("reference.zig");
 
 pub const Options = struct {
     directories: accounts.json_store.Directories,
@@ -75,9 +65,9 @@ pub fn init(self: *Harness, gpa: std.mem.Allocator, io: std.Io, options: *const 
     errdefer gpa.free(self.system);
     self.document = try describe.compose(gpa, &.{
         .config = &self.config,
-        .effort_default = effort_default,
-        .key_hints = &key_hints,
-        .repeat_window_ms = repeat_window_ms,
+        .effort_default = reference.effort_default,
+        .key_hints = &reference.key_hints,
+        .repeat_window_ms = reference.repeat_window_ms,
     });
     self.tool_registry = .{
         .host = .{

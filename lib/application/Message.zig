@@ -4,8 +4,10 @@ const Message = @This();
 
 content: []const u8,
 severity: Severity,
+confirmation: ?Confirmation = null,
 
 pub const Severity = enum { information, warning, failure };
+pub const Confirmation = enum { message, removal, rewind };
 
 pub fn print(
     gpa: std.mem.Allocator,
@@ -17,7 +19,9 @@ pub fn print(
 }
 
 pub fn dupe(self: *const Message, gpa: std.mem.Allocator) error{OutOfMemory}!Message {
-    return .{ .content = try gpa.dupe(u8, self.content), .severity = self.severity };
+    var result = self.*;
+    result.content = try gpa.dupe(u8, self.content);
+    return result;
 }
 
 pub fn deinit(self: *const Message, gpa: std.mem.Allocator) void {

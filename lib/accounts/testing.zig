@@ -285,6 +285,12 @@ pub fn tmpPath(buffer: []u8, tmp: *const std.testing.TmpDir, sub_path: []const u
     return std.mem.print(buffer, tmp_root ++ "{s}/{s}", .{ tmp.sub_path, sub_path });
 }
 
+pub fn planStore(comptime generation: []const u8) []const u8 {
+    return "{ \"openai-plan\": { \"access\": \"access-" ++ generation ++
+        "\", \"refresh\": \"refresh-" ++ generation ++
+        "\", \"expires_ms\": 4102444800000, \"account_id\": \"account-1\" } }";
+}
+
 pub fn writeStore(io: std.Io, tmp: *const std.testing.TmpDir, data: []const u8) !void {
     var directory = try tmp.dir.createDirPathOpen(io, ".drinky", .{});
     directory.close(io);

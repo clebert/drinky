@@ -1,149 +1,113 @@
 const std = @import("std");
-
+const application = @import("application");
 const accounts = @import("accounts");
 const core = @import("core");
 const providers = @import("providers");
 const tools = @import("tools");
-
-const billing = @import("billing.zig");
 const command_line = @import("command_line.zig");
-const escape = @import("escape.zig");
-const Harness = @import("Harness.zig");
-const project = @import("project.zig");
 const testing = @import("testing.zig");
-const tool_environment = @import("tool_environment.zig");
-const turn_text = @import("turn_text.zig");
-
-const nested_refusal = "Drinky cannot start drinky run inside another drinky run process.";
-const prompt_missing = "Drinky received no prompt on stdin.";
-const prompt_not_utf8 = "Drinky cannot use the prompt because it is not valid UTF-8.";
-const models_missing = "No signed-in account has a saved model list. Sign in and fetch a " ++
-    "list with /model in Drinky.";
-
-const block_separator = "\n\n";
-
 pub const Options = struct {
-    directories: accounts.json_store.Directories,
+    directories: application.Directories,
     environment: *const std.process.Environ.Map,
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
-    transport: ?providers.Transport = null,
+    transport: ?application.Transport = null,
 };
-
-pub const Request = struct {
-    run: command_line.Run,
-    prompt: []const u8,
-};
-
-const Found = union(enum) {
-    model: Target,
-    unknown,
-    unusable: usize,
-
-    const Target = struct {
-        account: usize,
-        model: accounts.Model,
-    };
-};
-
+pub const Request = struct { run: command_line.Run, prompt: []const u8 };
+const queue_capacity = 64;
 const Listener = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
-    model: *const accounts.Model,
-    reporter: ?tools.CostPipe.Writer,
-    cost_error: ?tools.CostPipe.Error = null,
-    mutex: std.Io.Mutex = .init,
-    blocks: std.ArrayList(std.ArrayList(u8)) = .empty,
+    reporter: ?application.CostReporter,
+    cost_error: ?application.CostReportError = null,
     final: std.ArrayList(u8) = .empty,
-    lost: bool = false,
-    outcome: ?core.Session.Outcome = null,
-    ended: std.Io.Event = .unset,
+    outcome: ?application.Outcome = null,
+    refusal: ?application.Message = null,
+    mail: std.Io.Queue(application.Mail),
+    mail_buffer: [queue_capacity]application.Mail = undefined,
 
-    const vtable: core.Session.Sink.VTable = .{ .emit = emit };
+    const sink_vtable: application.Sink.VTable = .{ .emit = emit };
+    const mailbox_vtable: application.Mailbox.VTable = .{ .post = post };
 
-    fn sink(self: *Listener) core.Session.Sink {
-        return .{ .ptr = self, .vtable = &vtable };
+    fn init(
+        self: *Listener,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        reporter: ?application.CostReporter,
+    ) void {
+        self.* = .{ .gpa = gpa, .io = io, .reporter = reporter, .mail = undefined };
+        self.mail = .init(&self.mail_buffer);
     }
 
     fn deinit(self: *Listener) void {
-        self.discard(self.blocks.items.len);
-        self.blocks.deinit(self.gpa);
+        self.closeMail();
         self.final.deinit(self.gpa);
         if (self.outcome) |*outcome| outcome.deinit(self.gpa);
+        if (self.refusal) |*refusal| refusal.deinit(self.gpa);
     }
 
-    fn emit(ptr: *anyopaque, event: *const core.Session.Event) void {
-        const self: *Listener = @ptrCast(@alignCast(ptr));
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        switch (event.*) {
-            .usage => |usage| self.charge(&usage),
-            .turn_ended => |*outcome| {
-                self.outcome = outcome.dupe(self.gpa);
-                self.ended.set(self.io);
-            },
-            else => if (!self.lost) self.apply(event) catch {
-                self.lost = true;
-            },
+    fn closeMail(self: *Listener) void {
+        self.mail.close(self.io);
+        var buffer: [queue_capacity]application.Mail = undefined;
+        while (true) {
+            const count = self.mail.get(self.io, &buffer, 0) catch return;
+            if (count == 0) return;
+            for (buffer[0..count]) |*mail| mail.deinit(self.gpa);
         }
     }
 
-    fn charge(self: *Listener, usage: *const core.Provider.Usage) void {
+    fn ended(self: *const Listener) bool {
+        return self.outcome != null or self.refusal != null;
+    }
+
+    fn wait(self: *Listener, controller: *application.Controller) void {
+        while (!self.ended()) {
+            const mail = self.mail.getOneUncancelable(self.io) catch return;
+            controller.receive(mail);
+        }
+    }
+
+    fn emit(ptr: *anyopaque, message: *const application.Event) void {
+        const self: *Listener = @ptrCast(@alignCast(ptr));
+        switch (message.*) {
+            .charge => |amount| self.charge(amount),
+            .startup_refused => |*refusal| {
+                self.refusal = refusal.dupe(self.gpa) catch application.support.outOfMemory();
+            },
+            .turn_ended => |*turn| {
+                self.outcome = turn.outcome.dupe(self.gpa) catch application.support.outOfMemory();
+                self.final.appendSlice(self.gpa, turn.answer) catch
+                    application.support.outOfMemory();
+            },
+            else => {},
+        }
+    }
+
+    fn post(ptr: *anyopaque, mail: application.Mail) void {
+        const self: *Listener = @ptrCast(@alignCast(ptr));
+        self.mail.putOneUncancelable(self.io, mail) catch mail.deinit(self.gpa);
+    }
+
+    fn charge(self: *Listener, amount: f64) void {
         const reporter = self.reporter orelse return;
-        const amount = billing.cost(usage, self.model) orelse return;
         reporter.send(amount) catch |err| {
             self.cost_error = err;
         };
     }
 
-    fn apply(self: *Listener, event: *const core.Session.Event) error{OutOfMemory}!void {
-        switch (event.*) {
-            .text_started, .reasoning_started, .tool_call_started => {
-                try self.blocks.append(self.gpa, .empty);
-            },
-            .text => |delta| {
-                const blocks = self.blocks.items;
-                try blocks[blocks.len - 1].appendSlice(self.gpa, delta);
-            },
-            .tail_discarded => |count| self.discard(count),
-            .committed => try self.commit(),
-            else => {},
-        }
-    }
-
-    fn discard(self: *Listener, count: usize) void {
-        std.debug.assert(count <= self.blocks.items.len);
-        for (0..count) |_| {
-            var block = self.blocks.pop().?;
-            block.deinit(self.gpa);
-        }
-    }
-
-    fn commit(self: *Listener) error{OutOfMemory}!void {
-        self.final.clearRetainingCapacity();
-        for (self.blocks.items) |block| {
-            if (block.items.len == 0) continue;
-            if (self.final.items.len > 0) try self.final.appendSlice(self.gpa, block_separator);
-            try self.final.appendSlice(self.gpa, block.items);
-        }
-        self.discard(self.blocks.items.len);
-    }
-
     fn report(self: *Listener, options: *const Options) !bool {
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
-        if (self.lost) return refuseFailure(self.gpa, options, &.{ .reason = .out_of_memory });
+        if (self.refusal) |refusal| return refuse(options.stderr, refusal.content);
         const succeeded = switch (self.outcome.?) {
             .stopped => |reason| stopped: {
                 try self.writeFinal(options.stdout);
                 break :stopped switch (reason) {
                     .complete => true,
-                    .truncated => try refuse(options.stderr, turn_text.truncated.content),
+                    .truncated => try refuse(options.stderr, application.support.truncated.content),
                 };
             },
             .exhausted => exhausted: {
                 try self.writeFinal(options.stdout);
-                break :exhausted try refuse(options.stderr, turn_text.exhausted);
+                break :exhausted try refuse(options.stderr, application.support.exhausted);
             },
             .failed => |*failure| try refuseFailure(self.gpa, options, failure),
             .canceled => unreachable,
@@ -166,125 +130,45 @@ pub fn run(
     options: *const Options,
     request: *const Request,
 ) !bool {
-    const stderr = options.stderr;
-    if (options.environment.get(tool_environment.nested) != null)
-        return refuse(stderr, nested_refusal);
-    if (!std.unicode.utf8ValidateSlice(request.prompt)) return refuse(stderr, prompt_not_utf8);
-    if (std.mem.trim(u8, request.prompt, &std.ascii.whitespace).len == 0)
-        return refuse(stderr, prompt_missing);
-
-    const reporter = if (options.environment.get(tools.CostPipe.environment)) |value|
-        tools.CostPipe.Writer.fromEnvironment(io, value) catch |err|
-            return refuseCostReport(stderr, err)
+    const reporter = if (options.environment.get(application.cost_report_environment)) |value|
+        application.CostReporter.fromEnvironment(io, value) catch |err|
+            return refuseCostReport(options.stderr, err)
     else
         null;
-
-    var environment = try options.environment.clone(gpa);
-    defer environment.deinit();
-    _ = environment.swapRemove(tools.CostPipe.environment);
-    try environment.put(tool_environment.nested, "1");
-    const block = try environment.createPosixBlock(gpa, .{});
-    defer block.deinit(gpa);
-
-    var harness: Harness = undefined;
-    try harness.init(gpa, io, &.{
-        .directories = options.directories,
-        .environ = .{ .block = block },
-        .surface = .run,
-    });
-    defer harness.deinit(gpa);
-    var registry: accounts.Registry = undefined;
-    try openRegistry(&registry, gpa, io, options, &harness.config.timeouts);
-    defer registry.deinit();
-
-    const target = switch (find(&registry, request.run.model)) {
-        .model => |target| target,
-        .unknown => return refuseModel(gpa, options, request.run.model),
-        .unusable => |account| return refuseAccount(options, &registry, account),
-    };
-    var client: accounts.Client = undefined;
-    registry.open(&client, target.account) catch |err| switch (err) {
-        error.SignedOut => unreachable,
-        error.OutOfMemory => return error.OutOfMemory,
-    };
-    defer client.deinit();
-
-    var listener: Listener = .{
-        .gpa = gpa,
-        .io = io,
-        .model = &target.model,
-        .reporter = reporter,
-    };
+    var listener: Listener = undefined;
+    listener.init(gpa, io, reporter);
     defer listener.deinit();
-    var session = harness.session(gpa, io, listener.sink());
-    defer session.deinit();
-    try session.start();
-    const variables = tool_environment.variables(request.run.model, request.run.effort);
-    try session.send(&.{ .configure = .{
-        .provider = client.provider(),
-        .account = accounts.Account.table[target.account].id,
-        .model = target.model.name(),
-        .effort = target.model.fold(request.run.effort),
-        .tokens_max = target.model.tokens_max,
-        .system = harness.system,
-        .variables = &variables,
-    } });
-    try session.send(&.{ .prompt = request.prompt });
-    listener.ended.waitUncancelable(io);
+    const controller = try application.Controller.create(gpa, io, &.{
+        .directories = options.directories,
+        .environment = options.environment,
+        .transport = options.transport,
+        .startup = .{ .run = .{
+            .model = request.run.model,
+            .effort = request.run.effort,
+            .prompt = request.prompt,
+        } },
+        .sink = .{ .ptr = &listener, .vtable = &Listener.sink_vtable },
+        .mailbox = .{ .ptr = &listener, .vtable = &Listener.mailbox_vtable },
+    });
+    defer {
+        listener.closeMail();
+        controller.destroy();
+    }
+    listener.wait(controller);
     return listener.report(options);
 }
 
 pub fn models(gpa: std.mem.Allocator, io: std.Io, options: *const Options) !bool {
-    var registry: accounts.Registry = undefined;
-    try openRegistry(&registry, gpa, io, options, &accounts.Registry.timeouts_default);
-    defer registry.deinit();
-
-    var listed: std.ArrayList(accounts.Model) = .empty;
-    defer listed.deinit(gpa);
-    var count: usize = 0;
-    for (&accounts.Account.table, 0..) |*row, index| {
-        if (!registry.isAuthenticated(index)) continue;
-        listed.clearRetainingCapacity();
-        try registry.listModels(index, &listed, gpa);
-        for (listed.items) |*model| {
-            try options.stdout.print("{s}/{s}\n", .{ row.id, model.name() });
-        }
-        count += listed.items.len;
-    }
-    if (count == 0) return refuse(options.stderr, models_missing);
-    return true;
-}
-
-const registry_sink_vtable: accounts.Registry.Sink.VTable = .{ .emit = emitRegistryEvent };
-
-fn emitRegistryEvent(_: *anyopaque, _: *const accounts.Registry.Event) void {
-    unreachable;
-}
-
-fn openRegistry(
-    registry: *accounts.Registry,
-    gpa: std.mem.Allocator,
-    io: std.Io,
-    options: *const Options,
-    timeouts: *const accounts.Registry.Timeouts,
-) !void {
-    try registry.init(gpa, io, &.{
+    const list = try application.model_list.compose(gpa, io, &.{
         .directories = options.directories,
         .environment = options.environment,
-        .sink = .{ .ptr = registry, .vtable = &registry_sink_vtable },
-        .timeouts = timeouts.*,
         .transport = options.transport,
     });
+    defer gpa.free(list);
+    if (list.len == 0) return refuse(options.stderr, application.reference.models_missing);
+    try options.stdout.writeAll(list);
+    return true;
 }
-
-fn find(registry: *accounts.Registry, value: []const u8) Found {
-    const slash = std.mem.findScalar(u8, value, '/') orelse return .unknown;
-    const account = accounts.Account.index(value[0..slash]) orelse return .unknown;
-    if (!registry.isAuthenticated(account)) return .{ .unusable = account };
-    const model = registry.findModel(account, value[slash + 1 ..]) orelse return .unknown;
-    return .{ .model = .{ .account = account, .model = model } };
-}
-
 fn refuse(writer: *std.Io.Writer, sentence: []const u8) std.Io.Writer.Error!bool {
     try writer.print("{s}\n", .{sentence});
     return false;
@@ -292,7 +176,7 @@ fn refuse(writer: *std.Io.Writer, sentence: []const u8) std.Io.Writer.Error!bool
 
 fn refuseCostReport(
     writer: *std.Io.Writer,
-    err: tools.CostPipe.Error,
+    err: application.CostReportError,
 ) std.Io.Writer.Error!bool {
     try writer.print("Drinky could not report the run cost because of error {s}.\n", .{
         @errorName(err),
@@ -303,49 +187,11 @@ fn refuseCostReport(
 fn refuseFailure(
     gpa: std.mem.Allocator,
     options: *const Options,
-    failure: *const core.Provider.Failure,
+    failure: *const application.Failure,
 ) !bool {
-    const text = try turn_text.failureText(gpa, failure);
+    const text = try application.support.failureText(gpa, failure);
     defer gpa.free(text);
     return refuse(options.stderr, text);
-}
-
-fn refuseModel(gpa: std.mem.Allocator, options: *const Options, value: []const u8) !bool {
-    const shown = try escape.diagnostic(gpa, value);
-    defer gpa.free(shown);
-    try options.stderr.print(
-        "Drinky does not know the model \"{s}\". Run drinky models for the valid values.\n",
-        .{shown},
-    );
-    return false;
-}
-
-fn refuseAccount(
-    options: *const Options,
-    registry: *const accounts.Registry,
-    account: usize,
-) std.Io.Writer.Error!bool {
-    const row = &accounts.Account.table[account];
-    const stderr = options.stderr;
-    if (registry.loadError(account)) |err| {
-        try stderr.print("Drinky could not load the {s} account because of error {s}.\n", .{
-            row.id,
-            @errorName(err),
-        });
-        return false;
-    }
-    switch (row.credential) {
-        .store => try stderr.print(
-            "Drinky cannot use the account {s} because it is signed out. Sign in with /login " ++
-                "in Drinky.\n",
-            .{row.id},
-        ),
-        .environment, .key_file => try stderr.print(
-            "Set {s} in the environment to use the account {s}.\n",
-            .{ row.setting().?, row.id },
-        ),
-    }
-    return false;
 }
 
 test "a run gives its tools its three variables and writes only the final reply to stdout" {
@@ -399,7 +245,7 @@ test "a run reports a failed attempt before the next attempt ends" {
         _ = future.await(io) catch {};
     };
     try hold.reached.wait(io);
-    try expectCosts(&pipe, &.{0.1});
+    try expectFirstCost(&pipe, 0.1);
     try std.testing.expectEqualStrings("", rig.stdout.written());
     hold.released.set(io);
     const succeeded = future.await(io);
@@ -463,6 +309,20 @@ test "an invalid cost channel refuses the run before it sends a request" {
     try std.testing.expectEqual(@as(usize, 0), rig.transport.requests.items.len);
 }
 
+fn expectFirstCost(pipe: *tools.CostPipe, expected: f64) !void {
+    var buffer: [64]u8 = undefined;
+    const count = try core.timeout.run(std.testing.io, 5_000, readPipe, .{ pipe, &buffer }, null);
+    var costs: tools.testing.Costs = .{};
+    defer costs.deinit();
+    var decoder: tools.CostPipe.Decoder = .{ .sink = costs.sink() };
+    try decoder.feed(std.testing.io, buffer[0..count]);
+    try costs.expect(&.{expected});
+}
+
+fn readPipe(pipe: *tools.CostPipe, buffer: *[64]u8) std.Io.File.ReadStreamingError!usize {
+    return pipe.reader.readStreaming(std.testing.io, &.{buffer});
+}
+
 fn expectCosts(pipe: *tools.CostPipe, expected: []const f64) !void {
     var costs: tools.testing.Costs = .{};
     defer costs.deinit();
@@ -512,7 +372,7 @@ const Rig = struct {
         const io = std.testing.io;
         self.tmp = std.testing.tmpDir(.{});
         errdefer self.tmp.cleanup();
-        try self.tmp.dir.writeFile(io, .{ .sub_path = project.marker_name, .data = "" });
+        try self.tmp.dir.writeFile(io, .{ .sub_path = ".git", .data = "" });
         var store = try self.tmp.dir.createDirPathOpen(io, ".drinky", .{});
         defer store.close(io);
         try store.writeFile(io, .{ .sub_path = "config.json", .data = config });
@@ -635,7 +495,10 @@ test "a truncated final reply reaches stdout, and its event reaches stderr as a 
 
     try std.testing.expect(!try rig.ask(.high, "openai-api-key/gpt-5.6-sol", "review"));
     try std.testing.expectEqualStrings("partial\n", rig.stdout.written());
-    try std.testing.expectEqualStrings(turn_text.truncated.content ++ "\n", rig.stderr.written());
+    try std.testing.expectEqualStrings(
+        application.support.truncated.content ++ "\n",
+        rig.stderr.written(),
+    );
 }
 
 test "a failed turn writes its failure to stderr and nothing to stdout" {
@@ -652,7 +515,7 @@ test "a failed turn writes its failure to stderr and nothing to stdout" {
     try testing.expectContains(rig.stderr.written(), ": down\n");
 }
 
-test "a run refuses a nested start, a blank prompt, and a prompt that is not UTF-8" {
+test "a run refuses a nested start, then a blank or non-UTF-8 prompt, before it checks the model" {
     const Case = struct {
         variables: []const [2][]const u8 = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
         prompt: []const u8,
@@ -662,19 +525,19 @@ test "a run refuses a nested start, a blank prompt, and a prompt that is not UTF
         .{
             .variables = &.{
                 .{ "OPENAI_API_KEY", "sk-openai" },
-                .{ tool_environment.nested, "1" },
+                .{ application.reference.nested, "1" },
             },
-            .prompt = "review",
-            .refusal = nested_refusal,
+            .prompt = " \n\t",
+            .refusal = application.reference.nested_refusal,
         },
-        .{ .prompt = " \n\t", .refusal = prompt_missing },
-        .{ .prompt = "review \xff", .refusal = prompt_not_utf8 },
+        .{ .prompt = " \n\t", .refusal = application.reference.prompt_missing },
+        .{ .prompt = "review \xff", .refusal = application.reference.prompt_not_utf8 },
     };
     for (cases) |case| {
         var rig: Rig = undefined;
         try rig.init(&.{ .variables = case.variables });
         defer rig.deinit();
-        try std.testing.expect(!try rig.ask(.high, "openai-api-key/gpt-5.6-sol", case.prompt));
+        try std.testing.expect(!try rig.ask(.high, "openai-api-key/gpt-9", case.prompt));
         try std.testing.expectEqualStrings("", rig.stdout.written());
         try std.testing.expectEqualStrings(case.refusal, std.mem.trimEnd(
             u8,
@@ -753,5 +616,8 @@ test "the model list names each saved model of a signed-in account and fails whe
     defer empty.deinit();
     try std.testing.expect(!try empty.listModels());
     try std.testing.expectEqualStrings("", empty.stdout.written());
-    try std.testing.expectEqualStrings(models_missing ++ "\n", empty.stderr.written());
+    try std.testing.expectEqualStrings(
+        application.reference.models_missing ++ "\n",
+        empty.stderr.written(),
+    );
 }

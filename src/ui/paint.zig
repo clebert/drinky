@@ -1,9 +1,8 @@
 const std = @import("std");
+const application = @import("application");
 
 const core = @import("core");
 const terminal = @import("terminal");
-
-const Message = @import("../Message.zig");
 
 const attribute = @import("attribute.zig");
 const role = @import("role.zig");
@@ -24,7 +23,7 @@ pub const NoticeStyle = struct {
 
     pub const note: NoticeStyle = .{ .role = .user_note, .prefix = "→ ", .fit = .head };
 
-    pub fn of(severity: Message.Severity) NoticeStyle {
+    pub fn of(severity: application.Message.Severity) NoticeStyle {
         return switch (severity) {
             .information => .{ .role = .accent, .prefix = "ℹ " },
             .warning => .{ .role = .warning, .prefix = "⚠ " },
@@ -69,8 +68,6 @@ pub const NoticeStyle = struct {
 pub const separator = " \u{00B7} ";
 
 pub const continuation_marker = "↪ ";
-
-pub const blank_bytes = " \t\r\n";
 
 const Row = struct { end: usize, next: usize, shortened: bool = false };
 
@@ -334,27 +331,8 @@ const FramedRow = struct {
     marks: []const Mark = &.{},
 };
 
-pub fn singleLine(text: []u8) []u8 {
-    var length: usize = 0;
-    var blank = false;
-    for (text) |byte| {
-        if (byte == ' ' or byte <= 0x1f or byte == 0x7f) {
-            blank = length != 0;
-            continue;
-        }
-        if (blank) {
-            text[length] = ' ';
-            length += 1;
-            blank = false;
-        }
-        text[length] = byte;
-        length += 1;
-    }
-    return text[0..length];
-}
-
 pub fn isBlank(text: []const u8) bool {
-    return std.mem.findNone(u8, text, blank_bytes) == null;
+    return std.mem.findNone(u8, text, application.reference.blank_bytes) == null;
 }
 
 pub fn packRow(line: []const u8, room: usize, overwide: Overwide) Row {

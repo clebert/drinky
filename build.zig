@@ -50,17 +50,26 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    const application_module = b.addModule("application", .{
+        .root_source_file = b.path("lib/application/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "core", .module = core_module },
+            .{ .name = "providers", .module = providers_module },
+            .{ .name = "tools", .module = tools_module },
+            .{ .name = "accounts", .module = accounts_module },
+        },
+    });
+
     const root_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
+            .{ .name = "application", .module = application_module },
             .{ .name = "terminal", .module = terminal_module },
             .{ .name = "markdown", .module = markdown_module },
-            .{ .name = "core", .module = core_module },
-            .{ .name = "providers", .module = providers_module },
-            .{ .name = "tools", .module = tools_module },
-            .{ .name = "accounts", .module = accounts_module },
         },
     });
 
@@ -102,6 +111,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "providers", .module = providers_module },
         .{ .name = "tools", .module = tools_module },
         .{ .name = "accounts", .module = accounts_module },
+        .{ .name = "application", .module = application_module },
         .{ .name = "src", .module = root_module },
         .{ .name = "comment_scan", .module = comment_scan_module },
         .{ .name = "width_scan", .module = width_scan_module },
@@ -117,6 +127,12 @@ pub fn build(b: *std.Build) void {
         });
         for (module.import_table.keys(), module.import_table.values()) |name, imported|
             test_module.addImport(name, imported);
+        if (module == root_module) {
+            test_module.addImport("core", core_module);
+            test_module.addImport("providers", providers_module);
+            test_module.addImport("tools", tools_module);
+            test_module.addImport("accounts", accounts_module);
+        }
         const tests = b.addTest(.{ .name = tested.name, .root_module = test_module });
         const run_tests = b.addRunArtifact(tests);
         run_tests.has_side_effects = true;

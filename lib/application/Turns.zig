@@ -52,6 +52,13 @@ pub fn mutatedFrom(self: *const Turns, index: usize) bool {
     return false;
 }
 
+pub fn takeLine(self: *Turns, index: usize) []const u8 {
+    const turn = &self.list.items[index];
+    const line = turn.line.?;
+    turn.line = null;
+    return line;
+}
+
 pub fn truncate(self: *Turns, count: usize) void {
     std.debug.assert(count <= self.list.items.len);
     for (self.list.items[count..]) |turn| {

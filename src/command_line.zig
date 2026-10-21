@@ -1,20 +1,7 @@
 const std = @import("std");
-
-const core = @import("core");
-
-const escape = @import("escape.zig");
+const application = @import("application");
 
 const usage = "Use drinky, drinky models, or drinky run --model account/model --effort level.";
-
-pub const effort_levels = levels: {
-    const names = @typeInfo(core.Provider.Effort).@"enum".field_names;
-    var text: []const u8 = "";
-    for (names, 0..) |name, index| {
-        const separator = if (index == 0) "" else if (index + 1 == names.len) ", or " else ", ";
-        text = text ++ separator ++ name;
-    }
-    break :levels text;
-};
 
 pub const Parsed = union(enum) {
     terminal,
@@ -25,7 +12,7 @@ pub const Parsed = union(enum) {
 
 pub const Run = struct {
     model: []const u8,
-    effort: core.Provider.Effort,
+    effort: application.Effort,
 };
 
 pub const Refusal = union(enum) {
@@ -42,7 +29,7 @@ pub const Refusal = union(enum) {
     ) (error{OutOfMemory} || std.Io.Writer.Error)!void {
         switch (self.*) {
             .unknown_argument => |argument| {
-                const shown = try escape.diagnostic(gpa, argument);
+                const shown = try application.support.diagnostic(gpa, argument);
                 defer gpa.free(shown);
                 try writer.print("Drinky does not know the argument \"{s}\". {s}\n", .{
                     shown,
@@ -55,14 +42,15 @@ pub const Refusal = union(enum) {
                     "valid values.\n",
             ),
             .effort_missing => try writer.writeAll(
-                "Add the flag --effort with one of the levels " ++ effort_levels ++ ".\n",
+                "Add the flag --effort with one of the levels " ++
+                    application.reference.effort_levels ++ ".\n",
             ),
             .effort_unknown => |level| {
-                const shown = try escape.diagnostic(gpa, level);
+                const shown = try application.support.diagnostic(gpa, level);
                 defer gpa.free(shown);
                 try writer.print("Drinky does not know the effort level \"{s}\". Use {s}.\n", .{
                     shown,
-                    effort_levels,
+                    application.reference.effort_levels,
                 });
             },
         }
@@ -98,7 +86,7 @@ fn parseRun(arguments: []const [:0]const u8) Parsed {
     }
     const model = maybe_model orelse return .{ .refused = .model_missing };
     const level = maybe_level orelse return .{ .refused = .effort_missing };
-    const effort = std.meta.stringToEnum(core.Provider.Effort, level) orelse
+    const effort = std.meta.stringToEnum(application.Effort, level) orelse
         return .{ .refused = .{ .effort_unknown = level } };
     return .{ .run = .{ .model = model, .effort = effort } };
 }

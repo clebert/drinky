@@ -2,7 +2,7 @@ const std = @import("std");
 
 const discovery = @import("../discovery/root.zig");
 const Message = @import("../Message.zig");
-const ui = @import("../ui/root.zig");
+const reference = @import("../reference.zig");
 const Context = @import("Context.zig");
 const testing = @import("testing.zig");
 
@@ -52,14 +52,14 @@ pub fn load(
     arguments: []const u8,
 ) !Context.Outcome {
     const gpa = context.gpa;
-    const content = target.invoke(gpa, context.io, arguments) catch |err| {
-        if (err == error.Canceled or err == error.OutOfMemory) return err;
-        return .{ .refusal = try Message.print(
+    const content = target.invoke(gpa, context.io, arguments) catch |err| switch (err) {
+        error.Canceled, error.OutOfMemory => |known| return known,
+        else => return .{ .refusal = try Message.print(
             gpa,
             .failure,
             "Drinky could not load the skill {s} because of error {s}.",
             .{ target.name, @errorName(err) },
-        ) };
+        ) },
     };
     errdefer gpa.free(content);
     const name_copy = try gpa.dupe(u8, target.name);
@@ -96,8 +96,8 @@ fn firstSentence(description: []const u8) []const u8 {
         const end = stop + 1;
         index = end;
         if (end == description.len) break;
-        if (std.mem.findScalar(u8, ui.paint.blank_bytes, description[end]) == null) continue;
-        const next = std.mem.findNone(u8, description[end..], ui.paint.blank_bytes) orelse break;
+        if (std.mem.findScalar(u8, reference.blank_bytes, description[end]) == null) continue;
+        const next = std.mem.findNone(u8, description[end..], reference.blank_bytes) orelse break;
         const start = description[end + next];
         if (start < 'a' or start > 'z') return description[0..end];
     }

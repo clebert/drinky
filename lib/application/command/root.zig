@@ -3,7 +3,7 @@ const std = @import("std");
 const core = @import("core");
 
 const Message = @import("../Message.zig");
-const ui = @import("../ui/root.zig");
+const reference = @import("../reference.zig");
 
 pub const Context = @import("Context.zig");
 pub const login = @import("login.zig");
@@ -119,7 +119,7 @@ fn listed(out: *[commands.len]Entry) []const Entry {
 fn parse(line: []const u8) ?[]const u8 {
     if (!std.mem.startsWith(u8, line, "/")) return null;
     const body = line[1..];
-    const end = std.mem.findAny(u8, body, ui.paint.blank_bytes) orelse body.len;
+    const end = std.mem.findAny(u8, body, reference.blank_bytes) orelse body.len;
     return body[0..end];
 }
 
@@ -129,7 +129,7 @@ fn loadsSkill(name: []const u8) bool {
 
 fn tail(line: []const u8, name: []const u8) []const u8 {
     std.debug.assert(std.mem.startsWith(u8, line[1..], name));
-    return std.mem.trim(u8, line[1 + name.len ..], ui.paint.blank_bytes);
+    return std.mem.trim(u8, line[1 + name.len ..], reference.blank_bytes);
 }
 
 fn lookup(name: []const u8) ?*const Entry {

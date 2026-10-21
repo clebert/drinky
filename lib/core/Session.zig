@@ -3,6 +3,7 @@ const std = @import("std");
 const actor = @import("actor.zig");
 const Aside = @import("Aside.zig");
 const Conversation = @import("Conversation.zig");
+const fatal = @import("fatal.zig");
 const Provider = @import("Provider.zig");
 const Retry = @import("Retry.zig");
 const Runner = @import("Runner.zig");
@@ -145,10 +146,10 @@ pub const Event = union(enum) {
         failure: Provider.Failure,
         delay_ms: u64,
 
-        fn dupe(self: *const Attempt, gpa: std.mem.Allocator) Attempt {
+        fn dupe(self: *const Attempt, gpa: std.mem.Allocator) error{OutOfMemory}!Attempt {
             return .{
                 .attempt = self.attempt,
-                .failure = self.failure.dupe(gpa),
+                .failure = try self.failure.dupe(gpa),
                 .delay_ms = self.delay_ms,
             };
         }
@@ -164,7 +165,7 @@ pub const Event = union(enum) {
             .text => |delta| .{ .text = try gpa.dupe(u8, delta) },
             .aside_text => |delta| .{ .aside_text = try gpa.dupe(u8, delta) },
             .aside_reasoning => |delta| .{ .aside_reasoning = try gpa.dupe(u8, delta) },
-            .aside_ended => |*outcome| .{ .aside_ended = outcome.dupe(gpa) },
+            .aside_ended => |*outcome| .{ .aside_ended = try outcome.dupe(gpa) },
             .reasoning => |delta| .{ .reasoning = try gpa.dupe(u8, delta) },
             .tool_call_started => |name| .{ .tool_call_started = try gpa.dupe(u8, name) },
             .tool_call_arguments => |delta| .{ .tool_call_arguments = try gpa.dupe(u8, delta) },
@@ -182,8 +183,8 @@ pub const Event = union(enum) {
                     .served = try gpa.dupe(u8, served.served),
                 } };
             },
-            .attempt_failed => |*attempt| .{ .attempt_failed = attempt.dupe(gpa) },
-            .aside_attempt_failed => |*attempt| .{ .aside_attempt_failed = attempt.dupe(gpa) },
+            .attempt_failed => |*attempt| .{ .attempt_failed = try attempt.dupe(gpa) },
+            .aside_attempt_failed => |*attempt| .{ .aside_attempt_failed = try attempt.dupe(gpa) },
             .skill_loaded => |skill| {
                 const name = try gpa.dupe(u8, skill.name);
                 errdefer gpa.free(name);
@@ -192,7 +193,7 @@ pub const Event = union(enum) {
                     .source = try gpa.dupe(u8, skill.source),
                 } };
             },
-            .turn_ended => |*outcome| .{ .turn_ended = outcome.dupe(gpa) },
+            .turn_ended => |*outcome| .{ .turn_ended = try outcome.dupe(gpa) },
             .setup_dropped,
             .text_started,
             .reasoning_started,
@@ -253,9 +254,9 @@ pub const Outcome = union(enum) {
     exhausted,
     failed: Provider.Failure,
 
-    pub fn dupe(self: *const Outcome, gpa: std.mem.Allocator) Outcome {
+    pub fn dupe(self: *const Outcome, gpa: std.mem.Allocator) error{OutOfMemory}!Outcome {
         return switch (self.*) {
-            .failed => |*failure| .{ .failed = failure.dupe(gpa) },
+            .failed => |*failure| .{ .failed = try failure.dupe(gpa) },
             .stopped, .canceled, .exhausted => self.*,
         };
     }
@@ -355,11 +356,7 @@ fn prompt(self: *Session, text: []const u8) void {
     std.debug.assert(self.setup != null);
     const turn_index = self.turn_count;
     self.turn_count += 1;
-    self.appendPrompt(turn_index, text) catch {
-        self.gpa.free(text);
-        self.emit(&.{ .turn_ended = .{ .failed = .{ .reason = .out_of_memory } } });
-        return;
-    };
+    self.appendPrompt(turn_index, text) catch fatal.outOfMemory();
     const turn: Turn = .{
         .gpa = self.gpa,
         .io = self.io,
@@ -608,9 +605,9 @@ const fixture = struct {
     };
     const write_call: Tool.Call = .{ .id = "w1", .name = "write", .arguments = "{}" };
     const stop_complete: Provider.Event = .{ .stopped = .{} };
-    const canceled_text = "The user canceled the call before Drinky received its result. " ++
+    const canceled_text = "Drinky canceled the call before it received its result. " ++
         "The call can have completed some or all of its work.";
-    const unstarted_text = "Drinky did not run the call because the user canceled the turn.";
+    const unstarted_text = "Drinky did not run the call because the turn ended.";
     const handoff: Aside.Request = .{
         .system = "Summarize the task.",
         .text = "Prepare a handoff.",
@@ -786,7 +783,7 @@ test "a cancel while a tool call runs answers the next call as a call that did n
         \\tool_call_started:read
         \\tool_started:w1
         \\tool_result:w1:done
-        \\tool_result:c1:Drinky did not run the call because the user canceled the turn.:canceled
+        \\tool_result:c1:Drinky did not run the call because the turn ended.:canceled
         \\committed
         \\turn_ended:canceled
     , try harness.turn("hi"));
@@ -795,7 +792,7 @@ test "a cancel while a tool call runs answers the next call as a call that did n
     _ = try harness.turn("next");
     try std.testing.expectEqualStrings(
         "model-a|user:hi|call:w1:write:{}|call:c1:read:{\"path\":\"a.txt\"}|result:w1:done|" ++
-            "result:c1:Drinky did not run the call because the user canceled the turn.|user:next",
+            "result:c1:Drinky did not run the call because the turn ended.|user:next",
         harness.provider.requests.items[1],
     );
 }
@@ -852,18 +849,22 @@ test "a cancel during a write answers the write as started and the next call as 
         .command = .cancel,
         .after_cancel = .fail,
     };
+    const events = try harness.turn("hi");
+    try std.testing.expect(std.mem.find(u8, events, "user canceled") == null);
     try std.testing.expectEqualStrings(
         "tool_call_started:write\ntool_call_started:read\ntool_started:w1\ntool_result:w1:" ++
             fixture.canceled_text ++ ":canceled\ntool_result:c1:" ++ fixture.unstarted_text ++
             ":canceled\ncommitted\nturn_ended:canceled",
-        try harness.turn("hi"),
+        events,
     );
     try std.testing.expectEqual(@as(u32, 1), harness.runner.canceled);
     _ = try harness.turn("next");
+    const request = harness.provider.requests.items[1];
+    try std.testing.expect(std.mem.find(u8, request, "user canceled") == null);
     try std.testing.expectEqualStrings(
         "model-a|user:hi|call:w1:write:{}|call:c1:read:{\"path\":\"a.txt\"}|result:w1:" ++
             fixture.canceled_text ++ "|result:c1:" ++ fixture.unstarted_text ++ "|user:next",
-        harness.provider.requests.items[1],
+        request,
     );
 }
 
@@ -2138,6 +2139,11 @@ test "a deinit during a turn cancels its stream and frees every item" {
 
 test "a copy of each event owns its bytes, and a failed copy leaks nothing" {
     const call: Tool.Call = .{ .id = "c1", .name = "read", .arguments = "{}" };
+    const failure: Provider.Failure = .{
+        .reason = .rate_limited,
+        .retry_after_ms = 7,
+        .message = "slow",
+    };
     const events = [_]Event{
         .{ .text = "delta" },
         .{ .reasoning = "delta" },
@@ -2148,48 +2154,14 @@ test "a copy of each event owns its bytes, and a failed copy leaks nothing" {
         .{ .model_served = .{ .requested = "a", .served = "b" } },
         .{ .skill_loaded = .{ .name = "zig-style", .source = "SKILL.md" } },
         .{ .turn_ended = .canceled },
+        .{ .turn_ended = .{ .failed = failure } },
+        .{ .attempt_failed = .{ .attempt = 1, .failure = failure, .delay_ms = 0 } },
         .{ .aside_text = "delta" },
         .{ .aside_reasoning = "delta" },
         .{ .aside_ended = .canceled },
+        .{ .aside_ended = .{ .failed = failure } },
+        .{ .aside_attempt_failed = .{ .attempt = 1, .failure = failure, .delay_ms = 0 } },
         .committed,
     };
     try testing.checkCopyAllocationFailures(Event, &events);
-}
-
-test "a failure keeps its reason and its wait when the copy of its message fails" {
-    const failure: Provider.Failure = .{
-        .reason = .rate_limited,
-        .retry_after_ms = 7,
-        .message = "slow",
-    };
-    const events = [_]Event{
-        .{ .attempt_failed = .{ .attempt = 1, .failure = failure, .delay_ms = 0 } },
-        .{ .aside_attempt_failed = .{ .attempt = 1, .failure = failure, .delay_ms = 0 } },
-        .{ .turn_ended = .{ .failed = failure } },
-        .{ .aside_ended = .{ .failed = failure } },
-    };
-    for (&events) |*event| {
-        const owned = try event.dupe(std.testing.allocator);
-        defer owned.deinit(std.testing.allocator);
-        try std.testing.expectEqualStrings("slow", failureOf(&owned).message);
-
-        var failing: std.testing.FailingAllocator = .init(
-            std.testing.allocator,
-            .{ .fail_index = 0 },
-        );
-        const bare = try event.dupe(failing.allocator());
-        defer bare.deinit(failing.allocator());
-        const kept = failureOf(&bare);
-        try std.testing.expectEqual(failure.reason, kept.reason);
-        try std.testing.expectEqual(failure.retry_after_ms, kept.retry_after_ms);
-        try std.testing.expectEqualStrings("", kept.message);
-    }
-}
-
-fn failureOf(event: *const Event) Provider.Failure {
-    return switch (event.*) {
-        .attempt_failed, .aside_attempt_failed => |attempt| attempt.failure,
-        .turn_ended, .aside_ended => |outcome| outcome.failed,
-        else => unreachable,
-    };
 }

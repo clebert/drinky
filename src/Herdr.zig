@@ -1,4 +1,5 @@
 const std = @import("std");
+const application = @import("application");
 
 const core = @import("core");
 
@@ -114,7 +115,7 @@ fn deliver(
     writeRequest(&line_writer, endpoint, request, sequence_number) catch return;
     const line = line_writer.buffered();
     for (attempt_timeout_ms) |timeout_ms| {
-        core.timeout.run(
+        application.support.timeout(
             self.io,
             timeout_ms,
             exchange,

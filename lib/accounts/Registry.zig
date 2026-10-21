@@ -194,9 +194,9 @@ pub const Event = union(enum) {
             .login_ended => |ended| .{ .login_ended = .{
                 .account = ended.account,
                 .outcome = if (ended.outcome) |login| switch (login) {
-                    .saved => |path| .{ .saved = gpa.dupe(u8, path) catch "" },
+                    .saved => |path| .{ .saved = try gpa.dupe(u8, path) },
                     .memory_only => |failure| .{ .memory_only = .{
-                        .path = gpa.dupe(u8, failure.path) catch "",
+                        .path = try gpa.dupe(u8, failure.path),
                         .save_error = failure.save_error,
                     } },
                 } else |err| err,
@@ -692,12 +692,14 @@ fn runLogin(self: *Registry, index: usize) Mail {
         .browser = self.browser orelse self.opener.browser(),
         .loopback = self.loopbackOf(),
     };
-    return .{ .login_ended = switch (self.slots[index]) {
+    const outcome = switch (self.slots[index]) {
         .login => |*login| switch (login.*) {
             inline else => |*store| store.signIn(&context),
         },
         .absent, .key, .google => unreachable,
-    } };
+    };
+    if (outcome) |_| {} else |err| if (err == error.OutOfMemory) core.fatal.outOfMemory();
+    return .{ .login_ended = outcome };
 }
 
 fn runFetch(self: *Registry, index: usize) Mail {
@@ -781,6 +783,7 @@ fn refresh(self: *Registry, index: usize) Refresh {
             defer self.gpa.free(discovered);
             recordSave(&result.models_save_error, self.catalog.setAccount(index, discovered));
         } else |err| {
+            if (err == error.OutOfMemory) core.fatal.outOfMemory();
             result.models_error = err;
         }
         if (isCanceled(FetchError, result.models_error)) return result;
@@ -789,14 +792,14 @@ fn refresh(self: *Registry, index: usize) Refresh {
     if (Metadata.fetch(self.gpa, self.io, self.transport, &deadline)) |metadata| {
         recordSave(&result.metadata_save_error, self.catalog.setMetadata(metadata));
     } else |err| {
+        if (err == error.OutOfMemory) core.fatal.outOfMemory();
         if (public) result.models_error = err else result.metadata_error = err;
     }
 
     var listed: std.ArrayList(Model) = .empty;
     defer listed.deinit(self.gpa);
-    if (self.catalog.list(index, &listed, self.gpa)) {
-        result.count = listed.items.len;
-    } else |_| {}
+    self.catalog.list(index, &listed, self.gpa) catch core.fatal.outOfMemory();
+    result.count = listed.items.len;
     return result;
 }
 
@@ -806,6 +809,7 @@ fn modelsUrl(gpa: std.mem.Allocator, row: *const Account) error{OutOfMemory}![]u
 
 fn recordSave(target: *?json_store.SaveError, outcome: json_store.SaveError!void) void {
     outcome catch |err| {
+        if (err == error.OutOfMemory) core.fatal.outOfMemory();
         target.* = err;
     };
 }
@@ -1592,33 +1596,23 @@ test "a copy of each event owns its bytes, and a failed copy leaks nothing" {
     try core.testing.checkCopyAllocationFailures(Event, &events);
 }
 
-test "a copy of a login end keeps its outcome, and a failed copy drops only the path" {
+test "a copy of a login end keeps its outcome, and a failed copy leaks nothing" {
     const path = "/home/.drinky/auth.json";
     const saved: Event = .{ .login_ended = .{ .account = 3, .outcome = .{ .saved = path } } };
     const memory_only: Event = .{ .login_ended = .{ .account = 3, .outcome = .{ .memory_only = .{
         .path = path,
         .save_error = error.AccessDenied,
     } } } };
-    const cases = [_]struct { fail_index: usize, kept: []const u8 }{
-        .{ .fail_index = std.math.maxInt(usize), .kept = path },
-        .{ .fail_index = 0, .kept = "" },
-    };
-    for (cases) |case| {
-        var failing: std.testing.FailingAllocator = .init(
-            std.testing.allocator,
-            .{ .fail_index = case.fail_index },
-        );
-        const gpa = failing.allocator();
-        const saved_copy = try saved.dupe(gpa);
-        defer saved_copy.deinit(gpa);
-        const memory_only_copy = try memory_only.dupe(gpa);
-        defer memory_only_copy.deinit(gpa);
-        try std.testing.expectEqual(@as(usize, 3), saved_copy.login_ended.account);
-        try std.testing.expectEqualStrings(case.kept, (try saved_copy.login_ended.outcome).saved);
-        const failure = (try memory_only_copy.login_ended.outcome).memory_only;
-        try std.testing.expectEqualStrings(case.kept, failure.path);
-        try std.testing.expectEqual(error.AccessDenied, failure.save_error);
-    }
+    const saved_copy = try saved.dupe(std.testing.allocator);
+    defer saved_copy.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 3), saved_copy.login_ended.account);
+    try std.testing.expectEqualStrings(path, (try saved_copy.login_ended.outcome).saved);
+    const memory_only_copy = try memory_only.dupe(std.testing.allocator);
+    defer memory_only_copy.deinit(std.testing.allocator);
+    const failure = (try memory_only_copy.login_ended.outcome).memory_only;
+    try std.testing.expectEqualStrings(path, failure.path);
+    try std.testing.expectEqual(error.AccessDenied, failure.save_error);
+    try core.testing.checkCopyAllocationFailures(Event, &.{ saved, memory_only });
 }
 
 fn expectRequestLine(rig: *testing.Rig, client: *Client, line: []const u8) !void {

@@ -1,11 +1,8 @@
 const std = @import("std");
+const application = @import("application");
 
 const core = @import("core");
 const terminal = @import("terminal");
-
-const format = @import("../format.zig");
-const Message = @import("../Message.zig");
-const project = @import("../project.zig");
 
 const attribute = @import("attribute.zig");
 const paint = @import("paint.zig");
@@ -16,26 +13,18 @@ pub const Info = struct {
     directory: []const u8,
     branch: ?[]const u8,
     context_tokens: ?u64,
-    cache_usage: core.Provider.Usage,
+    cache_usage: application.Usage,
     cost: f64,
     context_window: ?u64,
     model: ?[]const u8,
     effort: []const u8,
     account: ?[]const u8,
-    quota: ?core.Provider.Quota,
+    quota: ?application.Quota,
     quota_age_ms: i64,
-    credits: ?core.Provider.Credits,
+    credits: ?application.Credits,
     turn_active: bool,
-    gauge: Gauge = .{},
-    notice: ?Message = null,
-};
-
-pub const Gauge = struct {
-    percent_warning: f64 = 75,
-    percent_error: f64 = 90,
-
-    pub const percent_min: f64 = 0;
-    pub const percent_max: f64 = 100;
+    gauge: application.Settings.Gauge = .{},
+    notice: ?application.Message = null,
 };
 
 const Directory = struct {
@@ -154,7 +143,7 @@ fn reduce(parts: *Parts, reduction: Reduction) void {
 
 const runs_max = 3;
 
-fn pressureRole(gauge: Gauge, used_percent: f64) role.Name {
+fn pressureRole(gauge: application.Settings.Gauge, used_percent: f64) role.Name {
     if (used_percent >= gauge.percent_error) return .@"error";
     if (used_percent >= gauge.percent_warning) return .warning;
     return .muted;
@@ -176,7 +165,11 @@ fn paintRuns(sink: *terminal.View.Sink, line: *const Line, kept: []const u8) !vo
 }
 
 pub fn directoryLabel(gpa: std.mem.Allocator, directory: *const Directory) ![]const u8 {
-    const label = try format.path(gpa, directory.path, &.{ .home_directory = directory.home });
+    const label = try application.support.format.path(
+        gpa,
+        directory.path,
+        &.{ .home_directory = directory.home },
+    );
     if (label.len <= directory_bytes_max) return label;
     defer gpa.free(label);
     const budget = directory_bytes_max - paint.ellipsis.len;
@@ -188,11 +181,22 @@ pub fn render(placement: *const paint.Placement, info: *const Info) !void {
     if (info.notice) |notice| {
         var style: paint.NoticeStyle = .of(notice.severity);
         style.fit = .head;
-        return paint.notice(placement, &style, notice.content);
+        const text = if (notice.confirmation) |confirmation| switch (confirmation) {
+            .message => message: {
+                style.prefix = switch (notice.severity) {
+                    inline else => |severity| (comptime paint.NoticeStyle.of(severity)).prefix ++
+                        "Enter: Send as a message · ",
+                };
+                break :message notice.content;
+            },
+            .removal => "Press Ctrl+N again to remove the canceled turn. Tool changes stay.",
+            .rewind => "Press Enter again to rewind. Tool changes stay.",
+        } else notice.content;
+        return paint.notice(placement, &style, text);
     }
     if (!placement.begin(placement.base)) return;
 
-    var left_scratch: [project.head_bytes_max + 512]u8 = undefined;
+    var left_scratch: [application.branch_bytes_max + 512]u8 = undefined;
     var right_scratch: [192]u8 = undefined;
     var parts: Parts = .all;
     var left: Line = undefined;
@@ -280,20 +284,20 @@ fn writeCredits(line: *Line, info: *const Info) !void {
     try writeUsd(&line.out, credits.remaining());
 }
 
-fn orderedWindows(quota: *const core.Provider.Quota) [2]?core.Provider.Quota.Window {
+fn orderedWindows(quota: *const application.Quota) [2]?application.Quota.Window {
     const first = quota.primary orelse return .{ quota.secondary, null };
     const second = quota.secondary orelse return .{ first, null };
     if (sortMinutes(&second) < sortMinutes(&first)) return .{ second, first };
     return .{ first, second };
 }
 
-fn sortMinutes(window: *const core.Provider.Quota.Window) u32 {
+fn sortMinutes(window: *const application.Quota.Window) u32 {
     return window.window_minutes orelse std.math.maxInt(u32);
 }
 
 fn writeQuotaPart(
     line: *Line,
-    maybe_window: *const ?core.Provider.Quota.Window,
+    maybe_window: *const ?application.Quota.Window,
     info: *const Info,
     parts: *const Parts,
 ) !void {
@@ -385,8 +389,8 @@ fn writeCache(line: *Line, info: *const Info) !void {
 
 fn writeQuotaWindow(
     line: *Line,
-    window: *const core.Provider.Quota.Window,
-    gauge: Gauge,
+    window: *const application.Quota.Window,
+    gauge: application.Settings.Gauge,
     wait_seconds: ?u64,
 ) !void {
     const used = @round(@max(0.0, @min(100.0, window.used_percent)));
@@ -896,6 +900,54 @@ test "a warning notice takes the warning symbol in the warning role" {
         &.{comptime role.sequence(.warning) ++ "⚠ Enter: Send anyway"},
     );
     try testing.expectHides(painted, &.{ "Error:", comptime role.sequence(.@"error") });
+}
+
+test "semantic confirmations keep the terminal text, roles, and width reductions" {
+    const cases = [_]struct {
+        kind: application.Confirmation,
+        content: []const u8,
+        expected: []const u8,
+    }{
+        .{
+            .kind = .message,
+            .content = "Drinky does not recognize the command /unknown.",
+            .expected = "Enter: Send as a message · " ++
+                "Drinky does not recognize the command /unknown.",
+        },
+        .{
+            .kind = .removal,
+            .content = "",
+            .expected = "Press Ctrl+N again to remove the canceled turn. Tool changes stay.",
+        },
+        .{
+            .kind = .rewind,
+            .content = "",
+            .expected = "Press Enter again to rewind. Tool changes stay.",
+        },
+    };
+    for (cases) |case| for (std.enums.values(application.Message.Severity)) |severity| {
+        for ([_]usize{ 1, 2, 8, 27, 40, 100 }) |columns| {
+            var actual: testing.Rig = undefined;
+            actual.init(std.testing.allocator);
+            defer actual.deinit();
+            var info = test_info;
+            info.notice = .{
+                .content = case.content,
+                .severity = severity,
+                .confirmation = case.kind,
+            };
+            try renderForTest(&actual, &info, columns);
+
+            var expected: testing.Rig = undefined;
+            expected.init(std.testing.allocator);
+            defer expected.deinit();
+            var style: paint.NoticeStyle = .of(severity);
+            style.fit = .head;
+            const placement = try expected.begin(&.{ .columns = columns, .rows = 1 });
+            try paint.notice(&placement, &style, case.expected);
+            try std.testing.expectEqualStrings(try expected.painted(), try actual.painted());
+        }
+    };
 }
 
 test "an information notice takes the information symbol in the accent role" {

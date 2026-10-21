@@ -51,18 +51,18 @@ fn select(
         return model.usedEvent(context);
     }
     if (row.hasLogin()) return .{ .login = account };
-    if (context.account_registry.loadError(account)) |err| return Context.Outcome.reportNotice(
+    if (context.account_registry.loadError(account)) |err| return .{ .refusal = try Message.print(
         gpa,
         .failure,
         "Drinky could not load the {s} account because of error {s}. Fix it and restart Drinky.",
         .{ row.id, @errorName(err) },
-    );
-    return Context.Outcome.reportNotice(
+    ) };
+    return .{ .refusal = try Message.print(
         gpa,
         .information,
         "Set {s} in the environment. Restart Drinky to use {s}.",
         .{ row.setting().?, row.id },
-    );
+    ) };
 }
 
 pub fn authorization(
@@ -216,7 +216,7 @@ test "the picker lists every account, marking the active, the signed-in, and the
         .information,
         "active account",
     );
-    try testing.expectNotice(
+    try testing.expectRefusal(
         try testing.selectRow(&pick, &context, accounts.testing.google_cloud_key),
         .failure,
         "because of error BadLocation",
@@ -271,7 +271,7 @@ test "select starts a login, instructs a key account, and adopts a set key with 
         .{ .account = accounts.testing.deepseek_api_key, .setting = "DEEPSEEK_API_KEY" },
         .{ .account = accounts.testing.google_cloud_key, .setting = "GOOGLE_CLOUD_LOCATION" },
     };
-    for (settings) |case| try testing.expectNotice(
+    for (settings) |case| try testing.expectRefusal(
         try testing.selectRow(&pick, &context, case.account),
         .information,
         case.setting,

@@ -1,4 +1,5 @@
 const std = @import("std");
+const application = @import("application");
 
 const core = @import("core");
 const markdown = @import("markdown");
@@ -9,13 +10,13 @@ const paint = @import("paint.zig");
 const role = @import("role.zig");
 const testing = @import("testing.zig");
 
-const blanks = core.text.repeat(" ", 32);
+const blanks = application.support.repeat(" ", 32);
 
 const rule_cell = "─";
 
 const rule_columns = 80;
 
-const rule_cells = core.text.repeat(rule_cell, rule_columns);
+const rule_cells = application.support.repeat(rule_cell, rule_columns);
 
 const Look = struct {
     role: ?role.Name = null,

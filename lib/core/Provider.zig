@@ -117,14 +117,13 @@ pub const Failure = struct {
         unsupported_reply,
         too_many_tool_calls,
         concurrency_unavailable,
-        out_of_memory,
     };
 
-    pub fn dupe(self: *const Failure, gpa: std.mem.Allocator) Failure {
+    pub fn dupe(self: *const Failure, gpa: std.mem.Allocator) error{OutOfMemory}!Failure {
         return .{
             .reason = self.reason,
             .retry_after_ms = self.retry_after_ms,
-            .message = gpa.dupe(u8, self.message) catch "",
+            .message = try gpa.dupe(u8, self.message),
         };
     }
 

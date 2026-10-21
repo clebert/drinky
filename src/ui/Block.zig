@@ -1,10 +1,8 @@
 const std = @import("std");
+const application = @import("application");
 
+const core = @import("core");
 const terminal = @import("terminal");
-
-const format = @import("../format.zig");
-const Message = @import("../Message.zig");
-
 const Caption = @import("Caption.zig");
 const markdown = @import("markdown.zig");
 const paint = @import("paint.zig");
@@ -14,6 +12,7 @@ const testing = @import("testing.zig");
 const Block = @This();
 
 content: Content,
+record_id: ?u64 = null,
 cache: Cache = .{},
 verbose: bool = true,
 work: ?Work = null,
@@ -27,18 +26,16 @@ pub const Work = struct {
 
     const identity_prefix = "Agent: work (";
 
-    pub const Status = enum { running, complete, canceled, failed, truncated };
-
     pub const End = struct {
         time_ms: i64,
-        status: Status,
+        status: application.Record.Work.Status,
     };
 
     pub const Summary = struct {
         elapsed_ms: i64,
         tools: ?usize,
         received_bytes: usize,
-        status: Status,
+        status: application.Record.Work.Status,
 
         pub const segment_count = 4;
 
@@ -54,13 +51,17 @@ pub const Work = struct {
             try writer.print("{s}{s})", .{ identity_prefix, value });
             options.ends[0] = writer.buffered().len;
             var time_buffer: [24]u8 = undefined;
-            const time = format.durationSeconds(&time_buffer, self.elapsed_ms, .down);
+            const time = application.support.format.durationSeconds(
+                &time_buffer,
+                self.elapsed_ms,
+                .down,
+            );
             try writer.print("{s}Time: {s}", .{ paint.separator, time });
             options.ends[1] = writer.buffered().len;
             if (self.tools) |tools| try writer.print("{s}Tools: {d}", .{ paint.separator, tools });
             options.ends[2] = writer.buffered().len;
             var bytes_buffer: [16]u8 = undefined;
-            const bytes = format.bytes(&bytes_buffer, self.received_bytes);
+            const bytes = application.support.format.bytes(&bytes_buffer, self.received_bytes);
             try writer.print("{s}Received: {s}", .{ paint.separator, bytes });
             options.ends[3] = writer.buffered().len;
         }
@@ -81,7 +82,7 @@ pub const Work = struct {
         buffer: [128]u8 = undefined,
         length: usize = 0,
         ends: [Summary.segment_count]usize = @splat(0),
-        status: Status = .running,
+        status: application.Record.Work.Status = .running,
 
         fn text(self: *const Row) []const u8 {
             return self.buffer[0..self.length];
@@ -92,7 +93,11 @@ pub const Work = struct {
         }
     };
 
-    pub fn box(text: []const u8, ends: []const usize, status: Status) paint.Box {
+    pub fn box(
+        text: []const u8,
+        ends: []const usize,
+        status: application.Record.Work.Status,
+    ) paint.Box {
         return .{
             .text = text,
             .segment_ends = ends,
@@ -145,7 +150,6 @@ const ToolResult = struct {
     qualifiers: std.ArrayList(paint.Mark),
     command: ?paint.Box.Range,
     received_bytes: usize,
-    survives_discard: bool = false,
 
     const Payload = struct {
         text: []const u8,
@@ -160,21 +164,15 @@ const ToolResult = struct {
 
 pub const Event = struct {
     text: std.ArrayList(u8),
-    severity: Message.Severity,
-    survives_discard: bool,
+    severity: application.Message.Severity,
 
     pub const Payload = struct {
         text: []const u8,
-        severity: Message.Severity = .information,
-        survives_discard: bool = false,
+        severity: application.Message.Severity = .information,
     };
 
     fn init(gpa: std.mem.Allocator, payload: *const Payload) !Event {
-        return .{
-            .text = try copy(gpa, payload.text),
-            .severity = payload.severity,
-            .survives_discard = payload.survives_discard,
-        };
+        return .{ .text = try copy(gpa, payload.text), .severity = payload.severity };
     }
 };
 
@@ -283,15 +281,27 @@ pub fn appendText(self: *Block, gpa: std.mem.Allocator, delta: []const u8) !void
     self.cache.forget();
 }
 
-pub fn replaceEvent(
-    self: *Block,
-    gpa: std.mem.Allocator,
-    payload: *const Event.Payload,
-) !void {
-    const event = try Event.init(gpa, payload);
-    self.content.event.text.deinit(gpa);
-    self.content.event = event;
-    self.cache.invalidate();
+pub fn sameContent(self: *const Block, other: *const Block) bool {
+    if (std.meta.activeTag(self.content) != std.meta.activeTag(other.content)) return false;
+    return switch (self.content) {
+        .tool_result => |*result| std.mem.eql(
+            u8,
+            result.text.items,
+            other.content.tool_result.text.items,
+        ),
+        .event => |*event| event.severity == other.content.event.severity and
+            std.mem.eql(u8, event.text.items, other.content.event.text.items),
+        inline else => |list, tag| std.mem.eql(
+            u8,
+            list.items,
+            @field(other.content, @tagName(tag)).items,
+        ),
+    };
+}
+
+pub fn adoptCache(self: *Block, previous: *const Block) void {
+    self.cache.epoch = previous.cache.epoch;
+    self.cache.rewritten = true;
 }
 
 pub fn release(self: *Block, gpa: std.mem.Allocator) void {
@@ -307,12 +317,8 @@ pub fn stampEpoch(self: *Block, epoch: u64) void {
     self.cache.epoch = epoch;
 }
 
-pub fn survivesDiscard(self: *const Block) bool {
-    return switch (self.content) {
-        .event => |*event| event.survives_discard,
-        .tool_result => |*result| result.survives_discard,
-        .intro, .user, .user_note, .thinking, .model => false,
-    };
+pub fn receivedBytes(self: *const Block) usize {
+    return self.content.tool_result.received_bytes;
 }
 
 pub fn present(self: *Block, verbose: bool) void {
@@ -413,10 +419,10 @@ pub fn render(
     }
     self.cache.rewritten = false;
     if (placement.skip > 0) return;
-    self.cache.retain(gpa, placement.sink, .{
+    try self.cache.retain(gpa, placement.sink, .{
         .columns = placement.columns,
         .first_row = first_row,
-    }) catch self.cache.forget();
+    });
 }
 
 fn replay(placement: *const paint.Placement, lines: *const terminal.View.Lines) !void {
@@ -429,12 +435,13 @@ fn replay(placement: *const paint.Placement, lines: *const terminal.View.Lines) 
 }
 
 fn trimBlank(text: []const u8) []const u8 {
-    const first = std.mem.findNone(u8, text, paint.blank_bytes) orelse return text[0..0];
+    const first = std.mem.findNone(u8, text, application.reference.blank_bytes) orelse
+        return text[0..0];
     const line_start = if (std.mem.findScalarLast(u8, text[0..first], '\n')) |newline|
         newline + 1
     else
         0;
-    return std.mem.trimEnd(u8, text[line_start..], paint.blank_bytes);
+    return std.mem.trimEnd(u8, text[line_start..], application.reference.blank_bytes);
 }
 
 test "each block variant renders exactly the rows it counts" {
@@ -472,6 +479,25 @@ test "each block variant renders exactly the rows it counts" {
             try std.testing.expectEqual(counted, try renderedRows(gpa, &block, columns, 0));
         }
     }
+}
+
+test "a render cache returns every allocation failure and releases each partial allocation" {
+    try std.testing.checkAllAllocationFailures(
+        core.testing.no_resize_allocator,
+        checkRenderAllocations,
+        .{},
+    );
+}
+
+fn checkRenderAllocations(gpa: std.mem.Allocator) !void {
+    var block = try Block.init(gpa, &.{ .model = "Answer." });
+    defer block.deinit(gpa);
+    var rig: testing.Rig = undefined;
+    rig.init(std.testing.allocator);
+    defer rig.deinit();
+    const placement = try rig.begin(&.{ .columns = 80, .rows = 24 });
+    try block.render(gpa, &placement);
+    try testing.expectShows(try rig.painted(), &.{"Answer."});
 }
 
 const markdown_reply =

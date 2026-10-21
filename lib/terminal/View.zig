@@ -118,49 +118,50 @@ pub const Sink = struct {
         self.link_open = false;
     }
 
-    pub fn text(self: *Sink, bytes: []const u8) !void {
+    pub fn text(self: *Sink, bytes: []const u8) error{OutOfMemory}!void {
         if (bytes.len == 0) return;
         try self.guard(bytes);
         const available = self.columns -| self.columns_written;
         const start = self.frame.blob.writer.end;
-        self.columns_written += try width.writeFitted(&self.frame.blob.writer, bytes, available);
+        self.columns_written += width.writeFitted(&self.frame.blob.writer, bytes, available) catch
+            return error.OutOfMemory;
         self.trackTail(start);
     }
 
-    pub fn spaces(self: *Sink, count: usize) !void {
+    pub fn spaces(self: *Sink, count: usize) error{OutOfMemory}!void {
         return self.repeat(" ", count);
     }
 
-    pub fn repeat(self: *Sink, comptime cell: []const u8, count: usize) !void {
+    pub fn repeat(self: *Sink, comptime cell: []const u8, count: usize) error{OutOfMemory}!void {
         comptime std.debug.assert(width.ofText(cell) == 1);
         const shown = @min(count, self.columns -| self.columns_written);
         if (shown == 0) return;
         try self.guard(cell);
         const start = self.frame.blob.writer.end;
-        try self.frame.blob.writer.splatBytesAll(cell, shown);
+        self.frame.blob.writer.splatBytesAll(cell, shown) catch return error.OutOfMemory;
         self.columns_written += shown;
         self.trackTail(start);
     }
 
-    pub fn sgr(self: *Sink, comptime sequence: []const u8) !void {
+    pub fn sgr(self: *Sink, comptime sequence: []const u8) error{OutOfMemory}!void {
         comptime if (!validSgr(sequence))
             @compileError("trusted style must be one complete SGR sequence");
-        try self.frame.blob.writer.writeAll(sequence);
+        self.frame.blob.writer.writeAll(sequence) catch return error.OutOfMemory;
     }
 
-    pub fn linkSet(self: *Sink, url: []const u8) !void {
+    pub fn linkSet(self: *Sink, url: []const u8) error{OutOfMemory}!void {
         if (!linkable(url)) return;
         const writer = &self.frame.blob.writer;
-        try writer.writeAll(escape.link_set);
-        try writer.writeAll(url);
-        try writer.writeAll(escape.string_end);
+        writer.writeAll(escape.link_set) catch return error.OutOfMemory;
+        writer.writeAll(url) catch return error.OutOfMemory;
+        writer.writeAll(escape.string_end) catch return error.OutOfMemory;
         self.link_open = true;
     }
 
-    pub fn linkReset(self: *Sink) !void {
+    pub fn linkReset(self: *Sink) error{OutOfMemory}!void {
         if (!self.link_open) return;
         self.link_open = false;
-        try self.frame.blob.writer.writeAll(escape.link_reset);
+        self.frame.blob.writer.writeAll(escape.link_reset) catch return error.OutOfMemory;
     }
 
     pub fn linkable(url: []const u8) bool {
@@ -191,17 +192,22 @@ pub const Sink = struct {
         return self.frame.rows.items.len;
     }
 
-    pub fn capture(self: *const Sink, gpa: std.mem.Allocator, first: usize, lines: *Lines) !void {
+    pub fn capture(
+        self: *const Sink,
+        gpa: std.mem.Allocator,
+        first: usize,
+        lines: *Lines,
+    ) error{OutOfMemory}!void {
         for (self.frame.rows.items[first..]) |row| {
             try lines.append(gpa, self.frame.bytes(&row), row.columns);
         }
     }
 
-    pub fn replay(self: *Sink, lines: *const Lines, index: usize) !void {
+    pub fn replay(self: *Sink, lines: *const Lines, index: usize) error{OutOfMemory}!void {
         std.debug.assert(!self.has_text);
         const span = lines.spans.items[index];
         std.debug.assert(span.columns <= self.columns);
-        try self.frame.blob.writer.writeAll(lines.bytes(index));
+        self.frame.blob.writer.writeAll(lines.bytes(index)) catch return error.OutOfMemory;
         self.columns_written = span.columns;
         self.has_text = true;
         self.tail_joining = true;
@@ -211,10 +217,10 @@ pub const Sink = struct {
         self.frame.caret = .{ .row = self.frame.rows.items.len, .column = column };
     }
 
-    fn guard(self: *Sink, bytes: []const u8) !void {
+    fn guard(self: *Sink, bytes: []const u8) error{OutOfMemory}!void {
         if (!self.has_text) return;
         if (!self.tail_joining and !grapheme.startsJoining(bytes)) return;
-        try self.frame.blob.writer.writeAll(width.grapheme_boundary);
+        self.frame.blob.writer.writeAll(width.grapheme_boundary) catch return error.OutOfMemory;
     }
 
     fn trackTail(self: *Sink, start: usize) void {

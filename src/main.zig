@@ -1,11 +1,10 @@
 const std = @import("std");
+const application = @import("application");
 
-const accounts = @import("accounts");
 const terminal = @import("terminal");
 
 const App = @import("App.zig");
 const command_line = @import("command_line.zig");
-const escape = @import("escape.zig");
 const headless = @import("headless.zig");
 const Herdr = @import("Herdr.zig");
 
@@ -14,6 +13,13 @@ const failure_exit_code = 1;
 pub const panic = std.debug.FullPanic(restoreAndPanic);
 
 pub fn main(init: std.process.Init) !void {
+    run(&init) catch |err| switch (err) {
+        error.OutOfMemory => application.support.outOfMemory(),
+        else => return err,
+    };
+}
+
+fn run(init: *const std.process.Init) !void {
     std.posix.sigaction(.TERM, &.{
         .handler = .{ .handler = restoreAndTerminate },
         .mask = std.posix.sigemptyset(),
@@ -30,11 +36,11 @@ pub fn main(init: std.process.Init) !void {
 
     const arguments = try init.minimal.args.toSlice(init.arena.allocator());
     const parsed = command_line.parse(arguments[@min(1, arguments.len)..]);
-    const directories: accounts.json_store.Directories = .{
+    const directories: application.Directories = .{
         .working_directory = cwd,
         .home = home,
     };
-    if (parsed == .terminal) return runTerminal(&init, &directories);
+    if (parsed == .terminal) return runTerminal(init, &directories);
 
     var stdout_buffer: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
@@ -49,12 +55,12 @@ pub fn main(init: std.process.Init) !void {
     const succeeded = switch (parsed) {
         .terminal => unreachable,
         .models => try headless.models(gpa, io, &options),
-        .run => |run| run: {
+        .run => |request| run: {
             var stdin_buffer: [4096]u8 = undefined;
             var stdin = std.Io.File.stdin().readerStreaming(io, &stdin_buffer);
             const prompt = try stdin.interface.allocRemaining(gpa, .unlimited);
             defer gpa.free(prompt);
-            break :run try headless.run(gpa, io, &options, &.{ .run = run, .prompt = prompt });
+            break :run try headless.run(gpa, io, &options, &.{ .run = request, .prompt = prompt });
         },
         .refused => |*refusal| refused: {
             try refusal.write(gpa, &stderr.interface);
@@ -68,7 +74,7 @@ pub fn main(init: std.process.Init) !void {
 
 fn runTerminal(
     init: *const std.process.Init,
-    directories: *const accounts.json_store.Directories,
+    directories: *const application.Directories,
 ) !void {
     var tty: terminal.Tty = undefined;
     try tty.init(init.io);
@@ -88,7 +94,7 @@ fn runTerminal(
 
 fn validateWorkingDirectory(gpa: std.mem.Allocator, path: []const u8) !void {
     if (std.unicode.utf8ValidateSlice(path)) return;
-    const safe_path = try escape.diagnostic(gpa, path);
+    const safe_path = try application.support.diagnostic(gpa, path);
     defer gpa.free(safe_path);
     std.debug.print(
         "Drinky cannot use the working directory {s} because its path is not valid UTF-8.\n",

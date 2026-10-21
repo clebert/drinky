@@ -1,52 +1,48 @@
 const std = @import("std");
+const application = @import("application");
 
 const accounts = @import("accounts");
 const core = @import("core");
+const providers = @import("providers");
 const terminal = @import("terminal");
-const tools = @import("tools");
 
-const billing = @import("billing.zig");
-const Choice = @import("Choice.zig");
-const command = @import("command/root.zig");
-const format = @import("format.zig");
 const layout = @import("layout.zig");
-const Message = @import("Message.zig");
-const project = @import("project.zig");
 const testing = @import("testing.zig");
 const tool_line = @import("tool_line.zig");
 const Transcript = @import("Transcript.zig");
-const turn_text = @import("turn_text.zig");
-const Turns = @import("Turns.zig");
 const ui = @import("ui/root.zig");
 
 const Screen = @This();
 
-const canceled_event = "You canceled the turn.";
-
 pub const editor_caption_rows_max: usize = 3;
+const picker_scrolls_max = 8;
 
 gpa: std.mem.Allocator,
 transcript: Transcript,
-notice: ?Message,
+notice: ?application.Message,
 editor: ui.Editor,
 view: terminal.View,
 page_view: terminal.View,
 widget: Widget,
 columns: usize,
 rows: usize,
-statistics: Statistics,
-choice: Choice,
+statistics: application.Statistics,
+choice: application.Choice,
 directory_shown: []const u8,
-branch_buffer: [project.head_bytes_max]u8,
+branch_buffer: [application.branch_bytes_max]u8,
 branch_length: usize,
-bash_timeout_ms: u64,
 window_pages: usize,
-gauge: ui.status.Gauge,
-display_roots: format.Roots,
+gauge: application.Settings.Gauge,
+display_roots: application.support.format.Roots,
+intro: []const u8 = "",
 verbose: bool = true,
 repaint_transcript: bool = false,
-thinking_active: ?usize = null,
 page_wait: ?PageWait = null,
+picker_id: u64 = 0,
+page_id: u64 = 0,
+notice_id: u64 = 0,
+picker_depth: usize = 0,
+picker_scrolls: [picker_scrolls_max]usize = undefined,
 
 pub const Time = struct {
     awake_ms: i64,
@@ -64,40 +60,6 @@ const PageWait = struct {
     }
 };
 
-const Statistics = struct {
-    cost: f64 = 0,
-    context_tokens: ?u64 = 0,
-    cache_usage: core.Provider.Usage = .{},
-    quota: ?core.Provider.Quota = null,
-    quota_seen_ms: i64 = 0,
-    credits: ?core.Provider.Credits = null,
-
-    fn forgetTurnEvidence(self: *Statistics) void {
-        self.cache_usage = .{};
-        self.quota_seen_ms = 0;
-        self.forgetBilling();
-    }
-
-    fn forgetBilling(self: *Statistics) void {
-        self.quota = null;
-        self.credits = null;
-    }
-
-    fn charge(
-        self: *Statistics,
-        usage: *const core.Provider.Usage,
-        maybe_model: ?*const accounts.Model,
-    ) void {
-        const amount = billing.cost(usage, maybe_model) orelse return;
-        self.addCost(amount);
-    }
-
-    fn addCost(self: *Statistics, amount: f64) void {
-        std.debug.assert(std.math.isFinite(amount) and amount >= 0);
-        self.cost = @min(self.cost + amount, core.Provider.amount_usd_max);
-    }
-};
-
 pub const Widget = union(enum) {
     prompt,
     turn: Turn,
@@ -105,12 +67,9 @@ pub const Widget = union(enum) {
     page: ui.Page,
 };
 
-const Turn = struct {
-    committed: usize,
-    blocks: std.ArrayList(Block),
-    thinking_discarded: std.ArrayList(ui.Block),
-    served_buffer: [accounts.Model.name_bytes_max]u8,
-    served_length: usize,
+pub const Turn = struct {
+    calls: std.ArrayList(Call),
+    thinking: bool,
     activity_tick: u64,
     progress_tick_last: u64,
     caret_tick: u64,
@@ -120,38 +79,31 @@ const Turn = struct {
     work_line: std.ArrayList(u8),
     work_ends: [ui.Block.Work.Summary.segment_count]usize,
 
-    fn init(committed: usize) Turn {
-        return .{
-            .committed = committed,
-            .blocks = .empty,
-            .thinking_discarded = .empty,
-            .served_buffer = undefined,
-            .served_length = 0,
-            .activity_tick = 0,
-            .progress_tick_last = 0,
-            .caret_tick = 0,
-            .box_view = .empty,
-            .box_hashes = .empty,
-            .box_tracks = .empty,
-            .work_line = .empty,
-            .work_ends = undefined,
-        };
-    }
+    const empty: Turn = .{
+        .calls = .empty,
+        .thinking = false,
+        .activity_tick = 0,
+        .progress_tick_last = 0,
+        .caret_tick = 0,
+        .box_view = .empty,
+        .box_hashes = .empty,
+        .box_tracks = .empty,
+        .work_line = .empty,
+        .work_ends = undefined,
+    };
 
     fn deinit(self: *Turn, gpa: std.mem.Allocator) void {
-        for (self.thinking_discarded.items) |*block| block.deinit(gpa);
-        self.thinking_discarded.deinit(gpa);
-        self.releaseBlocks(gpa, 0);
-        self.blocks.deinit(gpa);
+        self.releaseCalls(gpa);
+        self.calls.deinit(gpa);
         self.box_view.deinit(gpa);
         self.box_hashes.deinit(gpa);
         self.box_tracks.deinit(gpa);
         self.work_line.deinit(gpa);
     }
 
-    fn releaseBlocks(self: *Turn, gpa: std.mem.Allocator, kept: usize) void {
-        for (self.blocks.items[kept..]) |*block| block.deinit(gpa);
-        self.blocks.shrinkRetainingCapacity(kept);
+    fn releaseCalls(self: *Turn, gpa: std.mem.Allocator) void {
+        for (self.calls.items) |*call| call.deinit(gpa);
+        self.calls.clearRetainingCapacity();
     }
 
     fn activity(self: *const Turn) ui.paint.Activity {
@@ -162,34 +114,9 @@ const Turn = struct {
         };
     }
 
-    fn lastBlock(self: *Turn, kind: Block.Kind) ?*Block {
-        const block = self.blocks.lastPtr() orelse return null;
-        return if (block.kind == kind) block else null;
-    }
-
-    fn firstCall(self: *Turn, phases: []const Call.Phase) ?*Block {
-        for (self.blocks.items) |*block| {
-            const call = if (block.call) |*call| call else continue;
-            for (phases) |phase| {
-                if (call.phase == phase) return block;
-            }
-        }
-        return null;
-    }
-
-    fn callById(self: *Turn, id: []const u8) ?*Block {
-        for (self.blocks.items) |*block| {
-            const call = if (block.call) |*call| call else continue;
-            if (call.phase == .running and std.mem.eql(u8, call.id, id)) return block;
-        }
-        return null;
-    }
-
     fn boxes(self: *Turn, gpa: std.mem.Allocator, now_ms: i64) ![]const ui.paint.Box {
         self.box_view.clearRetainingCapacity();
-        for (self.blocks.items) |*block| {
-            const call = if (block.call) |*call| call else continue;
-            if (call.phase == .done) continue;
+        for (self.calls.items) |*call| {
             try self.box_view.append(gpa, .{
                 .text = try call.text(gpa, now_ms),
                 .segment_ends = call.line.?.segment_ends,
@@ -204,7 +131,7 @@ const Turn = struct {
     fn workBoxes(
         self: *Turn,
         gpa: std.mem.Allocator,
-        options: *const struct { now_ms: i64, open: ?Transcript.Run, thinking: bool },
+        options: *const struct { now_ms: i64, open: ?Transcript.Run },
     ) ![]const ui.paint.Box {
         self.box_view.clearRetainingCapacity();
         var started_ms: ?i64 = null;
@@ -221,16 +148,14 @@ const Turn = struct {
         }
         var activity_text: std.ArrayList(u8) = .empty;
         defer activity_text.deinit(gpa);
-        if (options.thinking) try activity_text.appendSlice(gpa, "thinking");
-        for (self.blocks.items, 0..) |*block, index| {
-            const call = if (block.call) |*call| call else continue;
-            if (call.phase == .done) continue;
+        if (self.thinking) try activity_text.appendSlice(gpa, "thinking");
+        for (self.calls.items, 0..) |*call, index| {
             started_ms = @min(started_ms orelse call.opened_ms, call.opened_ms);
-            if (options.thinking or self.liveCallBefore(index, call.name)) continue;
+            if (self.thinking or self.liveCallBefore(index, call.name)) continue;
             if (activity_text.items.len > 0) try activity_text.appendSlice(gpa, ", ");
             const name_start = activity_text.items.len;
             try activity_text.appendSlice(gpa, call.name);
-            const shown = ui.paint.singleLine(activity_text.items[name_start..]);
+            const shown = application.reference.singleLine(activity_text.items[name_start..]);
             activity_text.shrinkRetainingCapacity(name_start + shown.len);
         }
         summary.elapsed_ms = options.now_ms - (started_ms orelse return &.{});
@@ -249,9 +174,8 @@ const Turn = struct {
     }
 
     fn liveCallBefore(self: *const Turn, index: usize, name: []const u8) bool {
-        for (self.blocks.items[0..index]) |*block| {
-            const call = if (block.call) |*call| call else continue;
-            if (call.phase != .done and std.mem.eql(u8, call.name, name)) return true;
+        for (self.calls.items[0..index]) |*call| {
+            if (std.mem.eql(u8, call.name, name)) return true;
         }
         return false;
     }
@@ -277,85 +201,73 @@ const Turn = struct {
     }
 };
 
-const Block = struct {
-    kind: Kind,
-    transcript_index: ?usize,
-    call: ?Call,
-
-    const Kind = enum { text, reasoning, call };
-
-    fn deinit(self: *Block, gpa: std.mem.Allocator) void {
-        if (self.call) |*call| call.deinit(gpa);
-    }
-};
-
-const Call = struct {
+pub const Call = struct {
     name: []const u8,
-    id: []const u8,
-    phase: Phase,
-    bytes: usize,
-    subject: std.ArrayList(u8),
-    subject_kind: ?tools.Registry.Description.Kind,
+    phase: application.Live.Call.Phase,
+    subject: []const u8,
+    subject_kind: ?application.ToolDescription.Kind,
     opened_ms: i64,
     started_ms: i64,
     timeout_ms: ?u64,
     line: ?tool_line.Line,
     elapsed_seconds: ?i64,
 
-    const Phase = enum { streaming, queued, running, done };
-
-    fn init(gpa: std.mem.Allocator, name: []const u8, opened_ms: i64) !Call {
-        var call: Call = .{
-            .name = try gpa.dupe(u8, name),
-            .id = "",
-            .phase = .streaming,
-            .bytes = 0,
-            .subject = .empty,
-            .subject_kind = null,
-            .opened_ms = opened_ms,
-            .started_ms = 0,
-            .timeout_ms = null,
-            .line = null,
+    fn init(
+        gpa: std.mem.Allocator,
+        live: *const application.Live.Call,
+        roots: *const application.support.format.Roots,
+    ) !Call {
+        const name = try gpa.dupe(u8, live.name);
+        errdefer gpa.free(name);
+        const subject = try tool_line.subject(gpa, &live.description, roots);
+        errdefer gpa.free(subject);
+        const subject_kind = if (live.description.subject) |value| value.kind else null;
+        const line = try tool_line.render(gpa, &.{
+            .name = live.name,
+            .phase = switch (live.phase) {
+                .streaming => .streaming,
+                .queued => .queued,
+                .running => .running,
+            },
+            .subject = subject,
+            .subject_kind = subject_kind,
+            .timeout_ms = if (live.phase == .running) live.description.timeout_ms else null,
+            .received_bytes = if (live.phase == .running) null else live.argument_bytes,
+        });
+        return .{
+            .name = name,
+            .phase = live.phase,
+            .subject = subject,
+            .subject_kind = subject_kind,
+            .opened_ms = live.opened_ms,
+            .started_ms = live.started_ms,
+            .timeout_ms = live.description.timeout_ms,
+            .line = line,
             .elapsed_seconds = null,
         };
-        errdefer call.deinit(gpa);
-        try call.refresh(gpa);
-        return call;
     }
 
     fn deinit(self: *Call, gpa: std.mem.Allocator) void {
         gpa.free(self.name);
-        gpa.free(self.id);
-        self.subject.deinit(gpa);
+        gpa.free(self.subject);
         if (self.line) |*line| line.deinit(gpa);
-    }
-
-    fn refresh(self: *Call, gpa: std.mem.Allocator) !void {
-        const line = try tool_line.render(gpa, &.{
-            .name = self.name,
-            .phase = switch (self.phase) {
-                .streaming => .streaming,
-                .queued => .queued,
-                .running => .running,
-                .done => unreachable,
-            },
-            .subject = self.subject.items,
-            .subject_kind = self.subject_kind,
-            .elapsed_ms = if (self.elapsed_seconds) |seconds| seconds * std.time.ms_per_s else null,
-            .timeout_ms = if (self.phase == .running) self.timeout_ms else null,
-            .received_bytes = if (self.phase == .running) null else self.bytes,
-        });
-        if (self.line) |*previous| previous.deinit(gpa);
-        self.line = line;
     }
 
     fn text(self: *Call, gpa: std.mem.Allocator, now_ms: i64) ![]const u8 {
         if (self.phase == .running and self.timeout_ms != null) {
             const seconds = @divFloor(@max(now_ms - self.started_ms, 0), std.time.ms_per_s);
             if (self.elapsed_seconds != seconds) {
+                const line = try tool_line.render(gpa, &.{
+                    .name = self.name,
+                    .phase = .running,
+                    .subject = self.subject,
+                    .subject_kind = self.subject_kind,
+                    .elapsed_ms = seconds * std.time.ms_per_s,
+                    .timeout_ms = self.timeout_ms,
+                });
+                if (self.line) |*previous| previous.deinit(gpa);
+                self.line = line;
                 self.elapsed_seconds = seconds;
-                errdefer self.elapsed_seconds = null;
-                try self.refresh(gpa);
             }
         }
         return self.line.?.text;
@@ -364,22 +276,14 @@ const Call = struct {
 
 const Picking = struct {
     picker: ui.Picker,
-    selector: *const fn (
-        *command.Context,
-        command.Context.Outcome.Pick.Selection,
-    ) command.Context.Error!command.Context.Outcome,
-    payload: usize,
-    cancellation_message: []const u8,
-    reopen: ?command.Context.Outcome.Opener,
-    trail: Trail,
+    title: []const u8,
+    wait_text: []const u8 = "",
     wait_tick: ?u64,
 
-    pub fn select(
-        self: *const Picking,
-        context: *command.Context,
-        row: usize,
-    ) command.Context.Error!command.Context.Outcome {
-        return self.selector(context, .{ .payload = self.payload, .row = row });
+    fn deinit(self: *Picking, gpa: std.mem.Allocator) void {
+        self.picker.deinit();
+        gpa.free(self.title);
+        gpa.free(self.wait_text);
     }
 
     fn activity(self: *const Picking) ?ui.paint.Activity {
@@ -388,49 +292,10 @@ const Picking = struct {
     }
 };
 
-const Trail = struct {
-    entries: [8]Entry = undefined,
-    len: usize = 0,
-
-    const Entry = struct {
-        open: command.Context.Outcome.Opener,
-        position: ui.Picker.Position,
-    };
-
-    fn push(
-        self: *Trail,
-        position: ui.Picker.Position,
-        opener: ?command.Context.Outcome.Opener,
-    ) void {
-        const open = opener orelse {
-            self.len = 0;
-            return;
-        };
-        if (self.len == self.entries.len) {
-            std.mem.copyForwards(
-                Entry,
-                self.entries[0 .. self.len - 1],
-                self.entries[1..self.len],
-            );
-            self.len -= 1;
-        }
-        self.entries[self.len] = .{ .open = open, .position = position };
-        self.len += 1;
-    }
-
-    fn last(self: *const Trail) ?Entry {
-        return if (self.len == 0) null else self.entries[self.len - 1];
-    }
-
-    fn dropLast(self: *Trail) void {
-        if (self.len > 0) self.len -= 1;
-    }
-};
-
-pub fn init(gpa: std.mem.Allocator, writer: *std.Io.Writer, effort: core.Provider.Effort) Screen {
+pub fn init(gpa: std.mem.Allocator, writer: *std.Io.Writer, effort: application.Effort) Screen {
     var self: Screen = .{
         .gpa = gpa,
-        .transcript = Transcript.init(gpa),
+        .transcript = .init(gpa),
         .notice = null,
         .editor = ui.Editor.init(gpa),
         .view = terminal.View.init(gpa, writer),
@@ -443,8 +308,7 @@ pub fn init(gpa: std.mem.Allocator, writer: *std.Io.Writer, effort: core.Provide
         .directory_shown = "",
         .branch_buffer = undefined,
         .branch_length = 0,
-        .bash_timeout_ms = (tools.Context.Bash{}).timeout_ms,
-        .window_pages = layout.window_pages_default,
+        .window_pages = application.Settings.window_pages_default,
         .gauge = .{},
         .display_roots = .{},
     };
@@ -461,22 +325,10 @@ pub fn deinit(self: *Screen) void {
     self.editor.deinit();
 }
 
-pub fn toggleVerbose(self: *Screen) void {
-    self.verbose = !self.verbose;
+fn setVerbose(self: *Screen, verbose: bool) void {
+    if (self.verbose == verbose) return;
+    self.verbose = verbose;
     self.repaint_transcript = true;
-}
-
-pub fn clearConversation(self: *Screen) void {
-    std.debug.assert(self.widget == .prompt);
-    self.clearNotice();
-    self.transcript.truncate(0);
-    self.statistics = .{};
-    self.view.resetScreen();
-}
-
-pub fn showChoice(self: *Screen, choice: *const Choice) void {
-    if (self.choice.account != choice.account) self.statistics.forgetBilling();
-    self.choice = choice.*;
 }
 
 pub fn clearNotice(self: *Screen) void {
@@ -486,583 +338,292 @@ pub fn clearNotice(self: *Screen) void {
     }
 }
 
-pub fn setNotice(self: *Screen, notice: Message) void {
+pub fn setNotice(self: *Screen, notice: application.Message) void {
     self.clearNotice();
     self.notice = notice;
-}
-
-fn showNotice(self: *Screen, severity: Message.Severity, text: []const u8) !void {
-    self.setNotice(.{ .content = try self.gpa.dupe(u8, text), .severity = severity });
 }
 
 fn deinitWidget(self: *Screen) void {
     switch (self.widget) {
         .prompt => {},
         .turn => |*turn| turn.deinit(self.gpa),
-        .picking => |*picking| picking.picker.deinit(),
+        .picking => |*picking| picking.deinit(self.gpa),
         .page => |*page| page.deinit(),
     }
 }
 
-pub fn beginTurn(self: *Screen) void {
-    std.debug.assert(self.widget == .prompt);
-    self.transcript.endMessage();
-    self.statistics.forgetTurnEvidence();
-    self.widget = .{ .turn = .init(self.transcript.blocks().len) };
-}
-
-pub fn rewind(self: *Screen, dropped: []const Turns.Turn) !void {
-    std.debug.assert(self.widget == .prompt);
-    try self.editor.prependText(dropped[0].line.?);
-    for (0..dropped.len) |offset| self.transcript.remove(dropped[dropped.len - 1 - offset].range);
-    self.view.resetScreen();
-    self.markEdited();
-}
-
-pub fn apply(
-    self: *Screen,
-    event: *const core.Session.Event,
-    time: Time,
-) !?core.Session.Outcome {
-    const turn = self.activeTurn() orelse return self.applyIdle(event, time);
+pub fn applyChange(self: *Screen, event: *const application.Event) !void {
     switch (event.*) {
-        .setup_dropped,
-        .aside_text,
-        .aside_reasoning,
-        .aside_attempt_failed,
-        .aside_ended,
-        => unreachable,
-        .text_started => {
-            self.finishThinking();
-            try self.beginText(turn);
+        .append_record => |*record| {
+            var block = try self.blockFrom(record);
+            errdefer block.deinit(self.gpa);
+            try self.transcript.block_list.append(self.gpa, block);
         },
-        .text => |delta| {
-            if (turn.lastBlock(.text) == null) {
-                self.finishThinking();
-                try self.beginText(turn);
-            }
-            try self.transcript.appendStream(.model, delta);
-            const block = turn.lastBlock(.text).?;
-            if (block.transcript_index == null) {
-                block.transcript_index = self.transcript.runIndex();
-                if (block.transcript_index != null)
-                    self.transcript.closeWork(&.{ .time_ms = time.awake_ms, .status = .complete });
+        .record_text => |value| {
+            const block = &self.transcript.block_list.items[self.transcript.find(value.id).?];
+            try block.appendText(self.gpa, value.text);
+        },
+        .replace_record => |*record| {
+            const index = self.transcript.find(record.id).?;
+            self.transcript.replace(index, try self.blockFrom(record));
+        },
+        .remove_records => |ids| {
+            self.transcript.remove(ids);
+            if (self.widget != .turn) {
+                self.view.resetScreen();
+                self.markEdited();
             }
         },
-        .reasoning_started => try self.beginThinking(turn, time.awake_ms),
-        .reasoning => |delta| {
-            if (turn.lastBlock(.reasoning) == null or self.thinking_active == null) {
-                try self.beginThinking(turn, time.awake_ms);
-            } else if (self.transcript.runIndex() != self.thinking_active) {
-                _ = try self.openThinking(time.awake_ms);
-            }
-            try self.transcript.appendStream(.thinking, delta);
-        },
-        .tool_call_started => |name| {
-            self.finishThinking();
-            try self.startCall(turn, name, time.awake_ms);
-        },
-        .tool_call_arguments => |delta| try self.growCall(turn, delta),
-        .tool_started => |*call| {
-            self.finishThinking();
-            try self.runCall(turn, call, time);
-        },
-        .tool_result => |*result| {
-            self.finishThinking();
-            try self.settleCall(turn, result, time.awake_ms);
-        },
-        .committed => {
-            self.finishThinking();
-            self.transcript.endMessage();
-            turn.committed = self.transcript.blocks().len;
-            turn.releaseBlocks(self.gpa, 0);
-        },
-        .tail_discarded => |count| try self.discardTail(turn, count),
-        .usage => |usage| {
-            self.statistics.cache_usage = usage;
-            self.statistics.charge(&usage, self.chosenModel());
-        },
-        .cost => |amount| self.statistics.addCost(amount),
-        .quota => |quota| {
-            self.statistics.quota = quota;
-            self.statistics.quota_seen_ms = time.boot_ms;
-        },
-        .credits => |credits| self.statistics.credits = credits,
-        .context => |tokens| self.statistics.context_tokens = tokens,
-        .model_served => |served| try self.recordServed(turn, &served, time),
-        .attempt_failed => |*attempt| {
-            self.finishThinking();
-            try self.restoreThinking(turn);
-            self.transcript.endMessage();
-            const uncommitted = self.transcript.blocks()[turn.committed..];
-            const status: ui.Block.Work.Status = for (uncommitted) |*block| {
-                if (block.work != null) break .failed;
-            } else .complete;
-            const message = try attemptMessage(self.gpa, attempt);
-            defer message.deinit(self.gpa);
-            try self.transcript.append(&.{ .event = .{
-                .text = message.content,
-                .severity = message.severity,
-                .survives_discard = true,
-            } });
-            self.transcript.closeWork(&.{ .time_ms = time.awake_ms, .status = status });
-        },
-        .skill_loaded => |*loaded| {
-            self.finishThinking();
-            self.transcript.endMessage();
-            try self.appendSkillNote(loaded);
-            self.transcript.closeWork(&.{ .time_ms = time.awake_ms, .status = .complete });
-        },
-        .turn_ended => |outcome| {
-            const status: ui.Block.Work.Status = switch (outcome) {
-                .stopped => |reason| switch (reason) {
-                    .complete => .complete,
-                    .truncated => .truncated,
-                },
-                .canceled => .canceled,
-                .failed, .exhausted => .failed,
-            };
-            self.finishThinking();
-            if (status != .complete) try self.restoreThinking(turn);
-            self.transcript.endMessage();
-            try self.recordOutcome(&outcome);
-            self.transcript.closeWork(&.{ .time_ms = time.awake_ms, .status = status });
-            self.endTurn();
-            return outcome;
-        },
+        .live => |*live| try self.showLive(live),
+        .statistics => |statistics| self.statistics = statistics,
+        .page_text => |text| try self.activePage().?.append(text),
+        .clear_conversation => try self.clearConversation(),
+        else => unreachable,
     }
-    turn.progress_tick_last = turn.activity_tick;
-    return null;
+    if (self.activeTurn()) |turn| turn.progress_tick_last = turn.activity_tick;
 }
 
-fn applyIdle(
-    self: *Screen,
-    event: *const core.Session.Event,
-    time: Time,
-) !?core.Session.Outcome {
-    switch (event.*) {
-        .context => |tokens| self.statistics.context_tokens = tokens,
-        .usage => |usage| {
-            self.statistics.charge(&usage, self.chosenModel());
-        },
-        .cost => |amount| self.statistics.addCost(amount),
-        .quota => |quota| {
-            self.statistics.quota = quota;
-            self.statistics.quota_seen_ms = time.boot_ms;
-        },
-        .credits => |credits| self.statistics.credits = credits,
-        else => {},
-    }
-    return null;
-}
-
-fn chosenModel(self: *const Screen) ?*const accounts.Model {
-    return if (self.choice.model) |*found| found else null;
-}
-
-fn beginThinking(self: *Screen, turn: *Turn, now_ms: i64) !void {
-    try turn.blocks.ensureUnusedCapacity(self.gpa, 1);
-    const index = try self.openThinking(now_ms);
-    turn.blocks.appendAssumeCapacity(.{
-        .kind = .reasoning,
-        .transcript_index = index,
-        .call = null,
-    });
-}
-
-fn openThinking(self: *Screen, now_ms: i64) !usize {
-    const index = try self.transcript.beginThinking(now_ms);
-    self.thinking_active = index;
-    return index;
-}
-
-fn finishThinking(self: *Screen) void {
-    self.thinking_active = null;
-}
-
-fn beginText(self: *Screen, turn: *Turn) !void {
-    self.transcript.endMessage();
-    try turn.blocks.append(self.gpa, .{
-        .kind = .text,
-        .transcript_index = null,
-        .call = null,
-    });
-    self.transcript.beginRun(.model);
-}
-
-fn startCall(self: *Screen, turn: *Turn, name: []const u8, now_ms: i64) !void {
-    self.transcript.endMessage();
-    if (turn.firstCall(&.{.streaming})) |block| {
-        block.call.?.phase = .queued;
-        try block.call.?.refresh(self.gpa);
-    }
-    var call = try Call.init(self.gpa, name, now_ms);
-    errdefer call.deinit(self.gpa);
-    try turn.blocks.append(self.gpa, .{ .kind = .call, .transcript_index = null, .call = call });
-}
-
-fn growCall(self: *Screen, turn: *Turn, delta: []const u8) !void {
-    const block = turn.firstCall(&.{.streaming}) orelse return;
-    block.call.?.bytes += delta.len;
-    try block.call.?.refresh(self.gpa);
-}
-
-fn runCall(self: *Screen, turn: *Turn, started: *const core.Tool.Call, time: Time) !void {
-    const block = turn.firstCall(&.{ .streaming, .queued }) orelse return;
-    const call = &block.call.?;
-    try self.describeCall(call, started);
-    const id = try self.gpa.dupe(u8, started.id);
-    self.gpa.free(call.id);
-    call.id = id;
-    call.phase = .running;
-    call.started_ms = time.awake_ms;
-    try call.refresh(self.gpa);
-    while (turn.firstCall(&.{.streaming})) |later| {
-        later.call.?.phase = .queued;
-        try later.call.?.refresh(self.gpa);
-    }
-}
-
-fn settleCall(
-    self: *Screen,
-    turn: *Turn,
-    result: *const core.Session.Event.ToolResult,
-    now_ms: i64,
-) !void {
-    const block = turn.callById(result.call.id) orelse
-        turn.firstCall(&.{ .running, .queued, .streaming }) orelse
-        return self.appendUnknownResult(result, now_ms);
-    const call = &block.call.?;
-    const ran = call.phase == .running;
-    if (!ran) try self.describeCall(call, &result.call);
-    call.phase = .done;
-    const canceled = result.output.conditions.contains(.canceled);
-    block.transcript_index = try self.appendToolBlock(&.{
-        .name = call.name,
-        .subject = call.subject.items,
-        .subject_kind = call.subject_kind,
-        .output = &result.output,
-        .elapsed_ms = if (ran and canceled) now_ms - call.started_ms else null,
-    }, .{ .started_ms = call.opened_ms, .received_bytes = result.call.arguments.len });
-}
-
-fn describeCall(self: *Screen, call: *Call, tool_call: *const core.Tool.Call) !void {
-    const description = try tools.Registry.describe(self.gpa, tool_call, self.bash_timeout_ms);
-    defer description.deinit(self.gpa);
-    const subject = try tool_line.subject(self.gpa, &description, &self.display_roots);
-    defer self.gpa.free(subject);
-    if (!std.mem.eql(u8, call.name, tool_call.name)) {
-        const name = try self.gpa.dupe(u8, tool_call.name);
-        self.gpa.free(call.name);
-        call.name = name;
-    }
-    call.subject.clearRetainingCapacity();
-    try call.subject.appendSlice(self.gpa, subject);
-    call.subject_kind = if (description.subject) |value| value.kind else null;
-    call.timeout_ms = description.timeout_ms;
-}
-
-fn appendUnknownResult(
-    self: *Screen,
-    result: *const core.Session.Event.ToolResult,
-    now_ms: i64,
-) !void {
-    _ = try self.appendToolBlock(
-        &.{ .name = result.call.name, .output = &result.output },
-        .{ .started_ms = now_ms, .received_bytes = result.call.arguments.len },
-    );
-}
-
-fn appendToolBlock(
-    self: *Screen,
-    options: *const tool_line.Options,
-    work: struct { started_ms: i64, received_bytes: usize },
-) !usize {
-    const line = try tool_line.render(self.gpa, options);
-    defer line.deinit(self.gpa);
-    try self.transcript.append(&.{ .tool_result = .{
-        .text = line.text,
-        .segment_ends = line.segment_ends,
-        .status = line.status,
-        .qualifiers = line.qualifiers,
-        .command = line.command,
+fn blockFrom(self: *Screen, record: *const application.Record) !ui.Block {
+    var block: ui.Block = switch (record.content) {
+        .user => |text| try .init(self.gpa, &.{ .user = text.items }),
+        .user_note => |*note| if (note.skill) |*skill|
+            try self.skillBlock(skill)
+        else
+            try .init(self.gpa, &.{ .user_note = .{ .text = note.text.items } }),
+        .model => |text| try .init(self.gpa, &.{ .model = text.items }),
+        .thinking => |text| try .init(self.gpa, &.{ .thinking = text.items }),
+        .event => |*event| try .init(self.gpa, &.{ .event = .{
+            .text = event.text.items,
+            .severity = event.severity,
+        } }),
+        .tool_result => |*result| try self.toolBlock(result),
+    };
+    block.record_id = record.id;
+    if (record.work) |work| block.work = .{
         .started_ms = work.started_ms,
-        .received_bytes = work.received_bytes,
-    } });
-    return self.transcript.blocks().len - 1;
+        .end = if (work.end) |end| .{ .time_ms = end.time_ms, .status = end.status } else null,
+    };
+    return block;
 }
 
-fn discardTail(self: *Screen, turn: *Turn, count: usize) !void {
-    self.transcript.endMessage();
-    const kept = turn.blocks.items.len -| count;
-    var first: ?usize = null;
-    for (turn.blocks.items[kept..]) |block| {
-        const index = block.transcript_index orelse continue;
-        first = if (first) |found| @min(found, index) else index;
-    }
-    if (first) |index| {
-        const discarded = @max(index, turn.committed);
-        try self.transcript.takeThinking(discarded, &turn.thinking_discarded);
-        for (turn.blocks.items[0..kept]) |block| {
-            if (block.kind != .call) continue;
-            const retained = block.transcript_index orelse continue;
-            const result = &self.transcript.block_list.items[retained].content.tool_result;
-            if (retained >= discarded) result.survives_discard = true;
-        }
-        for (turn.blocks.items[0..kept]) |*block| {
-            const retained = block.transcript_index orelse continue;
-            if (retained < discarded) continue;
-            var removed: usize = 0;
-            for (self.transcript.blocks()[discarded..retained]) |*item|
-                removed += @intFromBool(!item.survivesDiscard());
-            block.transcript_index = retained - removed;
-        }
-        if (self.thinking_active) |active| if (active >= discarded) self.finishThinking();
-        self.transcript.discard(discarded);
-    }
-    turn.releaseBlocks(self.gpa, kept);
-}
-
-fn restoreThinking(self: *Screen, turn: *Turn) error{OutOfMemory}!void {
-    try self.transcript.block_list.appendSlice(self.gpa, turn.thinking_discarded.items);
-    turn.thinking_discarded.clearRetainingCapacity();
-}
-
-fn recordServed(
-    self: *Screen,
-    turn: *Turn,
-    served: *const core.Session.Event.ModelServed,
-    time: Time,
-) !void {
-    if (self.chosenModel()) |model| {
-        if (model.sameName(served.requested) and model.serves(served.served)) return;
-    }
-    const reported = turn.served_buffer[0..turn.served_length];
-    const length = @min(served.served.len, turn.served_buffer.len);
-    if (std.mem.eql(u8, reported, served.served[0..length])) return;
-    @memcpy(turn.served_buffer[0..length], served.served[0..length]);
-    turn.served_length = length;
-    self.transcript.endMessage();
-    const text = try self.gpa.print(
-        "The provider answered with the model \"{s}\" instead of the requested model \"{s}\".",
-        .{ served.served, served.requested },
-    );
-    defer self.gpa.free(text);
-    try self.transcript.append(&.{ .event = .{ .text = text, .severity = .warning } });
-    self.transcript.closeWork(&.{ .time_ms = time.awake_ms, .status = .complete });
-}
-
-fn recordOutcome(self: *Screen, outcome: *const core.Session.Outcome) !void {
-    switch (outcome.*) {
-        .stopped => |reason| switch (reason) {
-            .complete => {},
-            .truncated => try self.transcript.append(&.{ .event = .{
-                .text = turn_text.truncated.content,
-                .severity = turn_text.truncated.severity,
-            } }),
-        },
-        .canceled => try self.transcript.append(&.{ .event = .{ .text = canceled_event } }),
-        .exhausted => try self.appendFailure(turn_text.exhausted),
-        .failed => |*failure| {
-            const text = try turn_text.failureText(self.gpa, failure);
-            defer self.gpa.free(text);
-            try self.appendFailure(text);
-        },
-    }
-}
-
-pub fn attemptMessage(
-    gpa: std.mem.Allocator,
-    attempt: *const core.Session.Event.Attempt,
-) error{OutOfMemory}!Message {
-    var buffer: [24]u8 = undefined;
-    const delay = tools.format.duration(&buffer, @intCast(@min(
-        attempt.delay_ms,
-        std.math.maxInt(i64),
-    )));
-    const sentence = turn_text.failureSentence(attempt.failure.reason);
-    const content = if (attempt.failure.message.len == 0)
-        try gpa.print(
-            "Attempt {d} failed. {s} Drinky tries again in {s}.",
-            .{ attempt.attempt, sentence, delay },
-        )
-    else
-        try gpa.print(
-            "Attempt {d} failed. {s} Drinky tries again in {s}. Details: {s}",
-            .{ attempt.attempt, sentence, delay, attempt.failure.message },
-        );
-    return .{ .content = content, .severity = .information };
-}
-
-fn appendFailure(self: *Screen, text: []const u8) !void {
-    try self.transcript.append(&.{ .event = .{ .text = text, .severity = .failure } });
-}
-
-pub fn appendEvent(self: *Screen, message: Message) !void {
-    defer message.deinit(self.gpa);
-    try self.transcript.append(&.{ .event = .{
-        .text = message.content,
-        .severity = message.severity,
-    } });
-}
-
-pub fn appendUser(self: *Screen, text: []const u8) !void {
-    try self.transcript.append(&.{ .user = text });
-}
-
-pub fn appendSkillNote(self: *Screen, skill: *const core.Session.Event.SkillLoaded) !void {
-    const path = try format.path(self.gpa, skill.source, &self.display_roots);
+fn skillBlock(self: *Screen, skill: *const application.SkillLoaded) !ui.Block {
+    const path = try application.support.format.path(self.gpa, skill.source, &self.display_roots);
     defer self.gpa.free(path);
     const name = try self.gpa.dupe(u8, skill.name);
     defer self.gpa.free(name);
-    const shown_name = ui.paint.singleLine(name);
+    const shown_name = application.reference.singleLine(name);
     const text = try self.gpa.print("Skill: {s} · File: {s}", .{
         shown_name,
-        ui.paint.singleLine(path),
+        application.reference.singleLine(path),
     });
     defer self.gpa.free(text);
-    try self.transcript.append(&.{ .user_note = .{
+    return .init(self.gpa, &.{ .user_note = .{
         .text = text,
         .segment_ends = &.{ "Skill: ".len + shown_name.len, text.len },
     } });
 }
 
-pub fn appendNote(self: *Screen, text: []const u8) !void {
-    try self.transcript.append(&.{ .user_note = .{ .text = text } });
-}
-
-pub fn appendIntro(self: *Screen, text: []const u8) !void {
-    try self.transcript.append(&.{ .intro = text });
-}
-
-pub fn replaceEvent(self: *Screen, index: usize, message: Message) !void {
-    defer message.deinit(self.gpa);
-    try self.transcript.replaceEvent(index, &.{
-        .text = message.content,
-        .severity = message.severity,
+fn toolBlock(self: *Screen, result: *const application.Record.Result) !ui.Block {
+    const subject = try tool_line.subject(self.gpa, &result.description, &self.display_roots);
+    defer self.gpa.free(subject);
+    const line = try tool_line.render(self.gpa, &.{
+        .name = result.name,
+        .subject = subject,
+        .subject_kind = if (result.description.subject) |value| value.kind else null,
+        .output = &result.output,
+        .elapsed_ms = result.elapsed_ms,
     });
+    defer line.deinit(self.gpa);
+    return .init(self.gpa, &.{ .tool_result = .{
+        .text = line.text,
+        .segment_ends = line.segment_ends,
+        .status = line.status,
+        .qualifiers = line.qualifiers,
+        .command = line.command,
+        .started_ms = result.started_ms,
+        .received_bytes = result.received_bytes,
+    } });
+}
+
+fn showLive(self: *Screen, live: *const application.Live) !void {
+    const turn = self.activeTurn() orelse {
+        std.debug.assert(live.calls.len == 0 and !live.thinking);
+        return;
+    };
+    var calls: std.ArrayList(Call) = .empty;
+    errdefer {
+        for (calls.items) |*call| call.deinit(self.gpa);
+        calls.deinit(self.gpa);
+    }
+    try calls.ensureTotalCapacity(self.gpa, live.calls.len);
+    for (live.calls) |*call|
+        calls.appendAssumeCapacity(try .init(self.gpa, call, &self.display_roots));
+    turn.releaseCalls(self.gpa);
+    turn.calls.deinit(self.gpa);
+    turn.calls = calls;
+    turn.thinking = live.thinking;
+}
+
+fn clearConversation(self: *Screen) !void {
+    std.debug.assert(self.widget == .prompt);
+    self.clearNotice();
+    self.transcript.truncate(0);
+    try self.appendIntro();
+    self.view.resetScreen();
+}
+
+fn appendIntro(self: *Screen) !void {
+    try self.transcript.append(&.{ .intro = self.intro });
+}
+
+fn beginTurn(self: *Screen) void {
+    std.debug.assert(self.widget == .prompt);
+    self.widget = .{ .turn = .empty };
+}
+
+fn endTurn(self: *Screen) void {
+    if (self.activeTurn()) |turn| turn.deinit(self.gpa);
+    self.clearNotice();
+    self.widget = .prompt;
+}
+
+pub fn applyInteraction(self: *Screen, value: *const application.Interaction) !void {
+    self.choice = value.choice;
+    self.setBranch(value.branch);
+    self.setVerbose(value.settings.verbose);
+    self.window_pages = value.settings.window_pages;
+    self.gauge = value.settings.gauge;
+    switch (value.mode) {
+        .prompt, .sign_in => self.leaveWidget(),
+        .turn => if (self.widget != .turn) {
+            self.leaveWidget();
+            self.beginTurn();
+        },
+        .picker, .fetch => {
+            const picker = &value.picker.?;
+            if (self.widget != .picking) self.leaveWidget();
+            if (self.widget != .picking or self.picker_id != picker.id) try self.openPicker(picker);
+            if (value.mode == .fetch and self.widget.picking.wait_tick == null)
+                try self.beginPickerWait(application.reference.fetch_wait_text);
+        },
+        .page => try self.showPage(&value.page.?),
+    }
+    if (value.notice_id != self.notice_id) {
+        const notice = if (value.notice) |*message| try message.dupe(self.gpa) else null;
+        self.notice_id = value.notice_id;
+        if (notice) |message| self.setNotice(message) else self.clearNotice();
+    }
+}
+
+fn leaveWidget(self: *Screen) void {
+    switch (self.widget) {
+        .prompt => {},
+        .turn => self.endTurn(),
+        .picking => self.closePicker(),
+        .page => self.closePage(),
+    }
+}
+
+fn showPage(self: *Screen, value: *const application.Interaction.Page) !void {
+    if (self.widget != .page or self.page_id != value.id) {
+        self.leaveWidget();
+        try self.openPage(&.{ .title = value.title, .content = "", .action = value.action });
+        self.page_id = value.id;
+    }
+    const page = &self.widget.page;
+    page.action = value.action;
+    if (value.retry) |*message| {
+        if (!sameMessage(&page.retry, message)) try page.setRetry(message);
+    }
+    if (value.notice) |*message| {
+        if (!sameMessage(&page.notice, message)) try page.setNotice(message);
+    }
+    const wait = value.wait orelse {
+        self.page_wait = null;
+        return;
+    };
+    if (self.page_wait == null) self.page_wait = .{ .started_ms = wait.started_ms };
+    const shown = &self.page_wait.?;
+    if (shown.received_bytes == wait.received_bytes and shown.thinking == wait.thinking) return;
+    shown.received_bytes = wait.received_bytes;
+    shown.thinking = wait.thinking;
+    shown.seconds_shown = null;
+}
+
+fn sameMessage(
+    maybe_shown: *const ?application.Message,
+    message: *const application.Message,
+) bool {
+    const shown = maybe_shown.* orelse return false;
+    return shown.severity == message.severity and std.mem.eql(u8, shown.content, message.content);
 }
 
 pub fn setDraft(self: *Screen, text: []const u8) !void {
-    self.editor.clear();
-    try self.editor.insert(text);
+    var editor = ui.Editor.init(self.gpa);
+    errdefer editor.deinit();
+    try editor.insert(text);
+    self.editor.deinit();
+    self.editor = editor;
     self.markEdited();
 }
 
-pub fn openPicker(self: *Screen, pick: *const command.Context.Outcome.Pick) !void {
-    var trail: Trail = .{};
-    if (self.widget == .picking) {
-        trail = self.widget.picking.trail;
-        if (!sameStep(&self.widget.picking.reopen, &pick.reopen))
-            trail.push(self.widget.picking.picker.position(), self.widget.picking.reopen);
+fn openPicker(self: *Screen, pick: *const application.Picker) !void {
+    try self.openPickerAt(pick, self.stepScroll(pick.depth));
+}
+
+fn stepScroll(self: *Screen, depth: usize) usize {
+    const previous = self.activePicker() orelse return 0;
+    if (depth > self.picker_depth) {
+        if (self.picker_depth < picker_scrolls_max)
+            self.picker_scrolls[self.picker_depth] = previous.window.scroll;
+        return 0;
     }
-    return self.enterPicker(pick, trail, null);
+    if (depth < self.picker_depth and depth < picker_scrolls_max) return self.picker_scrolls[depth];
+    return 0;
 }
 
-fn sameStep(
-    step: *const ?command.Context.Outcome.Opener,
-    other: *const ?command.Context.Outcome.Opener,
-) bool {
-    const step_open = step.* orelse return false;
-    const other_open = other.* orelse return false;
-    return step_open.eql(other_open);
-}
-
-pub fn openPickerAbove(self: *Screen, pick: *const command.Context.Outcome.Pick) !void {
-    std.debug.assert(self.widget == .picking);
-    var trail = self.widget.picking.trail;
-    const entry = trail.last().?;
-    trail.dropLast();
-    return self.enterPicker(pick, trail, entry.position);
-}
-
-pub fn stepAbove(self: *const Screen) ?command.Context.Outcome.Opener {
-    return switch (self.widget) {
-        .picking => |*picking| if (picking.trail.last()) |entry| entry.open else null,
-        else => null,
-    };
-}
-
-fn enterPicker(
-    self: *Screen,
-    pick: *const command.Context.Outcome.Pick,
-    trail: Trail,
-    position: ?ui.Picker.Position,
-) !void {
-    errdefer freePickerOptions(self.gpa, pick.options);
-    if (pick.report) |message| try self.appendEvent(message);
-    const picker = try ui.Picker.init(self.gpa, pick.title, pick.options, &.{
+fn openPickerAt(self: *Screen, pick: *const application.Picker, scroll: usize) !void {
+    const owned = try pick.dupe(self.gpa);
+    errdefer owned.deinit(self.gpa);
+    const picker = try ui.Picker.init(self.gpa, owned.title, owned.options, &.{
         .current = pick.current,
         .preselected = pick.preselected,
-        .position = position,
-        .can_step_back = trail.len > 0,
+        .position = if (pick.cursor) |cursor| .{ .cursor = cursor, .scroll = scroll } else null,
+        .can_step_back = pick.depth > 0,
     });
     self.deinitWidget();
-    self.widget = .{ .picking = .{
-        .picker = picker,
-        .selector = pick.select,
-        .payload = pick.payload,
-        .cancellation_message = pick.cancellation_message,
-        .reopen = pick.reopen,
-        .trail = trail,
-        .wait_tick = null,
-    } };
+    self.widget = .{ .picking = .{ .picker = picker, .title = owned.title, .wait_tick = null } };
+    self.picker_id = pick.id;
+    self.picker_depth = pick.depth;
 }
 
-fn freePickerOptions(gpa: std.mem.Allocator, options: []const ui.Picker.Option) void {
-    for (options) |*option| option.deinit(gpa);
-    gpa.free(options);
-}
-
-pub fn closePicker(self: *Screen) void {
+fn closePicker(self: *Screen) void {
     switch (self.widget) {
         .picking => |*picking| {
-            picking.picker.deinit();
+            picking.deinit(self.gpa);
             self.widget = .prompt;
         },
         else => {},
     }
 }
 
-pub fn beginPickerWait(self: *Screen, text: []const u8) !void {
+fn beginPickerWait(self: *Screen, text: []const u8) !void {
     const picking = &self.widget.picking;
-    try picking.picker.beginWait(text);
+    const owned = try self.gpa.dupe(u8, text);
+    errdefer self.gpa.free(owned);
+    try picking.picker.beginWait(owned);
+    self.gpa.free(picking.wait_text);
+    picking.wait_text = owned;
     picking.wait_tick = 0;
 }
 
-pub fn cancelPicker(self: *Screen) !void {
-    const cancellation_message = switch (self.widget) {
-        .picking => |picking| picking.cancellation_message,
-        else => return,
-    };
-    self.closePicker();
-    try self.showNotice(.information, cancellation_message);
-}
-
-pub fn openPage(self: *Screen, options: *const ui.Page.Options) !void {
+fn openPage(self: *Screen, options: *const application.Page.Options) !void {
     std.debug.assert(self.widget == .prompt);
     var page = try ui.Page.init(self.gpa, options);
     page.reflow(.{ .columns = self.columns, .rows = self.rows });
     self.page_view.forget();
     self.page_view.resetScreen();
     self.widget = .{ .page = page };
-}
-
-pub fn waitOnPage(self: *Screen, now_ms: i64) void {
-    std.debug.assert(self.widget == .page and self.page_wait == null);
-    self.page_wait = .{ .started_ms = now_ms };
-}
-
-pub fn receiveOnPage(self: *Screen, bytes: usize) void {
-    const wait = &self.page_wait.?;
-    wait.thinking = true;
-    wait.received_bytes +|= bytes;
-    wait.seconds_shown = null;
-}
-
-pub fn noteOnPage(self: *Screen, note: *const Message) error{OutOfMemory}!void {
-    std.debug.assert(self.widget == .page and self.page_wait != null);
-    try self.widget.page.setRetry(note);
 }
 
 fn pageWaiting(self: *const Screen, page: *const ui.Page) bool {
@@ -1082,7 +643,7 @@ fn showPageWait(self: *Screen, page: *ui.Page, now_ms: i64) void {
     wait.seconds_shown = seconds;
 }
 
-pub fn closePage(self: *Screen) void {
+fn closePage(self: *Screen) void {
     self.page_wait = null;
     switch (self.widget) {
         .page => |*page| {
@@ -1093,23 +654,56 @@ pub fn closePage(self: *Screen) void {
     }
 }
 
-pub fn setBranch(self: *Screen, name: []const u8) void {
+fn setBranch(self: *Screen, name: []const u8) void {
     std.debug.assert(name.len <= self.branch_buffer.len);
     if (std.mem.eql(u8, self.branch_buffer[0..self.branch_length], name)) return;
     @memcpy(self.branch_buffer[0..name.len], name);
     self.branch_length = name.len;
 }
 
-fn branch(self: *const Screen) ?[]const u8 {
+pub fn branch(self: *const Screen) ?[]const u8 {
     if (self.branch_length == 0) return null;
     return self.branch_buffer[0..self.branch_length];
 }
 
-fn endTurn(self: *Screen) void {
-    if (self.activeTurn()) |turn| turn.deinit(self.gpa);
-    self.clearNotice();
-    self.widget = .prompt;
-    self.transcript.endMessage();
+pub fn restore(self: *Screen, snapshot: *const application.Snapshot) !void {
+    const interaction = &snapshot.interaction;
+    var restored = Screen.init(self.gpa, self.view.writer, interaction.choice.effort);
+    errdefer restored.deinit();
+    restored.intro = self.intro;
+    restored.repaint_transcript = self.repaint_transcript or
+        self.transcript.block_list.items.len > 0;
+    restored.verbose = interaction.settings.verbose;
+    restored.display_roots = .{
+        .working_directory = snapshot.working_directory,
+        .home_directory = snapshot.home_directory,
+    };
+    restored.directory_shown = self.directory_shown;
+    restored.statistics = snapshot.statistics;
+    restored.picker_scrolls = self.picker_scrolls;
+    try restored.appendIntro();
+    try restored.transcript.block_list.ensureUnusedCapacity(self.gpa, snapshot.records.len);
+    for (snapshot.records) |*record|
+        restored.transcript.block_list.appendAssumeCapacity(try restored.blockFrom(record));
+    try restored.applyInteraction(interaction);
+    if (interaction.mode == .turn) try restored.showLive(&snapshot.live);
+    if (restored.activePicker()) |picker| if (self.activePicker()) |previous| {
+        if (self.picker_id == restored.picker_id) try picker.restorePosition(previous);
+    };
+    if (restored.activePage()) |page| {
+        try page.append(snapshot.page_text);
+        if (self.activePage()) |previous| if (self.page_id == restored.page_id) {
+            page.restorePosition(previous);
+        };
+    }
+    const editor = self.editor;
+    self.editor = restored.editor;
+    restored.editor = editor;
+    std.mem.swap(terminal.View, &self.view, &restored.view);
+    const roots = self.display_roots;
+    self.deinit();
+    self.* = restored;
+    self.display_roots = roots;
 }
 
 pub fn paint(
@@ -1156,7 +750,6 @@ pub fn paint(
                 try turn.workBoxes(self.gpa, &.{
                     .now_ms = time.awake_ms,
                     .open = self.transcript.openWork(),
-                    .thinking = self.thinking_active != null,
                 });
             const tracks = try turn.trackBoxes(self.gpa);
             break :turn .{
@@ -1314,43 +907,118 @@ fn testModel() accounts.Model {
 const Rig = struct {
     out: std.Io.Writer.Allocating,
     screen: Screen,
+    reduction: application.testing.Reduction,
     time: Time,
 
     fn init(self: *Rig) void {
-        const gpa = std.testing.allocator;
+        self.initWith(std.testing.allocator, null);
+    }
+
+    fn initWith(self: *Rig, gpa: std.mem.Allocator, writer: ?*std.Io.Writer) void {
         self.out = .init(gpa);
-        self.screen = Screen.init(gpa, &self.out.writer, .high);
-        self.screen.showChoice(&.{
+        self.screen = Screen.init(gpa, writer orelse &self.out.writer, .high);
+        const choice: application.Choice = .{
             .account = accounts.testing.anthropic_plan,
             .model = testModel(),
             .effort = .high,
-        });
+        };
+        self.screen.choice = choice;
+        self.reduction.init(std.testing.allocator, choice);
         self.time = .{ .awake_ms = 0, .boot_ms = 0 };
     }
 
     fn deinit(self: *Rig) void {
+        self.reduction.deinit();
         self.screen.deinit();
         self.out.deinit();
     }
 
-    fn start(self: *Rig, text: []const u8) !void {
-        try self.screen.appendUser(text);
-        self.screen.beginTurn();
+    fn forward(self: *Rig) error{OutOfMemory}!void {
+        defer self.reduction.clear();
+        for (self.reduction.events.items) |*event| try self.mirror(event);
+    }
+
+    fn choose(self: *Rig, choice: *const application.Choice) error{OutOfMemory}!void {
+        self.reduction.surface.showChoice(choice);
+        self.reduction.flush();
+        try self.forward();
+    }
+
+    fn start(self: *Rig, text: []const u8) error{OutOfMemory}!void {
+        try self.reduction.start(text);
+        try self.forward();
+    }
+
+    fn addUser(self: *Rig, text: []const u8) error{OutOfMemory}!void {
+        try self.reduction.surface.appendUser(text);
+        self.reduction.flush();
+        try self.forward();
+    }
+
+    fn addSkill(self: *Rig, skill: *const application.SkillLoaded) error{OutOfMemory}!void {
+        try self.reduction.surface.appendSkillNote(skill);
+        self.reduction.flush();
+        try self.forward();
+    }
+
+    fn step(self: *Rig, event: *const core.Session.Event) error{OutOfMemory}!?core.Session.Outcome {
+        const outcome = try self.reduction.apply(event, .{
+            .awake_ms = self.time.awake_ms,
+            .boot_ms = self.time.boot_ms,
+        });
+        try self.forward();
+        return outcome;
+    }
+
+    fn mirror(self: *Rig, event: *const application.Event) !void {
+        switch (event.*) {
+            .append_record,
+            .record_text,
+            .replace_record,
+            .remove_records,
+            .live,
+            .statistics,
+            .page_text,
+            .clear_conversation,
+            => try self.screen.applyChange(event),
+            .interaction => |*value| try self.screen.applyInteraction(&self.shown(value)),
+            else => {},
+        }
+    }
+
+    fn shown(self: *const Rig, value: *const application.Interaction) application.Interaction {
+        var result = value.*;
+        result.branch = self.screen.branch() orelse "";
+        result.settings = .{
+            .verbose = self.screen.verbose,
+            .window_pages = self.screen.window_pages,
+            .gauge = self.screen.gauge,
+        };
+        return result;
+    }
+
+    fn showPage(self: *Rig, page: *const application.Interaction.Page) !void {
+        try self.screen.applyInteraction(&self.shown(&.{
+            .mode = .page,
+            .page = page.*,
+            .notice_id = self.screen.notice_id,
+            .choice = self.screen.choice,
+        }));
     }
 
     fn apply(self: *Rig, event: *const core.Session.Event) !void {
-        try std.testing.expect((try self.screen.apply(event, self.time)) == null);
+        try std.testing.expect(try self.step(event) == null);
     }
 
     fn end(self: *Rig, outcome: *const core.Session.Outcome) !void {
-        const ended = (try self.screen.apply(&.{ .turn_ended = outcome.* }, self.time)) orelse
+        const ended = try self.step(&.{ .turn_ended = outcome.* }) orelse
             return error.TestExpectedTurnEnd;
         try std.testing.expectEqual(std.meta.activeTag(outcome.*), std.meta.activeTag(ended));
         try std.testing.expect(self.screen.widget == .prompt);
     }
 
     fn blocks(self: *const Rig) []const ui.Block {
-        return self.screen.transcript.blocks();
+        return self.screen.transcript.block_list.items;
     }
 
     fn expectKinds(self: *const Rig, expected: []const ui.Block.Kind) !void {
@@ -1429,7 +1097,6 @@ test "verbose commands preserve line breaks and wrap before and after completion
     var rig: Rig = undefined;
     rig.init();
     defer rig.deinit();
-    rig.screen.bash_timeout_ms = 120_000;
     try rig.start("prompt");
     const call: core.Tool.Call = .{
         .id = "bash",
@@ -1611,13 +1278,12 @@ fn expectSummary(painted: []const u8, expected: []const u8) !void {
 }
 
 fn checkWorkAllocations(gpa: std.mem.Allocator) error{OutOfMemory}!void {
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var screen = Screen.init(gpa, &out.writer, .high);
-    defer screen.deinit();
-    screen.toggleVerbose();
-    try screen.appendUser("prompt");
-    screen.beginTurn();
+    var rig: Rig = undefined;
+    rig.initWith(gpa, null);
+    defer rig.deinit();
+    const screen = &rig.screen;
+    screen.setVerbose(!screen.verbose);
+    try rig.start("prompt");
     const call: core.Tool.Call = .{
         .id = "call",
         .name = "read",
@@ -1640,17 +1306,18 @@ fn checkWorkAllocations(gpa: std.mem.Allocator) error{OutOfMemory}!void {
         .committed,
         .{ .turn_ended = .{ .stopped = .complete } },
     };
-    for (&events) |*event| _ = try screen.apply(event, .{ .awake_ms = 2_000, .boot_ms = 2_000 });
-    try screen.appendUser("next");
-    screen.beginTurn();
+    rig.time = .{ .awake_ms = 2_000, .boot_ms = 2_000 };
+    for (&events) |*event| _ = try rig.step(event);
+    try rig.start("next");
     const canceled = [_]core.Session.Event{
         .reasoning_started,
         .{ .reasoning = "partial" },
         .{ .tail_discarded = 1 },
         .{ .turn_ended = .canceled },
     };
-    for (&canceled) |*event| _ = try screen.apply(event, .{ .awake_ms = 4_000, .boot_ms = 4_000 });
-    screen.toggleVerbose();
+    rig.time = .{ .awake_ms = 4_000, .boot_ms = 4_000 };
+    for (&canceled) |*event| _ = try rig.step(event);
+    screen.setVerbose(!screen.verbose);
 }
 
 test "work summaries and tool events free each partial allocation" {
@@ -1669,14 +1336,15 @@ test "tool commands and metadata release each partial allocation" {
     );
 }
 
-fn checkToolAllocations(gpa: std.mem.Allocator) error{OutOfMemory}!void {
-    var out: std.Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var screen = Screen.init(gpa, &out.writer, .high);
-    defer screen.deinit();
-    screen.toggleVerbose();
-    try screen.appendUser("prompt");
-    screen.beginTurn();
+fn checkToolAllocations(gpa: std.mem.Allocator) !void {
+    var output_buffer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output_buffer.deinit();
+    var rig: Rig = undefined;
+    rig.initWith(gpa, &output_buffer.writer);
+    defer rig.deinit();
+    const screen = &rig.screen;
+    screen.setVerbose(!screen.verbose);
+    try rig.start("prompt");
     const call: core.Tool.Call = .{
         .id = "bash",
         .name = "bash",
@@ -1688,44 +1356,51 @@ fn checkToolAllocations(gpa: std.mem.Allocator) error{OutOfMemory}!void {
         .{ .tool_call_started = "read" },
         .{ .tool_started = call },
     };
-    var time: Time = .{ .awake_ms = 0, .boot_ms = 0 };
-    for (&events) |*event| _ = try screen.apply(event, time);
+    for (&events) |*event| _ = try rig.step(event);
     for ([_]usize{ 80, 20 }) |columns| {
-        time.awake_ms += 1_000;
-        screen.paint(.{ .columns = columns, .rows = 24 }, time, &no_caption) catch
-            return error.OutOfMemory;
+        rig.time.awake_ms += 1_000;
+        try screen.paint(.{ .columns = columns, .rows = 24 }, rig.time, &no_caption);
     }
     var output: core.Tool.Output = .{};
     output.measures.put(.duration_ms, 2_000);
     output.measures.put(.exit_code, 0);
     output.conditions.insert(.output_truncated);
-    _ = try screen.apply(&.{ .tool_result = .{ .call = call, .output = output } }, time);
+    _ = try rig.step(&.{ .tool_result = .{ .call = call, .output = output } });
     const read: core.Tool.Call = .{
         .id = "read",
         .name = "read",
         .arguments = "{\"path\":\"a · b.zig\"}",
     };
-    _ = try screen.apply(&.{ .tool_started = read }, time);
+    _ = try rig.step(&.{ .tool_started = read });
     var failure: core.Tool.Output = .{ .content = "Drinky could not read the complete file." };
     failure.conditions.insert(.path_missing);
-    _ = try screen.apply(&.{ .tool_result = .{ .call = read, .output = failure } }, time);
+    _ = try rig.step(&.{ .tool_result = .{ .call = read, .output = failure } });
     const grep: core.Tool.Call = .{
         .id = "grep",
         .name = "grep",
         .arguments = "{\"pattern\":\"needle\"}",
     };
-    _ = try screen.apply(&.{ .tool_call_started = grep.name }, time);
-    _ = try screen.apply(&.{ .tool_started = grep }, time);
+    _ = try rig.step(&.{ .tool_call_started = grep.name });
+    _ = try rig.step(&.{ .tool_started = grep });
     var partial: core.Tool.Output = .{};
     partial.conditions.insert(.time_limit_reached);
     partial.conditions.insert(.match_limit_reached);
     partial.conditions.insert(.byte_limit_reached);
     partial.conditions.insert(.incomplete);
-    _ = try screen.apply(&.{ .tool_result = .{ .call = grep, .output = partial } }, time);
-    try screen.appendSkillNote(&.{ .name = "zig-style", .source = "a · b/SKILL.md" });
-    screen.toggleVerbose();
-    screen.paint(.{ .columns = 30, .rows = 24 }, time, &no_caption) catch
-        return error.OutOfMemory;
+    _ = try rig.step(&.{ .tool_result = .{ .call = grep, .output = partial } });
+    try rig.addSkill(&.{ .name = "zig-style", .source = "a · b/SKILL.md" });
+    screen.setVerbose(!screen.verbose);
+    try screen.paint(.{ .columns = 30, .rows = 24 }, rig.time, &no_caption);
+}
+
+test "a device write failure stays distinct from an allocation failure" {
+    var writer: std.Io.Writer = .failing;
+    var screen = Screen.init(std.testing.allocator, &writer, .high);
+    defer screen.deinit();
+    try std.testing.expectError(
+        error.WriteFailed,
+        screen.paint(.{ .columns = 80, .rows = 24 }, .{ .awake_ms = 0, .boot_ms = 0 }, &no_caption),
+    );
 }
 
 test "a work row in a small window keeps its current measurements and final status" {
@@ -1734,16 +1409,16 @@ test "a work row in a small window keeps its current measurements and final stat
     var device: terminal.testing.FakeDevice = undefined;
     try device.init(gpa, std.testing.io, size);
     defer device.deinit();
-    var screen = Screen.init(gpa, device.device().writer(), .high);
-    defer screen.deinit();
+    var rig: Rig = undefined;
+    rig.initWith(gpa, device.device().writer());
+    defer rig.deinit();
+    const screen = &rig.screen;
     screen.window_pages = 1;
-    screen.toggleVerbose();
-    try screen.appendUser("prompt");
-    screen.beginTurn();
-    var time: Time = .{ .awake_ms = 0, .boot_ms = 0 };
-    _ = try screen.apply(&.reasoning_started, time);
-    _ = try screen.apply(&.{ .reasoning = "abc" }, time);
-    try screen.paint(size, time, &no_caption);
+    screen.setVerbose(!screen.verbose);
+    try rig.start("prompt");
+    try rig.apply(&.reasoning_started);
+    try rig.apply(&.{ .reasoning = "abc" });
+    try screen.paint(size, rig.time, &no_caption);
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     const first = try device.snapshot(arena.allocator());
@@ -1751,9 +1426,9 @@ test "a work row in a small window keeps its current measurements and final stat
         try std.mem.join(arena.allocator(), "\n", first.rows),
         "Agent: work (thinking) · Time: 0s · Tools: 0 · Received: 3 B",
     );
-    time.awake_ms = 3_000;
-    _ = try screen.apply(&.{ .reasoning = "def" }, time);
-    try screen.paint(size, time, &no_caption);
+    rig.time.awake_ms = 3_000;
+    try rig.apply(&.{ .reasoning = "def" });
+    try screen.paint(size, rig.time, &no_caption);
     const active = try device.snapshot(arena.allocator());
     const active_rows = try std.mem.join(arena.allocator(), "\n", active.rows);
     try expectSummary(
@@ -1761,10 +1436,10 @@ test "a work row in a small window keeps its current measurements and final stat
         "Agent: work (thinking) · Time: 3s · Tools: 0 · Received: 6 B",
     );
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, active_rows, "Agent: work"));
-    time.awake_ms = 4_000;
-    _ = try screen.apply(&.committed, time);
-    _ = try screen.apply(&.{ .turn_ended = .{ .stopped = .complete } }, time);
-    try screen.paint(size, time, &no_caption);
+    rig.time.awake_ms = 4_000;
+    try rig.apply(&.committed);
+    try rig.end(&.{ .stopped = .complete });
+    try screen.paint(size, rig.time, &no_caption);
     const complete = try device.snapshot(arena.allocator());
     const complete_rows = try std.mem.join(arena.allocator(), "\n", complete.rows);
     try expectSummary(
@@ -1780,29 +1455,30 @@ test "a work update inside the frame keeps all history above the visible screen"
     var device: terminal.testing.FakeDevice = undefined;
     try device.init(gpa, std.testing.io, size);
     defer device.deinit();
-    var screen = Screen.init(gpa, device.device().writer(), .high);
-    defer screen.deinit();
-    for (0..100) |index| {
+    var rig: Rig = undefined;
+    rig.initWith(gpa, device.device().writer());
+    defer rig.deinit();
+    const screen = &rig.screen;
+    for (0..99) |index| {
         const text = try gpa.print("message-{d}", .{index});
         defer gpa.free(text);
-        try screen.appendUser(text);
+        try rig.addUser(text);
     }
     try screen.setDraft("line1\nline2\nline3\nline4\nline5");
-    screen.beginTurn();
-    var time: Time = .{ .awake_ms = 0, .boot_ms = 0 };
-    _ = try screen.apply(&.reasoning_started, time);
-    _ = try screen.apply(&.{ .reasoning = "abc" }, time);
-    screen.toggleVerbose();
-    try screen.paint(size, time, &no_caption);
+    try rig.start("message-99");
+    try rig.apply(&.reasoning_started);
+    try rig.apply(&.{ .reasoning = "abc" });
+    screen.setVerbose(!screen.verbose);
+    try screen.paint(size, rig.time, &no_caption);
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     const first = try device.snapshot(arena.allocator());
     var first_count: usize = 0;
     for (first.rows) |row| first_count += @intFromBool(std.mem.startsWith(u8, row, "message-"));
     try std.testing.expectEqual(@as(usize, 100), first_count);
-    time.awake_ms = 3_000;
-    _ = try screen.apply(&.{ .reasoning = "def" }, time);
-    try screen.paint(size, time, &no_caption);
+    rig.time.awake_ms = 3_000;
+    try rig.apply(&.{ .reasoning = "def" });
+    try screen.paint(size, rig.time, &no_caption);
     const active = try device.snapshot(arena.allocator());
     var active_count: usize = 0;
     for (active.rows) |row| {
@@ -1815,6 +1491,27 @@ test "a work update inside the frame keeps all history above the visible screen"
     );
 }
 
+test "a verbose work end above the window keeps the scrollback" {
+    const gpa = std.testing.allocator;
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    rig.screen.window_pages = 1;
+    try rig.start("prompt");
+    try rig.apply(&.reasoning_started);
+    var reasoning = try ui.testing.numberedLines(gpa, 40);
+    defer reasoning.deinit(gpa);
+    try rig.apply(&.{ .reasoning = reasoning.items });
+    const before = try rig.paintPlain(80);
+    defer gpa.free(before);
+    try rig.apply(&.text_started);
+    try rig.apply(&.{ .text = "answer" });
+    const after = try rig.paintPlain(80);
+    defer gpa.free(after);
+    try testing.expectContains(after, "answer");
+    try std.testing.expect(std.mem.find(u8, rig.out.written(), "\x1b[3J") == null);
+}
+
 test "a verbosity toggle repaints the complete transcript beyond the window limit" {
     const gpa = std.testing.allocator;
     var rig: Rig = undefined;
@@ -1824,13 +1521,13 @@ test "a verbosity toggle repaints the complete transcript beyond the window limi
     for (0..60) |index| {
         const text = try gpa.print("message-{d}", .{index});
         defer gpa.free(text);
-        try rig.screen.appendUser(text);
+        try rig.addUser(text);
     }
     const recent = try rig.paintPlain(80);
     defer gpa.free(recent);
     try std.testing.expect(std.mem.find(u8, recent, "message-0") == null);
     for (0..2) |_| {
-        rig.screen.toggleVerbose();
+        rig.screen.setVerbose(!rig.screen.verbose);
         const repainted = try rig.paintPlain(80);
         defer gpa.free(repainted);
         try std.testing.expectEqual(@as(usize, 60), std.mem.count(u8, repainted, "message-"));
@@ -1848,7 +1545,7 @@ test "a work summary joins consecutive thinking blocks and keeps their text and 
     var rig: Rig = undefined;
     rig.init();
     defer rig.deinit();
-    rig.screen.toggleVerbose();
+    rig.screen.setVerbose(!rig.screen.verbose);
     try rig.start("prompt");
     try rig.apply(&.reasoning_started);
     rig.time.awake_ms = 2_000;
@@ -1866,8 +1563,8 @@ test "a work summary joins consecutive thinking blocks and keeps their text and 
     try rig.apply(&.reasoning_started);
     try rig.apply(&.{ .reasoning = "βeta" });
     rig.time.awake_ms = 6_000;
-    rig.screen.toggleVerbose();
-    rig.screen.toggleVerbose();
+    rig.screen.setVerbose(!rig.screen.verbose);
+    rig.screen.setVerbose(!rig.screen.verbose);
     const active = try rig.paintPlain(80);
     defer gpa.free(active);
     try expectSummary(
@@ -1884,14 +1581,14 @@ test "a work summary joins consecutive thinking blocks and keeps their text and 
     try rig.apply(&.committed);
     try rig.end(&.{ .stopped = .complete });
     rig.time.awake_ms = 90_000;
-    rig.screen.toggleVerbose();
-    rig.screen.toggleVerbose();
+    rig.screen.setVerbose(!rig.screen.verbose);
+    rig.screen.setVerbose(!rig.screen.verbose);
     const complete = try rig.paintPlain(80);
     defer gpa.free(complete);
     try expectSummary(complete, "Agent: work (complete) · Time: 7s · Tools: 0 · Received: 10 B");
     try testing.expectContains(complete, "answer");
 
-    rig.screen.toggleVerbose();
+    rig.screen.setVerbose(!rig.screen.verbose);
     const full = try rig.paintPlain(80);
     defer gpa.free(full);
     try testing.expectContains(full, "alpha");
@@ -1940,7 +1637,7 @@ test "work reports each terminal outcome and freezes its measurements" {
         var rig: Rig = undefined;
         rig.init();
         defer rig.deinit();
-        rig.screen.toggleVerbose();
+        rig.screen.setVerbose(!rig.screen.verbose);
         try rig.start("prompt");
         rig.time.awake_ms = 1_000;
         try rig.apply(&.reasoning_started);
@@ -1971,7 +1668,7 @@ test "work reports each terminal outcome and freezes its measurements" {
         try std.testing.expect(std.mem.find(u8, rig.out.written(), "\x1b[32;7m") == null);
         try std.testing.expect(std.mem.find(u8, rig.out.written(), "\x1b[31;7m") == null);
         try std.testing.expect(std.mem.find(u8, rig.out.written(), "\x1b[36;7m") == null);
-        rig.screen.toggleVerbose();
+        rig.screen.setVerbose(!rig.screen.verbose);
         const thinking = try rig.paintPlain(80);
         defer std.testing.allocator.free(thinking);
         try testing.expectContains(thinking, "abc");
@@ -1984,7 +1681,7 @@ test "a retry keeps the failed work summary separate from the new attempt" {
     var rig: Rig = undefined;
     rig.init();
     defer rig.deinit();
-    rig.screen.toggleVerbose();
+    rig.screen.setVerbose(!rig.screen.verbose);
     try rig.start("prompt");
     try rig.apply(&.reasoning_started);
     try rig.apply(&.{ .reasoning = "first" });
@@ -2019,7 +1716,7 @@ test "a work row folds thinking and finished calls across steps until agent text
     var rig: Rig = undefined;
     rig.init();
     defer rig.deinit();
-    rig.screen.toggleVerbose();
+    rig.screen.setVerbose(!rig.screen.verbose);
     try rig.start("prompt");
     const read: core.Tool.Call = .{
         .id = "r1",
@@ -2069,7 +1766,7 @@ test "a work row folds thinking and finished calls across steps until agent text
     try std.testing.expect(std.mem.find(u8, complete, "Tool:") == null);
     try testing.expectContains(complete, "answer");
 
-    rig.screen.toggleVerbose();
+    rig.screen.setVerbose(!rig.screen.verbose);
     const full = try rig.paintPlain(80);
     defer gpa.free(full);
     for ([_][]const u8{ "Tool: read (complete)", "Tool: bash (complete)", "plan", "done" }) |part|
@@ -2082,7 +1779,7 @@ test "verbose off names the work that runs now and hides the rows of running cal
     var rig: Rig = undefined;
     rig.init();
     defer rig.deinit();
-    rig.screen.toggleVerbose();
+    rig.screen.setVerbose(!rig.screen.verbose);
     try rig.start("prompt");
     const idle = try rig.paintPlain(80);
     defer gpa.free(idle);
@@ -2141,7 +1838,7 @@ test "work activities keep unfinished tools, isolate thinking, and wait between 
     var rig: Rig = undefined;
     rig.init();
     defer rig.deinit();
-    rig.screen.toggleVerbose();
+    rig.screen.setVerbose(!rig.screen.verbose);
     try rig.start("prompt");
     const calls = [_]core.Tool.Call{
         .{ .id = "r1", .name = "read", .arguments = "{}" },
@@ -2186,7 +1883,7 @@ test "work activities keep unfinished tools, isolate thinking, and wait between 
     const complete = try rig.paintPlain(80);
     defer gpa.free(complete);
     try expectSummary(complete, "Agent: work (complete) · Time: 1s · Tools: 3 · Received: 10 B");
-    rig.screen.toggleVerbose();
+    rig.screen.setVerbose(!rig.screen.verbose);
     const full = try rig.paintPlain(80);
     defer gpa.free(full);
     try testing.expectContains(full, "plan");
@@ -2198,7 +1895,7 @@ test "work activities remove optional metrics before truncating inside the paren
     var rig: Rig = undefined;
     rig.init();
     defer rig.deinit();
-    rig.screen.toggleVerbose();
+    rig.screen.setVerbose(!rig.screen.verbose);
     try rig.start("prompt");
     for ([_][]const u8{ "read", "write", "edit", "find", "grep", "bash", "describe_drinky" }) |name|
         try rig.apply(&.{ .tool_call_started = name });
@@ -2230,7 +1927,7 @@ test "work activities keep complete Unicode graphemes and the closing parenthesi
     var rig: Rig = undefined;
     rig.init();
     defer rig.deinit();
-    rig.screen.toggleVerbose();
+    rig.screen.setVerbose(!rig.screen.verbose);
     try rig.start("prompt");
     try rig.apply(&.{ .tool_call_started = "読む👩‍💻" });
     const cases = [_]struct { columns: usize, expected: []const u8 }{
@@ -2255,7 +1952,7 @@ test "work activities keep the closing parenthesis for a single overwide graphem
         var rig: Rig = undefined;
         rig.init();
         defer rig.deinit();
-        rig.screen.toggleVerbose();
+        rig.screen.setVerbose(!rig.screen.verbose);
         try rig.start("prompt");
         try rig.apply(&.{ .tool_call_started = name });
         const painted = try rig.paintPlain(15);
@@ -2270,7 +1967,7 @@ test "an attempt that fails without work closes the committed work row as comple
     var rig: Rig = undefined;
     rig.init();
     defer rig.deinit();
-    rig.screen.toggleVerbose();
+    rig.screen.setVerbose(!rig.screen.verbose);
     try rig.start("prompt");
     const call: core.Tool.Call = .{ .id = "c1", .name = "read", .arguments = "{}" };
     try rig.apply(&.{ .tool_call_started = "read" });
@@ -2314,7 +2011,7 @@ test "agent text, a notice, and a skill note end a work run, and a commit or bla
         var rig: Rig = undefined;
         rig.init();
         defer rig.deinit();
-        rig.screen.toggleVerbose();
+        rig.screen.setVerbose(!rig.screen.verbose);
         try rig.start("prompt");
         try rig.apply(&.reasoning_started);
         try rig.apply(&.{ .reasoning = "a" });
@@ -2352,7 +2049,7 @@ test "work after a model notice keeps its counter and terminal status" {
     var rig: Rig = undefined;
     rig.init();
     defer rig.deinit();
-    rig.screen.toggleVerbose();
+    rig.screen.setVerbose(!rig.screen.verbose);
     try rig.start("prompt");
     rig.time.awake_ms = 1_000;
     try rig.apply(&.reasoning_started);
@@ -2374,7 +2071,7 @@ test "a discarded thinking block no longer contributes to its work summary" {
     var rig: Rig = undefined;
     rig.init();
     defer rig.deinit();
-    rig.screen.toggleVerbose();
+    rig.screen.setVerbose(!rig.screen.verbose);
     try rig.start("prompt");
     try rig.apply(&.reasoning_started);
     try rig.apply(&.{ .reasoning = "a" });
@@ -2387,8 +2084,8 @@ test "a discarded thinking block no longer contributes to its work summary" {
     try rig.apply(&.{ .tail_discarded = 1 });
     rig.time.awake_ms = 8_000;
     try rig.end(&.{ .stopped = .complete });
-    rig.screen.toggleVerbose();
-    rig.screen.toggleVerbose();
+    rig.screen.setVerbose(!rig.screen.verbose);
+    rig.screen.setVerbose(!rig.screen.verbose);
     const complete = try rig.paintPlain(80);
     defer gpa.free(complete);
     try expectSummary(complete, "Agent: work (complete) · Time: 8s · Tools: 0 · Received: 1 B");
@@ -2399,7 +2096,7 @@ test "a canceled run that drops a streaming call keeps the received bytes of its
     var rig: Rig = undefined;
     rig.init();
     defer rig.deinit();
-    rig.screen.toggleVerbose();
+    rig.screen.setVerbose(!rig.screen.verbose);
     try rig.start("prompt");
     try rig.apply(&.reasoning_started);
     try rig.apply(&.{ .reasoning = "abc" });
@@ -2420,7 +2117,6 @@ test "a tool call streams as a row, runs with its subject and timer, and ends as
     var rig: Rig = undefined;
     rig.init();
     defer rig.deinit();
-    rig.screen.bash_timeout_ms = 120_000;
     try rig.start("run it");
 
     try rig.apply(&.{ .tool_call_started = "bash" });
@@ -2532,8 +2228,8 @@ test "pending and completed calls keep the draft and share the detail threshold"
             try std.testing.expect(command_seen);
             try testing.expectContains(painted, "last-line");
         }
-        rig.screen.toggleVerbose();
-        rig.screen.toggleVerbose();
+        rig.screen.setVerbose(!rig.screen.verbose);
+        rig.screen.setVerbose(!rig.screen.verbose);
         const draft = try rig.screen.editor.expanded();
         defer gpa.free(draft);
         try std.testing.expectEqualStrings("draft", draft);
@@ -2567,7 +2263,7 @@ test "verbose off hides each command, and verbose on keeps its complete text" {
         var rig: Rig = undefined;
         rig.init();
         defer rig.deinit();
-        rig.screen.toggleVerbose();
+        rig.screen.setVerbose(!rig.screen.verbose);
         try rig.start("prompt");
         try rig.apply(&.{ .tool_call_started = "bash" });
         const call: core.Tool.Call = .{
@@ -2593,7 +2289,7 @@ test "verbose off hides each command, and verbose on keeps its complete text" {
         try std.testing.expect(std.mem.find(u8, complete, "Command:") == null);
         try std.testing.expect(std.mem.find(u8, complete, "Error:") == null);
 
-        rig.screen.toggleVerbose();
+        rig.screen.setVerbose(!rig.screen.verbose);
         const full = try rig.paintPlain(100);
         defer gpa.free(full);
         try testing.expectContains(full, case.hidden);
@@ -2609,7 +2305,7 @@ test "verbose off hides each command, and verbose on keeps its complete text" {
             "\x1b[0m\r\n                      \x1b[2;39mError: Drinky",
         );
 
-        rig.screen.toggleVerbose();
+        rig.screen.setVerbose(!rig.screen.verbose);
         const restored = try rig.paintPlain(56);
         defer gpa.free(restored);
         try testing.expectContains(restored, "Agent: work (complete)");
@@ -2857,7 +2553,7 @@ test "a reasoning discard keeps a retained call result that arrived after the re
         var rig: Rig = undefined;
         rig.init();
         defer rig.deinit();
-        if (!verbose) rig.screen.toggleVerbose();
+        if (!verbose) rig.screen.setVerbose(!rig.screen.verbose);
         try rig.start("prompt");
         try rig.apply(&.reasoning_started);
         try rig.apply(&.{ .tool_call_started = "write" });
@@ -2965,12 +2661,12 @@ test "every outcome states its end, and a failure names its details" {
 
     try rig.start("a");
     try rig.end(&.{ .stopped = .truncated });
-    try std.testing.expectEqualStrings(turn_text.truncated.content, rig.eventText(1));
+    try std.testing.expectEqualStrings(application.support.truncated.content, rig.eventText(1));
     try std.testing.expectEqual(.failure, rig.blocks()[1].content.event.severity);
 
     try rig.start("b");
     try rig.end(&.exhausted);
-    try std.testing.expectEqualStrings(turn_text.exhausted, rig.eventText(3));
+    try std.testing.expectEqualStrings(application.support.exhausted, rig.eventText(3));
 
     try rig.start("c");
     try rig.end(&.{ .failed = .{ .reason = .unauthorized, .message = "401 Unauthorized" } });
@@ -3016,7 +2712,7 @@ test "a reply under the served name of the chosen model records no warning" {
     defer rig.deinit();
     var alias = testModel();
     try alias.serveAs("claude-sonnet-4-6-20260101");
-    rig.screen.showChoice(&.{
+    try rig.choose(&.{
         .account = accounts.testing.anthropic_plan,
         .model = alias,
         .effort = .high,
@@ -3064,7 +2760,7 @@ test "the statistics forget the evidence of the last turn and report the new one
     try std.testing.expectEqualStrings("claude-sonnet-4-6", rig.screen.statusInfo(0).model.?);
     try std.testing.expect(rig.screen.statusInfo(0).quota != null);
 
-    rig.screen.showChoice(&.{ .account = accounts.testing.openai_api_key, .effort = .high });
+    try rig.choose(&.{ .account = accounts.testing.openai_api_key, .effort = .high });
     try std.testing.expect(rig.screen.statusInfo(0).quota == null);
     try std.testing.expect(rig.screen.statusInfo(0).credits == null);
 }
@@ -3081,7 +2777,7 @@ test "the cost takes a reported charge over the estimate, skips an unpriced mode
 
     var unpriced = testModel();
     unpriced.price = null;
-    rig.screen.showChoice(&.{
+    try rig.choose(&.{
         .account = accounts.testing.anthropic_plan,
         .model = unpriced,
         .effort = .high,
@@ -3129,7 +2825,7 @@ test "a reported charge does not require model prices or a selected model" {
     var rig: Rig = undefined;
     rig.init();
     defer rig.deinit();
-    rig.screen.showChoice(&.{ .effort = .high });
+    try rig.choose(&.{ .effort = .high });
     try rig.apply(&.{ .usage = .{ .cost_usd = 0.42 } });
     try std.testing.expectApproxEqAbs(@as(f64, 0.42), rig.screen.statusInfo(0).cost, 1e-9);
 }
@@ -3179,7 +2875,7 @@ test "an account switch keeps every block and the scrollback" {
     defer gpa.free(own);
     try testing.expectContains(own, "weigh it");
 
-    rig.screen.showChoice(&.{ .account = accounts.testing.openai_api_key, .effort = .high });
+    try rig.choose(&.{ .account = accounts.testing.openai_api_key, .effort = .high });
     const switched = try rig.paintPlain(80);
     defer gpa.free(switched);
     try std.testing.expect(
@@ -3195,14 +2891,20 @@ test "a notice replaces its predecessor, and a turn end drops it" {
     var rig: Rig = undefined;
     rig.init();
     defer rig.deinit();
-    rig.screen.setNotice(try Message.print(std.testing.allocator, .information, "First.", .{}));
-    rig.screen.setNotice(try Message.print(std.testing.allocator, .failure, "Second.", .{}));
+    rig.screen.setNotice(
+        try application.Message.print(std.testing.allocator, .information, "First.", .{}),
+    );
+    rig.screen.setNotice(
+        try application.Message.print(std.testing.allocator, .failure, "Second.", .{}),
+    );
     try std.testing.expectEqual(@as(usize, 0), rig.blocks().len);
     try std.testing.expectEqualStrings("Second.", rig.screen.notice.?.content);
-    try std.testing.expectEqual(Message.Severity.failure, rig.screen.notice.?.severity);
+    try std.testing.expectEqual(application.Message.Severity.failure, rig.screen.notice.?.severity);
 
     try rig.start("hi");
-    rig.screen.setNotice(try Message.print(std.testing.allocator, .warning, "Turn notice.", .{}));
+    rig.screen.setNotice(
+        try application.Message.print(std.testing.allocator, .warning, "Turn notice.", .{}),
+    );
     try rig.end(&.{ .stopped = .complete });
     try std.testing.expect(rig.screen.notice == null);
 }
@@ -3219,69 +2921,50 @@ test "a conversation clear drops every block and the statistics" {
     try rig.end(&.{ .stopped = .complete });
     try std.testing.expectApproxEqAbs(@as(f64, 3), rig.screen.statusInfo(0).cost, 1e-9);
 
-    rig.screen.clearConversation();
-    try std.testing.expectEqual(@as(usize, 0), rig.blocks().len);
+    rig.reduction.surface.clearConversation();
+    try rig.forward();
+    try rig.expectKinds(&.{.intro});
     try std.testing.expectEqual(@as(f64, 0), rig.screen.statusInfo(0).cost);
     try std.testing.expectEqualStrings("claude-sonnet-4-6", rig.screen.statusInfo(0).model.?);
 }
 
-fn openNothing(_: *command.Context, _: usize) command.Context.Error!command.Context.Outcome {
-    unreachable;
-}
-
-fn openNothingElse(_: *command.Context, _: usize) command.Context.Error!command.Context.Outcome {
-    unreachable;
-}
-
-fn pickForTest(
-    gpa: std.mem.Allocator,
-    names: []const []const u8,
-    open: ?command.Context.Outcome.Opener,
-) !command.Context.Outcome.Pick {
-    const options = try gpa.alloc(ui.Picker.Option, names.len);
-    errdefer gpa.free(options);
-    for (names, options) |name, *option| option.* = .{ .name = try gpa.dupe(u8, name) };
-    return .{
-        .select = undefined,
-        .title = "Step",
-        .cancellation_message = "You canceled the selection.",
-        .options = options,
-        .current = null,
-        .reopen = open,
-    };
-}
-
-test "a picker keeps its trail, waits with animation, and a repeat of a step stays in place" {
+test "a picker displays public options and waits with animation" {
     const gpa = std.testing.allocator;
     var rig: Rig = undefined;
     rig.init();
     defer rig.deinit();
-    const account_step: command.Context.Outcome.Opener = .{ .open = openNothing };
-    const model_step: command.Context.Outcome.Opener = .{ .open = openNothingElse, .payload = 3 };
-
-    try rig.screen.openPicker(&try pickForTest(gpa, &.{"row"}, account_step));
-    try std.testing.expect(rig.screen.stepAbove() == null);
-    try rig.screen.openPicker(&try pickForTest(gpa, &.{"row"}, model_step));
-    try std.testing.expect(rig.screen.stepAbove().?.eql(account_step));
-    for (0..2) |_| {
-        try rig.screen.openPicker(&try pickForTest(gpa, &.{"row"}, model_step));
-        try std.testing.expect(rig.screen.stepAbove().?.eql(account_step));
-    }
+    const options = [_]application.Picker.Option{.{ .name = "row" }};
+    try rig.screen.openPicker(
+        &.{ .id = 3, .title = "Step", .options = &options, .depth = 1 },
+    );
+    try std.testing.expectEqual(@as(u64, 3), rig.screen.picker_id);
     try std.testing.expect(!rig.screen.animating());
-
     try rig.screen.beginPickerWait("Drinky fetches the model list.");
     try std.testing.expect(rig.screen.animating());
     const painted = try rig.paintPlain(80);
     defer gpa.free(painted);
     try testing.expectContains(painted, "Drinky fetches");
     try std.testing.expect(std.mem.find(u8, painted, "> row") == null);
-
-    try rig.screen.openPicker(&try pickForTest(gpa, &.{"row"}, model_step));
+    try rig.screen.openPicker(&.{ .id = 4, .title = "Step", .options = &options });
     try std.testing.expect(!rig.screen.animating());
-    try std.testing.expect(rig.screen.stepAbove().?.eql(account_step));
-    try rig.screen.cancelPicker();
+    rig.screen.closePicker();
     try std.testing.expect(rig.screen.widget == .prompt);
-    try std.testing.expectEqualStrings("You canceled the selection.", rig.screen.notice.?.content);
+}
+
+test "a picker wait keeps its text after the event text is gone and the next paint composes it" {
+    const gpa = std.testing.allocator;
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    const options = [_]application.Picker.Option{.{ .name = "row" }};
+    try rig.screen.openPicker(&.{ .id = 3, .title = "Step", .options = &options });
+    const text = try gpa.dupe(u8, application.reference.fetch_wait_text);
+    try rig.screen.beginPickerWait(text);
+    @memset(text, 'x');
+    gpa.free(text);
+    const painted = try rig.paintPlain(60);
+    defer gpa.free(painted);
+    try testing.expectContains(painted, application.reference.fetch_wait_text);
 }
 
 test "a waiting page ticks its time, counts reasoning bytes, adds a note, and stops at text" {
@@ -3289,9 +2972,11 @@ test "a waiting page ticks its time, counts reasoning bytes, adds a note, and st
     var rig: Rig = undefined;
     rig.init();
     defer rig.deinit();
-    try rig.screen.openPage(&.{ .title = "Handoff", .content = "" });
+    try rig.showPage(&.{ .id = 1, .title = "Handoff", .action = .close });
     try std.testing.expect(!rig.screen.animating());
-    rig.screen.waitOnPage(1_000);
+    try rig.showPage(&.{ .id = 1, .title = "Handoff", .action = .close, .wait = .{
+        .started_ms = 1_000,
+    } });
     rig.time.awake_ms = 1_000;
     try std.testing.expect(rig.screen.animating());
     const waiting = try rig.paintPlain(80);
@@ -3301,8 +2986,13 @@ test "a waiting page ticks its time, counts reasoning bytes, adds a note, and st
     try std.testing.expect(rig.screen.advanceFrame(3_000));
 
     rig.time.awake_ms = 3_000;
-    rig.screen.receiveOnPage(2048);
-    try rig.screen.noteOnPage(&.{ .content = "Attempt 1 failed.", .severity = .information });
+    try rig.showPage(&.{
+        .id = 1,
+        .title = "Handoff",
+        .action = .close,
+        .retry = .{ .content = "Attempt 1 failed.", .severity = .information },
+        .wait = .{ .started_ms = 1_000, .received_bytes = 2048, .thinking = true },
+    });
     const thinking = try rig.paintPlain(80);
     defer gpa.free(thinking);
     try testing.expectContains(thinking, "Agent: work (thinking) · Time: 2s · Received: 2.0 KiB");
@@ -3347,9 +3037,11 @@ test "page wait lines keep one adaptive row with the transcript work style" {
                 var rig: Rig = undefined;
                 rig.init();
                 defer rig.deinit();
-                try rig.screen.openPage(&.{ .title = "Handoff", .content = "" });
-                rig.screen.waitOnPage(0);
-                if (thinking) rig.screen.receiveOnPage(2048);
+                try rig.showPage(&.{ .id = 1, .title = "Handoff", .action = .close, .wait = .{
+                    .started_ms = 0,
+                    .received_bytes = if (thinking) 2048 else 0,
+                    .thinking = thinking,
+                } });
                 if (presentation == .source) rig.screen.activePage().?.toggleSource(.{
                     .columns = case.columns,
                     .rows = 24,
@@ -3378,15 +3070,16 @@ test "page retry notes use the transcript information symbol and color in both p
         var rig: Rig = undefined;
         rig.init();
         defer rig.deinit();
-        try rig.screen.openPage(&.{ .title = "Handoff", .content = "" });
-        rig.screen.waitOnPage(0);
-        const message = try Screen.attemptMessage(gpa, &.{
-            .attempt = 1,
-            .failure = .{ .reason = .overloaded, .message = "**down**" },
-            .delay_ms = 1500,
+        try rig.showPage(&.{
+            .id = 1,
+            .title = "Handoff",
+            .action = .close,
+            .retry = .{
+                .content = "Attempt 1 failed. The provider is overloaded. Details: **down**",
+                .severity = .information,
+            },
+            .wait = .{ .started_ms = 0 },
         });
-        defer message.deinit(gpa);
-        try rig.screen.noteOnPage(&message);
         if (presentation == .source)
             rig.screen.activePage().?.toggleSource(.{ .columns = 80, .rows = 24 });
         const plain = try rig.paintPlain(80);
@@ -3410,9 +3103,13 @@ test "a tick of the wait line keeps the scroll position, and a new note returns 
     defer emulator.deinit();
     const size: terminal.View.Size = .{ .columns = 80, .rows = 4 };
     emulator.resize(size.rows);
-    try rig.screen.openPage(&.{ .title = "Handoff", .content = "" });
-    rig.screen.waitOnPage(0);
-    try rig.screen.noteOnPage(&.{ .content = "N1\nN2\nN3", .severity = .information });
+    try rig.showPage(&.{
+        .id = 1,
+        .title = "Handoff",
+        .action = .close,
+        .retry = .{ .content = "N1\nN2\nN3", .severity = .information },
+        .wait = .{ .started_ms = 0 },
+    });
     try rig.paintInto(&emulator, size);
     rig.screen.activePage().?.moveDown(size);
     try rig.paintInto(&emulator, size);
@@ -3422,7 +3119,13 @@ test "a tick of the wait line keeps the scroll position, and a new note returns 
     try rig.paintInto(&emulator, size);
     try expectBodyRows(&emulator, &.{ "ℹ N1", "N2" });
 
-    try rig.screen.noteOnPage(&.{ .content = "M1", .severity = .information });
+    try rig.showPage(&.{
+        .id = 1,
+        .title = "Handoff",
+        .action = .close,
+        .retry = .{ .content = "M1", .severity = .information },
+        .wait = .{ .started_ms = 0 },
+    });
     try rig.paintInto(&emulator, size);
     try expectBodyRows(&emulator, &.{ "Agent: work (waiting) · Time: 1s · Received: 0 B", "ℹ M1" });
     rig.screen.closePage();
@@ -3439,46 +3142,48 @@ fn expectBodyRows(emulator: *const terminal.testing.Emulator, expected: []const 
     }
 }
 
-test "the picker trail restores a position, bounds its depth, and ends at a step without return" {
+test "a step back restores the scroll row of the parent picker" {
     const gpa = std.testing.allocator;
     var rig: Rig = undefined;
     rig.init();
     defer rig.deinit();
-    const rows = [_][]const u8{ "first", "second", "third" };
-    const first_step: command.Context.Outcome.Opener = .{ .open = openNothing };
-    const depth_max = (Trail{}).entries.len;
+    var names: [40][5]u8 = undefined;
+    var options: [40]application.Picker.Option = undefined;
+    for (&options, &names, 0..) |*option, *name, index|
+        option.* = .{ .name = try std.fmt.bufPrint(name, "row{d:0>2}", .{index}) };
+    try rig.screen.openPicker(&.{ .id = 1, .title = "Parent", .options = &options });
+    for (0..30) |_| try rig.screen.activePicker().?.moveDown();
+    gpa.free(try rig.paintPlain(80));
+    for (0..10) |_| try rig.screen.activePicker().?.moveUp();
+    gpa.free(try rig.paintPlain(80));
+    const scroll = rig.screen.activePicker().?.window.scroll;
+    try std.testing.expect(scroll > 0);
+    try rig.screen.openPicker(
+        &.{ .id = 2, .title = "Child", .options = options[0..2], .depth = 1 },
+    );
+    try rig.screen.openPicker(&.{ .id = 3, .title = "Parent", .options = &options, .cursor = 20 });
+    gpa.free(try rig.paintPlain(80));
+    try std.testing.expectEqual(scroll, rig.screen.activePicker().?.window.scroll);
+}
 
-    var first = try pickForTest(gpa, &rows, first_step);
-    first.preselected = 2;
-    try rig.screen.openPicker(&first);
-    try rig.screen.openPicker(&try pickForTest(gpa, &.{"next"}, null));
-    try std.testing.expect(rig.screen.stepAbove().?.eql(first_step));
-    try rig.screen.openPickerAbove(&try pickForTest(gpa, &rows, first_step));
-    try std.testing.expect(rig.screen.stepAbove() == null);
-    const restored = try rig.paintPlain(80);
-    defer gpa.free(restored);
-    try testing.expectContains(restored, "> third");
-
-    for (1..depth_max + 2) |payload| {
-        const step: command.Context.Outcome.Opener = .{
-            .open = openNothingElse,
-            .payload = payload,
-        };
-        try rig.screen.openPicker(&try pickForTest(gpa, &.{"row"}, step));
-    }
-    for (0..depth_max) |back| {
-        const step: command.Context.Outcome.Opener = .{
-            .open = openNothingElse,
-            .payload = depth_max - back,
-        };
-        try std.testing.expect(rig.screen.stepAbove().?.eql(step));
-        try rig.screen.openPickerAbove(&try pickForTest(gpa, &.{"row"}, step));
-    }
-    try std.testing.expect(rig.screen.stepAbove() == null);
-
-    try rig.screen.openPicker(&try pickForTest(gpa, &.{"row"}, null));
-    try rig.screen.openPicker(&try pickForTest(gpa, &.{"row"}, first_step));
-    try std.testing.expect(rig.screen.stepAbove() == null);
+test "a public picker position restores the selected row" {
+    const gpa = std.testing.allocator;
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    const options = [_]application.Picker.Option{
+        .{ .name = "first" },
+        .{ .name = "second" },
+        .{ .name = "third" },
+    };
+    try rig.screen.openPicker(
+        &.{ .id = 2, .title = "Step", .options = &options, .cursor = 2 },
+    );
+    const painted = try rig.paintPlain(80);
+    defer gpa.free(painted);
+    try testing.expectContains(painted, "> third");
+    try rig.screen.openPicker(&.{ .id = 3, .title = "Step", .options = &options });
+    try std.testing.expectEqual(@as(usize, 0), rig.screen.activePicker().?.cursor);
     rig.screen.closePicker();
 }
 
@@ -3523,4 +3228,281 @@ test "a window without a column or a row paints as one column and one row" {
     try rig.end(&.{ .stopped = .complete });
     try rig.screen.openPage(&.{ .title = "Page", .content = "body" });
     try rig.screen.paint(.{ .columns = 0, .rows = 0 }, rig.time, &no_caption);
+}
+
+test "snapshot restoration releases every partial allocation and keeps the draft" {
+    var controller: application.testing.Rig = undefined;
+    try controller.init(&.{});
+    defer controller.deinit();
+    const initial = try controller.snapshot();
+    defer initial.deinit(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(
+        core.testing.no_resize_allocator,
+        checkSnapshotRestore,
+        .{&initial},
+    );
+}
+
+fn checkSnapshotRestore(gpa: std.mem.Allocator, snapshot: *const application.Snapshot) !void {
+    var rig: Rig = undefined;
+    rig.initWith(gpa, null);
+    defer rig.deinit();
+    const screen = &rig.screen;
+    try rig.addUser("Kept user message.");
+    try screen.setDraft("Kept draft.");
+    screen.verbose = true;
+    screen.window_pages = application.Settings.window_pages_min;
+    try screen.restore(snapshot);
+    try std.testing.expectEqualStrings("Kept draft.", screen.editor.visible());
+    try std.testing.expectEqual(snapshot.interaction.settings.verbose, screen.verbose);
+    try std.testing.expectEqual(snapshot.interaction.settings.window_pages, screen.window_pages);
+}
+
+test "picker snapshots keep local navigation only while the picker id stays unchanged" {
+    var names: [20][8]u8 = undefined;
+    var options: [names.len]application.Picker.Option = undefined;
+    for (&names, &options, 0..) |*buffer, *option, index| {
+        option.* = .{ .name = try std.mem.print(buffer, "row{d:0>2}", .{index}) };
+    }
+    var snapshot: application.Snapshot = .{
+        .records = &.{},
+        .statistics = .{},
+        .interaction = .{
+            .mode = .picker,
+            .picker = .{ .id = 1, .title = "Pick", .options = &options, .preselected = 2 },
+            .choice = .{ .effort = .high },
+        },
+        .working_directory = "/work",
+        .home_directory = "/home",
+    };
+    for ([_]usize{ 24, 80 }) |columns| {
+        var rig: Rig = undefined;
+        rig.init();
+        defer rig.deinit();
+        const size: terminal.View.Size = .{ .columns = columns, .rows = 8 };
+        try rig.screen.restore(&snapshot);
+        for (2..names.len - 1) |_| try rig.screen.activePicker().?.moveDown();
+        try rig.screen.paint(size, rig.time, &no_caption);
+        const scroll = rig.screen.activePicker().?.window.scroll;
+        try std.testing.expect(scroll > 0);
+        try rig.screen.restore(&snapshot);
+        try std.testing.expectEqual(names.len - 1, rig.screen.activePicker().?.cursor);
+        try rig.screen.paint(size, rig.time, &no_caption);
+        try std.testing.expectEqual(scroll, rig.screen.activePicker().?.window.scroll);
+        try testing.expectContains(rig.screen.activePicker().?.content.items, " > row19");
+        snapshot.interaction.picker.?.id += 1;
+        try rig.screen.restore(&snapshot);
+        try std.testing.expectEqual(@as(usize, 2), rig.screen.activePicker().?.cursor);
+        try std.testing.expectEqual(@as(usize, 0), rig.screen.activePicker().?.window.scroll);
+    }
+}
+
+test "page snapshots keep the source position and start new content at its first row" {
+    const snapshot: application.Snapshot = .{
+        .records = &.{},
+        .statistics = .{},
+        .interaction = .{
+            .mode = .page,
+            .page = .{ .id = 1, .title = "Page", .action = .close },
+            .choice = .{ .effort = .high },
+        },
+        .page_text = application.support.repeat(
+            "# Heading\n\nA long paragraph with **bold text**.\n\n",
+            40,
+        ),
+        .working_directory = "/work",
+        .home_directory = "/home",
+    };
+    for (std.enums.values(ui.Page.Presentation)) |presentation| {
+        for ([_]usize{ 24, 80 }) |columns| {
+            var rig: Rig = undefined;
+            rig.init();
+            defer rig.deinit();
+            const size: terminal.View.Size = .{ .columns = columns, .rows = 24 };
+            try rig.screen.restore(&snapshot);
+            try rig.screen.paint(size, rig.time, &no_caption);
+            const page = rig.screen.activePage().?;
+            if (presentation == .source) page.toggleSource(size);
+            page.moveEnd(size);
+            const scroll = page.scroll;
+            try std.testing.expect(scroll > 0);
+            try rig.screen.restore(&snapshot);
+            try rig.screen.paint(size, rig.time, &no_caption);
+            try std.testing.expectEqual(presentation, rig.screen.activePage().?.presentation);
+            try std.testing.expectEqual(scroll, rig.screen.activePage().?.scroll);
+            const resized: terminal.View.Size = .{
+                .columns = if (columns == 24) 80 else 24,
+                .rows = size.rows,
+            };
+            const restored = rig.screen.activePage().?;
+            restored.reflow(resized);
+            const resized_scroll = restored.scroll;
+            restored.reflow(size);
+            try rig.screen.restore(&snapshot);
+            try rig.screen.paint(resized, rig.time, &no_caption);
+            try std.testing.expectEqual(resized_scroll, rig.screen.activePage().?.scroll);
+        }
+    }
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    var waiting = snapshot;
+    waiting.page_text = "";
+    waiting.interaction.page.?.wait = .{ .started_ms = 0 };
+    waiting.interaction.page.?.retry = .{
+        .content = application.support.repeat("The attempt failed. ", 100),
+        .severity = .information,
+    };
+    const size: terminal.View.Size = .{ .columns = 24, .rows = 24 };
+    try rig.screen.restore(&waiting);
+    try rig.screen.paint(size, rig.time, &no_caption);
+    rig.screen.activePage().?.moveEnd(size);
+    try std.testing.expect(rig.screen.activePage().?.scroll > 0);
+    try rig.screen.restore(&snapshot);
+    try rig.screen.paint(size, rig.time, &no_caption);
+    try std.testing.expectEqual(@as(usize, 0), rig.screen.activePage().?.scroll);
+}
+
+test "a snapshot of a model fetch restores its wait presentation" {
+    const gpa = std.testing.allocator;
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    var stall: providers.testing.FakeTransport.Stall = .{ .io = std.testing.io };
+    var controller: application.testing.Rig = undefined;
+    try controller.init(&.{ .replies = &.{.{ .stall = &stall }} });
+    defer controller.deinit();
+    const initial = try controller.snapshot();
+    initial.deinit(gpa);
+    _ = controller.send(&.{ .submit = .{ .line = "/model" } });
+    const picking = try controller.snapshot();
+    defer picking.deinit(gpa);
+    _ = controller.send(&.{ .select = .{ .cursor = 0 } });
+    try stall.reached.wait(std.testing.io);
+    const fetching = try controller.snapshot();
+    defer fetching.deinit(gpa);
+    try rig.screen.restore(&fetching);
+    try std.testing.expect(rig.screen.animating());
+    const painted = try rig.paintPlain(80);
+    defer gpa.free(painted);
+    try testing.expectContains(painted, "Drinky fetches the model list.");
+}
+
+test "an event between two thinking segments closes both across toggles and snapshots" {
+    const gpa = std.testing.allocator;
+    var stream: application.testing.StreamTransport = .{
+        .prefix = "data: {\"type\":\"response.reasoning_summary_text.delta\"," ++
+            "\"item_id\":\"r1\",\"summary_index\":0,\"delta\":\"First reasoning.\"}\n\n",
+        .tail = "data: {\"type\":\"response.reasoning_summary_text.delta\"," ++
+            "\"item_id\":\"r1\",\"summary_index\":0,\"delta\":\"Second reasoning.\"}\n\n" ++
+            providers.testing.reply_stream,
+    };
+    var controller: application.testing.Rig = undefined;
+    try controller.init(&.{ .transport = stream.transport() });
+    defer controller.deinit();
+    defer stream.released.set(std.testing.io);
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    const initial = try controller.snapshot();
+    defer initial.deinit(gpa);
+    try rig.screen.restore(&initial);
+    rig.screen.verbose = false;
+    _ = controller.send(&.{ .submit = .{ .line = "Task." } });
+    var inserted = false;
+    for (0..4096) |_| {
+        const event = try controller.next();
+        defer event.deinit(gpa);
+        try rig.mirror(&event);
+        if (event == .turn_ended) break;
+        if (inserted) continue;
+        for (rig.blocks()) |*block| {
+            if (block.content != .thinking) continue;
+            if (!std.mem.eql(u8, block.content.thinking.items, "First reasoning.")) continue;
+            inserted = true;
+            _ = controller.send(&.{ .client_notice = .{
+                .severity = .information,
+                .content = "Integration notice.",
+            } });
+            stream.released.set(std.testing.io);
+        }
+    } else return error.TestExpectedEnd;
+    for (0..2) |_| {
+        for ([_]usize{ 24, 80 }) |columns| {
+            for (0..3) |toggle| {
+                const verbose = toggle == 1;
+                if (rig.screen.verbose != verbose) rig.screen.setVerbose(!rig.screen.verbose);
+                const painted = try rig.paintPlain(columns);
+                defer gpa.free(painted);
+                try testing.expectContains(painted, "ℹ Integration notice.");
+                if (verbose) {
+                    try testing.expectContains(painted, "First reasoning.");
+                    try testing.expectContains(painted, "Second reasoning.");
+                    try std.testing.expectEqual(0, std.mem.count(u8, painted, "Agent: work"));
+                } else {
+                    try std.testing.expectEqual(2, std.mem.count(u8, painted, "Agent: work"));
+                    try std.testing.expectEqual(2, std.mem.count(
+                        u8,
+                        rig.out.written(),
+                        "\x1b[32m\x1b[2mAgent: work (complete)\x1b[0m",
+                    ));
+                    if (columns == 80) {
+                        try testing.expectContains(painted, "Tools: 0 · Received: 16 B");
+                        try testing.expectContains(painted, "Tools: 0 · Received: 17 B");
+                    } else {
+                        try std.testing.expect(std.mem.find(u8, painted, "Time:") == null);
+                    }
+                }
+            }
+        }
+        const snapshot = try controller.snapshot();
+        defer snapshot.deinit(gpa);
+        var closed: usize = 0;
+        for (snapshot.records) |record| {
+            if (record.work) |work| {
+                try std.testing.expect(work.end != null);
+                try std.testing.expectEqual(.complete, work.end.?.status);
+                closed += 1;
+            }
+        }
+        try std.testing.expectEqual(2, closed);
+        try rig.screen.restore(&snapshot);
+    }
+}
+
+test "a streaming snapshot continues the current text record after restoration" {
+    const gpa = std.testing.allocator;
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    var transport: application.testing.StreamTransport = .{
+        .prefix = "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"m1\"" ++
+            ",\"delta\":\"partial\"}\n\n",
+        .tail = "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"m1\"" ++
+            ",\"delta\":\" answer\"}\n\n" ++
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"id\":\"" ++
+            "m1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"" ++
+            "type\":\"output_text\",\"text\":\"partial answer\"}]}}\n\n" ++
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+    };
+    var controller: application.testing.Rig = undefined;
+    try controller.init(&.{ .transport = transport.transport() });
+    defer controller.deinit();
+    defer transport.released.set(std.testing.io);
+    const initial = try controller.snapshot();
+    initial.deinit(gpa);
+    _ = controller.send(&.{ .submit = .{ .line = "Task." } });
+    try transport.reached.wait(std.testing.io);
+    const snapshot = try controller.snapshot();
+    defer snapshot.deinit(gpa);
+    try rig.screen.restore(&snapshot);
+    transport.released.set(std.testing.io);
+    for (0..4096) |_| {
+        const event = try controller.next();
+        defer event.deinit(gpa);
+        try rig.mirror(&event);
+        if (event == .turn_ended) break;
+    } else return error.TestExpectedEnd;
+    try rig.expectKinds(&.{ .intro, .user, .model });
+    try std.testing.expectEqualStrings("partial answer", rig.blocks()[2].content.model.items);
 }

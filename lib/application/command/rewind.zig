@@ -1,7 +1,7 @@
 const std = @import("std");
 
 const Message = @import("../Message.zig");
-const ui = @import("../ui/root.zig");
+const reference = @import("../reference.zig");
 const Context = @import("Context.zig");
 const testing = @import("testing.zig");
 
@@ -14,7 +14,7 @@ pub fn run(context: *Context) Context.Error!Context.Outcome {
     for (context.turns.all()) |turn| {
         const line = try context.gpa.dupe(u8, turn.line orelse continue);
         defer context.gpa.free(line);
-        try options.print("{s}", .{ui.paint.singleLine(line)});
+        try options.print("{s}", .{reference.singleLine(line)});
     }
     if (options.rows.items.len == 0) return .{ .refusal = try Message.print(
         context.gpa,

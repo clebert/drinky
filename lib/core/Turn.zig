@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const Conversation = @import("Conversation.zig");
+const fatal = @import("fatal.zig");
 const Provider = @import("Provider.zig");
 const Runner = @import("Runner.zig");
 const Session = @import("Session.zig");
@@ -13,9 +14,9 @@ pub const tool_calls_max: usize = 64;
 pub const read_only_calls_max: usize = 32;
 pub const rounds_max: usize = 1000;
 const skills_max: usize = 64;
-const canceled_call_text = "The user canceled the call before Drinky received its result. " ++
+const canceled_call_text = "Drinky canceled the call before it received its result. " ++
     "The call can have completed some or all of its work.";
-const unstarted_call_text = "Drinky did not run the call because the user canceled the turn.";
+const unstarted_call_text = "Drinky did not run the call because the turn ended.";
 
 gpa: std.mem.Allocator,
 io: std.Io,
@@ -281,7 +282,7 @@ const Staging = struct {
 
     fn keepFailure(self: *Staging, failure: *const Provider.Failure) Provider.Failure {
         self.failure_message.clearRetainingCapacity();
-        self.failure_message.appendSlice(self.gpa, failure.message) catch {};
+        self.failure_message.appendSlice(self.gpa, failure.message) catch fatal.outOfMemory();
         return .{
             .reason = failure.reason,
             .retry_after_ms = failure.retry_after_ms,
@@ -325,32 +326,28 @@ fn rounds(self: *Turn) Session.Outcome {
         };
         const calls = staging.hasCalls();
         if (calls and round + 1 == rounds_max) {
-            self.commit(&staging) catch return outOfMemory();
+            self.commit(&staging) catch fatal.outOfMemory();
             return .exhausted;
         }
         if (calls) self.answer(&staging) catch |err| {
             if (err == error.Canceled) self.answerCanceled(&staging);
-            self.commit(&staging) catch return outOfMemory();
+            self.commit(&staging) catch fatal.outOfMemory();
             return switch (err) {
                 error.Canceled => .canceled,
-                error.OutOfMemory => outOfMemory(),
+                error.OutOfMemory => fatal.outOfMemory(),
                 error.ConcurrencyUnavailable => .{
                     .failed = .{ .reason = .concurrency_unavailable },
                 },
             };
         };
-        self.commit(&staging) catch return outOfMemory();
+        self.commit(&staging) catch fatal.outOfMemory();
         const loaded = self.loadSkills() catch |err| return switch (err) {
             error.Canceled => .canceled,
-            error.OutOfMemory => outOfMemory(),
+            error.OutOfMemory => fatal.outOfMemory(),
         };
         if (!calls and !loaded) return .{ .stopped = reason };
     }
     return .exhausted;
-}
-
-fn outOfMemory() Session.Outcome {
-    return .{ .failed = .{ .reason = .out_of_memory } };
 }
 
 fn step(self: *Turn, staging: *Staging) Step {
@@ -376,16 +373,15 @@ fn step(self: *Turn, staging: *Staging) Step {
 }
 
 fn endCanceled(self: *Turn, staging: *Staging) Step {
-    self.commit(staging) catch return .{ .ended = outOfMemory() };
+    self.commit(staging) catch fatal.outOfMemory();
     return .{ .ended = .canceled };
 }
 
 fn endFailed(self: *Turn, staging: *Staging, failure: *const Provider.Failure) Step {
-    const outcome: Session.Outcome = .{ .failed = failure.dupe(self.gpa) };
-    self.commit(staging) catch {
-        outcome.deinit(self.gpa);
-        return .{ .ended = outOfMemory() };
+    const outcome: Session.Outcome = .{
+        .failed = failure.dupe(self.gpa) catch fatal.outOfMemory(),
     };
+    self.commit(staging) catch fatal.outOfMemory();
     return .{ .ended = outcome };
 }
 
@@ -403,7 +399,7 @@ fn reply(self: *Turn, staging: *Staging) Reply {
     };
     setup.provider.open(&request) catch |err| return switch (err) {
         error.Canceled => .canceled,
-        error.OutOfMemory => .{ .failed = .{ .reason = .out_of_memory } },
+        error.OutOfMemory => fatal.outOfMemory(),
     };
     defer setup.provider.close();
     const stop = switch (self.read(staging, setup.provider)) {
@@ -413,7 +409,7 @@ fn reply(self: *Turn, staging: *Staging) Reply {
     };
     const calls = staging.hasCalls();
     if (calls and stop.reason != .complete) return .{ .failed = .{ .reason = .invalid_reply } };
-    const kept = staging.resolve() catch return .{ .failed = .{ .reason = .out_of_memory } };
+    const kept = staging.resolve() catch fatal.outOfMemory();
     if (!calls and kept.empty()) return .{ .failed = .{ .reason = .empty_reply } };
     if (staging.usage) |usage| self.measure(usage.total(), setup);
     if (stop.model.len != 0 and !std.mem.eql(u8, stop.model, setup.model)) {
@@ -429,7 +425,7 @@ fn read(self: *Turn, staging: *Staging, provider: Provider) Read {
     for (0..Provider.reply_events_max) |_| {
         const maybe_event = provider.next() catch |err| return switch (err) {
             error.Canceled => .canceled,
-            error.OutOfMemory => .{ .failed = .{ .reason = .out_of_memory } },
+            error.OutOfMemory => fatal.outOfMemory(),
         };
         const event = maybe_event orelse return .{ .failed = .{ .reason = .invalid_reply } };
         switch (event) {
@@ -456,12 +452,11 @@ fn read(self: *Turn, staging: *Staging, provider: Provider) Read {
                 }
                 staging.keep(output) catch |err| switch (err) {
                     error.Invalid => invalid = true,
-                    error.OutOfMemory => return .{ .failed = .{ .reason = .out_of_memory } },
+                    error.OutOfMemory => fatal.outOfMemory(),
                 };
             },
             .text => |delta| {
-                const started = staging.appendText(delta) catch
-                    return .{ .failed = .{ .reason = .out_of_memory } };
+                const started = staging.appendText(delta) catch fatal.outOfMemory();
                 if (started) self.emit(&.text_started);
                 self.emit(&.{ .text = delta });
             },
@@ -497,11 +492,8 @@ fn showMessage(self: *Turn, staging: *Staging, text: []const u8) void {
 }
 
 fn measure(self: *Turn, tokens: u64, setup: *const Session.Setup) void {
-    const account = self.gpa.dupe(u8, setup.account) catch return;
-    const model = self.gpa.dupe(u8, setup.model) catch {
-        self.gpa.free(account);
-        return;
-    };
+    const account = self.gpa.dupe(u8, setup.account) catch fatal.outOfMemory();
+    const model = self.gpa.dupe(u8, setup.model) catch fatal.outOfMemory();
     if (self.measured) |*measured| measured.deinit(self.gpa);
     self.measured = .{
         .tokens = tokens,
@@ -564,7 +556,10 @@ fn answerBatch(
     if (spawned == 0) return error.ConcurrencyUnavailable;
     var joined: usize = 0;
     defer for (futures[joined..spawned], joined..) |*future, position| {
-        const output = future.cancel(self.io) catch continue;
+        const output = future.cancel(self.io) catch |err| switch (err) {
+            error.Canceled => continue,
+            error.OutOfMemory => fatal.outOfMemory(),
+        };
         self.settle(staging, calls[batch.start + position], output);
     };
     while (joined < spawned) : (joined += 1) {
@@ -614,7 +609,7 @@ fn answerCanceled(self: *Turn, staging: *Staging) void {
         const pending = staging.pendingAt(index);
         if (pending.output != null) continue;
         const text = if (pending.started) canceled_call_text else unstarted_call_text;
-        const content = self.gpa.dupe(u8, text) catch return;
+        const content = self.gpa.dupe(u8, text) catch fatal.outOfMemory();
         self.settle(staging, index, .{ .content = content, .conditions = .initOne(.canceled) });
     }
 }

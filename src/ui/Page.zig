@@ -1,9 +1,8 @@
 const std = @import("std");
+const application = @import("application");
 
 const core = @import("core");
 const terminal = @import("terminal");
-
-const Message = @import("../Message.zig");
 
 const Block = @import("Block.zig");
 const Caption = @import("Caption.zig");
@@ -19,8 +18,8 @@ gpa: std.mem.Allocator,
 title: []const u8,
 content: std.ArrayList(u8),
 wait: ?Wait,
-retry: ?Message,
-notice: ?Message,
+retry: ?application.Message,
+notice: ?application.Message,
 scroll: usize,
 source_offset: ?SourceOffset,
 presentation: Presentation,
@@ -28,9 +27,7 @@ layout_columns: usize,
 layout_presentation: Presentation,
 layout_rows: usize,
 layout_bytes: usize,
-action: Action,
-
-pub const Action = enum { close, discard, apply };
+action: application.Page.Action,
 
 pub const Presentation = enum { markdown, source };
 
@@ -52,19 +49,13 @@ pub const Wait = struct {
     }
 };
 
-pub const Options = struct {
-    title: []const u8,
-    content: []const u8,
-    action: Action = .close,
-};
-
 const SourceOffset = union(enum) {
     body: usize,
     notice: usize,
     gap,
 };
 
-pub fn init(gpa: std.mem.Allocator, options: *const Options) !Page {
+pub fn init(gpa: std.mem.Allocator, options: *const application.Page.Options) !Page {
     const title = try gpa.dupe(u8, options.title);
     errdefer gpa.free(title);
     var content: std.ArrayList(u8) = .empty;
@@ -102,7 +93,7 @@ fn waiting(self: *const Page) bool {
     return self.content.items.len == 0 and self.notice == null and self.wait != null;
 }
 
-fn displayedNotice(self: *const Page) ?Message {
+fn displayedNotice(self: *const Page) ?application.Message {
     if (self.notice) |notice| return notice;
     return if (self.waiting()) self.retry else null;
 }
@@ -116,14 +107,14 @@ pub fn refreshWait(self: *Page, wait: *const Wait) void {
     self.wait = wait.*;
 }
 
-pub fn setRetry(self: *Page, note: *const Message) error{OutOfMemory}!void {
+pub fn setRetry(self: *Page, note: *const application.Message) error{OutOfMemory}!void {
     const copy = try note.dupe(self.gpa);
     if (self.retry) |*previous| previous.deinit(self.gpa);
     self.retry = copy;
     if (self.content.items.len == 0) self.restart();
 }
 
-pub fn setNotice(self: *Page, notice: *const Message) error{OutOfMemory}!void {
+pub fn setNotice(self: *Page, notice: *const application.Message) error{OutOfMemory}!void {
     const copy = try notice.dupe(self.gpa);
     const source_offset = self.sourceOffset();
     if (self.notice) |*previous| previous.deinit(self.gpa);
@@ -159,6 +150,13 @@ pub fn reflow(self: *Page, size: terminal.View.Size) void {
         self.scroll = scroll_max;
         self.source_offset = null;
     }
+}
+
+pub fn restorePosition(self: *Page, previous: *const Page) void {
+    self.presentation = previous.presentation;
+    if (previous.text().len == 0 and self.text().len > 0) return;
+    self.source_offset = previous.sourceOffset();
+    self.layout_columns = 0;
 }
 
 pub fn moveUp(self: *Page, size: terminal.View.Size) void {
@@ -620,7 +618,7 @@ test "page wait lines and transcript work rows use the same style and layout acr
 test "page notices and transcript events use the same style and layout across terminal widths" {
     const gpa = std.testing.allocator;
     const note = "Details: **é👩‍💻**\nNext line\x1b[2J";
-    for ([_]Message.Severity{ .information, .warning, .failure }) |severity| {
+    for ([_]application.Message.Severity{ .information, .warning, .failure }) |severity| {
         for ([_]Presentation{ .markdown, .source }) |presentation| {
             for ([_]usize{ 1, 5, 16, 80 }) |columns| {
                 const size: terminal.View.Size = .{ .columns = columns, .rows = 100 };
@@ -662,7 +660,7 @@ test "page notices and transcript events use the same style and layout across te
 
 test "page notices fit the viewport and keep their final row reachable" {
     const gpa = std.testing.allocator;
-    for ([_]Message.Severity{ .information, .warning, .failure }) |severity| {
+    for ([_]application.Message.Severity{ .information, .warning, .failure }) |severity| {
         for ([_]Presentation{ .markdown, .source }) |presentation| {
             for ([_]usize{ 1, 5, 16, 80 }) |columns| {
                 for ([_]usize{ 1, 2, 3, 4, 6 }) |rows| {
@@ -716,7 +714,7 @@ test "a notice keeps its prefix row separate from its first content row during n
 test "page notes use the transcript symbols and severity colors in both presentations" {
     const gpa = std.testing.allocator;
     const size: terminal.View.Size = .{ .columns = 80, .rows = 6 };
-    const cases = [_]struct { severity: Message.Severity, colored: []const u8 }{
+    const cases = [_]struct { severity: application.Message.Severity, colored: []const u8 }{
         .{ .severity = .information, .colored = "\x1b[22;36mℹ # Details: **down**" },
         .{ .severity = .warning, .colored = "\x1b[33m⚠ # Details: **down**" },
         .{ .severity = .failure, .colored = "\x1b[31m⚠ # Details: **down**" },
@@ -812,7 +810,7 @@ fn copyNotes(gpa: std.mem.Allocator) !void {
     page.reflow(size);
     try page.setRetry(&.{ .content = "Again.", .severity = .information });
     {
-        const notice = try Message.print(gpa, .failure, "Failed.", .{});
+        const notice = try application.Message.print(gpa, .failure, "Failed.", .{});
         defer notice.deinit(gpa);
         try page.setNotice(&notice);
     }

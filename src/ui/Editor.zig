@@ -1,4 +1,5 @@
 const std = @import("std");
+const application = @import("application");
 
 const core = @import("core");
 const terminal = @import("terminal");
@@ -52,7 +53,7 @@ const Draft = struct {
             position = atom.end;
         }
         out.appendSliceAssumeCapacity(self.visible.items[position..]);
-        const trimmed = std.mem.trim(u8, out.items, paint.blank_bytes);
+        const trimmed = std.mem.trim(u8, out.items, application.reference.blank_bytes);
         std.mem.copyForwards(u8, out.items, trimmed);
         out.items.len = trimmed.len;
         return out.toOwnedSlice(gpa);
@@ -1046,27 +1047,22 @@ test "an expanded send copy is independent of clearing the editor" {
     try std.testing.expectEqualStrings("A" ++ eleven_lines ++ "B", text);
 }
 
-test "large-paste allocation failures leave the editor usable and leak nothing" {
-    const fail_index_max = 40;
-    var fail_index: usize = 0;
-    while (fail_index < fail_index_max) : (fail_index += 1) {
-        var failing = std.testing.FailingAllocator.init(
-            std.testing.allocator,
-            .{ .fail_index = fail_index },
-        );
-        const gpa = failing.allocator();
-        var editor = Editor.init(gpa);
-        defer editor.deinit();
-        editor.insert("keep") catch continue;
-        editor.paste(eleven_lines, true) catch {
-            try std.testing.expectEqualStrings("keep", editor.visible());
-            try std.testing.expectEqual(@as(usize, 0), editor.draft.atoms.items.len);
-            continue;
-        };
-        try std.testing.expectEqual(@as(usize, 1), editor.draft.atoms.items.len);
-        break;
-    }
-    try std.testing.expect(fail_index < fail_index_max);
+test "a large paste releases every partial allocation" {
+    try std.testing.checkAllAllocationFailures(
+        core.testing.no_resize_allocator,
+        checkPasteAllocations,
+        .{},
+    );
+}
+
+fn checkPasteAllocations(gpa: std.mem.Allocator) !void {
+    var editor: Editor = .init(gpa);
+    defer editor.deinit();
+    try editor.insert("keep");
+    try editor.paste(eleven_lines, true);
+    const text = try editor.expanded();
+    defer gpa.free(text);
+    try std.testing.expectEqualStrings("keep" ++ eleven_lines, text);
 }
 
 test render {

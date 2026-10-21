@@ -26,7 +26,6 @@ pub fn failureSentence(reason: core.Provider.Failure.Reason) []const u8 {
         .too_many_tool_calls => "Drinky stopped the reply because it asked for too many tool " ++
             "calls.",
         .concurrency_unavailable => "Drinky could not start a task.",
-        .out_of_memory => "Drinky ran out of memory.",
     };
 }
 
@@ -48,10 +47,6 @@ test "failure text keeps the reason sentence and adds nonempty details" {
         .{
             .failure = .{ .reason = .network, .message = "Connection closed." },
             .text = "Drinky could not reach the provider. Details: Connection closed.",
-        },
-        .{
-            .failure = .{ .reason = .out_of_memory },
-            .text = "Drinky ran out of memory.",
         },
     };
     for (&cases) |*case| {

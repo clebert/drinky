@@ -82,7 +82,10 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, options: *const OpenOptions) !St
         .saved = null,
         .saving = .enabled,
     };
-    state.read();
+    errdefer for (state.model_names) |maybe_name| {
+        if (maybe_name) |name| gpa.free(name);
+    };
+    try state.read();
     return state;
 }
 
@@ -128,8 +131,8 @@ fn save(self: *State, account: usize, effort: core.Provider.Effort) json_store.S
     };
 }
 
-fn read(self: *State) void {
-    var file = (json_store.open(self.gpa, self.io, self.path) catch return) orelse return;
+fn read(self: *State) error{OutOfMemory}!void {
+    var file = try json_store.openReadable(self.gpa, self.io, self.path) orelse return;
     defer file.deinit();
     const entry = file.entry(self.project) orelse return;
     const account = providers.json.string(entry.getPtr("account")) orelse "";
@@ -141,7 +144,7 @@ fn read(self: *State) void {
     const listed = providers.json.object(entry.getPtr("models")) orelse return;
     for (&Account.table, &self.model_names) |*row, *slot| {
         const name = providers.json.string(listed.getPtr(row.id)) orelse continue;
-        slot.* = self.gpa.dupe(u8, name) catch return;
+        slot.* = try self.gpa.dupe(u8, name);
     }
 }
 
@@ -232,6 +235,32 @@ test "a stored entry reads back the account, the effort level, and one model per
     );
     try std.testing.expectEqualStrings("gpt-5.6-luna", state.model_names[testing.openai_api_key].?);
     try std.testing.expect(state.model_names[testing.anthropic_api_key] == null);
+}
+
+test "a read returns every allocation failure and releases every partial allocation" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(home);
+    try writeForTest(io, &tmp,
+        \\{ "/work": { "account": "anthropic-plan", "effort": "max",
+        \\    "models": { "anthropic-plan": "claude-opus-5",
+        \\      "openai-api-key": "gpt-5.6-luna" } } }
+    );
+    try std.testing.checkAllAllocationFailures(
+        core.testing.no_resize_allocator,
+        checkRead,
+        .{home},
+    );
+}
+
+fn checkRead(gpa: std.mem.Allocator, home: []const u8) !void {
+    var state = try openForTest(gpa, std.testing.io, home);
+    defer state.deinit();
+    const name = state.model_names[testing.openai_api_key] orelse return error.TestExpectedModel;
+    try std.testing.expectEqualStrings("gpt-5.6-luna", name);
 }
 
 test "an unusable value reads as nothing remembered" {

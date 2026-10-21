@@ -90,6 +90,7 @@ pub const Opener = struct {
                 .{ .argv = &.{ launcher, url } },
             ) catch |err| switch (err) {
                 error.Canceled => return error.Canceled,
+                error.OutOfMemory => core.fatal.outOfMemory(),
                 else => continue,
             };
             return true;

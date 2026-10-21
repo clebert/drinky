@@ -4,7 +4,7 @@ const core = @import("core");
 const tools = @import("tools");
 
 const command = @import("command/root.zig");
-const command_line = @import("command_line.zig");
+const reference = @import("reference.zig");
 const Config = @import("Config.zig");
 const tool_environment = @import("tool_environment.zig");
 
@@ -250,8 +250,8 @@ fn writeKeys(writer: *std.Io.Writer, options: *const Options) !void {
         \\
         \\The prompt takes these keys:
         \\
-        \\- Enter sends the line. After Drinky refuses a command line, a second Enter sends that
-        \\  line as a message.
+        \\- Enter sends the line. A refused line stays in the editor. After Drinky refuses a
+        \\  command line, a second Enter sends that line as a message.
         \\- Ctrl+C clears the editor. A second press within {d} milliseconds quits Drinky.
         \\- Ctrl+D quits at an empty editor. Ctrl+D with a draft warns first and quits on the
         \\  second press.
@@ -350,11 +350,11 @@ fn writeHeadless(writer: *std.Io.Writer) !void {
         \\```
         \\
     , .{
-        .levels = command_line.effort_levels,
+        .levels = reference.effort_levels,
         .timeout_key = Config.keyPath("bash.timeout_ms"),
         .model_variable = tool_environment.model,
         .effort_variable = tool_environment.effort,
-        .nested_variable = tool_environment.nested,
+        .nested_variable = reference.nested,
     });
 }
 
@@ -418,7 +418,7 @@ test "the document orders sections and states each command, key hint, window, li
         std.mem.find(u8, text[discovery_index..headless_index], window) != null,
     );
     const headless = text[headless_index..repository_index];
-    try std.testing.expect(std.mem.find(u8, headless, command_line.effort_levels) != null);
+    try std.testing.expect(std.mem.find(u8, headless, reference.effort_levels) != null);
     try std.testing.expect(std.mem.find(u8, headless, "available costs") != null);
     try std.testing.expect(std.mem.find(u8, headless, "no summary") != null);
 }

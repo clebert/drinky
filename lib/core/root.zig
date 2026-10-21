@@ -3,6 +3,7 @@ const std = @import("std");
 pub const actor = @import("actor.zig");
 pub const Conversation = @import("Conversation.zig");
 pub const error_set = @import("error_set.zig");
+pub const fatal = @import("fatal.zig");
 pub const Provider = @import("Provider.zig");
 pub const Retry = @import("Retry.zig");
 pub const Runner = @import("Runner.zig");

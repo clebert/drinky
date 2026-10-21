@@ -63,18 +63,18 @@ pub const head_bytes_max = 4096;
 
 const object_name_columns = 7;
 
-pub fn head(gpa: std.mem.Allocator, io: std.Io, root: []const u8) ?Head {
-    const directory = headDirectory(gpa, io, root) orelse return null;
+pub fn head(gpa: std.mem.Allocator, io: std.Io, root: []const u8) error{OutOfMemory}!?Head {
+    const directory = try headDirectory(gpa, io, root) orelse return null;
     defer gpa.free(directory);
-    const path = std.Io.Dir.path.join(gpa, &.{ directory, "HEAD" }) catch return null;
+    const path = try std.Io.Dir.path.join(gpa, &.{ directory, "HEAD" });
     defer gpa.free(path);
-    const data = readHeadFile(gpa, io, path) orelse return null;
+    const data = try readHeadFile(gpa, io, path) orelse return null;
     defer gpa.free(data);
     return parseHead(data);
 }
 
-fn headDirectory(gpa: std.mem.Allocator, io: std.Io, root: []const u8) ?[]u8 {
-    const marker_path = std.Io.Dir.path.join(gpa, &.{ root, marker_name }) catch return null;
+fn headDirectory(gpa: std.mem.Allocator, io: std.Io, root: []const u8) error{OutOfMemory}!?[]u8 {
+    const marker_path = try std.Io.Dir.path.join(gpa, &.{ root, marker_name });
     const stat = std.Io.Dir.cwd().statFile(io, marker_path, .{}) catch {
         gpa.free(marker_path);
         return null;
@@ -83,19 +83,23 @@ fn headDirectory(gpa: std.mem.Allocator, io: std.Io, root: []const u8) ?[]u8 {
     defer gpa.free(marker_path);
     if (stat.kind != .file) return null;
 
-    const data = readHeadFile(gpa, io, marker_path) orelse return null;
+    const data = try readHeadFile(gpa, io, marker_path) orelse return null;
     defer gpa.free(data);
     const prefix = "gitdir: ";
     const line = std.mem.trim(u8, data, " \t\r\n");
     if (!std.mem.startsWith(u8, line, prefix)) return null;
     const target = std.mem.trim(u8, line[prefix.len..], " \t");
     if (target.len == 0) return null;
-    if (std.Io.Dir.path.isAbsolute(target)) return gpa.dupe(u8, target) catch null;
-    return std.Io.Dir.path.resolve(gpa, &.{ root, target }) catch null;
+    if (std.Io.Dir.path.isAbsolute(target)) return try gpa.dupe(u8, target);
+    return try std.Io.Dir.path.resolve(gpa, &.{ root, target });
 }
 
-fn readHeadFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8) ?[]u8 {
-    return std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(head_bytes_max)) catch null;
+fn readHeadFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8) error{OutOfMemory}!?[]u8 {
+    return std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(head_bytes_max)) catch |err|
+        switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => null,
+        };
 }
 
 fn parseHead(data: []const u8) ?Head {
@@ -168,7 +172,7 @@ test "a marker that links to a Git directory is the root, and its head names the
     const boundary = try findBoundary(gpa, io, working_directory);
     try std.testing.expect(boundary.has_root);
     try std.testing.expectEqualStrings(root, boundary.path);
-    try std.testing.expectEqualStrings("main", head(gpa, io, root).?.name());
+    try std.testing.expectEqualStrings("main", (try head(gpa, io, root)).?.name());
 }
 
 test "an unreadable marker stops the walk and travels back as a value" {
@@ -241,7 +245,7 @@ test "a head names its branch, its tag, or its detached object, and only as prin
     };
     for (cases) |case| {
         try tree.write("repo/.git/HEAD", case.data);
-        const maybe_head = head(gpa, io, root);
+        const maybe_head = try head(gpa, io, root);
         if (case.name) |name| {
             try std.testing.expectEqualStrings(name, maybe_head.?.name());
         } else {
@@ -257,19 +261,40 @@ test "a head reads the Git directory that a marker file names, and a missing hea
     defer tree.deinit();
 
     const root = try tree.path("repo");
-    try std.testing.expect(head(gpa, io, root) == null);
+    try std.testing.expect(try head(gpa, io, root) == null);
 
     try tree.directory("repo/.git");
-    try std.testing.expect(head(gpa, io, root) == null);
+    try std.testing.expect(try head(gpa, io, root) == null);
 
     try tree.write("repo/.git/HEAD", "ref: refs/heads/main\n");
-    try std.testing.expectEqualStrings("main", head(gpa, io, root).?.name());
+    try std.testing.expectEqualStrings("main", (try head(gpa, io, root)).?.name());
 
     try tree.write("repo/.git/worktrees/next/HEAD", "ref: refs/heads/next\n");
     try tree.write("next/.git", "gitdir: ../repo/.git/worktrees/next\n");
     const worktree_root = try tree.path("next");
-    try std.testing.expectEqualStrings("next", head(gpa, io, worktree_root).?.name());
+    try std.testing.expectEqualStrings("next", (try head(gpa, io, worktree_root)).?.name());
 
     try tree.write("next/.git", "nothing\n");
-    try std.testing.expect(head(gpa, io, worktree_root) == null);
+    try std.testing.expect(try head(gpa, io, worktree_root) == null);
+}
+
+test "a head read returns every allocation failure and releases every partial allocation" {
+    var tree: testing.Tree = try .init();
+    defer tree.deinit();
+    try tree.write("repo/.git/worktrees/next/HEAD", "ref: refs/heads/next\n");
+    try tree.write("next/.git", "gitdir: ../repo/.git/worktrees/next\n");
+    const root = try tree.path("next");
+    try std.testing.checkAllAllocationFailures(
+        core.testing.no_resize_allocator,
+        checkHead,
+        .{root},
+    );
+}
+
+fn checkHead(
+    gpa: std.mem.Allocator,
+    root: []const u8,
+) error{ OutOfMemory, TestExpectedHead, TestExpectedEqual }!void {
+    const found = try head(gpa, std.testing.io, root) orelse return error.TestExpectedHead;
+    try std.testing.expectEqualStrings("next", found.name());
 }

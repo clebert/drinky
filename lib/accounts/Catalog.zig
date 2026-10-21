@@ -84,13 +84,14 @@ pub fn init(
         .metadata = .{ .gpa = gpa, .entries = &.{} },
         .mutex = .init,
     };
-    catalog.loadAccounts();
-    catalog.loadMetadata();
+    errdefer catalog.freeLists();
+    try catalog.loadAccounts();
+    try catalog.loadMetadata();
     return catalog;
 }
 
 pub fn deinit(self: *Catalog) void {
-    for (self.lists) |models| self.gpa.free(models);
+    self.freeLists();
     self.metadata.deinit();
     self.gpa.free(self.models_path);
     self.gpa.free(self.metadata_path);
@@ -171,7 +172,10 @@ pub fn dropAccount(self: *Catalog, index: usize) void {
     json_store.remove(self.gpa, self.io, &.{
         .path = self.models_path,
         .key = Account.table[index].id,
-    }) catch {};
+    }) catch |err| switch (err) {
+        error.OutOfMemory => core.fatal.outOfMemory(),
+        else => {},
+    };
 }
 
 pub fn setMetadata(self: *Catalog, metadata: Metadata) json_store.SaveError!void {
@@ -182,20 +186,24 @@ pub fn setMetadata(self: *Catalog, metadata: Metadata) json_store.SaveError!void
     try self.saveMetadata();
 }
 
-fn loadAccounts(self: *Catalog) void {
-    var file = (json_store.open(self.gpa, self.io, self.models_path) catch return) orelse return;
+fn freeLists(self: *Catalog) void {
+    for (self.lists) |models| self.gpa.free(models);
+}
+
+fn loadAccounts(self: *Catalog) error{OutOfMemory}!void {
+    var file = try json_store.openReadable(self.gpa, self.io, self.models_path) orelse return;
     defer file.deinit();
     for (&Account.table, 0..) |*row, index| {
         const entry = file.entry(row.id) orelse continue;
         const listed = providers.json.array(entry.getPtr(models_key)) orelse continue;
-        const models = json.models(self.gpa, listed.items, decodeModel) catch continue;
+        const models = try json.models(self.gpa, listed.items, decodeModel);
         self.gpa.free(self.lists[index]);
         self.lists[index] = models;
     }
 }
 
-fn loadMetadata(self: *Catalog) void {
-    var file = (json_store.open(self.gpa, self.io, self.metadata_path) catch return) orelse return;
+fn loadMetadata(self: *Catalog) error{OutOfMemory}!void {
+    var file = try json_store.openReadable(self.gpa, self.io, self.metadata_path) orelse return;
     defer file.deinit();
 
     var entries: std.ArrayList(Metadata.Entry) = .empty;
@@ -205,10 +213,10 @@ fn loadMetadata(self: *Catalog) void {
         const listed = providers.json.array(entry.getPtr(models_key)) orelse continue;
         for (listed.items) |*value| {
             const model = decodeModel(value) orelse continue;
-            entries.append(self.gpa, .{ .vendor = vendor, .model = model }) catch return;
+            try entries.append(self.gpa, .{ .vendor = vendor, .model = model });
         }
     }
-    const owned = entries.toOwnedSlice(self.gpa) catch return;
+    const owned = try entries.toOwnedSlice(self.gpa);
     self.metadata.deinit();
     self.metadata = .{ .gpa = self.gpa, .entries = owned };
 }

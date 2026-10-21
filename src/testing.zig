@@ -1,7 +1,7 @@
 const std = @import("std");
+const application = @import("application");
 
 const accounts = @import("accounts");
-const core = @import("core");
 
 const Herdr = @import("Herdr.zig");
 
@@ -13,12 +13,15 @@ pub const Clock = struct {
     changes: std.atomic.Value(u32),
     sleep_count: usize,
     sleep_deadline_ms: i64,
+    refuse_concurrency: std.atomic.Value(bool),
 
     pub fn init(self: *Clock, gpa: std.mem.Allocator) void {
         self.threaded = .init(gpa, .{});
         self.vtable = self.threaded.io().vtable.*;
         self.vtable.now = now;
         self.vtable.sleep = sleep;
+        self.vtable.concurrent = concurrent;
+        self.refuse_concurrency = .init(false);
         self.mutex = .init;
         self.now_ms = 0;
         self.changes = .init(0);
@@ -53,7 +56,13 @@ pub const Clock = struct {
         self: *Clock,
         seen: usize,
     ) error{ Timeout, Canceled, ConcurrencyUnavailable }!i64 {
-        return core.timeout.run(std.testing.io, 5_000, sleepAfter, .{ self, seen }, null);
+        return application.support.timeout(
+            std.testing.io,
+            5_000,
+            sleepAfter,
+            .{ self, seen },
+            null,
+        );
     }
 
     fn sleepAfter(self: *Clock, seen: usize) std.Io.Cancelable!i64 {
@@ -77,6 +86,26 @@ pub const Clock = struct {
     fn of(userdata: ?*anyopaque) *Clock {
         const threaded: *std.Io.Threaded = @ptrCast(@alignCast(userdata));
         return @fieldParentPtr("threaded", threaded);
+    }
+
+    fn concurrent(
+        userdata: ?*anyopaque,
+        result_len: usize,
+        result_alignment: std.mem.Alignment,
+        context: []const u8,
+        context_alignment: std.mem.Alignment,
+        start: *const fn (*const anyopaque, *anyopaque) void,
+    ) std.Io.ConcurrentError!*std.Io.AnyFuture {
+        const self = of(userdata);
+        if (self.refuse_concurrency.load(.acquire)) return error.ConcurrencyUnavailable;
+        return self.threaded.io().vtable.concurrent(
+            userdata,
+            result_len,
+            result_alignment,
+            context,
+            context_alignment,
+            start,
+        );
     }
 
     fn nowMs(self: *Clock) i64 {
@@ -112,78 +141,8 @@ pub const Clock = struct {
 };
 
 pub fn expectContains(text: []const u8, needle: []const u8) !void {
-    if (std.mem.find(u8, text, needle) != null) return;
-    std.debug.print("the text holds no \"{s}\":\n{s}\n", .{ needle, text });
-    return error.TestExpectedNeedle;
+    return application.testing.expectContains(text, needle);
 }
-
-pub const Tree = struct {
-    tmp: std.testing.TmpDir,
-    root: [:0]u8,
-    paths: std.ArrayList([]u8),
-
-    pub fn init() !Tree {
-        var tmp = std.testing.tmpDir(.{});
-        errdefer tmp.cleanup();
-        const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
-        return .{ .tmp = tmp, .root = root, .paths = .empty };
-    }
-
-    pub fn deinit(self: *Tree) void {
-        for (self.paths.items) |path_item| std.testing.allocator.free(path_item);
-        self.paths.deinit(std.testing.allocator);
-        std.testing.allocator.free(self.root);
-        self.tmp.cleanup();
-    }
-
-    pub fn path(self: *Tree, sub_path: []const u8) ![]const u8 {
-        const gpa = std.testing.allocator;
-        const joined = try std.Io.Dir.path.join(gpa, &.{ self.root, sub_path });
-        errdefer gpa.free(joined);
-        try self.paths.append(gpa, joined);
-        return joined;
-    }
-
-    pub fn directory(self: *Tree, sub_path: []const u8) !void {
-        try self.tmp.dir.createDirPath(std.testing.io, sub_path);
-    }
-
-    pub fn write(self: *Tree, sub_path: []const u8, data: []const u8) !void {
-        if (std.Io.Dir.path.dirname(sub_path)) |parent| try self.directory(parent);
-        try self.tmp.dir.writeFile(std.testing.io, .{ .sub_path = sub_path, .data = data });
-    }
-
-    pub fn skill(
-        self: *Tree,
-        parent: []const u8,
-        options: *const struct { name: []const u8, description: []const u8 },
-    ) !void {
-        var path_buffer: [256]u8 = undefined;
-        const sub_path = try std.mem.print(&path_buffer, "{s}/SKILL.md", .{parent});
-        var source_buffer: [512]u8 = undefined;
-        const source = try std.mem.print(
-            &source_buffer,
-            "---\nname: {s}\ndescription: {s}\n---\nFollow this skill.\n",
-            .{ options.name, options.description },
-        );
-        try self.write(sub_path, source);
-    }
-
-    pub fn link(
-        self: *Tree,
-        target: []const u8,
-        sub_path: []const u8,
-        flags: std.Io.Dir.SymLinkFlags,
-    ) !void {
-        self.tmp.dir.symLink(std.testing.io, target, sub_path, flags) catch |err| switch (err) {
-            error.AccessDenied,
-            error.PermissionDenied,
-            error.ReadOnlyFileSystem,
-            => return error.SkipZigTest,
-            else => return err,
-        };
-    }
-};
 
 const take_ms_max = 5_000;
 
@@ -241,7 +200,7 @@ pub const FakeHerdr = struct {
     }
 
     pub fn take(self: *FakeHerdr) ![]u8 {
-        return core.timeout.run(self.io, take_ms_max, takeLine, .{self}, releaseLine);
+        return application.support.timeout(self.io, take_ms_max, takeLine, .{self}, releaseLine);
     }
 
     fn takeLine(self: *FakeHerdr) (std.Io.QueueClosedError || std.Io.Cancelable)![]u8 {

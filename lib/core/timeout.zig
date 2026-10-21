@@ -108,11 +108,11 @@ fn race(
     defer if (timer) |*future| future.cancel(io);
     var work = try io.concurrent(Work.call, .{ &finish, args });
     finish.event.wait(io) catch |err| {
-        drop(Function, work.cancel(io), &args, release);
+        try drop(Function, work.cancel(io), &args, release);
         return err;
     };
     if (finish.first.load(.acquire) == .timer) {
-        drop(Function, work.cancel(io), &args, release);
+        try drop(Function, work.cancel(io), &args, release);
         return error.Timeout;
     }
     return work.await(io);
@@ -123,14 +123,15 @@ fn drop(
     result: Return(Function),
     args: *const std.meta.ArgsTuple(Function),
     comptime release: ?Release(Function),
-) void {
-    if (release) |free| {
-        const payload: Payload(Function) = if (@typeInfo(Return(Function)) == .error_union)
-            result catch return
-        else
-            result;
-        free(&payload, args);
-    }
+) Failure(Function)!void {
+    const payload: Payload(Function) = if (@typeInfo(Return(Function)) == .error_union)
+        result catch |err| {
+            if (err == error.OutOfMemory) return err;
+            return;
+        }
+    else
+        result;
+    if (release) |free| free(&payload, args);
 }
 
 pub fn sleep(io: std.Io, milliseconds: u64) std.Io.Cancelable!void {
@@ -253,6 +254,60 @@ test "a payload that arrives after a cancel goes to the release of the caller" {
     var future = try io.concurrent(timedStubbornWork, .{ io, std.testing.allocator, &released });
     try std.testing.expectError(error.Canceled, future.cancel(io));
     try std.testing.expect(released);
+}
+
+test "canceled and timed out work returns every allocation failure with or without a release" {
+    for ([_]bool{ false, true }) |with_release| {
+        for ([_]u64{ 0, 20 }) |timeout_ms| {
+            try std.testing.checkAllAllocationFailures(
+                testing.no_resize_allocator,
+                checkStoppedAllocations,
+                .{AllocationStop{ .with_release = with_release, .timeout_ms = timeout_ms }},
+            );
+        }
+    }
+}
+
+const AllocationStop = struct { with_release: bool, timeout_ms: u64 };
+
+fn checkStoppedAllocations(gpa: std.mem.Allocator, stop: AllocationStop) !void {
+    var clock: testing.ClockIo = undefined;
+    clock.init(std.testing.allocator);
+    defer clock.deinit();
+    const io = clock.io();
+    var released = false;
+    var future = try io.concurrent(allocatingOperation, .{ io, gpa, &released, stop });
+    const result = if (stop.timeout_ms == 0) future.cancel(io) else future.await(io);
+    result catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        try std.testing.expect(err == if (stop.timeout_ms == 0) error.Canceled else error.Timeout);
+        try std.testing.expectEqual(stop.with_release, released);
+        return;
+    };
+    return error.TestExpectedStop;
+}
+
+fn allocatingOperation(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    released: *bool,
+    stop: AllocationStop,
+) error{ OutOfMemory, Canceled, Timeout, ConcurrencyUnavailable }!void {
+    if (stop.with_release) {
+        const text = try run(
+            io,
+            stop.timeout_ms,
+            stubbornWork,
+            .{ io, gpa, released },
+            releaseStubborn,
+        );
+        gpa.free(text);
+    } else try run(io, stop.timeout_ms, temporaryWork, .{ io, gpa, released }, null);
+}
+
+fn temporaryWork(io: std.Io, gpa: std.mem.Allocator, released: *bool) error{OutOfMemory}!void {
+    const text = try stubbornWork(io, gpa, released);
+    gpa.free(text);
 }
 
 test "a deadline with a zero timeout never expires and starts no timer" {

@@ -6,10 +6,9 @@ const providers = @import("providers");
 const tools = @import("tools");
 
 const discovery = @import("discovery/root.zig");
-const layout = @import("layout.zig");
+const Settings = @import("Settings.zig");
 const Reports = @import("Reports.zig");
 const testing = @import("testing.zig");
-const ui = @import("ui/root.zig");
 
 const Config = @This();
 
@@ -17,16 +16,16 @@ path: []const u8,
 timeouts: accounts.Registry.Timeouts = accounts.Registry.timeouts_default,
 retry: core.Retry = .{},
 bash: tools.Context.Bash = .{},
-window_pages: usize = layout.window_pages_default,
-verbose: bool = false,
-gauge: ui.status.Gauge = .{},
+window_pages: usize = Settings.window_pages_default,
+verbose: bool = (Settings{}).verbose,
+gauge: Settings.Gauge = .{},
 effort_default: ?core.Provider.Effort = null,
 user_instructions: discovery.instructions.Result,
 required_skills: []const RequiredSkill = &.{},
 effort_dropped: ?[]const u8 = null,
 bash_timeout_ms_dropped: ?u64 = null,
 window_pages_dropped: ?usize = null,
-gauge_dropped: ?ui.status.Gauge = null,
+gauge_dropped: ?Settings.Gauge = null,
 unknown_keys: []const []const u8 = &.{},
 unknown_keys_omitted: bool = false,
 load_error: ?LoadError = null,
@@ -87,8 +86,8 @@ const File = struct {
     };
 
     const Interface = struct {
-        window_pages: usize = layout.window_pages_default,
-        verbose: bool = false,
+        window_pages: usize = Settings.window_pages_default,
+        verbose: bool = (Settings{}).verbose,
         gauge_percent_warning: f64 = gauge_default.percent_warning,
         gauge_percent_error: f64 = gauge_default.percent_error,
     };
@@ -109,7 +108,7 @@ const SectionField = struct {
 const transport_timeouts_default: providers.Transport.Timeouts = .{};
 const retry_default: core.Retry = .{};
 const bash_default: tools.Context.Bash = .{};
-const gauge_default: ui.status.Gauge = .{};
+const gauge_default: Settings.Gauge = .{};
 
 const unknown_keys_max = 16;
 
@@ -238,7 +237,7 @@ const keys = [_]Key{
                 "use and keeps the default. A verbosity toggle repaints the complete transcript " ++
                 "regardless of this count. A terminal reset also repaints the complete " ++
                 "transcript.",
-            .{ layout.window_pages_min, layout.window_pages_max },
+            .{ Settings.window_pages_min, Settings.window_pages_max },
         ),
     },
     .{
@@ -247,7 +246,7 @@ const keys = [_]Key{
             "The used share at which the context gauge and a quota window take the warning " ++
                 "color. The share must be from {d} to {d}, and it must not pass the error " ++
                 "share. Drinky reports a pair it cannot use and keeps both compiled shares.",
-            .{ ui.status.Gauge.percent_min, ui.status.Gauge.percent_max },
+            .{ Settings.Gauge.percent_min, Settings.Gauge.percent_max },
         ),
     },
     .{
@@ -256,7 +255,7 @@ const keys = [_]Key{
             "The used share at which the context gauge and a quota window take the error " ++
                 "color. The share must be from {d} to {d}. Drinky reports a pair it cannot " ++
                 "use and keeps both compiled shares.",
-            .{ ui.status.Gauge.percent_min, ui.status.Gauge.percent_max },
+            .{ Settings.Gauge.percent_min, Settings.Gauge.percent_max },
         ),
     },
     .{
@@ -542,7 +541,7 @@ pub fn reports(
         .failure,
         "Drinky ignored the configured window page count {d} because the count must be from " ++
             "{d} to {d}. Drinky uses the default count of {d} pages.",
-        .{ dropped, layout.window_pages_min, layout.window_pages_max, self.window_pages },
+        .{ dropped, Settings.window_pages_min, Settings.window_pages_max, self.window_pages },
     );
     if (self.gauge_dropped) |dropped| try result.add(
         gpa,
@@ -553,8 +552,8 @@ pub fn reports(
         .{
             dropped.percent_warning,
             dropped.percent_error,
-            ui.status.Gauge.percent_min,
-            ui.status.Gauge.percent_max,
+            Settings.Gauge.percent_min,
+            Settings.Gauge.percent_max,
             self.gauge.percent_warning,
             self.gauge.percent_error,
         },
@@ -676,7 +675,7 @@ fn loadFromData(gpa: std.mem.Allocator, io: std.Io, options: *const DataOptions)
     const bash_timeout_ms = resolveBashTimeout(&bash_timeout_ms_dropped, bash.timeout_ms);
     var window_pages_dropped: ?usize = null;
     const window_pages = resolveWindowPages(&window_pages_dropped, interface.window_pages);
-    var gauge_dropped: ?ui.status.Gauge = null;
+    var gauge_dropped: ?Settings.Gauge = null;
     const gauge = resolveGauge(&gauge_dropped, &interface);
     var unknown: std.ArrayList([]const u8) = .empty;
     errdefer {
@@ -837,14 +836,14 @@ fn resolveBashTimeout(dropped: *?u64, configured: u64) u64 {
 }
 
 fn resolveWindowPages(dropped: *?usize, configured: usize) usize {
-    if (configured >= layout.window_pages_min and configured <= layout.window_pages_max)
+    if (configured >= Settings.window_pages_min and configured <= Settings.window_pages_max)
         return configured;
     dropped.* = configured;
-    return layout.window_pages_default;
+    return Settings.window_pages_default;
 }
 
-fn resolveGauge(dropped: *?ui.status.Gauge, configured: *const File.Interface) ui.status.Gauge {
-    const gauge: ui.status.Gauge = .{
+fn resolveGauge(dropped: *?Settings.Gauge, configured: *const File.Interface) Settings.Gauge {
+    const gauge: Settings.Gauge = .{
         .percent_warning = configured.gauge_percent_warning,
         .percent_error = configured.gauge_percent_error,
     };
@@ -855,7 +854,7 @@ fn resolveGauge(dropped: *?ui.status.Gauge, configured: *const File.Interface) u
 }
 
 fn isShare(percent: f64) bool {
-    return percent >= ui.status.Gauge.percent_min and percent <= ui.status.Gauge.percent_max;
+    return percent >= Settings.Gauge.percent_min and percent <= Settings.Gauge.percent_max;
 }
 
 test "load reads the request section" {
@@ -934,7 +933,7 @@ test "load reads the interface section" {
 
     var empty = try loadDataForTest("{}");
     defer empty.deinit(std.testing.allocator);
-    try std.testing.expectEqual(layout.window_pages_default, empty.window_pages);
+    try std.testing.expectEqual(Settings.window_pages_default, empty.window_pages);
     try std.testing.expectEqual(gauge_default.percent_warning, empty.gauge.percent_warning);
     try std.testing.expectEqual(gauge_default.percent_error, empty.gauge.percent_error);
     try std.testing.expect(empty.window_pages_dropped == null);
@@ -983,7 +982,7 @@ test "verbosity rejects nonboolean values through the existing config error" {
 }
 
 test "a page count Drinky cannot use falls back to the default and is reported" {
-    const cases = [_]usize{ 0, layout.window_pages_max + 1, 100_000 };
+    const cases = [_]usize{ 0, Settings.window_pages_max + 1, 100_000 };
     for (cases) |configured| {
         const data = try std.testing.allocator.print(
             "{{ \"interface\": {{ \"window_pages\": {d} }} }}",
@@ -992,11 +991,11 @@ test "a page count Drinky cannot use falls back to the default and is reported" 
         defer std.testing.allocator.free(data);
         var config = try loadDataForTest(data);
         defer config.deinit(std.testing.allocator);
-        try std.testing.expectEqual(layout.window_pages_default, config.window_pages);
+        try std.testing.expectEqual(Settings.window_pages_default, config.window_pages);
         try std.testing.expectEqual(@as(?usize, configured), config.window_pages_dropped);
     }
 
-    const edges = [_]usize{ layout.window_pages_min, layout.window_pages_max };
+    const edges = [_]usize{ Settings.window_pages_min, Settings.window_pages_max };
     for (edges) |configured| {
         const data = try std.testing.allocator.print(
             "{{ \"interface\": {{ \"window_pages\": {d} }} }}",
@@ -1286,7 +1285,7 @@ test "the config document names the file, each key, and each limit, and its exam
     }
     try std.testing.expect(std.mem.find(u8, text, std.fmt.comptimePrint(
         "count must be from {d} to {d}",
-        .{ layout.window_pages_min, layout.window_pages_max },
+        .{ Settings.window_pages_min, Settings.window_pages_max },
     )) != null);
     try std.testing.expect(std.mem.find(u8, text, std.fmt.comptimePrint(
         "at most {d} files",

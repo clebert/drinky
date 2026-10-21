@@ -61,6 +61,13 @@ pub fn locate(
     );
 }
 
+pub fn openReadable(gpa: std.mem.Allocator, io: std.Io, path: []const u8) error{OutOfMemory}!?File {
+    return open(gpa, io, path) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => null,
+    };
+}
+
 pub fn open(gpa: std.mem.Allocator, io: std.Io, path: []const u8) OpenError!?File {
     const data = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited) catch |err|
         switch (err) {

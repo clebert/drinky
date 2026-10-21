@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const Conversation = @import("Conversation.zig");
+const fatal = @import("fatal.zig");
 const Provider = @import("Provider.zig");
 const Session = @import("Session.zig");
 const timeout = @import("timeout.zig");
@@ -43,7 +44,7 @@ const Reply = union(enum) {
 };
 
 pub fn run(self: *const Aside) Session.Outcome {
-    const items = self.requestItems() catch return .{ .failed = .{ .reason = .out_of_memory } };
+    const items = self.requestItems() catch fatal.outOfMemory();
     defer self.gpa.free(items);
     const setup = self.setup;
     const request: Provider.Request = .{
@@ -115,7 +116,7 @@ fn reply(self: *const Aside, shown: *bool, request: *const Provider.Request) Rep
     const provider = self.setup.provider;
     provider.open(request) catch |err| return switch (err) {
         error.Canceled => .canceled,
-        error.OutOfMemory => .{ .failed = .{ .reason = .out_of_memory } },
+        error.OutOfMemory => fatal.outOfMemory(),
     };
     defer provider.close();
     var maybe_usage: ?Provider.Usage = null;
@@ -125,7 +126,7 @@ fn reply(self: *const Aside, shown: *bool, request: *const Provider.Request) Rep
     for (0..Provider.reply_events_max) |_| {
         const maybe_event = provider.next() catch |err| return switch (err) {
             error.Canceled => .canceled,
-            error.OutOfMemory => .{ .failed = .{ .reason = .out_of_memory } },
+            error.OutOfMemory => fatal.outOfMemory(),
         };
         const event = maybe_event orelse return .{ .failed = .{ .reason = .invalid_reply } };
         switch (event) {
@@ -148,7 +149,9 @@ fn reply(self: *const Aside, shown: *bool, request: *const Provider.Request) Rep
                 if (!has_content) return .{ .failed = .{ .reason = .empty_reply } };
                 return .{ .stopped = stop.reason };
             },
-            .failed => |*failure| return .{ .failed = failure.dupe(self.gpa) },
+            .failed => |*failure| return .{
+                .failed = failure.dupe(self.gpa) catch fatal.outOfMemory(),
+            },
             .reasoning_started, .tool_call_started, .tool_call_arguments => {},
         }
     }

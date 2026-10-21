@@ -15,6 +15,12 @@ for file in $(grep -rl 'checkAllAllocationFailures(' src lib scripts --include='
         printf 'Its allocation count can change between runs. Use core.testing.no_resize_allocator.\n' >&2
         exit 1
     fi
+    if tr -d '[:space:]' <"$file" |
+        grep -qE '\.paint\([^;]*\)catchreturnerror\.OutOfMemory'; then
+        printf 'check: %s changes a render error into OutOfMemory.\n' "$file" >&2
+        printf 'Allocation tests must preserve render errors. Use a non-failing output writer.\n' >&2
+        exit 1
+    fi
 done
 
 npx --yes prettier@3 --check --log-level warn '**/*.md'
@@ -35,3 +41,5 @@ if [ "${ran:-0}" != "$declared" ]; then
 fi
 
 printf 'check: all %s declared tests ran.\n' "$declared"
+
+zig build test -Doptimize=safe --summary all

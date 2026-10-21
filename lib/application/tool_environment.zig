@@ -1,6 +1,5 @@
 const core = @import("core");
 
-pub const nested = "DRINKY_RUN";
 pub const model = "DRINKY_MODEL";
 pub const effort = "DRINKY_EFFORT";
 

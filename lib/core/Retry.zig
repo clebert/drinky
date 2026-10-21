@@ -28,7 +28,6 @@ pub fn delay(self: *const Retry, attempt: u32, failure: *const Provider.Failure)
         .unsupported_reply,
         .too_many_tool_calls,
         .concurrency_unavailable,
-        .out_of_memory,
         => return null,
     }
     const backoff = &self.backoff;
@@ -82,7 +81,6 @@ test "a reply that a repeat can fix waits, and one that it cannot stops" {
     try std.testing.expectEqual(@as(?u64, 500), delayOf(.overloaded, 1));
     try std.testing.expectEqual(@as(?u64, null), delayOf(.unsupported_reply, 1));
     try std.testing.expectEqual(@as(?u64, null), delayOf(.too_many_tool_calls, 1));
-    try std.testing.expectEqual(@as(?u64, null), delayOf(.out_of_memory, 1));
 }
 
 test "a failure that a repeat cannot fix stops at once" {
