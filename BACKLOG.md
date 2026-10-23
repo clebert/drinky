@@ -18,13 +18,15 @@ when the user drops it.
   workflow or runtime export. The endpoint hosts the passive controller on its own task, like
   `App.zig`. It owns the request ids, the event sequence, and the event buffer of each browser. A
   browser that misses an event requests a snapshot. It sends no command until that snapshot arrives.
-  Only the next command can confirm a refused command line, a rewind, or a removal, so the browser
-  must drop a confirmation at any other input. A slow browser must not block the sink of the
-  controller. Records, page waits, and the quota age use the awake clock and the boot clock of the
-  controller. The endpoint needs the current reading of each clock in every snapshot, so a browser
-  can compute its offset. The design must decide whether more than one browser can attach to one
-  controller. The system prompt and the help document still describe terminal output and terminal
-  controls. Adapt those texts when the HTTP frontend is added.
+  The browser owns its confirmation policy, and the endpoint keeps no confirmation state. A slow
+  browser must not block the sink of the controller. Records, result waits, and the quota age use
+  the awake clock and the boot clock of the controller. The endpoint needs the current reading of
+  each clock in every snapshot, so a browser can compute its offset. The design must decide whether
+  more than one browser can attach to one controller. The browser words the typed refusals, notices,
+  and record events, because `src/wording.zig` serves only the native clients. A record event can
+  hold a path or a name that is not valid UTF-8, so the conversion must escape it. The HTTP host
+  must supply its output instructions and reference text through `Frontend`. It must not reuse the
+  native terminal descriptions.
 - `drinky run` shows no token totals or per-run cost. Internal cost reports update only the parent
   session total.
 - A run that outlives its bash invocation cannot report later costs. Keep the invocation open with
@@ -42,9 +44,9 @@ when the user drops it.
   can hang or lose a cancel too. Trigger: a Zig release that fixes both defects.
 - An unauthorized failure of `/handoff` or `/tldr` does not reject the credential. The page only
   shows the failure, and the next turn rejects the credential. When a turn fails as unauthorized,
-  the controller calls `rejectCredential`, which can sign out and open the login picker. A page
-  cannot hold a picker, so both commands need a design for a sign-out while their page is open
-  first.
+  the controller calls `rejectCredential`, which can sign out and report that no account remains.
+  The terminal then opens the sign-in picker. The terminal cannot show that picker over an open
+  result page. Both commands need a design for a sign-out while their page is open first.
 - The start of Drinky reads the config file and the instruction files and scans the skill
   directories without a time limit. A file system call that does not return stops the start. A
   pending macOS privacy prompt causes such a call. The tools and the skill file reads already stop

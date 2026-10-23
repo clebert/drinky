@@ -1,25 +1,28 @@
 const std = @import("std");
 const application = @import("application");
+const format = @import("format.zig");
 
 const accounts = @import("accounts");
 const core = @import("core");
-const providers = @import("providers");
 const terminal = @import("terminal");
 
+const Flow = @import("Flow.zig");
 const layout = @import("layout.zig");
 const testing = @import("testing.zig");
 const tool_line = @import("tool_line.zig");
 const Transcript = @import("Transcript.zig");
 const ui = @import("ui/root.zig");
+const wording = @import("wording.zig");
 
 const Screen = @This();
 
 pub const editor_caption_rows_max: usize = 3;
 const picker_scrolls_max = 8;
+const retry_note = "Drinky asked the model to continue from the committed work.";
 
 gpa: std.mem.Allocator,
 transcript: Transcript,
-notice: ?application.Message,
+notice: ?ui.Message,
 editor: ui.Editor,
 view: terminal.View,
 page_view: terminal.View,
@@ -30,16 +33,17 @@ statistics: application.Statistics,
 choice: application.Choice,
 directory_shown: []const u8,
 branch_buffer: [application.branch_bytes_max]u8,
-branch_length: usize,
+branch_length: ?usize,
 window_pages: usize,
 gauge: application.Settings.Gauge,
-display_roots: application.support.format.Roots,
+display_roots: format.Roots,
 intro: []const u8 = "",
+startup_failure: ?[]const u8 = null,
 verbose: bool = true,
 repaint_transcript: bool = false,
 page_wait: ?PageWait = null,
-picker_id: u64 = 0,
-page_id: u64 = 0,
+result_page: ?ResultPage = null,
+confirmation: ?ui.status.Confirmation = null,
 notice_id: u64 = 0,
 picker_depth: usize = 0,
 picker_scrolls: [picker_scrolls_max]usize = undefined,
@@ -58,6 +62,30 @@ const PageWait = struct {
     fn seconds(self: *const PageWait, now_ms: i64) i64 {
         return @divFloor(@max(now_ms - self.started_ms, 0), std.time.ms_per_s);
     }
+};
+
+pub const ResultPage = struct {
+    id: u64,
+    phase: std.meta.Tag(application.State.Result.Phase),
+};
+
+pub const PickerOptions = struct {
+    title: []const u8,
+    options: []const ui.Picker.Option,
+    current: ?usize = null,
+    preselected: ?usize = null,
+    cursor: ?usize = null,
+    depth: usize = 0,
+};
+
+pub const Change = union(enum) {
+    append_record: *const application.Record,
+    record_text: application.Event.RecordText,
+    replace_record: *const application.Record,
+    remove_records: []const u64,
+    live: *const application.Live,
+    statistics: application.Statistics,
+    clear_conversation,
 };
 
 pub const Widget = union(enum) {
@@ -139,7 +167,7 @@ pub const Turn = struct {
             .elapsed_ms = 0,
             .tools = 0,
             .received_bytes = 0,
-            .status = .running,
+            .status = null,
         };
         if (options.open) |run| {
             started_ms = run.started_ms;
@@ -155,7 +183,7 @@ pub const Turn = struct {
             if (activity_text.items.len > 0) try activity_text.appendSlice(gpa, ", ");
             const name_start = activity_text.items.len;
             try activity_text.appendSlice(gpa, call.name);
-            const shown = application.reference.singleLine(activity_text.items[name_start..]);
+            const shown = format.singleLine(activity_text.items[name_start..]);
             activity_text.shrinkRetainingCapacity(name_start + shown.len);
         }
         summary.elapsed_ms = options.now_ms - (started_ms orelse return &.{});
@@ -168,7 +196,7 @@ pub const Turn = struct {
         }) catch return error.OutOfMemory;
         try self.box_view.append(
             gpa,
-            ui.Block.Work.box(out.written(), &self.work_ends, .running),
+            ui.Block.Work.box(out.written(), &self.work_ends, null),
         );
         return self.box_view.items;
     }
@@ -207,7 +235,6 @@ pub const Call = struct {
     subject: []const u8,
     subject_kind: ?application.ToolDescription.Kind,
     opened_ms: i64,
-    started_ms: i64,
     timeout_ms: ?u64,
     line: ?tool_line.Line,
     elapsed_seconds: ?i64,
@@ -215,7 +242,7 @@ pub const Call = struct {
     fn init(
         gpa: std.mem.Allocator,
         live: *const application.Live.Call,
-        roots: *const application.support.format.Roots,
+        roots: *const format.Roots,
     ) !Call {
         const name = try gpa.dupe(u8, live.name);
         errdefer gpa.free(name);
@@ -231,8 +258,14 @@ pub const Call = struct {
             },
             .subject = subject,
             .subject_kind = subject_kind,
-            .timeout_ms = if (live.phase == .running) live.description.timeout_ms else null,
-            .received_bytes = if (live.phase == .running) null else live.argument_bytes,
+            .timeout_ms = switch (live.phase) {
+                .running => live.description.timeout_ms,
+                .streaming, .queued => null,
+            },
+            .received_bytes = switch (live.phase) {
+                .running => null,
+                .streaming, .queued => live.argument_bytes,
+            },
         });
         return .{
             .name = name,
@@ -240,7 +273,6 @@ pub const Call = struct {
             .subject = subject,
             .subject_kind = subject_kind,
             .opened_ms = live.opened_ms,
-            .started_ms = live.started_ms,
             .timeout_ms = live.description.timeout_ms,
             .line = line,
             .elapsed_seconds = null,
@@ -254,23 +286,25 @@ pub const Call = struct {
     }
 
     fn text(self: *Call, gpa: std.mem.Allocator, now_ms: i64) ![]const u8 {
-        if (self.phase == .running and self.timeout_ms != null) {
-            const seconds = @divFloor(@max(now_ms - self.started_ms, 0), std.time.ms_per_s);
-            if (self.elapsed_seconds != seconds) {
-                const line = try tool_line.render(gpa, &.{
-                    .name = self.name,
-                    .phase = .running,
-                    .subject = self.subject,
-                    .subject_kind = self.subject_kind,
-                    .elapsed_ms = seconds * std.time.ms_per_s,
-                    .timeout_ms = self.timeout_ms,
-                });
-                if (self.line) |*previous| previous.deinit(gpa);
-                self.line = line;
-                self.elapsed_seconds = seconds;
-            }
-        }
-        return self.line.?.text;
+        const running = switch (self.phase) {
+            .running => |running| running,
+            .streaming, .queued => return self.line.?.text,
+        };
+        const timeout_ms = self.timeout_ms orelse return self.line.?.text;
+        const seconds = @divFloor(@max(now_ms - running.started_ms, 0), std.time.ms_per_s);
+        if (self.elapsed_seconds == seconds) return self.line.?.text;
+        const line = try tool_line.render(gpa, &.{
+            .name = self.name,
+            .phase = .running,
+            .subject = self.subject,
+            .subject_kind = self.subject_kind,
+            .elapsed_ms = seconds * std.time.ms_per_s,
+            .timeout_ms = timeout_ms,
+        });
+        if (self.line) |*previous| previous.deinit(gpa);
+        self.line = line;
+        self.elapsed_seconds = seconds;
+        return line.text;
     }
 };
 
@@ -307,7 +341,7 @@ pub fn init(gpa: std.mem.Allocator, writer: *std.Io.Writer, effort: application.
         .choice = .{ .effort = effort },
         .directory_shown = "",
         .branch_buffer = undefined,
-        .branch_length = 0,
+        .branch_length = null,
         .window_pages = application.Settings.window_pages_default,
         .gauge = .{},
         .display_roots = .{},
@@ -317,6 +351,7 @@ pub fn init(gpa: std.mem.Allocator, writer: *std.Io.Writer, effort: application.
 }
 
 pub fn deinit(self: *Screen) void {
+    if (self.startup_failure) |text| self.gpa.free(text);
     self.deinitWidget();
     self.clearNotice();
     self.transcript.deinit();
@@ -325,22 +360,32 @@ pub fn deinit(self: *Screen) void {
     self.editor.deinit();
 }
 
-fn setVerbose(self: *Screen, verbose: bool) void {
+pub fn setVerbose(self: *Screen, verbose: bool) void {
     if (self.verbose == verbose) return;
     self.verbose = verbose;
     self.repaint_transcript = true;
 }
 
 pub fn clearNotice(self: *Screen) void {
+    self.confirmation = null;
     if (self.notice) |notice| {
         notice.deinit(self.gpa);
         self.notice = null;
     }
 }
 
-pub fn setNotice(self: *Screen, notice: application.Message) void {
+pub fn setNotice(self: *Screen, notice: ui.Message) void {
     self.clearNotice();
     self.notice = notice;
+}
+
+pub fn confirm(
+    self: *Screen,
+    confirmation: ui.status.Confirmation,
+    notice: ui.Message,
+) void {
+    self.setNotice(notice);
+    self.confirmation = confirmation;
 }
 
 fn deinitWidget(self: *Screen) void {
@@ -352,9 +397,31 @@ fn deinitWidget(self: *Screen) void {
     }
 }
 
-pub fn applyChange(self: *Screen, event: *const application.Event) !void {
-    switch (event.*) {
-        .append_record => |*record| {
+pub fn changeOf(event: *const application.Event) ?Change {
+    return switch (event.*) {
+        .append_record => |*record| .{ .append_record = record },
+        .record_text => |text| .{ .record_text = text },
+        .replace_record => |*record| .{ .replace_record = record },
+        .remove_records => |ids| .{ .remove_records = ids },
+        .live => |*live| .{ .live = live },
+        .statistics => |statistics| .{ .statistics = statistics },
+        .clear_conversation => .clear_conversation,
+        .snapshot,
+        .state,
+        .paste_replayed,
+        .turn_ended,
+        .sign_in_ended,
+        .fetch_ended,
+        .no_account,
+        .charge,
+        .startup_refused,
+        => null,
+    };
+}
+
+pub fn applyChange(self: *Screen, change: *const Change) !void {
+    switch (change.*) {
+        .append_record => |record| {
             var block = try self.blockFrom(record);
             errdefer block.deinit(self.gpa);
             try self.transcript.block_list.append(self.gpa, block);
@@ -363,7 +430,7 @@ pub fn applyChange(self: *Screen, event: *const application.Event) !void {
             const block = &self.transcript.block_list.items[self.transcript.find(value.id).?];
             try block.appendText(self.gpa, value.text);
         },
-        .replace_record => |*record| {
+        .replace_record => |record| {
             const index = self.transcript.find(record.id).?;
             self.transcript.replace(index, try self.blockFrom(record));
         },
@@ -374,11 +441,9 @@ pub fn applyChange(self: *Screen, event: *const application.Event) !void {
                 self.markEdited();
             }
         },
-        .live => |*live| try self.showLive(live),
+        .live => |live| try self.showLive(live),
         .statistics => |statistics| self.statistics = statistics,
-        .page_text => |text| try self.activePage().?.append(text),
         .clear_conversation => try self.clearConversation(),
-        else => unreachable,
     }
     if (self.activeTurn()) |turn| turn.progress_tick_last = turn.activity_tick;
 }
@@ -386,17 +451,22 @@ pub fn applyChange(self: *Screen, event: *const application.Event) !void {
 fn blockFrom(self: *Screen, record: *const application.Record) !ui.Block {
     var block: ui.Block = switch (record.content) {
         .user => |text| try .init(self.gpa, &.{ .user = text.items }),
-        .user_note => |*note| if (note.skill) |*skill|
-            try self.skillBlock(skill)
-        else
-            try .init(self.gpa, &.{ .user_note = .{ .text = note.text.items } }),
+        .user_note => |*note| switch (note.*) {
+            .skill => |*skill| try self.skillBlock(skill),
+            .retry => try .init(self.gpa, &.{ .user_note = .{ .text = retry_note } }),
+        },
         .model => |text| try .init(self.gpa, &.{ .model = text.items }),
         .thinking => |text| try .init(self.gpa, &.{ .thinking = text.items }),
-        .event => |*event| try .init(self.gpa, &.{ .event = .{
-            .text = event.text.items,
-            .severity = event.severity,
-        } }),
+        .event => |*event| event: {
+            const message = try wording.event(self.gpa, event);
+            defer message.deinit(self.gpa);
+            break :event try .init(self.gpa, &.{ .event = .{
+                .text = message.content,
+                .severity = message.severity,
+            } });
+        },
         .tool_result => |*result| try self.toolBlock(result),
+        .authorization => |*authorization| try authorizationBlock(self.gpa, authorization),
     };
     block.record_id = record.id;
     if (record.work) |work| block.work = .{
@@ -406,15 +476,33 @@ fn blockFrom(self: *Screen, record: *const application.Record) !ui.Block {
     return block;
 }
 
+fn authorizationBlock(
+    gpa: std.mem.Allocator,
+    authorization: *const application.Record.Authorization,
+) !ui.Block {
+    const lead = "Open this URL to authorize the sign-in to {s}:\n\n{s}\n\n";
+    const account = application.query.accountId(authorization.account);
+    const text = if (authorization.code) |code| try gpa.print(
+        lead ++ "Enter this code if the page asks for one: {s}",
+        .{ account, authorization.url, code },
+    ) else try gpa.print(
+        lead ++ "If the browser shows an error, paste the callback URL from its address bar " ++
+            "and press Enter.",
+        .{ account, authorization.url },
+    );
+    defer gpa.free(text);
+    return .init(gpa, &.{ .event = .{ .text = text, .severity = .information } });
+}
+
 fn skillBlock(self: *Screen, skill: *const application.SkillLoaded) !ui.Block {
-    const path = try application.support.format.path(self.gpa, skill.source, &self.display_roots);
+    const path = try format.path(self.gpa, skill.source, &self.display_roots);
     defer self.gpa.free(path);
     const name = try self.gpa.dupe(u8, skill.name);
     defer self.gpa.free(name);
-    const shown_name = application.reference.singleLine(name);
+    const shown_name = format.singleLine(name);
     const text = try self.gpa.print("Skill: {s} · File: {s}", .{
         shown_name,
-        application.reference.singleLine(path),
+        format.singleLine(path),
     });
     defer self.gpa.free(text);
     return .init(self.gpa, &.{ .user_note = .{
@@ -467,13 +555,23 @@ fn showLive(self: *Screen, live: *const application.Live) !void {
 fn clearConversation(self: *Screen) !void {
     std.debug.assert(self.widget == .prompt);
     self.clearNotice();
+    if (self.startup_failure) |text| self.gpa.free(text);
+    self.startup_failure = null;
     self.transcript.truncate(0);
     try self.appendIntro();
     self.view.resetScreen();
 }
 
+pub fn setStartupFailure(self: *Screen, text: []const u8) error{OutOfMemory}!void {
+    const owned = try self.gpa.dupe(u8, text);
+    if (self.startup_failure) |previous| self.gpa.free(previous);
+    self.startup_failure = owned;
+}
+
 fn appendIntro(self: *Screen) !void {
     try self.transcript.append(&.{ .intro = self.intro });
+    const failure = self.startup_failure orelse return;
+    try self.transcript.append(&.{ .event = .{ .text = failure, .severity = .failure } });
 }
 
 fn beginTurn(self: *Screen) void {
@@ -487,29 +585,18 @@ fn endTurn(self: *Screen) void {
     self.widget = .prompt;
 }
 
-pub fn applyInteraction(self: *Screen, value: *const application.Interaction) !void {
+pub fn applyState(self: *Screen, value: *const application.State) !void {
     self.choice = value.choice;
     self.setBranch(value.branch);
-    self.setVerbose(value.settings.verbose);
-    self.window_pages = value.settings.window_pages;
-    self.gauge = value.settings.gauge;
-    switch (value.mode) {
-        .prompt, .sign_in => self.leaveWidget(),
-        .turn => if (self.widget != .turn) {
+    if (value.work == .turn) {
+        if (self.widget != .turn) {
             self.leaveWidget();
             self.beginTurn();
-        },
-        .picker, .fetch => {
-            const picker = &value.picker.?;
-            if (self.widget != .picking) self.leaveWidget();
-            if (self.widget != .picking or self.picker_id != picker.id) try self.openPicker(picker);
-            if (value.mode == .fetch and self.widget.picking.wait_tick == null)
-                try self.beginPickerWait(application.reference.fetch_wait_text);
-        },
-        .page => try self.showPage(&value.page.?),
-    }
+        }
+    } else if (self.widget == .turn) self.endTurn();
+    try self.showResult(if (value.result) |*result| result else null);
     if (value.notice_id != self.notice_id) {
-        const notice = if (value.notice) |*message| try message.dupe(self.gpa) else null;
+        const notice = if (value.notice) |*event| try wording.event(self.gpa, event) else null;
         self.notice_id = value.notice_id;
         if (notice) |message| self.setNotice(message) else self.clearNotice();
     }
@@ -524,36 +611,69 @@ fn leaveWidget(self: *Screen) void {
     }
 }
 
-fn showPage(self: *Screen, value: *const application.Interaction.Page) !void {
-    if (self.widget != .page or self.page_id != value.id) {
-        self.leaveWidget();
-        try self.openPage(&.{ .title = value.title, .content = "", .action = value.action });
-        self.page_id = value.id;
-    }
-    const page = &self.widget.page;
-    page.action = value.action;
-    if (value.retry) |*message| {
-        if (!sameMessage(&page.retry, message)) try page.setRetry(message);
-    }
-    if (value.notice) |*message| {
-        if (!sameMessage(&page.notice, message)) try page.setNotice(message);
-    }
-    const wait = value.wait orelse {
-        self.page_wait = null;
+fn showResult(self: *Screen, maybe_result: ?*const application.State.Result) !void {
+    const result = maybe_result orelse {
+        if (self.result_page != null) self.closePage();
         return;
     };
-    if (self.page_wait == null) self.page_wait = .{ .started_ms = wait.started_ms };
+    if (self.result_page == null or self.result_page.?.id != result.id) {
+        self.leaveWidget();
+        try self.openPage(&.{
+            .title = switch (result.purpose) {
+                .handoff => "Handoff",
+                .short_answer => "Short answer",
+            },
+            .content = "",
+        });
+    }
+    self.result_page = .{ .id = result.id, .phase = result.phase };
+    const page = self.activePage().?;
+    const shown_text = page.text();
+    if (result.text.len > shown_text.len) try page.append(result.text[shown_text.len..]);
+    page.action = switch (result.purpose) {
+        .handoff => if (result.phase == .complete) .apply else .discard,
+        .short_answer => .close,
+    };
+    switch (result.phase) {
+        .generating => |*generating| try self.showGenerating(page, generating),
+        .complete => self.endPageWait(page),
+        .incomplete => |notice| {
+            self.endPageWait(page);
+            const message = try wording.event(self.gpa, &switch (notice) {
+                .truncated => .reply_truncated,
+                .failed => |failure| .{ .request_failed = failure },
+            });
+            defer message.deinit(self.gpa);
+            if (!sameMessage(&page.notice, &message)) try page.setNotice(&message);
+        },
+    }
+}
+
+fn endPageWait(self: *Screen, page: *ui.Page) void {
+    self.page_wait = null;
+    page.endWait();
+}
+
+fn showGenerating(
+    self: *Screen,
+    page: *ui.Page,
+    generating: *const application.State.Result.Generating,
+) !void {
+    if (generating.retry) |attempt| {
+        const message = try wording.event(self.gpa, &.{ .attempt_failed = attempt });
+        defer message.deinit(self.gpa);
+        if (!sameMessage(&page.retry, &message)) try page.setRetry(&message);
+    }
+    if (self.page_wait == null) self.page_wait = .{ .started_ms = generating.started_ms };
     const shown = &self.page_wait.?;
-    if (shown.received_bytes == wait.received_bytes and shown.thinking == wait.thinking) return;
-    shown.received_bytes = wait.received_bytes;
-    shown.thinking = wait.thinking;
+    if (shown.received_bytes == generating.received_bytes and
+        shown.thinking == generating.thinking) return;
+    shown.received_bytes = generating.received_bytes;
+    shown.thinking = generating.thinking;
     shown.seconds_shown = null;
 }
 
-fn sameMessage(
-    maybe_shown: *const ?application.Message,
-    message: *const application.Message,
-) bool {
+fn sameMessage(maybe_shown: *const ?ui.Message, message: *const ui.Message) bool {
     const shown = maybe_shown.* orelse return false;
     return shown.severity == message.severity and std.mem.eql(u8, shown.content, message.content);
 }
@@ -567,8 +687,29 @@ pub fn setDraft(self: *Screen, text: []const u8) !void {
     self.markEdited();
 }
 
-fn openPicker(self: *Screen, pick: *const application.Picker) !void {
-    try self.openPickerAt(pick, self.stepScroll(pick.depth));
+pub fn openPicker(self: *Screen, options: *const PickerOptions) !void {
+    const scroll = self.stepScroll(options.depth);
+    const title = try self.gpa.dupe(u8, options.title);
+    errdefer self.gpa.free(title);
+    const owned = try self.gpa.alloc(ui.Picker.Option, options.options.len);
+    var count: usize = 0;
+    errdefer {
+        for (owned[0..count]) |*option| option.deinit(self.gpa);
+        self.gpa.free(owned);
+    }
+    for (options.options, owned) |*source, *target| {
+        target.* = try source.dupe(self.gpa);
+        count += 1;
+    }
+    const picker = try ui.Picker.init(self.gpa, title, owned, &.{
+        .current = options.current,
+        .preselected = options.preselected,
+        .position = if (options.cursor) |cursor| .{ .cursor = cursor, .scroll = scroll } else null,
+        .can_step_back = options.depth > 0,
+    });
+    self.leaveWidget();
+    self.widget = .{ .picking = .{ .picker = picker, .title = title, .wait_tick = null } };
+    self.picker_depth = options.depth;
 }
 
 fn stepScroll(self: *Screen, depth: usize) usize {
@@ -582,32 +723,17 @@ fn stepScroll(self: *Screen, depth: usize) usize {
     return 0;
 }
 
-fn openPickerAt(self: *Screen, pick: *const application.Picker, scroll: usize) !void {
-    const owned = try pick.dupe(self.gpa);
-    errdefer owned.deinit(self.gpa);
-    const picker = try ui.Picker.init(self.gpa, owned.title, owned.options, &.{
-        .current = pick.current,
-        .preselected = pick.preselected,
-        .position = if (pick.cursor) |cursor| .{ .cursor = cursor, .scroll = scroll } else null,
-        .can_step_back = pick.depth > 0,
-    });
-    self.deinitWidget();
-    self.widget = .{ .picking = .{ .picker = picker, .title = owned.title, .wait_tick = null } };
-    self.picker_id = pick.id;
-    self.picker_depth = pick.depth;
-}
-
-fn closePicker(self: *Screen) void {
+pub fn closePicker(self: *Screen) void {
     switch (self.widget) {
         .picking => |*picking| {
             picking.deinit(self.gpa);
             self.widget = .prompt;
         },
-        else => {},
+        .prompt, .turn, .page => {},
     }
 }
 
-fn beginPickerWait(self: *Screen, text: []const u8) !void {
+pub fn beginPickerWait(self: *Screen, text: []const u8) !void {
     const picking = &self.widget.picking;
     const owned = try self.gpa.dupe(u8, text);
     errdefer self.gpa.free(owned);
@@ -617,7 +743,7 @@ fn beginPickerWait(self: *Screen, text: []const u8) !void {
     picking.wait_tick = 0;
 }
 
-fn openPage(self: *Screen, options: *const application.Page.Options) !void {
+pub fn openPage(self: *Screen, options: *const ui.Page.Options) !void {
     std.debug.assert(self.widget == .prompt);
     var page = try ui.Page.init(self.gpa, options);
     page.reflow(.{ .columns = self.columns, .rows = self.rows });
@@ -643,37 +769,44 @@ fn showPageWait(self: *Screen, page: *ui.Page, now_ms: i64) void {
     wait.seconds_shown = seconds;
 }
 
-fn closePage(self: *Screen) void {
+pub fn closePage(self: *Screen) void {
     self.page_wait = null;
+    self.result_page = null;
     switch (self.widget) {
         .page => |*page| {
             page.deinit();
             self.widget = .prompt;
         },
-        else => {},
+        .prompt, .turn, .picking => {},
     }
 }
 
-fn setBranch(self: *Screen, name: []const u8) void {
-    std.debug.assert(name.len <= self.branch_buffer.len);
-    if (std.mem.eql(u8, self.branch_buffer[0..self.branch_length], name)) return;
-    @memcpy(self.branch_buffer[0..name.len], name);
-    self.branch_length = name.len;
+fn setBranch(self: *Screen, maybe_name: ?[]const u8) void {
+    if (self.branch()) |shown| if (maybe_name) |name| if (std.mem.eql(u8, shown, name)) return;
+    self.branch_length = if (maybe_name) |name| length: {
+        std.debug.assert(name.len <= self.branch_buffer.len);
+        @memcpy(self.branch_buffer[0..name.len], name);
+        break :length name.len;
+    } else null;
 }
 
 pub fn branch(self: *const Screen) ?[]const u8 {
-    if (self.branch_length == 0) return null;
-    return self.branch_buffer[0..self.branch_length];
+    const length = self.branch_length orelse return null;
+    return self.branch_buffer[0..length];
 }
 
 pub fn restore(self: *Screen, snapshot: *const application.Snapshot) !void {
-    const interaction = &snapshot.interaction;
-    var restored = Screen.init(self.gpa, self.view.writer, interaction.choice.effort);
+    const state = &snapshot.state;
+    var restored = Screen.init(self.gpa, self.view.writer, state.choice.effort);
     errdefer restored.deinit();
     restored.intro = self.intro;
+    restored.startup_failure = self.startup_failure;
+    self.startup_failure = null;
     restored.repaint_transcript = self.repaint_transcript or
         self.transcript.block_list.items.len > 0;
-    restored.verbose = interaction.settings.verbose;
+    restored.verbose = self.verbose;
+    restored.window_pages = snapshot.settings.window_pages;
+    restored.gauge = snapshot.settings.gauge;
     restored.display_roots = .{
         .working_directory = snapshot.working_directory,
         .home_directory = snapshot.home_directory,
@@ -681,20 +814,34 @@ pub fn restore(self: *Screen, snapshot: *const application.Snapshot) !void {
     restored.directory_shown = self.directory_shown;
     restored.statistics = snapshot.statistics;
     restored.picker_scrolls = self.picker_scrolls;
+    restored.picker_depth = self.picker_depth;
     try restored.appendIntro();
     try restored.transcript.block_list.ensureUnusedCapacity(self.gpa, snapshot.records.len);
     for (snapshot.records) |*record|
         restored.transcript.block_list.appendAssumeCapacity(try restored.blockFrom(record));
-    try restored.applyInteraction(interaction);
-    if (interaction.mode == .turn) try restored.showLive(&snapshot.live);
-    if (restored.activePicker()) |picker| if (self.activePicker()) |previous| {
-        if (self.picker_id == restored.picker_id) try picker.restorePosition(previous);
-    };
-    if (restored.activePage()) |page| {
-        try page.append(snapshot.page_text);
-        if (self.activePage()) |previous| if (self.page_id == restored.page_id) {
-            page.restorePosition(previous);
+    try restored.applyState(state);
+    if (state.work == .turn) try restored.showLive(&snapshot.live);
+    if (restored.result_page) |shown| {
+        const page = restored.activePage().?;
+        if (self.result_page) |previous| if (previous.id == shown.id) {
+            page.restorePosition(self.activePage().?);
         };
+    }
+    const local = switch (self.widget) {
+        .picking => true,
+        .page => self.result_page == null,
+        .prompt, .turn => false,
+    };
+    if (self.notice != null and self.notice_id == state.notice_id) {
+        restored.clearNotice();
+        restored.notice = self.notice;
+        restored.confirmation = self.confirmation;
+        self.notice = null;
+    }
+    if (local and restored.widget == .prompt) {
+        restored.widget = self.widget;
+        self.widget = .prompt;
+        std.mem.swap(terminal.View, &self.page_view, &restored.page_view);
     }
     const editor = self.editor;
     self.editor = restored.editor;
@@ -726,7 +873,7 @@ pub fn paint(
             try layout.project(self.gpa, &self.page_view, size, &scene);
             return;
         },
-        else => {},
+        .prompt, .turn, .picking => {},
     }
 
     self.transcript.present(self.verbose);
@@ -792,12 +939,15 @@ fn statusInfo(self: *const Screen, boot_ms: i64) ui.status.Info {
         .model = if (self.choice.model) |*found| found.name() else null,
         .effort = @tagName(self.choice.effort),
         .account = self.choice.accountId(),
-        .quota = self.statistics.quota,
-        .quota_age_ms = boot_ms - self.statistics.quota_seen_ms,
+        .quota = if (self.statistics.quota) |reading|
+            .{ .windows = reading.windows, .age_ms = boot_ms - reading.seen_ms }
+        else
+            null,
         .credits = self.statistics.credits,
         .turn_active = self.widget == .turn,
         .gauge = self.gauge,
         .notice = self.notice,
+        .confirmation = self.confirmation,
     };
 }
 
@@ -858,7 +1008,7 @@ pub fn activePage(self: *Screen) ?*ui.Page {
 fn activeTurn(self: *Screen) ?*Turn {
     return switch (self.widget) {
         .turn => |*turn| turn,
-        else => null,
+        .prompt, .picking, .page => null,
     };
 }
 
@@ -971,39 +1121,27 @@ const Rig = struct {
     }
 
     fn mirror(self: *Rig, event: *const application.Event) !void {
-        switch (event.*) {
-            .append_record,
-            .record_text,
-            .replace_record,
-            .remove_records,
-            .live,
-            .statistics,
-            .page_text,
-            .clear_conversation,
-            => try self.screen.applyChange(event),
-            .interaction => |*value| try self.screen.applyInteraction(&self.shown(value)),
-            else => {},
-        }
+        if (changeOf(event)) |*change| try self.screen.applyChange(change);
+        if (event.* == .state) try self.screen.applyState(&self.shown(&event.state));
     }
 
-    fn shown(self: *const Rig, value: *const application.Interaction) application.Interaction {
+    fn shown(self: *const Rig, value: *const application.State) application.State {
         var result = value.*;
-        result.branch = self.screen.branch() orelse "";
-        result.settings = .{
-            .verbose = self.screen.verbose,
-            .window_pages = self.screen.window_pages,
-            .gauge = self.screen.gauge,
-        };
+        result.branch = self.screen.branch();
         return result;
     }
 
-    fn showPage(self: *Rig, page: *const application.Interaction.Page) !void {
-        try self.screen.applyInteraction(&self.shown(&.{
-            .mode = .page,
-            .page = page.*,
+    fn showResult(self: *Rig, result: *const application.State.Result) !void {
+        try self.screen.applyState(&self.shown(&.{
+            .work = if (result.phase == .generating) .{ .aside = result.id } else .idle,
+            .result = result.*,
             .notice_id = self.screen.notice_id,
             .choice = self.screen.choice,
         }));
+    }
+
+    fn setRetry(self: *Rig, text: []const u8) !void {
+        try self.screen.activePage().?.setRetry(&.{ .content = text, .severity = .information });
     }
 
     fn apply(self: *Rig, event: *const core.Session.Event) !void {
@@ -1047,6 +1185,12 @@ const Rig = struct {
 };
 
 const no_caption: ?ui.Caption = null;
+const overloaded_attempt: application.Record.Event.Attempt = .{
+    .attempt = 1,
+    .reason = .overloaded,
+    .details = null,
+    .delay_ms = 0,
+};
 
 test "tool metadata keeps its state and removes whole segments during and after a call" {
     const gpa = std.testing.allocator;
@@ -2661,12 +2805,15 @@ test "every outcome states its end, and a failure names its details" {
 
     try rig.start("a");
     try rig.end(&.{ .stopped = .truncated });
-    try std.testing.expectEqualStrings(application.support.truncated.content, rig.eventText(1));
+    try std.testing.expectEqualStrings(testing.truncated_text, rig.eventText(1));
     try std.testing.expectEqual(.failure, rig.blocks()[1].content.event.severity);
 
     try rig.start("b");
     try rig.end(&.exhausted);
-    try std.testing.expectEqualStrings(application.support.exhausted, rig.eventText(3));
+    try std.testing.expectEqualStrings(
+        "The turn reached the limit for tool rounds.",
+        rig.eventText(3),
+    );
 
     try rig.start("c");
     try rig.end(&.{ .failed = .{ .reason = .unauthorized, .message = "401 Unauthorized" } });
@@ -2753,7 +2900,7 @@ test "the statistics forget the evidence of the last turn and report the new one
     try rig.apply(&.{ .credits = .{ .total = 10, .used = 1 } });
     const reported = rig.screen.statusInfo(0);
     try std.testing.expectEqual(@as(u64, 90), reported.cache_usage.cache_read);
-    try std.testing.expectEqual(@as(f64, 12), reported.quota.?.primary.?.used_percent);
+    try std.testing.expectEqual(@as(f64, 12), reported.quota.?.windows.primary.?.used_percent);
     try std.testing.expectEqual(@as(f64, 10), reported.credits.?.total);
     try rig.end(&.{ .stopped = .complete });
     try std.testing.expectEqualStrings("anthropic-plan", rig.screen.statusInfo(0).account.?);
@@ -2887,23 +3034,57 @@ test "an account switch keeps every block and the scrollback" {
     try testing.expectContains(wider, "answer");
 }
 
+test "the authorization record renders its URL with a device code or a callback hint" {
+    const cases = [_]struct { code: ?[]const u8, text: []const u8 }{
+        .{
+            .code = "ABCD-1234",
+            .text = "Open this URL to authorize the sign-in to openai-plan:\n\n" ++
+                "https://auth.example/device\n\nEnter this code if the page asks for one: " ++
+                "ABCD-1234",
+        },
+        .{
+            .code = null,
+            .text = "Open this URL to authorize the sign-in to openai-plan:\n\n" ++
+                "https://auth.example/device\n\nIf the browser shows an error, paste the " ++
+                "callback URL from its address bar and press Enter.",
+        },
+    };
+    for (cases) |case| {
+        var rig: Rig = undefined;
+        rig.init();
+        defer rig.deinit();
+        try rig.screen.applyChange(&.{ .append_record = &.{
+            .id = 7,
+            .content = .{ .authorization = .{
+                .account = accounts.testing.openai_plan,
+                .url = "https://auth.example/device",
+                .code = case.code,
+            } },
+        } });
+        const block = rig.blocks()[0];
+        try std.testing.expectEqual(@as(?u64, 7), block.record_id);
+        try std.testing.expectEqual(.information, block.content.event.severity);
+        try std.testing.expectEqualStrings(case.text, block.content.event.text.items);
+    }
+}
+
 test "a notice replaces its predecessor, and a turn end drops it" {
     var rig: Rig = undefined;
     rig.init();
     defer rig.deinit();
     rig.screen.setNotice(
-        try application.Message.print(std.testing.allocator, .information, "First.", .{}),
+        try ui.Message.print(std.testing.allocator, .information, "First.", .{}),
     );
     rig.screen.setNotice(
-        try application.Message.print(std.testing.allocator, .failure, "Second.", .{}),
+        try ui.Message.print(std.testing.allocator, .failure, "Second.", .{}),
     );
     try std.testing.expectEqual(@as(usize, 0), rig.blocks().len);
     try std.testing.expectEqualStrings("Second.", rig.screen.notice.?.content);
-    try std.testing.expectEqual(application.Message.Severity.failure, rig.screen.notice.?.severity);
+    try std.testing.expectEqual(ui.Message.Severity.failure, rig.screen.notice.?.severity);
 
     try rig.start("hi");
     rig.screen.setNotice(
-        try application.Message.print(std.testing.allocator, .warning, "Turn notice.", .{}),
+        try ui.Message.print(std.testing.allocator, .warning, "Turn notice.", .{}),
     );
     try rig.end(&.{ .stopped = .complete });
     try std.testing.expect(rig.screen.notice == null);
@@ -2933,22 +3114,39 @@ test "a picker displays public options and waits with animation" {
     var rig: Rig = undefined;
     rig.init();
     defer rig.deinit();
-    const options = [_]application.Picker.Option{.{ .name = "row" }};
-    try rig.screen.openPicker(
-        &.{ .id = 3, .title = "Step", .options = &options, .depth = 1 },
-    );
-    try std.testing.expectEqual(@as(u64, 3), rig.screen.picker_id);
+    const options = [_]ui.Picker.Option{.{ .name = "row" }};
+    try rig.screen.openPicker(&.{ .title = "Step", .options = &options, .depth = 1 });
     try std.testing.expect(!rig.screen.animating());
-    try rig.screen.beginPickerWait("Drinky fetches the model list.");
+    try rig.screen.beginPickerWait(Flow.fetch_wait_text);
     try std.testing.expect(rig.screen.animating());
     const painted = try rig.paintPlain(80);
     defer gpa.free(painted);
     try testing.expectContains(painted, "Drinky fetches");
     try std.testing.expect(std.mem.find(u8, painted, "> row") == null);
-    try rig.screen.openPicker(&.{ .id = 4, .title = "Step", .options = &options });
+    try rig.screen.openPicker(&.{ .title = "Step", .options = &options });
     try std.testing.expect(!rig.screen.animating());
     rig.screen.closePicker();
     try std.testing.expect(rig.screen.widget == .prompt);
+}
+
+test "a picker opening releases every partial allocation" {
+    try std.testing.checkAllAllocationFailures(
+        core.testing.no_resize_allocator,
+        checkPickerOpening,
+        .{},
+    );
+}
+
+fn checkPickerOpening(gpa: std.mem.Allocator) !void {
+    var rig: Rig = undefined;
+    rig.initWith(gpa, null);
+    defer rig.deinit();
+    const options = [_]ui.Picker.Option{
+        .{ .name = "first", .extra = "Extra.", .tag = "Set" },
+        .{ .name = "second" },
+    };
+    try rig.screen.openPicker(&.{ .title = "Step", .options = &options, .current = 0 });
+    try rig.screen.openPicker(&.{ .title = "Child", .options = options[1..], .depth = 1 });
 }
 
 test "a picker wait keeps its text after the event text is gone and the next paint composes it" {
@@ -2956,15 +3154,15 @@ test "a picker wait keeps its text after the event text is gone and the next pai
     var rig: Rig = undefined;
     rig.init();
     defer rig.deinit();
-    const options = [_]application.Picker.Option{.{ .name = "row" }};
-    try rig.screen.openPicker(&.{ .id = 3, .title = "Step", .options = &options });
-    const text = try gpa.dupe(u8, application.reference.fetch_wait_text);
+    const options = [_]ui.Picker.Option{.{ .name = "row" }};
+    try rig.screen.openPicker(&.{ .title = "Step", .options = &options });
+    const text = try gpa.dupe(u8, Flow.fetch_wait_text);
     try rig.screen.beginPickerWait(text);
     @memset(text, 'x');
     gpa.free(text);
     const painted = try rig.paintPlain(60);
     defer gpa.free(painted);
-    try testing.expectContains(painted, application.reference.fetch_wait_text);
+    try testing.expectContains(painted, Flow.fetch_wait_text);
 }
 
 test "a waiting page ticks its time, counts reasoning bytes, adds a note, and stops at text" {
@@ -2972,11 +3170,12 @@ test "a waiting page ticks its time, counts reasoning bytes, adds a note, and st
     var rig: Rig = undefined;
     rig.init();
     defer rig.deinit();
-    try rig.showPage(&.{ .id = 1, .title = "Handoff", .action = .close });
-    try std.testing.expect(!rig.screen.animating());
-    try rig.showPage(&.{ .id = 1, .title = "Handoff", .action = .close, .wait = .{
-        .started_ms = 1_000,
-    } });
+    try rig.showResult(&.{
+        .id = 1,
+        .purpose = .short_answer,
+        .text = "",
+        .phase = .{ .generating = .{ .started_ms = 1_000 } },
+    });
     rig.time.awake_ms = 1_000;
     try std.testing.expect(rig.screen.animating());
     const waiting = try rig.paintPlain(80);
@@ -2986,12 +3185,16 @@ test "a waiting page ticks its time, counts reasoning bytes, adds a note, and st
     try std.testing.expect(rig.screen.advanceFrame(3_000));
 
     rig.time.awake_ms = 3_000;
-    try rig.showPage(&.{
+    try rig.showResult(&.{
         .id = 1,
-        .title = "Handoff",
-        .action = .close,
-        .retry = .{ .content = "Attempt 1 failed.", .severity = .information },
-        .wait = .{ .started_ms = 1_000, .received_bytes = 2048, .thinking = true },
+        .purpose = .short_answer,
+        .text = "",
+        .phase = .{ .generating = .{
+            .started_ms = 1_000,
+            .received_bytes = 2048,
+            .thinking = true,
+            .retry = overloaded_attempt,
+        } },
     });
     const thinking = try rig.paintPlain(80);
     defer gpa.free(thinking);
@@ -3037,11 +3240,16 @@ test "page wait lines keep one adaptive row with the transcript work style" {
                 var rig: Rig = undefined;
                 rig.init();
                 defer rig.deinit();
-                try rig.showPage(&.{ .id = 1, .title = "Handoff", .action = .close, .wait = .{
-                    .started_ms = 0,
-                    .received_bytes = if (thinking) 2048 else 0,
-                    .thinking = thinking,
-                } });
+                try rig.showResult(&.{
+                    .id = 1,
+                    .purpose = .short_answer,
+                    .text = "",
+                    .phase = .{ .generating = .{
+                        .started_ms = 0,
+                        .received_bytes = if (thinking) 2048 else 0,
+                        .thinking = thinking,
+                    } },
+                });
                 if (presentation == .source) rig.screen.activePage().?.toggleSource(.{
                     .columns = case.columns,
                     .rows = 24,
@@ -3070,15 +3278,19 @@ test "page retry notes use the transcript information symbol and color in both p
         var rig: Rig = undefined;
         rig.init();
         defer rig.deinit();
-        try rig.showPage(&.{
+        try rig.showResult(&.{
             .id = 1,
-            .title = "Handoff",
-            .action = .close,
-            .retry = .{
-                .content = "Attempt 1 failed. The provider is overloaded. Details: **down**",
-                .severity = .information,
-            },
-            .wait = .{ .started_ms = 0 },
+            .purpose = .short_answer,
+            .text = "",
+            .phase = .{ .generating = .{
+                .started_ms = 0,
+                .retry = .{
+                    .attempt = 1,
+                    .reason = .overloaded,
+                    .details = "**down**",
+                    .delay_ms = 0,
+                },
+            } },
         });
         if (presentation == .source)
             rig.screen.activePage().?.toggleSource(.{ .columns = 80, .rows = 24 });
@@ -3094,6 +3306,29 @@ test "page retry notes use the transcript information symbol and color in both p
     }
 }
 
+test "a result that completes without text ends its wait line" {
+    const gpa = std.testing.allocator;
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    var emulator = try terminal.testing.Emulator.init(gpa, 80);
+    defer emulator.deinit();
+    const size: terminal.View.Size = .{ .columns = 80, .rows = 6 };
+    emulator.resize(size.rows);
+    try rig.showResult(&.{
+        .id = 1,
+        .purpose = .short_answer,
+        .text = "",
+        .phase = .{ .generating = .{ .started_ms = 0 } },
+    });
+    try rig.paintInto(&emulator, size);
+    try expectBodyRows(&emulator, &.{"Agent: work (waiting) · Time: 0s · Received: 0 B"});
+    try rig.showResult(&.{ .id = 1, .purpose = .short_answer, .phase = .complete, .text = "" });
+    try std.testing.expect(!rig.screen.animating());
+    try rig.paintInto(&emulator, size);
+    try expectBodyRows(&emulator, &.{""});
+}
+
 test "a tick of the wait line keeps the scroll position, and a new note returns to the top" {
     const gpa = std.testing.allocator;
     var rig: Rig = undefined;
@@ -3103,13 +3338,13 @@ test "a tick of the wait line keeps the scroll position, and a new note returns 
     defer emulator.deinit();
     const size: terminal.View.Size = .{ .columns = 80, .rows = 4 };
     emulator.resize(size.rows);
-    try rig.showPage(&.{
+    try rig.showResult(&.{
         .id = 1,
-        .title = "Handoff",
-        .action = .close,
-        .retry = .{ .content = "N1\nN2\nN3", .severity = .information },
-        .wait = .{ .started_ms = 0 },
+        .purpose = .short_answer,
+        .text = "",
+        .phase = .{ .generating = .{ .started_ms = 0 } },
     });
+    try rig.setRetry("N1\nN2\nN3");
     try rig.paintInto(&emulator, size);
     rig.screen.activePage().?.moveDown(size);
     try rig.paintInto(&emulator, size);
@@ -3119,13 +3354,7 @@ test "a tick of the wait line keeps the scroll position, and a new note returns 
     try rig.paintInto(&emulator, size);
     try expectBodyRows(&emulator, &.{ "ℹ N1", "N2" });
 
-    try rig.showPage(&.{
-        .id = 1,
-        .title = "Handoff",
-        .action = .close,
-        .retry = .{ .content = "M1", .severity = .information },
-        .wait = .{ .started_ms = 0 },
-    });
+    try rig.setRetry("M1");
     try rig.paintInto(&emulator, size);
     try expectBodyRows(&emulator, &.{ "Agent: work (waiting) · Time: 1s · Received: 0 B", "ℹ M1" });
     rig.screen.closePage();
@@ -3148,41 +3377,37 @@ test "a step back restores the scroll row of the parent picker" {
     rig.init();
     defer rig.deinit();
     var names: [40][5]u8 = undefined;
-    var options: [40]application.Picker.Option = undefined;
+    var options: [40]ui.Picker.Option = undefined;
     for (&options, &names, 0..) |*option, *name, index|
         option.* = .{ .name = try std.fmt.bufPrint(name, "row{d:0>2}", .{index}) };
-    try rig.screen.openPicker(&.{ .id = 1, .title = "Parent", .options = &options });
+    try rig.screen.openPicker(&.{ .title = "Parent", .options = &options });
     for (0..30) |_| try rig.screen.activePicker().?.moveDown();
     gpa.free(try rig.paintPlain(80));
     for (0..10) |_| try rig.screen.activePicker().?.moveUp();
     gpa.free(try rig.paintPlain(80));
     const scroll = rig.screen.activePicker().?.window.scroll;
     try std.testing.expect(scroll > 0);
-    try rig.screen.openPicker(
-        &.{ .id = 2, .title = "Child", .options = options[0..2], .depth = 1 },
-    );
-    try rig.screen.openPicker(&.{ .id = 3, .title = "Parent", .options = &options, .cursor = 20 });
+    try rig.screen.openPicker(&.{ .title = "Child", .options = options[0..2], .depth = 1 });
+    try rig.screen.openPicker(&.{ .title = "Parent", .options = &options, .cursor = 20 });
     gpa.free(try rig.paintPlain(80));
     try std.testing.expectEqual(scroll, rig.screen.activePicker().?.window.scroll);
 }
 
-test "a public picker position restores the selected row" {
+test "a picker position restores the selected row" {
     const gpa = std.testing.allocator;
     var rig: Rig = undefined;
     rig.init();
     defer rig.deinit();
-    const options = [_]application.Picker.Option{
+    const options = [_]ui.Picker.Option{
         .{ .name = "first" },
         .{ .name = "second" },
         .{ .name = "third" },
     };
-    try rig.screen.openPicker(
-        &.{ .id = 2, .title = "Step", .options = &options, .cursor = 2 },
-    );
+    try rig.screen.openPicker(&.{ .title = "Step", .options = &options, .cursor = 2 });
     const painted = try rig.paintPlain(80);
     defer gpa.free(painted);
     try testing.expectContains(painted, "> third");
-    try rig.screen.openPicker(&.{ .id = 3, .title = "Step", .options = &options });
+    try rig.screen.openPicker(&.{ .title = "Step", .options = &options });
     try std.testing.expectEqual(@as(usize, 0), rig.screen.activePicker().?.cursor);
     rig.screen.closePicker();
 }
@@ -3254,24 +3479,20 @@ fn checkSnapshotRestore(gpa: std.mem.Allocator, snapshot: *const application.Sna
     screen.window_pages = application.Settings.window_pages_min;
     try screen.restore(snapshot);
     try std.testing.expectEqualStrings("Kept draft.", screen.editor.visible());
-    try std.testing.expectEqual(snapshot.interaction.settings.verbose, screen.verbose);
-    try std.testing.expectEqual(snapshot.interaction.settings.window_pages, screen.window_pages);
+    try std.testing.expect(screen.verbose);
+    try std.testing.expectEqual(snapshot.settings.window_pages, screen.window_pages);
 }
 
-test "picker snapshots keep local navigation only while the picker id stays unchanged" {
+test "a snapshot keeps a local picker with its position and its wait" {
     var names: [20][8]u8 = undefined;
-    var options: [names.len]application.Picker.Option = undefined;
+    var options: [names.len]ui.Picker.Option = undefined;
     for (&names, &options, 0..) |*buffer, *option, index| {
         option.* = .{ .name = try std.mem.print(buffer, "row{d:0>2}", .{index}) };
     }
-    var snapshot: application.Snapshot = .{
+    const snapshot: application.Snapshot = .{
         .records = &.{},
         .statistics = .{},
-        .interaction = .{
-            .mode = .picker,
-            .picker = .{ .id = 1, .title = "Pick", .options = &options, .preselected = 2 },
-            .choice = .{ .effort = .high },
-        },
+        .state = .{ .choice = .{ .effort = .high } },
         .working_directory = "/work",
         .home_directory = "/home",
     };
@@ -3280,7 +3501,7 @@ test "picker snapshots keep local navigation only while the picker id stays unch
         rig.init();
         defer rig.deinit();
         const size: terminal.View.Size = .{ .columns = columns, .rows = 8 };
-        try rig.screen.restore(&snapshot);
+        try rig.screen.openPicker(&.{ .title = "Pick", .options = &options, .preselected = 2 });
         for (2..names.len - 1) |_| try rig.screen.activePicker().?.moveDown();
         try rig.screen.paint(size, rig.time, &no_caption);
         const scroll = rig.screen.activePicker().?.window.scroll;
@@ -3290,10 +3511,12 @@ test "picker snapshots keep local navigation only while the picker id stays unch
         try rig.screen.paint(size, rig.time, &no_caption);
         try std.testing.expectEqual(scroll, rig.screen.activePicker().?.window.scroll);
         try testing.expectContains(rig.screen.activePicker().?.content.items, " > row19");
-        snapshot.interaction.picker.?.id += 1;
+        try rig.screen.beginPickerWait(Flow.fetch_wait_text);
         try rig.screen.restore(&snapshot);
-        try std.testing.expectEqual(@as(usize, 2), rig.screen.activePicker().?.cursor);
-        try std.testing.expectEqual(@as(usize, 0), rig.screen.activePicker().?.window.scroll);
+        try std.testing.expect(rig.screen.animating());
+        const painted = try rig.paintPlain(columns);
+        defer std.testing.allocator.free(painted);
+        try testing.expectContains(painted, "Drinky fetches");
     }
 }
 
@@ -3301,15 +3524,18 @@ test "page snapshots keep the source position and start new content at its first
     const snapshot: application.Snapshot = .{
         .records = &.{},
         .statistics = .{},
-        .interaction = .{
-            .mode = .page,
-            .page = .{ .id = 1, .title = "Page", .action = .close },
+        .state = .{
+            .result = .{
+                .id = 1,
+                .purpose = .short_answer,
+                .phase = .complete,
+                .text = application.support.repeat(
+                    "# Heading\n\nA long paragraph with **bold text**.\n\n",
+                    40,
+                ),
+            },
             .choice = .{ .effort = .high },
         },
-        .page_text = application.support.repeat(
-            "# Heading\n\nA long paragraph with **bold text**.\n\n",
-            40,
-        ),
         .working_directory = "/work",
         .home_directory = "/home",
     };
@@ -3347,12 +3573,16 @@ test "page snapshots keep the source position and start new content at its first
     rig.init();
     defer rig.deinit();
     var waiting = snapshot;
-    waiting.page_text = "";
-    waiting.interaction.page.?.wait = .{ .started_ms = 0 };
-    waiting.interaction.page.?.retry = .{
-        .content = application.support.repeat("The attempt failed. ", 100),
-        .severity = .information,
-    };
+    waiting.state.result.?.text = "";
+    waiting.state.result.?.phase = .{ .generating = .{
+        .started_ms = 0,
+        .retry = .{
+            .attempt = 1,
+            .reason = .overloaded,
+            .details = application.support.repeat("The attempt failed. ", 100),
+            .delay_ms = 0,
+        },
+    } };
     const size: terminal.View.Size = .{ .columns = 24, .rows = 24 };
     try rig.screen.restore(&waiting);
     try rig.screen.paint(size, rig.time, &no_caption);
@@ -3361,113 +3591,6 @@ test "page snapshots keep the source position and start new content at its first
     try rig.screen.restore(&snapshot);
     try rig.screen.paint(size, rig.time, &no_caption);
     try std.testing.expectEqual(@as(usize, 0), rig.screen.activePage().?.scroll);
-}
-
-test "a snapshot of a model fetch restores its wait presentation" {
-    const gpa = std.testing.allocator;
-    var rig: Rig = undefined;
-    rig.init();
-    defer rig.deinit();
-    var stall: providers.testing.FakeTransport.Stall = .{ .io = std.testing.io };
-    var controller: application.testing.Rig = undefined;
-    try controller.init(&.{ .replies = &.{.{ .stall = &stall }} });
-    defer controller.deinit();
-    const initial = try controller.snapshot();
-    initial.deinit(gpa);
-    _ = controller.send(&.{ .submit = .{ .line = "/model" } });
-    const picking = try controller.snapshot();
-    defer picking.deinit(gpa);
-    _ = controller.send(&.{ .select = .{ .cursor = 0 } });
-    try stall.reached.wait(std.testing.io);
-    const fetching = try controller.snapshot();
-    defer fetching.deinit(gpa);
-    try rig.screen.restore(&fetching);
-    try std.testing.expect(rig.screen.animating());
-    const painted = try rig.paintPlain(80);
-    defer gpa.free(painted);
-    try testing.expectContains(painted, "Drinky fetches the model list.");
-}
-
-test "an event between two thinking segments closes both across toggles and snapshots" {
-    const gpa = std.testing.allocator;
-    var stream: application.testing.StreamTransport = .{
-        .prefix = "data: {\"type\":\"response.reasoning_summary_text.delta\"," ++
-            "\"item_id\":\"r1\",\"summary_index\":0,\"delta\":\"First reasoning.\"}\n\n",
-        .tail = "data: {\"type\":\"response.reasoning_summary_text.delta\"," ++
-            "\"item_id\":\"r1\",\"summary_index\":0,\"delta\":\"Second reasoning.\"}\n\n" ++
-            providers.testing.reply_stream,
-    };
-    var controller: application.testing.Rig = undefined;
-    try controller.init(&.{ .transport = stream.transport() });
-    defer controller.deinit();
-    defer stream.released.set(std.testing.io);
-    var rig: Rig = undefined;
-    rig.init();
-    defer rig.deinit();
-    const initial = try controller.snapshot();
-    defer initial.deinit(gpa);
-    try rig.screen.restore(&initial);
-    rig.screen.verbose = false;
-    _ = controller.send(&.{ .submit = .{ .line = "Task." } });
-    var inserted = false;
-    for (0..4096) |_| {
-        const event = try controller.next();
-        defer event.deinit(gpa);
-        try rig.mirror(&event);
-        if (event == .turn_ended) break;
-        if (inserted) continue;
-        for (rig.blocks()) |*block| {
-            if (block.content != .thinking) continue;
-            if (!std.mem.eql(u8, block.content.thinking.items, "First reasoning.")) continue;
-            inserted = true;
-            _ = controller.send(&.{ .client_notice = .{
-                .severity = .information,
-                .content = "Integration notice.",
-            } });
-            stream.released.set(std.testing.io);
-        }
-    } else return error.TestExpectedEnd;
-    for (0..2) |_| {
-        for ([_]usize{ 24, 80 }) |columns| {
-            for (0..3) |toggle| {
-                const verbose = toggle == 1;
-                if (rig.screen.verbose != verbose) rig.screen.setVerbose(!rig.screen.verbose);
-                const painted = try rig.paintPlain(columns);
-                defer gpa.free(painted);
-                try testing.expectContains(painted, "ℹ Integration notice.");
-                if (verbose) {
-                    try testing.expectContains(painted, "First reasoning.");
-                    try testing.expectContains(painted, "Second reasoning.");
-                    try std.testing.expectEqual(0, std.mem.count(u8, painted, "Agent: work"));
-                } else {
-                    try std.testing.expectEqual(2, std.mem.count(u8, painted, "Agent: work"));
-                    try std.testing.expectEqual(2, std.mem.count(
-                        u8,
-                        rig.out.written(),
-                        "\x1b[32m\x1b[2mAgent: work (complete)\x1b[0m",
-                    ));
-                    if (columns == 80) {
-                        try testing.expectContains(painted, "Tools: 0 · Received: 16 B");
-                        try testing.expectContains(painted, "Tools: 0 · Received: 17 B");
-                    } else {
-                        try std.testing.expect(std.mem.find(u8, painted, "Time:") == null);
-                    }
-                }
-            }
-        }
-        const snapshot = try controller.snapshot();
-        defer snapshot.deinit(gpa);
-        var closed: usize = 0;
-        for (snapshot.records) |record| {
-            if (record.work) |work| {
-                try std.testing.expect(work.end != null);
-                try std.testing.expectEqual(.complete, work.end.?.status);
-                closed += 1;
-            }
-        }
-        try std.testing.expectEqual(2, closed);
-        try rig.screen.restore(&snapshot);
-    }
 }
 
 test "a streaming snapshot continues the current text record after restoration" {
@@ -3491,7 +3614,7 @@ test "a streaming snapshot continues the current text record after restoration" 
     defer transport.released.set(std.testing.io);
     const initial = try controller.snapshot();
     initial.deinit(gpa);
-    _ = controller.send(&.{ .submit = .{ .line = "Task." } });
+    _ = controller.send(&.{ .send_message = "Task." });
     try transport.reached.wait(std.testing.io);
     const snapshot = try controller.snapshot();
     defer snapshot.deinit(gpa);

@@ -6,8 +6,10 @@ const Turns = @This();
 
 gpa: std.mem.Allocator,
 list: std.ArrayList(Turn),
+id_next: u64 = 1,
 
 pub const Turn = struct {
+    id: u64,
     range: Transcript.Range,
     line: ?[]const u8,
     mutated: bool,
@@ -26,14 +28,23 @@ pub fn all(self: *const Turns) []const Turn {
     return self.list.items;
 }
 
+pub fn find(self: *const Turns, id: u64) ?usize {
+    for (self.list.items, 0..) |turn, index| {
+        if (turn.id == id) return index;
+    }
+    return null;
+}
+
 pub fn begin(self: *Turns, start: usize, maybe_line: ?[]const u8) error{OutOfMemory}!void {
     try self.list.ensureUnusedCapacity(self.gpa, 1);
     const line = if (maybe_line) |text| try self.gpa.dupe(u8, text) else null;
     self.list.appendAssumeCapacity(.{
+        .id = self.id_next,
         .range = .{ .start = start, .end = start },
         .line = line,
         .mutated = false,
     });
+    self.id_next += 1;
 }
 
 pub fn markMutated(self: *Turns) void {
@@ -43,13 +54,6 @@ pub fn markMutated(self: *Turns) void {
 pub fn end(self: *Turns, block_count: usize) void {
     std.debug.assert(block_count >= self.last().range.start);
     self.last().range.end = block_count;
-}
-
-pub fn mutatedFrom(self: *const Turns, index: usize) bool {
-    for (self.list.items[index..]) |turn| {
-        if (turn.mutated) return true;
-    }
-    return false;
 }
 
 pub fn takeLine(self: *Turns, index: usize) []const u8 {

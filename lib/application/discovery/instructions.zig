@@ -3,8 +3,8 @@ const std = @import("std");
 const core = @import("core");
 const tools = @import("tools");
 
-const Message = @import("../Message.zig");
 const project = @import("../project.zig");
+const Record = @import("../Record.zig");
 const Reports = @import("../Reports.zig");
 const testing = @import("../testing.zig");
 
@@ -15,18 +15,6 @@ pub const file_kibibytes_max = @divExact(file_bytes_max, 1024);
 pub const source_kibibytes_max = @divExact(source_bytes_max, 1024);
 
 pub const files_max = 32;
-
-const Source = enum {
-    user,
-    project,
-
-    fn noun(self: Source) []const u8 {
-        return switch (self) {
-            .user => "user instruction",
-            .project => "project instruction",
-        };
-    }
-};
 
 pub const File = struct {
     path: []const u8,
@@ -40,42 +28,20 @@ pub const File = struct {
     }
 };
 
-const Problem = enum {
-    empty,
-    too_large,
-    not_text,
-
-    fn severity(self: Problem) Message.Severity {
-        return switch (self) {
-            .empty => .information,
-            else => .failure,
-        };
-    }
-
-    fn reason(self: Problem) []const u8 {
-        return switch (self) {
-            .empty => "the file is empty",
-            .too_large => std.fmt.comptimePrint(
-                "the file is larger than {d} KiB",
-                .{file_kibibytes_max},
-            ),
-            .not_text => "the file is not UTF-8 text",
-        };
-    }
-};
+const Rejection = enum { empty, too_large, not_text };
 
 const Content = union(enum) {
     loaded: []u8,
-    rejected: Problem,
+    rejected: Rejection,
     failed: std.Io.File.Reader.Error,
 };
 
 pub const Result = struct {
     gpa: std.mem.Allocator,
-    source: Source,
+    scope: Record.Event.InstructionReport.Scope,
     project_root_path: ?[]const u8 = null,
     file_items: std.ArrayList(File) = .empty,
-    reports: Reports = .{ .subject = "instruction files" },
+    reports: Reports = .{ .subject = .instructions },
     bytes_total: usize = 0,
 
     const TakeOptions = struct {
@@ -84,8 +50,8 @@ pub const Result = struct {
         file: std.Io.File,
     };
 
-    pub fn init(gpa: std.mem.Allocator, source: Source) Result {
-        return .{ .gpa = gpa, .source = source };
+    pub fn init(gpa: std.mem.Allocator, scope: Record.Event.InstructionReport.Scope) Result {
+        return .{ .gpa = gpa, .scope = scope };
     }
 
     pub fn deinit(self: *Result) void {
@@ -112,43 +78,34 @@ pub const Result = struct {
     }
 
     fn take(self: *Result, io: std.Io, options: *const TakeOptions) !void {
-        const noun = self.source.noun();
-        if (self.holds(options.identity)) {
-            return self.report(
-                .failure,
-                "Drinky skipped the {s} file {s} because Drinky already loaded the same file.",
-                .{ noun, options.path },
-            );
-        }
+        if (self.holds(options.identity))
+            return self.report(&.{ .duplicate = options.path });
         const content = switch (try readContent(self.gpa, io, options.file)) {
             .loaded => |loaded| loaded,
-            .rejected => |problem| return self.report(
-                problem.severity(),
-                "Drinky skipped the {s} file {s} because {s}.",
-                .{ noun, options.path, problem.reason() },
-            ),
-            .failed => |err| return self.report(
-                .failure,
-                "Drinky could not read the {s} file {s} because of error {s}.",
-                .{ noun, options.path, @errorName(err) },
-            ),
+            .rejected => |rejection| return self.report(&switch (rejection) {
+                .empty => .{ .empty = options.path },
+                .too_large => .{ .too_large = .{
+                    .path = options.path,
+                    .limit = file_kibibytes_max,
+                } },
+                .not_text => .{ .not_text = options.path },
+            }),
+            .failed => |err| return self.report(&.{ .unread = .{
+                .path = options.path,
+                .cause = @errorName(err),
+            } }),
         };
         errdefer self.gpa.free(content);
         if (self.file_items.items.len == files_max) {
-            try self.report(
-                .failure,
-                "Drinky skipped the {s} file {s} because Drinky already loaded {d} files.",
-                .{ noun, options.path, files_max },
-            );
+            try self.report(&.{ .count_capped = .{ .path = options.path, .limit = files_max } });
             self.gpa.free(content);
             return;
         }
         if (content.len > source_bytes_max - self.bytes_total) {
-            try self.report(
-                .failure,
-                "Drinky skipped the {s} file {s} to keep the total at or below {d} KiB.",
-                .{ noun, options.path, source_kibibytes_max },
-            );
+            try self.report(&.{ .total_capped = .{
+                .path = options.path,
+                .limit = source_kibibytes_max,
+            } });
             self.gpa.free(content);
             return;
         }
@@ -164,13 +121,11 @@ pub const Result = struct {
         self.bytes_total += content.len;
     }
 
-    fn report(
-        self: *Result,
-        severity: Message.Severity,
-        comptime template: []const u8,
-        args: anytype,
-    ) !void {
-        try self.reports.add(self.gpa, severity, template, args);
+    fn report(self: *Result, problem: *const Record.Event.InstructionReport.Problem) !void {
+        try self.reports.add(self.gpa, &.{ .instruction_report = .{
+            .scope = self.scope,
+            .problem = problem.*,
+        } });
     }
 };
 
@@ -179,8 +134,6 @@ const Discovery = struct {
     io: std.Io,
     working_directory: []const u8,
     result: *Result,
-
-    const noun = Source.noun(.project);
 
     const ScanOptions = struct {
         directory: []const u8,
@@ -231,11 +184,10 @@ const Discovery = struct {
             &.{ marker.directory, project.marker_name },
         );
         defer self.gpa.free(marker_path);
-        try self.result.report(
-            .failure,
-            "Drinky could not inspect the repository marker {s} because of error {s}.",
-            .{ marker_path, @errorName(marker.err) },
-        );
+        try self.result.report(&.{ .marker_uninspected = .{
+            .path = marker_path,
+            .cause = @errorName(marker.err),
+        } });
     }
 
     fn scanDirectory(self: *Discovery, options: *const ScanOptions) !void {
@@ -245,11 +197,10 @@ const Discovery = struct {
             .{ .iterate = true },
         ) catch |err| {
             if (err == error.Canceled or err == error.OutOfMemory) return err;
-            try self.result.report(
-                .failure,
-                "Drinky could not scan the directory {s} for AGENTS.md because of error {s}.",
-                .{ options.directory, @errorName(err) },
-            );
+            try self.result.report(&.{ .directory_unscanned = .{
+                .path = options.directory,
+                .cause = @errorName(err),
+            } });
             return;
         };
         defer dir.close(self.io);
@@ -262,11 +213,10 @@ const Discovery = struct {
         for (0..directory_entries_max + 1) |attempt| {
             const maybe_entry = iterator.next(self.io) catch |err| {
                 if (err == error.Canceled or err == error.OutOfMemory) return err;
-                try self.result.report(
-                    .failure,
-                    "Drinky stopped the scan for AGENTS.md in {s} because of error {s}.",
-                    .{ options.directory, @errorName(err) },
-                );
+                try self.result.report(&.{ .scan_stopped = .{
+                    .path = options.directory,
+                    .cause = @errorName(err),
+                } });
                 break;
             };
             const entry = maybe_entry orelse {
@@ -274,11 +224,10 @@ const Discovery = struct {
                 break;
             };
             if (attempt == directory_entries_max) {
-                try self.result.report(
-                    .failure,
-                    "Drinky stopped the scan for AGENTS.md in {s} after {d} entries.",
-                    .{ options.directory, directory_entries_max },
-                );
+                try self.result.report(&.{ .scan_capped = .{
+                    .path = options.directory,
+                    .limit = directory_entries_max,
+                } });
                 break;
             }
             if (std.mem.eql(u8, entry.name, "AGENTS.md")) {
@@ -304,22 +253,14 @@ const Discovery = struct {
         if (claude_present) {
             const path = try std.Io.Dir.path.join(self.gpa, &.{ options.directory, "CLAUDE.md" });
             defer self.gpa.free(path);
-            if (try self.isRegularFile(path)) try self.result.report(
-                .failure,
-                "Drinky ignored the CLAUDE.md file {s}. Add or link a project instruction file " ++
-                    "named AGENTS.md in the same directory.",
-                .{path},
-            );
+            if (try self.isRegularFile(path))
+                try self.result.report(&.{ .claude_ignored = path });
         }
         if (agent_present) {
             const path = try std.Io.Dir.path.join(self.gpa, &.{ options.directory, "AGENT.md" });
             defer self.gpa.free(path);
-            if (try self.isRegularFile(path)) try self.result.report(
-                .failure,
-                "Drinky ignored the AGENT.md file {s}. Rename the file to AGENTS.md if the file " ++
-                    "contains project instructions.",
-                .{path},
-            );
+            if (try self.isRegularFile(path))
+                try self.result.report(&.{ .agent_ignored = path });
         }
     }
 
@@ -338,11 +279,10 @@ const Discovery = struct {
             .{ .follow_symlinks = false },
         ) catch |err| {
             if (err == error.Canceled or err == error.OutOfMemory) return err;
-            try self.result.report(
-                .failure,
-                "Drinky could not inspect the " ++ noun ++ " path {s} because of error {s}.",
-                .{ options.source_path, @errorName(err) },
-            );
+            try self.result.report(&.{ .uninspected = .{
+                .path = options.source_path,
+                .cause = @errorName(err),
+            } });
             return;
         };
         switch (stat.kind) {
@@ -360,29 +300,15 @@ const Discovery = struct {
                 ) catch |err| {
                     if (err == error.Canceled or err == error.OutOfMemory) return err;
                     if (err == error.FileNotFound) {
-                        try self.result.report(
-                            .failure,
-                            "Drinky skipped the " ++ noun ++ " file {s} because the " ++
-                                "symbolic-link target does not exist.",
-                            .{options.source_path},
-                        );
-                    } else {
-                        try self.result.report(
-                            .failure,
-                            "Drinky could not inspect the symbolic-link target of the " ++ noun ++
-                                " file {s} because of error {s}.",
-                            .{ options.source_path, @errorName(err) },
-                        );
-                    }
+                        try self.result.report(&.{ .link_target_missing = options.source_path });
+                    } else try self.result.report(&.{ .link_uninspected = .{
+                        .path = options.source_path,
+                        .cause = @errorName(err),
+                    } });
                     return;
                 };
                 if (target_stat.kind != .file) {
-                    try self.result.report(
-                        .failure,
-                        "Drinky skipped the " ++ noun ++ " file {s} because the symbolic-link " ++
-                            "target is not a regular file.",
-                        .{options.source_path},
-                    );
+                    try self.result.report(&.{ .link_target_irregular = options.source_path });
                     return;
                 }
                 try self.openCandidate(&.{
@@ -392,12 +318,7 @@ const Discovery = struct {
                     .was_symlink = true,
                 });
             },
-            else => try self.result.report(
-                .failure,
-                "Drinky skipped the " ++ noun ++ " path {s} because the path is not a regular " ++
-                    "file.",
-                .{options.source_path},
-            ),
+            else => try self.result.report(&.{ .irregular = options.source_path }),
         }
     }
 
@@ -408,60 +329,40 @@ const Discovery = struct {
         }) catch |err| {
             if (err == error.Canceled or err == error.OutOfMemory) return err;
             if (options.was_symlink and err == error.FileNotFound) {
-                try self.result.report(
-                    .failure,
-                    "Drinky skipped the " ++ noun ++ " file {s} because the symbolic-link " ++
-                        "target does not exist.",
-                    .{options.source_path},
-                );
-            } else {
-                try self.result.report(
-                    .failure,
-                    "Drinky could not open the " ++ noun ++ " file {s} because of error {s}.",
-                    .{ options.source_path, @errorName(err) },
-                );
-            }
+                try self.result.report(&.{ .link_target_missing = options.source_path });
+            } else try self.result.report(&.{ .unopened = .{
+                .path = options.source_path,
+                .cause = @errorName(err),
+            } });
             return;
         };
         defer file.close(self.io);
 
         const stat = file.stat(self.io) catch |err| {
             if (err == error.Canceled or err == error.OutOfMemory) return err;
-            try self.result.report(
-                .failure,
-                "Drinky could not inspect the open " ++ noun ++ " file {s} because of error {s}.",
-                .{ options.source_path, @errorName(err) },
-            );
+            try self.result.report(&.{ .open_uninspected = .{
+                .path = options.source_path,
+                .cause = @errorName(err),
+            } });
             return;
         };
         if (stat.kind != .file) {
-            try self.result.report(
-                .failure,
-                "Drinky skipped the " ++ noun ++ " path {s} because the path is not a regular " ++
-                    "file.",
-                .{options.source_path},
-            );
+            try self.result.report(&.{ .irregular = options.source_path });
             return;
         }
 
         var target_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
         const target_length = file.realPath(self.io, &target_buffer) catch |err| {
             if (err == error.Canceled or err == error.OutOfMemory) return err;
-            try self.result.report(
-                .failure,
-                "Drinky could not resolve the " ++ noun ++ " file {s} because of error {s}.",
-                .{ options.source_path, @errorName(err) },
-            );
+            try self.result.report(&.{ .unresolved = .{
+                .path = options.source_path,
+                .cause = @errorName(err),
+            } });
             return;
         };
         const target = target_buffer[0..target_length];
         if (!tools.format.contains(&.{ .boundary = options.content_boundary, .target = target })) {
-            try self.result.report(
-                .failure,
-                "Drinky skipped the " ++ noun ++ " file {s} because the file resolves outside " ++
-                    "the project boundary.",
-                .{options.source_path},
-            );
+            try self.result.report(&.{ .outside = options.source_path });
             return;
         }
         try self.result.take(self.io, &.{
@@ -495,14 +396,14 @@ fn readContent(
             return .{ .failed = read_error };
         },
     };
-    if (checkContent(content)) |problem| {
+    if (checkContent(content)) |rejection| {
         gpa.free(content);
-        return .{ .rejected = problem };
+        return .{ .rejected = rejection };
     }
     return .{ .loaded = content };
 }
 
-fn checkContent(content: []const u8) ?Problem {
+fn checkContent(content: []const u8) ?Rejection {
     if (content.len == 0) return .empty;
     if (!tools.format.isText(content)) return .not_text;
     return null;
@@ -535,12 +436,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, options: *const LoadOptions) !Re
     errdefer result.deinit();
     for (options.paths, 0..) |configured, index| {
         if (index == files_max) {
-            try result.report(
-                .failure,
-                "Drinky skipped the remaining {s} files because Drinky already inspected {d} " ++
-                    "entries.",
-                .{ result.source.noun(), files_max },
-            );
+            try result.report(&.{ .paths_capped = files_max });
             break;
         }
         const path = try std.Io.Dir.path.resolve(gpa, &.{ options.directory, configured });
@@ -551,47 +447,23 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, options: *const LoadOptions) !Re
 }
 
 fn loadPath(result: *Result, io: std.Io, path: []const u8) !void {
-    const noun = result.source.noun();
     const cwd = std.Io.Dir.cwd();
     const stat = cwd.statFile(io, path, .{}) catch |err| {
         if (err == error.Canceled or err == error.OutOfMemory) return err;
-        if (err == error.FileNotFound) {
-            return result.report(
-                .failure,
-                "Drinky skipped the {s} path {s} because the path does not exist.",
-                .{ noun, path },
-            );
-        }
-        return result.report(
-            .failure,
-            "Drinky could not inspect the {s} path {s} because of error {s}.",
-            .{ noun, path, @errorName(err) },
-        );
+        if (err == error.FileNotFound)
+            return result.report(&.{ .missing = path });
+        return result.report(&.{ .uninspected = .{ .path = path, .cause = @errorName(err) } });
     };
-    if (stat.kind != .file) {
-        return result.report(
-            .failure,
-            "Drinky skipped the {s} path {s} because the path is not a regular file.",
-            .{ noun, path },
-        );
-    }
+    if (stat.kind != .file) return result.report(&.{ .irregular = path });
     const file = cwd.openFile(io, path, .{ .allow_directory = false }) catch |err| {
         if (err == error.Canceled or err == error.OutOfMemory) return err;
-        return result.report(
-            .failure,
-            "Drinky could not open the {s} file {s} because of error {s}.",
-            .{ noun, path, @errorName(err) },
-        );
+        return result.report(&.{ .unopened = .{ .path = path, .cause = @errorName(err) } });
     };
     defer file.close(io);
     var target_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const target_length = file.realPath(io, &target_buffer) catch |err| {
         if (err == error.Canceled or err == error.OutOfMemory) return err;
-        return result.report(
-            .failure,
-            "Drinky could not resolve the {s} file {s} because of error {s}.",
-            .{ noun, path, @errorName(err) },
-        );
+        return result.report(&.{ .unresolved = .{ .path = path, .cause = @errorName(err) } });
     };
     try result.take(io, &.{
         .path = path,
@@ -653,13 +525,25 @@ test "outside Git only the working directory is inspected and compatibility file
     defer result.deinit();
     try std.testing.expect(result.projectRoot() == null);
     try std.testing.expectEqual(@as(usize, 0), result.files().len);
-    try std.testing.expectEqual(@as(usize, 2), result.reports.messages().len);
-    try std.testing.expect(
-        std.mem.find(u8, result.reports.messages()[0].content, "CLAUDE.md") != null,
-    );
-    try std.testing.expect(
-        std.mem.find(u8, result.reports.messages()[1].content, "AGENT.md") != null,
-    );
+    try expectProblems(&result, &.{ .claude_ignored, .agent_ignored });
+    try std.testing.expect(std.mem.endsWith(u8, problemAt(&result, 0).claude_ignored, "CLAUDE.md"));
+    try std.testing.expect(std.mem.endsWith(u8, problemAt(&result, 1).agent_ignored, "AGENT.md"));
+}
+
+fn expectProblems(
+    result: *const Result,
+    expected: []const std.meta.Tag(Record.Event.InstructionReport.Problem),
+) !void {
+    const events = result.reports.events();
+    try std.testing.expectEqual(expected.len, events.len);
+    for (expected, events) |problem, *event| {
+        try std.testing.expectEqual(problem, std.meta.activeTag(event.instruction_report.problem));
+        try std.testing.expectEqual(result.scope, event.instruction_report.scope);
+    }
+}
+
+fn problemAt(result: *const Result, index: usize) Record.Event.InstructionReport.Problem {
+    return result.reports.events()[index].instruction_report.problem;
 }
 
 test "an exact AGENTS.md entry suppresses compatibility warnings even when skipped" {
@@ -677,10 +561,7 @@ test "an exact AGENTS.md entry suppresses compatibility warnings even when skipp
     var result = try discover(gpa, io, working_directory);
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 0), result.files().len);
-    try std.testing.expectEqual(@as(usize, 1), result.reports.messages().len);
-    try std.testing.expect(
-        std.mem.find(u8, result.reports.messages()[0].content, "is not a regular file") != null,
-    );
+    try expectProblems(&result, &.{.irregular});
 }
 
 test "invalid, oversized, and empty files are skipped and reported" {
@@ -701,25 +582,8 @@ test "invalid, oversized, and empty files are skipped and reported" {
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 1), result.files().len);
     try std.testing.expectEqual(@as(usize, file_bytes_max), result.files()[0].content.len);
-    try std.testing.expectEqual(@as(usize, 4), result.reports.messages().len);
-    var empty_found = false;
-    var oversized_found = false;
-    var not_text_count: usize = 0;
-    for (result.reports.messages()) |notice| {
-        if (std.mem.find(u8, notice.content, "is empty") != null) {
-            empty_found = true;
-            try std.testing.expectEqual(Message.Severity.information, notice.severity);
-            continue;
-        }
-        try std.testing.expectEqual(Message.Severity.failure, notice.severity);
-        if (std.mem.find(u8, notice.content, "larger than 32 KiB") != null) {
-            oversized_found = true;
-        }
-        if (std.mem.find(u8, notice.content, "not UTF-8 text") != null) not_text_count += 1;
-    }
-    try std.testing.expect(empty_found);
-    try std.testing.expect(oversized_found);
-    try std.testing.expectEqual(@as(usize, 2), not_text_count);
+    try expectProblems(&result, &.{ .too_large, .not_text, .not_text, .empty });
+    try std.testing.expectEqual(@as(usize, 32), problemAt(&result, 0).too_large.limit);
 }
 
 test "aggregate budgeting keeps the nearest whole files" {
@@ -739,10 +603,8 @@ test "aggregate budgeting keeps the nearest whole files" {
     try std.testing.expectEqual(@as(usize, 2), result.files().len);
     try std.testing.expectEqual(@as(u8, 'a'), result.files()[0].content[0]);
     try std.testing.expectEqual(@as(u8, 'b'), result.files()[1].content[0]);
-    try std.testing.expectEqual(@as(usize, 1), result.reports.messages().len);
-    try std.testing.expect(
-        std.mem.find(u8, result.reports.messages()[0].content, "64 KiB") != null,
-    );
+    try expectProblems(&result, &.{.total_capped});
+    try std.testing.expectEqual(@as(usize, 64), problemAt(&result, 0).total_capped.limit);
 }
 
 test "the file-count limit also retains the nearest instructions" {
@@ -771,7 +633,7 @@ test "the file-count limit also retains the nearest instructions" {
     try std.testing.expect(
         std.mem.endsWith(u8, result.files()[files_max - 1].path, "d31/AGENTS.md"),
     );
-    try std.testing.expectEqual(@as(usize, 1), result.reports.messages().len);
+    try expectProblems(&result, &.{.count_capped});
 }
 
 test "instruction symlinks stay inside the project and load one file once" {
@@ -799,14 +661,11 @@ test "instruction symlinks stay inside the project and load one file once" {
     try std.testing.expectEqual(@as(usize, 1), result.files().len);
     try std.testing.expectEqualStrings("linked", result.files()[0].content);
     try std.testing.expect(std.mem.endsWith(u8, result.files()[0].path, "a/b/c/AGENTS.md"));
-    try std.testing.expectEqual(@as(usize, 4), result.reports.messages().len);
-    var repeat_found = false;
-    for (result.reports.messages()) |notice| {
-        if (std.mem.find(u8, notice.content, "already loaded the same file") == null) continue;
-        repeat_found = true;
-        try std.testing.expect(std.mem.find(u8, notice.content, "a/b/AGENTS.md") != null);
-    }
-    try std.testing.expect(repeat_found);
+    try expectProblems(
+        &result,
+        &.{ .link_target_irregular, .duplicate, .link_target_missing, .outside },
+    );
+    try std.testing.expect(std.mem.endsWith(u8, problemAt(&result, 1).duplicate, "a/b/AGENTS.md"));
 }
 
 test "unreadable instruction files are reported and do not load" {
@@ -837,10 +696,7 @@ test "unreadable instruction files are reported and do not load" {
     var result = try discover(gpa, io, working_directory);
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 0), result.files().len);
-    try std.testing.expectEqual(@as(usize, 1), result.reports.messages().len);
-    try std.testing.expect(
-        std.mem.find(u8, result.reports.messages()[0].content, "could not open") != null,
-    );
+    try expectProblems(&result, &.{.unopened});
 }
 
 test "repository marker inspection errors stop ancestor traversal conservatively" {
@@ -871,12 +727,8 @@ test "repository marker inspection errors stop ancestor traversal conservatively
     defer result.deinit();
     try std.testing.expect(result.projectRoot() == null);
     try std.testing.expectEqual(@as(usize, 0), result.files().len);
-    try std.testing.expectEqual(@as(usize, 2), result.reports.messages().len);
-    try std.testing.expect(std.mem.find(
-        u8,
-        result.reports.messages()[0].content,
-        "could not inspect the repository marker",
-    ) != null);
+    try std.testing.expectEqual(@as(usize, 2), result.reports.events().len);
+    try std.testing.expectEqualStrings(marker_path, problemAt(&result, 0).marker_uninspected.path);
 }
 
 fn checkDiscoveryAllocationFailure(
@@ -928,13 +780,7 @@ test "configured files load in order and one file loads once" {
     try std.testing.expectEqualStrings("Second.\n", result.files()[0].content);
     try std.testing.expectEqualStrings("First.\n", result.files()[1].content);
     try std.testing.expectEqualStrings(absolute_first, result.files()[1].path);
-    try std.testing.expectEqual(@as(usize, 3), result.reports.messages().len);
-    for (result.reports.messages()) |notice| {
-        try std.testing.expectEqual(Message.Severity.failure, notice.severity);
-        try std.testing.expect(
-            std.mem.find(u8, notice.content, "already loaded the same file") != null,
-        );
-    }
+    try expectProblems(&result, &.{ .duplicate, .duplicate, .duplicate });
 }
 
 test "a configured list stops after the file cap and reports the rest" {
@@ -959,12 +805,8 @@ test "a configured list stops after the file cap and reports the rest" {
     var result = try load(gpa, io, &.{ .directory = directory, .paths = paths.items });
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, files_max), result.files().len);
-    try std.testing.expectEqual(@as(usize, 1), result.reports.messages().len);
-    try std.testing.expect(std.mem.find(
-        u8,
-        result.reports.messages()[0].content,
-        "skipped the remaining user instruction files",
-    ) != null);
+    try expectProblems(&result, &.{.paths_capped});
+    try std.testing.expectEqual(files_max, problemAt(&result, 0).paths_capped);
 }
 
 test "configured files stop at the shared byte budget" {
@@ -986,10 +828,7 @@ test "configured files stop at the shared byte budget" {
     try std.testing.expectEqual(@as(usize, 2), result.files().len);
     try std.testing.expectEqual(@as(u8, 'a'), result.files()[0].content[0]);
     try std.testing.expectEqual(@as(u8, 'b'), result.files()[1].content[0]);
-    try std.testing.expectEqual(@as(usize, 1), result.reports.messages().len);
-    try std.testing.expect(
-        std.mem.find(u8, result.reports.messages()[0].content, "64 KiB") != null,
-    );
+    try expectProblems(&result, &.{.total_capped});
 }
 
 test "an unusable configured path is skipped and reported" {
@@ -1018,23 +857,11 @@ test "an unusable configured path is skipped and reported" {
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 1), result.files().len);
     try std.testing.expectEqual(@as(usize, file_bytes_max), result.files()[0].content.len);
-    try std.testing.expectEqual(@as(usize, 6), result.reports.messages().len);
-    const expected_reasons = [_][]const u8{
-        "the path does not exist",
-        "the path is not a regular file",
-        "the file is empty",
-        "the file is not UTF-8 text",
-        "the file is not UTF-8 text",
-        "the file is larger than 32 KiB",
-    };
-    for (expected_reasons, result.reports.messages()) |reason, notice| {
-        try std.testing.expect(std.mem.find(u8, notice.content, reason) != null);
-        try std.testing.expect(
-            std.mem.find(u8, notice.content, "the user instruction ") != null,
-        );
-    }
-    const empty = result.reports.messages()[2];
-    try std.testing.expectEqual(Message.Severity.information, empty.severity);
+    try expectProblems(
+        &result,
+        &.{ .missing, .irregular, .empty, .not_text, .not_text, .too_large },
+    );
+    try std.testing.expect(std.mem.endsWith(u8, problemAt(&result, 0).missing, "missing.md"));
 }
 
 test "an unreadable configured file is skipped and reported" {
@@ -1063,10 +890,7 @@ test "an unreadable configured file is skipped and reported" {
     var result = try load(gpa, io, &.{ .directory = directory, .paths = &.{"hidden.md"} });
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 0), result.files().len);
-    try std.testing.expectEqual(@as(usize, 1), result.reports.messages().len);
-    try std.testing.expect(
-        std.mem.find(u8, result.reports.messages()[0].content, "could not open") != null,
-    );
+    try expectProblems(&result, &.{.unopened});
 }
 
 fn checkLoadAllocationFailure(gpa: std.mem.Allocator, io: std.Io, directory: []const u8) !void {
@@ -1079,7 +903,7 @@ fn checkLoadAllocationFailure(gpa: std.mem.Allocator, io: std.Io, directory: []c
     } });
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 2), result.files().len);
-    try std.testing.expectEqual(@as(usize, 3), result.reports.messages().len);
+    try std.testing.expectEqual(@as(usize, 3), result.reports.events().len);
 }
 
 test "the configured load frees every partial allocation" {

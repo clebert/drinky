@@ -5,10 +5,27 @@ const providers = @import("providers");
 const tools = @import("tools");
 const Choice = @import("Choice.zig");
 const Controller = @import("Controller.zig");
-const Interaction = @import("Interaction.zig");
 const Record = @import("Record.zig");
 const Snapshot = @import("Snapshot.zig");
+const State = @import("State.zig");
 const Surface = @import("Surface.zig");
+
+pub const frontend_default: @FieldType(Controller.Options, "frontend") = .{
+    .instructions = "Use the client interface.",
+    .reference = "## Client interface\n\nClient reference facts.",
+};
+
+pub const write_call_stream =
+    "data: {\"type\":\"response.output_item.done\",\"item\":{\"id\":\"fc_1\"," ++
+    "\"type\":\"function_call\",\"status\":\"completed\",\"call_id\":\"call_1\"," ++
+    "\"name\":\"write\",\"arguments\":\"{}\"}}\n\n" ++
+    "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n";
+
+pub const expired_plan_store =
+    "{\"openai-plan\":{\"access\":\"access-first\",\"refresh\":\"refresh-first\"," ++
+    "\"expires_ms\":0,\"account_id\":\"account-1\"}}";
+pub const plan_models_body =
+    "{\"models\":[{\"slug\":\"gpt-next\",\"visibility\":\"list\",\"context_window\":400000}]}";
 
 pub fn expectContains(text: []const u8, needle: []const u8) !void {
     if (std.mem.find(u8, text, needle) != null) return;
@@ -21,13 +38,27 @@ pub fn expectUsers(records: []const Record, expected: []const []const u8) !void 
     for (records) |*record| {
         const text = switch (record.content) {
             .user => |list| list.items,
-            else => continue,
+            .user_note, .thinking, .model, .tool_result, .event, .authorization => continue,
         };
         try std.testing.expect(count < expected.len);
         try std.testing.expectEqualStrings(expected[count], text);
         count += 1;
     }
     try std.testing.expectEqual(expected.len, count);
+}
+
+pub fn eventOf(
+    records: []const Record,
+    comptime tag: std.meta.Tag(Record.Event),
+) ?@FieldType(Record.Event, @tagName(tag)) {
+    for (records) |*record| {
+        const event = switch (record.content) {
+            .event => |event| event,
+            .user, .user_note, .thinking, .model, .tool_result, .authorization => continue,
+        };
+        if (event == tag) return @field(event, @tagName(tag));
+    }
+    return null;
 }
 
 pub const Tree = struct {
@@ -116,7 +147,8 @@ pub const Rig = struct {
 
     pub const Options = struct {
         allocator: std.mem.Allocator = std.testing.allocator,
-        startup: Controller.Startup = .terminal,
+        startup: Controller.Startup = .session,
+        frontend: @FieldType(Controller.Options, "frontend") = frontend_default,
         replies: []const providers.testing.FakeTransport.Reply = &.{},
         transport: ?providers.Transport = null,
         config: []const u8 = "{\"request\":{\"delay_ms_initial\":0,\"delay_ms_max\":0}}",
@@ -128,6 +160,7 @@ pub const Rig = struct {
             .account = accounts.testing.openai_api_key,
             .names = &.{"gpt-5.6-sol"},
         }},
+        remembered: []const struct { account: usize, name: []const u8 } = &.{},
         files: []const [2][]const u8 = &.{},
     };
 
@@ -159,6 +192,11 @@ pub const Rig = struct {
                 .string = models.names[0],
             });
         }
+        for (options.remembered) |entry| try remembered.put(
+            gpa,
+            accounts.Account.table[entry.account].id,
+            .{ .string = entry.name },
+        );
         const selected_id = accounts.Account.table[options.selected_account].id;
         const data = try gpa.print(
             "{{{f}:{{\"account\":\"{s}\",\"models\":{f},\"effort\":\"high\"}}}}",
@@ -180,6 +218,7 @@ pub const Rig = struct {
             .directories = .{ .working_directory = self.tree.root, .home = self.tree.root },
             .environment = &self.environment,
             .startup = options.startup,
+            .frontend = options.frontend,
             .transport = options.transport orelse self.transport.transport(),
             .browser = self.browser.browser(),
             .loopback = self.loopback.loopback(),
@@ -218,33 +257,31 @@ pub const Rig = struct {
     pub fn send(self: *Rig, command: *const Controller.Command) Controller.Response {
         return self.controller.submit(command);
     }
-    pub fn select(self: *Rig, name: []const u8) !void {
-        const current = try self.snapshot();
-        defer current.deinit(std.testing.allocator);
-        const picker = current.interaction.picker orelse return error.TestExpectedPicker;
-        for (picker.options, 0..) |*option, cursor| {
-            if (!std.mem.eql(u8, option.name, name)) continue;
-            try std.testing.expect(self.send(&.{ .select = .{ .cursor = cursor } }).accepted);
-            return;
-        }
-        return error.TestExpectedOption;
-    }
-    pub fn interaction(self: *Rig, mode: Interaction.Mode) !Interaction {
+    pub fn state(self: *Rig, work: std.meta.Tag(State.Work)) !State {
         for (0..4096) |_| {
             const event = try self.next();
-            if (event == .interaction and event.interaction.mode == mode) return event.interaction;
+            if (event == .state and event.state.work == work) return event.state;
             event.deinit(std.testing.allocator);
         }
-        return error.TestExpectedInteraction;
+        return error.TestExpectedState;
     }
-    pub fn page(self: *Rig) !Snapshot {
+    pub fn result(self: *Rig) !Snapshot {
         for (0..4096) |_| {
             const event = try self.next();
             defer event.deinit(std.testing.allocator);
-            if (event == .interaction and event.interaction.mode == .page and
-                !event.interaction.working) return self.snapshot();
+            if (event != .state) continue;
+            const value = event.state.result orelse continue;
+            if (value.phase != .generating) return self.snapshot();
         }
-        return error.TestExpectedPage;
+        return error.TestExpectedResult;
+    }
+    pub fn eventOf(self: *Rig, tag: std.meta.Tag(Controller.Event)) !Controller.Event {
+        for (0..4096) |_| {
+            const value = try self.next();
+            if (value == tag) return value;
+            value.deinit(std.testing.allocator);
+        }
+        return error.TestExpectedEvent;
     }
     pub fn next(self: *Rig) !Controller.Event {
         for (0..4096) |_| {
@@ -297,11 +334,8 @@ pub const Rig = struct {
         for (0..4096) |_| {
             const event = try self.next();
             defer event.deinit(std.testing.allocator);
-            if (event != .append_record or event.append_record.content != .event) continue;
-            const text = event.append_record.content.event.text.items;
-            const url_start = std.mem.find(u8, text, "https://") orelse continue;
-            const url_end = std.mem.findScalarPos(u8, text, url_start, '\n') orelse text.len;
-            const url = text[url_start..url_end];
+            if (event != .append_record or event.append_record.content != .authorization) continue;
+            const url = event.append_record.content.authorization.url;
             const state_start = (std.mem.find(u8, url, "&state=") orelse
                 return error.TestExpectedState) + "&state=".len;
             const state_end = std.mem.findScalarPos(u8, url, state_start, '&') orelse url.len;
@@ -313,16 +347,10 @@ pub const Rig = struct {
         return error.TestExpectedAuthorization;
     }
 
-    pub fn expectMutatedTurn(self: *Rig) !void {
-        _ = self.send(&.{ .submit = .{ .line = "/rewind" } });
-        const response = self.send(&.{ .select = .{ .cursor = 0 } });
-        try std.testing.expectEqual(.rewind, response.confirmation.?);
-    }
-
     pub fn snapshot(self: *Rig) !Snapshot {
         self.receivePosted();
         self.skip();
-        try std.testing.expect(self.send(&.snapshot).accepted);
+        try std.testing.expect(self.send(&.snapshot).accepted());
         while (self.taken < self.events.items.len) {
             const event = self.events.items[self.taken];
             self.taken += 1;
@@ -381,19 +409,22 @@ pub const StreamTransport = struct {
 pub const Reduction = struct {
     surface: Surface,
     events: std.ArrayList(Controller.Event) = .empty,
-    revision: u64 = 0,
+    published: State,
 
     const vtable: Controller.Sink.VTable = .{ .emit = publish };
     const changes_vtable: Controller.Sink.VTable = .{ .emit = emit };
 
     pub fn init(self: *Reduction, gpa: std.mem.Allocator, choice: Choice) void {
-        self.* = .{ .surface = .init(
-            gpa,
-            std.testing.io,
-            .{ .ptr = self, .vtable = &vtable },
-            choice,
-            (tools.Context.Bash{}).timeout_ms,
-        ) };
+        self.* = .{
+            .surface = .init(
+                gpa,
+                std.testing.io,
+                .{ .ptr = self, .vtable = &vtable },
+                choice,
+                (tools.Context.Bash{}).timeout_ms,
+            ),
+            .published = .{ .choice = choice },
+        };
     }
 
     pub fn deinit(self: *Reduction) void {
@@ -424,17 +455,15 @@ pub const Reduction = struct {
     }
 
     pub fn flush(self: *Reduction) void {
-        const changed = self.revision != self.surface.revision;
-        self.revision = self.surface.revision;
-        const value: Interaction = .{
-            .mode = std.meta.activeTag(self.surface.state),
-            .working = self.surface.state == .turn,
-            .notice = self.surface.notice,
-            .notice_id = self.surface.notice_id,
+        const value: State = .{
+            .work = if (self.surface.turn == null) .idle else .{ .turn = 1 },
             .choice = self.surface.choice,
         };
+        const unchanged = std.meta.eql(self.published.work, value.work) and
+            self.published.choice.eql(&value.choice);
+        self.published = value;
         const sink: Controller.Sink = .{ .ptr = self, .vtable = &changes_vtable };
-        self.surface.flush(sink, if (changed) &value else null);
+        self.surface.flush(sink, if (unchanged) null else &value);
     }
 
     fn publish(ptr: *anyopaque, event: *const Controller.Event) void {

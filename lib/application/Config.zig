@@ -222,39 +222,30 @@ const keys = [_]Key{
     },
     .{
         .path = "interface.verbose",
-        .description = "The value true shows complete thinking text, tool rows, " ++
-            "and bash commands at startup. " ++
-            "The value false folds each run of thinking and tool calls into one work row. " ++
-            "The /verbose command changes only the current session.",
+        .description = "The initial detail preference of the frontend.",
     },
     .{
         .path = "interface.window_pages",
         .description = std.fmt.comptimePrint(
-            "The pages of the newest conversation that Drinky keeps on the screen. One page " ++
-                "is one window height. Every frame measures and paints each kept row again, " ++
-                "so a higher count keeps more of the conversation and costs more work per " ++
-                "frame. The count must be from {d} to {d}. Drinky reports a value it cannot " ++
-                "use and keeps the default. A verbosity toggle repaints the complete transcript " ++
-                "regardless of this count. A terminal reset also repaints the complete " ++
-                "transcript.",
+            "The initial window page count of the frontend. The count must be from {d} to {d}. " ++
+                "Drinky reports a value it cannot use and keeps the default.",
             .{ Settings.window_pages_min, Settings.window_pages_max },
         ),
     },
     .{
         .path = "interface.gauge_percent_warning",
         .description = std.fmt.comptimePrint(
-            "The used share at which the context gauge and a quota window take the warning " ++
-                "color. The share must be from {d} to {d}, and it must not pass the error " ++
-                "share. Drinky reports a pair it cannot use and keeps both compiled shares.",
+            "The warning threshold of the frontend gauge. The share must be from {d} to {d}. " ++
+                "It must not pass the error threshold. Drinky reports an invalid pair and " ++
+                "keeps both compiled shares.",
             .{ Settings.Gauge.percent_min, Settings.Gauge.percent_max },
         ),
     },
     .{
         .path = "interface.gauge_percent_error",
         .description = std.fmt.comptimePrint(
-            "The used share at which the context gauge and a quota window take the error " ++
-                "color. The share must be from {d} to {d}. Drinky reports a pair it cannot " ++
-                "use and keeps both compiled shares.",
+            "The error threshold of the frontend gauge. The share must be from {d} to {d}. " ++
+                "Drinky reports an invalid pair and keeps both compiled shares.",
             .{ Settings.Gauge.percent_min, Settings.Gauge.percent_max },
         ),
     },
@@ -467,12 +458,12 @@ pub fn document(
         \\### Models and effort
         \\
         \\- This file names no model. Drinky learns every model from the provider, and the user
-        \\  fetches that list from the /model command. Drinky remembers the model of each
+        \\  fetches that list through the frontend. Drinky remembers the model of each
         \\  account per project in a separate state file.
         \\- `default_effort` takes one of: {s}. Without the key, Drinky uses {s}.
         \\- Drinky remembers the effort level of each project in that same state file, and that
-        \\  memory outranks this file. Only the /effort command changes a project that Drinky
-        \\  already ran in.
+        \\  memory outranks this file. An explicit effort change updates a project that
+        \\  Drinky already ran in.
         \\
         \\### Example
         \\
@@ -515,74 +506,43 @@ pub fn reports(
     gpa: std.mem.Allocator,
     options: ReportOptions,
 ) error{OutOfMemory}!Reports {
-    var result: Reports = .{ .subject = "config file" };
+    var result: Reports = .{ .subject = .config };
     errdefer result.deinit(gpa);
-    if (self.effort_dropped) |dropped| try result.add(
-        gpa,
-        .failure,
-        "Drinky ignored the configured default effort level \"{s}\" because Drinky does not " ++
-            "know that level. Drinky uses the effort level \"{s}\".",
-        .{ dropped, @tagName(options.effort) },
-    );
-    if (self.bash_timeout_ms_dropped) |dropped| try result.add(
-        gpa,
-        .failure,
-        "Drinky ignored the configured command timeout {d} because the value must be from {d} " ++
-            "to {d} milliseconds. Drinky uses the default timeout of {d} milliseconds.",
-        .{
-            dropped,
-            tools.Context.Bash.timeout_ms_min,
-            tools.Context.Bash.timeout_ms_max,
-            self.bash.timeout_ms,
-        },
-    );
-    if (self.window_pages_dropped) |dropped| try result.add(
-        gpa,
-        .failure,
-        "Drinky ignored the configured window page count {d} because the count must be from " ++
-            "{d} to {d}. Drinky uses the default count of {d} pages.",
-        .{ dropped, Settings.window_pages_min, Settings.window_pages_max, self.window_pages },
-    );
-    if (self.gauge_dropped) |dropped| try result.add(
-        gpa,
-        .failure,
-        "Drinky ignored the gauge shares {d} and {d}. A share must be from {d} to {d}, and " ++
-            "the warning share must not pass the error share. Drinky uses the shares {d} " ++
-            "and {d}.",
-        .{
-            dropped.percent_warning,
-            dropped.percent_error,
-            Settings.Gauge.percent_min,
-            Settings.Gauge.percent_max,
-            self.gauge.percent_warning,
-            self.gauge.percent_error,
-        },
-    );
-    if (options.required_capped) try result.add(
-        gpa,
-        .failure,
-        "Drinky used only the first {d} required skills in {s}.",
-        .{ tools.SkillGuard.rules_max, self.path },
-    );
-    if (self.load_error) |err| try result.add(
-        gpa,
-        .failure,
-        "Drinky could not read the config file {s} because of error {s}. Drinky uses " ++
-            "the default value of each key.",
-        .{ self.path, @errorName(err) },
-    );
-    for (self.unknown_keys) |key| try result.add(
-        gpa,
-        .failure,
-        "Drinky ignored the unknown config key \"{s}\" in {s}.",
-        .{ key, self.path },
-    );
-    if (self.unknown_keys_omitted) try result.add(
-        gpa,
-        .failure,
-        "Drinky omitted the remaining unknown config keys in {s}.",
-        .{self.path},
-    );
+    if (self.effort_dropped) |dropped| try result.add(gpa, &.{ .effort_unknown = .{
+        .value = dropped,
+        .used = options.effort,
+    } });
+    if (self.bash_timeout_ms_dropped) |dropped| try result.add(gpa, &.{ .bash_timeout_ignored = .{
+        .value = dropped,
+        .min = tools.Context.Bash.timeout_ms_min,
+        .max = tools.Context.Bash.timeout_ms_max,
+        .used = self.bash.timeout_ms,
+    } });
+    if (self.window_pages_dropped) |dropped| try result.add(gpa, &.{ .window_pages_ignored = .{
+        .value = dropped,
+        .min = Settings.window_pages_min,
+        .max = Settings.window_pages_max,
+        .used = self.window_pages,
+    } });
+    if (self.gauge_dropped) |dropped| try result.add(gpa, &.{ .gauge_ignored = .{
+        .dropped = dropped,
+        .used = self.gauge,
+        .min = Settings.Gauge.percent_min,
+        .max = Settings.Gauge.percent_max,
+    } });
+    if (options.required_capped) try result.add(gpa, &.{ .required_skills_capped = .{
+        .path = self.path,
+        .limit = tools.SkillGuard.rules_max,
+    } });
+    if (self.load_error) |err| try result.add(gpa, &.{ .config_unread = .{
+        .path = self.path,
+        .cause = @errorName(err),
+    } });
+    for (self.unknown_keys) |key| try result.add(gpa, &.{ .config_key_unknown = .{
+        .path = self.path,
+        .key = key,
+    } });
+    if (self.unknown_keys_omitted) try result.add(gpa, &.{ .config_keys_omitted = self.path });
     return result;
 }
 
@@ -969,12 +929,11 @@ test "the removed transcript setting reports an unknown key without migration" {
         .required_capped = false,
     });
     defer report.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 1), report.messages().len);
-    try std.testing.expect(std.mem.find(
-        u8,
-        report.messages()[0].content,
-        "ignored the unknown config key \"interface.transcript_mode\"",
-    ) != null);
+    try std.testing.expectEqual(@as(usize, 1), report.events().len);
+    try std.testing.expectEqualStrings(
+        "interface.transcript_mode",
+        report.events()[0].config_key_unknown.key,
+    );
 }
 
 test "verbosity rejects nonboolean values through the existing config error" {
@@ -1337,12 +1296,10 @@ test "load resolves user instruction paths against the config directory in order
     try std.testing.expectEqualStrings("Second.\n", files[0].content);
     try std.testing.expectEqualStrings(first_path, files[1].path);
     try std.testing.expectEqualStrings("First.\n", files[1].content);
-    try std.testing.expectEqual(@as(usize, 1), config.user_instructions.reports.messages().len);
-    try std.testing.expect(std.mem.find(
-        u8,
-        config.user_instructions.reports.messages()[0].content,
-        "missing.md",
-    ) != null);
+    const events = config.user_instructions.reports.events();
+    try std.testing.expectEqual(@as(usize, 1), events.len);
+    const missing = events[0].instruction_report.problem.missing;
+    try std.testing.expect(std.mem.endsWith(u8, missing, "missing.md"));
 }
 
 test "load accepts an absolute path to user instructions" {
@@ -1383,7 +1340,7 @@ test "an absent config file loads the built-in defaults" {
         config.timeouts.get(.anthropic).connect_ms,
     );
     try std.testing.expectEqual(@as(usize, 0), config.user_instructions.files().len);
-    try std.testing.expectEqual(@as(usize, 0), config.user_instructions.reports.messages().len);
+    try std.testing.expectEqual(@as(usize, 0), config.user_instructions.reports.events().len);
     try std.testing.expect(!config.verbose);
 }
 
@@ -1416,7 +1373,7 @@ fn checkLoadAllocationFailure(gpa: std.mem.Allocator, io: std.Io, home: []const 
     var config = try loadForTest(gpa, io, home);
     defer config.deinit(gpa);
     try std.testing.expectEqual(@as(usize, 1), config.user_instructions.files().len);
-    try std.testing.expectEqual(@as(usize, 1), config.user_instructions.reports.messages().len);
+    try std.testing.expectEqual(@as(usize, 1), config.user_instructions.reports.events().len);
     try std.testing.expect(config.effort_dropped != null);
     try std.testing.expectEqual(@as(usize, 3), config.unknown_keys.len);
     var reports_result = try config.reports(gpa, .{ .effort = .xhigh, .required_capped = false });

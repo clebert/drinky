@@ -1,7 +1,8 @@
 const std = @import("std");
-const Interaction = @import("Interaction.zig");
 const Live = @import("Live.zig");
 const Record = @import("Record.zig");
+const Settings = @import("Settings.zig");
+const State = @import("State.zig");
 const Surface = @import("Surface.zig");
 
 const Snapshot = @This();
@@ -9,8 +10,8 @@ const Snapshot = @This();
 records: []const Record,
 live: Live = .{},
 statistics: Surface.Statistics,
-interaction: Interaction,
-page_text: []const u8 = "",
+state: State,
+settings: Settings = .{},
 working_directory: []const u8,
 home_directory: []const u8,
 
@@ -20,10 +21,8 @@ pub fn dupe(self: *const Snapshot, gpa: std.mem.Allocator) error{OutOfMemory}!Sn
     errdefer freeRecords(gpa, result.records);
     result.live = try self.live.dupe(gpa);
     errdefer result.live.deinit(gpa);
-    result.interaction = try self.interaction.dupe(gpa);
-    errdefer result.interaction.deinit(gpa);
-    result.page_text = try gpa.dupe(u8, self.page_text);
-    errdefer gpa.free(result.page_text);
+    result.state = try self.state.dupe(gpa);
+    errdefer result.state.deinit(gpa);
     result.working_directory = try gpa.dupe(u8, self.working_directory);
     errdefer gpa.free(result.working_directory);
     result.home_directory = try gpa.dupe(u8, self.home_directory);
@@ -33,8 +32,7 @@ pub fn dupe(self: *const Snapshot, gpa: std.mem.Allocator) error{OutOfMemory}!Sn
 pub fn deinit(self: *const Snapshot, gpa: std.mem.Allocator) void {
     freeRecords(gpa, self.records);
     self.live.deinit(gpa);
-    self.interaction.deinit(gpa);
-    gpa.free(self.page_text);
+    self.state.deinit(gpa);
     gpa.free(self.working_directory);
     gpa.free(self.home_directory);
 }

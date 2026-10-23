@@ -5,6 +5,7 @@ const core = @import("core");
 const terminal = @import("terminal");
 
 const attribute = @import("attribute.zig");
+const Message = @import("Message.zig");
 const role = @import("role.zig");
 const testing = @import("testing.zig");
 
@@ -23,7 +24,7 @@ pub const NoticeStyle = struct {
 
     pub const note: NoticeStyle = .{ .role = .user_note, .prefix = "→ ", .fit = .head };
 
-    pub fn of(severity: application.Message.Severity) NoticeStyle {
+    pub fn of(severity: Message.Severity) NoticeStyle {
         return switch (severity) {
             .information => .{ .role = .accent, .prefix = "ℹ " },
             .warning => .{ .role = .warning, .prefix = "⚠ " },

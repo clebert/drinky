@@ -1,11 +1,19 @@
 const std = @import("std");
 const application = @import("application");
+const reference = @import("reference.zig");
 const accounts = @import("accounts");
 const core = @import("core");
 const providers = @import("providers");
 const tools = @import("tools");
 const command_line = @import("command_line.zig");
+const describe = @import("describe.zig");
 const testing = @import("testing.zig");
+const wording = @import("wording.zig");
+const nested_refusal = "Drinky cannot start drinky run inside another drinky run process.";
+const prompt_missing = "Drinky received no prompt on stdin.";
+const prompt_not_utf8 = "Drinky cannot use the prompt because it is not valid UTF-8.";
+const models_missing = "No signed-in account has a saved model list. Sign in and fetch a " ++
+    "list with " ++ reference.line(.model) ++ " in Drinky.";
 pub const Options = struct {
     directories: application.Directories,
     environment: *const std.process.Environ.Map,
@@ -22,7 +30,7 @@ const Listener = struct {
     cost_error: ?application.CostReportError = null,
     final: std.ArrayList(u8) = .empty,
     outcome: ?application.Outcome = null,
-    refusal: ?application.Message = null,
+    refusal: ?application.StartupRefusal = null,
     mail: std.Io.Queue(application.Mail),
     mail_buffer: [queue_capacity]application.Mail = undefined,
 
@@ -79,7 +87,20 @@ const Listener = struct {
                 self.final.appendSlice(self.gpa, turn.answer) catch
                     application.support.outOfMemory();
             },
-            else => {},
+            .snapshot,
+            .append_record,
+            .record_text,
+            .replace_record,
+            .remove_records,
+            .live,
+            .statistics,
+            .state,
+            .clear_conversation,
+            .paste_replayed,
+            .sign_in_ended,
+            .fetch_ended,
+            .no_account,
+            => {},
         }
     }
 
@@ -96,20 +117,24 @@ const Listener = struct {
     }
 
     fn report(self: *Listener, options: *const Options) !bool {
-        if (self.refusal) |refusal| return refuse(options.stderr, refusal.content);
+        if (self.refusal) |*refusal| return refuseStartup(self.gpa, options.stderr, refusal);
         const succeeded = switch (self.outcome.?) {
             .stopped => |reason| stopped: {
                 try self.writeFinal(options.stdout);
                 break :stopped switch (reason) {
                     .complete => true,
-                    .truncated => try refuse(options.stderr, application.support.truncated.content),
+                    .truncated => try refuseEvent(self.gpa, options.stderr, &.reply_truncated),
                 };
             },
             .exhausted => exhausted: {
                 try self.writeFinal(options.stdout);
-                break :exhausted try refuse(options.stderr, application.support.exhausted);
+                break :exhausted try refuseEvent(self.gpa, options.stderr, &.tool_rounds_exhausted);
             },
-            .failed => |*failure| try refuseFailure(self.gpa, options, failure),
+            .failed => |*failure| try refuseEvent(
+                self.gpa,
+                options.stderr,
+                &.{ .request_failed = .from(failure) },
+            ),
             .canceled => unreachable,
         };
         if (self.cost_error) |err| return refuseCostReport(options.stderr, err);
@@ -138,10 +163,17 @@ pub fn run(
     var listener: Listener = undefined;
     listener.init(gpa, io, reporter);
     defer listener.deinit();
+    const document = try describe.compose(gpa);
+    defer gpa.free(document);
+    const frontend: application.Frontend = .{
+        .instructions = describe.run_instructions,
+        .reference = document,
+    };
     const controller = try application.Controller.create(gpa, io, &.{
         .directories = options.directories,
         .environment = options.environment,
         .transport = options.transport,
+        .frontend = frontend,
         .startup = .{ .run = .{
             .model = request.run.model,
             .effort = request.run.effort,
@@ -165,7 +197,7 @@ pub fn models(gpa: std.mem.Allocator, io: std.Io, options: *const Options) !bool
         .transport = options.transport,
     });
     defer gpa.free(list);
-    if (list.len == 0) return refuse(options.stderr, application.reference.models_missing);
+    if (list.len == 0) return refuse(options.stderr, models_missing);
     try options.stdout.writeAll(list);
     return true;
 }
@@ -184,17 +216,55 @@ fn refuseCostReport(
     return false;
 }
 
-fn refuseFailure(
+fn refuseEvent(
     gpa: std.mem.Allocator,
-    options: *const Options,
-    failure: *const application.Failure,
-) !bool {
-    const text = try application.support.failureText(gpa, failure);
-    defer gpa.free(text);
-    return refuse(options.stderr, text);
+    writer: *std.Io.Writer,
+    event: *const application.Record.Event,
+) (std.Io.Writer.Error || error{OutOfMemory})!bool {
+    const message = try wording.event(gpa, event);
+    defer message.deinit(gpa);
+    return refuse(writer, message.content);
 }
 
-test "a run gives its tools its three variables and writes only the final reply to stdout" {
+fn refuseStartup(
+    gpa: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    refusal: *const application.StartupRefusal,
+) (std.Io.Writer.Error || error{OutOfMemory})!bool {
+    switch (refusal.*) {
+        .nested => try writer.writeAll(nested_refusal),
+        .prompt_missing => try writer.writeAll(prompt_missing),
+        .prompt_not_utf8 => try writer.writeAll(prompt_not_utf8),
+        .unknown_model => |value| {
+            const shown = try application.support.diagnostic(gpa, value);
+            defer gpa.free(shown);
+            try writer.print(
+                "Drinky does not know the model \"{s}\". Run drinky models for the valid values.",
+                .{shown},
+            );
+        },
+        .account_unloaded => |unloaded| try writer.print(
+            "Drinky could not load the {s} account because of error {t}.",
+            .{ application.query.accountId(unloaded.account), unloaded.cause },
+        ),
+        .signed_out => |account| try writer.print(
+            "Drinky cannot use the account {s} because it is signed out. Sign in with " ++
+                reference.line(.login) ++ " in Drinky.",
+            .{application.query.accountId(account)},
+        ),
+        .credential_missing => |account| try writer.print(
+            "Set {s} in the environment to use the account {s}.",
+            .{
+                application.query.accountSetting(account).?,
+                application.query.accountId(account),
+            },
+        ),
+    }
+    try writer.writeByte('\n');
+    return false;
+}
+
+test "a run uses concise stdout instructions and tool variables and writes only the final reply" {
     var rig: Rig = undefined;
     try rig.init(&.{ .replies = &.{
         .{ .body = marker_call_stream },
@@ -207,6 +277,16 @@ test "a run gives its tools its three variables and writes only the final reply 
     try std.testing.expectEqualStrings("", rig.stderr.written());
     const requests = rig.transport.requests.items;
     try std.testing.expectEqual(@as(usize, 2), requests.len);
+    try testing.expectContains(requests[0], "keep it short");
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        std.mem.count(u8, requests[0], "You run inside Drinky"),
+    );
+    try testing.expectContains(
+        requests[0],
+        "## Frontend\\n\\nDrinky writes your final answer to stdout without a terminal.",
+    );
+    try std.testing.expect(std.mem.find(u8, requests[0], "terminal coding-agent harness") == null);
     try testing.expectContains(requests[1], "marker:1:openai-api-key/gpt-5.6-sol:max");
 }
 
@@ -496,7 +576,7 @@ test "a truncated final reply reaches stdout, and its event reaches stderr as a 
     try std.testing.expect(!try rig.ask(.high, "openai-api-key/gpt-5.6-sol", "review"));
     try std.testing.expectEqualStrings("partial\n", rig.stdout.written());
     try std.testing.expectEqualStrings(
-        application.support.truncated.content ++ "\n",
+        testing.truncated_text ++ "\n",
         rig.stderr.written(),
     );
 }
@@ -528,10 +608,10 @@ test "a run refuses a nested start, then a blank or non-UTF-8 prompt, before it 
                 .{ application.reference.nested, "1" },
             },
             .prompt = " \n\t",
-            .refusal = application.reference.nested_refusal,
+            .refusal = nested_refusal,
         },
-        .{ .prompt = " \n\t", .refusal = application.reference.prompt_missing },
-        .{ .prompt = "review \xff", .refusal = application.reference.prompt_not_utf8 },
+        .{ .prompt = " \n\t", .refusal = prompt_missing },
+        .{ .prompt = "review \xff", .refusal = prompt_not_utf8 },
     };
     for (cases) |case| {
         var rig: Rig = undefined;
@@ -617,7 +697,7 @@ test "the model list names each saved model of a signed-in account and fails whe
     try std.testing.expect(!try empty.listModels());
     try std.testing.expectEqualStrings("", empty.stdout.written());
     try std.testing.expectEqualStrings(
-        application.reference.models_missing ++ "\n",
+        models_missing ++ "\n",
         empty.stderr.written(),
     );
 }

@@ -33,7 +33,21 @@ const State = struct {
                 self.indic_linker = true;
             },
             .extend_incb, .zwj => {},
-            else => {
+            .other,
+            .cr,
+            .lf,
+            .control,
+            .extend,
+            .regional_indicator,
+            .prepend,
+            .spacing_mark,
+            .l,
+            .v,
+            .t,
+            .lv,
+            .lvt,
+            .extended_pictographic,
+            => {
                 self.indic_armed = false;
                 self.indic_linker = false;
             },
@@ -95,7 +109,17 @@ pub fn startsJoining(text: []const u8) bool {
     const first = decode(text) orelse return false;
     return switch (classOf(first.codepoint)) {
         .extend, .extend_incb, .linker, .zwj, .spacing_mark, .regional_indicator, .v, .t => true,
-        else => false,
+        .other,
+        .cr,
+        .lf,
+        .control,
+        .prepend,
+        .l,
+        .lv,
+        .lvt,
+        .extended_pictographic,
+        .consonant,
+        => false,
     };
 }
 
@@ -105,7 +129,20 @@ pub fn endsJoining(text: []const u8) bool {
         switch (classOf(last.codepoint)) {
             .prepend, .zwj, .linker, .l => return true,
             .extend_incb => tail = tail[0 .. tail.len - last.bytes],
-            else => return false,
+            .other,
+            .cr,
+            .lf,
+            .control,
+            .extend,
+            .regional_indicator,
+            .spacing_mark,
+            .v,
+            .t,
+            .lv,
+            .lvt,
+            .extended_pictographic,
+            .consonant,
+            => return false,
         }
     }
     return false;

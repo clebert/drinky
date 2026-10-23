@@ -1,10 +1,12 @@
 const std = @import("std");
 const application = @import("application");
+const format = @import("../format.zig");
 
 const core = @import("core");
 const terminal = @import("terminal");
 const Caption = @import("Caption.zig");
 const markdown = @import("markdown.zig");
+const Message = @import("Message.zig");
 const paint = @import("paint.zig");
 const role = @import("role.zig");
 const testing = @import("testing.zig");
@@ -35,7 +37,7 @@ pub const Work = struct {
         elapsed_ms: i64,
         tools: ?usize,
         received_bytes: usize,
-        status: application.Record.Work.Status,
+        status: ?application.Record.Work.Status,
 
         pub const segment_count = 4;
 
@@ -44,14 +46,13 @@ pub const Work = struct {
             writer: *std.Io.Writer,
             options: *const struct { activity: []const u8, ends: *[segment_count]usize },
         ) std.Io.Writer.Error!void {
-            const value = if (self.status == .running)
-                if (options.activity.len > 0) options.activity else "waiting"
-            else
-                @tagName(self.status);
+            const value = if (self.status) |status|
+                @tagName(status)
+            else if (options.activity.len > 0) options.activity else "waiting";
             try writer.print("{s}{s})", .{ identity_prefix, value });
             options.ends[0] = writer.buffered().len;
             var time_buffer: [24]u8 = undefined;
-            const time = application.support.format.durationSeconds(
+            const time = format.durationSeconds(
                 &time_buffer,
                 self.elapsed_ms,
                 .down,
@@ -61,7 +62,7 @@ pub const Work = struct {
             if (self.tools) |tools| try writer.print("{s}Tools: {d}", .{ paint.separator, tools });
             options.ends[2] = writer.buffered().len;
             var bytes_buffer: [16]u8 = undefined;
-            const bytes = application.support.format.bytes(&bytes_buffer, self.received_bytes);
+            const bytes = format.bytes(&bytes_buffer, self.received_bytes);
             try writer.print("{s}Received: {s}", .{ paint.separator, bytes });
             options.ends[3] = writer.buffered().len;
         }
@@ -82,7 +83,7 @@ pub const Work = struct {
         buffer: [128]u8 = undefined,
         length: usize = 0,
         ends: [Summary.segment_count]usize = @splat(0),
-        status: application.Record.Work.Status = .running,
+        status: ?application.Record.Work.Status = null,
 
         fn text(self: *const Row) []const u8 {
             return self.buffer[0..self.length];
@@ -96,7 +97,7 @@ pub const Work = struct {
     pub fn box(
         text: []const u8,
         ends: []const usize,
-        status: application.Record.Work.Status,
+        maybe_status: ?application.Record.Work.Status,
     ) paint.Box {
         return .{
             .text = text,
@@ -106,12 +107,11 @@ pub const Work = struct {
                 .start = 0,
                 .end = ends[0],
                 .dim = true,
-                .role = switch (status) {
-                    .running => .activity,
+                .role = if (maybe_status) |status| switch (status) {
                     .complete => .success,
                     .canceled, .truncated => .warning,
                     .failed => .@"error",
-                },
+                } else .activity,
             },
         };
     }
@@ -164,11 +164,11 @@ const ToolResult = struct {
 
 pub const Event = struct {
     text: std.ArrayList(u8),
-    severity: application.Message.Severity,
+    severity: Message.Severity,
 
     pub const Payload = struct {
         text: []const u8,
-        severity: application.Message.Severity = .information,
+        severity: Message.Severity = .information,
     };
 
     fn init(gpa: std.mem.Allocator, payload: *const Payload) !Event {
@@ -1004,7 +1004,7 @@ test "work summaries keep time before tools and bytes and reduce to one row" {
         try std.testing.expectEqual(@as(usize, 1), testing.paintedRows(painted));
     }
 
-    block.presentWork(&.{ .elapsed_ms = 0, .tools = 1, .received_bytes = 5, .status = .running });
+    block.presentWork(&.{ .elapsed_ms = 0, .tools = 1, .received_bytes = 5, .status = null });
     const running = try rendered(gpa, &block, 80, 0);
     defer gpa.free(running);
     const plain = try terminal.testing.plainText(gpa, running);

@@ -3,8 +3,7 @@ const std = @import("std");
 const core = @import("core");
 const tools = @import("tools");
 
-const escape = @import("../escape.zig");
-const Message = @import("../Message.zig");
+const Record = @import("../Record.zig");
 const Reports = @import("../Reports.zig");
 const testing = @import("../testing.zig");
 const front_matter = @import("front_matter.zig");
@@ -82,7 +81,7 @@ pub const Skill = struct {
 pub const Registry = struct {
     gpa: std.mem.Allocator,
     skill_items: std.ArrayList(Skill) = .empty,
-    reports: Reports = .{ .subject = "skill files" },
+    reports: Reports = .{ .subject = .skills },
     skills_capped: bool = false,
 
     pub fn init(gpa: std.mem.Allocator) Registry {
@@ -119,59 +118,39 @@ pub const Registry = struct {
         }) catch |err| switch (err) {
             error.FileNotFound => return,
             error.Canceled, error.OutOfMemory => |known| return known,
-            else => return self.report(
-                .failure,
-                "Drinky could not scan the skill directory {s} because of error {s}.",
-                .{ root, @errorName(err) },
-            ),
+            else => return self.report(&.{ .root_unscanned = .{
+                .path = root,
+                .cause = @errorName(err),
+            } }),
         };
         defer match.deinit(self.gpa);
-        for (match.skips) |skip| switch (skip.kind) {
-            .entry => try self.report(
-                .failure,
-                "Drinky skipped one entry in {s} because of error {s}.",
-                .{ root, skip.error_name },
-            ),
-            .directory => try self.report(
-                .failure,
-                "Drinky could not scan the skill directory {s}/{s} because of error {s}.",
-                .{ root, skip.path, skip.error_name },
-            ),
-            .link => try self.report(
-                .failure,
-                "Drinky could not resolve the symbolic link {s}/{s} because of error {s}.",
-                .{ root, skip.path, skip.error_name },
-            ),
-            .followed_link => try self.report(
-                .failure,
-                "Drinky could not follow the symbolic link {s}/{s} because of error {s}.",
-                .{ root, skip.path, skip.error_name },
-            ),
-        };
-        if (match.stop == .entries) try self.report(
-            .failure,
-            "Drinky stopped the skill scan in {s} after {d} entries.",
-            .{ root, entries_visited_max },
-        );
-        if (match.matched > match.paths.len) try self.report(
-            .failure,
-            "Drinky used only the first {d} SKILL.md paths in {s}.",
-            .{ candidates_retained_max, root },
-        );
+        for (match.skips) |skip| {
+            const skipped: Record.Event.SkillReport.Skip = .{
+                .root = root,
+                .path = skip.path,
+                .cause = skip.error_name,
+            };
+            try self.report(&switch (skip.kind) {
+                .entry => .{ .entry_skipped = .{ .path = root, .cause = skip.error_name } },
+                .directory => .{ .directory_unscanned = skipped },
+                .link => .{ .link_unresolved = skipped },
+                .followed_link => .{ .link_unfollowed = skipped },
+            });
+        }
+        if (match.stop == .entries) try self.report(&.{ .scan_capped = .{
+            .path = root,
+            .limit = entries_visited_max,
+        } });
+        if (match.matched > match.paths.len) try self.report(&.{ .paths_capped = .{
+            .path = root,
+            .limit = candidates_retained_max,
+        } });
         for (match.paths) |path| try self.loadPath(io, path, scope);
     }
 
     fn loadPath(self: *Registry, io: std.Io, path: []const u8, scope: Skill.Scope) !void {
-        if (!std.unicode.utf8ValidateSlice(path)) {
-            const safe = try escape.diagnostic(self.gpa, path);
-            defer self.gpa.free(safe);
-            try self.report(
-                .failure,
-                "Drinky skipped the skill path {s} because it is not valid UTF-8.",
-                .{safe},
-            );
-            return;
-        }
+        if (!std.unicode.utf8ValidateSlice(path))
+            return self.report(&.{ .path_invalid = path });
         const data = std.Io.Dir.cwd().readFileAlloc(
             io,
             path,
@@ -179,121 +158,62 @@ pub const Registry = struct {
             .limited(tools.read.bytes_max + 1),
         ) catch |err| switch (err) {
             error.Canceled, error.OutOfMemory => |known| return known,
-            error.StreamTooLong => return self.report(
-                .failure,
-                "Drinky skipped {s} because the skill file is larger than {d} bytes.",
-                .{ path, tools.read.bytes_max },
-            ),
-            else => return self.report(
-                .failure,
-                "Drinky could not read the skill file {s} because of error {s}.",
-                .{ path, @errorName(err) },
-            ),
+            error.StreamTooLong => return self.report(&.{ .too_large = .{
+                .path = path,
+                .limit = tools.read.bytes_max,
+            } }),
+            else => return self.report(&.{ .unread = .{
+                .path = path,
+                .cause = @errorName(err),
+            } }),
         };
         defer self.gpa.free(data);
-        if (!tools.format.isText(data)) {
-            try self.report(
-                .failure,
-                "Drinky skipped {s} because the skill file is not UTF-8 text.",
-                .{path},
-            );
-            return;
-        }
-        if (tools.format.lines(data) > tools.read.lines_max) {
-            try self.report(
-                .failure,
-                "Drinky skipped {s} because the skill file has more than {d} lines.",
-                .{ path, tools.read.lines_max },
-            );
-            return;
-        }
+        if (!tools.format.isText(data))
+            return self.report(&.{ .not_text = path });
+        if (tools.format.lines(data) > tools.read.lines_max) return self.report(&.{ .too_long = .{
+            .path = path,
+            .limit = tools.read.lines_max,
+        } });
 
         var frontmatter = front_matter.parse(self.gpa, data) catch |err| switch (err) {
-            error.MissingFrontmatter => {
-                try self.report(
-                    .failure,
-                    "Drinky skipped {s} because the YAML front matter is missing.",
-                    .{path},
-                );
-                return;
-            },
-            error.UnclosedFrontmatter => {
-                try self.report(
-                    .failure,
-                    "Drinky skipped {s} because the YAML front matter is not closed.",
-                    .{path},
-                );
-                return;
-            },
+            error.MissingFrontmatter => return self.report(&.{ .front_matter_missing = path }),
+            error.UnclosedFrontmatter => return self.report(&.{ .front_matter_unclosed = path }),
             error.OutOfMemory => return error.OutOfMemory,
         };
         defer frontmatter.deinit(self.gpa);
 
         const description = std.mem.trim(u8, frontmatter.description orelse "", " \t\r\n");
-        if (description.len == 0) {
-            try self.report(
-                .failure,
-                "Drinky skipped {s} because the skill description is missing or empty.",
-                .{path},
-            );
-            return;
-        }
-        if (std.mem.findScalar(u8, description, 0) != null) {
-            try self.report(
-                .failure,
-                "Drinky skipped {s} because the skill description contains a NUL byte.",
-                .{path},
-            );
-            return;
-        }
+        if (description.len == 0)
+            return self.report(&.{ .description_missing = path });
+        if (std.mem.findScalar(u8, description, 0) != null)
+            return self.report(&.{ .description_nul = path });
 
         const directory_path = std.Io.Dir.path.dirname(path).?;
         const directory_name = std.Io.Dir.path.basename(directory_path);
         const name_source = if (frontmatter.name) |declared| name: {
             if (nameValid(declared)) break :name declared;
-            const safe = try escape.diagnostic(self.gpa, declared);
-            defer self.gpa.free(safe);
-            try self.report(
-                .warning,
-                "Drinky used the directory name for {s} because the skill name \"{s}\" is not " ++
-                    "valid.",
-                .{ path, safe },
-            );
+            try self.report(&.{ .name_invalid = .{ .path = path, .name = declared } });
             break :name directory_name;
         } else name: {
-            try self.report(
-                .warning,
-                "Drinky used the directory name for {s} because the skill name is missing.",
-                .{path},
-            );
+            try self.report(&.{ .name_missing = path });
             break :name directory_name;
         };
-        if (!nameValid(name_source)) {
-            try self.report(
-                .failure,
-                "Drinky skipped {s} because the directory name \"{s}\" is not a valid skill name.",
-                .{ path, directory_name },
-            );
-            return;
-        }
-        if (!std.mem.eql(u8, name_source, directory_name)) try self.report(
-            .warning,
-            "The skill name \"{s}\" in {s} differs from the directory name \"{s}\".",
-            .{ name_source, path, directory_name },
-        );
+        if (!nameValid(name_source)) return self.report(&.{ .directory_invalid = .{
+            .path = path,
+            .name = directory_name,
+        } });
+        if (!std.mem.eql(u8, name_source, directory_name)) try self.report(&.{ .name_differs = .{
+            .path = path,
+            .name = name_source,
+            .directory = directory_name,
+        } });
         const description_length = std.unicode.utf8CountCodepoints(description) catch unreachable;
         const description_truncated = description_length > description_codepoints_max;
-        if (description_truncated) try self.report(
-            .warning,
-            "Drinky shortened the catalog description for {s} because it has more than " ++
-                "{d} characters.",
-            .{ path, description_codepoints_max },
-        );
-        if (frontmatter.metadata_inline) try self.report(
-            .warning,
-            "Drinky ignored the metadata in {s} because the value is not a block map.",
-            .{path},
-        );
+        if (description_truncated) try self.report(&.{ .description_shortened = .{
+            .path = path,
+            .limit = description_codepoints_max,
+        } });
+        if (frontmatter.metadata_inline) try self.report(&.{ .metadata_ignored = path });
 
         var skill: Skill = .{
             .name = try self.gpa.dupe(u8, name_source),
@@ -323,22 +243,18 @@ pub const Registry = struct {
                 incoming.* = undefined;
                 return;
             }
-            try self.report(
-                .failure,
-                "Drinky ignored the skill \"{s}\" at {s} because {s} has priority.",
-                .{ incoming.name, incoming.path, existing.path },
-            );
+            try self.report(&.{ .shadowed = .{
+                .path = incoming.path,
+                .name = incoming.name,
+                .winner = existing.path,
+            } });
             incoming.deinit(self.gpa);
             return;
         }
 
         if (self.skill_items.items.len == skills_max) {
             if (!self.skills_capped) {
-                try self.report(
-                    .failure,
-                    "Drinky loaded only the first {d} distinct skills.",
-                    .{skills_max},
-                );
+                try self.report(&.{ .count_capped = skills_max });
                 self.skills_capped = true;
             }
             incoming.deinit(self.gpa);
@@ -348,13 +264,8 @@ pub const Registry = struct {
         incoming.* = undefined;
     }
 
-    fn report(
-        self: *Registry,
-        severity: Message.Severity,
-        comptime template: []const u8,
-        args: anytype,
-    ) !void {
-        try self.reports.add(self.gpa, severity, template, args);
+    fn report(self: *Registry, report_value: *const Record.Event.SkillReport) !void {
+        try self.reports.add(self.gpa, &.{ .skill_report = report_value.* });
     }
 };
 
@@ -481,10 +392,9 @@ test "discovery is recursive and project skills shadow user and ancestor skills"
         "user/shared/SKILL.md",
     ));
     try std.testing.expect(registry.get("other").?.replaced_path == null);
-    try std.testing.expectEqual(@as(usize, 1), registry.reports.messages().len);
-    try std.testing.expect(
-        std.mem.find(u8, registry.reports.messages()[0].content, "has priority") != null,
-    );
+    const reports = registry.reports.events();
+    try std.testing.expectEqual(@as(usize, 1), reports.len);
+    try std.testing.expectEqualStrings("shared", reports[0].skill_report.shadowed.name);
 }
 
 test "without a Git root the project scan covers only the working directory" {
@@ -556,20 +466,25 @@ test "a skill file above the window of one read call is skipped" {
     try std.testing.expect(registry.get("wide") == null);
     try std.testing.expect(registry.get("tall") == null);
     try std.testing.expect(registry.get("edge") != null);
-    try std.testing.expectEqual(@as(usize, 2), registry.reports.messages().len);
-    try std.testing.expect(std.mem.find(
-        u8,
-        registry.reports.messages()[1].content,
-        "larger than",
-    ) != null);
-    try std.testing.expect(std.mem.find(
-        u8,
-        registry.reports.messages()[0].content,
-        "more than",
-    ) != null);
+    try expectProblems(&registry, &.{ .too_long, .too_large });
 }
 
-test "a skill that loads warns, and a skipped skill fails" {
+fn expectProblems(
+    registry: *const Registry,
+    expected: []const std.meta.Tag(Record.Event.SkillReport),
+) !void {
+    const events = registry.reports.events();
+    try std.testing.expectEqual(expected.len, events.len);
+    for (expected) |problem| {
+        var expected_count: usize = 0;
+        for (expected) |other| expected_count += @intFromBool(other == problem);
+        var count: usize = 0;
+        for (events) |*event| count += @intFromBool(event.skill_report == problem);
+        try std.testing.expectEqual(expected_count, count);
+    }
+}
+
+test "a skill that loads reports its fallbacks, and a skipped skill reports its problem" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var tree: testing.Tree = try .init();
@@ -604,13 +519,13 @@ test "a skill that loads warns, and a skipped skill fails" {
     try std.testing.expectEqual(@as(usize, description_codepoints_max), long.description.len);
     try std.testing.expect(long.description_truncated);
     try std.testing.expect(registry.get("manual").?.model_invocation_disabled);
-    const reports = registry.reports.messages();
-    try std.testing.expectEqual(@as(usize, 5), reports.len);
-    for (reports) |report| {
-        const skipped = std.mem.startsWith(u8, report.content, "Drinky skipped");
-        const severity: Message.Severity = if (skipped) .failure else .warning;
-        try std.testing.expectEqual(severity, report.severity);
-    }
+    try expectProblems(&registry, &.{
+        .name_invalid,
+        .description_missing,
+        .description_shortened,
+        .name_missing,
+        .directory_invalid,
+    });
 
     const manual = registry.get("manual").?;
     const explicit = try manual.invoke(gpa, io, "");
@@ -619,7 +534,7 @@ test "a skill that loads warns, and a skipped skill fails" {
     try std.testing.expect(std.mem.find(u8, explicit, "body") != null);
 }
 
-test "an inline metadata value hides no skill from a run and warns" {
+test "an inline metadata value hides no skill from a run and reports the ignored metadata" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var tree: testing.Tree = try .init();
@@ -638,16 +553,10 @@ test "an inline metadata value hides no skill from a run and warns" {
     defer registry.deinit();
 
     try std.testing.expect(registry.get("inline").?.advertised(.run));
-    const reports = registry.reports.messages();
-    try std.testing.expectEqual(@as(usize, 1), reports.len);
-    try std.testing.expectEqual(Message.Severity.warning, reports[0].severity);
+    try expectProblems(&registry, &.{.metadata_ignored});
     const path = try tree.path("user/inline/SKILL.md");
-    const expected = try gpa.print(
-        "Drinky ignored the metadata in {s} because the value is not a block map.",
-        .{path},
-    );
-    defer gpa.free(expected);
-    try std.testing.expectEqualStrings(expected, reports[0].content);
+    const ignored = registry.reports.events()[0].skill_report.metadata_ignored;
+    try std.testing.expectEqualStrings(path, ignored);
 }
 
 test "explicit invocation loads the full file and appends arguments" {
@@ -728,18 +637,18 @@ test "discovery follows directory symlinks once and skips cycles" {
     try std.testing.expect(registry.get("pdf-tools") != null);
 }
 
-test "a skill whose path is not valid UTF-8 is skipped with a safe warning" {
+test "a skill whose path is not valid UTF-8 is skipped and reported with the raw path" {
     const gpa = std.testing.allocator;
     var registry = Registry.init(gpa);
     defer registry.deinit();
     try registry.loadPath(undefined, "user/\xff\xfe/SKILL.md", .user);
 
     try std.testing.expectEqual(@as(usize, 0), registry.items().len);
-    try std.testing.expectEqual(@as(usize, 1), registry.reports.messages().len);
-    const notice = registry.reports.messages()[0];
-    try std.testing.expectEqual(Message.Severity.failure, notice.severity);
-    try std.testing.expect(std.mem.find(u8, notice.content, "not valid UTF-8") != null);
-    try std.testing.expect(std.mem.find(u8, notice.content, "\\xff") != null);
+    try expectProblems(&registry, &.{.path_invalid});
+    try std.testing.expectEqualStrings(
+        "user/\xff\xfe/SKILL.md",
+        registry.reports.events()[0].skill_report.path_invalid,
+    );
 }
 
 fn checkDiscoverAllocationFailure(

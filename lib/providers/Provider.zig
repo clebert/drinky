@@ -900,13 +900,11 @@ test "no dialect reports a reason that only the session produces" {
             var events: Dialect.Events = .empty;
             _ = try dialect.decode(arena.allocator(), payload, &events);
             try dialect.finish(arena.allocator(), &events);
-            for (events.items) |event| switch (event) {
-                .failed => |failure| {
-                    failures += 1;
-                    try std.testing.expect(!sessionOwns(failure.reason));
-                },
-                else => {},
-            };
+            for (events.items) |event| {
+                if (event != .failed) continue;
+                failures += 1;
+                try std.testing.expect(!sessionOwns(event.failed.reason));
+            }
         }
         try std.testing.expect(failures >= 5);
     }

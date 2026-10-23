@@ -24,7 +24,7 @@ const unbounded = std.math.maxInt(usize);
 
 gpa: std.mem.Allocator,
 title: []const u8,
-options: []const application.Picker.Option,
+options: []const Option,
 cursor: usize,
 current: ?usize,
 content: std.ArrayList(u8),
@@ -35,6 +35,30 @@ columns: usize,
 can_step_back: bool,
 wait: ?[]const u8,
 marks: std.ArrayList(paint.Mark),
+
+pub const Option = struct {
+    name: []const u8,
+    extra: ?[]const u8 = null,
+    extra_pressure: bool = false,
+    tag: ?[]const u8 = null,
+    tag_pressure: bool = false,
+
+    pub fn dupe(self: *const Option, gpa: std.mem.Allocator) error{OutOfMemory}!Option {
+        var result = self.*;
+        result.name = try gpa.dupe(u8, self.name);
+        errdefer gpa.free(result.name);
+        result.extra = if (self.extra) |extra| try gpa.dupe(u8, extra) else null;
+        errdefer if (result.extra) |extra| gpa.free(extra);
+        result.tag = if (self.tag) |tag| try gpa.dupe(u8, tag) else null;
+        return result;
+    }
+
+    pub fn deinit(self: *const Option, gpa: std.mem.Allocator) void {
+        gpa.free(self.name);
+        if (self.extra) |extra| gpa.free(extra);
+        if (self.tag) |tag| gpa.free(tag);
+    }
+};
 
 pub const Position = struct {
     cursor: usize = 0,
@@ -76,7 +100,7 @@ const Tag = struct {
 pub fn init(
     gpa: std.mem.Allocator,
     title: []const u8,
-    options: []const application.Picker.Option,
+    options: []const Option,
     start: *const Start,
 ) !Picker {
     const index_max = options.len -| 1;
@@ -262,7 +286,7 @@ fn compose(self: *Picker) !void {
     }
 }
 
-fn appendExtra(self: *Picker, option: *const application.Picker.Option) !?Range {
+fn appendExtra(self: *Picker, option: *const Option) !?Range {
     const extra = option.extra orelse return null;
     const start = self.content.items.len;
     try self.content.appendSlice(self.gpa, paint.separator);
@@ -270,14 +294,14 @@ fn appendExtra(self: *Picker, option: *const application.Picker.Option) !?Range 
     return .{ .start = start, .end = self.content.items.len };
 }
 
-fn tagColumns(current: bool, option: *const application.Picker.Option) usize {
+fn tagColumns(current: bool, option: *const Option) usize {
     if (current) return terminal.width.ofText(tag_current);
     const inner = option.tag orelse return 0;
     return terminal.width.ofText(tag_open) + terminal.width.ofText(inner) +
         terminal.width.ofText(tag_close);
 }
 
-fn appendTag(self: *Picker, current: bool, option: *const application.Picker.Option) !?Tag {
+fn appendTag(self: *Picker, current: bool, option: *const Option) !?Tag {
     const start = self.content.items.len;
     if (current) {
         try self.content.appendSlice(self.gpa, tag_current);
@@ -341,7 +365,7 @@ test "navigation rolls over at both ends and the cursor tracks the selection" {
 }
 
 fn testPicker(gpa: std.mem.Allocator, labels: []const []const u8, start: *const Start) !Picker {
-    const options = try gpa.alloc(application.Picker.Option, labels.len);
+    const options = try gpa.alloc(Option, labels.len);
     errdefer gpa.free(options);
     var count: usize = 0;
     errdefer for (options[0..count]) |*option| option.deinit(gpa);
@@ -388,7 +412,7 @@ test "the frame holds the option rows alone and the caption stays above it" {
 
 test "a current name is underlined, an extra is muted, and pressure is warning" {
     const gpa = std.testing.allocator;
-    const options = try gpa.alloc(application.Picker.Option, 4);
+    const options = try gpa.alloc(Option, 4);
     options[0] = .{ .name = try gpa.dupe(u8, "high") };
     options[1] = .{
         .name = try gpa.dupe(u8, "medium"),
@@ -425,7 +449,7 @@ test "option text is not extra or tag chrome" {
         "Notes · The output limit is unknown.",
         "google-cloud-key (Not loaded)",
     };
-    const options = try gpa.alloc(application.Picker.Option, labels.len);
+    const options = try gpa.alloc(Option, labels.len);
     for (labels, options) |label, *option| option.* = .{ .name = try gpa.dupe(u8, label) };
     var picker = try Picker.init(gpa, "Skill", options, &.{});
     defer picker.deinit();

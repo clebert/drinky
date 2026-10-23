@@ -285,7 +285,7 @@ fn callNumberMax(items: []const core.Conversation.Item) u64 {
             const number = std.fmt.parseInt(u64, digits, 10) catch continue;
             number_max = @max(number_max, number);
         },
-        else => {},
+        .message, .reasoning, .tool_result => {},
     };
     return number_max;
 }
@@ -296,7 +296,7 @@ fn callName(prior: []const core.Conversation.Item, call_id: []const u8) ![]const
         index -= 1;
         switch (prior[index]) {
             .tool_call => |call| if (std.mem.eql(u8, call.id, call_id)) return call.name,
-            else => {},
+            .message, .reasoning, .tool_result => {},
         }
     }
     return error.OrphanToolResult;

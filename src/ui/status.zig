@@ -1,10 +1,12 @@
 const std = @import("std");
 const application = @import("application");
+const format = @import("../format.zig");
 
 const core = @import("core");
 const terminal = @import("terminal");
 
 const attribute = @import("attribute.zig");
+const Message = @import("Message.zig");
 const paint = @import("paint.zig");
 const role = @import("role.zig");
 const testing = @import("testing.zig");
@@ -19,12 +21,19 @@ pub const Info = struct {
     model: ?[]const u8,
     effort: []const u8,
     account: ?[]const u8,
-    quota: ?application.Quota,
-    quota_age_ms: i64,
+    quota: ?Quota,
     credits: ?application.Credits,
     turn_active: bool,
     gauge: application.Settings.Gauge = .{},
-    notice: ?application.Message = null,
+    notice: ?Message = null,
+    confirmation: ?Confirmation = null,
+};
+
+pub const Confirmation = enum { message, removal, rewind };
+
+pub const Quota = struct {
+    windows: application.Quota,
+    age_ms: i64,
 };
 
 const Directory = struct {
@@ -165,7 +174,7 @@ fn paintRuns(sink: *terminal.View.Sink, line: *const Line, kept: []const u8) !vo
 }
 
 pub fn directoryLabel(gpa: std.mem.Allocator, directory: *const Directory) ![]const u8 {
-    const label = try application.support.format.path(
+    const label = try format.path(
         gpa,
         directory.path,
         &.{ .home_directory = directory.home },
@@ -181,7 +190,7 @@ pub fn render(placement: *const paint.Placement, info: *const Info) !void {
     if (info.notice) |notice| {
         var style: paint.NoticeStyle = .of(notice.severity);
         style.fit = .head;
-        const text = if (notice.confirmation) |confirmation| switch (confirmation) {
+        const text = if (info.confirmation) |confirmation| switch (confirmation) {
             .message => message: {
                 style.prefix = switch (notice.severity) {
                     inline else => |severity| (comptime paint.NoticeStyle.of(severity)).prefix ++
@@ -269,10 +278,10 @@ fn writeLeft(line: *Line, info: *const Info, parts: *const Parts) !void {
     try writeContext(line, info, parts.context);
     if (parts.cost) try writeCost(line, info);
     if (!info.turn_active) return;
-    if (info.quota) |quota| {
-        const windows = orderedWindows(&quota);
-        if (parts.quota_short) try writeQuotaPart(line, &windows[0], info, parts);
-        if (parts.quota_long) try writeQuotaPart(line, &windows[1], info, parts);
+    if (info.quota) |*quota| {
+        const windows = orderedWindows(&quota.windows);
+        if (parts.quota_short) try writeQuotaPart(line, &windows[0], quota.age_ms, info, parts);
+        if (parts.quota_long) try writeQuotaPart(line, &windows[1], quota.age_ms, info, parts);
     }
     if (parts.credits) try writeCredits(line, info);
     if (parts.cache) try writeCache(line, info);
@@ -298,12 +307,13 @@ fn sortMinutes(window: *const application.Quota.Window) u32 {
 fn writeQuotaPart(
     line: *Line,
     maybe_window: *const ?application.Quota.Window,
+    age_ms: i64,
     info: *const Info,
     parts: *const Parts,
 ) !void {
     const window = maybe_window.* orelse return;
     const wait_seconds = if (parts.quota_wait)
-        waitSeconds(window.reset_seconds, info.quota_age_ms)
+        waitSeconds(window.reset_seconds, age_ms)
     else
         null;
     try writeQuotaWindow(line, &window, info.gauge, wait_seconds);
@@ -489,11 +499,10 @@ const test_info: Info = .{
     .model = "claude-opus-4-8",
     .effort = "xhigh",
     .account = "anthropic-plan",
-    .quota = .{
+    .quota = .{ .windows = .{
         .primary = .{ .used_percent = 11.6, .window_minutes = 300, .reset_seconds = 3180 },
         .secondary = .{ .used_percent = 73.6, .window_minutes = 10080, .reset_seconds = 580_769 },
-    },
-    .quota_age_ms = 0,
+    }, .age_ms = 0 },
     .credits = null,
     .turn_active = true,
 };
@@ -698,10 +707,10 @@ test "a gauge takes a color when it fills past its threshold" {
     const gpa = std.testing.allocator;
     var info = test_info;
     info.context_tokens = 750_000;
-    info.quota = .{
+    info.quota = .{ .windows = .{
         .primary = .{ .used_percent = 90, .window_minutes = 300 },
         .secondary = .{ .used_percent = 74, .window_minutes = 10080 },
-    };
+    }, .age_ms = 0 };
     var rig: testing.Rig = undefined;
     rig.init(gpa);
     defer rig.deinit();
@@ -725,10 +734,10 @@ test "a configured pair moves the shares at which a gauge takes a color" {
     const gpa = std.testing.allocator;
     var info = test_info;
     info.gauge = .{ .percent_warning = 20, .percent_error = 50 };
-    info.quota = .{
+    info.quota = .{ .windows = .{
         .primary = .{ .used_percent = 50, .window_minutes = 300 },
         .secondary = .{ .used_percent = 19, .window_minutes = 10080 },
-    };
+    }, .age_ms = 0 };
     var rig: testing.Rig = undefined;
     rig.init(gpa);
     defer rig.deinit();
@@ -746,10 +755,10 @@ test "the color follows the share that the line prints" {
     const gpa = std.testing.allocator;
     var info = test_info;
     info.context_tokens = 746_000;
-    info.quota = .{
+    info.quota = .{ .windows = .{
         .primary = .{ .used_percent = 89.6, .window_minutes = 300 },
         .secondary = null,
-    };
+    }, .age_ms = 0 };
     var rig: testing.Rig = undefined;
     rig.init(gpa);
     defer rig.deinit();
@@ -904,7 +913,7 @@ test "a warning notice takes the warning symbol in the warning role" {
 
 test "semantic confirmations keep the terminal text, roles, and width reductions" {
     const cases = [_]struct {
-        kind: application.Confirmation,
+        kind: Confirmation,
         content: []const u8,
         expected: []const u8,
     }{
@@ -925,17 +934,14 @@ test "semantic confirmations keep the terminal text, roles, and width reductions
             .expected = "Press Enter again to rewind. Tool changes stay.",
         },
     };
-    for (cases) |case| for (std.enums.values(application.Message.Severity)) |severity| {
+    for (cases) |case| for (std.enums.values(Message.Severity)) |severity| {
         for ([_]usize{ 1, 2, 8, 27, 40, 100 }) |columns| {
             var actual: testing.Rig = undefined;
             actual.init(std.testing.allocator);
             defer actual.deinit();
             var info = test_info;
-            info.notice = .{
-                .content = case.content,
-                .severity = severity,
-                .confirmation = case.kind,
-            };
+            info.notice = .{ .content = case.content, .severity = severity };
+            info.confirmation = case.kind;
             try renderForTest(&actual, &info, columns);
 
             var expected: testing.Rig = undefined;
@@ -1045,10 +1051,10 @@ test "quota windows show the used share, labeled by length" {
 
 test "the shortest window prints first, whatever slot carries it" {
     var info = test_info;
-    info.quota = .{
+    info.quota = .{ .windows = .{
         .primary = .{ .used_percent = 10, .window_minutes = 10080, .reset_seconds = 580_769 },
         .secondary = .{ .used_percent = 4, .window_minutes = 300, .reset_seconds = 8600 },
-    };
+    }, .age_ms = 0 };
     try expectPlainShows(&info, "· 5h: 4% (2h) · Week: 10% (6d) ·");
 }
 
@@ -1076,17 +1082,19 @@ test "a lone quota window of any length shows under the label of its length" {
     };
     for (cases) |case| {
         var info = test_info;
-        info.quota = .{ .primary = .{ .used_percent = 12, .window_minutes = case.minutes } };
+        info.quota = .{ .windows = .{
+            .primary = .{ .used_percent = 12, .window_minutes = case.minutes },
+        }, .age_ms = 0 };
         try expectPlainShows(&info, case.shown);
     }
 }
 
 test "a window without a length prints after a window with a length" {
     var info = test_info;
-    info.quota = .{
+    info.quota = .{ .windows = .{
         .primary = .{ .used_percent = 0 },
         .secondary = .{ .used_percent = 77, .window_minutes = 10080 },
-    };
+    }, .age_ms = 0 };
     try expectPlainShows(&info, "· Week: 77% · Quota: 0% · Cache");
 }
 
@@ -1193,15 +1201,14 @@ test "a quota countdown shows the time left in its largest unit and drops at its
     };
     for (cases) |case| {
         var info = test_info;
-        info.quota = .{
+        info.quota = .{ .windows = .{
             .primary = .{
                 .used_percent = 12,
                 .window_minutes = 300,
                 .reset_seconds = case.reset_seconds,
             },
             .secondary = null,
-        };
-        info.quota_age_ms = case.age_ms;
+        }, .age_ms = case.age_ms };
         try expectPlainShows(&info, case.shown);
     }
 }

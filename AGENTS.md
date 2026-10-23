@@ -30,23 +30,36 @@ infrastructure modules for its existing fakes.
   usage sources, and saved state. `Client` builds the provider of one row and reports its usage
   source before the stop of every reply. The account registry is an actor with a child task for a
   sign-in or a model fetch. A row is an index into the table.
-- `lib/application` owns the shared controller, workflows, canonical transcript, interaction state,
-  turn boundaries, accounts, saved choices, statistics, and their lifetimes. The controller exposes
-  an opaque handle with commands, synchronous responses, events, and snapshots. Record changes use
-  stable ids. No client repeats a turn rule on these records. Apart from the `interface`
-  preferences, events and snapshots contain no terminal layout or control bindings. Each frontend
-  supplies its confirmation controls. The application also owns the config, discovery, system
-  prompt, and tools. Shared reference facts include terminal controls. The public `support`
-  namespace exposes helpers without a runtime owner or controller access. `support.outOfMemory`
-  exposes `core.fatal.outOfMemory`.
+- `lib/application` owns the shared controller, workflows, canonical transcript, work state,
+  generated results, turn boundaries, accounts, saved choices, statistics, and their lifetimes. The
+  controller exposes an opaque handle with semantic commands, queries, synchronous responses,
+  events, and snapshots. A command names its target by an account, a model, a turn id, or an
+  operation id. Work stays exclusive across turns, asides, sign-ins, and model fetches. Record
+  changes use stable ids. No client repeats a turn rule on these records. Apart from the `interface`
+  preferences, events and snapshots contain no terminal layout, navigation, editor instruction,
+  control binding, or text for the user. A refusal, a startup refusal, a notice, and a record event
+  are typed facts with data fields, and each client words them. The controller validates the target
+  and the current state of each command, and it asks for no confirmation. The application also owns
+  the config, discovery, shared model instructions, and tools. Each frontend supplies its output
+  instructions and reference text as data. The controller requires frontend text and copies it
+  during creation. A frontend can release that text when creation returns. The application composes
+  those texts with the shared instructions and reference facts. Config schemas, defaults,
+  validation, and neutral descriptions stay with the application. The public `support` namespace
+  exposes helpers without a runtime owner or controller access. `support.outOfMemory` exposes
+  `core.fatal.outOfMemory`.
 - `src` owns the native clients. The terminal loop hosts the controller and owns keys, editor
-  mechanics, focus, and animation. The screen owns a disposable presentation copy and its layout
-  caches. It applies interactions and snapshots through one path. A snapshot preserves local
-  navigation when the page id or picker id stays unchanged. The presentation copy applies record
-  changes by id and groups work runs for display. Native clients use only public application
-  commands and events for application operations. Routine repaints use the local copy without a
-  snapshot. The UI fits and paints Markdown through one shared layout walk. `Herdr.Endpoint` stays
-  terminal integration data.
+  mechanics, focus, and animation. It also owns slash-command parsing, pickers, pages, drafts,
+  confirmation policy, command descriptions, control hints, terminal reference text, and terminal
+  output instructions. Each native client supplies the words of every typed fact.
+  `src/reference.zig` owns the command table and control hints. `src/describe.zig` owns the native
+  reference text and output instructions. `src/format.zig` owns the native display helpers.
+  `src/wording.zig` words the refusals and record events, and `src/headless.zig` words the startup
+  refusals. The screen owns a disposable presentation copy and its layout caches. It applies states
+  and snapshots through one path. A snapshot keeps the local pickers and pages. The presentation
+  copy applies record changes by id and groups work runs for display. Native clients use only public
+  application commands, queries, and events for application operations. Routine repaints use the
+  local copy without a snapshot. The UI fits and paints Markdown through one shared layout walk.
+  `Herdr.Endpoint` stays terminal integration data.
 - `src/ui/role.zig` maps a role to terminal colors. A widget names a role and writes no color of its
   own.
 
@@ -55,10 +68,10 @@ controller calls. The session and account registry post owned mail to the mailbo
 mailbox must accept posts from concurrent tasks. `Controller.receive` takes ownership of each mail.
 The host closes its mailbox before controller destruction. It releases any remaining mail with the
 controller allocator. Event callbacks borrow their data, and a sink copies data that it retains. A
-sink must not call the controller from an event callback. A response borrows its editor text until
-the next command. The host applies or copies that text before it submits another command. A client
-dismisses a notice by its id. Dismissal also withdraws its confirmation. A stale notice id changes
-no interaction state.
+sink must not call the controller from an event callback. The host records a continuation from an
+event and runs it after the controller call returns. A response and a query result borrow controller
+memory until the next controller call. The host copies that data before it calls the controller
+again. A client dismisses a notice by its id. A stale notice id changes no state.
 
 A loop task lends state to its child task and touches none of it until the child ends. The child
 returns its result with its end. A lock guards state that the tasks of two actors share.
@@ -72,18 +85,26 @@ costs through a private pipe to that sink. The pipe ends with the `bash` invocat
 
 These rules outrank existing behavior and repository precedent.
 
-- Equivalent UI elements must share a semantic renderer across the transcript, pages, and status
-  surfaces. The shared renderer must own the roles, symbols, metadata order, and width reductions.
-- An exit ends one thing. An exit is Esc, Ctrl+C, or Ctrl+D. No exit reaches past the step, the
-  page, or the turn that holds it.
-- Drinky destroys nothing without a decision. If a key press has another meaning, Drinky warns
-  first. A second press of the same key confirms the action.
-- `/verbose` toggles the displayed detail, even during a turn. It clears terminal scrollback and
-  repaints the complete transcript without a warning.
+### Product guarantees
+
+- An exit ends one operation or interaction. It reaches no enclosing operation or interaction.
+- Drinky destroys no user work without an explicit decision. Each frontend owns its confirmation
+  controls.
 - A failure is not a decision. Every draft and user message survives a failure. Out of memory is the
   exception. It ends Drinky, and the draft is lost.
 - `user_note` is the role of a message that Drinky writes for the user. An event reports session
   state. A user message holds typed text or a handoff that the user applied.
+
+### Terminal policies
+
+- Equivalent UI elements must share a semantic renderer across the transcript, pages, and status
+  surfaces. The shared renderer must own the roles, symbols, metadata order, and width reductions.
+- An exit is Esc, Ctrl+C, or Ctrl+D. No exit reaches past the step, the page, or the turn that holds
+  it.
+- If a key press has another meaning, Drinky warns first. A second press of the same key confirms
+  the action.
+- `/verbose` toggles the displayed detail, even during a turn. It clears terminal scrollback and
+  repaints the complete transcript without a warning.
 
 ## Code
 
@@ -92,13 +113,17 @@ These rules outrank existing behavior and repository precedent.
   name, or the chat.
 - Less code is better. Delete code without a caller. Add a seam, a pointer with a vtable in the
   shape of `std.mem.Allocator`, only when a second implementation or a test fake exists.
-- Before you write a helper, search the modules that the build lets the module import. Move a second
-  copy to the lowest module that both callers import.
+- Before you write a helper, search the modules that the build lets the module import. Share code
+  within its responsibility boundary. Semantic ownership takes priority over the removal of
+  duplicate code. Do not move presentation code into the application or core solely to share it.
 - Production code holds no option, entry point, mode, or global that only a test uses. A test fakes
   the clock through an `Io` and the network through a `Transport`. A size cap stays an option when
   no test can reach its production value.
 - Do not pass the implementation of a contract as `anytype`. A seam or a generic type states the
   contract.
+- A fact that crosses a module boundary carries the data needed to interpret its meaning. A client
+  must not infer a missing cause or target. A client can use the originating request to choose its
+  words. Do not add redundant fields solely to select those words.
 - A branch that no production path reaches is an assert or `unreachable`. It holds no text for the
   user.
 - Write a rule for each vendor, wire, or sign-in flow as an exhaustive switch over its enum.

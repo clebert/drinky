@@ -1,6 +1,6 @@
 const std = @import("std");
 
-const tools = @import("tools");
+const application = @import("application");
 
 pub const Roots = struct {
     working_directory: []const u8 = "",
@@ -33,12 +33,16 @@ pub fn path(
 ) error{OutOfMemory}![]u8 {
     const working = roots.working_directory;
     const home = roots.home_directory;
-    if (tools.format.relativeTo(&.{ .boundary = working, .target = target })) |relative|
-        return gpa.dupe(u8, relative);
-    if (tools.format.relativeTo(&.{ .boundary = home, .target = target })) |relative|
+    if (application.support.paths.relativeTo(&.{
+        .boundary = working,
+        .target = target,
+    })) |relative| return gpa.dupe(u8, relative);
+    if (application.support.paths.relativeTo(&.{ .boundary = home, .target = target })) |relative|
         return gpa.print("~/{s}", .{relative});
-    if (home.len > 0 and tools.format.contains(&.{ .boundary = home, .target = target }))
-        return gpa.dupe(u8, "~");
+    if (home.len > 0 and application.support.paths.contains(&.{
+        .boundary = home,
+        .target = target,
+    })) return gpa.dupe(u8, "~");
     return gpa.dupe(u8, target);
 }
 
@@ -54,6 +58,25 @@ pub fn durationSeconds(buffer: []u8, milliseconds: i64, rounding: Rounding) []co
         @divFloor(seconds, std.time.s_per_min),
         @mod(seconds, std.time.s_per_min),
     }) catch unreachable;
+}
+
+pub fn singleLine(text: []u8) []u8 {
+    var length: usize = 0;
+    var blank = false;
+    for (text) |byte| {
+        if (byte == ' ' or byte <= 0x1f or byte == 0x7f) {
+            blank = length > 0;
+            continue;
+        }
+        if (blank) {
+            text[length] = ' ';
+            length += 1;
+            blank = false;
+        }
+        text[length] = byte;
+        length += 1;
+    }
+    return text[0..length];
 }
 
 test path {

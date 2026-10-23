@@ -8,25 +8,25 @@ const controller = @import("Controller.zig");
 pub const Controller = controller.Handle;
 pub const Options = controller.Options;
 pub const Startup = controller.Startup;
+pub const Frontend = @import("Harness.zig").Frontend;
 pub const Command = controller.Command;
 pub const Event = controller.Event;
 pub const Sink = controller.Sink;
 pub const Mail = controller.Mail;
 pub const Mailbox = controller.Mailbox;
 pub const Response = controller.Response;
-pub const Confirmation = @import("Message.zig").Confirmation;
+pub const Refusal = controller.Refusal;
+pub const StartupRefusal = controller.StartupRefusal;
+pub const query = @import("query.zig");
 pub const SkillLoaded = core.Session.Event.SkillLoaded;
 
 pub const Snapshot = @import("Snapshot.zig");
-pub const Interaction = @import("Interaction.zig");
+pub const State = @import("State.zig");
 pub const model_list = @import("model_list.zig");
 pub const Record = @import("Record.zig");
 pub const Live = @import("Live.zig");
-pub const Picker = @import("Picker.zig");
-pub const Page = @import("Page.zig");
 pub const Statistics = @import("Surface.zig").Statistics;
 pub const Settings = @import("Settings.zig");
-pub const Message = @import("Message.zig");
 pub const Choice = @import("Choice.zig");
 pub const Usage = core.Provider.Usage;
 pub const Quota = core.Provider.Quota;
@@ -53,10 +53,15 @@ pub const support = struct {
     pub const duration = tools.format.duration;
     pub const entryNoun = tools.walk.entryNoun;
     pub const diagnostic = @import("escape.zig").diagnostic;
-    pub const format = @import("format.zig");
-    pub const failureText = @import("turn_text.zig").failureText;
-    pub const truncated = @import("turn_text.zig").truncated;
-    pub const exhausted = @import("turn_text.zig").exhausted;
+    pub const display = @import("escape.zig").display;
+    pub const paths = struct {
+        pub const relativeTo = tools.format.relativeTo;
+        pub const contains = tools.format.contains;
+    };
+    pub const environment = @import("tool_environment.zig");
+    pub const config = struct {
+        pub const keyPath = @import("Config.zig").keyPath;
+    };
     pub const outOfMemory = core.fatal.outOfMemory;
 };
 
@@ -67,9 +72,8 @@ test {
     _ = @import("Config.zig");
     _ = @import("describe.zig");
     _ = @import("discovery/root.zig");
-    _ = @import("command/root.zig");
+    _ = @import("escape.zig");
     _ = @import("system_prompt.zig");
-    _ = @import("sources.zig");
     _ = @import("Transcript.zig");
     _ = @import("reducer.zig");
 }

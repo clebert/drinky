@@ -305,7 +305,7 @@ test "the block iterator retains each block and its source slices" {
                 try std.testing.expectEqualStrings("[x] ", item.task_box.?);
                 try std.testing.expectEqualStrings("done", item.body);
             },
-            else => {},
+            .fence_open, .fence_line, .fence_close, .blank, .rule, .paragraph => {},
         }
     }
     try std.testing.expect(blocks.next() == null);

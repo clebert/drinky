@@ -3,9 +3,6 @@ const core = @import("core");
 const Record = @import("Record.zig");
 const Surface = @import("Surface.zig");
 const testing = @import("testing.zig");
-const turn_text = @import("turn_text.zig");
-
-const canceled_event = "You canceled the turn.";
 
 pub fn apply(
     self: *Surface,
@@ -78,10 +75,8 @@ pub fn apply(
             const status: Record.Work.Status = for (uncommitted) |*entry| {
                 if (entry.record.work != null) break .failed;
             } else .complete;
-            const message = try Surface.attemptMessage(self.gpa, attempt);
-            defer message.deinit(self.gpa);
             try self.transcript.append(
-                &.{ .event = .{ .text = message.content, .severity = message.severity } },
+                &.{ .event = .{ .attempt_failed = .from(attempt) } },
                 .{ .survives_discard = true },
             );
             self.transcript.closeWork(&.{ .time_ms = time.awake_ms, .status = status });
@@ -167,8 +162,7 @@ fn runCall(
     const id = try self.gpa.dupe(u8, started.id);
     self.gpa.free(call.id);
     call.id = id;
-    call.phase = .running;
-    call.started_ms = time.awake_ms;
+    call.phase = .{ .running = .{ .started_ms = time.awake_ms } };
     while (turn.firstCall(&.{.streaming})) |later| later.call.?.phase = .queued;
 }
 
@@ -182,13 +176,10 @@ fn settleCall(
         turn.firstCall(&.{ .running, .queued, .streaming }) orelse
         return self.appendUnknownResult(result, now_ms);
     const call = &block.call.?;
-    const ran = call.phase == .running;
-    if (!ran) try self.describeCall(call, &result.call);
-    const canceled = result.output.conditions.contains(.canceled);
+    if (call.phase != .running) try self.describeCall(call, &result.call);
     block.transcript_index = try self.appendCallResult(call, result, &.{
-        .ran = ran,
         .now_ms = now_ms,
-        .canceled = canceled,
+        .canceled = result.output.conditions.contains(.canceled),
     });
     call.phase = .done;
 }
@@ -242,36 +233,24 @@ fn recordServed(
     @memcpy(turn.served_buffer[0..length], served.served[0..length]);
     turn.served_length = length;
     self.transcript.endMessage();
-    const text = try self.gpa.print(
-        "The provider answered with the model \"{s}\" instead of the requested model \"{s}\".",
-        .{ served.served, served.requested },
-    );
-    defer self.gpa.free(text);
-    try self.transcript.append(&.{ .event = .{ .text = text, .severity = .warning } }, .{});
+    try self.transcript.append(&.{ .event = .{ .model_substituted = .{
+        .requested = served.requested,
+        .served = served.served,
+    } } }, .{});
     self.transcript.closeWork(&.{ .time_ms = time.awake_ms, .status = .complete });
 }
 
 fn recordOutcome(self: *Surface, outcome: *const core.Session.Outcome) !void {
-    switch (outcome.*) {
+    const event: Record.Event = switch (outcome.*) {
         .stopped => |reason| switch (reason) {
-            .complete => {},
-            .truncated => try self.transcript.append(&.{ .event = .{
-                .text = turn_text.truncated.content,
-                .severity = turn_text.truncated.severity,
-            } }, .{}),
+            .complete => return,
+            .truncated => .reply_truncated,
         },
-        .canceled => try self.transcript.append(&.{ .event = .{ .text = canceled_event } }, .{}),
-        .exhausted => try appendFailure(self, turn_text.exhausted),
-        .failed => |*failure| {
-            const text = try turn_text.failureText(self.gpa, failure);
-            defer self.gpa.free(text);
-            try appendFailure(self, text);
-        },
-    }
-}
-
-fn appendFailure(self: *Surface, text: []const u8) !void {
-    try self.transcript.append(&.{ .event = .{ .text = text, .severity = .failure } }, .{});
+        .canceled => .turn_canceled,
+        .exhausted => .tool_rounds_exhausted,
+        .failed => |*failure| .{ .request_failed = .from(failure) },
+    };
+    try self.transcript.append(&.{ .event = event }, .{});
 }
 
 test "a turn reduction frees each partial allocation" {

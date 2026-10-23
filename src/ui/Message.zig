@@ -4,10 +4,8 @@ const Message = @This();
 
 content: []const u8,
 severity: Severity,
-confirmation: ?Confirmation = null,
 
 pub const Severity = enum { information, warning, failure };
-pub const Confirmation = enum { message, removal, rewind };
 
 pub fn print(
     gpa: std.mem.Allocator,

@@ -344,7 +344,6 @@ const test_status: ui.status.Info = .{
     .effort = "high",
     .account = "anthropic-plan",
     .quota = null,
-    .quota_age_ms = 0,
     .credits = null,
     .turn_active = false,
 };

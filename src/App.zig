@@ -1,16 +1,24 @@
 const std = @import("std");
 const application = @import("application");
+const reference = @import("reference.zig");
 const terminal = @import("terminal");
 const accounts = @import("accounts");
 const core = @import("core");
 const providers = @import("providers");
 const tools = @import("tools");
+const command = @import("command.zig");
+const describe = @import("describe.zig");
+const Flow = @import("Flow.zig");
 const Herdr = @import("Herdr.zig");
 const Screen = @import("Screen.zig");
+const sources = @import("sources.zig");
 const testing = @import("testing.zig");
 const ui = @import("ui/root.zig");
+const wording = @import("wording.zig");
 const App = @This();
 const turn_cancel_notice = "Press Esc again to cancel the turn. The draft stays.";
+const turn_message_notice = "Drinky sends no message while a turn runs. The draft stays.";
+const fetch_cancel_notice = "You canceled the model fetch.";
 const login_callback_controls = "Enter: Replay callback URL · Esc: Cancel";
 const login_device_controls = "Esc: Cancel";
 const retry_caption: ui.Caption = .{
@@ -25,12 +33,13 @@ const removal_caption: ui.Caption = .{
 };
 const intro_text = blk: {
     var line: []const u8 = "";
-    for (application.reference.key_hints) |hint| line = line ++ hint ++ ui.paint.separator;
-    break :blk line ++ "/help: Commands";
+    for (reference.key_hints) |hint| line = line ++ hint ++ ui.paint.separator;
+    break :blk line ++ reference.line(.help) ++ ": Commands";
 };
 const escape_wait_ms = 50;
 const sign_in_title_bytes_max = 64;
 const queue_capacity = 256;
+const pending_max = 4;
 
 gpa: std.mem.Allocator,
 io: std.Io,
@@ -38,14 +47,12 @@ device: terminal.Device,
 controller: *application.Controller,
 screen: Screen,
 input: terminal.Input,
-mode: application.Interaction.Mode = .prompt,
-offer: application.Interaction.Offer = .none,
-working: bool = false,
-takes_paste: bool = false,
+work: application.State.Work = .idle,
+offer: application.State.Offer = .none,
 running: bool = false,
 dirty: bool = false,
-ctrl_c_ms_last: i64 = -application.reference.repeat_window_ms,
-ctrl_d_ms_last: i64 = -application.reference.repeat_window_ms,
+ctrl_c_ms_last: i64 = -reference.repeat_window_ms,
+ctrl_d_ms_last: i64 = -reference.repeat_window_ms,
 escape_deadline_ms: ?i64 = null,
 queue: std.Io.Queue(UiEvent),
 queue_buffer: [queue_capacity]UiEvent = undefined,
@@ -56,6 +63,9 @@ tick_future: ?std.Io.Future(void) = null,
 frame_grid: FrameGrid = .reset(0),
 herdr: Herdr,
 confirmation: ?Confirmation = null,
+flow: ?Flow = null,
+pending: [pending_max]Transition = undefined,
+pending_count: usize = 0,
 edits: u64 = 0,
 paste_edits: ?u64 = null,
 working_directory: []const u8,
@@ -104,11 +114,32 @@ const FrameGrid = struct {
     }
 };
 
-const Confirmation = enum {
+const Mode = union(enum) {
+    prompt,
+    turn: u64,
+    picker,
+    fetch,
+    page,
+    sign_in: application.State.SignIn,
+};
+
+const Origin = enum { line, help };
+
+const Exit = enum { escape, ctrl_c, ctrl_d };
+
+const CheckedStep = enum { model, logout, rewind };
+
+const Transition = union(enum) {
+    sign_in: application.Event.SignInEnd,
+    fetch: application.Event.FetchEnd,
+    no_account,
+};
+
+const Confirmation = union(enum) {
     message,
     quit,
-    removal,
-    rewind,
+    removal: u64,
+    rewind: u64,
     cancel,
 
     fn confirms(self: Confirmation, event: *const terminal.Input.Key) bool {
@@ -160,11 +191,18 @@ pub fn init(self: *App, gpa: std.mem.Allocator, io: std.Io, options: *const Opti
     self.queue = .init(&self.queue_buffer);
     errdefer self.screen.deinit();
     errdefer self.input.deinit();
+    const document = try describe.compose(gpa);
+    defer gpa.free(document);
+    const frontend: application.Frontend = .{
+        .instructions = describe.terminal_instructions,
+        .reference = document,
+    };
     self.controller = try application.Controller.create(gpa, io, &.{
         .directories = .{ .working_directory = options.working_directory, .home = options.home },
         .environment = options.environment,
         .environ = options.environ,
-        .startup = .terminal,
+        .startup = .session,
+        .frontend = frontend,
         .transport = options.transport,
         .browser = options.browser,
         .loopback = options.loopback,
@@ -173,25 +211,27 @@ pub fn init(self: *App, gpa: std.mem.Allocator, io: std.Io, options: *const Opti
     });
     errdefer {
         self.stopQueue();
+        self.closeFlow();
         self.controller.destroy();
         self.drainQueue();
         self.gpa.free(self.home_directory);
         self.gpa.free(self.directory_label);
     }
-    _ = self.controller.submit(&.snapshot);
+    errdefer self.herdr.deinit();
     self.herdr.start(options.herdr) catch |err| {
-        const message = try application.Message.print(
-            gpa,
-            .failure,
+        const text = try gpa.print(
             "Drinky could not start the state reports to Herdr because of error {s}.",
             .{@errorName(err)},
         );
-        defer message.deinit(gpa);
-        _ = self.controller.submit(&.{ .client_notice = message });
+        defer gpa.free(text);
+        try self.screen.setStartupFailure(text);
     };
+    _ = self.controller.submit(&.snapshot);
+    try self.settle();
 }
 pub fn deinit(self: *App) void {
     self.stopQueue();
+    self.closeFlow();
     self.controller.destroy();
     self.closeQueue();
     self.herdr.deinit();
@@ -266,9 +306,9 @@ fn runLoop(self: *App) !void {
         };
         const ticked = try self.applyBatch(batch[0..count]);
         try self.flushEscape();
-        self.herdr.sync(
-            if (self.working) .working else if (self.offer == .retry) .blocked else .idle,
-        );
+        self.herdr.sync(if (self.working())
+            .working
+        else if (self.offer == .retry) .blocked else .idle);
         if (ticked) {
             self.awaitFuture(&self.tick_future);
             const activity_changed = self.screen.advanceFrame(self.nowMs());
@@ -282,6 +322,10 @@ fn runLoop(self: *App) !void {
             self.escape_deadline_ms != null;
         if (waiting and self.tick_future == null) try self.armTick();
     }
+}
+
+fn working(self: *const App) bool {
+    return self.work == .turn or self.work == .aside;
 }
 
 fn armTick(self: *App) !void {
@@ -338,9 +382,10 @@ fn readInput(self: *App) void {
 fn handleKeys(self: *App, bytes: []const u8) !void {
     try self.input.feed(bytes);
     while (self.input.next()) |event| {
-        const before = self.mode;
+        const before = std.meta.activeTag(self.mode());
         try self.handleKey(&event);
-        if (before != self.mode and isExitKey(&event)) {
+        try self.settle();
+        if (before != std.meta.activeTag(self.mode()) and exitOf(&event) != null) {
             while (self.input.next()) |_| {}
             break;
         }
@@ -351,11 +396,30 @@ fn handleKeys(self: *App, bytes: []const u8) !void {
         null;
 }
 
-fn isExitKey(event: *const terminal.Input.Key) bool {
+fn exitOf(event: *const terminal.Input.Key) ?Exit {
     return switch (event.*) {
-        .escape => true,
-        .ctrl => |letter| letter == 'c' or letter == 'd',
-        else => false,
+        .escape => .escape,
+        .ctrl => |letter| switch (letter) {
+            'c' => .ctrl_c,
+            'd' => .ctrl_d,
+            else => null,
+        },
+        .char,
+        .paste,
+        .enter,
+        .shift_enter,
+        .tab,
+        .backspace,
+        .left,
+        .right,
+        .up,
+        .down,
+        .page_up,
+        .page_down,
+        .home,
+        .end,
+        .unknown,
+        => null,
     };
 }
 
@@ -366,11 +430,42 @@ fn flushEscape(self: *App) !void {
     if (!self.input.takeEscape()) return;
     self.dirty = true;
     try self.handleKey(&.escape);
+    try self.settle();
+}
+
+fn mode(self: *const App) Mode {
+    if (self.flow) |*flow| return if (flow.fetch == null) .picker else .fetch;
+    if (self.screen.widget == .page) return .page;
+    return switch (self.work) {
+        .idle, .fetch => .prompt,
+        .turn => |operation| .{ .turn = operation },
+        .sign_in => |sign_in| .{ .sign_in = sign_in },
+        .aside => .page,
+    };
+}
+
+fn armed(self: *const App, expected: Confirmation) bool {
+    const current = self.confirmation orelse return false;
+    return std.meta.eql(current, expected);
 }
 
 fn disarm(self: *App, event: *const terminal.Input.Key) void {
     const confirmation = self.confirmation orelse return;
     if (!confirmation.confirms(event)) self.confirmation = null;
+}
+
+fn confirm(self: *App, confirmation: Confirmation, notice: ui.Message) void {
+    self.screen.confirm(switch (confirmation) {
+        .message => .message,
+        .removal => .removal,
+        .rewind => .rewind,
+        .quit, .cancel => unreachable,
+    }, notice);
+    self.confirmation = confirmation;
+}
+
+fn confirmTurn(self: *App, confirmation: Confirmation) !void {
+    self.confirm(confirmation, try ui.Message.print(self.gpa, .warning, "", .{}));
 }
 
 fn draftEmpty(self: *const App) bool {
@@ -379,6 +474,11 @@ fn draftEmpty(self: *const App) bool {
 
 fn clearDraft(self: *App) void {
     self.screen.editor.clear();
+    self.screen.markEdited();
+}
+
+fn prependDraft(self: *App, text: []const u8) !void {
+    try self.screen.editor.prependText(text);
     self.screen.markEdited();
 }
 
@@ -399,7 +499,7 @@ fn editKey(self: *App, event: *const terminal.Input.Key) !bool {
             'j' => try editor.insert("\n"),
             else => return false,
         },
-        else => return false,
+        .enter, .tab, .escape, .page_up, .page_down, .unknown => return false,
     }
     self.screen.markEdited();
     self.edits +%= 1;
@@ -408,7 +508,7 @@ fn editKey(self: *App, event: *const terminal.Input.Key) !bool {
 
 fn clearOrQuit(self: *App) void {
     const now = self.nowMs();
-    if (now - self.ctrl_c_ms_last < application.reference.repeat_window_ms) {
+    if (now - self.ctrl_c_ms_last < reference.repeat_window_ms) {
         self.running = false;
     } else {
         self.clearDraft();
@@ -418,8 +518,8 @@ fn clearOrQuit(self: *App) void {
 
 fn quitOrWarn(self: *App) !void {
     const draft = !self.draftEmpty();
-    const recent_exit = self.nowMs() - self.ctrl_d_ms_last < application.reference.repeat_window_ms;
-    if (self.confirmation == .quit or (!draft and !recent_exit)) {
+    const recent_exit = self.nowMs() - self.ctrl_d_ms_last < reference.repeat_window_ms;
+    if (self.armed(.quit) or (!draft and !recent_exit)) {
         self.running = false;
         return;
     }
@@ -438,7 +538,7 @@ fn quitOrWarn(self: *App) !void {
 fn refresh(self: *App) !void {
     const size: terminal.View.Size = self.device.size() orelse
         .{ .columns = self.screen.columns, .rows = self.screen.rows };
-    try self.device.setAlternateScreen(self.mode == .page);
+    try self.device.setAlternateScreen(self.mode() == .page);
     try self.screen.paint(size, self.screenTime(), &self.caption());
 }
 
@@ -459,16 +559,18 @@ fn nowNs(self: *App) i96 {
 }
 
 fn caption(self: *const App) ?ui.Caption {
-    if (self.mode == .sign_in) return .{
-        .title = self.sign_in_title[0..self.sign_in_title_length],
-        .controls = if (self.takes_paste) login_callback_controls else login_device_controls,
-        .rows_max = Screen.editor_caption_rows_max,
-    };
-    if (self.mode != .prompt) return null;
-    return switch (self.offer) {
-        .none => null,
-        .retry => retry_caption,
-        .removal => removal_caption,
+    return switch (self.mode()) {
+        .sign_in => |sign_in| .{
+            .title = self.sign_in_title[0..self.sign_in_title_length],
+            .controls = if (sign_in.callback) login_callback_controls else login_device_controls,
+            .rows_max = Screen.editor_caption_rows_max,
+        },
+        .prompt => switch (self.offer) {
+            .none => null,
+            .retry => retry_caption,
+            .removal => removal_caption,
+        },
+        .turn, .picker, .fetch, .page => null,
     };
 }
 fn applyBatch(self: *App, events: []const UiEvent) !bool {
@@ -486,35 +588,78 @@ fn applyBatch(self: *App, events: []const UiEvent) !bool {
                 _ = self.controller.submit(&.refresh_project);
                 try self.handleKeys(bytes);
             },
-            .mail => |mail| self.controller.receive(mail),
+            .mail => |mail| {
+                self.controller.receive(mail);
+                try self.settle();
+            },
         }
     }
     return ticked;
 }
 fn applyEvent(self: *App, event: *const application.Event) !void {
+    if (Screen.changeOf(event)) |*change| try self.screen.applyChange(change);
     switch (event.*) {
         .snapshot => |*snapshot| try self.applySnapshot(snapshot),
-        .interaction => |*value| {
-            const verbose = self.screen.verbose;
+        .state => |*value| {
             self.adopt(value);
-            try self.screen.applyInteraction(value);
-            if (self.screen.verbose != verbose) try self.reportNotice(
-                .information,
-                "Verbose output is {s}.",
-                .{if (self.screen.verbose) "on" else "off"},
-            );
+            try self.screen.applyState(value);
         },
+        .paste_replayed => if (self.paste_edits == self.edits) self.clearDraft(),
+        .sign_in_ended => |ended| self.postpone(.{ .sign_in = ended }),
+        .fetch_ended => |ended| self.postpone(.{ .fetch = ended }),
+        .no_account => self.postpone(.no_account),
         .append_record,
         .record_text,
         .replace_record,
         .remove_records,
         .live,
         .statistics,
-        .page_text,
         .clear_conversation,
-        => try self.screen.applyChange(event),
-        .paste_replayed => if (self.paste_edits == self.edits) self.clearDraft(),
-        .turn_ended, .charge, .startup_refused => {},
+        .turn_ended,
+        .charge,
+        .startup_refused,
+        => {},
+    }
+}
+fn postpone(self: *App, transition: Transition) void {
+    for (self.pending[0..self.pending_count]) |held| {
+        if (std.meta.eql(held, transition)) return;
+    }
+    std.debug.assert(self.pending_count < pending_max);
+    self.pending[self.pending_count] = transition;
+    self.pending_count += 1;
+}
+fn settle(self: *App) !void {
+    var index: usize = 0;
+    while (index < self.pending_count) : (index += 1) {
+        switch (self.pending[index]) {
+            .sign_in => |ended| if (ended.signed_in) {
+                try self.startFlow(Flow.forAccount(&self.controller.listAccounts(), ended.account));
+            },
+            .fetch => |ended| try self.finishFetch(&ended),
+            .no_account => {
+                self.closeFlow();
+                try self.startFlow(.login);
+            },
+        }
+    }
+    self.pending_count = 0;
+}
+fn finishFetch(self: *App, ended: *const application.Event.FetchEnd) !void {
+    const flow = if (self.flow) |*flow| flow else return;
+    const fetch = flow.fetch orelse return;
+    if (fetch.operation != ended.operation) return;
+    flow.fetch = null;
+    const exit = fetch.exit orelse {
+        if (ended.listed) return self.showStep(flow.step, .{});
+        return self.closeFlow();
+    };
+    switch (exit) {
+        .command => try self.cancelFlow(),
+        .step => {
+            try self.showStep(flow.step, .{});
+            try self.reportNotice(.information, fetch_cancel_notice, .{});
+        },
     }
 }
 fn applySnapshot(self: *App, snapshot: *const application.Snapshot) !void {
@@ -532,6 +677,7 @@ fn applySnapshot(self: *App, snapshot: *const application.Snapshot) !void {
     else
         self.directory_label;
     errdefer if (initialize_roots) self.gpa.free(label);
+    if (initialize_roots) self.screen.verbose = snapshot.settings.verbose;
     try self.screen.restore(snapshot);
     self.home_directory = home;
     self.directory_label = label;
@@ -540,81 +686,341 @@ fn applySnapshot(self: *App, snapshot: *const application.Snapshot) !void {
         .home_directory = home,
     };
     self.screen.directory_shown = if (self.project_row) self.directory_label else "";
-    self.adopt(&snapshot.interaction);
+    self.adopt(&snapshot.state);
 }
-fn adopt(self: *App, value: *const application.Interaction) void {
-    self.mode = value.mode;
+fn adopt(self: *App, value: *const application.State) void {
+    if (value.notice_id != self.screen.notice_id and self.armed(.message)) self.confirmation = null;
+    self.work = value.work;
     self.offer = value.offer;
-    self.working = value.working;
-    self.takes_paste = value.takes_paste;
-    const title = std.fmt.bufPrint(&self.sign_in_title, "Sign in: {s}", .{value.sign_in_account});
+    const sign_in = switch (value.work) {
+        .sign_in => |sign_in| sign_in,
+        .idle, .turn, .aside, .fetch => return,
+    };
+    const title = std.fmt.bufPrint(
+        &self.sign_in_title,
+        "Sign in: {s}",
+        .{application.query.accountId(sign_in.account)},
+    );
     self.sign_in_title_length = (title catch unreachable).len;
 }
-fn send(self: *App, command: *const application.Command) !void {
-    const response = self.controller.submit(command);
-    if (command.* == .submit and self.mode == .sign_in and response.accepted)
-        self.paste_edits = self.edits;
-    try self.applyEditor(&response.editor);
-    const kind = response.confirmation orelse return;
-    self.confirmation = switch (kind) {
-        .message => .message,
-        .rewind => .rewind,
-        .removal => .removal,
-    };
-}
-fn applyEditor(self: *App, editor: *const application.Response.Editor) !void {
-    switch (editor.*) {
-        .keep => {},
-        .clear => self.clearDraft(),
-        .replace => |text| try self.screen.setDraft(text),
-        .prepend => |text| {
-            try self.screen.editor.prependText(text);
-            self.screen.markEdited();
-        },
-    }
+fn send(self: *App, value: *const application.Command) !application.Response {
+    const response = self.controller.submit(value);
+    const refusal = response.refusal orelse return response;
+    const message = try wording.refusal(self.gpa, value, &refusal) orelse return response;
+    defer message.deinit(self.gpa);
+    try self.showMessage(&message);
+    return response;
 }
 fn submit(self: *App) !void {
-    const confirmed = self.confirmation == .message;
+    const confirmed = self.armed(.message);
     self.confirmation = null;
     if (self.screen.editor.blank()) return;
     const text = try self.screen.editor.expanded();
     defer self.gpa.free(text);
-    try self.send(&.{ .submit = .{ .line = text, .confirmed = confirmed } });
+    switch (self.mode()) {
+        .sign_in => |sign_in| {
+            const response = try self.send(&.{ .submit_callback = .{
+                .operation = sign_in.operation,
+                .line = text,
+            } });
+            if (response.accepted()) self.paste_edits = self.edits;
+        },
+        .turn => try self.submitDuringTurn(text),
+        .prompt => if (confirmed) try self.sendMessage(text) else try self.submitLine(text),
+        .picker, .fetch, .page => unreachable,
+    }
 }
-fn cancel(self: *App, step: bool) !void {
-    try self.send(&.{ .cancel = .{ .step = step } });
-}
-fn handleExit(self: *App, event: *const terminal.Input.Key, notice_shown: bool) !void {
-    if (event.* == .ctrl and event.ctrl == 'd' and self.mode != .prompt)
-        self.ctrl_d_ms_last = self.nowMs();
-    if (event.* == .ctrl and event.ctrl == 'c' and
-        (self.mode == .prompt or self.mode == .turn or self.mode == .sign_in) and
-        !self.draftEmpty())
-    {
-        if (self.mode == .prompt) self.clearOrQuit() else self.clearDraft();
+fn submitLine(self: *App, line: []const u8) !void {
+    const command_name = command.name(line) orelse return self.sendMessage(line);
+    if (try command.check(self.gpa, line, self.controller.listSkills())) |message|
+        return self.confirm(.message, message);
+    const tail = command.tail(line, command_name);
+    if (command.skillName(command_name)) |skill| {
+        const response = try self.send(&.{ .invoke_skill = .{
+            .name = skill,
+            .arguments = tail,
+            .line = line,
+        } });
+        if (response.accepted()) self.clearDraft();
         return;
     }
-    if (event.* == .escape and self.mode == .turn) {
-        if (notice_shown and self.confirmation != .cancel) return;
-        if (!self.draftEmpty() and self.confirmation != .cancel) {
-            try self.reportNotice(.warning, turn_cancel_notice, .{});
-            self.confirmation = .cancel;
-            return;
-        }
-        return self.cancel(false);
+    try self.runCommand(command.lookup(command_name).?, tail, .line);
+}
+fn submitDuringTurn(self: *App, line: []const u8) !void {
+    if (try command.checkDuringTurn(self.gpa, line, self.controller.listSkills())) |message| {
+        defer message.deinit(self.gpa);
+        return self.showMessage(&message);
     }
-    switch (self.mode) {
-        .prompt => switch (event.*) {
-            .escape => try self.send(&.dismiss_offer),
-            .ctrl => |letter| switch (letter) {
-                'c' => self.clearOrQuit(),
-                'd' => try self.quitOrWarn(),
-                else => unreachable,
-            },
-            else => unreachable,
+    const command_name = command.name(line) orelse return self.sendMessage(line);
+    try self.runCommand(command.lookup(command_name).?, command.tail(line, command_name), .line);
+}
+fn sendMessage(self: *App, line: []const u8) !void {
+    const response = try self.send(&.{ .send_message = line });
+    const refusal = response.refusal orelse return self.clearDraft();
+    if (refusal == .busy) try self.reportNotice(.information, turn_message_notice, .{});
+}
+fn runCommand(
+    self: *App,
+    value: reference.Command,
+    tail: []const u8,
+    origin: Origin,
+) !void {
+    switch (value) {
+        .effort => try self.openCommandStep(.effort, origin),
+        .help => try self.openCommandStep(.help, origin),
+        .login => try self.openCommandStep(.login, origin),
+        .logout => try self.openCheckedStep(.logout, origin),
+        .model => try self.openCheckedStep(.model, origin),
+        .rewind => try self.openCheckedStep(.rewind, origin),
+        .skill => {
+            if (self.controller.listSkills().len > 0) return self.openCommandStep(.skill, origin);
+            self.closeFlow();
+            try self.reportNotice(.warning, "Drinky found no skill.", .{});
         },
-        .picker, .fetch => try self.cancel(event.* == .escape),
-        .turn, .sign_in, .page => try self.cancel(false),
+        .handoff => {
+            self.closeFlow();
+            _ = try self.send(&.{ .prepare_handoff = tail });
+            if (origin == .help) try self.screen.setDraft(reference.line(.handoff));
+        },
+        .tldr => {
+            self.closeFlow();
+            if ((try self.send(&.prepare_short_answer)).accepted()) self.clearDraft();
+        },
+        .new => {
+            self.closeFlow();
+            const accepted = (try self.send(&.new_conversation)).accepted();
+            if (accepted and origin == .line) self.clearDraft();
+        },
+        .sources => {
+            self.closeFlow();
+            const page = try sources.compose(self.gpa, &.{
+                .documents = &self.controller.documents(),
+                .roots = self.screen.display_roots,
+            });
+            defer self.gpa.free(page);
+            try self.screen.openPage(&.{ .title = "Sources", .content = page });
+            if (origin == .line) self.clearDraft();
+        },
+        .system => {
+            self.closeFlow();
+            const prompt = self.controller.documents().system_prompt;
+            try self.screen.openPage(&.{ .title = "System prompt", .content = prompt });
+            if (origin == .line) self.clearDraft();
+        },
+        .verbose => {
+            self.closeFlow();
+            try self.toggleVerbose();
+            if (origin == .line) self.clearDraft();
+        },
+    }
+}
+fn openCommandStep(self: *App, step: Flow.Step, origin: Origin) !void {
+    switch (origin) {
+        .line => {
+            try self.startFlow(step);
+            self.clearDraft();
+        },
+        .help => try self.openStep(step),
+    }
+}
+fn openCheckedStep(self: *App, checked: CheckedStep, origin: Origin) !void {
+    if (self.work != .idle) return self.closeFlow();
+    const step: Flow.Step = switch (checked) {
+        .model => .vendor,
+        .logout => .logout,
+        .rewind => .rewind,
+    };
+    const missing = self.missingTarget(checked) orelse return self.openCommandStep(step, origin);
+    self.closeFlow();
+    try self.showMessage(&missing);
+}
+fn missingTarget(self: *App, checked: CheckedStep) ?ui.Message {
+    const facts = self.controller.listAccounts();
+    return switch (checked) {
+        .model => for (&facts) |*fact| {
+            if (fact.authenticated) break null;
+        } else .{
+            .severity = .failure,
+            .content = "Sign in to an account before you select a model.",
+        },
+        .logout => for (&facts) |*fact| {
+            if (fact.login and fact.authenticated) break null;
+        } else .{ .severity = .failure, .content = "No accounts are signed in." },
+        .rewind => if (self.controller.listTurns().len > 0)
+            null
+        else
+            .{ .severity = .warning, .content = "No prompts are in the conversation." },
+    };
+}
+fn toggleVerbose(self: *App) !void {
+    self.screen.setVerbose(!self.screen.verbose);
+    try self.reportNotice(
+        .information,
+        "Verbose output is {s}.",
+        .{if (self.screen.verbose) "on" else "off"},
+    );
+}
+fn startFlow(self: *App, step: Flow.Step) !void {
+    self.closeFlow();
+    self.flow = .init(self.gpa);
+    try self.showStep(Flow.resolve(self.controller, step), .{});
+}
+fn openStep(self: *App, step: Flow.Step) !void {
+    const flow = &self.flow.?;
+    const resolved = Flow.resolve(self.controller, step);
+    if (!std.meta.eql(flow.step, resolved)) flow.push(self.screen.activePicker().?.cursor);
+    try self.showStep(resolved, .{});
+}
+fn showStep(self: *App, step: Flow.Step, options: struct { cursor: ?usize = null }) !void {
+    const flow = &self.flow.?;
+    const shown = try flow.show(self.controller, &self.screen.choice, step);
+    try self.screen.openPicker(&.{
+        .title = shown.title,
+        .options = shown.options,
+        .current = shown.current,
+        .preselected = shown.preselected,
+        .cursor = options.cursor,
+        .depth = flow.depth,
+    });
+}
+fn closeFlow(self: *App) void {
+    const flow = if (self.flow) |*flow| flow else return;
+    flow.deinit();
+    self.flow = null;
+    self.screen.closePicker();
+}
+fn cancelFlow(self: *App) !void {
+    const message = self.flow.?.step.cancellation();
+    self.closeFlow();
+    try self.reportNotice(.information, "{s}", .{message});
+}
+fn backFlow(self: *App) !void {
+    const entry = self.flow.?.back() orelse return self.cancelFlow();
+    try self.showStep(Flow.resolve(self.controller, entry.step), .{ .cursor = entry.cursor });
+}
+fn selectRow(self: *App) !void {
+    const flow = &self.flow.?;
+    const item = flow.target(self.screen.activePicker().?.cursor);
+    switch (item) {
+        .command => |value| try self.runCommand(value, "", .help),
+        .vendor => |account| try self.openStep(.{ .account = account }),
+        .account => |account| {
+            try self.openStep(Flow.forAccount(&self.controller.listAccounts(), account));
+        },
+        .fetch => |account| {
+            const response = try self.send(&.{ .fetch_models = account });
+            const operation = response.operation orelse return;
+            flow.fetch = .{ .operation = operation };
+            try self.screen.beginPickerWait(Flow.fetch_wait_text);
+        },
+        .author => |named| {
+            try flow.setAuthor(named.name);
+            try self.openStep(.{ .author_models = named.account });
+        },
+        .model => |named| {
+            const name = try self.gpa.dupe(u8, named.name);
+            defer self.gpa.free(name);
+            self.closeFlow();
+            _ = try self.send(&.{ .select_model = .{ .account = named.account, .model = name } });
+        },
+        .effort => |level| {
+            self.closeFlow();
+            _ = try self.send(&.{ .set_effort = level });
+        },
+        .sign_in => |account| {
+            self.closeFlow();
+            _ = try self.send(&.{ .select_account = account });
+        },
+        .sign_out => |account| {
+            self.closeFlow();
+            _ = try self.send(&.{ .sign_out = account });
+        },
+        .skill => |name| {
+            const line = try self.gpa.print(
+                "{s}{s} ",
+                .{ "/" ++ reference.skill_prefix, name },
+            );
+            defer self.gpa.free(line);
+            self.closeFlow();
+            try self.screen.setDraft(line);
+        },
+        .turn => |turn| {
+            if (turn.mutated and !self.armed(.{ .rewind = turn.id }))
+                return self.confirmTurn(.{ .rewind = turn.id });
+            self.confirmation = null;
+            self.closeFlow();
+            const response = try self.send(&.{ .rewind = turn.id });
+            if (response.recovered) |text| try self.prependDraft(text);
+        },
+    }
+}
+fn takeOffer(self: *App) !void {
+    switch (self.offer) {
+        .none => {},
+        .retry => _ = try self.send(&.retry),
+        .removal => |removal| {
+            if (removal.mutated and !self.armed(.{ .removal = removal.turn }))
+                return self.confirmTurn(.{ .removal = removal.turn });
+            self.confirmation = null;
+            const response = try self.send(&.{ .remove_canceled_turn = removal.turn });
+            if (response.recovered) |text| try self.prependDraft(text);
+        },
+    }
+}
+fn cancelWork(self: *App, operation: u64) !void {
+    _ = try self.send(&.{ .cancel = operation });
+}
+fn exitFetch(self: *App, exit: Flow.Fetch.Exit) !void {
+    const fetch = &self.flow.?.fetch.?;
+    if (fetch.exit != null) return;
+    fetch.exit = exit;
+    _ = try self.send(&.{ .cancel = fetch.operation });
+}
+fn closePage(self: *App) !void {
+    const shown = self.screen.result_page orelse return self.screen.closePage();
+    if (shown.phase == .generating) {
+        _ = try self.send(&.{ .cancel = shown.id });
+        return;
+    }
+    _ = try self.send(&.{ .discard_result = shown.id });
+}
+fn applyResult(self: *App) !void {
+    const shown = self.screen.result_page.?;
+    if ((try self.send(&.{ .apply_result = shown.id })).accepted()) self.clearDraft();
+}
+fn handleExit(self: *App, exit: Exit, notice_shown: bool) !void {
+    const current = self.mode();
+    if (exit == .ctrl_d and current != .prompt) self.ctrl_d_ms_last = self.nowMs();
+    if (exit == .ctrl_c and
+        (current == .prompt or current == .turn or current == .sign_in) and
+        !self.draftEmpty())
+    {
+        if (current == .prompt) self.clearOrQuit() else self.clearDraft();
+        return;
+    }
+    if (exit == .escape) switch (current) {
+        .turn => |operation| {
+            if (notice_shown and !self.armed(.cancel)) return;
+            if (!self.draftEmpty() and !self.armed(.cancel)) {
+                try self.reportNotice(.warning, turn_cancel_notice, .{});
+                self.confirmation = .cancel;
+                return;
+            }
+            return self.cancelWork(operation);
+        },
+        .prompt, .picker, .fetch, .page, .sign_in => {},
+    };
+    switch (current) {
+        .prompt => switch (exit) {
+            .escape => _ = try self.send(&.dismiss_offer),
+            .ctrl_c => self.clearOrQuit(),
+            .ctrl_d => try self.quitOrWarn(),
+        },
+        .picker => if (exit == .escape) try self.backFlow() else try self.cancelFlow(),
+        .fetch => try self.exitFetch(if (exit == .escape) .step else .command),
+        .turn => |operation| try self.cancelWork(operation),
+        .sign_in => |sign_in| try self.cancelWork(sign_in.operation),
+        .page => try self.closePage(),
     }
 }
 fn handleKey(self: *App, event: *const terminal.Input.Key) !void {
@@ -623,32 +1029,54 @@ fn handleKey(self: *App, event: *const terminal.Input.Key) !void {
     self.screen.clearNotice();
     if (notice_shown and self.confirmation == null)
         _ = self.controller.submit(&.{ .dismiss_notice = self.screen.notice_id });
-    if (isExitKey(event)) return self.handleExit(event, notice_shown);
-    switch (self.mode) {
+    if (exitOf(event)) |exit| return self.handleExit(exit, notice_shown);
+    switch (self.mode()) {
         .prompt, .turn, .sign_in => {
             if (try self.editKey(event)) return;
             switch (event.*) {
                 .enter => try self.submit(),
-                .ctrl => |letter| if (letter == 'n' and self.mode == .prompt) {
-                    const confirmed = self.confirmation == .removal;
-                    self.confirmation = null;
-                    try self.send(&.{ .take_offer = .{ .confirmed = confirmed } });
+                .ctrl => |letter| if (letter == 'n' and self.mode() == .prompt) {
+                    try self.takeOffer();
                 },
-                else => {},
+                .char,
+                .paste,
+                .shift_enter,
+                .tab,
+                .backspace,
+                .left,
+                .right,
+                .up,
+                .down,
+                .page_up,
+                .page_down,
+                .home,
+                .end,
+                .unknown,
+                => {},
+                .escape => unreachable,
             }
         },
         .picker => {
-            const picker = self.screen.activePicker() orelse return;
+            const picker = self.screen.activePicker().?;
             switch (event.*) {
                 .up => try picker.moveUp(),
                 .down => try picker.moveDown(),
-                .enter => {
-                    const confirmed = self.confirmation == .rewind;
-                    self.confirmation = null;
-                    const cursor = picker.cursor;
-                    try self.send(&.{ .select = .{ .cursor = cursor, .confirmed = confirmed } });
-                },
-                else => {},
+                .enter => try self.selectRow(),
+                .escape => unreachable,
+                .char,
+                .ctrl,
+                .paste,
+                .shift_enter,
+                .tab,
+                .backspace,
+                .left,
+                .right,
+                .page_up,
+                .page_down,
+                .home,
+                .end,
+                .unknown,
+                => {},
             }
         },
         .fetch => {},
@@ -659,7 +1087,7 @@ fn handleKey(self: *App, event: *const terminal.Input.Key) !void {
                 .rows = self.screen.rows,
             };
             switch (event.*) {
-                .enter => if (page.action == .apply) try self.send(&.apply_preview),
+                .enter => if (page.action == .apply) try self.applyResult(),
                 .up => page.moveUp(size),
                 .down => page.moveDown(size),
                 .page_up => page.pageUp(size),
@@ -669,22 +1097,34 @@ fn handleKey(self: *App, event: *const terminal.Input.Key) !void {
                 .char => |codepoint| if (codepoint == 'm' or codepoint == 'M') {
                     page.toggleSource(size);
                 },
-                else => {},
+                .escape => unreachable,
+                .ctrl,
+                .paste,
+                .shift_enter,
+                .tab,
+                .backspace,
+                .left,
+                .right,
+                .unknown,
+                => {},
             }
         },
     }
 }
 fn reportNotice(
     self: *App,
-    severity: application.Message.Severity,
+    severity: ui.Message.Severity,
     comptime format: []const u8,
     args: anytype,
 ) !void {
-    const notice = try application.Message.print(self.gpa, severity, format, args);
-    if (self.confirmation == .message) self.confirmation = null;
+    const notice = try ui.Message.print(self.gpa, severity, format, args);
+    if (self.armed(.message)) self.confirmation = null;
     self.screen.setNotice(notice);
 }
-test "a Herdr startup failure stays in canonical snapshots, and the branch stays known" {
+fn showMessage(self: *App, message: *const ui.Message) !void {
+    try self.reportNotice(message.severity, "{s}", .{message.content});
+}
+test "a Herdr startup failure stays in the transcript across snapshots with the branch" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{ .concurrent_limit = .limited(2) });
     defer threaded.deinit();
@@ -706,15 +1146,18 @@ test "a Herdr startup failure stays in canonical snapshots, and the branch stays
         .herdr = .{ .socket_path = "/unused", .pane_id = "p1" },
     });
     defer app.deinit();
-    const blocks = app.screen.transcript.block_list.items;
-    const notice = &blocks[blocks.len - 1].content.event;
-    try std.testing.expectEqual(.failure, notice.severity);
-    try testing.expectContains(
-        notice.text.items,
-        "Drinky could not start the state reports to Herdr because of error " ++
-            "ConcurrencyUnavailable.",
-    );
-    try std.testing.expectEqualStrings("main", app.screen.branch().?);
+    for (0..2) |_| {
+        const blocks = app.screen.transcript.block_list.items;
+        const notice = &blocks[1].content.event;
+        try std.testing.expectEqual(.failure, notice.severity);
+        try std.testing.expectEqualStrings(
+            "Drinky could not start the state reports to Herdr because of error " ++
+                "ConcurrencyUnavailable.",
+            notice.text.items,
+        );
+        try std.testing.expectEqualStrings("main", app.screen.branch().?);
+        _ = app.controller.submit(&.snapshot);
+    }
 }
 
 test "startup keeps shell scrollback, and a verbosity toggle clears it" {
@@ -738,7 +1181,7 @@ test "startup keeps shell scrollback, and a verbosity toggle clears it" {
     });
 }
 
-test "a prompt runs a turn through the session, and the answer joins the transcript" {
+test "terminal turns use frontend instructions and append replies to the transcript" {
     var rig: Rig = undefined;
     try rig.init(&.{
         .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
@@ -764,6 +1207,15 @@ test "a prompt runs a turn through the session, and the answer joins the transcr
         .{ .activity = false },
     });
     try std.testing.expectEqual(@as(usize, 2), rig.transport.requests.items.len);
+    try expectRequested(
+        &rig,
+        "## Frontend\\n\\nDrinky renders your answer as Markdown in a terminal",
+    );
+    try expectRequested(&rig, "keep it short");
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        std.mem.count(u8, rig.lastRequest(), "You run inside Drinky"),
+    );
 }
 
 const sign_in_titles = blk: {
@@ -774,7 +1226,6 @@ const sign_in_titles = blk: {
 
 const retry_note = "Drinky asked the model to continue from the committed work.";
 const short_answer_title = "Short answer";
-const turn_message_notice = "Drinky sends no message while a turn runs. The draft stays.";
 const removal_warning = "Press Ctrl+N again to remove the canceled turn. Tool changes stay.";
 const rewind_warning = "Press Enter again to rewind. Tool changes stay.";
 
@@ -1223,7 +1674,7 @@ test "a failed turn or retry offers a retry that Esc dismisses and Ctrl+N sends 
     });
     try expectRequested(
         &rig,
-        "\"text\":\"<retry_request>\\nThe provider is overloaded. Details: 500 Internal Server " ++
+        "\"text\":\"<retry_request>\\nFailure: overloaded\\nDetails: 500 Internal Server " ++
             "Error: down\\nContinue from the last committed checkpoint.\\n</retry_request>\"",
     );
     try rig.keys("\x0e");
@@ -1277,18 +1728,10 @@ test "Ctrl+N removes a canceled turn, keeps the later events, and returns its li
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, rig.lastRequest(), "fix it"));
 }
 
-const write_call_stream =
-    "data: {\"type\":\"response.output_item.done\",\"item\":{\"id\":\"fc_1\"," ++
-    "\"type\":\"function_call\",\"status\":\"completed\",\"call_id\":\"call_1\"," ++
-    "\"name\":\"write\",\"arguments\":\"{}\"}}\n" ++
-    "\n" ++
-    "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n" ++
-    "\n";
-
 test "Ctrl+N warns before it removes a canceled turn that ran a mutating tool" {
     var stall: providers.testing.FakeTransport.Stall = .{ .io = std.testing.io };
     const replies = [_]providers.testing.FakeTransport.Reply{
-        .{ .body = write_call_stream },
+        .{ .body = application.testing.write_call_stream },
         .{ .stall = &stall },
     };
     var rig: Rig = undefined;
@@ -1455,7 +1898,7 @@ test "/rewind returns the chosen prompt to the editor and drops its turn and eve
 
 test "/rewind warns before it drops a turn that ran a mutating tool" {
     const replies = [_]providers.testing.FakeTransport.Reply{
-        .{ .body = write_call_stream },
+        .{ .body = application.testing.write_call_stream },
         .{ .body = providers.testing.reply_stream },
         .{ .body = providers.testing.reply_stream },
         .{ .body = providers.testing.reply_stream },
@@ -2380,26 +2823,116 @@ test "Esc ends a model fetch at its step, and Ctrl+C ends the whole command" {
     try step_stall.reached.wait(std.testing.io);
     try rig.waitFor(&.{
         .{ .absent = model_picker },
-        .{ .text = application.reference.fetch_wait_text },
+        .{ .text = Flow.fetch_wait_text },
     });
     try rig.keys("\x1b");
     try rig.waitFor(&.{
         .{ .text = model_picker },
-        .{ .absent = application.reference.fetch_wait_text },
+        .{ .absent = Flow.fetch_wait_text },
         .{ .status = "You canceled the model fetch." },
     });
     try std.testing.expect(step_stall.canceled);
 
     try rig.keys("\r");
     try command_stall.reached.wait(std.testing.io);
-    try rig.waitFor(&.{.{ .text = application.reference.fetch_wait_text }});
+    try rig.waitFor(&.{.{ .text = Flow.fetch_wait_text }});
     try rig.keys("\x03");
     try rig.waitFor(&.{
         .{ .absent = "Model: openai-api-key · " },
-        .{ .absent = application.reference.fetch_wait_text },
+        .{ .absent = Flow.fetch_wait_text },
         .{ .status = "You canceled the model selection." },
     });
     try std.testing.expect(command_stall.canceled);
+}
+
+test "help keeps its command position across nested steps and fetch cancellations" {
+    var stalls: [2]providers.testing.FakeTransport.Stall = @splat(.{ .io = std.testing.io });
+    var rig: Rig = undefined;
+    try rig.init(&.{
+        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .replies = &.{ .{ .stall = &stalls[0] }, .{ .stall = &stalls[1] } },
+    });
+    defer rig.deinit();
+    const help_caption = "Command · ↑/↓: Move · Enter: Select · Esc: Cancel";
+    const model_caption = "Model: openai-api-key · ↑/↓: Move · Enter: Select · Esc: Back";
+    try rig.keys("/help\r");
+    try rig.waitFor(&.{.{ .text = help_caption }});
+    try rig.keys(core.text.repeat("\x1b[B", 4));
+    try rig.waitFor(&.{.{ .text = " > /model" }});
+    try rig.keys("\r");
+    try rig.waitFor(&.{.{ .text = model_caption }});
+    for (&stalls) |*stall| {
+        try rig.keys("\r");
+        try stall.reached.wait(std.testing.io);
+        try rig.waitFor(&.{.{ .text = Flow.fetch_wait_text }});
+        try rig.keys("\x1b");
+        try rig.waitFor(&.{
+            .{ .text = model_caption },
+            .{ .status = "You canceled the model fetch." },
+        });
+        try std.testing.expect(stall.canceled);
+    }
+    try rig.keys("\x1b");
+    try rig.waitFor(&.{ .{ .text = help_caption }, .{ .text = " > /model" } });
+    try rig.keys("\r");
+    try rig.waitFor(&.{.{ .text = "Model: openai-api-key · ↑/↓" }});
+    try rig.keys("\x03");
+    try rig.waitFor(&.{
+        .{ .absent = "Model: openai-api-key · " },
+        .{ .status = "You canceled the model selection." },
+    });
+}
+
+test "a completed model fetch reopens its step with the fetched models" {
+    var rig: Rig = undefined;
+    try rig.init(&.{
+        .store = accounts.testing.planStore("first"),
+        .replies = &.{
+            .{ .body = application.testing.plan_models_body },
+            .{ .body = "{\"data\":[]}" },
+        },
+    });
+    defer rig.deinit();
+    try rig.waitFor(&.{.{ .status = "Model: openai-plan/none" }});
+    try rig.keys("/model\r");
+    try rig.waitFor(&.{
+        .{ .text = "Model: openai-plan · ↑/↓" },
+        .{ .line = " > Fetch the model list" },
+    });
+    try rig.keys("\r");
+    try rig.waitFor(&.{
+        .{ .text = "Model: openai-plan · ↑/↓" },
+        .{ .rows = &.{ " > Refresh the model list", "   gpt-next" } },
+    });
+    try rig.keys("\x1b[B\r");
+    try rig.waitFor(&.{
+        .{ .absent = "Model: openai-plan · ↑/↓" },
+        .{ .status = "Model: openai-plan/gpt-next" },
+        .{ .text = "Drinky now uses openai-plan/gpt-next." },
+    });
+}
+
+test "a model fetch that signs out the last account opens the sign-in picker" {
+    var rig: Rig = undefined;
+    try rig.init(&.{
+        .store = application.testing.expired_plan_store,
+        .replies = &.{
+            .{
+                .status = .unauthorized,
+                .body = "{\"error\":{\"code\":\"refresh_token_reused\"}}",
+            },
+            .{ .body = "{\"data\":[]}" },
+        },
+    });
+    defer rig.deinit();
+    try rig.keys("/model\r");
+    try rig.waitFor(&.{.{ .text = "Model: openai-plan · ↑/↓" }});
+    try rig.keys("\r");
+    try rig.waitFor(&.{
+        .{ .text = "Sign in · ↑/↓" },
+        .{ .text = "Drinky signed out of openai-plan. Select an account to sign in." },
+        .{ .status = "Model: signed out" },
+    });
 }
 
 test "Esc on the models of an author returns to the author step at that author" {
@@ -2562,7 +3095,7 @@ test "Esc stops the short answer before the page closes, and a failed or cut one
     try rig.keys("/tldr\r");
     try rig.waitFor(&.{
         .{ .alternate_screen = true },
-        .{ .rows = &.{ "cut", application.support.truncated.content } },
+        .{ .rows = &.{ "cut", testing.truncated_text } },
     });
     try rig.keys("\x1b");
     try rig.waitFor(&.{.{ .alternate_screen = false }});
@@ -2594,11 +3127,11 @@ test "incomplete page replies use the transcript failure symbol and color" {
         try rig.keys(command_line);
         try rig.waitFor(&.{
             .{ .alternate_screen = true },
-            .{ .text = application.support.truncated.content },
+            .{ .text = testing.truncated_text },
         });
         const output = try rig.device.outputBytes(gpa);
         defer gpa.free(output);
-        try testing.expectContains(output, "\x1b[31m⚠ " ++ application.support.truncated.content);
+        try testing.expectContains(output, "\x1b[31m⚠ " ++ testing.truncated_text);
     }
 }
 
@@ -2842,7 +3375,7 @@ test "a failed or truncated handoff cannot apply, and its command survives" {
     try rig.waitFor(&.{ .{ .alternate_screen = false }, .{ .editor = "/handoff Keep checks." } });
     try rig.keys("\r");
     try rig.waitFor(
-        &.{ .{ .text = application.support.truncated.content }, .{ .absent = "Enter: Apply" } },
+        &.{ .{ .text = testing.truncated_text }, .{ .absent = "Enter: Apply" } },
     );
     try rig.keys("\r\x1b");
     try rig.waitFor(&.{
@@ -2998,10 +3531,6 @@ test "paste labels keep their sequence across an immediate new draft" {
     try rig.waitFor(&.{.{ .text = "[Paste #2: 1001 bytes]" }});
 }
 
-fn verboseNotice(verbose: bool) []const u8 {
-    return if (verbose) "Verbose output is on." else "Verbose output is off.";
-}
-
 test "Ctrl+D in the same input as a sign-in selection cancels it and guards the next quit" {
     var rig: Rig = undefined;
     try rig.init(&.{});
@@ -3034,7 +3563,7 @@ test "Ctrl+D during a sign-in cancels it instead of the terminal" {
     try rig.waitFor(&.{.{ .status = "Press Ctrl+D again to quit." }});
 }
 
-test "exits after page and turn responses use the authoritative interaction" {
+test "exits after page and turn responses use the authoritative state" {
     for ([_]bool{ false, true }) |turn| {
         var stall: providers.testing.FakeTransport.Stall = .{ .io = std.testing.io };
         var rig: Rig = undefined;

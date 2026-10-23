@@ -8,21 +8,21 @@ const testing = @import("testing.zig");
 
 const default_core =
     "# System prompt\n\n" ++
-    "You are a coding assistant. You run inside Drinky, a terminal coding-agent harness.\n\n" ++
+    "You are a coding assistant. You run inside Drinky.\n\n" ++
     "Complete the user's request.\n" ++
     "Use the available tools according to their schemas.\n" ++
     "Use the find tool and the grep tool to search files.\n" ++
     "Run a search in bash only when these tools cannot express it.\n" ++
     "Read a file before you change it, because an edit must match the current bytes.\n" ++
     "Answer a question about Drinky itself from the describe_drinky tool, and never from " ++
-    "memory.\n" ++
-    "Drinky renders your answer as Markdown in a terminal, so keep it short.";
+    "memory.";
 
 const date_timestamp_nanoseconds_max: i96 =
     253_402_300_800 * std.time.ns_per_s - 1;
 
 const Options = struct {
     current_time: std.Io.Timestamp,
+    frontend_instructions: []const u8,
     working_directory: []const u8,
     user_instructions: []const discovery.instructions.File,
     project_instructions: *const discovery.instructions.Result,
@@ -50,6 +50,8 @@ fn write(
     options: *const Options,
 ) (std.Io.Writer.Error || error{OutOfMemory})!void {
     try writer.writeAll(default_core);
+    try writer.writeAll("\n\n## Frontend\n\n");
+    try writer.writeAll(options.frontend_instructions);
     try writeEnvironment(gpa, writer, options);
     const project_files = options.project_instructions.files();
     try writePrecedence(writer, options);
@@ -251,11 +253,15 @@ test "UTC date formatting handles bounds and a leap day" {
     );
 }
 
+const test_core = default_core ++ "\n\n## Frontend\n\n" ++
+    testing.frontend_default.instructions;
+
 const no_instructions: discovery.instructions.Result = .init(std.testing.allocator, .project);
 
 fn emptyOptions() Options {
     return .{
         .current_time = .zero,
+        .frontend_instructions = testing.frontend_default.instructions,
         .working_directory = "/work",
         .user_instructions = &.{},
         .project_instructions = &no_instructions,
@@ -292,7 +298,7 @@ test "a wall clock outside the supported years empties the date but composes" {
     const prompt = try compose(gpa, &options);
     defer gpa.free(prompt);
     try std.testing.expectEqualStrings(
-        default_core ++ "\n\n## Environment\n\n<environment>\n" ++
+        test_core ++ "\n\n## Environment\n\n<environment>\n" ++
             "  <current_date />\n" ++
             "  <working_directory>/work</working_directory>\n" ++
             "  <repository_root />\n</environment>",
@@ -341,7 +347,7 @@ test "composition orders sections and preserves instruction Markdown" {
     const prompt = try compose(gpa, &options);
     defer gpa.free(prompt);
 
-    try std.testing.expect(std.mem.startsWith(u8, prompt, default_core));
+    try std.testing.expect(std.mem.startsWith(u8, prompt, test_core));
     const environment_index = std.mem.find(u8, prompt, "## Environment").?;
     const precedence_index = std.mem.find(u8, prompt, "## Instruction precedence").?;
     const project_index = std.mem.find(u8, prompt, "## Project instructions").?;
@@ -432,7 +438,7 @@ test "configured user instructions have their own section" {
     defer gpa.free(prompt);
 
     try std.testing.expectEqualStrings(
-        default_core ++ "\n\n## Environment\n\n<environment>\n" ++
+        test_core ++ "\n\n## Environment\n\n<environment>\n" ++
             "  <current_date>2026-08-02</current_date>\n" ++
             "  <working_directory>/work</working_directory>\n" ++
             "  <repository_root />\n" ++
@@ -543,7 +549,7 @@ test "a session lists a skill that its metadata hides from a run, and a run leav
     const run_prompt = try compose(gpa, &run_options);
     defer gpa.free(run_prompt);
     try std.testing.expectEqualStrings(
-        default_core ++ "\n\n## Environment\n\n<environment>\n" ++
+        test_core ++ "\n\n## Environment\n\n<environment>\n" ++
             "  <current_date>1970-01-01</current_date>\n" ++
             "  <working_directory>/work</working_directory>\n" ++
             "  <repository_root />\n</environment>",
@@ -568,7 +574,7 @@ test "empty project and skill sections are omitted independently" {
     const empty_prompt = try compose(gpa, &empty_options);
     defer gpa.free(empty_prompt);
     try std.testing.expectEqualStrings(
-        default_core ++ "\n\n## Environment\n\n<environment>\n" ++
+        test_core ++ "\n\n## Environment\n\n<environment>\n" ++
             "  <current_date>1970-01-01</current_date>\n" ++
             "  <working_directory>/work&amp;space</working_directory>\n" ++
             "  <repository_root />\n</environment>",

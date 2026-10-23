@@ -1,5 +1,6 @@
 const std = @import("std");
 const application = @import("application");
+const format = @import("format.zig");
 
 const core = @import("core");
 const tools = @import("tools");
@@ -65,17 +66,17 @@ const Parts = struct {
 pub fn subject(
     gpa: std.mem.Allocator,
     description: *const application.ToolDescription,
-    roots: *const application.support.format.Roots,
+    roots: *const format.Roots,
 ) error{OutOfMemory}![]u8 {
     const value = description.subject orelse return gpa.dupe(u8, "");
     if (value.kind == .command) return gpa.print("Command: {s}", .{value.text});
     const shown = switch (value.kind) {
-        .path => try application.support.format.path(gpa, value.text, roots),
+        .path => try format.path(gpa, value.text, roots),
         .pattern => try gpa.dupe(u8, value.text),
         .command => unreachable,
     };
     defer gpa.free(shown);
-    const line = application.reference.singleLine(shown);
+    const line = format.singleLine(shown);
     if (line.len == 0) return gpa.dupe(u8, "");
     return gpa.print("{s}: {s}", .{
         switch (value.kind) {
@@ -128,7 +129,7 @@ fn write(parts: *Parts, options: *const Options) !void {
     };
     const name = try parts.gpa.dupe(u8, options.name);
     defer parts.gpa.free(name);
-    const shown_name = application.reference.singleLine(name);
+    const shown_name = format.singleLine(name);
     try parts.print("Tool: {s} ({s})", .{ shown_name, @tagName(state) });
     parts.status = .{
         .start = 0,
@@ -144,7 +145,7 @@ fn write(parts: *Parts, options: *const Options) !void {
     if (options.elapsed_ms) |elapsed_ms| {
         var buffer: [24]u8 = undefined;
         const shown = if (options.output == null)
-            application.support.format.durationSeconds(&buffer, elapsed_ms, .down)
+            format.durationSeconds(&buffer, elapsed_ms, .down)
         else
             application.support.duration(&buffer, elapsed_ms);
         try parts.print("Time: {s}", .{shown});
@@ -188,12 +189,12 @@ fn write(parts: *Parts, options: *const Options) !void {
     }
     if (options.received_bytes) |bytes| {
         var buffer: [16]u8 = undefined;
-        try parts.print("Received: {s}", .{application.support.format.bytes(&buffer, bytes)});
+        try parts.print("Received: {s}", .{format.bytes(&buffer, bytes)});
     }
     if (options.timeout_ms) |timeout_ms| {
         var buffer: [24]u8 = undefined;
         try parts.print("Timeout: {s}", .{
-            application.support.format.durationSeconds(&buffer, @intCast(timeout_ms), .up),
+            format.durationSeconds(&buffer, @intCast(timeout_ms), .up),
         });
     }
     if (command) {
@@ -446,7 +447,7 @@ test "a failed output keeps its error sentence and a bare output only its comple
 
 test "a tool names its subject and preserves each command line below its metadata" {
     const gpa = std.testing.allocator;
-    const roots: application.support.format.Roots = .{
+    const roots: format.Roots = .{
         .working_directory = "/home/you/work",
         .home_directory = "/home/you",
     };

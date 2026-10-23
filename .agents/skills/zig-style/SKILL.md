@@ -2,8 +2,8 @@
 name: zig-style
 description:
   Zig code-style conventions for this environment. The rules cover naming, file/module structure,
-  control flow, slices, optional captures, and visibility. Load before you write, edit, or review
-  Zig so the code matches the documented rules rather than personal taste.
+  types, control flow, slices, optional captures, and visibility. Load before you write, edit, or
+  review Zig so the code matches the documented rules rather than personal taste.
 ---
 
 # Zig Code Style
@@ -54,6 +54,16 @@ description:
   is cheap, build it unconditionally and guard its _use_ with a boolean
   (`const buffer = ...; if (enabled) buffer.write(...)`). Otherwise name the optional `maybe_foo` so
   the capture stays clean (`if (maybe_buffer) |buffer|`).
+- **Types state the rules**: build a value so that the compiler rejects a state that has no meaning.
+  Use a tagged union for alternatives that carry different data. Do not use a struct whose fields
+  apply only in some states. Give each union payload only the fields that it uses.
+- **No sentinels**: use an optional for an absent value. Do not use an empty string, a zero, or a
+  flag to mean "absent".
+- **Exhaustive switches**: switch over each tag of an enum or a union that the repository defines.
+  Do not write `else` there, so that a new tag stops the build until each switch handles it.
+- **No implied tags**: do not read a union field because another value implies its tag. Carry the
+  data in the value itself. Give a function a narrow enum, not a wide one with an `unreachable`
+  branch.
 - **No recursion**: no function calls itself at runtime, directly or through a cycle. Runtime
   recursion has no static depth bound and can overrun the stack. Iterate with a bounded loop, or
   unroll a fixed number of steps instead of a recursive solver. This rule targets a runtime call. A

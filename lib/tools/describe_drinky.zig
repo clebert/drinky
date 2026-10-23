@@ -9,9 +9,8 @@ const testing = @import("testing.zig");
 pub const spec: core.Tool = .{
     .name = "describe_drinky",
     .description = "Return the reference document of the Drinky harness. The tool takes no " ++
-        "arguments. The document names the slash commands, every key of the config file, " ++
-        "and the key bindings. It also names the instruction and skill files that Drinky " ++
-        "discovers, and the headless mode that starts another agent. It reports no current " ++
+        "arguments. The document describes the config, instruction discovery, skill " ++
+        "discovery, and frontend capabilities. It reports no current " ++
         "value. Read it before you answer a question about Drinky. Read it before you change " ++
         "a config key too, because the harness ignores a key that it does not know.",
     .parameters = &.{},

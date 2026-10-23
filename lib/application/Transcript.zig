@@ -83,9 +83,9 @@ pub fn append(self: *Transcript, source: *const Record.Source, options: Options)
     self.list.appendAssumeCapacity(entry);
 }
 
-pub fn replaceEvent(self: *Transcript, index: usize, payload: *const Record.Event.Payload) !void {
+pub fn replaceEvent(self: *Transcript, index: usize, event: *const Record.Event) !void {
     const entry = &self.list.items[index];
-    try entry.record.replaceEvent(self.gpa, payload);
+    try entry.record.replaceEvent(self.gpa, event);
     entry.revision +%= 1;
     self.dirty_from = @min(self.dirty_from, index);
 }
@@ -104,7 +104,6 @@ pub fn beginThinking(self: *Transcript, started_ms: i64) !usize {
 }
 
 pub fn closeWork(self: *Transcript, end: *const Record.Work.End) void {
-    std.debug.assert(end.status != .running);
     var index = self.list.items.len;
     while (index > 0) {
         index -= 1;
@@ -141,7 +140,7 @@ fn openRun(self: *Transcript, kind: Record.Kind) !usize {
     const source: Record.Source = switch (kind) {
         .thinking => .{ .thinking = self.held.items },
         .model => .{ .model = self.held.items },
-        .user, .user_note, .tool_result, .event => unreachable,
+        .user, .user_note, .tool_result, .event, .authorization => unreachable,
     };
     try self.reserve();
     var entry: Entry = .{ .record = try .init(self.gpa, self.allocateId(), &source) };
@@ -239,7 +238,7 @@ pub fn lastAnswer(self: *const Transcript) ?[]const u8 {
         index -= 1;
         switch (self.list.items[index].record.content) {
             .model => |text| return text.items,
-            .user, .user_note, .thinking, .tool_result, .event => {},
+            .user, .user_note, .thinking, .tool_result, .event, .authorization => {},
         }
     }
     return null;
@@ -254,7 +253,7 @@ pub fn writeAnswer(
     for (self.list.items[start..]) |*entry| {
         const text = switch (entry.record.content) {
             .model => |list| list.items,
-            else => continue,
+            .user, .user_note, .thinking, .tool_result, .event, .authorization => continue,
         };
         if (answer.items.len > 0) try answer.appendSlice(self.gpa, "\n\n");
         try answer.appendSlice(self.gpa, text);
@@ -311,9 +310,13 @@ test "streamed deltas collect into one block until a discrete block ends the run
 fn textAt(transcript: *const Transcript, index: usize) []const u8 {
     return switch (transcript.entries()[index].record.content) {
         .user, .thinking, .model => |list| list.items,
-        .event => |*event| event.text.items,
-        .user_note, .tool_result => unreachable,
+        .event => |*event| event.choices_corrupt,
+        .user_note, .tool_result, .authorization => unreachable,
     };
+}
+
+fn textEvent(text: []const u8) Record.Source {
+    return .{ .event = .{ .choices_corrupt = text } };
 }
 
 test "an empty delta opens no block and does not break a run" {
@@ -400,8 +403,8 @@ test "remove drops the blocks of its range and keeps the blocks around it" {
     try transcript.append(&.{ .user = "keep prompt" }, .{});
     try transcript.append(&.{ .user = "drop prompt" }, .{});
     try transcript.appendStream(.model, "drop reply");
-    try transcript.append(&.{ .event = .{ .text = "drop retry" } }, .{ .survives_discard = true });
-    try transcript.append(&.{ .event = .{ .text = "keep later event" } }, .{});
+    try transcript.append(&textEvent("drop retry"), .{ .survives_discard = true });
+    try transcript.append(&textEvent("keep later event"), .{});
     transcript.remove(.{ .start = 1, .end = 4 });
 
     try std.testing.expectEqual(@as(usize, 2), transcript.entries().len);
@@ -414,10 +417,10 @@ test "a discard preserves only marked events after its checkpoint" {
     var transcript: Transcript = .init(gpa);
     defer transcript.deinit();
 
-    try transcript.append(&.{ .event = .{ .text = "keep before checkpoint" } }, .{});
+    try transcript.append(&textEvent("keep before checkpoint"), .{});
     try transcript.append(&.{ .user = "drop user prompt" }, .{});
-    try transcript.append(&.{ .event = .{ .text = "keep retry" } }, .{ .survives_discard = true });
-    try transcript.append(&.{ .event = .{ .text = "drop ordinary event" } }, .{});
+    try transcript.append(&textEvent("keep retry"), .{ .survives_discard = true });
+    try transcript.append(&textEvent("drop ordinary event"), .{});
     try transcript.appendStream(.model, "drop partial reply");
     transcript.discard(1);
 
@@ -439,7 +442,7 @@ test "the last answer is the newest model text, even before later blocks of othe
     try std.testing.expectEqualStrings("final text", transcript.lastAnswer().?);
 
     try transcript.append(&.{ .user = "second" }, .{});
-    try transcript.append(&.{ .event = .{ .text = "The provider failed." } }, .{});
+    try transcript.append(&textEvent("The provider failed."), .{});
     try std.testing.expectEqualStrings("final text", transcript.lastAnswer().?);
 }
 
@@ -463,7 +466,7 @@ test "a flush sends new records, added text, replacements, and removals by id on
     var changes: Changes = .{};
     defer changes.deinit();
 
-    try transcript.append(&.{ .event = .{ .text = "notice" } }, .{});
+    try transcript.append(&textEvent("notice"), .{});
     try transcript.appendStream(.model, "hel");
     transcript.flush(changes.sink(), std.testing.io);
     try changes.expect(&.{ "append 1 notice", "append 2 hel" });
@@ -478,13 +481,13 @@ test "a flush sends new records, added text, replacements, and removals by id on
     try changes.expect(&.{ "text 2 lo", "append 3 weigh" });
 
     transcript.closeWork(&.{ .time_ms = 9, .status = .complete });
-    try transcript.replaceEvent(0, &.{ .text = "edited" });
+    try transcript.replaceEvent(0, &.{ .choices_corrupt = "edited" });
     transcript.flush(changes.sink(), std.testing.io);
     try changes.expect(&.{ "replace 1 edited", "replace 3 weigh" });
     try std.testing.expectEqual(@as(usize, 2), started);
 
     transcript.remove(.{ .start = 1, .end = 3 });
-    try transcript.append(&.{ .event = .{ .text = "later" } }, .{});
+    try transcript.append(&textEvent("later"), .{});
     transcript.flush(changes.sink(), std.testing.io);
     try changes.expect(&.{ "remove 2 3", "append 4 later" });
 }
@@ -563,7 +566,19 @@ const Changes = struct {
                 for (ids) |id| line.writer.print(" {d}", .{id}) catch unreachable;
                 break :removal gpa.dupe(u8, line.written());
             },
-            else => unreachable,
+            .snapshot,
+            .live,
+            .statistics,
+            .state,
+            .clear_conversation,
+            .paste_replayed,
+            .turn_ended,
+            .sign_in_ended,
+            .fetch_ended,
+            .no_account,
+            .charge,
+            .startup_refused,
+            => unreachable,
         } catch unreachable;
         self.lines.append(gpa, line) catch unreachable;
     }
@@ -571,8 +586,8 @@ const Changes = struct {
     fn print(comptime verb: []const u8, record: *const Record) error{OutOfMemory}![]u8 {
         const text = switch (record.content) {
             .user, .thinking, .model => |list| list.items,
-            .event => |*event| event.text.items,
-            .user_note, .tool_result => unreachable,
+            .event => |*event| event.choices_corrupt,
+            .user_note, .tool_result, .authorization => unreachable,
         };
         return std.testing.allocator.print(verb ++ " {d} {s}", .{ record.id, text });
     }

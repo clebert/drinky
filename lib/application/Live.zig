@@ -13,10 +13,10 @@ pub const Call = struct {
     phase: Phase,
     argument_bytes: usize,
     opened_ms: i64,
-    started_ms: i64,
     description: tools.Registry.Description,
 
-    pub const Phase = enum { streaming, queued, running };
+    pub const Phase = union(enum) { streaming, queued, running: Running };
+    pub const Running = struct { started_ms: i64 };
 };
 
 pub fn dupe(self: *const Live, gpa: std.mem.Allocator) error{OutOfMemory}!Live {

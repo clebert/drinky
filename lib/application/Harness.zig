@@ -27,6 +27,12 @@ pub const Options = struct {
     directories: accounts.json_store.Directories,
     environ: std.process.Environ,
     surface: discovery.skills.Skill.Surface,
+    frontend: Frontend,
+};
+
+pub const Frontend = struct {
+    instructions: []const u8,
+    reference: []const u8,
 };
 
 pub fn init(self: *Harness, gpa: std.mem.Allocator, io: std.Io, options: *const Options) !void {
@@ -55,6 +61,7 @@ pub fn init(self: *Harness, gpa: std.mem.Allocator, io: std.Io, options: *const 
 
     self.system = try system_prompt.compose(gpa, &.{
         .current_time = std.Io.Clock.real.now(io),
+        .frontend_instructions = options.frontend.instructions,
         .working_directory = cwd,
         .user_instructions = self.config.user_instructions.files(),
         .project_instructions = &self.project_instructions,
@@ -66,8 +73,7 @@ pub fn init(self: *Harness, gpa: std.mem.Allocator, io: std.Io, options: *const 
     self.document = try describe.compose(gpa, &.{
         .config = &self.config,
         .effort_default = reference.effort_default,
-        .key_hints = &reference.key_hints,
-        .repeat_window_ms = reference.repeat_window_ms,
+        .frontend_reference = options.frontend.reference,
     });
     self.tool_registry = .{
         .host = .{

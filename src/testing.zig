@@ -5,6 +5,8 @@ const accounts = @import("accounts");
 
 const Herdr = @import("Herdr.zig");
 
+pub const truncated_text = "The reply is incomplete. The model reached an output or context limit.";
+
 pub const Clock = struct {
     threaded: std.Io.Threaded,
     vtable: std.Io.VTable,
