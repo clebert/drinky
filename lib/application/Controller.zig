@@ -1900,6 +1900,40 @@ test "state-dependent command refusals keep the line" {
     }
 }
 
+test "model and effort changes during a turn are refused with a notice and keep the choice" {
+    var stall: providers.testing.FakeTransport.Stall = .{ .io = std.testing.io };
+    var rig: testing.Rig = undefined;
+    try rig.init(&.{ .replies = &.{
+        .{ .stall = &stall },
+        .{ .body = providers.testing.reply_stream },
+    } });
+    defer rig.deinit();
+    const initial = try rig.snapshot();
+    defer initial.deinit(std.testing.allocator);
+    try std.testing.expect(rig.send(&.{ .submit = .{ .line = "Task." } }).accepted);
+    try stall.reached.wait(std.testing.io);
+    for ([_][]const u8{ "/model", "/effort" }) |line| {
+        const response_value = rig.send(&.{ .submit = .{ .line = line } });
+        try std.testing.expect(!response_value.accepted);
+        try std.testing.expect(response_value.editor == .keep);
+        const current = try rig.snapshot();
+        defer current.deinit(std.testing.allocator);
+        try std.testing.expectEqual(.turn, current.interaction.mode);
+        try std.testing.expect(initial.interaction.choice.eql(&current.interaction.choice));
+        const notice = current.interaction.notice.?;
+        try std.testing.expectEqual(.warning, notice.severity);
+        try testing.expectContains(notice.content, "cannot run while a turn runs");
+    }
+    _ = rig.send(&.{ .cancel = .{} });
+    try rig.expectTurn(.canceled);
+    try std.testing.expect(rig.send(&.{ .submit = .{ .line = "Next task." } }).accepted);
+    try rig.expectTurn(.stopped);
+    const ended = try rig.snapshot();
+    defer ended.deinit(std.testing.allocator);
+    try std.testing.expectEqual(.prompt, ended.interaction.mode);
+    try std.testing.expect(initial.interaction.choice.eql(&ended.interaction.choice));
+}
+
 test "picker refusals remain refusals while unchanged selections remain accepted" {
     var rig: testing.Rig = undefined;
     try rig.init(&.{});

@@ -22,7 +22,6 @@ conversation: Conversation,
 turn_count: usize,
 turn_starts: std.ArrayList(TurnStart),
 setup: ?Setup,
-next_setup: ?Setup,
 clear_pending: bool,
 measured: ?Turn.Measured,
 aside: ?Aside.Request,
@@ -292,7 +291,6 @@ pub fn init(gpa: std.mem.Allocator, io: std.Io, options: *const Options) Session
         .turn_count = 0,
         .turn_starts = .empty,
         .setup = null,
-        .next_setup = null,
         .clear_pending = false,
         .measured = null,
         .aside = null,
@@ -311,7 +309,6 @@ pub fn deinit(self: *Session) void {
     self.mailbox.close(self.io);
     self.mailbox.drain(self.io, self.gpa);
     if (self.setup) |*setup| setup.deinit(self.gpa);
-    if (self.next_setup) |*setup| setup.deinit(self.gpa);
     if (self.measured) |*measured| measured.deinit(self.gpa);
     self.dropAside();
     self.turn_starts.deinit(self.gpa);
@@ -410,27 +407,20 @@ fn dropAside(self: *Session) void {
 }
 
 fn configure(self: *Session, setup: Setup) void {
-    if (!self.mailbox.busy()) return self.apply(setup);
-    if (self.next_setup) |*previous| self.drop(previous);
-    self.next_setup = setup;
+    std.debug.assert(!self.mailbox.busy());
+    const maybe_previous = self.setup;
+    self.setup = setup;
+    if (maybe_previous) |*previous| {
+        const provider = previous.provider;
+        previous.deinit(self.gpa);
+        self.emit(&.{ .setup_dropped = provider });
+    }
+    self.emit(&.{ .context = self.contextShown() });
 }
 
 fn requestClear(self: *Session) void {
     if (!self.mailbox.busy()) return self.clear();
     self.clear_pending = true;
-}
-
-fn apply(self: *Session, setup: Setup) void {
-    const maybe_previous = self.setup;
-    self.setup = setup;
-    if (maybe_previous) |*previous| self.drop(previous);
-    self.emit(&.{ .context = self.contextShown() });
-}
-
-fn drop(self: *Session, setup: *const Setup) void {
-    const provider = setup.provider;
-    setup.deinit(self.gpa);
-    self.emit(&.{ .setup_dropped = provider });
 }
 
 fn clear(self: *Session) void {
@@ -482,10 +472,6 @@ fn endAside(self: *Session, outcome: Outcome) void {
 }
 
 fn settle(self: *Session) void {
-    if (self.next_setup) |setup| {
-        self.next_setup = null;
-        self.apply(setup);
-    }
     if (self.clear_pending) {
         self.clear_pending = false;
         self.clear();
@@ -1086,42 +1072,6 @@ test "a cancel that arrives during the wait ends the turn as canceled" {
     );
 }
 
-test "a setup that arrives during a turn applies from the next turn on" {
-    var harness: testing.Harness = undefined;
-    try harness.init(std.testing.allocator, std.testing.io, &.{});
-    defer harness.deinit();
-
-    harness.provider.load(&.{
-        .{ .done = &.{ fixture.toolCall(fixture.call), fixture.stop_complete } },
-        .{ .done = &.{ fixture.message("one"), fixture.stop_complete } },
-    });
-    harness.other.load(&.{
-        .{ .done = &.{ fixture.message("two"), fixture.stop_complete } },
-    });
-    harness.runner.hook = .{
-        .session = &harness.session,
-        .command = .{ .configure = testing.Harness.setup(&harness.other, "model-c") },
-    };
-    try std.testing.expectEqualStrings(
-        \\tool_call_started:read
-        \\tool_started:c1
-        \\tool_result:c1:done
-        \\committed
-        \\text_started
-        \\text:one
-        \\committed
-        \\setup_dropped
-        \\context:none
-        \\turn_ended:complete
-    , try harness.turn("a"));
-    _ = try harness.turn("b");
-    try std.testing.expectEqual(@as(usize, 2), harness.provider.requests.items.len);
-    try std.testing.expectEqualStrings(
-        "model-c|user:a|call:c1:read:{\"path\":\"a.txt\"}|result:c1:done|assistant:one|user:b",
-        harness.other.requests.items[0],
-    );
-}
-
 test "a tool call gets the variables of the setup that runs its turn" {
     var harness: testing.Harness = undefined;
     try harness.init(std.testing.allocator, std.testing.io, &.{});
@@ -1139,10 +1089,10 @@ test "a tool call gets the variables of the setup that runs its turn" {
     var first = testing.Harness.setup(&harness.provider, "model-a");
     first.variables = &.{.{ .name = "MODEL", .value = "a" }};
     try harness.session.send(&.{ .configure = first });
+    _ = try harness.turn("a");
     var second = testing.Harness.setup(&harness.other, "model-b");
     second.variables = &.{.{ .name = "MODEL", .value = "b" }};
-    harness.runner.hook = .{ .session = &harness.session, .command = .{ .configure = second } };
-    _ = try harness.turn("a");
+    try harness.session.send(&.{ .configure = second });
     _ = try harness.turn("b");
 
     const calls = harness.runner.calls.items;
@@ -1150,33 +1100,6 @@ test "a tool call gets the variables of the setup that runs its turn" {
     try std.testing.expectEqualStrings("read:{\"path\":\"a.txt\"}|MODEL=a", calls[0]);
     try std.testing.expectEqualStrings("read:{\"path\":\"a.txt\"}|MODEL=a", calls[1]);
     try std.testing.expectEqualStrings("read:{\"path\":\"a.txt\"}|MODEL=b", calls[2]);
-}
-
-test "a newer setup drops a deferred one at once, and the setup of the turn drops at its end" {
-    var harness: testing.Harness = undefined;
-    try harness.init(std.testing.allocator, std.testing.io, &.{});
-    defer harness.deinit();
-
-    harness.provider.load(&.{.{ .open = &.{.{ .text = "I read " }} }});
-    harness.other.load(&.{.{ .done = &.{ fixture.message("ok"), fixture.stop_complete } }});
-    try harness.prompt("first");
-    try harness.expect("text_started");
-    try harness.expect("text:I read ");
-    try harness.configure(&harness.other, "model-b");
-    try harness.configure(&harness.other, "model-c");
-    try harness.expect("setup_dropped");
-    try harness.session.send(&.cancel);
-    try std.testing.expectEqualStrings(
-        \\committed
-        \\setup_dropped
-        \\context:none
-        \\turn_ended:canceled
-    , try harness.until("turn_ended"));
-    _ = try harness.turn("second");
-    try std.testing.expectEqualStrings(
-        "model-c|user:first|assistant:I read |user:second",
-        harness.other.requests.items[0],
-    );
 }
 
 test "a turn that calls a tool in every round ends when it uses its rounds" {
@@ -1415,7 +1338,7 @@ test "an aside whose task cannot start fails as unavailable concurrency and send
     try std.testing.expectEqual(@as(usize, 0), harness.provider.requests.items.len);
 }
 
-test "a cancel ends an aside, and a setup that arrives during it applies at its end" {
+test "a cancel ends an aside and keeps the conversation" {
     var harness: testing.Harness = undefined;
     try harness.init(std.testing.allocator, std.testing.io, &.{});
     defer harness.deinit();
@@ -1423,23 +1346,18 @@ test "a cancel ends an aside, and a setup that arrives during it applies at its 
     harness.provider.load(&.{
         .{ .done = &.{ fixture.message("one"), fixture.stop_complete } },
         .{ .open = &.{.{ .text = "Short" }} },
+        .{ .done = &.{ fixture.message("two"), fixture.stop_complete } },
     });
-    harness.other.load(&.{.{ .done = &.{ fixture.message("two"), fixture.stop_complete } }});
     _ = try harness.turn("a");
     try harness.ask("one");
     try harness.expect("aside_text:Short");
-    try harness.configure(&harness.other, "model-b");
     try harness.session.send(&.cancel);
-    try std.testing.expectEqualStrings(
-        \\setup_dropped
-        \\context:none
-        \\aside_ended:canceled
-    , try harness.until("aside_ended"));
+    try harness.expect("aside_ended:canceled");
     try std.testing.expectEqual(@as(u32, 1), harness.provider.canceled);
     _ = try harness.turn("b");
     try std.testing.expectEqualStrings(
-        "model-b|user:a|assistant:one|user:b",
-        harness.other.requests.items[0],
+        "model-a|user:a|assistant:one|user:b",
+        harness.provider.requests.items[2],
     );
 }
 
