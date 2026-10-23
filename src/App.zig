@@ -3606,7 +3606,7 @@ test "a frame timer task failure withdraws the send as message confirmation" {
     try rig.device.resize(.{ .columns = 120, .rows = 30 });
     try rig.waitFor(&.{.{ .status = "Drinky could not start the frame timer" }});
     rig.clock.refuse_concurrency.store(false, .release);
-    try rig.keys("\r");
+    try rig.keyFrame("\r");
     try rig.waitFor(&.{ .{ .status = refusal_offer }, .{ .editor = "/nope" } });
     try std.testing.expectEqual(@as(usize, 0), rig.transport.requests.items.len);
 }
