@@ -38,7 +38,7 @@ fn requestSubscription(
     io: std.Io,
     transport: ?providers.Transport,
     subscription: *const Subscription,
-) ![]Model {
+) paging.Error![]Model {
     if (!validSubscriptionCredentials(subscription))
         return error.BadModelListCredentials;
 

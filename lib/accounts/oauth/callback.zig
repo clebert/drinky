@@ -263,7 +263,12 @@ fn acceptRedirect(
     io: std.Io,
     connections: Connections,
     expected: *const Expected,
-) !Redirect {
+) (std.Io.net.Server.AcceptError || error{
+    OutOfMemory,
+    AuthorizationFailed,
+    StreamTooLong,
+    ConcurrencyUnavailable,
+})!Redirect {
     var request_buffer: [request_bytes_max]u8 = undefined;
     while (true) {
         try connections.accept();

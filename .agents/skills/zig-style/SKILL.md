@@ -1,12 +1,12 @@
 ---
 name: zig-style
 description:
-  Zig code-style conventions for this environment. The rules cover naming, file/module structure,
-  types, control flow, slices, optional captures, and visibility. Load before you write, edit, or
-  review Zig so the code matches the documented rules rather than personal taste.
+  Zig code-style conventions for this environment. The rules cover names, modules, types, control
+  flow, ownership, errors, and concurrency. Load before you write, edit, or review Zig so the code
+  follows the shared conventions.
 ---
 
-# Zig Code Style
+# Zig code style
 
 - **Formatting**: `tab_size: 4`, `print_width: 100`.
 - **Types**: `PascalCase`, acronyms as single words (`Json`, not `JSON`).
@@ -45,10 +45,10 @@ description:
   lives in `root.zig` (exports only), and never in a file of its own. A file is always a struct, so
   a union-as-file is impossible. The rules above ban both workarounds: a stuttering `token.Token`
   path and a single-declaration alias.
-- **No fake `pub`**: do not mark unused code `pub` to silence warnings. Remove it, along with any
-  tests that exist only to exercise it. A symbol that another module consumes is real API, so keep
-  it and its symmetric constants. A test in _another_ module counts as a consumer. `Limit.min` is
-  such a symbol, and `Limit.max` stays with it.
+- **Unused code**: delete code without a caller. Do not mark unused code `pub` to silence warnings.
+  Remove tests that exist only to exercise it. A symbol that another module consumes is real API, so
+  keep it and its symmetric constants. A test in _another_ module counts as a consumer. `Limit.min`
+  is such a symbol, and `Limit.max` stays with it.
 - **Const slices**: `[]const T` for a read-only slice parameter, `[]T` only for an output buffer.
 - **Optional captures**: never accept a shadow-forced capture name (`if (buffer) |b|`). If the value
   is cheap, build it unconditionally and guard its _use_ with a boolean
@@ -59,11 +59,13 @@ description:
   apply only in some states. Give each union payload only the fields that it uses.
 - **No sentinels**: use an optional for an absent value. Do not use an empty string, a zero, or a
   flag to mean "absent".
-- **Exhaustive switches**: switch over each tag of an enum or a union that the repository defines.
-  Do not write `else` there, so that a new tag stops the build until each switch handles it.
-- **No implied tags**: do not read a union field because another value implies its tag. Carry the
+- **Exhaustive switches**: write each vendor, wire, or sign-in rule as an exhaustive switch over its
+  enum. Handle each tag when you switch on an enum or a union that the project defines. Do not write
+  `else` there. A new tag must stop the build until each switch handles it.
+- **Impossible states**: do not read a union field because another value implies its tag. Carry the
   data in the value itself. Give a function a narrow enum, not a wide one with an `unreachable`
-  branch.
+  branch. For a branch that no production path reaches and the types cannot exclude, use an
+  assertion or `unreachable`. Put no text for the user in that branch.
 - **No recursion**: no function calls itself at runtime, directly or through a cycle. Runtime
   recursion has no static depth bound and can overrun the stack. Iterate with a bounded loop, or
   unroll a fixed number of steps instead of a recursive solver. This rule targets a runtime call. A
@@ -87,3 +89,15 @@ description:
   you do not intend a copy. An accidental stack copy then cannot hide.
 - **Show rounding intent**: divide with `@divExact`, `@divFloor`, or `@divCeil`, and never with a
   bare `/`. The choice proves that you considered the rounding.
+- **Explicit contracts**: a seam is a pointer with a vtable in the shape of `std.mem.Allocator`. Do
+  not pass the implementation of a contract as `anytype`. Use a seam or a generic type to state the
+  contract.
+- **Explicit error sets**: a seam, a callback, and a function that runs under a timeout declare
+  their error set. Do not widen an error set to `anyerror`.
+- **Event ownership**: an event payload type owns its `dupe` and its `deinit`.
+- **Allocation failures**: propagate `error.OutOfMemory` and release partial allocations. Never
+  suppress an allocation failure, including during cancellation or cache operations. Convert
+  failures from known allocating writers into `error.OutOfMemory`. Keep external write failures
+  distinct from allocation failures.
+- **Concurrency**: a cancel must end every wait. Run task work in a concurrent task, never inline in
+  the caller. Report task creation failures.

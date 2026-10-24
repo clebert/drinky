@@ -39,7 +39,11 @@ pub fn fetch(
     return deadline.run(io, request, .{ gpa, io, transport }, release);
 }
 
-fn request(gpa: std.mem.Allocator, io: std.Io, transport: ?providers.Transport) !Metadata {
+fn request(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    transport: ?providers.Transport,
+) FetchError!Metadata {
     const body = net.getBody(gpa, io, transport, &.{
         .method = .GET,
         .url = endpoint,
@@ -580,7 +584,7 @@ test "the OpenRouter list keeps its tool models in source order and drops varian
     try std.testing.expectEqualStrings("anthropic/claude", names[5]);
 
     const newest = metadata.lookup(.openrouter, "openai/gpt-new").?;
-    try std.testing.expectEqualStrings("gpt-new", newest.servedName());
+    try std.testing.expectEqualStrings("gpt-new", newest.servedName().?);
     try std.testing.expect(newest.serves("gpt-new"));
     try std.testing.expect(newest.serves("openai/gpt-new"));
 }

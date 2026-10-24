@@ -30,7 +30,7 @@ fn request(
     io: std.Io,
     transport: ?providers.Transport,
     list: *const List,
-) ![]Model {
+) paging.Error![]Model {
     if (!providers.Transport.validHeaderValue(list.token)) return error.BadModelListCredentials;
     const authorization = try gpa.print("Bearer {s}", .{list.token});
     defer gpa.free(authorization);
@@ -115,7 +115,7 @@ test parse {
     try std.testing.expect(models[0].fold(.high) == null);
     try std.testing.expectEqual(@as(?u64, null), models[2].context_window);
     try std.testing.expectEqualStrings("grok-4.20-0309-reasoning", models[3].name());
-    try std.testing.expectEqualStrings("", models[3].servedName());
+    try std.testing.expect(models[3].servedName() == null);
     try std.testing.expectEqualStrings("grok-4.20", models[4].name());
-    try std.testing.expectEqualStrings("grok-4.20-0309-reasoning", models[4].servedName());
+    try std.testing.expectEqualStrings("grok-4.20-0309-reasoning", models[4].servedName().?);
 }

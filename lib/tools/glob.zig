@@ -1,72 +1,78 @@
 const std = @import("std");
 
 pub fn match(query: *const struct { pattern: []const u8, path: []const u8 }) bool {
-    return backtrack(&struct {
-        pattern: []const u8,
-        path: []const u8,
-        fn wild(self: *const @This(), index: usize) bool {
-            return std.mem.eql(u8, segmentAt(self.pattern, index), "**");
-        }
-        fn eql(self: *const @This(), pattern_index: usize, path_index: usize) bool {
-            return matchSegment(&.{
-                .pattern = segmentAt(self.pattern, pattern_index),
-                .name = segmentAt(self.path, path_index),
-            });
-        }
-    }{
-        .pattern = query.pattern,
-        .path = query.path,
-    }, .{ .pattern = segmentCount(query.pattern), .path = segmentCount(query.path) });
+    const matcher: Matcher(.segment) = .{ .pattern = query.pattern, .path = query.path };
+    return matcher.match();
 }
 
-fn matchSegment(segment: *const struct { pattern: []const u8, name: []const u8 }) bool {
-    return backtrack(&struct {
+fn Matcher(comptime unit: enum { segment, byte }) type {
+    return struct {
         pattern: []const u8,
         path: []const u8,
-        fn wild(self: *const @This(), index: usize) bool {
-            return self.pattern[index] == '*';
-        }
-        fn eql(self: *const @This(), pattern_index: usize, path_index: usize) bool {
-            return self.pattern[pattern_index] == '?' or
-                self.pattern[pattern_index] == self.path[path_index];
-        }
-    }{
-        .pattern = segment.pattern,
-        .path = segment.name,
-    }, .{ .pattern = segment.pattern.len, .path = segment.name.len });
-}
 
-fn backtrack(matcher: anytype, counts: struct { pattern: usize, path: usize }) bool {
-    var pattern_index: usize = 0;
-    var path_index: usize = 0;
-    var star_pattern: ?usize = null;
-    var star_path: usize = 0;
+        const Self = @This();
 
-    while (path_index < counts.path) {
-        if (pattern_index < counts.pattern) {
-            if (matcher.wild(pattern_index)) {
-                star_pattern = pattern_index + 1;
-                star_path = path_index;
-                pattern_index += 1;
-                continue;
+        fn match(self: *const Self) bool {
+            const counts = switch (unit) {
+                .segment => .{
+                    .pattern = segmentCount(self.pattern),
+                    .path = segmentCount(self.path),
+                },
+                .byte => .{ .pattern = self.pattern.len, .path = self.path.len },
+            };
+            var pattern_index: usize = 0;
+            var path_index: usize = 0;
+            var star_pattern: ?usize = null;
+            var star_path: usize = 0;
+
+            while (path_index < counts.path) {
+                if (pattern_index < counts.pattern) {
+                    if (self.wild(pattern_index)) {
+                        star_pattern = pattern_index + 1;
+                        star_path = path_index;
+                        pattern_index += 1;
+                        continue;
+                    }
+                    if (self.eql(.{ .pattern = pattern_index, .path = path_index })) {
+                        pattern_index += 1;
+                        path_index += 1;
+                        continue;
+                    }
+                }
+                if (star_pattern) |resume_pattern| {
+                    star_path += 1;
+                    path_index = star_path;
+                    pattern_index = resume_pattern;
+                    continue;
+                }
+                return false;
             }
-            if (matcher.eql(pattern_index, path_index)) {
-                pattern_index += 1;
-                path_index += 1;
-                continue;
-            }
-        }
-        if (star_pattern) |resume_pattern| {
-            star_path += 1;
-            path_index = star_path;
-            pattern_index = resume_pattern;
-            continue;
-        }
-        return false;
-    }
 
-    while (pattern_index < counts.pattern and matcher.wild(pattern_index)) pattern_index += 1;
-    return pattern_index == counts.pattern;
+            while (pattern_index < counts.pattern and self.wild(pattern_index)) pattern_index += 1;
+            return pattern_index == counts.pattern;
+        }
+
+        fn wild(self: *const Self, index: usize) bool {
+            return switch (unit) {
+                .segment => std.mem.eql(u8, segmentAt(self.pattern, index), "**"),
+                .byte => self.pattern[index] == '*',
+            };
+        }
+
+        fn eql(self: *const Self, indices: struct { pattern: usize, path: usize }) bool {
+            return switch (unit) {
+                .segment => match: {
+                    const matcher: Matcher(.byte) = .{
+                        .pattern = segmentAt(self.pattern, indices.pattern),
+                        .path = segmentAt(self.path, indices.path),
+                    };
+                    break :match matcher.match();
+                },
+                .byte => self.pattern[indices.pattern] == '?' or
+                    self.pattern[indices.pattern] == self.path[indices.path],
+            };
+        }
+    };
 }
 
 fn segmentCount(text: []const u8) usize {

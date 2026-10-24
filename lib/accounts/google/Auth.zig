@@ -119,7 +119,7 @@ pub fn deinit(self: *Auth) void {
     self.gpa.free(self.token_uri);
 }
 
-pub fn accessToken(self: *Auth, gpa: std.mem.Allocator) ![]const u8 {
+pub fn accessToken(self: *Auth, gpa: std.mem.Allocator) store.TokenError![]const u8 {
     try self.mutex.lock(self.io);
     defer self.mutex.unlock(self.io);
     const live = if (self.token) |token| self.nowMs() < token.expires_ms else false;

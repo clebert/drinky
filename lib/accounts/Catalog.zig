@@ -269,10 +269,7 @@ fn encode(gpa: std.mem.Allocator, model: *const Model) !Encoded {
     }
     return .{
         .name = try gpa.dupe(u8, model.name()),
-        .served_as = if (model.servedName().len != 0)
-            try gpa.dupe(u8, model.servedName())
-        else
-            null,
+        .served_as = if (model.servedName()) |alias| try gpa.dupe(u8, alias) else null,
         .context_window = model.context_window,
         .tokens_max = model.tokens_max,
         .thinking = @tagName(model.thinking),
@@ -593,10 +590,10 @@ test "a stored model survives a round trip through both files" {
     try std.testing.expectEqual(@as(f64, 37.5), restored_tier.output);
     try std.testing.expectEqual(@as(f64, 1), restored_tier.cache_read);
     try std.testing.expectEqual(@as(f64, 12.5), restored_tier.cache_write);
-    try std.testing.expectEqualStrings("", restored.servedName());
+    try std.testing.expect(restored.servedName() == null);
     try std.testing.expectEqualStrings(
         "grok-4.20-0309-reasoning",
-        read.find(testing.anthropic_plan, "grok-4.20").?.servedName(),
+        read.find(testing.anthropic_plan, "grok-4.20").?.servedName().?,
     );
     const public = read.find(testing.openrouter_api, "anthropic/public-only").?;
     try std.testing.expectEqual(@as(?u64, 200_000), public.context_window);

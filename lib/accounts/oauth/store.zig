@@ -205,7 +205,7 @@ pub fn Store(comptime Flow: type) type {
             return .{ .ptr = self, .vtable = &credential_vtable };
         }
 
-        pub fn accessToken(self: *Self, gpa: std.mem.Allocator) ![]const u8 {
+        pub fn accessToken(self: *Self, gpa: std.mem.Allocator) TokenError![]const u8 {
             try self.mutex.lock(self.io);
             defer self.mutex.unlock(self.io);
             if (self.save_pending) {

@@ -11,15 +11,12 @@ Drinky is a Zig coding agent that keeps the conversation in the terminal scrollb
 infrastructure modules for its existing fakes.
 
 - `lib/terminal` owns keyboard input, screen output, and the device seam. It knows no model and no
-  provider. `Tty` implements the device seam.
+  provider.
 - `lib/markdown` imports `std` alone. It parses Markdown and exposes source offsets. It knows no
   terminal, role, or URL limit. It holds the CommonMark test corpus and its license notice.
 - `lib/core` imports `std` alone. It owns the neutral conversation, session, provider seam, tool
-  seam, and retry policy. It also holds the shared actor shell, timeout race, error-set check,
-  allocation panic, and text helpers. It names no vendor. An account is an opaque id, and a
-  reasoning proof holds that id and opaque payload bytes. The session is an actor with one command
-  loop and one child task for a turn or an aside. An aside sends one request outside the
-  conversation, with no tools and the model and the effort of a turn.
+  seam, retry policy, and shared actor helpers. It names no vendor. Account identifiers and
+  reasoning payloads stay opaque.
 - `lib/providers` implements the provider seam. It owns the HTTP transport, SSE engine, credential
   seam, and one dialect per wire: Responses, Messages, and Gemini. A dialect builds requests,
   classifies failures, and decodes frames into core events. A per-account switch is a dialect
@@ -27,39 +24,19 @@ infrastructure modules for its existing fakes.
 - `lib/tools` implements the tool seam. It owns the tool registry and required-skill checks. Tool
   outputs separate model content from the conditions and measures that a client shows.
 - `lib/accounts` owns the account table, credentials, sign-in flows, model catalog, public metadata,
-  usage sources, and saved state. `Client` builds the provider of one row and reports its usage
-  source before the stop of every reply. The account registry is an actor with a child task for a
-  sign-in or a model fetch. A row is an index into the table.
+  usage sources, and saved state.
 - `lib/application` owns the shared controller, workflows, canonical transcript, work state,
-  generated results, turn boundaries, accounts, saved choices, statistics, and their lifetimes. The
-  controller exposes an opaque handle with semantic commands, queries, synchronous responses,
-  events, and snapshots. A command names its target by an account, a model, a turn id, or an
-  operation id. Work stays exclusive across turns, asides, sign-ins, and model fetches. Record
-  changes use stable ids. No client repeats a turn rule on these records. Apart from the `interface`
-  preferences, events and snapshots contain no terminal layout, navigation, editor instruction,
-  control binding, or text for the user. A refusal, a startup refusal, a notice, and a record event
-  are typed facts with data fields, and each client words them. The controller validates the target
-  and the current state of each command, and it asks for no confirmation. The application also owns
-  the config, discovery, shared model instructions, and tools. Each frontend supplies its output
-  instructions and reference text as data. The controller requires frontend text and copies it
-  during creation. A frontend can release that text when creation returns. The application composes
-  those texts with the shared instructions and reference facts. Config schemas, defaults,
-  validation, and neutral descriptions stay with the application. The public `support` namespace
-  exposes helpers without a runtime owner or controller access. `support.outOfMemory` exposes
-  `core.fatal.outOfMemory`.
-- `src` owns the native clients. The terminal loop hosts the controller and owns keys, editor
-  mechanics, focus, and animation. It also owns slash-command parsing, pickers, pages, drafts,
-  confirmation policy, command descriptions, control hints, terminal reference text, and terminal
-  output instructions. Each native client supplies the words of every typed fact.
-  `src/reference.zig` owns the command table and control hints. `src/describe.zig` owns the native
-  reference text and output instructions. `src/format.zig` owns the native display helpers.
-  `src/wording.zig` words the refusals and record events, and `src/headless.zig` words the startup
-  refusals. The screen owns a disposable presentation copy and its layout caches. It applies states
-  and snapshots through one path. A snapshot keeps the local pickers and pages. The presentation
-  copy applies record changes by id and groups work runs for display. Native clients use only public
-  application commands, queries, and events for application operations. Routine repaints use the
-  local copy without a snapshot. The UI fits and paints Markdown through one shared layout walk.
-  `Herdr.Endpoint` stays terminal integration data.
+  generated results, turn boundaries, accounts, saved choices, and statistics. It owns their
+  lifetimes. The controller validates commands and owns the workflow rules. Work stays exclusive
+  across turns, asides, sign-ins, and model fetches. Record changes use stable ids. Events and
+  snapshots carry typed facts, not terminal layout, navigation, editor instructions, control
+  bindings, or text for the user. The `interface` preferences are the exception. The application
+  also owns the config, discovery, shared model instructions, and tools. Config schemas, defaults,
+  validation, and neutral descriptions stay with the application.
+- `src` owns the native clients, terminal controls, editor, pages, drafts, confirmation policy, and
+  text for the user. The terminal loop hosts the controller. Each native client supplies the words
+  of every typed fact. The screen keeps a disposable presentation copy. Native clients use only
+  public application commands, queries, and events for application operations.
 - `src/ui/role.zig` maps a role to terminal colors. A widget names a role and writes no color of its
   own.
 
@@ -71,15 +48,18 @@ controller allocator. Event callbacks borrow their data, and a sink copies data 
 sink must not call the controller from an event callback. The host records a continuation from an
 event and runs it after the controller call returns. A response and a query result borrow controller
 memory until the next controller call. The host copies that data before it calls the controller
-again. A client dismisses a notice by its id. A stale notice id changes no state.
+again.
 
 A loop task lends state to its child task and touches none of it until the child ends. The child
 returns its result with its end. A lock guards state that the tasks of two actors share.
 
-A turn and an aside report the final available usage of each model attempt to the controller. The
-controller adds each cost to the session total. `lib/application/billing.zig` holds the charge rule.
-The runner reports tool costs through its own sink. A `drinky run` under the `bash` tool reports its
-costs through a private pipe to that sink. The pipe ends with the `bash` invocation.
+## Skills
+
+Read `.agents/skills/architecture/SKILL.md` before you change or review module ownership, public
+contracts, actors, concurrency, timeouts, frontend behavior or text, or billing.
+
+Read `.agents/skills/accounts-vocabulary/SKILL.md` before you change or review accounts, models,
+credentials, public metadata, provider terminology, vendor terminology, or platform terminology.
 
 ## Interface
 
@@ -111,36 +91,22 @@ These rules outrank existing behavior and repository precedent.
 - Drinky has no dependency but the Zig standard library. `build.zig.zon` names no package.
 - Write no comment. A name or a test carries the intent, and a fact that matters goes into a test, a
   name, or the chat.
-- Less code is better. Delete code without a caller. Add a seam, a pointer with a vtable in the
-  shape of `std.mem.Allocator`, only when a second implementation or a test fake exists.
+- Less code is better. Add a seam only when a second implementation or a test fake exists.
 - Before you write a helper, search the modules that the build lets the module import. Share code
   within its responsibility boundary. Semantic ownership takes priority over the removal of
   duplicate code. Do not move presentation code into the application or core solely to share it.
 - Production code holds no option, entry point, mode, or global that only a test uses. A test fakes
   the clock through an `Io` and the network through a `Transport`. A size cap stays an option when
   no test can reach its production value.
-- Do not pass the implementation of a contract as `anytype`. A seam or a generic type states the
-  contract.
 - A fact that crosses a module boundary carries the data needed to interpret its meaning. A client
   must not infer a missing cause or target. A client can use the originating request to choose its
   words. Do not add redundant fields solely to select those words.
-- A branch that no production path reaches is an assert or `unreachable`. It holds no text for the
-  user.
-- Write a rule for each vendor, wire, or sign-in flow as an exhaustive switch over its enum.
-- A seam, a callback, and a timed call declare their error set. Do not widen an error set to
-  `anyerror`.
-- The type that defines an event owns its `dupe` and its `deinit`. A sink takes `*const Event`,
-  returns nothing, and copies what it keeps.
-- Allocation failure is fatal to the process. Propagate `error.OutOfMemory` and release partial
-  allocations. Application boundaries must call `core.fatal.outOfMemory`. The panic ends every
-  controller in the process. A callback or task must call the same function when it cannot propagate
-  the error. Never suppress an allocation failure, including during cancellation or cache
-  operations. Convert failures from known allocating writers into `error.OutOfMemory`. Keep device
-  write failures distinct.
+- An event sink takes `*const Event`, returns nothing, and copies what it keeps.
+- Allocation failure is fatal to the process. Application boundaries must call
+  `core.fatal.outOfMemory`. The panic ends every controller in the process. A callback or task must
+  call the same function when it cannot propagate the error.
 - Only reads of optional caches, saved choices, and display metadata can treat other errors as
   missing data. Every other reader keeps its error contract.
-- A cancel must end every wait. Never run the work of a task in place of the task. When
-  `io.concurrent` fails, report the failure. A zero window starts the task without a timer.
 - The module graph is the architecture. A new module gets its row in `build.zig` and its line in the
   Layers section of this file.
 - The development tools of the Zig code are the Zig toolchain alone. `zig fmt` formats every Zig
@@ -160,8 +126,8 @@ These rules outrank existing behavior and repository precedent.
 - Do not require recovery tests for fatal allocation failures. A fix of out-of-memory handling needs
   a test only where `std.testing.checkAllAllocationFailures` covers it. Use exhaustive allocation
   checks for cleanup where functions return `error.OutOfMemory`.
-- A test reaches a state through commands, events, keys, and options, with a hand-written fake. It
-  reads the state through public functions.
+- Prefer tests that reach state through commands, events, keys, and options, with a hand-written
+  fake. Read state through public functions when you test a module boundary.
 - Use no network and no sleep. A test takes `std.testing.io`. Build an `Io` only to set a limit or
   to control the clock.
 - Run `std.testing.checkAllAllocationFailures` on `core.testing.no_resize_allocator`.
@@ -169,9 +135,8 @@ These rules outrank existing behavior and repository precedent.
   cancel ended the wait.
 - A test that changes with every implementation change tests the implementation. Delete it or move
   it to the boundary.
-- A test calls a private pure function only when its input and its output are facts outside the
-  code. A vendor date and its epoch seconds are such facts. A model before the catalog merge is not
-  such a fact. Every other test calls the public function that gives the same fact.
+- A test can call a private pure function to verify meaningful behavior without a large fixture. Do
+  not copy the implementation to compute the expected result.
 - A test name states the behavior that its body checks.
 - Put the shared test code of a module into its `testing.zig`. Put a private rig, fixture, or fake
   after the first test of its file.
@@ -183,10 +148,11 @@ These rules outrank existing behavior and repository precedent.
 
 ## Decisions
 
-- Report every decision that the code does not force. A cut, a sentinel, a default, a rename, and a
-  deferral are decisions.
-- Write every deferral into `BACKLOG.md`, and name its trigger when an event must come first.
-- A control that a user sets is never code without a caller. Never reduce its range.
+- Report decisions that affect behavior, public contracts, scope, or significant trade-offs.
+- Record unfinished work that the user requested in `BACKLOG.md`. Name a trigger only when an event
+  must come first.
+- A control that a user sets is never code without a caller. Do not reduce its range silently. A
+  range reduction requires an explicit user decision and a compatibility assessment.
 - A recommendation names its evidence. A claim about a provider names the field, the endpoint, or
   the document that proves it.
 
@@ -218,7 +184,8 @@ English.
   value.
 - Put a dynamic error name in a complete sentence:
   `Drinky could not open {path} because of error {name}.`
-- Every text is timeless and impersonal. Use no name, no date, and no pointer to a session.
+- Keep text timeless and impersonal. Use no personal attribution or reference to a development chat.
+  Technical names and dates can state required facts.
 
 These rules do not apply to a literal technical identifier or a schema. Preserve the meaning and the
 terminal-width limits when you reword a text.
@@ -228,31 +195,6 @@ terminal-width limits when you reword a text.
 Use `drinky` for a machine-parsed name and format it as code. Use `Drinky` for the product in prose
 and in user-facing text, and never start a sentence with lowercase `drinky`. Reserve `DRINKY` for an
 environment variable.
-
-## Models vocabulary
-
-- **author**: The slug before the slash in an OpenRouter model id, as in `openai` of
-  `openai/gpt-5.6-sol`. OpenRouter keeps `provider` for the company that serves a request.
-- **public metadata**: The price, window, effort, thinking, and tool facts of a model. Drinky stores
-  them in `metadata.json`. Never write **OpenRouter** for that source.
-
-`OpenRouter` names the provider alone.
-
-## Accounts vocabulary
-
-An account identifier reads `vendor-product`, as in `anthropic-plan`. A `-key` suffix marks a
-credential that an environment variable holds or names, as in `anthropic-api-key`. An identifier
-without it signs in through an OAuth login. The `id` field of a table row is the only spelling of an
-identifier. A model under an account reads `account/model`.
-
-- **vendor**: The `Account.Vendor` tag: `anthropic`, `openai`, `xai`, `openrouter`, `deepseek`, or
-  `google`.
-- **plan**: A consumer subscription, as in Claude Pro or Max, ChatGPT, and SuperGrok.
-- **api**: The developer API of the vendor, billed per token.
-- **cloud**: The cloud platform of the vendor, as in a Google Cloud project on the Agent Platform.
-- **Agent Platform**: The short form of Gemini Enterprise Agent Platform, the Google Cloud platform
-  that was Vertex AI. Name it in full with `(Vertex AI)` on the first mention of a document. Never
-  write **Gemini Enterprise** alone, because that is another Google product.
 
 ## Checks
 
@@ -268,5 +210,5 @@ regenerates the Unicode data, its test corpus, and its license notice. `zig buil
 regenerates the CommonMark test corpus and its license notice. Both steps use the network, so they
 never join the default build.
 
-A rule that a tool can check belongs in `scripts/check.sh`, because an editor setting enforces
-nothing. Add a check to `scripts/check.sh` for a problem that occurred.
+Add checks for mechanical errors when detection is reliable and the maintenance cost is
+proportionate. Run them through `scripts/check.sh`.

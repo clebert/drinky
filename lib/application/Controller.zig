@@ -98,10 +98,10 @@ startup_refusal: ?StartupRefusal = null,
 
 pub const Handle = opaque {
     pub fn create(gpa: std.mem.Allocator, io: std.Io, options: *const Options) !*Handle {
-        const self = try gpa.create(Controller);
-        errdefer gpa.destroy(self);
-        try self.init(gpa, io, options);
-        return @ptrCast(self);
+        return Controller.create(gpa, io, options) catch |err| switch (err) {
+            error.OutOfMemory => core.fatal.outOfMemory(),
+            else => return err,
+        };
     }
     pub fn submit(handle: *Handle, command_value: *const Command) Response {
         const self = controllerOf(handle);
@@ -469,6 +469,13 @@ pub const Event = union(enum) {
 const surface_sink_vtable: Sink.VTable = .{ .emit = emitSurfaceEvent };
 const session_sink_vtable: core.Session.Sink.VTable = .{ .emit = emitSessionEvent };
 const accounts_sink_vtable: accounts.Registry.Sink.VTable = .{ .emit = emitAccountsEvent };
+
+fn create(gpa: std.mem.Allocator, io: std.Io, options: *const Options) !*Handle {
+    const self = try gpa.create(Controller);
+    errdefer gpa.destroy(self);
+    try self.init(gpa, io, options);
+    return @ptrCast(self);
+}
 
 fn controllerOf(handle: *Handle) *Controller {
     return @ptrCast(@alignCast(handle));
@@ -2476,7 +2483,7 @@ fn checkSessionInitialization(gpa: std.mem.Allocator, directory: []const u8) !vo
     var environment: std.process.Environ.Map = .init(std.testing.allocator);
     defer environment.deinit();
     var listener: InitializationListener = .{ .gpa = gpa };
-    const controller = try Handle.create(gpa, std.testing.io, &.{
+    const controller = try create(gpa, std.testing.io, &.{
         .directories = .{ .working_directory = directory, .home = directory },
         .environment = &environment,
         .frontend = .{

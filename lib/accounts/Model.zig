@@ -14,7 +14,7 @@ pub const name_bytes_max = 64;
 name_buffer: [name_bytes_max]u8,
 name_length: u8,
 served_buffer: [name_bytes_max]u8,
-served_length: u8,
+served_length: ?u8,
 efforts: std.EnumSet(core.Provider.Effort),
 efforts_denied: bool,
 thinking: Thinking,
@@ -57,7 +57,7 @@ pub fn init(id: []const u8) error{BadModelName}!Model {
         .name_buffer = undefined,
         .name_length = @intCast(id.len),
         .served_buffer = undefined,
-        .served_length = 0,
+        .served_length = null,
         .efforts = .empty,
         .efforts_denied = false,
         .thinking = .unknown,
@@ -90,12 +90,15 @@ pub fn serveAs(self: *Model, id: []const u8) error{BadModelName}!void {
     self.served_length = @intCast(id.len);
 }
 
-pub fn servedName(self: *const Model) []const u8 {
-    return self.served_buffer[0..self.served_length];
+pub fn servedName(self: *const Model) ?[]const u8 {
+    const length = self.served_length orelse return null;
+    return self.served_buffer[0..length];
 }
 
 pub fn serves(self: *const Model, served: []const u8) bool {
-    return self.sameName(served) or std.mem.eql(u8, self.servedName(), served);
+    if (self.sameName(served)) return true;
+    const alias = self.servedName() orelse return false;
+    return std.mem.eql(u8, alias, served);
 }
 
 pub fn addEffort(self: *Model, level: core.Provider.Effort) void {
@@ -106,9 +109,15 @@ pub fn sameName(self: *const Model, other: []const u8) bool {
     return std.mem.eql(u8, self.name(), other);
 }
 
+fn sameServedName(self: *const Model, other: *const Model) bool {
+    const alias = self.servedName() orelse return other.servedName() == null;
+    const other_alias = other.servedName() orelse return false;
+    return std.mem.eql(u8, alias, other_alias);
+}
+
 pub fn eql(self: *const Model, other: *const Model) bool {
     return self.sameName(other.name()) and
-        std.mem.eql(u8, self.servedName(), other.servedName()) and
+        self.sameServedName(other) and
         self.efforts.eql(other.efforts) and
         self.efforts_denied == other.efforts_denied and
         self.thinking == other.thinking and
@@ -212,14 +221,6 @@ test "a name that a request line cannot carry names no model" {
     }) |accepted| try std.testing.expectEqualStrings(accepted, (try init(accepted)).name());
 }
 
-test "a copy owns its name" {
-    var original = try init("gpt-5.6-sol");
-    const copy = original;
-    original = try init("gpt-5.6-luna");
-    try std.testing.expectEqualStrings("gpt-5.6-sol", copy.name());
-    try std.testing.expectEqualStrings("gpt-5.6-luna", original.name());
-}
-
 test eql {
     const fetched = init("claude-opus-5") catch unreachable;
     var described = fetched;
@@ -267,27 +268,32 @@ test eql {
     var aliased = init("claude-opus-5") catch unreachable;
     aliased.serveAs("claude-opus-5-20260101") catch unreachable;
     try std.testing.expect(!fetched.eql(&aliased));
+    try std.testing.expect(!aliased.eql(&fetched));
+    var realiased = aliased;
+    try std.testing.expect(aliased.eql(&realiased));
+    try realiased.serveAs("claude-opus-5-20260202");
+    try std.testing.expect(!aliased.eql(&realiased));
 }
 
-test serves {
-    var alias = try init("grok-4.20");
-    try std.testing.expect(alias.serves("grok-4.20"));
-    try std.testing.expect(!alias.serves("grok-4.20-0309-reasoning"));
-    try std.testing.expectEqualStrings("", alias.servedName());
+test "a model serves its name and its stated alias and no other name" {
+    var model = try init("grok-4.20");
+    try std.testing.expect(model.serves("grok-4.20"));
+    try std.testing.expect(!model.serves(""));
+    try std.testing.expect(!model.serves("grok-4.20-0309-reasoning"));
 
-    try alias.serveAs("grok-4.20-0309-reasoning");
-    try std.testing.expectEqualStrings("grok-4.20-0309-reasoning", alias.servedName());
-    try std.testing.expect(alias.serves("grok-4.20"));
-    try std.testing.expect(alias.serves("grok-4.20-0309-reasoning"));
-    try std.testing.expect(!alias.serves("grok-4.20-0309"));
-    try std.testing.expect(!alias.serves(""));
+    try model.serveAs("grok-4.20-0309-reasoning");
+    try std.testing.expectEqualStrings("grok-4.20-0309-reasoning", model.servedName().?);
+    try std.testing.expect(model.serves("grok-4.20"));
+    try std.testing.expect(model.serves("grok-4.20-0309-reasoning"));
+    try std.testing.expect(!model.serves("grok-4.20-0309"));
+}
 
-    try std.testing.expectError(error.BadModelName, alias.serveAs(""));
-    try std.testing.expectError(error.BadModelName, alias.serveAs("grok 4"));
-    try std.testing.expectError(
-        error.BadModelName,
-        alias.serveAs(core.text.repeat("x", name_bytes_max + 1)),
-    );
+test "serveAs refuses an invalid alias and keeps the stated alias" {
+    var model = try init("grok-4.20");
+    try model.serveAs("grok-4.20-0309-reasoning");
+    for ([_][]const u8{ "", "grok 4", core.text.repeat("x", name_bytes_max + 1) }) |invalid|
+        try std.testing.expectError(error.BadModelName, model.serveAs(invalid));
+    try std.testing.expectEqualStrings("grok-4.20-0309-reasoning", model.servedName().?);
 }
 
 test "a fold takes the nearest level and prefers the lower one on a tie" {

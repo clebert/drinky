@@ -160,7 +160,12 @@ fn writeRequest(
     try writer.writeByte('\n');
 }
 
-fn exchange(io: std.Io, endpoint: *const Endpoint, line: []const u8) !void {
+fn exchange(
+    io: std.Io,
+    endpoint: *const Endpoint,
+    line: []const u8,
+) (std.Io.net.UnixAddress.InitError || std.Io.net.UnixAddress.ConnectError ||
+    std.Io.Writer.Error || std.Io.Reader.DelimiterError)!void {
     const address = try std.Io.net.UnixAddress.init(endpoint.socket_path);
     const stream = try address.connect(io);
     defer stream.close(io);

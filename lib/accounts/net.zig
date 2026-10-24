@@ -37,7 +37,7 @@ fn requestJson(
     io: std.Io,
     transport: ?providers.Transport,
     get: *const Get,
-) !?[]u8 {
+) providers.Http.FetchError!?[]u8 {
     const authorization = try gpa.print("Bearer {s}", .{get.bearer});
     defer gpa.free(authorization);
     const response = try providers.Http.fetch(gpa, io, transport, &.{
