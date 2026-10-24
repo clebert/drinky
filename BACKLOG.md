@@ -13,24 +13,6 @@ when the user drops it.
 
 ## Open items
 
-- Drinky has no headless HTTP endpoint with JSON commands and events. The endpoint must adapt the
-  existing application contract with conversion and transport code. It must add no application
-  workflow or runtime export. The endpoint hosts the passive controller on its own task, like
-  `App.zig`. It owns the request ids, the event sequence, and the event buffer of each browser. A
-  browser that misses an event requests a snapshot. It sends no command until that snapshot arrives.
-  The browser owns its confirmation policy, and the endpoint keeps no confirmation state. A slow
-  browser must not block the sink of the controller. Records, result waits, and the quota age use
-  the awake clock and the boot clock of the controller. The endpoint needs the current reading of
-  each clock in every snapshot, so a browser can compute its offset. The design must decide whether
-  more than one browser can attach to one controller. The browser words the typed refusals, notices,
-  and record events, because `src/wording.zig` serves only the native clients. A record event can
-  hold a path or a name that is not valid UTF-8, so the conversion must escape it. The HTTP host
-  must supply its output instructions and reference text through `Frontend`. It must not reuse the
-  native terminal descriptions.
-- `drinky run` shows no token totals or per-run cost. Internal cost reports update only the parent
-  session total.
-- A run that outlives its bash invocation cannot report later costs. Keep the invocation open with
-  `wait` to collect them.
 - A failed test shows no stack trace, because `build.zig` sets `strip = true` for each test module.
   It also sets the strip for the generators of `zig build unicode` and `zig build commonmark`.
   Without it, a generator hangs at its first allocation. Two defects of Zig 0.17.0 block the removal
@@ -51,8 +33,5 @@ when the user drops it.
   directories without a time limit. A file system call that does not return stops the start. A
   pending macOS privacy prompt causes such a call. The tools and the skill file reads already stop
   such a call after their time limit when the call accepts a cancel.
-- Drinky calls `std.unicode.utf8Decode` at six sites. Zig 0.17.0 deprecates the function but names
-  no successor, and the standard library still calls it. Trigger: a Zig release that names a
-  successor or removes the function.
 
 ## Ideas
