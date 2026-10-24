@@ -55,7 +55,7 @@ returns its result with its end. A lock guards state that the tasks of two actor
 
 ## Skills
 
-Read `.agents/skills/architecture/SKILL.md` before you change or review module ownership, public
+Read `.agents/skills/architecture/SKILL.md` to plan, change, or review module ownership, public
 contracts, actors, concurrency, timeouts, frontend behavior or text, or billing.
 
 Read `.agents/skills/accounts-vocabulary/SKILL.md` before you change or review accounts, models,
