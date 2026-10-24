@@ -69,7 +69,7 @@ pub fn subject(
     roots: *const format.Roots,
 ) error{OutOfMemory}![]u8 {
     const value = description.subject orelse return gpa.dupe(u8, "");
-    if (value.kind == .command) return gpa.print("Command: {s}", .{value.text});
+    if (value.kind == .command) return gpa.dupe(u8, value.text);
     const shown = switch (value.kind) {
         .path => try format.path(gpa, value.text, roots),
         .pattern => try gpa.dupe(u8, value.text),
@@ -479,7 +479,7 @@ test "a tool names its subject and preserves each command line below its metadat
         .{
             .name = "bash",
             .subject = .{ .kind = .command, .text = "cat <<'EOF'\n  one\n\n  two\nEOF" },
-            .expected = "Tool: bash (running)\nCommand: cat <<'EOF'\n  one\n\n  two\nEOF",
+            .expected = "Tool: bash (running)\ncat <<'EOF'\n  one\n\n  two\nEOF",
         },
         .{
             .name = "grep",

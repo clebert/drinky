@@ -131,13 +131,13 @@ fn writeCommands(writer: *std.Io.Writer) !void {
         \\A search that stops at a limit or skips entries shows `partial`.
         \\A file window or truncated output still shows `complete`.
         \\Bash commands and complete tool error sentences appear below the metadata.
-        \\Every detail row aligns under the first optional metadata field.
-        \\The indent uses the complete identity width plus the separator width, measured in
-        \\terminal columns.
-        \\The indent stays available when the header hides all optional metadata fields.
-        \\The indent applies only when at least 13 columns remain after it.
-        \\Otherwise, every detail row for that call starts at the left edge.
-        \\Source indentation stays in addition to the detail indent.
+        \\A command starts with `$ ` in a two-column gutter.
+        \\Each further command line starts with two spaces.
+        \\A wrapped command row starts with `↪ `.
+        \\Source indentation stays after the gutter.
+        \\At a width of two columns, the gutter has one column.
+        \\At a width of one column, the row has no gutter.
+        \\Tool error sentences start at the left edge.
         \\Complete tool error sentences wrap, even at very small widths.
         \\Work rows start with `Agent: work (activity)` while open and `Agent: work (status)` after
         \\completion.

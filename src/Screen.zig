@@ -1236,7 +1236,7 @@ test "tool metadata keeps its state and removes whole segments during and after 
         "a very long path with a · separator.zig · Lines: 120");
 }
 
-test "verbose commands preserve line breaks and wrap before and after completion" {
+test "a verbose command keeps its gutter rows when its call completes" {
     const gpa = std.testing.allocator;
     var rig: Rig = undefined;
     rig.init();
@@ -1251,27 +1251,24 @@ test "verbose commands preserve line breaks and wrap before and after completion
     try rig.apply(&.{ .tool_call_started = call.name });
     try rig.apply(&.{ .tool_started = call });
     rig.time.awake_ms = 3_000;
-    for (0..2) |stage| {
+    const expected = [_][]const u8{
+        "$ cat <<'EOF'",
+        "    first",
+        "",
+        "  a long command line that must wrap and keep",
+        "↪ its final-word",
+        "  EOF",
+    };
+    for ([_][]const u8{ "Tool: bash (running)", "Tool: bash (complete)" }, 0..) |identity, stage| {
         const painted = try rig.paintPlain(48);
         defer gpa.free(painted);
-        try testing.expectContains(painted, "Command: cat <<'EOF'");
         var rows = std.mem.splitSequence(u8, painted, "\r\n");
-        var first_kept = false;
         while (rows.next()) |row| {
-            const indent: usize = if (stage == 0) 23 else 24;
-            const expected = if (stage == 0)
-                "                         first"
-            else
-                "                          first";
-            if (!std.mem.eql(u8, std.mem.trimEnd(u8, row, " "), expected)) continue;
-            try std.testing.expect(std.mem.allEqual(u8, row[0..indent], ' '));
-            try std.testing.expect(ui.paint.isBlank(rows.next().?));
-            first_kept = true;
-            break;
+            if (std.mem.startsWith(u8, row, identity)) break;
+        } else return error.TestUnexpectedResult;
+        for (expected) |line| {
+            try std.testing.expectEqualStrings(line, std.mem.trimEnd(u8, rows.next().?, " "));
         }
-        try std.testing.expect(first_kept);
-        try testing.expectContains(painted, "final-word");
-        try testing.expectContains(painted, "EOF");
         if (stage == 0) {
             var output: core.Tool.Output = .{};
             output.measures.put(.duration_ms, 3_000);
@@ -2280,7 +2277,7 @@ test "a tool call streams as a row, runs with its subject and timer, and ends as
     const running = try rig.paintPlain(80);
     defer gpa.free(running);
     try testing.expectContains(running, "Tool: bash (running) · Time: 12s · Timeout: 2m 0s");
-    try testing.expectContains(running, "Command: zig build");
+    try testing.expectContains(running, "\r\n$ zig build");
 
     var output: core.Tool.Output = .{ .content = "ok\n" };
     output.measures.put(.duration_ms, 1500);
@@ -2293,7 +2290,7 @@ test "a tool call streams as a row, runs with its subject and timer, and ends as
     try rig.expectKinds(&.{ .user, .tool_result });
     const block = rig.blocks()[1].content.tool_result;
     try std.testing.expectEqualStrings(
-        "Tool: bash (complete) · Time: 1.5s · Exit code: 0 · Lines: 1\nCommand: zig build",
+        "Tool: bash (complete) · Time: 1.5s · Exit code: 0 · Lines: 1\nzig build",
         block.text.items,
     );
     try std.testing.expect(block.status.role == .success);
@@ -2340,7 +2337,7 @@ test "a failed tool result keeps its sentence below the call row" {
     try rig.end(&.{ .stopped = .complete });
 }
 
-test "pending and completed calls keep the draft and share the detail threshold" {
+test "pending and completed calls keep the draft and show the command in the gutter" {
     const gpa = std.testing.allocator;
     var rig: Rig = undefined;
     rig.init();
@@ -2355,23 +2352,10 @@ test "pending and completed calls keep the draft and share the detail threshold"
     try rig.apply(&.{ .tool_call_started = call.name });
     try rig.apply(&.{ .tool_started = call });
     for (0..2) |stage| {
-        const desired: usize = if (stage == 0) 23 else 24;
-        for ([_]usize{ 40, 37, 36, 35, 25, 24 }) |columns| {
-            const indent = if (columns -| desired >= 13) desired else 0;
-            const painted = try rig.paintPlain(columns);
-            defer gpa.free(painted);
-            var lines = std.mem.splitSequence(u8, painted, "\r\n");
-            var command_seen = false;
-            while (lines.next()) |row| {
-                if (std.mem.find(u8, row, "Command:") == null) continue;
-                try std.testing.expect(std.mem.allEqual(u8, row[0..indent], ' '));
-                try std.testing.expect(std.mem.startsWith(u8, row[indent..], "Command:"));
-                command_seen = true;
-                break;
-            }
-            try std.testing.expect(command_seen);
-            try testing.expectContains(painted, "last-line");
-        }
+        const painted = try rig.paintPlain(40);
+        defer gpa.free(painted);
+        try testing.expectContains(painted, "\r\n$ git diff --check");
+        try testing.expectContains(painted, "\r\n  last-line");
         rig.screen.setVerbose(!rig.screen.verbose);
         rig.screen.setVerbose(!rig.screen.verbose);
         const draft = try rig.screen.editor.expanded();
@@ -2419,7 +2403,7 @@ test "verbose off hides each command, and verbose on keeps its complete text" {
         const running = try rig.paintPlain(80);
         defer gpa.free(running);
         try expectSummary(running, "Agent: work (bash) · Time: 0s · Tools: 0 · Received: 0 B");
-        try std.testing.expect(std.mem.find(u8, running, "Command:") == null);
+        try std.testing.expect(std.mem.find(u8, running, "$ echo") == null);
         try std.testing.expect(std.mem.find(u8, running, case.hidden) == null);
 
         var output: core.Tool.Output = .{ .content = sentence };
@@ -2430,7 +2414,7 @@ test "verbose off hides each command, and verbose on keeps its complete text" {
         const complete = try rig.paintPlain(56);
         defer gpa.free(complete);
         try testing.expectContains(complete, "Agent: work (complete)");
-        try std.testing.expect(std.mem.find(u8, complete, "Command:") == null);
+        try std.testing.expect(std.mem.find(u8, complete, "$ echo") == null);
         try std.testing.expect(std.mem.find(u8, complete, "Error:") == null);
 
         rig.screen.setVerbose(!rig.screen.verbose);
@@ -2440,20 +2424,17 @@ test "verbose off hides each command, and verbose on keeps its complete text" {
         try testing.expectContains(full, sentence);
         try std.testing.expect(std.mem.find(u8, full, "…") == null);
         try testing.expectContains(rig.out.written(), "\x1b[31m\x1b[2mTool: bash (failed)");
-        try testing.expectContains(rig.out.written(), "\x1b[2;39mCommand:");
+        try testing.expectContains(rig.out.written(), "\x1b[2;39m$ echo");
         try std.testing.expect(std.mem.find(u8, rig.out.written(), "\x1b[7m") == null);
         if (std.mem.find(u8, case.arguments, "Error:") != null)
-            try testing.expectContains(rig.out.written(), "\x1b[2;39mError: command text");
-        try testing.expectContains(
-            rig.out.written(),
-            "\x1b[0m\r\n                      \x1b[2;39mError: Drinky",
-        );
+            try testing.expectContains(rig.out.written(), "\x1b[2;39m  Error: command text");
+        try testing.expectContains(rig.out.written(), "\x1b[0m\r\n\x1b[2;39mError: Drinky");
 
         rig.screen.setVerbose(!rig.screen.verbose);
         const restored = try rig.paintPlain(56);
         defer gpa.free(restored);
         try testing.expectContains(restored, "Agent: work (complete)");
-        try std.testing.expect(std.mem.find(u8, restored, "Command:") == null);
+        try std.testing.expect(std.mem.find(u8, restored, "$ echo") == null);
     }
 }
 

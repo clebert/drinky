@@ -446,6 +446,9 @@ fn trimBlank(text: []const u8) []const u8 {
 
 test "each block variant renders exactly the rows it counts" {
     const gpa = std.testing.allocator;
+    const bash_identity = "Tool: bash (complete)";
+    const bash_head = bash_identity ++ " · Exit code: 1";
+    const bash_command = "ls -la\n  long-argument";
     const cases = [_]Block.Source{
         .{ .intro = "a single intro line" },
         .{ .event = .{ .text = "first\nsecond\nthird" } },
@@ -465,7 +468,13 @@ test "each block variant renders exactly the rows it counts" {
             .text = "Tool: read (failed)\nError: Drinky could not read foo.zig.",
         } },
         .{ .tool_result = .{
-            .text = "Tool: bash · Command: ls\nTime: 400ms · Exit code: 1",
+            .text = bash_head ++ "\n" ++ bash_command,
+            .segment_ends = &.{ bash_identity.len, bash_head.len },
+            .status = .{ .start = 0, .end = bash_identity.len, .role = .success, .dim = true },
+            .command = .{
+                .start = bash_head.len + 1,
+                .end = bash_head.len + 1 + bash_command.len,
+            },
         } },
         .{ .tool_result = .{ .text = "Tool: describe_drinky" } },
         .{ .user = "你好世界" },
@@ -614,9 +623,9 @@ test "user messages preserve blank lines and indentation in a padded purple box"
     }
 }
 
-test "command ranges keep every detail aligned through wrapping replay and clipping" {
+test "command ranges keep the gutter and every detail through wrapping replay and clipping" {
     const gpa = std.testing.allocator;
-    const command = "Command: git diff --check\n  你好👩‍💻 tail\n\nError: command text\nlast-line\n";
+    const command = "git diff --check\n  你好👩‍💻 tail\n\nError: command text\nlast-line\n";
     const detail = "Error: Drinky could not run the command because of error AccessDenied.";
     for ([_][]const u8{ "Tool: bash (complete)", "Tool: 読む (complete)" }) |identity| {
         const head = try gpa.print("{s} · File: a/very/long/path.zig", .{identity});
@@ -632,10 +641,8 @@ test "command ranges keep every detail aligned through wrapping replay and clipp
         var block = try Block.init(gpa, &source);
         defer block.deinit(gpa);
         for ([_]usize{ 100, 40, 37, 36, 25, 24, 9, 1 }) |columns| {
-            const indent: usize = if (columns >= 37) 24 else 0;
-            const room = columns - indent;
             const expected_rows = block.rows(columns);
-            const command_rows = expected_rows - 1 - terminal.width.rows(detail, room);
+            const command_rows = expected_rows - 1 - terminal.width.rows(detail, columns);
             try std.testing.expect(command_rows >= std.mem.count(u8, command, "\n") + 1);
             const painted = try rendered(gpa, &block, columns, 0);
             defer gpa.free(painted);
@@ -653,10 +660,9 @@ test "command ranges keep every detail aligned through wrapping replay and clipp
             defer restored_error.deinit(gpa);
             var index: usize = 0;
             while (lines.next()) |row| : (index += 1) {
-                try std.testing.expect(std.mem.allEqual(u8, row[0..indent], ' '));
                 try std.testing.expect(terminal.width.ofText(row) <= columns);
                 if (index < command_rows) continue;
-                for (row[indent..]) |byte|
+                for (row) |byte|
                     if (byte != ' ') try restored_error.append(gpa, byte);
             }
             try std.testing.expectEqualStrings(
@@ -664,14 +670,12 @@ test "command ranges keep every detail aligned through wrapping replay and clipp
                 restored_error.items,
             );
             if (columns == 100) {
-                try testing.expectShows(painted, &.{"\x1b[2;39mCommand:"});
                 try testing.expectShows(painted, &.{
-                    "\x1b[0m\r\n                        \x1b[2;39mError: Drinky",
-                });
-                try testing.expectShows(painted, &.{
-                    "\x1b[2;39m  你好👩‍💻 tail",
-                    "\x1b[2;39mError: command text",
-                    "\x1b[2;39mlast-line",
+                    "\x1b[2;39m$ git diff --check",
+                    "\x1b[2;39m    你好👩‍💻 tail",
+                    "\x1b[2;39m  Error: command text",
+                    "\x1b[2;39m  last-line",
+                    "\x1b[0m\r\n\x1b[2;39mError: Drinky",
                 });
             }
             const replayed = try rendered(gpa, &block, columns, 0);
@@ -747,9 +751,7 @@ test "tool errors stay dim with red identities and complete text across terminal
             .status = .{ .start = 0, .end = identity.len, .role = .@"error", .dim = true },
         } });
         defer block.deinit(gpa);
-        const widths = [_]usize{ 80, 40, 35, 34, 25, 23, 22, 20, 1 };
-        for (widths) |columns| {
-            const indent: usize = if (columns >= 35) 22 else 0;
+        for ([_]usize{ 80, 40, 20, 1 }) |columns| {
             const painted = try rendered(gpa, &block, columns, 0);
             defer gpa.free(painted);
             var styled = std.mem.splitSequence(u8, painted, "\r\n");
@@ -758,29 +760,25 @@ test "tool errors stay dim with red identities and complete text across terminal
                 try testing.expectShows(row, &.{"\x1b[2;39m"});
             const plain = try terminal.testing.plainText(gpa, painted);
             defer gpa.free(plain);
-            if (columns == 80) try testing.expectShows(plain, &.{
-                "                      Error: Drinky",
-            });
+            if (columns == 80) try testing.expectShows(plain, &.{"\r\nError: Drinky"});
             var restored: std.ArrayList(u8) = .empty;
             defer restored.deinit(gpa);
             var lines = std.mem.splitSequence(u8, plain, "\r\n");
             _ = lines.next().?;
             while (lines.next()) |row| {
-                try std.testing.expect(row.len >= indent);
-                try std.testing.expect(std.mem.allEqual(u8, row[0..indent], ' '));
                 try std.testing.expect(terminal.width.ofText(row) <= columns);
-                for (row[indent..]) |byte| if (byte != ' ') try restored.append(gpa, byte);
+                for (row) |byte| if (byte != ' ') try restored.append(gpa, byte);
             }
             try std.testing.expectEqualStrings(
                 "Error:DrinkycouldnotreadthefilebecauseoferrorAccessDenied.",
                 restored.items,
             );
-            const expected_rows = 1 + terminal.width.rows(detail, columns - indent);
+            const expected_rows = 1 + terminal.width.rows(detail, columns);
             try std.testing.expectEqual(expected_rows, block.rows(columns));
             try std.testing.expectEqual(expected_rows, testing.paintedRows(painted));
-            const clipped = try rendered(gpa, &block, columns, 2);
+            const clipped = try rendered(gpa, &block, columns, 1);
             defer gpa.free(clipped);
-            try std.testing.expectEqual(expected_rows - 2, testing.paintedRows(clipped));
+            try std.testing.expectEqual(expected_rows - 1, testing.paintedRows(clipped));
         }
     }
 }

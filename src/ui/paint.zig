@@ -117,7 +117,6 @@ const BoxRow = struct {
     identity_value: ?Box.Range = null,
     status: ?Mark = null,
     marks: []const Mark = &.{},
-    indent: usize = 0,
 };
 
 pub const Mark = struct {
@@ -167,7 +166,9 @@ const BoxLines = struct {
     const Line = struct {
         text: []const u8,
         offset: usize,
-        command: bool,
+        part: Part,
+
+        const Part = enum { detail, command_start, command_rest };
     };
 
     fn init(body: *const Box) BoxLines {
@@ -181,38 +182,41 @@ const BoxLines = struct {
         const source = self.lines.next() orelse return null;
         const offset = self.offset;
         self.offset += source.len + 1;
-        const command = if (self.command) |range|
-            offset >= range.start and offset <= range.end
+        const part: Line.Part = if (self.command) |range|
+            if (offset == range.start)
+                .command_start
+            else if (offset > range.start and offset <= range.end) .command_rest else .detail
         else
-            false;
-        return .{ .text = lineText(source), .offset = offset, .command = command };
+            .detail;
+        return .{ .text = lineText(source), .offset = offset, .part = part };
     }
 };
 
 const BoxWrap = struct {
     iterator: terminal.width.Wrapper,
+    lead: []const u8,
     marker: []const u8,
-    continued_columns: usize,
 
     const Shown = struct { marker: []const u8, text: []const u8 };
 
     fn init(line: *const BoxLines.Line, room: usize) BoxWrap {
-        const marker = if (line.command)
-            terminal.width.truncate(continuation_marker, room -| 1)
-        else
-            "";
+        const lead = terminal.width.truncate(switch (line.part) {
+            .detail => "",
+            .command_start => "$ ",
+            .command_rest => "  ",
+        }, room -| 1);
+        const lead_columns = terminal.width.ofText(lead);
         return .{
-            .iterator = terminal.width.wrapper(line.text, room),
-            .marker = marker,
-            .continued_columns = room - terminal.width.ofText(marker),
+            .iterator = terminal.width.wrapper(line.text, room - lead_columns),
+            .lead = lead,
+            .marker = terminal.width.truncate(continuation_marker, lead_columns),
         };
     }
 
     fn next(self: *BoxWrap) ?Shown {
         const span = self.iterator.nextSpan() orelse return null;
-        self.iterator.columns_max = self.continued_columns;
         return .{
-            .marker = if (span.start == 0) "" else self.marker,
+            .marker = if (span.start == 0) self.lead else self.marker,
             .text = terminal.width.rowText(self.iterator.text[span.start..span.end]),
         };
     }
@@ -390,25 +394,16 @@ fn noticeWrap(style: *const NoticeStyle, text: []const u8, columns: usize) Wrap 
 
 pub fn boxRows(body: *const Box, columns: usize) usize {
     var count: usize = if (body.padded) 2 else 0;
-    const indent = boxIndent(body, columns);
     var lines = BoxLines.init(body);
     while (lines.next()) |line| {
         if (line.offset == 0 and body.segment_ends != null) {
             count += 1;
             continue;
         }
-        var wrap = BoxWrap.init(&line, columns - indent);
+        var wrap = BoxWrap.init(&line, columns);
         while (wrap.next()) |_| count += 1;
     }
     return count;
-}
-
-fn boxIndent(body: *const Box, columns: usize) usize {
-    if (body.status == null) return 0;
-    const ends = body.segment_ends orelse return 0;
-    if (ends.len == 0) return 0;
-    const indent = terminal.width.ofText(body.text[0..ends[0]]) + terminal.width.ofText(separator);
-    return if (columns -| indent >= 13) indent else 0;
 }
 
 fn segmentCut(
@@ -546,7 +541,6 @@ pub fn box(placement: *const Placement, name: role.Name, body: *const Box) !void
     if (body.padded) try boxEdge(placement, &line, name);
     const plain = body.status != null;
     const base_role: role.Name = if (plain) .muted else name;
-    const indent = boxIndent(body, placement.columns);
     var lines = BoxLines.init(body);
     while (lines.next()) |source| {
         const content = source.text;
@@ -560,13 +554,12 @@ pub fn box(placement: *const Placement, name: role.Name, body: *const Box) !void
                 .marks = body.qualifiers,
             });
         } else {
-            var wrap = BoxWrap.init(&source, placement.columns - indent);
+            var wrap = BoxWrap.init(&source, placement.columns);
             while (wrap.next()) |shown| {
                 try boxRow(placement, &line, &.{
                     .content = shown.text,
                     .marker = shown.marker,
-                    .role = if (plain or source.command) .muted else base_role,
-                    .indent = indent,
+                    .role = if (plain or source.part != .detail) .muted else base_role,
                 });
             }
         }
@@ -586,7 +579,6 @@ fn boxEdge(placement: *const Placement, line: *usize, name: role.Name) !void {
 fn boxRow(placement: *const Placement, line: *usize, row: *const BoxRow) !void {
     defer line.* += 1;
     if (!placement.begin(line.*)) return;
-    try placement.sink.spaces(row.indent);
     try role.apply(placement.sink, row.role);
     try boxRowCells(placement.sink, placement.columns, row);
     try attribute.apply(placement.sink, .reset);
@@ -595,7 +587,7 @@ fn boxRow(placement: *const Placement, line: *usize, row: *const BoxRow) !void {
 
 fn boxRowCells(sink: *terminal.View.Sink, columns: usize, row: *const BoxRow) !void {
     try sink.text(row.marker);
-    const room = columns - row.indent - terminal.width.ofText(row.marker);
+    const room = columns - terminal.width.ofText(row.marker);
     if (row.segment_ends) |ends| {
         const shown = segmentCut(row.content, room, ends, row.identity_value);
         try boxRowText(sink, shown.kept, row);
@@ -909,52 +901,39 @@ fn writeFrameGlyph(
     }
 }
 
-test "tool details retain alignment only with thirteen available columns" {
-    const gpa = std.testing.allocator;
-    for ([_][]const u8{ "Tool: bash (complete)", "Tool: 読む (complete)" }) |identity| {
-        const command = "Command: git diff --check";
-        const text = try gpa.print("{s}\n{s}\nError: bad.", .{ identity, command });
-        defer gpa.free(text);
-        const body: Box = .{
-            .text = text,
-            .segment_ends = &.{identity.len},
-            .status = .{ .start = 0, .end = identity.len, .role = .success, .dim = true },
-            .command = .{ .start = identity.len + 1, .end = identity.len + 1 + command.len },
-        };
-        const cases = [_]struct { columns: usize, indent: usize, first: []const u8 }{
-            .{ .columns = 40, .indent = 24, .first = "Command: git" },
-            .{ .columns = 37, .indent = 24, .first = "Command: git" },
-            .{ .columns = 36, .indent = 0, .first = command },
-            .{ .columns = 25, .indent = 0, .first = command },
-            .{ .columns = 24, .indent = 0, .first = "Command: git diff" },
-        };
-        for (cases) |case| {
-            var rig: testing.Rig = undefined;
-            rig.init(gpa);
-            defer rig.deinit();
-            const placement = try rig.begin(&.{ .columns = case.columns, .rows = 100 });
-            try box(&placement, .text, &body);
-            const plain = try rig.plain();
-            var lines = std.mem.splitSequence(u8, plain, "\r\n");
-            _ = lines.next().?;
-            const first = lines.next().?;
-            const shown = std.mem.trimEnd(u8, first, " ");
-            try std.testing.expectEqualStrings(case.first, shown[case.indent..]);
-            try std.testing.expect(std.mem.allEqual(u8, first[0..case.indent], ' '));
-            while (lines.next()) |row| {
-                try std.testing.expect(std.mem.allEqual(u8, row[0..case.indent], ' '));
-                try std.testing.expect(row[case.indent] != ' ');
-            }
-            try std.testing.expectEqual(boxRows(&body, case.columns), testing.paintedRows(
-                try rig.painted(),
-            ));
+test "the command gutter narrows with the row and keeps one column for text" {
+    const identity = "Tool: bash (complete)";
+    const command = "ab\ncd";
+    const body: Box = .{
+        .text = identity ++ "\n" ++ command,
+        .segment_ends = &.{identity.len},
+        .status = .{ .start = 0, .end = identity.len, .role = .success, .dim = true },
+        .command = .{ .start = identity.len + 1, .end = identity.len + 1 + command.len },
+    };
+    const cases = [_]struct { columns: usize, rows: []const []const u8 }{
+        .{ .columns = 3, .rows = &.{ "$ a", "↪ b", "  c", "↪ d" } },
+        .{ .columns = 2, .rows = &.{ "$a", "↪b", " c", "↪d" } },
+        .{ .columns = 1, .rows = &.{ "a", "b", "c", "d" } },
+    };
+    for (cases) |case| {
+        var rig: testing.Rig = undefined;
+        rig.init(std.testing.allocator);
+        defer rig.deinit();
+        const placement = try rig.begin(&.{ .columns = case.columns, .rows = 100 });
+        try box(&placement, .text, &body);
+        var lines = std.mem.splitSequence(u8, try rig.plain(), "\r\n");
+        _ = lines.next().?;
+        for (case.rows) |expected| {
+            try std.testing.expectEqualStrings(expected, std.mem.trimEnd(u8, lines.next().?, " "));
         }
+        try std.testing.expect(lines.next() == null);
+        try std.testing.expectEqual(case.rows.len + 1, boxRows(&body, case.columns));
     }
 }
 
-test "a wrapped command row starts with a continuation marker and a detail row holds none" {
+test "a command row starts in the gutter, and a detail row starts at the edge" {
     const identity = "Tool: bash (complete)";
-    const command = "Command: git diff --check -- paint.zig\n  echo short";
+    const command = "git diff --check -- paint.zig\n  echo short";
     const body: Box = .{
         .text = identity ++ "\n" ++ command ++ "\nError: Drinky could not run the command.",
         .segment_ends = &.{identity.len},
@@ -969,18 +948,18 @@ test "a wrapped command row starts with a continuation marker and a detail row h
     var lines = std.mem.splitSequence(u8, try rig.plain(), "\r\n");
     _ = lines.next().?;
     for ([_][]const u8{
-        "Command: git diff",
-        "↪ --check --",
-        "↪ paint.zig",
-        "  echo short",
+        "$ git diff --check",
+        "↪ -- paint.zig",
+        "    echo short",
         "Error: Drinky could",
         "not run the command.",
     }) |expected| {
         try std.testing.expectEqualStrings(expected, std.mem.trimEnd(u8, lines.next().?, " "));
     }
     try std.testing.expect(lines.next() == null);
-    try std.testing.expectEqual(@as(usize, 7), boxRows(&body, 20));
-    try testing.expectShows(try rig.painted(), &.{comptime role.sequence(.muted) ++ "↪ --check"});
+    try std.testing.expectEqual(@as(usize, 6), boxRows(&body, 20));
+    const muted = comptime role.sequence(.muted);
+    try testing.expectShows(try rig.painted(), &.{ muted ++ "$ git", muted ++ "↪ -- paint" });
 }
 
 test "box rows preserve message whitespace, and padding adds a full-width role row on each side" {
