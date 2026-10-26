@@ -112,6 +112,7 @@ These rules outrank existing behavior and repository precedent.
 - The development tools of the Zig code are the Zig toolchain alone. `zig fmt` formats every Zig
   file, and the check accepts no unformatted file.
 - Follow `.agents/skills/zig-style/SKILL.md` for every Zig file.
+- Write each vendor, wire, or sign-in rule as an exhaustive switch over its enum.
 
 ## Tests
 

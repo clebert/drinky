@@ -59,9 +59,9 @@ description:
   apply only in some states. Give each union payload only the fields that it uses.
 - **No sentinels**: use an optional for an absent value. Do not use an empty string, a zero, or a
   flag to mean "absent".
-- **Exhaustive switches**: write each vendor, wire, or sign-in rule as an exhaustive switch over its
-  enum. Handle each tag when you switch on an enum or a union that the project defines. Do not write
-  `else` there. A new tag must stop the build until each switch handles it.
+- **Exhaustive switches**: use an exhaustive switch for behavior that varies by enum tag. Handle
+  each tag when you switch on an enum or a union that the project defines. Do not write `else`
+  there. A new tag must stop the build until each switch handles it.
 - **Impossible states**: do not read a union field because another value implies its tag. Carry the
   data in the value itself. Give a function a narrow enum, not a wide one with an `unreachable`
   branch. For a branch that no production path reaches and the types cannot exclude, use an
