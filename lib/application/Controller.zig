@@ -116,6 +116,7 @@ work: Work = .idle,
 operation_next: u64 = 1,
 conversation: u64 = 0,
 result: ?Result = null,
+fetch_end: ?Event.FetchEnd = null,
 short_answer: ?ShortAnswer = null,
 paste_pending: bool = false,
 response: Response = .{},
@@ -177,6 +178,18 @@ pub const Handle = opaque {
     pub fn listSkills(handle: *Handle) []const query.Skill {
         const self = controllerOf(handle);
         return self.skillFacts() catch core.fatal.outOfMemory();
+    }
+    pub fn state(handle: *Handle) State {
+        return controllerOf(handle).currentState();
+    }
+    pub fn operation(handle: *Handle, id: u64) query.Operation {
+        const self = controllerOf(handle);
+        if (self.work.view().operation() == id) return .running;
+        if (self.fetch_end) |ended| {
+            if (ended.operation == id) return .{ .fetch_ended = ended.outcome };
+        }
+        const index = self.turns.find(id) orelse return .unknown;
+        return .{ .turn_ended = self.turns.all()[index].end orelse return .unknown };
     }
     pub fn documents(handle: *Handle) query.Documents {
         const harness = &controllerOf(handle).harness;
@@ -356,7 +369,7 @@ const Work = union(enum) {
                 .account = sign_in.account,
                 .callback = sign_in.callback,
             } },
-            .fetch => |fetch| .{ .fetch = fetch.id },
+            .fetch => |fetch| .{ .fetch = .{ .operation = fetch.id, .account = fetch.account } },
         };
     }
 };
@@ -438,7 +451,11 @@ pub const Event = union(enum) {
     pub const RecordText = struct { id: u64, text: []const u8 };
     pub const TurnEnd = struct { outcome: core.Session.Outcome, answer: []const u8 };
     pub const SignInEnd = struct { operation: u64, account: usize, signed_in: bool };
-    pub const FetchEnd = struct { operation: u64, listed: bool };
+    pub const FetchEnd = struct {
+        operation: u64,
+        account: usize,
+        outcome: query.FetchOutcome,
+    };
 
     pub fn dupe(self: *const Event, gpa: std.mem.Allocator) error{OutOfMemory}!Event {
         return switch (self.*) {
@@ -1098,13 +1115,13 @@ fn startUserTurn(self: *Controller, text: []const u8) !void {
 fn runTurn(self: *Controller, turn: *const TurnStart) !void {
     std.debug.assert(self.work == .idle);
     try self.refreshBranch();
-    try self.turns.begin(turn.start, turn.line);
+    const id = self.nextOperation();
+    try self.turns.begin(&.{ .id = id, .start = turn.start, .line = turn.line });
     errdefer self.turns.truncate(self.turns.all().len - 1);
     try self.session.send(&.{ .prompt = turn.text });
     self.dropOffer();
     self.surface.beginTurn();
     self.conversation +%= 1;
-    const id = self.nextOperation();
     self.work = .{ .turn = id };
     self.response.operation = id;
 }
@@ -1234,7 +1251,10 @@ fn changed(self: *Controller) void {
 }
 
 fn endTurn(self: *Controller, outcome: *const core.Session.Outcome) !void {
-    self.turns.end(self.surface.transcript.entries().len);
+    try self.turns.end(self.surface.transcript.entries().len, &.{
+        .outcome = outcome.*,
+        .answer = self.surface.answer.items,
+    });
     self.dropOffer();
     try self.refreshBranch();
     if (self.startup == .run) return;
@@ -1428,6 +1448,11 @@ fn finishLogin(self: *Controller, ended: *const accounts.Registry.Event.LoginEnd
     } });
 }
 
+fn endFetch(self: *Controller, fetch: *const Work.Fetch, outcome: query.FetchOutcome) void {
+    self.fetch_end = .{ .operation = fetch.id, .account = fetch.account, .outcome = outcome };
+    self.emit(&.{ .fetch_ended = self.fetch_end.? });
+}
+
 fn finishFetch(self: *Controller, ended: *const accounts.Registry.Event.FetchEnd) !void {
     const fetch = (self.activeFetch() orelse return).*;
     if (fetch.account != ended.account) return;
@@ -1436,17 +1461,11 @@ fn finishFetch(self: *Controller, ended: *const accounts.Registry.Event.FetchEnd
         self.clients.close();
         try self.sync();
     }
-    if (fetch.canceled) return self.emit(&.{ .fetch_ended = .{
-        .operation = fetch.id,
-        .listed = false,
-    } });
+    if (fetch.canceled) return self.endFetch(&fetch, .canceled);
     const refresh = &ended.refresh;
     if (refresh.models_error) |err| std.debug.assert(err != error.Canceled);
     if (Record.Event.fromRefresh(fetch.account, refresh)) |report| try self.recordEvent(&report);
-    self.emit(&.{ .fetch_ended = .{
-        .operation = fetch.id,
-        .listed = refresh.models_error == null,
-    } });
+    self.endFetch(&fetch, if (refresh.models_error) |err| .{ .failed = err } else .listed);
     const err = refresh.models_error orelse return;
     if (err != error.TokenGrantRejected and err != error.ModelListUnauthorized) return;
     if (try self.rejectCredential(fetch.account)) try self.recordEvent(&.{ .credential_reloaded = .{
@@ -2346,6 +2365,36 @@ test "turn facts mark mutating work, and a rewind applies at once through a stab
     try std.testing.expect(std.mem.find(u8, request, "First task.") == null);
 }
 
+test "a turn keeps its outcome and answer under its operation id until a rewind drops it" {
+    var stall: providers.testing.FakeTransport.Stall = .{ .io = std.testing.io };
+    var rig: testing.Rig = undefined;
+    try rig.init(&.{ .replies = &.{
+        .{ .stall = &stall },
+        .{ .body = providers.testing.reply_stream },
+    } });
+    defer rig.deinit();
+    try std.testing.expect(rig.controller.operation(1) == .unknown);
+    const started = rig.send(&.{ .send_message = "First task." });
+    const id = started.operation.?;
+    try stall.reached.wait(std.testing.io);
+    try std.testing.expectEqual(State.Work{ .turn = id }, rig.controller.state().work);
+    try std.testing.expect(rig.controller.operation(id) == .running);
+    _ = rig.send(&.{ .cancel = id });
+    try rig.expectTurn(.canceled);
+    try std.testing.expect(rig.controller.state().work == .idle);
+    try std.testing.expect(rig.controller.operation(id).turn_ended.outcome == .canceled);
+    const second = rig.send(&.{ .send_message = "Second task." }).operation.?;
+    try rig.expectTurn(.stopped);
+    try std.testing.expectEqual(id, rig.controller.listTurns()[0].id);
+    try std.testing.expectEqual(second, rig.controller.listTurns()[1].id);
+    const ended = rig.controller.operation(second).turn_ended;
+    try std.testing.expectEqual(core.Session.Outcome{ .stopped = .complete }, ended.outcome);
+    try std.testing.expectEqualStrings("done", ended.answer);
+    try std.testing.expect(rig.send(&.{ .rewind = second }).accepted());
+    try std.testing.expect(rig.controller.operation(second) == .unknown);
+    try std.testing.expect(rig.controller.operation(id) == .turn_ended);
+}
+
 test "a removed skill turn recovers the exact submitted line" {
     var stall: providers.testing.FakeTransport.Stall = .{ .io = std.testing.io };
     var rig: testing.Rig = undefined;
@@ -2635,10 +2684,16 @@ fn startPlanFetch(rig: *testing.Rig) !u64 {
     return response.operation.?;
 }
 
-fn expectFetchEnd(rig: *testing.Rig, operation: u64, listed: bool) !void {
-    const ended = try rig.eventOf(.fetch_ended);
-    try std.testing.expectEqual(operation, ended.fetch_ended.operation);
-    try std.testing.expectEqual(listed, ended.fetch_ended.listed);
+fn expectFetchEnd(
+    rig: *testing.Rig,
+    operation: u64,
+    outcome: std.meta.Tag(query.FetchOutcome),
+) !void {
+    const ended = (try rig.eventOf(.fetch_ended)).fetch_ended;
+    try std.testing.expectEqual(operation, ended.operation);
+    try std.testing.expectEqual(accounts.testing.openai_plan, ended.account);
+    try std.testing.expectEqual(outcome, std.meta.activeTag(ended.outcome));
+    try std.testing.expectEqual(ended.outcome, rig.controller.operation(operation).fetch_ended);
 }
 
 fn expectRequest(rig: *const testing.Rig, index: usize, text: []const u8) !void {
@@ -2717,7 +2772,7 @@ test "a rejected refresh during a model fetch reports no account and allows a si
     try rig.init(&options);
     defer rig.deinit();
     const operation = try startPlanFetch(&rig);
-    try expectFetchEnd(&rig, operation, false);
+    try expectFetchEnd(&rig, operation, .failed);
     const lost = try rig.eventOf(.no_account);
     lost.deinit(std.testing.allocator);
     const selection = rig.send(&.{ .select_account = accounts.testing.openai_plan });
@@ -2742,7 +2797,7 @@ test "a model fetch renews a rejected access token once and lists the models" {
     try rig.init(&options);
     defer rig.deinit();
     const operation = try startPlanFetch(&rig);
-    try expectFetchEnd(&rig, operation, true);
+    try expectFetchEnd(&rig, operation, .listed);
     const models = rig.controller.listModels(accounts.testing.openai_plan);
     try std.testing.expectEqualStrings("gpt-next", models[0].name);
     try std.testing.expectEqual(@as(usize, 4), rig.transport.requests.items.len);
@@ -2789,7 +2844,11 @@ test "a model fetch replacement updates the next turn after each outcome" {
             try std.testing.expect(rig.send(&.{ .cancel = operation }).accepted());
             try expectRefusal(rig.send(&.{ .send_message = "early" }), .busy);
         }
-        try expectFetchEnd(&rig, operation, outcome == .complete);
+        try expectFetchEnd(&rig, operation, switch (outcome) {
+            .complete => .listed,
+            .failed => .failed,
+            .canceled => .canceled,
+        });
         const snapshot = try rig.snapshot();
         defer snapshot.deinit(std.testing.allocator);
         switch (outcome) {
@@ -2838,7 +2897,7 @@ test "a model fetch that rejects the renewed token reports no account without an
     try rig.init(&options);
     defer rig.deinit();
     const operation = try startPlanFetch(&rig);
-    try expectFetchEnd(&rig, operation, false);
+    try expectFetchEnd(&rig, operation, .failed);
     const lost = try rig.eventOf(.no_account);
     lost.deinit(gpa);
     const ended = try rig.snapshot();
@@ -2865,7 +2924,7 @@ test "an uncertain model-fetch refresh failure keeps the account and a later fet
         try rig.init(&options);
         defer rig.deinit();
         const first = try startPlanFetch(&rig);
-        try expectFetchEnd(&rig, first, false);
+        try expectFetchEnd(&rig, first, .failed);
         const failed = try rig.snapshot();
         defer failed.deinit(gpa);
         try std.testing.expectEqual(
@@ -2874,7 +2933,8 @@ test "an uncertain model-fetch refresh failure keeps the account and a later fet
         );
         try std.testing.expect(testing.eventOf(failed.records, .models_unfetched) != null);
         const second = try startPlanFetch(&rig);
-        try expectFetchEnd(&rig, second, true);
+        try expectFetchEnd(&rig, second, .listed);
+        try std.testing.expect(rig.controller.operation(first) == .unknown);
         try std.testing.expectEqualStrings(
             "gpt-next",
             rig.controller.listModels(accounts.testing.openai_plan)[0].name,
@@ -2902,7 +2962,7 @@ test "a rejected model fetch of another account keeps the active account usable"
     try rig.init(&options);
     defer rig.deinit();
     const operation = try startPlanFetch(&rig);
-    try expectFetchEnd(&rig, operation, false);
+    try expectFetchEnd(&rig, operation, .failed);
     const ended = try rig.snapshot();
     defer ended.deinit(std.testing.allocator);
     try std.testing.expectEqual(
@@ -2935,7 +2995,7 @@ test "a rejected model fetch adopts a credential that another instance saved mea
     try hold.reached.wait(std.testing.io);
     try rig.tree.write(".drinky/auth.json", accounts.testing.planStore("second"));
     hold.released.set(std.testing.io);
-    try expectFetchEnd(&rig, operation, false);
+    try expectFetchEnd(&rig, operation, .failed);
     const ended = try rig.snapshot();
     defer ended.deinit(std.testing.allocator);
     try std.testing.expectEqual(
@@ -2958,7 +3018,7 @@ test "a cancel ends the credential renewal of a model fetch and keeps the accoun
     const operation = try startPlanFetch(&rig);
     try stall.reached.wait(std.testing.io);
     _ = rig.send(&.{ .cancel = operation });
-    try expectFetchEnd(&rig, operation, false);
+    try expectFetchEnd(&rig, operation, .canceled);
     try std.testing.expect(stall.canceled);
     const ended = try rig.snapshot();
     defer ended.deinit(std.testing.allocator);

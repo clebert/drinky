@@ -4,15 +4,27 @@ const reference = @import("reference.zig");
 
 const ui = @import("ui/root.zig");
 
-const during_turn_notice = notice: {
-    var text: []const u8 = "Commands during a turn:";
-    var separator: []const u8 = " ";
+const work_commands = list: {
+    var text: []const u8 = "";
+    var separator: []const u8 = "";
     for (std.enums.values(reference.Command)) |command| {
-        if (!reference.commands.get(command).during_turn) continue;
+        if (!reference.commands.get(command).during_work) continue;
         text = text ++ separator ++ reference.line(command);
         separator = ", ";
     }
-    break :notice text ++ ".";
+    break :list text;
+};
+
+pub const Work = enum {
+    turn,
+    fetch,
+
+    fn noun(self: Work) []const u8 {
+        return switch (self) {
+            .turn => "a turn",
+            .fetch => "a model fetch",
+        };
+    }
 };
 
 pub fn name(line: []const u8) ?[]const u8 {
@@ -75,24 +87,29 @@ pub fn check(
     return null;
 }
 
-pub fn checkDuringTurn(
+pub fn checkDuringWork(
     gpa: std.mem.Allocator,
     line: []const u8,
     skills: []const application.query.Skill,
+    work: Work,
 ) error{OutOfMemory}!?ui.Message {
     const command_name = name(line) orelse return null;
     if (try check(gpa, line, skills)) |refusal| return refusal;
     if (skillName(command_name) == null) {
         const command = lookup(command_name).?;
-        if (reference.commands.get(command).during_turn) return null;
-        if (command == .help)
-            return try ui.Message.print(gpa, .information, during_turn_notice, .{});
+        if (reference.commands.get(command).during_work) return null;
+        if (command == .help) return try ui.Message.print(
+            gpa,
+            .information,
+            "Commands during {s}: " ++ work_commands ++ ".",
+            .{work.noun()},
+        );
     }
     return try ui.Message.print(
         gpa,
         .warning,
-        "The command /{s} cannot run while a turn runs.",
-        .{command_name},
+        "The command /{s} cannot run while {s} runs.",
+        .{ command_name, work.noun() },
     );
 }
 
@@ -127,28 +144,47 @@ fn expectMessage(
     try std.testing.expectEqualStrings(text, message.content);
 }
 
-test "a command line during a turn gets a refusal, and a message line or verbose gets none" {
+test "a command line during work gets a refusal that names the work, and a message gets none" {
     const gpa = std.testing.allocator;
-    try std.testing.expect(try checkDuringTurn(gpa, "a message", no_skills) == null);
-    try std.testing.expect(try checkDuringTurn(gpa, "/verbose", no_skills) == null);
+    for (std.enums.values(Work)) |work| {
+        try std.testing.expect(try checkDuringWork(gpa, "a message", no_skills, work) == null);
+        try std.testing.expect(try checkDuringWork(gpa, "/verbose", no_skills, work) == null);
+        try std.testing.expect(try checkDuringWork(gpa, "/mcp", no_skills, work) == null);
+    }
     const cases = [_]struct {
         line: []const u8,
+        work: Work,
         severity: ui.Message.Severity,
         text: []const u8,
     }{
-        .{ .line = "/verbose extra", .severity = .warning, .text = "The command /verbose " ++
-            "takes no argument." },
-        .{ .line = "/effort", .severity = .warning, .text = "The command /effort cannot run " ++
-            "while a turn runs." },
-        .{ .line = "/handoff Keep it.", .severity = .warning, .text = "The command /handoff " ++
-            "cannot run while a turn runs." },
-        .{ .line = "/nope", .severity = .warning, .text = "Drinky does not recognize the " ++
-            "command /nope." },
-        .{ .line = "/", .severity = .information, .text = "Commands during a turn: /verbose." },
-        .{ .line = "/help", .severity = .information, .text = "Commands during a turn: /verbose." },
+        .{ .line = "/verbose extra", .work = .turn, .severity = .warning, .text = "The " ++
+            "command /verbose takes no argument." },
+        .{ .line = "/effort", .work = .turn, .severity = .warning, .text = "The command " ++
+            "/effort cannot run while a turn runs." },
+        .{ .line = "/handoff Keep it.", .work = .turn, .severity = .warning, .text = "The " ++
+            "command /handoff cannot run while a turn runs." },
+        .{ .line = "/model", .work = .fetch, .severity = .warning, .text = "The command " ++
+            "/model cannot run while a model fetch runs." },
+        .{ .line = "/nope", .work = .fetch, .severity = .warning, .text = "Drinky does not " ++
+            "recognize the command /nope." },
+        .{
+            .line = "/",
+            .work = .turn,
+            .severity = .information,
+            .text = "Commands during a turn: /mcp, /verbose.",
+        },
+        .{
+            .line = "/help",
+            .work = .fetch,
+            .severity = .information,
+            .text = "Commands during a model fetch: /mcp, /verbose.",
+        },
     };
-    for (cases) |case|
-        try expectMessage(try checkDuringTurn(gpa, case.line, no_skills), case.severity, case.text);
+    for (cases) |case| try expectMessage(
+        try checkDuringWork(gpa, case.line, no_skills, case.work),
+        case.severity,
+        case.text,
+    );
 }
 
 test "a line resolves its command, its aliases, its skill, and its trimmed tail" {

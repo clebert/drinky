@@ -7,6 +7,7 @@ const App = @import("App.zig");
 const command_line = @import("command_line.zig");
 const headless = @import("headless.zig");
 const Herdr = @import("Herdr.zig");
+const mcp = @import("mcp/root.zig");
 
 const failure_exit_code = 1;
 
@@ -41,6 +42,7 @@ fn run(init: *const std.process.Init) !void {
         .home = home,
     };
     if (parsed == .terminal) return runTerminal(init, &directories);
+    if (parsed == .mcp) return runGateway(init, home);
 
     var stdout_buffer: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
@@ -53,7 +55,7 @@ fn run(init: *const std.process.Init) !void {
         .stderr = &stderr.interface,
     };
     const succeeded = switch (parsed) {
-        .terminal => unreachable,
+        .terminal, .mcp => unreachable,
         .models => try headless.models(gpa, io, &options),
         .run => |request| run: {
             var stdin_buffer: [4096]u8 = undefined;
@@ -72,6 +74,24 @@ fn run(init: *const std.process.Init) !void {
     if (!succeeded) std.process.exit(failure_exit_code);
 }
 
+fn runGateway(init: *const std.process.Init, home: []const u8) !void {
+    const gpa = init.gpa;
+    const io = init.io;
+    const directory = try mcp.discovery.directory(gpa, home);
+    defer gpa.free(directory);
+    var stdin_buffer: [64 * 1024]u8 = undefined;
+    var stdin = std.Io.File.stdin().readerStreaming(io, &stdin_buffer);
+    var stdout_buffer: [64 * 1024]u8 = undefined;
+    var stdout = std.Io.File.stdout().writerStreaming(io, &stdout_buffer);
+    var gateway: mcp.Gateway = .{
+        .gpa = gpa,
+        .io = io,
+        .directory = directory,
+        .output = &stdout.interface,
+    };
+    try gateway.serve(&stdin.interface);
+}
+
 fn runTerminal(
     init: *const std.process.Init,
     directories: *const application.Directories,
@@ -79,10 +99,13 @@ fn runTerminal(
     var tty: terminal.Tty = undefined;
     try tty.init(init.io);
     defer tty.deinit();
+    const mcp_directory = try mcp.discovery.directory(init.gpa, directories.home);
+    defer init.gpa.free(mcp_directory);
     var app: App = undefined;
     try app.init(init.gpa, init.io, &.{
         .working_directory = directories.working_directory,
         .home = directories.home,
+        .mcp_directory = mcp_directory,
         .device = tty.device(),
         .environment = init.environ_map,
         .environ = init.minimal.environ,

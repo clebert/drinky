@@ -10,6 +10,7 @@ const command = @import("command.zig");
 const describe = @import("describe.zig");
 const Flow = @import("Flow.zig");
 const Herdr = @import("Herdr.zig");
+const mcp = @import("mcp/root.zig");
 const Screen = @import("Screen.zig");
 const sources = @import("sources.zig");
 const testing = @import("testing.zig");
@@ -18,9 +19,10 @@ const wording = @import("wording.zig");
 const App = @This();
 const turn_cancel_notice = "Press Esc again to cancel the turn. The draft stays.";
 const turn_message_notice = "Drinky sends no message while a turn runs. The draft stays.";
+const fetch_message_notice = "Drinky sends no message while a model fetch runs. The draft stays.";
 const fetch_cancel_notice = "You canceled the model fetch.";
 const login_callback_controls = "Enter: Replay callback URL · Esc: Cancel";
-const login_device_controls = "Esc: Cancel";
+const cancel_controls = "Esc: Cancel";
 const retry_caption: ui.Caption = .{
     .title = "Failed turn",
     .controls = "Ctrl+N: Try again · Esc: Dismiss",
@@ -37,7 +39,7 @@ const intro_text = blk: {
     break :blk line ++ reference.line(.help) ++ ": Commands";
 };
 const escape_wait_ms = 50;
-const sign_in_title_bytes_max = 64;
+const work_title_bytes_max = 64;
 const queue_capacity = 256;
 const pending_max = 4;
 
@@ -53,7 +55,7 @@ running: bool = false,
 dirty: bool = false,
 ctrl_c_ms_last: i64 = -reference.repeat_window_ms,
 ctrl_d_ms_last: i64 = -reference.repeat_window_ms,
-escape_deadline_ms: ?i64 = null,
+escape: ?PendingEscape = null,
 queue: std.Io.Queue(UiEvent),
 queue_buffer: [queue_capacity]UiEvent = undefined,
 queue_closing: std.atomic.Value(bool) = .init(false),
@@ -72,12 +74,15 @@ working_directory: []const u8,
 home_directory: []const u8 = "",
 directory_label: []const u8 = "",
 project_row: bool,
-sign_in_title: [sign_in_title_bytes_max]u8 = undefined,
-sign_in_title_length: usize = 0,
+work_title: [work_title_bytes_max]u8 = undefined,
+work_title_length: usize = 0,
+endpoint: mcp.Endpoint,
+serving_remote: bool = false,
 
 const Options = struct {
     working_directory: []const u8,
     home: []const u8,
+    mcp_directory: []const u8,
     device: terminal.Device,
     environment: *const std.process.Environ.Map,
     environ: std.process.Environ = .empty,
@@ -89,12 +94,14 @@ const Options = struct {
 const UiEvent = union(enum) {
     keys: []u8,
     mail: application.Mail,
+    remote: *mcp.Endpoint.Request,
     tick,
     resize,
-    fn deinit(self: *const UiEvent, gpa: std.mem.Allocator) void {
+    fn deinit(self: *const UiEvent, gpa: std.mem.Allocator, io: std.Io) void {
         switch (self.*) {
             .keys => |bytes| gpa.free(bytes),
             .mail => |*mail| mail.deinit(gpa),
+            .remote => |request| request.release(gpa, io),
             .tick, .resize => {},
         }
     }
@@ -117,13 +124,16 @@ const FrameGrid = struct {
 const Mode = union(enum) {
     prompt,
     turn: u64,
+    fetch: application.State.Fetch,
     picker,
-    fetch,
+    picker_fetch,
     page,
     sign_in: application.State.SignIn,
 };
 
 const Origin = enum { line, help };
+
+const PendingEscape = struct { deadline_ms: i64, mode: Mode };
 
 const Exit = enum { escape, ctrl_c, ctrl_d };
 
@@ -133,6 +143,7 @@ const Transition = union(enum) {
     sign_in: application.Event.SignInEnd,
     fetch: application.Event.FetchEnd,
     no_account,
+    remote_clear,
 };
 
 const Confirmation = union(enum) {
@@ -154,6 +165,7 @@ const Confirmation = union(enum) {
 
 const sink_vtable: application.Sink.VTable = .{ .emit = emitApplicationEvent };
 const mailbox_vtable: application.Mailbox.VTable = .{ .post = postMail };
+const host_vtable: mcp.Endpoint.Host.VTable = .{ .post = postRemote };
 
 fn emitApplicationEvent(ptr: *anyopaque, event: *const application.Event) void {
     const self: *App = @ptrCast(@alignCast(ptr));
@@ -166,10 +178,17 @@ fn postMail(ptr: *anyopaque, mail: application.Mail) void {
     const self: *App = @ptrCast(@alignCast(ptr));
     self.keep(.{ .mail = mail });
 }
+fn postRemote(ptr: *anyopaque, request: *mcp.Endpoint.Request) mcp.Endpoint.Host.PostError!void {
+    const self: *App = @ptrCast(@alignCast(ptr));
+    if (self.queue_closing.load(.acquire)) return error.Closed;
+    const count = self.queue.putUncancelable(self.io, &.{.{ .remote = request }}, 0) catch
+        return error.Closed;
+    if (count == 0) return error.Full;
+}
 fn keep(self: *App, event: UiEvent) void {
-    if (self.queue_closing.load(.acquire)) return event.deinit(self.gpa);
+    if (self.queue_closing.load(.acquire)) return event.deinit(self.gpa, self.io);
     self.queue.putOneUncancelable(self.io, event) catch {
-        event.deinit(self.gpa);
+        event.deinit(self.gpa, self.io);
         std.debug.assert(self.queue_closing.load(.acquire));
     };
 }
@@ -185,6 +204,7 @@ pub fn init(self: *App, gpa: std.mem.Allocator, io: std.Io, options: *const Opti
         .herdr = .init(io),
         .working_directory = options.working_directory,
         .project_row = options.herdr == null,
+        .endpoint = .init(gpa, io, options.mcp_directory, .{ .ptr = self, .vtable = &host_vtable }),
     };
     self.screen.verbose = (application.Settings{}).verbose;
     self.screen.intro = intro_text;
@@ -231,6 +251,7 @@ pub fn init(self: *App, gpa: std.mem.Allocator, io: std.Io, options: *const Opti
 }
 pub fn deinit(self: *App) void {
     self.stopQueue();
+    self.endpoint.deinit();
     self.closeFlow();
     self.controller.destroy();
     self.closeQueue();
@@ -294,7 +315,7 @@ fn drainQueue(self: *App) void {
     while (true) {
         const count = self.queue.get(self.io, &batch, 0) catch break;
         if (count == 0) break;
-        for (batch[0..count]) |event| event.deinit(self.gpa);
+        for (batch[0..count]) |event| event.deinit(self.gpa, self.io);
     }
 }
 
@@ -319,7 +340,7 @@ fn runLoop(self: *App) !void {
         }
         const waiting = self.dirty or
             self.screen.animating() or
-            self.escape_deadline_ms != null;
+            self.escape != null;
         if (waiting and self.tick_future == null) try self.armTick();
     }
 }
@@ -390,8 +411,8 @@ fn handleKeys(self: *App, bytes: []const u8) !void {
             break;
         }
     }
-    self.escape_deadline_ms = if (self.input.pendingEscape())
-        self.nowMs() + escape_wait_ms
+    self.escape = if (self.input.pendingEscape())
+        .{ .deadline_ms = self.nowMs() + escape_wait_ms, .mode = self.mode() }
     else
         null;
 }
@@ -424,21 +445,23 @@ fn exitOf(event: *const terminal.Input.Key) ?Exit {
 }
 
 fn flushEscape(self: *App) !void {
-    const deadline = self.escape_deadline_ms orelse return;
-    if (self.nowMs() < deadline) return;
-    self.escape_deadline_ms = null;
+    const pending = self.escape orelse return;
+    if (self.nowMs() < pending.deadline_ms) return;
+    self.escape = null;
     if (!self.input.takeEscape()) return;
+    if (!std.meta.eql(pending.mode, self.mode())) return;
     self.dirty = true;
     try self.handleKey(&.escape);
     try self.settle();
 }
 
 fn mode(self: *const App) Mode {
-    if (self.flow) |*flow| return if (flow.fetch == null) .picker else .fetch;
+    if (self.flow) |*flow| return if (flow.fetch == null) .picker else .picker_fetch;
     if (self.screen.widget == .page) return .page;
     return switch (self.work) {
-        .idle, .fetch => .prompt,
+        .idle => .prompt,
         .turn => |operation| .{ .turn = operation },
+        .fetch => |fetch| .{ .fetch = fetch },
         .sign_in => |sign_in| .{ .sign_in = sign_in },
         .aside => .page,
     };
@@ -561,8 +584,13 @@ fn nowNs(self: *App) i96 {
 fn caption(self: *const App) ?ui.Caption {
     return switch (self.mode()) {
         .sign_in => |sign_in| .{
-            .title = self.sign_in_title[0..self.sign_in_title_length],
-            .controls = if (sign_in.callback) login_callback_controls else login_device_controls,
+            .title = self.work_title[0..self.work_title_length],
+            .controls = if (sign_in.callback) login_callback_controls else cancel_controls,
+            .rows_max = Screen.editor_caption_rows_max,
+        },
+        .fetch => .{
+            .title = self.work_title[0..self.work_title_length],
+            .controls = cancel_controls,
             .rows_max = Screen.editor_caption_rows_max,
         },
         .prompt => switch (self.offer) {
@@ -570,12 +598,12 @@ fn caption(self: *const App) ?ui.Caption {
             .retry => retry_caption,
             .removal => removal_caption,
         },
-        .turn, .picker, .fetch, .page => null,
+        .turn, .picker, .picker_fetch, .page => null,
     };
 }
 fn applyBatch(self: *App, events: []const UiEvent) !bool {
     var applied_count: usize = 0;
-    errdefer for (events[applied_count..]) |*event| event.deinit(self.gpa);
+    errdefer for (events[applied_count..]) |*event| event.deinit(self.gpa, self.io);
     var ticked = false;
     for (events) |event| {
         applied_count += 1;
@@ -592,9 +620,31 @@ fn applyBatch(self: *App, events: []const UiEvent) !bool {
                 self.controller.receive(mail);
                 try self.settle();
             },
+            .remote => |request| {
+                defer request.release(self.gpa, self.io);
+                self.dirty = true;
+                try self.serveRemote(request);
+            },
         }
     }
     return ticked;
+}
+fn serveRemote(self: *App, request: *mcp.Endpoint.Request) !void {
+    const instance = self.endpoint.published() orelse return;
+    if (!self.endpoint.admit(request)) return;
+    self.serving_remote = true;
+    defer self.serving_remote = false;
+    const reply = try mcp.catalog.answer(self.gpa, &.{
+        .controller = self.controller,
+        .instance = instance,
+        .working_directory = self.working_directory,
+        .interaction = switch (self.mode()) {
+            .picker, .picker_fetch, .page, .sign_in => true,
+            .prompt, .turn, .fetch => false,
+        },
+    }, request.line);
+    request.deliver(self.gpa, self.io, reply);
+    try self.settle();
 }
 fn applyEvent(self: *App, event: *const application.Event) !void {
     if (Screen.changeOf(event)) |*change| try self.screen.applyChange(change);
@@ -608,13 +658,13 @@ fn applyEvent(self: *App, event: *const application.Event) !void {
         .sign_in_ended => |ended| self.postpone(.{ .sign_in = ended }),
         .fetch_ended => |ended| self.postpone(.{ .fetch = ended }),
         .no_account => self.postpone(.no_account),
+        .clear_conversation => if (self.serving_remote) self.postpone(.remote_clear),
         .append_record,
         .record_text,
         .replace_record,
         .remove_records,
         .live,
         .statistics,
-        .clear_conversation,
         .turn_ended,
         .charge,
         .startup_refused,
@@ -641,17 +691,22 @@ fn settle(self: *App) !void {
                 self.closeFlow();
                 try self.startFlow(.login);
             },
+            .remote_clear => try self.reportNotice(
+                .information,
+                "An MCP client cleared the conversation.",
+                .{},
+            ),
         }
     }
     self.pending_count = 0;
 }
 fn finishFetch(self: *App, ended: *const application.Event.FetchEnd) !void {
-    const flow = if (self.flow) |*flow| flow else return;
-    const fetch = flow.fetch orelse return;
+    const flow = if (self.flow) |*flow| flow else return self.reportFetch(ended);
+    const fetch = flow.fetch orelse return self.reportFetch(ended);
     if (fetch.operation != ended.operation) return;
     flow.fetch = null;
     const exit = fetch.exit orelse {
-        if (ended.listed) return self.showStep(flow.step, .{});
+        if (ended.outcome == .listed) return self.showStep(flow.step, .{});
         return self.closeFlow();
     };
     switch (exit) {
@@ -660,6 +715,16 @@ fn finishFetch(self: *App, ended: *const application.Event.FetchEnd) !void {
             try self.showStep(flow.step, .{});
             try self.reportNotice(.information, fetch_cancel_notice, .{});
         },
+    }
+}
+fn reportFetch(self: *App, ended: *const application.Event.FetchEnd) !void {
+    switch (ended.outcome) {
+        .listed => try self.reportNotice(
+            .information,
+            "Drinky fetched the model list of {s}.",
+            .{application.query.accountId(ended.account)},
+        ),
+        .canceled, .failed => {},
     }
 }
 fn applySnapshot(self: *App, snapshot: *const application.Snapshot) !void {
@@ -689,19 +754,27 @@ fn applySnapshot(self: *App, snapshot: *const application.Snapshot) !void {
     self.adopt(&snapshot.state);
 }
 fn adopt(self: *App, value: *const application.State) void {
-    if (value.notice_id != self.screen.notice_id and self.armed(.message)) self.confirmation = null;
+    if (value.notice_id != self.screen.notice_id) self.confirmation = null;
+    if (value.work.operation() != self.work.operation() and self.confirmation != null) {
+        self.confirmation = null;
+        self.screen.clearNotice();
+    }
     self.work = value.work;
     self.offer = value.offer;
-    const sign_in = switch (value.work) {
-        .sign_in => |sign_in| sign_in,
-        .idle, .turn, .aside, .fetch => return,
+    const title = switch (value.work) {
+        .sign_in => |sign_in| std.fmt.bufPrint(
+            &self.work_title,
+            "Sign in: {s}",
+            .{application.query.accountId(sign_in.account)},
+        ),
+        .fetch => |fetch| std.fmt.bufPrint(
+            &self.work_title,
+            "Model fetch: {s}",
+            .{application.query.accountId(fetch.account)},
+        ),
+        .idle, .turn, .aside => return,
     };
-    const title = std.fmt.bufPrint(
-        &self.sign_in_title,
-        "Sign in: {s}",
-        .{application.query.accountId(sign_in.account)},
-    );
-    self.sign_in_title_length = (title catch unreachable).len;
+    self.work_title_length = (title catch unreachable).len;
 }
 fn send(self: *App, value: *const application.Command) !application.Response {
     const response = self.controller.submit(value);
@@ -725,9 +798,10 @@ fn submit(self: *App) !void {
             } });
             if (response.accepted()) self.paste_edits = self.edits;
         },
-        .turn => try self.submitDuringTurn(text),
+        .turn => try self.submitDuringWork(text, .turn),
+        .fetch => try self.submitDuringWork(text, .fetch),
         .prompt => if (confirmed) try self.sendMessage(text) else try self.submitLine(text),
-        .picker, .fetch, .page => unreachable,
+        .picker, .picker_fetch, .page => unreachable,
     }
 }
 fn submitLine(self: *App, line: []const u8) !void {
@@ -746,8 +820,9 @@ fn submitLine(self: *App, line: []const u8) !void {
     }
     try self.runCommand(command.lookup(command_name).?, tail, .line);
 }
-fn submitDuringTurn(self: *App, line: []const u8) !void {
-    if (try command.checkDuringTurn(self.gpa, line, self.controller.listSkills())) |message| {
+fn submitDuringWork(self: *App, line: []const u8, work: command.Work) !void {
+    const skills = self.controller.listSkills();
+    if (try command.checkDuringWork(self.gpa, line, skills, work)) |message| {
         defer message.deinit(self.gpa);
         return self.showMessage(&message);
     }
@@ -757,7 +832,12 @@ fn submitDuringTurn(self: *App, line: []const u8) !void {
 fn sendMessage(self: *App, line: []const u8) !void {
     const response = try self.send(&.{ .send_message = line });
     const refusal = response.refusal orelse return self.clearDraft();
-    if (refusal == .busy) try self.reportNotice(.information, turn_message_notice, .{});
+    if (refusal != .busy) return;
+    switch (self.mode()) {
+        .turn => try self.reportNotice(.information, turn_message_notice, .{}),
+        .fetch => try self.reportNotice(.information, fetch_message_notice, .{}),
+        .prompt, .picker, .picker_fetch, .page, .sign_in => {},
+    }
 }
 fn runCommand(
     self: *App,
@@ -812,6 +892,11 @@ fn runCommand(
             try self.toggleVerbose();
             if (origin == .line) self.clearDraft();
         },
+        .mcp => {
+            self.closeFlow();
+            try self.toggleAccess();
+            if (origin == .line) self.clearDraft();
+        },
     }
 }
 fn openCommandStep(self: *App, step: Flow.Step, origin: Origin) !void {
@@ -859,6 +944,23 @@ fn toggleVerbose(self: *App) !void {
         "Verbose output is {s}.",
         .{if (self.screen.verbose) "on" else "off"},
     );
+}
+fn toggleAccess(self: *App) !void {
+    if (self.endpoint.published()) |instance| {
+        self.endpoint.disable() catch |err| return self.reportNotice(
+            .failure,
+            "MCP access is off for instance {s}. Drinky could not remove its entry because " ++
+                "of error {s}.",
+            .{ &instance, @errorName(err) },
+        );
+        return self.reportNotice(.information, "MCP access is off for instance {s}.", .{&instance});
+    }
+    const instance = self.endpoint.enable() catch |err| return self.reportNotice(
+        .failure,
+        "Drinky could not turn on MCP access because of error {s}.",
+        .{@errorName(err)},
+    );
+    try self.reportNotice(.information, "MCP access is on. Instance: {s}.", .{&instance});
 }
 fn startFlow(self: *App, step: Flow.Step) !void {
     self.closeFlow();
@@ -992,7 +1094,7 @@ fn handleExit(self: *App, exit: Exit, notice_shown: bool) !void {
     const current = self.mode();
     if (exit == .ctrl_d and current != .prompt) self.ctrl_d_ms_last = self.nowMs();
     if (exit == .ctrl_c and
-        (current == .prompt or current == .turn or current == .sign_in) and
+        (current == .prompt or current == .turn or current == .fetch or current == .sign_in) and
         !self.draftEmpty())
     {
         if (current == .prompt) self.clearOrQuit() else self.clearDraft();
@@ -1008,7 +1110,7 @@ fn handleExit(self: *App, exit: Exit, notice_shown: bool) !void {
             }
             return self.cancelWork(operation);
         },
-        .prompt, .picker, .fetch, .page, .sign_in => {},
+        .prompt, .fetch, .picker, .picker_fetch, .page, .sign_in => {},
     };
     switch (current) {
         .prompt => switch (exit) {
@@ -1017,7 +1119,10 @@ fn handleExit(self: *App, exit: Exit, notice_shown: bool) !void {
             .ctrl_d => try self.quitOrWarn(),
         },
         .picker => if (exit == .escape) try self.backFlow() else try self.cancelFlow(),
-        .fetch => try self.exitFetch(if (exit == .escape) .step else .command),
+        .picker_fetch => try self.exitFetch(if (exit == .escape) .step else .command),
+        .fetch => |fetch| if ((try self.send(&.{ .cancel = fetch.operation })).accepted()) {
+            try self.reportNotice(.information, fetch_cancel_notice, .{});
+        },
         .turn => |operation| try self.cancelWork(operation),
         .sign_in => |sign_in| try self.cancelWork(sign_in.operation),
         .page => try self.closePage(),
@@ -1031,7 +1136,7 @@ fn handleKey(self: *App, event: *const terminal.Input.Key) !void {
         _ = self.controller.submit(&.{ .dismiss_notice = self.screen.notice_id });
     if (exitOf(event)) |exit| return self.handleExit(exit, notice_shown);
     switch (self.mode()) {
-        .prompt, .turn, .sign_in => {
+        .prompt, .turn, .fetch, .sign_in => {
             if (try self.editKey(event)) return;
             switch (event.*) {
                 .enter => try self.submit(),
@@ -1079,7 +1184,7 @@ fn handleKey(self: *App, event: *const terminal.Input.Key) !void {
                 => {},
             }
         },
-        .fetch => {},
+        .picker_fetch => {},
         .page => {
             const page = self.screen.activePage() orelse return;
             const size: terminal.View.Size = .{
@@ -1141,6 +1246,7 @@ test "a Herdr startup failure stays in the transcript across snapshots with the 
     try app.init(gpa, io, &.{
         .working_directory = tree.root,
         .home = tree.root,
+        .mcp_directory = "unused",
         .environment = &environment,
         .device = device.device(),
         .herdr = .{ .socket_path = "/unused", .pane_id = "p1" },
@@ -1232,6 +1338,8 @@ const rewind_warning = "Press Enter again to rewind. Tool changes stay.";
 const Rig = struct {
     tmp: std.testing.TmpDir,
     directory: [:0]const u8,
+    mcp_buffer: [128]u8,
+    mcp_directory: []const u8,
     environment: std.process.Environ.Map,
     transport: providers.testing.FakeTransport,
     browser: accounts.testing.FakeBrowser,
@@ -1310,9 +1418,11 @@ const Rig = struct {
         try self.device.device().writer().writeAll(options.history);
         try self.device.device().writer().flush();
 
+        self.mcp_directory = try accounts.testing.tmpPath(&self.mcp_buffer, &self.tmp, "mcp");
         try self.app.init(options.allocator, io, &.{
             .working_directory = self.directory,
             .home = self.directory,
+            .mcp_directory = self.mcp_directory,
             .device = self.device.device(),
             .environment = &self.environment,
             .herdr = options.herdr,
@@ -2326,7 +2436,7 @@ test "command lines during a turn get a notice and keep the draft" {
     });
     try rig.keys("\x03/\r");
     try rig.waitFor(&.{
-        .{ .status = "Commands during a turn: /verbose." },
+        .{ .status = "Commands during a turn: /mcp, /verbose." },
         .{ .editor = "/" },
         .{ .activity = true },
     });
@@ -2857,7 +2967,7 @@ test "help keeps its command position across nested steps and fetch cancellation
     const model_caption = "Model: openai-api-key · ↑/↓: Move · Enter: Select · Esc: Back";
     try rig.keys("/help\r");
     try rig.waitFor(&.{.{ .text = help_caption }});
-    try rig.keys(core.text.repeat("\x1b[B", 4));
+    try rig.keys(core.text.repeat("\x1b[B", 5));
     try rig.waitFor(&.{.{ .text = " > /model" }});
     try rig.keys("\r");
     try rig.waitFor(&.{.{ .text = model_caption }});
@@ -3281,7 +3391,7 @@ test "a short answer from the command picker clears its line and returns to the 
     try rig.waitFor(&.{ .{ .text = "done" }, .{ .activity = false } });
     try rig.keys("/help\r");
     try rig.waitFor(&.{.{ .text = "Command ·" }});
-    for (0..10) |_| try rig.keys("\x1b[B");
+    for (0..11) |_| try rig.keys("\x1b[B");
     try rig.waitFor(&.{.{ .text = " > /tldr" }});
     try rig.keys("\r");
     try rig.waitFor(&.{ .{ .text = "Short text." }, .{ .alternate_screen = true } });
@@ -3609,4 +3719,401 @@ test "a frame timer task failure withdraws the send as message confirmation" {
     try rig.keyFrame("\r");
     try rig.waitFor(&.{ .{ .status = refusal_offer }, .{ .editor = "/nope" } });
     try std.testing.expectEqual(@as(usize, 0), rig.transport.requests.items.len);
+}
+
+const access_on = "MCP access is on. Instance: ";
+
+test "/mcp publishes the instance, and a second gateway reads the outcome of a remote turn" {
+    var rig: Rig = undefined;
+    try rig.init(&.{
+        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .replies = &.{.{ .body = providers.testing.reply_stream }},
+        .model = "gpt-5.6-sol",
+    });
+    defer rig.deinit();
+    try rig.keys("/mcp\r");
+    try rig.waitFor(&.{.{ .status = access_on }});
+    var remote: mcp.testing.Client = undefined;
+    remote.init(rig.mcp_directory);
+    defer remote.deinit();
+    const instance = try remote.instance(rig.directory);
+    const sent = try remote.target("send_message", &instance, ",\"text\":\"Task.\"");
+    defer sent.deinit();
+    try std.testing.expect(!sent.failed);
+    const operation = (try mcp.testing.member(sent.content, "operation")).string;
+    try rig.waitFor(&.{ .{ .text = "done" }, .{ .activity = false } });
+    var restarted: mcp.testing.Client = undefined;
+    restarted.init(rig.mcp_directory);
+    defer restarted.deinit();
+    try std.testing.expectEqualStrings(&instance, &try restarted.instance(rig.directory));
+    const rest = try std.testing.allocator.print(",\"operation\":\"{s}\"", .{operation});
+    defer std.testing.allocator.free(rest);
+    const ended = try restarted.target("get_operation", &instance, rest);
+    defer ended.deinit();
+    const status = try mcp.testing.member(ended.content, "status");
+    try std.testing.expectEqualStrings("ended", status.string);
+    try std.testing.expectEqualStrings(
+        "complete",
+        (try mcp.testing.member(ended.content, "outcome")).string,
+    );
+    try std.testing.expectEqualStrings("done", try ended.text("answer"));
+    const turns = try restarted.target("list_turns", &instance, "");
+    defer turns.deinit();
+    const turn = (try mcp.testing.member(turns.content, "turns")).array.items[0];
+    try std.testing.expectEqualStrings("Task.", (try mcp.testing.member(turn, "prompt")).string);
+    const turn_operation = try mcp.testing.member(turn, "operation");
+    try std.testing.expectEqualStrings(operation, turn_operation.string);
+}
+
+test "remote reads keep the notice and the draft, and a second message is refused as busy" {
+    var hold: providers.testing.FakeTransport.Hold = .{ .io = std.testing.io };
+    var rig: Rig = undefined;
+    try rig.init(&.{
+        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .replies = &.{.{ .body = providers.testing.reply_stream, .hold = &hold }},
+        .model = "gpt-5.6-sol",
+    });
+    defer rig.deinit();
+    defer hold.released.set(std.testing.io);
+    try rig.keys("/mcp\r");
+    try rig.waitFor(&.{.{ .status = access_on }});
+    try rig.keys("draft");
+    try rig.waitFor(&.{.{ .editor = "draft" }});
+    var remote: mcp.testing.Client = undefined;
+    remote.init(rig.mcp_directory);
+    defer remote.deinit();
+    const instance = try remote.instance(rig.directory);
+    const initial = try remote.target("get_state", &instance, "");
+    defer initial.deinit();
+    const effort = (try mcp.testing.member(initial.content, "effort")).string;
+    const rest = try std.testing.allocator.print(",\"effort\":\"{s}\"", .{effort});
+    defer std.testing.allocator.free(rest);
+    const unchanged = try remote.target("set_effort", &instance, rest);
+    defer unchanged.deinit();
+    try std.testing.expect(!unchanged.failed);
+    var notices: [2][]const u8 = undefined;
+    var reads: [2]mcp.testing.Client.Called = undefined;
+    for (&notices, &reads) |*notice, *read| {
+        read.* = try remote.target("get_state", &instance, "");
+        const shown = try mcp.testing.member(read.content, "notice");
+        notice.* = (try mcp.testing.member(shown, "text")).string;
+    }
+    defer for (&reads) |*read| read.deinit();
+    try std.testing.expectEqualStrings(notices[0], notices[1]);
+    try rig.waitFor(&.{ .{ .status = notices[0] }, .{ .editor = "draft" } });
+    const sent = try remote.target("send_message", &instance, ",\"text\":\"Task.\"");
+    defer sent.deinit();
+    try std.testing.expect(!sent.failed);
+    try hold.reached.wait(std.testing.io);
+    const refused = try remote.target("send_message", &instance, ",\"text\":\"More.\"");
+    defer refused.deinit();
+    try std.testing.expect(refused.failed);
+    const refusal = try mcp.testing.member(refused.content, "refusal");
+    try std.testing.expectEqualStrings("busy", refusal.string);
+    try rig.waitFor(&.{ .{ .activity = true }, .{ .editor = "draft" } });
+    hold.released.set(std.testing.io);
+    try rig.waitFor(&.{ .{ .text = "done" }, .{ .activity = false }, .{ .editor = "draft" } });
+}
+
+test "the end of access keeps the accepted turn and revokes the instance id" {
+    var hold: providers.testing.FakeTransport.Hold = .{ .io = std.testing.io };
+    var rig: Rig = undefined;
+    try rig.init(&.{
+        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .replies = &.{.{ .body = providers.testing.reply_stream, .hold = &hold }},
+        .model = "gpt-5.6-sol",
+    });
+    defer rig.deinit();
+    defer hold.released.set(std.testing.io);
+    try rig.keys("/mcp\r");
+    try rig.waitFor(&.{.{ .status = access_on }});
+    var remote: mcp.testing.Client = undefined;
+    remote.init(rig.mcp_directory);
+    defer remote.deinit();
+    const instance = try remote.instance(rig.directory);
+    const sent = try remote.target("send_message", &instance, ",\"text\":\"Task.\"");
+    defer sent.deinit();
+    try hold.reached.wait(std.testing.io);
+    try rig.keys("/mcp\r");
+    try rig.waitFor(&.{ .{ .status = "MCP access is off for instance " }, .{ .activity = true } });
+    const revoked = try remote.target("get_state", &instance, "");
+    defer revoked.deinit();
+    try std.testing.expectEqualStrings(
+        "unknown_instance",
+        (try mcp.testing.member(revoked.content, "failure")).string,
+    );
+    hold.released.set(std.testing.io);
+    try rig.waitFor(&.{ .{ .text = "done" }, .{ .activity = false } });
+    try rig.keys("/mcp\r");
+    try rig.waitFor(&.{.{ .status = access_on }});
+    try std.testing.expect(!std.mem.eql(u8, &instance, &try remote.instance(rig.directory)));
+}
+
+test "an Esc warning of an ended turn does not cancel a later remote turn at once" {
+    var holds: [2]providers.testing.FakeTransport.Hold = @splat(.{ .io = std.testing.io });
+    var rig: Rig = undefined;
+    try rig.init(&.{
+        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .replies = &.{
+            .{ .body = providers.testing.reply_stream, .hold = &holds[0] },
+            .{ .body = providers.testing.reply_stream, .hold = &holds[1] },
+        },
+        .model = "gpt-5.6-sol",
+    });
+    defer rig.deinit();
+    defer for (&holds) |*hold| hold.released.set(std.testing.io);
+    try rig.keys("/mcp\r");
+    try rig.waitFor(&.{.{ .status = access_on }});
+    var remote: mcp.testing.Client = undefined;
+    remote.init(rig.mcp_directory);
+    defer remote.deinit();
+    const instance = try remote.instance(rig.directory);
+    try rig.keys("Task.\r");
+    try holds[0].reached.wait(std.testing.io);
+    try rig.keys("draft");
+    try rig.waitFor(&.{ .{ .editor = "draft" }, .{ .activity = true } });
+    try rig.keys("\x1b");
+    try rig.waitFor(&.{.{ .status = turn_cancel_notice }});
+    holds[0].released.set(std.testing.io);
+    try rig.waitFor(&.{ .{ .text = "done" }, .{ .activity = false } });
+    const sent = try remote.target("send_message", &instance, ",\"text\":\"More.\"");
+    defer sent.deinit();
+    try holds[1].reached.wait(std.testing.io);
+    try rig.waitFor(&.{.{ .activity = true }});
+    try rig.keys("\x1b");
+    try rig.waitFor(&.{ .{ .status = turn_cancel_notice }, .{ .activity = true } });
+}
+
+test "a remote turn withdraws a quit warning and its confirmation" {
+    var hold: providers.testing.FakeTransport.Hold = .{ .io = std.testing.io };
+    var rig: Rig = undefined;
+    try rig.init(&.{
+        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .replies = &.{.{ .body = providers.testing.reply_stream, .hold = &hold }},
+        .model = "gpt-5.6-sol",
+    });
+    defer rig.deinit();
+    defer hold.released.set(std.testing.io);
+    try rig.keys("/mcp\r");
+    try rig.waitFor(&.{.{ .status = access_on }});
+    var remote: mcp.testing.Client = undefined;
+    remote.init(rig.mcp_directory);
+    defer remote.deinit();
+    const instance = try remote.instance(rig.directory);
+    try rig.keys("draft\x04");
+    const draft_quit_warning = "Press Ctrl+D again to quit. The quit discards the draft.";
+    try rig.waitFor(&.{.{ .status = draft_quit_warning }});
+    const sent = try remote.target("send_message", &instance, ",\"text\":\"Task.\"");
+    defer sent.deinit();
+    try hold.reached.wait(std.testing.io);
+    try rig.waitFor(&.{ .{ .activity = true }, .{ .absent = draft_quit_warning } });
+    hold.released.set(std.testing.io);
+    try rig.waitFor(&.{ .{ .text = "done" }, .{ .activity = false }, .{ .editor = "draft" } });
+}
+
+test "a remote notice that replaces a quit warning withdraws its confirmation" {
+    var rig: Rig = undefined;
+    try rig.init(&.{
+        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .model = "gpt-5.6-sol",
+    });
+    defer rig.deinit();
+    try rig.keys("/mcp\r");
+    try rig.waitFor(&.{.{ .status = access_on }});
+    var remote: mcp.testing.Client = undefined;
+    remote.init(rig.mcp_directory);
+    defer remote.deinit();
+    const instance = try remote.instance(rig.directory);
+    const draft_quit_warning = "Press Ctrl+D again to quit. The quit discards the draft.";
+    try rig.keys("draft\x04");
+    try rig.waitFor(&.{.{ .status = draft_quit_warning }});
+    const unchanged = try remote.target("set_effort", &instance, ",\"effort\":\"xhigh\"");
+    defer unchanged.deinit();
+    try std.testing.expect(!unchanged.failed);
+    try rig.waitFor(&.{ .{ .absent = draft_quit_warning }, .{ .editor = "draft" } });
+    try rig.keys("\x04");
+    try rig.waitFor(&.{ .{ .status = draft_quit_warning }, .{ .editor = "draft" } });
+}
+
+test "an Esc at the prompt does not reach a remote turn that starts within its wait" {
+    var hold: providers.testing.FakeTransport.Hold = .{ .io = std.testing.io };
+    var rig: Rig = undefined;
+    try rig.init(&.{
+        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .replies = &.{.{ .body = providers.testing.reply_stream, .hold = &hold }},
+        .model = "gpt-5.6-sol",
+    });
+    defer rig.deinit();
+    defer hold.released.set(std.testing.io);
+    try rig.keys("/mcp\r");
+    try rig.waitFor(&.{.{ .status = access_on }});
+    var remote: mcp.testing.Client = undefined;
+    remote.init(rig.mcp_directory);
+    defer remote.deinit();
+    const instance = try remote.instance(rig.directory);
+    try rig.keys("draft");
+    try rig.waitFor(&.{ .{ .absent = access_on }, .{ .editor = "draft" } });
+    try rig.keys("\x1b");
+    const sent = try remote.target("send_message", &instance, ",\"text\":\"Task.\"");
+    defer sent.deinit();
+    try std.testing.expect(!sent.failed);
+    try hold.reached.wait(std.testing.io);
+    const painted = rig.device.frameCount();
+    rig.clock.advance(escape_wait_ms * 2);
+    try rig.device.waitFrame(painted);
+    try rig.expectSees(&.{ .{ .absent = turn_cancel_notice }, .{ .editor = "draft" } });
+    hold.released.set(std.testing.io);
+    try rig.waitFor(&.{ .{ .text = "done" }, .{ .activity = false } });
+}
+
+test "remote changes fail while the terminal shows a picker, and remote reads still work" {
+    var rig: Rig = undefined;
+    try rig.init(&.{
+        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .model = "gpt-5.6-sol",
+    });
+    defer rig.deinit();
+    try rig.keys("/mcp\r");
+    try rig.waitFor(&.{.{ .status = access_on }});
+    var remote: mcp.testing.Client = undefined;
+    remote.init(rig.mcp_directory);
+    defer remote.deinit();
+    const instance = try remote.instance(rig.directory);
+    try rig.keys("/help\r");
+    try rig.waitFor(&.{.{ .text = "Command · ↑/↓" }});
+    for ([_][]const u8{ ",\"text\":\"Task.\"", ",\"effort\":\"low\"" }, 0..) |rest, index| {
+        const refused = if (index == 0)
+            try remote.target("send_message", &instance, rest)
+        else
+            try remote.target("set_effort", &instance, rest);
+        defer refused.deinit();
+        try std.testing.expectEqualStrings("terminal_interaction", try refused.text("failure"));
+    }
+    const read = try remote.target("get_state", &instance, "");
+    defer read.deinit();
+    try std.testing.expectEqualStrings("xhigh", try read.text("effort"));
+    try rig.waitFor(&.{.{ .text = "Command · ↑/↓" }});
+    try std.testing.expectEqual(@as(usize, 0), rig.transport.requests.items.len);
+}
+
+test "a remote model fetch shows its caption, refuses messages, and reports its end" {
+    var stall: providers.testing.FakeTransport.Stall = .{ .io = std.testing.io };
+    var rig: Rig = undefined;
+    try rig.init(&.{
+        .store = accounts.testing.planStore("first"),
+        .replies = &.{
+            .{ .stall = &stall },
+            .{ .body = application.testing.plan_models_body },
+            .{ .body = "{\"data\":[]}" },
+            .{ .status = .bad_request },
+            .{ .body = "{\"data\":[]}" },
+        },
+    });
+    defer rig.deinit();
+    try rig.keys("/mcp\r");
+    try rig.waitFor(&.{.{ .status = access_on }});
+    var remote: mcp.testing.Client = undefined;
+    remote.init(rig.mcp_directory);
+    defer remote.deinit();
+    const instance = try remote.instance(rig.directory);
+    const account = ",\"account\":\"openai-plan\"";
+    const canceled = try remote.target("fetch_models", &instance, account);
+    defer canceled.deinit();
+    try stall.reached.wait(std.testing.io);
+    const fetch_caption = "Model fetch: openai-plan · Esc: Cancel";
+    try rig.keys("draft\r");
+    try rig.waitFor(&.{
+        .{ .text = fetch_caption },
+        .{ .status = fetch_message_notice },
+        .{ .editor = "draft" },
+    });
+    try rig.keys("\x1b");
+    try rig.waitFor(&.{
+        .{ .absent = fetch_caption },
+        .{ .status = fetch_cancel_notice },
+        .{ .editor = "draft" },
+    });
+    try std.testing.expect(stall.canceled);
+    try expectFetchOutcome(&remote, &instance, try canceled.text("operation"), &.{
+        .outcome = "canceled",
+    });
+    const listed = try remote.target("fetch_models", &instance, account);
+    defer listed.deinit();
+    try rig.waitFor(&.{
+        .{ .status = "Drinky fetched the model list of openai-plan." },
+        .{ .editor = "draft" },
+    });
+    try expectFetchOutcome(&remote, &instance, try listed.text("operation"), &.{
+        .outcome = "listed",
+    });
+    const models = try remote.target("list_models", &instance, account);
+    defer models.deinit();
+    const first = (try mcp.testing.member(models.content, "models")).array.items[0];
+    try std.testing.expectEqualStrings("gpt-next", (try mcp.testing.member(first, "model")).string);
+    const failed = try remote.target("fetch_models", &instance, account);
+    defer failed.deinit();
+    try rig.waitFor(&.{
+        .{ .absent = fetch_caption },
+        .{ .text = "Drinky could not fetch the model list of openai-plan" },
+    });
+    try expectFetchOutcome(&remote, &instance, try failed.text("operation"), &.{
+        .outcome = "failed",
+        .cause = "ModelListRequestFailed",
+    });
+}
+
+fn expectFetchOutcome(
+    remote: *mcp.testing.Client,
+    instance: *const mcp.discovery.Id,
+    operation: []const u8,
+    expected: *const struct { outcome: []const u8, cause: ?[]const u8 = null },
+) !void {
+    const rest = try std.testing.allocator.print(",\"operation\":\"{s}\"", .{operation});
+    defer std.testing.allocator.free(rest);
+    const ended = try remote.target("get_operation", instance, rest);
+    defer ended.deinit();
+    try std.testing.expectEqualStrings("ended", try ended.text("status"));
+    try std.testing.expectEqualStrings(expected.outcome, try ended.text("outcome"));
+    const cause = expected.cause orelse
+        return std.testing.expectError(error.TestExpectedMember, ended.text("cause"));
+    try std.testing.expectEqualStrings(cause, try ended.text("cause"));
+}
+
+test "a remote clear keeps the draft and names the MCP client, and a terminal clear does not" {
+    var rig: Rig = undefined;
+    try rig.init(&.{
+        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .replies = &.{
+            .{ .body = providers.testing.reply_stream },
+            .{ .body = providers.testing.reply_stream },
+        },
+        .model = "gpt-5.6-sol",
+    });
+    defer rig.deinit();
+    const remote_clear_notice = "An MCP client cleared the conversation.";
+    try rig.keys("/mcp\r");
+    try rig.waitFor(&.{.{ .status = access_on }});
+    var remote: mcp.testing.Client = undefined;
+    remote.init(rig.mcp_directory);
+    defer remote.deinit();
+    const instance = try remote.instance(rig.directory);
+    try rig.keys("First task.\r");
+    try rig.waitFor(&.{ .{ .text = "done" }, .{ .activity = false } });
+    try rig.keys("/new\r");
+    try rig.waitFor(&.{ .{ .absent = "done" }, .{ .absent = remote_clear_notice } });
+    try rig.keys("Second task.\r");
+    try rig.waitFor(&.{ .{ .text = "done" }, .{ .activity = false } });
+    try rig.keys("draft");
+    const cleared = try remote.target("new_conversation", &instance, "");
+    defer cleared.deinit();
+    try std.testing.expect(!cleared.failed);
+    try rig.waitFor(&.{
+        .{ .absent = "done" },
+        .{ .status = remote_clear_notice },
+        .{ .editor = "draft" },
+    });
+    const turns = try remote.target("list_turns", &instance, "");
+    defer turns.deinit();
+    const listed = (try mcp.testing.member(turns.content, "turns")).array.items;
+    try std.testing.expectEqual(@as(usize, 0), listed.len);
 }

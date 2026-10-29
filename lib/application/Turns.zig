@@ -1,18 +1,25 @@
 const std = @import("std");
 
+const core = @import("core");
+
 const Transcript = @import("Transcript.zig");
 
 const Turns = @This();
 
 gpa: std.mem.Allocator,
 list: std.ArrayList(Turn),
-id_next: u64 = 1,
 
 pub const Turn = struct {
     id: u64,
     range: Transcript.Range,
     line: ?[]const u8,
     mutated: bool,
+    end: ?End = null,
+};
+
+pub const End = struct {
+    outcome: core.Session.Outcome,
+    answer: []const u8,
 };
 
 pub fn init(gpa: std.mem.Allocator) Turns {
@@ -35,25 +42,32 @@ pub fn find(self: *const Turns, id: u64) ?usize {
     return null;
 }
 
-pub fn begin(self: *Turns, start: usize, maybe_line: ?[]const u8) error{OutOfMemory}!void {
+pub fn begin(
+    self: *Turns,
+    options: *const struct { id: u64, start: usize, line: ?[]const u8 },
+) error{OutOfMemory}!void {
     try self.list.ensureUnusedCapacity(self.gpa, 1);
-    const line = if (maybe_line) |text| try self.gpa.dupe(u8, text) else null;
+    const line = if (options.line) |text| try self.gpa.dupe(u8, text) else null;
     self.list.appendAssumeCapacity(.{
-        .id = self.id_next,
-        .range = .{ .start = start, .end = start },
+        .id = options.id,
+        .range = .{ .start = options.start, .end = options.start },
         .line = line,
         .mutated = false,
     });
-    self.id_next += 1;
 }
 
 pub fn markMutated(self: *Turns) void {
     self.last().mutated = true;
 }
 
-pub fn end(self: *Turns, block_count: usize) void {
-    std.debug.assert(block_count >= self.last().range.start);
-    self.last().range.end = block_count;
+pub fn end(self: *Turns, block_count: usize, ended: *const End) error{OutOfMemory}!void {
+    const turn = self.last();
+    std.debug.assert(block_count >= turn.range.start);
+    std.debug.assert(turn.end == null);
+    const answer = try self.gpa.dupe(u8, ended.answer);
+    errdefer self.gpa.free(answer);
+    turn.end = .{ .outcome = try ended.outcome.dupe(self.gpa), .answer = answer };
+    turn.range.end = block_count;
 }
 
 pub fn takeLine(self: *Turns, index: usize) []const u8 {
@@ -67,6 +81,9 @@ pub fn truncate(self: *Turns, count: usize) void {
     std.debug.assert(count <= self.list.items.len);
     for (self.list.items[count..]) |turn| {
         if (turn.line) |line| self.gpa.free(line);
+        const ended = turn.end orelse continue;
+        ended.outcome.deinit(self.gpa);
+        self.gpa.free(ended.answer);
     }
     self.list.shrinkRetainingCapacity(count);
 }

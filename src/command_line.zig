@@ -1,10 +1,12 @@
 const std = @import("std");
 const application = @import("application");
 
-const usage = "Use drinky, drinky models, or drinky run --model account/model --effort level.";
+const usage = "Use drinky, drinky mcp, drinky models, or drinky run --model account/model " ++
+    "--effort level.";
 
 pub const Parsed = union(enum) {
     terminal,
+    mcp,
     models,
     run: Run,
     refused: Refusal,
@@ -65,6 +67,10 @@ pub fn parse(arguments: []const [:0]const u8) Parsed {
         if (rest.len > 0) return .{ .refused = .{ .unknown_argument = rest[0] } };
         return .models;
     }
+    if (std.mem.eql(u8, name, "mcp")) {
+        if (rest.len > 0) return .{ .refused = .{ .unknown_argument = rest[0] } };
+        return .mcp;
+    }
     if (std.mem.eql(u8, name, "run")) return parseRun(rest);
     return .{ .refused = .{ .unknown_argument = name } };
 }
@@ -91,11 +97,16 @@ fn parseRun(arguments: []const [:0]const u8) Parsed {
     return .{ .run = .{ .model = model, .effort = effort } };
 }
 
-test "the arguments select the terminal, the model list, or a run, and refuse the rest" {
+test "the arguments select the terminal, the MCP server, the models, or a run and refuse the rest" {
     const Case = struct { arguments: []const [:0]const u8, expected: Parsed };
     const cases = [_]Case{
         .{ .arguments = &.{}, .expected = .terminal },
         .{ .arguments = &.{"models"}, .expected = .models },
+        .{ .arguments = &.{"mcp"}, .expected = .mcp },
+        .{
+            .arguments = &.{ "mcp", "--all" },
+            .expected = .{ .refused = .{ .unknown_argument = "--all" } },
+        },
         .{
             .arguments = &.{ "run", "--model", "openai-api-key/gpt-5.6-sol", "--effort", "max" },
             .expected = .{ .run = .{ .model = "openai-api-key/gpt-5.6-sol", .effort = .max } },

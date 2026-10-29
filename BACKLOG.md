@@ -29,6 +29,18 @@ when the user drops it.
   the controller calls `rejectCredential`, which can sign out and report that no account remains.
   The terminal then opens the sign-in picker. The terminal cannot show that picker over an open
   result page. Both commands need a design for a sign-out while their page is open first.
+- The status line does not show MCP access. Only the notice of `/mcp` states the change.
+- No installed client has run the MCP gateway. Run the runtime gates for Codex and for ChatGPT Voice
+  on a paired iPhone. Trigger: an installed Codex build.
+  - Record the client version and confirm that it selects the protocol `2026-07-28`.
+  - Codex selects the modern stdio mode only with the server variable
+    `CODEX_MCP_PROTOCOL_VERSION = "2026-07-28"`. The source of this rule is
+    `codex-rs/rmcp-client/src/protocol_mode.rs` at commit `09db085`.
+  - Confirm the socket access under the permissions of the host.
+  - Discover two instances, toggle access, and recover an outcome after a gateway restart.
+  - Test the voice behavior, and confirm that the client blocks unwanted Codex tools.
+  - Confirm that each client asks the user before it calls `new_conversation`.
+  - Add a legacy protocol only when a trial needs it.
 - The start of Drinky reads the config file and the instruction files and scans the skill
   directories without a time limit. A file system call that does not return stops the start. A
   pending macOS privacy prompt causes such a call. The tools and the skill file reads already stop

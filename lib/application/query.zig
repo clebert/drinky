@@ -7,6 +7,7 @@ const tools = @import("tools");
 const Choice = @import("Choice.zig");
 const Config = @import("Config.zig");
 const discovery = @import("discovery/root.zig");
+const Turns = @import("Turns.zig");
 
 pub const account_count = accounts.Account.table.len;
 pub const levels = std.enums.values(core.Provider.Effort);
@@ -43,6 +44,19 @@ pub const Turn = struct {
 pub const Skill = struct {
     name: []const u8,
     description: []const u8,
+};
+
+pub const Operation = union(enum) {
+    running,
+    turn_ended: Turns.End,
+    fetch_ended: FetchOutcome,
+    unknown,
+};
+
+pub const FetchOutcome = union(enum) {
+    listed,
+    canceled,
+    failed: accounts.Registry.FetchError,
 };
 
 pub const Documents = struct {

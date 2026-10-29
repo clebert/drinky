@@ -17,17 +17,19 @@ pub const Work = union(enum) {
     turn: u64,
     aside: u64,
     sign_in: SignIn,
-    fetch: u64,
+    fetch: Fetch,
 
     pub fn operation(self: *const Work) ?u64 {
         return switch (self.*) {
             .idle => null,
-            .turn, .aside, .fetch => |id| id,
+            .turn, .aside => |id| id,
             .sign_in => |sign_in| sign_in.operation,
+            .fetch => |fetch| fetch.operation,
         };
     }
 };
 pub const SignIn = struct { operation: u64, account: usize, callback: bool };
+pub const Fetch = struct { operation: u64, account: usize };
 pub const Offer = union(enum) {
     none,
     retry,

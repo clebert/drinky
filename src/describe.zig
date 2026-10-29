@@ -53,6 +53,7 @@ fn write(writer: *std.Io.Writer) std.Io.Writer.Error!void {
     try writeKeys(writer);
     try writePreferences(writer);
     try writeHeadless(writer);
+    try writeAccess(writer);
 }
 
 fn writeCommands(writer: *std.Io.Writer) !void {
@@ -66,10 +67,11 @@ fn writeCommands(writer: *std.Io.Writer) !void {
     }
     try writer.writeAll(
         "\nA command refuses text after its name unless its row names trailing text. " ++
-            "The " ++ reference.line(.verbose) ++ " command also works while a turn runs. " ++
-            "During a turn, the line `/` or `" ++ reference.line(.help) ++ "` lists the " ++
-            "commands that work during a turn. " ++
-            "Drinky refuses other commands during a turn. The draft stays in both cases.\n",
+            "The " ++ reference.line(.mcp) ++ " and " ++ reference.line(.verbose) ++
+            " commands also work while a turn or a model fetch runs. " ++
+            "During that work, the line `/` or `" ++ reference.line(.help) ++ "` lists the " ++
+            "commands that work then. " ++
+            "Drinky refuses other commands during that work. The draft stays in both cases.\n",
     );
     try writer.print(
         \\
@@ -214,8 +216,8 @@ fn writeKeys(writer: *std.Io.Writer) !void {
         \\- Ctrl+C clears the editor. A second press within {d} milliseconds quits Drinky.
         \\- Ctrl+D quits at an empty editor. Ctrl+D with a draft warns first and quits on the
         \\  second press.
-        \\- Within {d} milliseconds after a Ctrl+D that ended a step, a page, a sign-in, or a turn,
-        \\  Ctrl+D warns first.
+        \\- Within {d} milliseconds after a Ctrl+D that ended a step, a page, a sign-in, a model
+        \\  fetch, or a turn, Ctrl+D warns first.
         \\- Ctrl+N acts on the offer that the caption above the editor names. Under `Failed turn`,
         \\  Ctrl+N asks the model to continue from the committed work. The draft stays. Under
         \\  `Canceled turn`, Ctrl+N removes the canceled turn from the conversation and returns its
@@ -231,21 +233,30 @@ fn writeKeys(writer: *std.Io.Writer) !void {
         \\- Esc or Ctrl+D cancels the sign-in and keeps the draft.
         \\- Ctrl+C clears a draft, and it cancels the sign-in at an empty editor.
         \\
+        \\A model fetch outside the model picker shows the caption `Model fetch:` and its account
+        \\above the editor. An MCP client can start such a fetch. The fetch takes these keys:
+        \\
+        \\- Enter runs `/mcp` or `/verbose` and clears its command line. Enter on `/` or `/help`
+        \\  lists the commands that work during the fetch. Enter refuses other lines and keeps
+        \\  them.
+        \\- Esc or Ctrl+D cancels the fetch and keeps the draft.
+        \\- Ctrl+C clears a draft, and it cancels the fetch at an empty editor.
+        \\
         \\A running turn takes these keys:
         \\
-        \\- Enter runs `/verbose` and clears its command line. Enter on `/` or `/help` lists the
-        \\  commands that work during a turn and keeps the line. Other slash commands get a
-        \\  refusal. Enter sends no message. Drinky shows the notice `Drinky sends no message
-        \\  while a turn runs. The draft stays.` and keeps the line.
+        \\- Enter runs `/mcp` or `/verbose` and clears its command line. Enter on `/` or `/help`
+        \\  lists the commands that work during a turn and keeps the line. Other slash commands
+        \\  get a refusal. Enter sends no message. Drinky shows the notice `Drinky sends no
+        \\  message while a turn runs. The draft stays.` and keeps the line.
         \\- Esc cancels the turn. Esc with a draft warns first and cancels on the second press.
         \\- When a notice other than that warning replaces the status line, Esc first clears the
         \\  notice.
         \\- Ctrl+D cancels the turn at once.
         \\- Ctrl+C clears a draft, and it cancels the turn at an empty editor.
         \\
-        \\This section names the keys of the prompt, a sign-in, and a turn. A full-window page
-        \\states its own keys in its header, and the editor carries the movement keys of a text
-        \\field.
+        \\This section names the keys of the prompt, a sign-in, a model fetch, and a turn. A
+        \\full-window page states its own keys in its header, and the editor carries the movement
+        \\keys of a text field.
         \\
     , .{ reference.repeat_window_ms, reference.repeat_window_ms });
 }
@@ -273,8 +284,8 @@ fn writeHeadless(writer: *std.Io.Writer) !void {
         \\
         \\## Headless mode
         \\
-        \\`drinky run` answers one prompt without a terminal. It is not a slash command, so you
-        \\can start it through the `bash` tool. A run can review your work as a second agent.
+        \\The command `drinky run` answers one prompt without a terminal. It is not a slash command,
+        \\so you can start it through the `bash` tool. A run can review your work as a second agent.
         \\
         \\- A run reads the prompt from stdin and writes the text of its final reply to stdout.
         \\- A run through the `bash` tool adds its available costs to the parent session total.
@@ -323,6 +334,32 @@ fn writeHeadless(writer: *std.Io.Writer) !void {
     });
 }
 
+fn writeAccess(writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    try writer.writeAll(
+        \\
+        \\## MCP access
+        \\
+        \\`/mcp` turns MCP access to this instance on or off. The command works while a turn runs
+        \\and changes no conversation. Each start of access gives the instance a new id, so the end
+        \\of access revokes every id that a client knows. Accepted work continues after the end.
+        \\
+        \\The command `drinky mcp` starts an MCP server on stdin and stdout for a client such as
+        \\Codex. It speaks the MCP protocol version 2026-07-28 alone. The server finds each instance
+        \\with MCP access, so the client needs one entry for all instances.
+        \\
+        \\A client can read the state and the prompts. It can send a message, load a skill, cancel
+        \\work, and continue a failed turn. It can also clear the conversation, fetch a model list,
+        \\and select a saved model and the effort. The terminal shows a notice when a client clears
+        \\the conversation. A client cannot rewind the conversation or remove a turn. It cannot
+        \\prepare or apply a handoff, shorten an answer, or sign in or out. A remote request that
+        \\changes the instance fails while the terminal shows a picker, a page, or a sign-in.
+        \\
+        \\MCP access lets another agent submit work to this agent. Drinky has no permission gate or
+        \\sandbox, so access is as powerful as the terminal.
+        \\
+    );
+}
+
 test "the native reference avoids shared text and preserves facts across allocation failures" {
     try std.testing.checkAllAllocationFailures(
         core.testing.no_resize_allocator,
@@ -343,7 +380,10 @@ fn checkReference(gpa: std.mem.Allocator) !void {
     const keys = std.mem.find(u8, text, "## Key bindings").?;
     const preferences = std.mem.find(u8, text, "## Terminal preferences").?;
     const headless = std.mem.find(u8, text, "## Headless mode").?;
+    const access = std.mem.find(u8, text, "## MCP access").?;
     try std.testing.expect(commands < keys and keys < preferences and preferences < headless);
+    try std.testing.expect(headless < access);
+    try std.testing.expect(std.mem.find(u8, text[access..], "`drinky mcp`") != null);
     for (reference.summaries) |summary| {
         const row = try gpa.print("- `/{s}` — {s}.", .{ summary.name, summary.summary });
         defer gpa.free(row);
@@ -362,5 +402,5 @@ fn checkReference(gpa: std.mem.Allocator) !void {
         application.reference.effort_levels,    application.support.environment.model,
         application.support.environment.effort, application.reference.nested,
         "available costs",                      "no summary",
-    }) |fact| try std.testing.expect(std.mem.find(u8, text[headless..], fact) != null);
+    }) |fact| try std.testing.expect(std.mem.find(u8, text[headless..access], fact) != null);
 }

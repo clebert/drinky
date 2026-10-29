@@ -52,8 +52,14 @@ reference text, and terminal output instructions.
 - `src/reference.zig` owns the command table and control hints.
 - `src/describe.zig` owns the native reference text and output instructions.
 - `src/format.zig` owns the native display helpers.
-- `src/wording.zig` words the refusals and record events.
+- `src/wording.zig` words the refusals and record events. `src/mcp/catalog.zig` words the refusals
+  for MCP clients and uses the event words of `src/wording.zig`.
 - `src/headless.zig` words the startup refusals.
+- `src/mcp` owns the MCP gateway of `drinky mcp`, the endpoint of `/mcp`, discovery, the tool
+  catalog, and the private protocol between gateway and endpoint.
+
+The endpoint posts each remote request to the queue of the terminal loop. The loop runs the request
+as a controller call and returns an owned reply to the waiting connection task.
 
 The screen owns its layout caches. It applies states and snapshots through one path. A snapshot
 keeps the local pickers and pages. The presentation copy applies record changes by id and groups

@@ -61,6 +61,17 @@ runs.
 
 Use `drinky models` to list the saved models of signed-in accounts.
 
+## MCP
+
+A local MCP client can control running Drinky instances. Type `/mcp` in an instance to turn MCP
+access to that instance on or off. The client starts `drinky mcp` as its stdio server. The server
+speaks MCP `2026-07-28` and finds each instance with MCP access, so one server entry covers all
+instances.
+
+The client can read the state, send messages, load skills, cancel work, clear the conversation,
+fetch a model list, and select the model and the effort. It cannot rewind the conversation, prepare
+a handoff, or sign in.
+
 ## Config file
 
 The optional `~/.drinky/config.json` file controls instructions, request limits, and interface
@@ -73,7 +84,8 @@ Drinky reports its state to [Herdr](https://herdr.dev), so a pane can notify whe
 
 ## Security
 
-Drinky has no permission gate or sandbox. Use a container for an untrusted repository.
+Drinky has no permission gate or sandbox. Use a container for an untrusted repository. MCP access
+lets any process of the same user submit work to the instance.
 
 ## License
 

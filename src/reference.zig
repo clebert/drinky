@@ -15,6 +15,7 @@ pub const Command = enum {
     help,
     login,
     logout,
+    mcp,
     model,
     new,
     rewind,
@@ -27,7 +28,7 @@ pub const Command = enum {
     const Facts = struct {
         summary: []const u8,
         tail: []const u8 = "",
-        during_turn: bool = false,
+        during_work: bool = false,
         alias: []const u8 = "",
     };
 };
@@ -41,6 +42,7 @@ pub const commands: std.enums.EnumArray(Command, Command.Facts) = .init(.{
     .help = .{ .summary = "List every command", .alias = "/" },
     .login = .{ .summary = "Sign in or switch the account" },
     .logout = .{ .summary = "Drop the credentials of an account" },
+    .mcp = .{ .summary = "Turn MCP access to this instance on or off", .during_work = true },
     .model = .{ .summary = "Switch the model" },
     .new = .{ .summary = "Clear the conversation" },
     .rewind = .{ .summary = "Return to an earlier prompt" },
@@ -50,7 +52,7 @@ pub const commands: std.enums.EnumArray(Command, Command.Facts) = .init(.{
     .tldr = .{ .summary = "Shorten the last answer with the current model" },
     .verbose = .{
         .summary = "Toggle thinking text, tool rows, and complete bash commands",
-        .during_turn = true,
+        .during_work = true,
     },
 });
 
