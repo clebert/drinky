@@ -64,9 +64,9 @@ Use `drinky models` to list the saved models of signed-in accounts.
 ## MCP
 
 A local MCP client can control running Drinky instances. Type `/mcp` in an instance to turn MCP
-access to that instance on or off. The client starts `drinky mcp` as its stdio server. The server
-speaks MCP `2026-07-28` and finds each instance with MCP access, so one server entry covers all
-instances.
+access to that instance on or off. While access is on, the status line shows `MCP: on`. The client
+starts `drinky mcp` as its stdio server. The server speaks MCP `2026-07-28` and finds each instance
+with MCP access, so one server entry covers all instances.
 
 The client can read the state, send messages, load skills, cancel work, clear the conversation,
 fetch a model list, and select the model and the effort. It cannot rewind the conversation, prepare

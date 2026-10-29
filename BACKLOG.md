@@ -29,7 +29,6 @@ when the user drops it.
   the controller calls `rejectCredential`, which can sign out and report that no account remains.
   The terminal then opens the sign-in picker. The terminal cannot show that picker over an open
   result page. Both commands need a design for a sign-out while their page is open first.
-- The status line does not show MCP access. Only the notice of `/mcp` states the change.
 - No installed client has run the MCP gateway. Run the runtime gates for Codex and for ChatGPT Voice
   on a paired iPhone. Trigger: an installed Codex build.
   - Record the client version and confirm that it selects the protocol `2026-07-28`.

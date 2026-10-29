@@ -24,6 +24,7 @@ pub const Info = struct {
     quota: ?Quota,
     credits: ?application.Credits,
     turn_active: bool,
+    mcp_access: bool = false,
     gauge: application.Settings.Gauge = .{},
     notice: ?Message = null,
     confirmation: ?Confirmation = null,
@@ -64,6 +65,7 @@ const Parts = struct {
     cache: bool,
     account: bool,
     effort: bool,
+    access: bool,
 
     const Form = enum { full, short, hidden };
 
@@ -81,6 +83,7 @@ const Parts = struct {
         .cache = true,
         .account = true,
         .effort = true,
+        .access = true,
     };
 };
 
@@ -100,6 +103,7 @@ const Reduction = enum {
     drop_branch,
     drop_place,
     drop_effort,
+    drop_access,
 };
 
 const Run = struct { start: usize, end: usize, name: role.Name };
@@ -147,6 +151,7 @@ fn reduce(parts: *Parts, reduction: Reduction) void {
         .drop_branch => parts.branch = .hidden,
         .drop_place => parts.place = .hidden,
         .drop_effort => parts.effort = false,
+        .drop_access => parts.access = false,
     }
 }
 
@@ -239,6 +244,13 @@ pub fn render(placement: *const paint.Placement, info: *const Info) !void {
 }
 
 fn writeRight(line: *Line, info: *const Info, parts: *const Parts) !void {
+    if (info.mcp_access and parts.access) {
+        try line.out.writeAll("MCP: ");
+        const access_start = line.offset();
+        try line.out.writeAll("on");
+        line.mark(access_start, .text);
+        try line.out.writeAll(paint.separator);
+    }
     try line.out.writeAll("Model: ");
     const value_start = line.offset();
     const account = info.account orelse {
@@ -790,6 +802,45 @@ test "the model value and the effort level leave the faint intensity" {
         reset ++ "Effort",
         reset ++ "claude-opus-4-8",
     });
+}
+
+test "MCP access shows only while on, before the model, and leaves after the effort" {
+    const gpa = std.testing.allocator;
+    var info = test_info;
+    info.mcp_access = true;
+    var rig: testing.Rig = undefined;
+    rig.init(gpa);
+    defer rig.deinit();
+    try renderForTest(&rig, &info, 200);
+    try testing.expectShows(try rig.painted(), &.{
+        comptime "MCP: " ++ attribute.sequence(.reset) ++ "on" ++ role.sequence(.muted) ++
+            " · Model: ",
+    });
+
+    var access_alone = false;
+    var model_alone = false;
+    var columns: usize = 8;
+    while (columns <= 200) : (columns += 1) {
+        var narrow_rig: testing.Rig = undefined;
+        narrow_rig.init(gpa);
+        defer narrow_rig.deinit();
+        try renderForTest(&narrow_rig, &info, columns);
+        const plain = try narrow_rig.plain();
+        const access = std.mem.find(u8, plain, "MCP: on · Model: ") != null;
+        const effort = std.mem.find(u8, plain, "Effort:") != null;
+        const model = std.mem.find(u8, plain, "Model: claude-opus-4-8") != null;
+        if (effort) try std.testing.expect(access);
+        if (access and !effort) access_alone = true;
+        if (model and !access) model_alone = true;
+    }
+    try std.testing.expect(access_alone);
+    try std.testing.expect(model_alone);
+
+    var off_rig: testing.Rig = undefined;
+    off_rig.init(gpa);
+    defer off_rig.deinit();
+    try renderForTest(&off_rig, &test_info, 200);
+    try testing.expectHides(try off_rig.painted(), &.{"MCP:"});
 }
 
 test "a cut keeps the color it lands in and drops the color it takes away" {

@@ -946,6 +946,7 @@ fn toggleVerbose(self: *App) !void {
     );
 }
 fn toggleAccess(self: *App) !void {
+    defer self.screen.mcp_access = self.endpoint.published() != null;
     if (self.endpoint.published()) |instance| {
         self.endpoint.disable() catch |err| return self.reportNotice(
             .failure,
@@ -4116,4 +4117,31 @@ test "a remote clear keeps the draft and names the MCP client, and a terminal cl
     defer turns.deinit();
     const listed = (try mcp.testing.member(turns.content, "turns")).array.items;
     try std.testing.expectEqual(@as(usize, 0), listed.len);
+}
+
+test "the status line shows MCP access while it is on and keeps it across a snapshot" {
+    var rig: Rig = undefined;
+    try rig.init(&.{
+        .variables = &.{.{ "OPENAI_API_KEY", "key" }},
+        .model = "gpt-5.6-sol",
+    });
+    defer rig.deinit();
+    const model_label = "Model: openai-api-key/gpt-5.6-sol";
+    const access_label = "MCP: on · " ++ model_label;
+    try rig.waitFor(&.{ .{ .status = model_label }, .{ .absent = "MCP:" } });
+    try rig.keys("/mcp\r");
+    try rig.waitFor(&.{.{ .status = access_on }});
+    try rig.keys("x");
+    try rig.waitFor(&.{ .{ .status = access_label }, .{ .editor = "x" } });
+    try rig.keys("\x7f/mcp\r");
+    try rig.waitFor(&.{.{ .status = "MCP access is off for instance " }});
+    try rig.keys("x");
+    try rig.waitFor(&.{ .{ .status = model_label }, .{ .absent = "MCP:" } });
+    try rig.keys("\x7f/mcp\r");
+    try rig.waitFor(&.{.{ .status = access_on }});
+    try rig.keys("\x04");
+    try rig.finish();
+    _ = rig.app.controller.submit(&.snapshot);
+    try rig.app.screen.paint(rig.device.window, .{ .awake_ms = 0, .boot_ms = 0 }, &null);
+    try rig.expectSees(&.{.{ .status = access_label }});
 }

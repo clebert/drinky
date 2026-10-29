@@ -32,6 +32,7 @@ rows: usize,
 statistics: application.Statistics,
 choice: application.Choice,
 directory_shown: []const u8,
+mcp_access: bool = false,
 branch_buffer: [application.branch_bytes_max]u8,
 branch_length: ?usize,
 window_pages: usize,
@@ -812,6 +813,7 @@ pub fn restore(self: *Screen, snapshot: *const application.Snapshot) !void {
         .home_directory = snapshot.home_directory,
     };
     restored.directory_shown = self.directory_shown;
+    restored.mcp_access = self.mcp_access;
     restored.statistics = snapshot.statistics;
     restored.picker_scrolls = self.picker_scrolls;
     restored.picker_depth = self.picker_depth;
@@ -945,6 +947,7 @@ fn statusInfo(self: *const Screen, boot_ms: i64) ui.status.Info {
             null,
         .credits = self.statistics.credits,
         .turn_active = self.widget == .turn,
+        .mcp_access = self.mcp_access,
         .gauge = self.gauge,
         .notice = self.notice,
         .confirmation = self.confirmation,

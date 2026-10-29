@@ -340,8 +340,9 @@ fn writeAccess(writer: *std.Io.Writer) std.Io.Writer.Error!void {
         \\## MCP access
         \\
         \\`/mcp` turns MCP access to this instance on or off. The command works while a turn runs
-        \\and changes no conversation. Each start of access gives the instance a new id, so the end
-        \\of access revokes every id that a client knows. Accepted work continues after the end.
+        \\and changes no conversation. While access is on, the status line shows `MCP: on` before
+        \\the model. Each start of access gives the instance a new id, so the end of access revokes
+        \\every id that a client knows. Accepted work continues after the end.
         \\
         \\The command `drinky mcp` starts an MCP server on stdin and stdout for a client such as
         \\Codex. It speaks the MCP protocol version 2026-07-28 alone. The server finds each instance
