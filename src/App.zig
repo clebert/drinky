@@ -230,7 +230,7 @@ pub fn init(self: *App, gpa: std.mem.Allocator, io: std.Io, options: *const Opti
         .queue = undefined,
         .herdr = .init(io),
         .working_directory = options.working_directory,
-        .project_row = options.herdr == null,
+        .project_row = !paneShowsProject(options),
         .endpoint = .init(gpa, io, options.mcp_directory, .{ .ptr = self, .vtable = &host_vtable }),
     };
     self.screen.verbose = (application.Settings{}).verbose;
@@ -275,6 +275,11 @@ pub fn init(self: *App, gpa: std.mem.Allocator, io: std.Io, options: *const Opti
     };
     _ = self.controller.submit(&.snapshot);
     try self.settle();
+}
+fn paneShowsProject(options: *const Options) bool {
+    if (options.herdr != null) return true;
+    const program = options.environment.get("TERM_PROGRAM") orelse return false;
+    return std.mem.eql(u8, program, "rex");
 }
 pub fn deinit(self: *App) void {
     self.stopQueue();
@@ -1340,6 +1345,31 @@ test "a Herdr startup failure stays in the transcript across snapshots with the 
         );
         try std.testing.expectEqualStrings("main", app.screen.branch().?);
         _ = app.controller.submit(&.snapshot);
+    }
+}
+
+test "the status line leaves out the project in a Herdr or Rex pane and shows it elsewhere" {
+    var herdr: testing.FakeHerdr = undefined;
+    try herdr.init(std.testing.allocator, std.testing.io);
+    defer herdr.deinit();
+    var serving = try std.testing.io.concurrent(testing.FakeHerdr.serve, .{ &herdr, 8 });
+    defer _ = serving.cancel(std.testing.io) catch {};
+    const cases = [_]struct { []const u8, ?Herdr.Endpoint, bool }{
+        .{ "rex", null, false },
+        .{ "Apple_Terminal", herdr.endpoint(), false },
+        .{ "Apple_Terminal", null, true },
+    };
+    for (cases) |case| {
+        var rig: Rig = undefined;
+        try rig.init(&.{
+            .variables = &.{ .{ "OPENAI_API_KEY", "sk-openai" }, .{ "TERM_PROGRAM", case[0] } },
+            .model = "gpt-5.6-sol",
+            .herdr = case[1],
+        });
+        defer rig.deinit();
+        try rig.waitFor(&.{.{ .status = "Model: openai-api-key/gpt-5.6-sol" }});
+        const place = "~" ++ ui.paint.separator;
+        try std.testing.expectEqual(case[2], try rig.seesAll(&.{.{ .status = place }}));
     }
 }
 
