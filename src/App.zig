@@ -64,6 +64,8 @@ resize_future: ?std.Io.Future(void) = null,
 tick_future: ?std.Io.Future(void) = null,
 frame_grid: FrameGrid = .reset(0),
 herdr: Herdr,
+program_status: ?ProgramStatus = null,
+unseen: ?Unseen = null,
 confirmation: ?Confirmation = null,
 flow: ?Flow = null,
 pending: [pending_max]Transition = undefined,
@@ -136,6 +138,31 @@ const Origin = enum { line, help };
 const PendingEscape = struct { deadline_ms: i64, mode: Mode };
 
 const Exit = enum { escape, ctrl_c, ctrl_d };
+
+const ProgramStatus = enum {
+    idle,
+    working,
+    done,
+    sign_in,
+    failed,
+
+    fn sequence(self: ProgramStatus) []const u8 {
+        return switch (self) {
+            .idle => report("idle"),
+            .working => report("working"),
+            .done => report("done"),
+            .sign_in => report("blocked:kind=auth"),
+            .failed => report("error"),
+        };
+    }
+
+    fn report(comptime state: []const u8) []const u8 {
+        return terminal.escape.program_status_set ++ "state=" ++ state ++ ":app=drinky" ++
+            terminal.escape.string_end;
+    }
+};
+
+const Unseen = enum { done, failed };
 
 const CheckedStep = enum { model, logout, rewind };
 
@@ -264,6 +291,7 @@ pub fn deinit(self: *App) void {
 pub fn run(self: *App) !void {
     defer self.prepareTerminalExit();
     try self.refresh();
+    try self.reportProgramStatus();
     self.frame_grid = .reset(self.nowNs());
 
     self.running = true;
@@ -277,6 +305,49 @@ pub fn run(self: *App) !void {
 fn prepareTerminalExit(self: *App) void {
     self.device.setAlternateScreen(false) catch return;
     self.screen.parkCursor() catch {};
+    if (self.program_status == null) return;
+    const writer = self.device.writer();
+    writer.writeAll(terminal.escape.program_status_reset) catch return;
+    writer.flush() catch {};
+}
+
+fn reportProgramStatus(self: *App) !void {
+    const status = self.programStatus();
+    if (self.program_status == status) return;
+    const writer = self.device.writer();
+    try writer.writeAll(status.sequence());
+    try writer.flush();
+    self.program_status = status;
+}
+
+fn programStatus(self: *const App) ProgramStatus {
+    return switch (self.work) {
+        .turn, .aside, .fetch => .working,
+        .sign_in => .sign_in,
+        .idle => if (self.unseen) |unseen| switch (unseen) {
+            .done => .done,
+            .failed => .failed,
+        } else .idle,
+    };
+}
+
+fn unseenOfTurn(ended: *const application.Event.TurnEnd) ?Unseen {
+    return switch (ended.outcome) {
+        .stopped => |reason| switch (reason) {
+            .complete => .done,
+            .truncated => .failed,
+        },
+        .exhausted, .failed => .failed,
+        .canceled => null,
+    };
+}
+
+fn unseenOfAside(phase: *const application.State.Result.Phase) Unseen {
+    return switch (phase.*) {
+        .generating => unreachable,
+        .complete => .done,
+        .incomplete => .failed,
+    };
 }
 
 fn stopTasks(self: *App) void {
@@ -330,6 +401,7 @@ fn runLoop(self: *App) !void {
         self.herdr.sync(if (self.working())
             .working
         else if (self.offer == .retry) .blocked else .idle);
+        try self.reportProgramStatus();
         if (ticked) {
             self.awaitFuture(&self.tick_future);
             const activity_changed = self.screen.advanceFrame(self.nowMs());
@@ -613,6 +685,7 @@ fn applyBatch(self: *App, events: []const UiEvent) !bool {
             .keys => |bytes| {
                 defer self.gpa.free(bytes);
                 self.dirty = true;
+                self.unseen = null;
                 _ = self.controller.submit(&.refresh_project);
                 try self.handleKeys(bytes);
             },
@@ -659,13 +732,13 @@ fn applyEvent(self: *App, event: *const application.Event) !void {
         .fetch_ended => |ended| self.postpone(.{ .fetch = ended }),
         .no_account => self.postpone(.no_account),
         .clear_conversation => if (self.serving_remote) self.postpone(.remote_clear),
+        .turn_ended => |*ended| self.unseen = unseenOfTurn(ended),
         .append_record,
         .record_text,
         .replace_record,
         .remove_records,
         .live,
         .statistics,
-        .turn_ended,
         .charge,
         .startup_refused,
         => {},
@@ -758,6 +831,9 @@ fn adopt(self: *App, value: *const application.State) void {
     if (value.work.operation() != self.work.operation() and self.confirmation != null) {
         self.confirmation = null;
         self.screen.clearNotice();
+    }
+    if (self.work == .aside and value.work != .aside) {
+        self.unseen = if (value.result) |*result| unseenOfAside(&result.phase) else null;
     }
     self.work = value.work;
     self.offer = value.offer;
@@ -3593,6 +3669,162 @@ fn expectHerdrState(herdr: *testing.FakeHerdr, comptime state: []const u8) !void
     }
     std.debug.print("Herdr heard {d} lines without the state \"{s}\"\n", .{ lines_max, state });
     return error.TestExpectedHerdrState;
+}
+
+const idle_status = "state=idle:app=drinky";
+const working_status = "state=working:app=drinky";
+
+test "the terminal hears working during a turn, done until a key, and a clear at exit" {
+    var rig: Rig = undefined;
+    try rig.init(&.{
+        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .replies = &.{.{ .body = providers.testing.reply_stream }},
+        .model = "gpt-5.6-sol",
+    });
+    defer rig.deinit();
+
+    try rig.keys("hello\r");
+    try rig.waitFor(&.{ .{ .text = "done" }, .{ .activity = false } });
+    const done_status = "state=done:app=drinky";
+    try expectProgramStatuses(&rig, &.{ idle_status, working_status, done_status });
+    try rig.keys("\x7f\x04");
+    try rig.finish();
+    try expectProgramStatuses(
+        &rig,
+        &.{ idle_status, working_status, done_status, idle_status, "state=clear" },
+    );
+}
+
+test "the terminal hears error after a failed turn and idle after a key or a cancel" {
+    var stall: providers.testing.FakeTransport.Stall = .{ .io = std.testing.io };
+    const replies = [_]providers.testing.FakeTransport.Reply{
+        failed_reply,
+        failed_reply,
+        .{ .stall = &stall },
+    };
+    var rig: Rig = undefined;
+    try rig.init(&.{
+        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .replies = &replies,
+        .model = "gpt-5.6-sol",
+    });
+    defer rig.deinit();
+
+    try rig.keys("hello\r");
+    try rig.waitFor(&.{ .{ .text = retry_caption_row }, .{ .activity = false } });
+    try rig.keys("\x1b");
+    try rig.waitFor(&.{.{ .absent = retry_caption_row }});
+    try rig.keys("again\r");
+    try stall.reached.wait(std.testing.io);
+    try rig.keys("\x04");
+    try rig.waitFor(&.{ .{ .text = removal_caption_row }, .{ .activity = false } });
+    try expectProgramStatuses(&rig, &.{
+        idle_status,
+        working_status,
+        "state=error:app=drinky",
+        idle_status,
+        working_status,
+        idle_status,
+    });
+}
+
+test "the terminal hears a block on auth while a sign-in waits" {
+    const anthropic_plan = accounts.Account.index("anthropic-plan").?;
+    var rig: Rig = undefined;
+    try rig.init(&.{});
+    defer rig.deinit();
+
+    try rig.startLoginOf(anthropic_plan);
+    try rig.waitFor(&.{.{ .text = anthropic_plan_caption }});
+    try rig.keys("\x1b");
+    try rig.waitFor(&.{.{ .absent = anthropic_plan_caption }});
+    try expectProgramStatuses(
+        &rig,
+        &.{ idle_status, "state=blocked:kind=auth:app=drinky", idle_status },
+    );
+}
+
+test "the terminal hears working while a model fetch runs" {
+    var stall: providers.testing.FakeTransport.Stall = .{ .io = std.testing.io };
+    var rig: Rig = undefined;
+    try rig.init(&.{
+        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .replies = &.{.{ .stall = &stall }},
+    });
+    defer rig.deinit();
+
+    try rig.keys("/model\r");
+    try rig.waitFor(&.{.{ .text = model_picker }});
+    try rig.keys("\r");
+    try stall.reached.wait(std.testing.io);
+    try rig.waitFor(&.{.{ .text = Flow.fetch_wait_text }});
+    try rig.keys("\x1b");
+    try rig.waitFor(&.{.{ .status = "You canceled the model fetch." }});
+    try expectProgramStatuses(&rig, &.{ idle_status, working_status, idle_status });
+}
+
+test "the terminal hears done after a complete handoff and error after a cut one" {
+    var rig: Rig = undefined;
+    try rig.init(&.{
+        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .replies = &.{
+            .{ .body = providers.testing.reply_stream },
+            .{ .body = providers.testing.replyStream("Resume the task.") },
+            .{ .body = cut_stream },
+        },
+        .model = "gpt-5.6-sol",
+    });
+    defer rig.deinit();
+
+    try rig.keys("Task.\r");
+    try rig.waitFor(&.{ .{ .text = "done" }, .{ .activity = false } });
+    try rig.keys("/handoff\r");
+    try rig.waitFor(&.{.{ .text = "Handoff · Enter: Apply" }});
+    try rig.keys("\x1b");
+    try rig.waitFor(&.{ .{ .alternate_screen = false }, .{ .editor = "/handoff" } });
+    try rig.keys("\r");
+    try rig.waitFor(&.{.{ .text = testing.truncated_text }});
+    const done_status = "state=done:app=drinky";
+    try expectProgramStatuses(&rig, &.{
+        idle_status,
+        working_status,
+        done_status,
+        working_status,
+        done_status,
+        idle_status,
+        working_status,
+        "state=error:app=drinky",
+    });
+}
+
+test "a complete reply leaves done, a failure or a limit leaves error, and a cancel leaves none" {
+    const cases = [_]struct { core.Session.Outcome, ?Unseen }{
+        .{ .{ .stopped = .complete }, .done },
+        .{ .{ .stopped = .truncated }, .failed },
+        .{ .exhausted, .failed },
+        .{ .{ .failed = .{ .reason = .network } }, .failed },
+        .{ .canceled, null },
+    };
+    for (cases) |case| {
+        try std.testing.expectEqual(case[1], unseenOfTurn(&.{ .outcome = case[0], .answer = "" }));
+    }
+}
+
+fn expectProgramStatuses(rig: *Rig, expected: []const []const u8) !void {
+    const gpa = std.testing.allocator;
+    const output = try rig.device.outputBytes(gpa);
+    defer gpa.free(output);
+    var reports: std.ArrayList([]const u8) = .empty;
+    defer reports.deinit(gpa);
+    var rest = output;
+    while (std.mem.find(u8, rest, terminal.escape.program_status_set)) |start| {
+        const body = rest[start + terminal.escape.program_status_set.len ..];
+        const end = std.mem.find(u8, body, terminal.escape.string_end) orelse
+            return error.TestUnterminatedProgramStatus;
+        try reports.append(gpa, body[0..end]);
+        rest = body[end..];
+    }
+    try std.testing.expectEqualDeep(expected, reports.items);
 }
 
 test "Ctrl+D at an empty prompt ends the run" {

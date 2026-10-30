@@ -20,6 +20,9 @@ pub const string_end = "\x1b\\";
 pub const link_set = "\x1b]8;;";
 pub const link_reset = link_set ++ string_end;
 
+pub const program_status_set = "\x1b]7501;";
+pub const program_status_reset = program_status_set ++ "state=clear" ++ string_end;
+
 pub const cursor_hide = "\x1b[?25l";
 pub const cursor_show = "\x1b[?25h";
 

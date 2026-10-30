@@ -78,9 +78,12 @@ The optional `~/.drinky/config.json` file controls instructions, request limits,
 settings. Drinky reads it at startup and does not change it. The config file holds no secrets.
 Credentials and remembered model choices live under `~/.drinky/`.
 
-## Herdr
+## Terminal status
 
-Drinky reports its state to [Herdr](https://herdr.dev), so a pane can notify when a turn ends.
+Drinky reports its state through the
+[Program Status Protocol](https://www.superlogical.com/rex/docs/build/program-status) (OSC 7501) and
+to [Herdr](https://herdr.dev). A terminal such as [Rex](https://www.superlogical.com/) can then show
+when Drinky works, waits for the user, or has a result.
 
 ## Security
 
