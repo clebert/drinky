@@ -29,26 +29,6 @@ when the user drops it.
   the controller calls `rejectCredential`, which can sign out and report that no account remains.
   The terminal then opens the sign-in picker. The terminal cannot show that picker over an open
   result page. Both commands need a design for a sign-out while their page is open first.
-- No installed client has run the MCP gateway. Run the runtime gates for Codex and for ChatGPT Voice
-  on a paired iPhone. Trigger: an installed Codex build.
-  - Record the client version and confirm that it selects the protocol `2026-07-28`.
-  - Codex selects the modern stdio mode only when two settings hold. The feature `mcp_2026_07_28`
-    must be on, and it is off by default. The server entry must set
-    `CODEX_MCP_PROTOCOL_VERSION = "2026-07-28"` in its `env`. Without the feature, Codex ignores the
-    variable and sends `2025-06-18`. The sources are `Config::mcp_protocol_mode` in
-    `codex-rs/core/src/config/mod.rs` and `stdio_mode` in
-    `codex-rs/rmcp-client/src/protocol_mode.rs` at commit `e9854c0`.
-  - Confirm the socket access under the permissions of the host.
-  - Discover two instances, toggle access, and recover an outcome after a gateway restart.
-  - Test the voice behavior, and confirm that the client blocks unwanted Codex tools.
-  - Confirm that each client asks the user before it calls `new_conversation`. In its default `auto`
-    mode, Codex asks for each tool with `destructiveHint: true`. The source is
-    `requires_mcp_tool_approval` in `codex-rs/core/src/mcp_tool_call.rs` at commit `e9854c0`.
-  - Confirm that a session-wide approval of one tool does not cover a later `new_conversation`.
-    Codex keeps a session approval key in its `auto` mode.
-  - Record the approval prompts of `send_message`, `invoke_skill`, and `retry` during voice use.
-    These tools also set `destructiveHint: true`.
-  - Add a legacy protocol only when a trial needs it.
 - The start of Drinky reads the config file and the instruction files and scans the skill
   directories without a time limit. A file system call that does not return stops the start. A
   pending macOS privacy prompt causes such a call. The tools and the skill file reads already stop
