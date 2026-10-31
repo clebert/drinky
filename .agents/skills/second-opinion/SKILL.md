@@ -43,9 +43,12 @@ agent. Ignore the remaining steps of this skill.
    Resolve missing facts from the sources. Ask the user only when a missing decision blocks the
    assessment. Do not invent requirements.
 2. Use any model and effort that the user specifies. In the first round, ask once for unspecified
-   values. Offer `DRINKY_MODEL` and `DRINKY_EFFORT` as the default. When a variable is empty, ask
-   for that value without a default. Show the output of `drinky models` only on request. In later
-   rounds, reuse the confirmed values unless the user names other values.
+   values. Offer `DRINKY_MODEL` and `DRINKY_EFFORT` as the default in a yes-no question:
+   `Do you want the second agent to use model <model> with effort <effort>?` Put the value that the
+   user named, or else the default value, in place of each placeholder. A reply of `yes` confirms
+   the two values. The user can name other values instead. When a variable is empty, ask for that
+   value without a default. Show the output of `drinky models` only on request. In later rounds,
+   reuse the confirmed values unless the user names other values.
 3. Prepare a self-contained brief. The second agent sees none of the current conversation. Include:
    - The goal and the specific questions to assess.
    - The proposal, its rationale, and any alternatives already considered.

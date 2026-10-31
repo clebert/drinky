@@ -41,8 +41,10 @@ and ignore the rest of this skill.
    them. Identify the relevant files and changes before you start the reviewer. When a file contains
    unrelated changes, specify the changes to review.
 2. In the first round of the conversation, ask one question for the model and the effort. Offer
-   `DRINKY_MODEL` and `DRINKY_EFFORT` as the default. When a variable is empty, ask for that value
-   without a default. The user confirms the default or names other values. Show the output of
+   `DRINKY_MODEL` and `DRINKY_EFFORT` as the default in a yes-no question:
+   `Do you want the reviewer to use model <model> with effort <effort>?` Put the two values in place
+   of the placeholders. A reply of `yes` confirms the default. The user can name other values
+   instead. When a variable is empty, ask for that value without a default. Show the output of
    `drinky models` only on request. In a later round, use the model and the effort of the last round
    without a question. Use other values only when the user names them.
 3. Start the reviewer with the `bash` tool and a `timeout_seconds` value of 3600:
