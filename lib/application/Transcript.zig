@@ -232,18 +232,6 @@ fn unpublish(self: *Transcript, entry: *Entry) void {
     self.removed.appendAssumeCapacity(entry.record.id);
 }
 
-pub fn lastAnswer(self: *const Transcript) ?[]const u8 {
-    var index = self.list.items.len;
-    while (index > 0) {
-        index -= 1;
-        switch (self.list.items[index].record.content) {
-            .model => |text| return text.items,
-            .user, .user_note, .thinking, .tool_result, .event, .authorization => {},
-        }
-    }
-    return null;
-}
-
 pub fn writeAnswer(
     self: *const Transcript,
     start: usize,
@@ -427,23 +415,6 @@ test "a discard preserves only marked events after its checkpoint" {
     try std.testing.expectEqual(@as(usize, 2), transcript.entries().len);
     try std.testing.expectEqualStrings("keep before checkpoint", textAt(&transcript, 0));
     try std.testing.expectEqualStrings("keep retry", textAt(&transcript, 1));
-}
-
-test "the last answer is the newest model text, even before later blocks of other kinds" {
-    const gpa = std.testing.allocator;
-    var transcript: Transcript = .init(gpa);
-    defer transcript.deinit();
-
-    try std.testing.expect(transcript.lastAnswer() == null);
-    try transcript.append(&.{ .user = "first" }, .{});
-    try transcript.appendStream(.model, "progress note");
-    try transcript.appendStream(.thinking, "weigh it");
-    try transcript.appendStream(.model, "final text");
-    try std.testing.expectEqualStrings("final text", transcript.lastAnswer().?);
-
-    try transcript.append(&.{ .user = "second" }, .{});
-    try transcript.append(&textEvent("The provider failed."), .{});
-    try std.testing.expectEqualStrings("final text", transcript.lastAnswer().?);
 }
 
 test "reasoning collects into a thinking block that the answer run does not extend" {

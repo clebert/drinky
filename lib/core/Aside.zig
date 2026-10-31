@@ -19,16 +19,11 @@ turn_starts: []const Session.TurnStart,
 pub const Request = struct {
     system: []const u8,
     text: []const u8,
-    include_dialogue: bool = false,
 
     pub fn dupe(self: *const Request, gpa: std.mem.Allocator) error{OutOfMemory}!Request {
         const system = try gpa.dupe(u8, self.system);
         errdefer gpa.free(system);
-        return .{
-            .system = system,
-            .text = try gpa.dupe(u8, self.text),
-            .include_dialogue = self.include_dialogue,
-        };
+        return .{ .system = system, .text = try gpa.dupe(u8, self.text) };
     }
 
     pub fn deinit(self: *const Request, gpa: std.mem.Allocator) void {
@@ -80,20 +75,18 @@ pub fn run(self: *const Aside) Session.Outcome {
 fn requestItems(self: *const Aside) error{OutOfMemory}![]Conversation.Item {
     var items: std.ArrayList(Conversation.Item) = .empty;
     errdefer items.deinit(self.gpa);
-    if (self.request.include_dialogue) {
-        const history = self.conversation.items.items;
-        for (self.turn_starts, 0..) |turn_start, index| {
-            const end = if (index + 1 < self.turn_starts.len)
-                self.turn_starts[index + 1].item
-            else
-                history.len;
-            const prompt = history[turn_start.item];
-            std.debug.assert(prompt == .message and prompt.message.role == .user);
-            try items.append(self.gpa, prompt);
-            const rounds = history[turn_start.item + 1 .. end];
-            for (rounds[answerStart(rounds)..]) |item| {
-                if (item == .message) try items.append(self.gpa, item);
-            }
+    const history = self.conversation.items.items;
+    for (self.turn_starts, 0..) |turn_start, index| {
+        const end = if (index + 1 < self.turn_starts.len)
+            self.turn_starts[index + 1].item
+        else
+            history.len;
+        const prompt = history[turn_start.item];
+        std.debug.assert(prompt == .message and prompt.message.role == .user);
+        try items.append(self.gpa, prompt);
+        const rounds = history[turn_start.item + 1 .. end];
+        for (rounds[answerStart(rounds)..]) |item| {
+            if (item == .message) try items.append(self.gpa, item);
         }
     }
     try items.append(self.gpa, .{ .message = .{ .role = .user, .text = self.request.text } });

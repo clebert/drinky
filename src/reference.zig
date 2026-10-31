@@ -22,7 +22,6 @@ pub const Command = enum {
     skill,
     sources,
     system,
-    tldr,
     verbose,
 
     const Facts = struct {
@@ -49,7 +48,6 @@ pub const commands: std.enums.EnumArray(Command, Command.Facts) = .init(.{
     .skill = .{ .summary = "Pick a skill", .alias = "/" ++ skill_prefix },
     .sources = .{ .summary = "Show the loaded instruction files and skills" },
     .system = .{ .summary = "Show the complete system prompt" },
-    .tldr = .{ .summary = "Shorten the last answer with the current model" },
     .verbose = .{
         .summary = "Toggle thinking text, tool rows, and complete bash commands",
         .during_work = true,

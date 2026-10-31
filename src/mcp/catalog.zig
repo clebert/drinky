@@ -665,7 +665,6 @@ fn writeRefusal(
         .stale => "The target of the request is no longer current.",
         .unavailable => "The instance cannot run the request.",
         .no_conversation => "The conversation is empty.",
-        .no_answer => "The conversation holds no answer.",
         .skill_unreadable => |unreadable| skill: {
             try protocol.field(json, "skill", unreadable.name);
             try protocol.field(json, "cause", @errorName(unreadable.cause));

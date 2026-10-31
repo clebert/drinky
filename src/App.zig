@@ -943,10 +943,6 @@ fn runCommand(
             _ = try self.send(&.{ .prepare_handoff = tail });
             if (origin == .help) try self.screen.setDraft(reference.line(.handoff));
         },
-        .tldr => {
-            self.closeFlow();
-            if ((try self.send(&.prepare_short_answer)).accepted()) self.clearDraft();
-        },
         .new => {
             self.closeFlow();
             const accepted = (try self.send(&.new_conversation)).accepted();
@@ -1438,7 +1434,6 @@ const sign_in_titles = blk: {
 };
 
 const retry_note = "Drinky asked the model to continue from the committed work.";
-const short_answer_title = "Short answer";
 const removal_warning = "Press Ctrl+N again to remove the canceled turn. Tool changes stay.";
 const rewind_warning = "Press Enter again to rewind. Tool changes stay.";
 
@@ -3244,81 +3239,8 @@ test "a page on the alternate screen scrolls, toggles the source, and closes on 
     });
 }
 
-const short_answer_caption = short_answer_title ++ " · Esc: Close";
+const handoff_wait_caption = "Handoff · Esc: Discard";
 const wait_line = "Agent: work (waiting) · Time: 0s · Received: 0 B";
-
-test "/tldr opens a short-answer page and Esc restores the transcript" {
-    var rig: Rig = undefined;
-    try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
-        .replies = &.{
-            .{ .body = providers.testing.reply_stream },
-            .{ .body = providers.testing.replyStream("Short version.") },
-        },
-        .model = "gpt-5.6-sol",
-    });
-    defer rig.deinit();
-    try rig.keys("hello\r");
-    try rig.waitFor(&.{ .{ .rows = &.{ "hello", "done" } }, .{ .activity = false } });
-    try rig.keys("/tldr\r");
-    try rig.waitFor(&.{
-        .{ .alternate_screen = true },
-        .{ .text = short_answer_caption },
-        .{ .text = "Short version." },
-    });
-    try rig.keys("\x1b");
-    try rig.waitFor(&.{
-        .{ .alternate_screen = false },
-        .{ .rows = &.{ "hello", "done" } },
-        .{ .absent = "Short version." },
-        .{ .editor = "" },
-    });
-}
-
-test "Esc stops the short answer before the page closes, and a failed or cut one is not kept" {
-    var stall: providers.testing.FakeTransport.Stall = .{ .io = std.testing.io };
-    const replies = [_]providers.testing.FakeTransport.Reply{
-        .{ .body = providers.testing.reply_stream },
-        .{ .stall = &stall },
-        .{ .body = partial_failure_stream },
-        .{ .body = cut_stream },
-        .{ .body = providers.testing.replyStream("Short version.") },
-    };
-    var rig: Rig = undefined;
-    try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
-        .replies = &replies,
-        .model = "gpt-5.6-sol",
-    });
-    defer rig.deinit();
-
-    try rig.keys("hello\r");
-    try rig.waitFor(&.{ .{ .rows = &.{ "hello", "done" } }, .{ .activity = false } });
-    try rig.keys("/tldr\r");
-    try stall.reached.wait(std.testing.io);
-    try rig.waitFor(&.{ .{ .text = short_answer_caption }, .{ .text = wait_line } });
-    try rig.keys("\x1b");
-    try rig.waitFor(&.{ .{ .alternate_screen = false }, .{ .rows = &.{ "hello", "done" } } });
-    try std.testing.expect(stall.canceled);
-
-    try rig.keys("/tldr\r");
-    try rig.waitFor(&.{
-        .{ .alternate_screen = true },
-        .{ .rows = &.{ "partial", "The provider is overloaded. Details: **down**" } },
-    });
-    try std.testing.expectEqual(@as(usize, 3), rig.transport.requests.items.len);
-    try rig.keys("\x1b");
-    try rig.waitFor(&.{.{ .alternate_screen = false }});
-    try rig.keys("/tldr\r");
-    try rig.waitFor(&.{
-        .{ .alternate_screen = true },
-        .{ .rows = &.{ "cut", testing.truncated_text } },
-    });
-    try rig.keys("\x1b");
-    try rig.waitFor(&.{.{ .alternate_screen = false }});
-    try rig.keys("/tldr\r");
-    try rig.waitFor(&.{ .{ .alternate_screen = true }, .{ .text = "Short version." } });
-}
 
 const partial_failure_stream = "data: {\"type\":\"response.output_text.delta\"," ++
     "\"item_id\":\"msg_1\",\"delta\":\"partial\"}\n" ++
@@ -3328,31 +3250,29 @@ const partial_failure_stream = "data: {\"type\":\"response.output_text.delta\","
 
 test "incomplete page replies use the transcript failure symbol and color" {
     const gpa = std.testing.allocator;
-    for ([_][]const u8{ "/tldr\r", "/handoff\r" }) |command_line| {
-        var rig: Rig = undefined;
-        try rig.init(&.{
-            .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
-            .replies = &.{
-                .{ .body = providers.testing.reply_stream },
-                .{ .body = cut_stream },
-            },
-            .model = "gpt-5.6-sol",
-        });
-        defer rig.deinit();
-        try rig.keys("Task.\r");
-        try rig.waitFor(&.{ .{ .text = "done" }, .{ .activity = false } });
-        try rig.keys(command_line);
-        try rig.waitFor(&.{
-            .{ .alternate_screen = true },
-            .{ .text = testing.truncated_text },
-        });
-        const output = try rig.device.outputBytes(gpa);
-        defer gpa.free(output);
-        try testing.expectContains(output, "\x1b[31m⚠ " ++ testing.truncated_text);
-    }
+    var rig: Rig = undefined;
+    try rig.init(&.{
+        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .replies = &.{
+            .{ .body = providers.testing.reply_stream },
+            .{ .body = cut_stream },
+        },
+        .model = "gpt-5.6-sol",
+    });
+    defer rig.deinit();
+    try rig.keys("Task.\r");
+    try rig.waitFor(&.{ .{ .text = "done" }, .{ .activity = false } });
+    try rig.keys("/handoff\r");
+    try rig.waitFor(&.{
+        .{ .alternate_screen = true },
+        .{ .text = testing.truncated_text },
+    });
+    const output = try rig.device.outputBytes(gpa);
+    defer gpa.free(output);
+    try testing.expectContains(output, "\x1b[31m⚠ " ++ testing.truncated_text);
 }
 
-test "a failed attempt adds its note below the wait line of the short answer until Esc" {
+test "a failed attempt adds its note below the wait line of the handoff until Esc" {
     var rig: Rig = undefined;
     try rig.init(&.{
         .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
@@ -3365,9 +3285,9 @@ test "a failed attempt adds its note below the wait line of the short answer unt
 
     try rig.keys("hello\r");
     try rig.waitFor(&.{ .{ .rows = &.{ "hello", "done" } }, .{ .activity = false } });
-    try rig.keys("/tldr\r");
+    try rig.keys("/handoff\r");
     try rig.waitFor(&.{
-        .{ .text = short_answer_caption },
+        .{ .text = handoff_wait_caption },
         .{ .text = wait_line },
         .{ .text = "Attempt 1 failed. The provider is overloaded. Drinky tries again in " },
     });
@@ -3376,7 +3296,7 @@ test "a failed attempt adds its note below the wait line of the short answer unt
     try std.testing.expectEqual(@as(usize, 2), rig.transport.requests.items.len);
 }
 
-test "/tldr after a sign-out asks for a sign-in to shorten the answer and sends no request" {
+test "/handoff after a sign-out asks for a sign-in and sends no request" {
     var rig: Rig = undefined;
     try rig.init(&.{
         .store = accounts.testing.planStore("first"),
@@ -3394,16 +3314,16 @@ test "/tldr after a sign-out asks for a sign-in to shorten the answer and sends 
     try rig.waitFor(&.{.{ .text = "Sign in · ↑/↓" }});
     try rig.keys("\x1b");
     try rig.waitFor(&.{.{ .absent = "Sign in · ↑/↓" }});
-    try rig.keys("/tldr\r");
+    try rig.keys("/handoff\r");
     try rig.waitFor(&.{
-        .{ .status = "Sign in with /login before you shorten an answer." },
-        .{ .editor = "/tldr" },
+        .{ .status = "Sign in with /login before you prepare a handoff." },
+        .{ .editor = "/handoff" },
         .{ .alternate_screen = false },
     });
     try std.testing.expectEqual(@as(usize, 1), rig.transport.requests.items.len);
 }
 
-test "Herdr hears working while /tldr streams and idle after the page closes" {
+test "Herdr hears working while /handoff streams and idle after the page closes" {
     const gpa = std.testing.allocator;
     var herdr: testing.FakeHerdr = undefined;
     try herdr.init(gpa, std.testing.io);
@@ -3430,10 +3350,10 @@ test "Herdr hears working while /tldr streams and idle after the page closes" {
     try expectHerdrState(&herdr, "working");
     hold.released.set(std.testing.io);
     try expectHerdrState(&herdr, "idle");
-    try rig.keys("/tldr\r");
+    try rig.keys("/handoff\r");
     try stall.reached.wait(std.testing.io);
     try expectHerdrState(&herdr, "working");
-    try rig.waitFor(&.{.{ .text = short_answer_caption }});
+    try rig.waitFor(&.{.{ .text = handoff_wait_caption }});
     try rig.keys("\x1b");
     try rig.waitFor(&.{.{ .alternate_screen = false }});
     try expectHerdrState(&herdr, "idle");
@@ -3483,30 +3403,6 @@ test "/handoff restores its command after discard and applies a preview with Ent
     try rig.waitFor(&.{ .{ .editor = "Resume the task." }, .{ .absent = "Continued." } });
 }
 
-test "a short answer from the command picker clears its line and returns to the prompt" {
-    var rig: Rig = undefined;
-    try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
-        .replies = &.{
-            .{ .body = providers.testing.reply_stream },
-            .{ .body = providers.testing.replyStream("Short text.") },
-        },
-        .model = "gpt-5.6-sol",
-    });
-    defer rig.deinit();
-    try rig.keys("Task.\r");
-    try rig.waitFor(&.{ .{ .text = "done" }, .{ .activity = false } });
-    try rig.keys("/help\r");
-    try rig.waitFor(&.{.{ .text = "Command ·" }});
-    for (0..11) |_| try rig.keys("\x1b[B");
-    try rig.waitFor(&.{.{ .text = " > /tldr" }});
-    try rig.keys("\r");
-    try rig.waitFor(&.{ .{ .text = "Short text." }, .{ .alternate_screen = true } });
-    try rig.keys("\x1b");
-    try rig.waitFor(&.{ .{ .alternate_screen = false }, .{ .editor = "" } });
-    try std.testing.expectEqual(@as(usize, 2), rig.transport.requests.items.len);
-}
-
 test "a handoff from the command picker restores its command after a discard" {
     var rig: Rig = undefined;
     try rig.init(&.{
@@ -3547,7 +3443,7 @@ test "handoff exits cancel generation without applying it or losing the command"
         try rig.keys("/handoff Keep the goal.\r");
         try stall.reached.wait(std.testing.io);
         try rig.waitFor(&.{
-            .{ .text = "Handoff · Esc: Discard" },
+            .{ .text = handoff_wait_caption },
             .{ .absent = "Enter: Apply" },
         });
         try rig.keys("\r");

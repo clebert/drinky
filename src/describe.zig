@@ -164,7 +164,18 @@ fn writeCommands(writer: *std.Io.Writer) !void {
         \\after a context overflow. It offers no tools and uses the effort of normal turns. A last
         \\user message asks for the handoff, and an optional instruction after the command joins
         \\it. The command leaves the conversation unchanged and streams the handoff into a
-        \\read-only page.
+        \\read-only page. Until the first text arrives, the page shows a wait line as
+        \\`Agent: work (waiting) · Time: 0s · Received: 0 B`. The time ticks every second. The
+        \\state changes to thinking when reasoning text arrives, and Received counts its bytes.
+        \\A failed attempt adds its note below the line.
+        \\The wait line uses the transcript work-row layout.
+        \\It stays on one row and removes Received before Time as the terminal narrows.
+        \\It shortens the identity only when the identity cannot fit.
+        \\The complete identity uses dim cyan text. Metadata uses dim default foreground text.
+        \\The notes use the transcript symbols and severity colors. A retry note uses cyan with ℹ.
+        \\A failure note or an incomplete reply note uses red with ⚠.
+        \\The notes stay separate from the model text in both page presentations.
+        \\The cost of the request joins the session cost.
         \\Enter applies a complete handoff. Drinky clears the conversation as /new does and sends
         \\the handoff as a normal user message. The model resumes the task and asks for any user
         \\decision that still blocks it. Normal rewind, retry, and canceled-turn edit behavior
@@ -176,30 +187,6 @@ fn writeCommands(writer: *std.Io.Writer) !void {
         \\Every invocation generates a fresh preview.
         \\The handoff has no fixed word count. It preserves the goal, constraints, decisions,
         \\completed work, verification results, remaining work, and pending user decisions.
-        \\
-        \\`/tldr` shortens the last answer with the current model. The request holds that answer.
-        \\It also holds the user prompts and the final answers of the conversation, so the model
-        \\can explain earlier terms and references. It uses the effort of normal turns.
-        \\The short version starts with the outcome. A flat list follows with at most seven facts
-        \\in plain sentences, ordered by their weight for the next step. It gives each proposal
-        \\the status that the answer gives it, such as now, later with its trigger, or not
-        \\justified yet. It keeps negations, conditions, and doubts. It names the content that it
-        \\leaves out. When the answer ends with a question, the short version ends with it too.
-        \\It opens a page and streams the short version into it. Until the first text arrives,
-        \\the page shows a wait line as `Agent: work (waiting) · Time: 0s · Received: 0 B`. The
-        \\time ticks every second. The state changes to thinking when reasoning text arrives, and
-        \\Received counts its bytes. A failed attempt adds its note below the line. `/handoff`
-        \\shows the same wait line. The wait line uses the transcript work-row layout.
-        \\It stays on one row and removes Received before Time as the terminal narrows.
-        \\It shortens the identity only when the identity cannot fit.
-        \\The complete identity uses dim cyan text. Metadata uses dim default foreground text.
-        \\The notes use the transcript symbols and severity colors. A retry note uses cyan with ℹ.
-        \\A failure note or an incomplete reply note uses red with ⚠.
-        \\The notes stay separate from the model text in both page presentations.
-        \\The transcript and the model conversation stay unchanged.
-        \\The cost of the request joins the session cost. Esc stops the request and closes the page.
-        \\Drinky keeps the short version of one answer, so the next `/tldr` for the same answer
-        \\shows it at once. When the request fails, the page shows the failure.
         \\
     , .{ .verbose = config_keys.verbose });
 }
@@ -352,8 +339,8 @@ fn writeAccess(writer: *std.Io.Writer) std.Io.Writer.Error!void {
         \\work, and continue a failed turn. It can also clear the conversation, fetch a model list,
         \\and select a saved model and the effort. The terminal shows a notice when a client clears
         \\the conversation. A client cannot rewind the conversation or remove a turn. It cannot
-        \\prepare or apply a handoff, shorten an answer, or sign in or out. A remote request that
-        \\changes the instance fails while the terminal shows a picker, a page, or a sign-in.
+        \\prepare or apply a handoff, or sign in or out. A remote request that changes the
+        \\instance fails while the terminal shows a picker, a page, or a sign-in.
         \\
         \\MCP access lets another agent submit work to this agent. Drinky has no permission gate or
         \\sandbox, so access is as powerful as the terminal.

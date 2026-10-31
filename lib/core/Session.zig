@@ -597,7 +597,6 @@ const fixture = struct {
     const handoff: Aside.Request = .{
         .system = "Summarize the task.",
         .text = "Prepare a handoff.",
-        .include_dialogue = true,
     };
 
     fn message(text: []const u8) Provider.Event {
@@ -1216,7 +1215,10 @@ test "an aside streams its reply outside the conversation with its system text a
     _ = try harness.turn("next");
 
     const provider = &harness.provider;
-    try std.testing.expectEqualStrings("model-a|user:The long answer.", provider.requests.items[1]);
+    try std.testing.expectEqualStrings(
+        "model-a|user:hi|assistant:ok|user:The long answer.",
+        provider.requests.items[1],
+    );
     try std.testing.expectEqualStrings("Be brief.||4096|high", provider.settings.items[1]);
     try std.testing.expectEqualStrings("", provider.keys.items[1]);
     try std.testing.expectEqualStrings(
@@ -1225,7 +1227,7 @@ test "an aside streams its reply outside the conversation with its system text a
     );
 }
 
-test "a handoff aside sends each prompt with the final answer of its turn and no tools" {
+test "an aside sends each prompt with the final answer of its turn and no tools" {
     var harness: testing.Harness = undefined;
     try harness.init(std.testing.allocator, std.testing.io, &.{});
     defer harness.deinit();

@@ -58,7 +58,6 @@ pub fn refusal(
             "No conversation is available for a handoff.",
             .{},
         ),
-        .no_answer => try ui.Message.print(gpa, .warning, "No answer is in the conversation.", .{}),
         .skill_unreadable => |unreadable| try ui.Message.print(
             gpa,
             .failure,
@@ -92,7 +91,6 @@ fn prerequisite(
     const action = switch (command.*) {
         .send_message, .invoke_skill, .retry, .apply_result => "send a message",
         .prepare_handoff => "prepare a handoff",
-        .prepare_short_answer => "shorten an answer",
         .new_conversation,
         .select_account,
         .sign_out,
@@ -1127,11 +1125,6 @@ test "a refusal names the action of its command, and a silent refusal holds no t
             .command = .{ .send_message = "Task." },
             .refusal = .signed_out,
             .text = "Sign in with /login before you send a message.",
-        },
-        .{
-            .command = .prepare_short_answer,
-            .refusal = .no_model,
-            .text = "Select a model with /model before you shorten an answer.",
         },
         .{
             .command = .{ .prepare_handoff = "" },

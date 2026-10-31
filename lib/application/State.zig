@@ -39,11 +39,9 @@ pub const Offer = union(enum) {
 };
 pub const Result = struct {
     id: u64,
-    purpose: Purpose,
     phase: Phase,
     text: []const u8,
 
-    pub const Purpose = enum { handoff, short_answer };
     pub const Phase = union(enum) {
         generating: Generating,
         complete,

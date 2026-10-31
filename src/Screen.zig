@@ -619,22 +619,13 @@ fn showResult(self: *Screen, maybe_result: ?*const application.State.Result) !vo
     };
     if (self.result_page == null or self.result_page.?.id != result.id) {
         self.leaveWidget();
-        try self.openPage(&.{
-            .title = switch (result.purpose) {
-                .handoff => "Handoff",
-                .short_answer => "Short answer",
-            },
-            .content = "",
-        });
+        try self.openPage(&.{ .title = "Handoff", .content = "" });
     }
     self.result_page = .{ .id = result.id, .phase = result.phase };
     const page = self.activePage().?;
     const shown_text = page.text();
     if (result.text.len > shown_text.len) try page.append(result.text[shown_text.len..]);
-    page.action = switch (result.purpose) {
-        .handoff => if (result.phase == .complete) .apply else .discard,
-        .short_answer => .close,
-    };
+    page.action = if (result.phase == .complete) .apply else .discard;
     switch (result.phase) {
         .generating => |*generating| try self.showGenerating(page, generating),
         .complete => self.endPageWait(page),
@@ -3156,7 +3147,6 @@ test "a waiting page ticks its time, counts reasoning bytes, adds a note, and st
     defer rig.deinit();
     try rig.showResult(&.{
         .id = 1,
-        .purpose = .short_answer,
         .text = "",
         .phase = .{ .generating = .{ .started_ms = 1_000 } },
     });
@@ -3171,7 +3161,6 @@ test "a waiting page ticks its time, counts reasoning bytes, adds a note, and st
     rig.time.awake_ms = 3_000;
     try rig.showResult(&.{
         .id = 1,
-        .purpose = .short_answer,
         .text = "",
         .phase = .{ .generating = .{
             .started_ms = 1_000,
@@ -3226,7 +3215,6 @@ test "page wait lines keep one adaptive row with the transcript work style" {
                 defer rig.deinit();
                 try rig.showResult(&.{
                     .id = 1,
-                    .purpose = .short_answer,
                     .text = "",
                     .phase = .{ .generating = .{
                         .started_ms = 0,
@@ -3264,7 +3252,6 @@ test "page retry notes use the transcript information symbol and color in both p
         defer rig.deinit();
         try rig.showResult(&.{
             .id = 1,
-            .purpose = .short_answer,
             .text = "",
             .phase = .{ .generating = .{
                 .started_ms = 0,
@@ -3301,16 +3288,20 @@ test "a result that completes without text ends its wait line" {
     emulator.resize(size.rows);
     try rig.showResult(&.{
         .id = 1,
-        .purpose = .short_answer,
         .text = "",
         .phase = .{ .generating = .{ .started_ms = 0 } },
     });
     try rig.paintInto(&emulator, size);
     try expectBodyRows(&emulator, &.{"Agent: work (waiting) · Time: 0s · Received: 0 B"});
-    try rig.showResult(&.{ .id = 1, .purpose = .short_answer, .phase = .complete, .text = "" });
+    try rig.showResult(&.{ .id = 1, .phase = .complete, .text = "" });
     try std.testing.expect(!rig.screen.animating());
     try rig.paintInto(&emulator, size);
-    try expectBodyRows(&emulator, &.{""});
+    try testing.expectContains(
+        emulator.document.items[emulator.screen_top].items,
+        "Handoff · Enter: Apply",
+    );
+    for (emulator.document.items) |row|
+        try std.testing.expect(std.mem.find(u8, row.items, "Agent: work") == null);
 }
 
 test "a tick of the wait line keeps the scroll position, and a new note returns to the top" {
@@ -3324,7 +3315,6 @@ test "a tick of the wait line keeps the scroll position, and a new note returns 
     emulator.resize(size.rows);
     try rig.showResult(&.{
         .id = 1,
-        .purpose = .short_answer,
         .text = "",
         .phase = .{ .generating = .{ .started_ms = 0 } },
     });
@@ -3511,7 +3501,6 @@ test "page snapshots keep the source position and start new content at its first
         .state = .{
             .result = .{
                 .id = 1,
-                .purpose = .short_answer,
                 .phase = .complete,
                 .text = application.support.repeat(
                     "# Heading\n\nA long paragraph with **bold text**.\n\n",
