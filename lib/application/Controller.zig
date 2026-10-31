@@ -564,6 +564,7 @@ fn init(self: *Controller, gpa: std.mem.Allocator, io: std.Io, options: *const O
     self.settings = .{
         .window_pages = config.window_pages,
         .verbose = config.verbose,
+        .mcp_access = config.mcp_access,
         .gauge = config.gauge,
     };
     self.surface = .init(
@@ -1705,14 +1706,15 @@ test "controllers own frontend text and compose it with shared instructions and 
 test "session startup exposes validated settings and acknowledges unchanged project refreshes" {
     var rig: testing.Rig = undefined;
     try rig.init(
-        &.{ .config = "{\"interface\":{\"verbose\":true,\"window_pages\":64,\"gauge_perc" ++
-            "ent_warning\":10,\"gauge_percent_error\":20}}" },
+        &.{ .config = "{\"interface\":{\"verbose\":true,\"mcp_access\":true,\"window_pages\":64," ++
+            "\"gauge_percent_warning\":10,\"gauge_percent_error\":20}}" },
     );
     defer rig.deinit();
     const initial = try rig.snapshot();
     defer initial.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 0), initial.records.len);
     try std.testing.expect(initial.settings.verbose);
+    try std.testing.expect(initial.settings.mcp_access);
     try std.testing.expectEqual(@as(usize, 64), initial.settings.window_pages);
     try std.testing.expectEqual(@as(f64, 10), initial.settings.gauge.percent_warning);
     try std.testing.expectEqualStrings("main", initial.state.branch.?);

@@ -39,7 +39,7 @@ window_pages: usize,
 gauge: application.Settings.Gauge,
 display_roots: format.Roots,
 intro: []const u8 = "",
-startup_failure: ?[]const u8 = null,
+startup_failures: std.ArrayList([]const u8) = .empty,
 verbose: bool = true,
 repaint_transcript: bool = false,
 page_wait: ?PageWait = null,
@@ -352,7 +352,7 @@ pub fn init(gpa: std.mem.Allocator, writer: *std.Io.Writer, effort: application.
 }
 
 pub fn deinit(self: *Screen) void {
-    if (self.startup_failure) |text| self.gpa.free(text);
+    self.freeStartupFailures();
     self.deinitWidget();
     self.clearNotice();
     self.transcript.deinit();
@@ -556,23 +556,28 @@ fn showLive(self: *Screen, live: *const application.Live) !void {
 fn clearConversation(self: *Screen) !void {
     std.debug.assert(self.widget == .prompt);
     self.clearNotice();
-    if (self.startup_failure) |text| self.gpa.free(text);
-    self.startup_failure = null;
+    self.freeStartupFailures();
     self.transcript.truncate(0);
     try self.appendIntro();
     self.view.resetScreen();
 }
 
-pub fn setStartupFailure(self: *Screen, text: []const u8) error{OutOfMemory}!void {
+pub fn addStartupFailure(self: *Screen, text: []const u8) error{OutOfMemory}!void {
     const owned = try self.gpa.dupe(u8, text);
-    if (self.startup_failure) |previous| self.gpa.free(previous);
-    self.startup_failure = owned;
+    errdefer self.gpa.free(owned);
+    try self.startup_failures.append(self.gpa, owned);
+}
+
+fn freeStartupFailures(self: *Screen) void {
+    for (self.startup_failures.items) |text| self.gpa.free(text);
+    self.startup_failures.deinit(self.gpa);
+    self.startup_failures = .empty;
 }
 
 fn appendIntro(self: *Screen) !void {
     try self.transcript.append(&.{ .intro = self.intro });
-    const failure = self.startup_failure orelse return;
-    try self.transcript.append(&.{ .event = .{ .text = failure, .severity = .failure } });
+    for (self.startup_failures.items) |failure|
+        try self.transcript.append(&.{ .event = .{ .text = failure, .severity = .failure } });
 }
 
 fn beginTurn(self: *Screen) void {
@@ -792,8 +797,8 @@ pub fn restore(self: *Screen, snapshot: *const application.Snapshot) !void {
     var restored = Screen.init(self.gpa, self.view.writer, state.choice.effort);
     errdefer restored.deinit();
     restored.intro = self.intro;
-    restored.startup_failure = self.startup_failure;
-    self.startup_failure = null;
+    restored.startup_failures = self.startup_failures;
+    self.startup_failures = .empty;
     restored.repaint_transcript = self.repaint_transcript or
         self.transcript.block_list.items.len > 0;
     restored.verbose = self.verbose;

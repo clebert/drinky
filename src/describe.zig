@@ -11,6 +11,7 @@ pub const run_instructions =
 
 const config_keys = struct {
     const verbose = application.support.config.keyPath("interface.verbose");
+    const mcp_access = application.support.config.keyPath("interface.mcp_access");
     const window_pages = application.support.config.keyPath("interface.window_pages");
     const gauge_percent_warning = application.support.config.keyPath(
         "interface.gauge_percent_warning",
@@ -255,6 +256,9 @@ fn writePreferences(writer: *std.Io.Writer) std.Io.Writer.Error!void {
             "The value true shows complete thinking text, tool rows, and bash commands. " ++
             "The value false folds each run of thinking and tool calls into one work row. " ++
             "The /verbose command changes only the current session.\n\n" ++
+            "The config key `" ++ config_keys.mcp_access ++ "` sets the initial MCP access. " ++
+            "The value true turns on access at startup. The value false keeps it off. " ++
+            "The /mcp command changes only the current session.\n\n" ++
             "The config key `" ++ config_keys.window_pages ++ "` sets the pages of the newest " ++
             "conversation that Drinky keeps on the screen. One page is one window height. " ++
             "Each frame measures and paints each kept row again. " ++
@@ -322,7 +326,7 @@ fn writeHeadless(writer: *std.Io.Writer) !void {
 }
 
 fn writeAccess(writer: *std.Io.Writer) std.Io.Writer.Error!void {
-    try writer.writeAll(
+    try writer.print(
         \\
         \\## MCP access
         \\
@@ -330,6 +334,10 @@ fn writeAccess(writer: *std.Io.Writer) std.Io.Writer.Error!void {
         \\and changes no conversation. While access is on, the status line shows `MCP: on` before
         \\the model. Each start of access gives the instance a new id, so the end of access revokes
         \\every id that a client knows. Accepted work continues after the end.
+        \\
+        \\Access starts off by default. The config key `{[mcp_access]s}` can turn it on at
+        \\startup. A successful start shows no notice. When access cannot start, the transcript
+        \\shows the failure. `/mcp` changes no config file.
         \\
         \\The command `drinky mcp` starts an MCP server on stdin and stdout for a client such as
         \\Codex. It speaks the MCP protocol version 2026-07-28 alone. The server finds each instance
@@ -345,7 +353,7 @@ fn writeAccess(writer: *std.Io.Writer) std.Io.Writer.Error!void {
         \\MCP access lets another agent submit work to this agent. Drinky has no permission gate or
         \\sandbox, so access is as powerful as the terminal.
         \\
-    );
+    , .{ .mcp_access = config_keys.mcp_access });
 }
 
 test "the native reference avoids shared text and preserves facts across allocation failures" {
@@ -372,6 +380,7 @@ fn checkReference(gpa: std.mem.Allocator) !void {
     try std.testing.expect(commands < keys and keys < preferences and preferences < headless);
     try std.testing.expect(headless < access);
     try std.testing.expect(std.mem.find(u8, text[access..], "`drinky mcp`") != null);
+    try std.testing.expect(std.mem.find(u8, text[access..], config_keys.mcp_access) != null);
     for (reference.summaries) |summary| {
         const row = try gpa.print("- `/{s}` — {s}.", .{ summary.name, summary.summary });
         defer gpa.free(row);
@@ -383,8 +392,9 @@ fn checkReference(gpa: std.mem.Allocator) !void {
     defer gpa.free(repeat);
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, text[keys..preferences], repeat));
     for ([_][]const u8{
-        config_keys.verbose,               config_keys.window_pages,
-        config_keys.gauge_percent_warning, config_keys.gauge_percent_error,
+        config_keys.verbose,             config_keys.mcp_access,
+        config_keys.window_pages,        config_keys.gauge_percent_warning,
+        config_keys.gauge_percent_error,
     }) |key| try std.testing.expect(std.mem.find(u8, text[preferences..headless], key) != null);
     for ([_][]const u8{
         application.reference.effort_levels,    application.support.environment.model,

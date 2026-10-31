@@ -2,6 +2,7 @@ const Settings = @This();
 
 window_pages: usize = window_pages_default,
 verbose: bool = false,
+mcp_access: bool = false,
 gauge: Gauge = .{},
 
 pub const window_pages_default: usize = 8;

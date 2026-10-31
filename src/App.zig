@@ -21,6 +21,7 @@ const turn_cancel_notice = "Press Esc again to cancel the turn. The draft stays.
 const turn_message_notice = "Drinky sends no message while a turn runs. The draft stays.";
 const fetch_message_notice = "Drinky sends no message while a model fetch runs. The draft stays.";
 const fetch_cancel_notice = "You canceled the model fetch.";
+const access_failure = "Drinky could not turn on MCP access because of error {s}.";
 const login_callback_controls = "Enter: Replay callback URL · Esc: Cancel";
 const cancel_controls = "Esc: Cancel";
 const retry_caption: ui.Caption = .{
@@ -258,6 +259,7 @@ pub fn init(self: *App, gpa: std.mem.Allocator, io: std.Io, options: *const Opti
     });
     errdefer {
         self.stopQueue();
+        self.endpoint.deinit();
         self.closeFlow();
         self.controller.destroy();
         self.drainQueue();
@@ -271,7 +273,7 @@ pub fn init(self: *App, gpa: std.mem.Allocator, io: std.Io, options: *const Opti
             .{@errorName(err)},
         );
         defer gpa.free(text);
-        try self.screen.setStartupFailure(text);
+        try self.screen.addStartupFailure(text);
     };
     _ = self.controller.submit(&.snapshot);
     try self.settle();
@@ -820,7 +822,10 @@ fn applySnapshot(self: *App, snapshot: *const application.Snapshot) !void {
     else
         self.directory_label;
     errdefer if (initialize_roots) self.gpa.free(label);
-    if (initialize_roots) self.screen.verbose = snapshot.settings.verbose;
+    if (initialize_roots) {
+        self.screen.verbose = snapshot.settings.verbose;
+        if (snapshot.settings.mcp_access) try self.startAccess();
+    }
     try self.screen.restore(snapshot);
     self.home_directory = home;
     self.directory_label = label;
@@ -1024,21 +1029,26 @@ fn toggleVerbose(self: *App) !void {
 }
 fn toggleAccess(self: *App) !void {
     defer self.screen.mcp_access = self.endpoint.published() != null;
-    if (self.endpoint.published()) |instance| {
+    if (self.endpoint.published() != null) {
         self.endpoint.disable() catch |err| return self.reportNotice(
             .failure,
-            "MCP access is off for instance {s}. Drinky could not remove its entry because " ++
+            "MCP access is off. Drinky could not remove the entry of this instance because " ++
                 "of error {s}.",
-            .{ &instance, @errorName(err) },
+            .{@errorName(err)},
         );
-        return self.reportNotice(.information, "MCP access is off for instance {s}.", .{&instance});
+        return self.reportNotice(.information, "MCP access is off.", .{});
     }
-    const instance = self.endpoint.enable() catch |err| return self.reportNotice(
-        .failure,
-        "Drinky could not turn on MCP access because of error {s}.",
-        .{@errorName(err)},
-    );
-    try self.reportNotice(.information, "MCP access is on. Instance: {s}.", .{&instance});
+    self.endpoint.enable() catch |err|
+        return self.reportNotice(.failure, access_failure, .{@errorName(err)});
+    try self.reportNotice(.information, "MCP access is on.", .{});
+}
+fn startAccess(self: *App) !void {
+    self.endpoint.enable() catch |err| {
+        const text = try self.gpa.print(access_failure, .{@errorName(err)});
+        defer self.gpa.free(text);
+        return self.screen.addStartupFailure(text);
+    };
+    self.screen.mcp_access = true;
 }
 fn startFlow(self: *App, step: Flow.Step) !void {
     self.closeFlow();
@@ -1307,7 +1317,7 @@ fn reportNotice(
 fn showMessage(self: *App, message: *const ui.Message) !void {
     try self.reportNotice(message.severity, "{s}", .{message.content});
 }
-test "a Herdr startup failure stays in the transcript across snapshots with the branch" {
+test "the startup failures stay in the transcript with the branch and the notice across snapshots" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{ .concurrent_limit = .limited(2) });
     defer threaded.deinit();
@@ -1315,6 +1325,7 @@ test "a Herdr startup failure stays in the transcript across snapshots with the 
     var tree = try application.testing.Tree.init();
     defer tree.deinit();
     try tree.write(".git/HEAD", "ref: refs/heads/main\n");
+    try tree.write(".drinky/config.json", "{\"interface\":{\"mcp_access\":true}}");
     var environment: std.process.Environ.Map = .init(gpa);
     defer environment.deinit();
     var device: terminal.testing.FakeDevice = undefined;
@@ -1324,21 +1335,30 @@ test "a Herdr startup failure stays in the transcript across snapshots with the 
     try app.init(gpa, io, &.{
         .working_directory = tree.root,
         .home = tree.root,
-        .mcp_directory = "unused",
+        .mcp_directory = try tree.path(".git/HEAD/mcp"),
         .environment = &environment,
         .device = device.device(),
         .herdr = .{ .socket_path = "/unused", .pane_id = "p1" },
     });
     defer app.deinit();
+    const failures = [_][]const u8{
+        "Drinky could not start the state reports to Herdr because of error " ++
+            "ConcurrencyUnavailable.",
+        "Drinky could not turn on MCP access because of error NotDir.",
+    };
     for (0..2) |_| {
         const blocks = app.screen.transcript.block_list.items;
-        const notice = &blocks[1].content.event;
-        try std.testing.expectEqual(.failure, notice.severity);
+        try std.testing.expect(blocks.len > failures.len);
+        for (failures, blocks[1..][0..failures.len]) |text, *block| {
+            const event = &block.content.event;
+            try std.testing.expectEqual(.failure, event.severity);
+            try std.testing.expectEqualStrings(text, event.text.items);
+        }
         try std.testing.expectEqualStrings(
-            "Drinky could not start the state reports to Herdr because of error " ++
-                "ConcurrencyUnavailable.",
-            notice.text.items,
+            "Select an account to sign in.",
+            app.screen.notice.?.content,
         );
+        try std.testing.expect(!app.screen.mcp_access);
         try std.testing.expectEqualStrings("main", app.screen.branch().?);
         _ = app.controller.submit(&.snapshot);
     }
@@ -3880,7 +3900,7 @@ test "a frame timer task failure withdraws the send as message confirmation" {
     try std.testing.expectEqual(@as(usize, 0), rig.transport.requests.items.len);
 }
 
-const access_on = "MCP access is on. Instance: ";
+const access_on = "MCP access is on.";
 
 test "/mcp publishes the instance, and a second gateway reads the outcome of a remote turn" {
     var rig: Rig = undefined;
@@ -3994,7 +4014,7 @@ test "the end of access keeps the accepted turn and revokes the instance id" {
     defer sent.deinit();
     try hold.reached.wait(std.testing.io);
     try rig.keys("/mcp\r");
-    try rig.waitFor(&.{ .{ .status = "MCP access is off for instance " }, .{ .activity = true } });
+    try rig.waitFor(&.{ .{ .status = "MCP access is off." }, .{ .activity = true } });
     const revoked = try remote.target("get_state", &instance, "");
     defer revoked.deinit();
     try std.testing.expectEqualStrings(
@@ -4292,7 +4312,7 @@ test "the status line shows MCP access while it is on and keeps it across a snap
     try rig.keys("x");
     try rig.waitFor(&.{ .{ .status = access_label }, .{ .editor = "x" } });
     try rig.keys("\x7f/mcp\r");
-    try rig.waitFor(&.{.{ .status = "MCP access is off for instance " }});
+    try rig.waitFor(&.{.{ .status = "MCP access is off." }});
     try rig.keys("x");
     try rig.waitFor(&.{ .{ .status = model_label }, .{ .absent = "MCP:" } });
     try rig.keys("\x7f/mcp\r");
@@ -4302,4 +4322,30 @@ test "the status line shows MCP access while it is on and keeps it across a snap
     _ = rig.app.controller.submit(&.snapshot);
     try rig.app.screen.paint(rig.device.window, .{ .awake_ms = 0, .boot_ms = 0 }, &null);
     try rig.expectSees(&.{.{ .status = access_label }});
+}
+
+test "the startup config turns on MCP access, keeps the sign-in notice, and /mcp turns it off" {
+    var rig: Rig = undefined;
+    try rig.init(&.{ .config = "{\"interface\":{\"mcp_access\":true}}" });
+    defer rig.deinit();
+    try rig.waitFor(&.{
+        .{ .text = "Sign in · ↑/↓" },
+        .{ .status = "Select an account to sign in." },
+    });
+    var remote: mcp.testing.Client = undefined;
+    remote.init(rig.mcp_directory);
+    defer remote.deinit();
+    const instance = try remote.instance(rig.directory);
+    try rig.keys("\x1b");
+    try rig.waitFor(&.{.{ .absent = "Sign in · ↑/↓" }});
+    try rig.keys("x");
+    try rig.waitFor(&.{ .{ .status = "MCP: on · " }, .{ .editor = "x" } });
+    try rig.keys("\x7f/mcp\r");
+    try rig.waitFor(&.{.{ .status = "MCP access is off." }});
+    const revoked = try remote.target("get_state", &instance, "");
+    defer revoked.deinit();
+    try std.testing.expectEqualStrings(
+        "unknown_instance",
+        (try mcp.testing.member(revoked.content, "failure")).string,
+    );
 }

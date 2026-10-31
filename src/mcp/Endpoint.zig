@@ -133,7 +133,7 @@ pub fn published(self: *const Endpoint) ?discovery.Id {
     return publication.entry.id;
 }
 
-pub fn enable(self: *Endpoint) EnableError!discovery.Id {
+pub fn enable(self: *Endpoint) EnableError!void {
     std.debug.assert(self.publication == null);
     var entry = try discovery.publish(self.io, self.directory);
     errdefer discovery.withdraw(self.io, &entry) catch {};
@@ -148,7 +148,6 @@ pub fn enable(self: *Endpoint) EnableError!discovery.Id {
         &publication.server,
         Session{ .generation = self.generation, .instance = entry.id },
     });
-    return entry.id;
 }
 
 pub fn disable(self: *Endpoint) std.Io.Dir.DeleteFileError!void {
@@ -349,7 +348,8 @@ const Rig = struct {
     }
 
     fn enable(self: *Rig) ![]const u8 {
-        const id = try self.endpoint.enable();
+        try self.endpoint.enable();
+        const id = self.endpoint.published().?;
         return discovery.socketPath(&self.socket_buffer, self.endpoint.directory, &id);
     }
 

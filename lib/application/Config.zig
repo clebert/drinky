@@ -18,6 +18,7 @@ retry: core.Retry = .{},
 bash: tools.Context.Bash = .{},
 window_pages: usize = Settings.window_pages_default,
 verbose: bool = (Settings{}).verbose,
+mcp_access: bool = (Settings{}).mcp_access,
 gauge: Settings.Gauge = .{},
 effort_default: ?core.Provider.Effort = null,
 user_instructions: discovery.instructions.Result,
@@ -88,6 +89,7 @@ const File = struct {
     const Interface = struct {
         window_pages: usize = Settings.window_pages_default,
         verbose: bool = (Settings{}).verbose,
+        mcp_access: bool = (Settings{}).mcp_access,
         gauge_percent_warning: f64 = gauge_default.percent_warning,
         gauge_percent_error: f64 = gauge_default.percent_error,
     };
@@ -223,6 +225,10 @@ const keys = [_]Key{
     .{
         .path = "interface.verbose",
         .description = "The initial detail preference of the frontend.",
+    },
+    .{
+        .path = "interface.mcp_access",
+        .description = "The initial MCP access preference of the frontend.",
     },
     .{
         .path = "interface.window_pages",
@@ -668,6 +674,7 @@ fn loadFromData(gpa: std.mem.Allocator, io: std.Io, options: *const DataOptions)
         },
         .window_pages = window_pages,
         .verbose = interface.verbose,
+        .mcp_access = interface.mcp_access,
         .gauge = gauge,
         .effort_default = effort_default,
         .user_instructions = user_instructions,
@@ -900,18 +907,21 @@ test "load reads the interface section" {
     try std.testing.expect(empty.gauge_dropped == null);
 }
 
-test "verbosity defaults to off and accepts both boolean values" {
-    const cases = [_]struct { data: []const u8, verbose: bool }{
-        .{ .data = "{}", .verbose = false },
-        .{ .data = "{\"interface\":{}}", .verbose = false },
-        .{ .data = "{\"interface\":{\"window_pages\":3}}", .verbose = false },
+test "verbosity and MCP access default to off and accept both boolean values" {
+    const cases = [_]struct { data: []const u8, verbose: bool = false, mcp_access: bool = false }{
+        .{ .data = "{}" },
+        .{ .data = "{\"interface\":{}}" },
+        .{ .data = "{\"interface\":{\"window_pages\":3}}" },
         .{ .data = "{\"interface\":{\"verbose\":true}}", .verbose = true },
-        .{ .data = "{\"interface\":{\"verbose\":false}}", .verbose = false },
+        .{ .data = "{\"interface\":{\"verbose\":false}}" },
+        .{ .data = "{\"interface\":{\"mcp_access\":true}}", .mcp_access = true },
+        .{ .data = "{\"interface\":{\"mcp_access\":false}}" },
     };
     for (cases) |case| {
         var config = try loadDataForTest(case.data);
         defer config.deinit(std.testing.allocator);
         try std.testing.expectEqual(case.verbose, config.verbose);
+        try std.testing.expectEqual(case.mcp_access, config.mcp_access);
         try std.testing.expectEqual(@as(usize, 0), config.unknown_keys.len);
     }
 }
