@@ -10,8 +10,8 @@ Drinky is a Zig coding agent that keeps the conversation in the terminal scrollb
 `providers`, `tools`, and `accounts`. No library imports `src`. The frontend test build adds the
 infrastructure modules for its existing fakes.
 
-- `lib/terminal` owns keyboard input, screen output, and the device seam. It knows no model and no
-  provider.
+- `lib/terminal` owns keyboard and mouse input, screen output, and the device seam. It knows no
+  model and no provider.
 - `lib/markdown` imports `std` alone. It parses Markdown and exposes source offsets. It knows no
   terminal, role, or URL limit. It holds the CommonMark test corpus and its license notice.
 - `lib/core` imports `std` alone. It owns the neutral conversation, session, provider seam, tool

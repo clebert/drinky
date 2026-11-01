@@ -26,6 +26,7 @@ gpa: std.mem.Allocator,
 title: []const u8,
 options: []const Option,
 cursor: usize,
+rotation: usize,
 current: ?usize,
 content: std.ArrayList(u8),
 line_roles: std.ArrayList(role.Name),
@@ -63,6 +64,7 @@ pub const Option = struct {
 pub const Position = struct {
     cursor: usize = 0,
     scroll: usize = 0,
+    rotation: usize = 0,
 };
 
 const Start = struct {
@@ -112,6 +114,7 @@ pub fn init(
         .title = title,
         .options = options,
         .cursor = @min(opened.cursor, index_max),
+        .rotation = @min(opened.rotation, index_max),
         .current = start.current,
         .content = .empty,
         .line_roles = .empty,
@@ -140,6 +143,7 @@ pub fn beginWait(self: *Picker, text: []const u8) !void {
     self.freeOptions();
     self.options = &.{};
     self.cursor = 0;
+    self.rotation = 0;
     self.current = null;
     self.window = .{};
     self.wait = text;
@@ -157,10 +161,8 @@ fn freeOptions(self: *Picker) void {
     self.gpa.free(self.options);
 }
 
-pub fn restorePosition(self: *Picker, previous: *const Picker) !void {
-    self.cursor = @min(previous.cursor, self.options.len -| 1);
-    self.window.scroll = previous.window.scroll;
-    try self.compose();
+pub fn position(self: *const Picker) Position {
+    return .{ .cursor = self.cursor, .scroll = self.window.scroll, .rotation = self.rotation };
 }
 
 pub fn moveUp(self: *Picker) !void {
@@ -173,6 +175,18 @@ pub fn moveDown(self: *Picker) !void {
     if (self.options.len == 0) return;
     self.cursor = if (self.cursor + 1 >= self.options.len) 0 else self.cursor + 1;
     try self.compose();
+}
+
+pub fn rotateUp(self: *Picker) !void {
+    if (self.options.len == 0) return;
+    self.rotation = (self.rotation + self.options.len - 1) % self.options.len;
+    try self.moveUp();
+}
+
+pub fn rotateDown(self: *Picker) !void {
+    if (self.options.len == 0) return;
+    self.rotation = (self.rotation + 1) % self.options.len;
+    try self.moveDown();
 }
 
 pub fn reflow(self: *Picker, size: terminal.View.Size) !void {
@@ -255,7 +269,9 @@ fn compose(self: *Picker) !void {
         return self.cut(.{ .start = 0, .columns_max = self.columns });
     }
 
-    for (self.options, 0..) |*option, index| {
+    for (0..self.options.len) |row_index| {
+        const index = (self.rotation + row_index) % self.options.len;
+        const option = &self.options[index];
         const chosen = index == self.cursor;
         const current = self.current == index;
         const line_role: role.Name = if (chosen) .selection else .text;
@@ -703,4 +719,61 @@ test "a tall option list scrolls the window to keep the selection in view" {
     try picker.reflow(size);
     try std.testing.expectEqual(@as(usize, 19), picker.cursor);
     try std.testing.expectEqual(@as(usize, 14), picker.window.scroll);
+}
+
+test "a wheel turn rotates the options under a fixed selection row, and arrows keep that order" {
+    const gpa = std.testing.allocator;
+    var picker = try testPicker(gpa, &.{ "alpha", "beta", "gamma", "delta" }, &.{
+        .current = 0,
+        .preselected = 1,
+    });
+    defer picker.deinit();
+    const size: terminal.View.Size = .{ .columns = 80, .rows = 24 };
+
+    const turns = [_]struct { down: bool, rows: [4][]const u8 }{
+        .{ .down = true, .rows = .{ "   beta", " > gamma", "   delta", "   alpha (Current)" } },
+        .{ .down = true, .rows = .{ "   gamma", " > delta", "   alpha (Current)", "   beta" } },
+        .{ .down = false, .rows = .{ "   beta", " > gamma", "   delta", "   alpha (Current)" } },
+        .{ .down = false, .rows = .{ "   alpha (Current)", " > beta", "   gamma", "   delta" } },
+        .{ .down = false, .rows = .{ "   delta", " > alpha (Current)", "   beta", "   gamma" } },
+    };
+    for (turns) |turn| {
+        if (turn.down) try picker.rotateDown() else try picker.rotateUp();
+        try picker.reflow(size);
+        const painted = try renderForTest(gpa, &picker, size);
+        defer gpa.free(painted);
+        const plain = try terminal.testing.plainText(gpa, painted);
+        defer gpa.free(plain);
+        var lines = std.mem.splitSequence(u8, plain, "\r\n");
+        _ = lines.next();
+        _ = lines.next();
+        for (turn.rows) |row| try std.testing.expectEqualStrings(row, lines.next().?);
+    }
+    try std.testing.expectEqual(@as(usize, 0), picker.cursor);
+
+    try picker.moveDown();
+    try picker.reflow(size);
+    const moved = try renderForTest(gpa, &picker, size);
+    defer gpa.free(moved);
+    try testing.expectShows(moved, &.{comptime role.sequence(.selection) ++ " > beta"});
+
+    var storage: [20][8]u8 = undefined;
+    var labels: [20][]const u8 = undefined;
+    for (&labels, 0..) |*label, index| {
+        label.* = std.mem.print(&storage[index], "row{d:0>2}", .{index}) catch unreachable;
+    }
+    var tall = try testPicker(gpa, &labels, &.{});
+    defer tall.deinit();
+    const short: terminal.View.Size = .{ .columns = 80, .rows = 20 };
+    for (0..8) |_| {
+        try tall.moveDown();
+        try tall.reflow(short);
+    }
+    try std.testing.expectEqual(@as(usize, 3), tall.window.scroll);
+    for (0..15) |_| {
+        try tall.rotateDown();
+        try tall.reflow(short);
+    }
+    try std.testing.expectEqual(@as(usize, 3), tall.cursor);
+    try std.testing.expectEqual(@as(usize, 3), tall.window.scroll);
 }

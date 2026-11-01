@@ -242,9 +242,14 @@ fn writeKeys(writer: *std.Io.Writer) !void {
         \\- Ctrl+D cancels the turn at once.
         \\- Ctrl+C clears a draft, and it cancels the turn at an empty editor.
         \\
-        \\This section names the keys of the prompt, a sign-in, a model fetch, and a turn. A
-        \\full-window page states its own keys in its header, and the editor carries the movement
-        \\keys of a text field.
+        \\A picker takes the mouse wheel. Each wheel step turns the option list by one row. The
+        \\selection row stays in place, so the option under it becomes the selection. The list is
+        \\circular. While a picker shows its options, the wheel does not scroll the terminal
+        \\scrollback.
+        \\
+        \\This section names the keys of the prompt, a sign-in, a model fetch, and a turn. It
+        \\also names the mouse wheel of a picker. A full-window page states its own keys in its
+        \\header, and the editor carries the movement keys of a text field.
         \\
     , .{ reference.repeat_window_ms, reference.repeat_window_ms });
 }

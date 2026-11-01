@@ -518,6 +518,8 @@ fn exitOf(event: *const terminal.Input.Key) ?Exit {
         .page_down,
         .home,
         .end,
+        .wheel_up,
+        .wheel_down,
         .unknown,
         => null,
     };
@@ -601,7 +603,15 @@ fn editKey(self: *App, event: *const terminal.Input.Key) !bool {
             'j' => try editor.insert("\n"),
             else => return false,
         },
-        .enter, .tab, .escape, .page_up, .page_down, .unknown => return false,
+        .enter,
+        .tab,
+        .escape,
+        .page_up,
+        .page_down,
+        .wheel_up,
+        .wheel_down,
+        .unknown,
+        => return false,
     }
     self.screen.markEdited();
     self.edits +%= 1;
@@ -641,6 +651,7 @@ fn refresh(self: *App) !void {
     const size: terminal.View.Size = self.device.size() orelse
         .{ .columns = self.screen.columns, .rows = self.screen.rows };
     try self.device.setAlternateScreen(self.mode() == .page);
+    try self.device.setMouseReport(self.mode() == .picker);
     try self.screen.paint(size, self.screenTime(), &self.caption());
 }
 
@@ -1217,6 +1228,8 @@ fn handleExit(self: *App, exit: Exit, notice_shown: bool) !void {
     }
 }
 fn handleKey(self: *App, event: *const terminal.Input.Key) !void {
+    const wheel = event.* == .wheel_up or event.* == .wheel_down;
+    if (wheel and self.mode() != .picker) return;
     self.disarm(event);
     const notice_shown = self.screen.notice != null;
     self.screen.clearNotice();
@@ -1244,6 +1257,8 @@ fn handleKey(self: *App, event: *const terminal.Input.Key) !void {
                 .page_down,
                 .home,
                 .end,
+                .wheel_up,
+                .wheel_down,
                 .unknown,
                 => {},
                 .escape => unreachable,
@@ -1254,6 +1269,8 @@ fn handleKey(self: *App, event: *const terminal.Input.Key) !void {
             switch (event.*) {
                 .up => try picker.moveUp(),
                 .down => try picker.moveDown(),
+                .wheel_up => try picker.rotateUp(),
+                .wheel_down => try picker.rotateDown(),
                 .enter => try self.selectRow(),
                 .escape => unreachable,
                 .char,
@@ -1298,6 +1315,8 @@ fn handleKey(self: *App, event: *const terminal.Input.Key) !void {
                 .backspace,
                 .left,
                 .right,
+                .wheel_up,
+                .wheel_down,
                 .unknown,
                 => {},
             }
@@ -1484,6 +1503,7 @@ const Rig = struct {
         status: []const u8,
         editor: []const u8,
         alternate_screen: bool,
+        mouse_report: bool,
         activity: bool,
     };
 
@@ -1698,6 +1718,9 @@ const Rig = struct {
                 .alternate_screen => |enabled| {
                     std.debug.print("{s}alternate screen {}\n", .{ mark, enabled });
                 },
+                .mouse_report => |enabled| {
+                    std.debug.print("{s}mouse report {}\n", .{ mark, enabled });
+                },
                 .activity => |active| std.debug.print("{s}activity {}\n", .{ mark, active }),
             }
         }
@@ -1754,6 +1777,7 @@ fn sees(snapshot: *const terminal.testing.FakeDevice.Snapshot, sight: *const Rig
         .status => |needle| statusHolds(rows, needle),
         .editor => |text| editorHolds(rows, text),
         .alternate_screen => |enabled| snapshot.alternate == enabled,
+        .mouse_report => |enabled| snapshot.mouse_report == enabled,
         .activity => |active| (rowWith(rows, "━") != null) == active,
     };
 }
@@ -2236,6 +2260,41 @@ test "a slash command opens its picker, a pick applies, and Esc leaves with a no
     try rig.keys("hello\r");
     try rig.waitFor(&.{ .{ .rows = &.{ "hello", "done" } }, .{ .activity = false } });
     try expectRequested(&rig, "\"effort\":\"low\"");
+}
+
+test "a picker turns on mouse reports, rotates on a wheel step, and ends the reports on Esc" {
+    var rig: Rig = undefined;
+    try rig.init(&.{
+        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .model = "gpt-5.6-sol",
+    });
+    defer rig.deinit();
+    try rig.waitFor(&.{.{ .mouse_report = false }});
+
+    try rig.keys("/effort\r");
+    try rig.waitFor(&.{ .{ .mouse_report = true }, .{ .text = " > xhigh" } });
+    try rig.keys("\x1b[<64;1;1M\x1b[<0;1;1M\x1b[<64;1;1M");
+    try rig.waitFor(&.{.{ .rows = &.{ "   xhigh", "   max", "   low", " > medium", "   high" } }});
+    try rig.keys("\x1b[<65;1;1M");
+    try rig.waitFor(&.{.{ .rows = &.{ "   max", "   low", "   medium", " > high", "   xhigh" } }});
+    try rig.keys("\x1b");
+    try rig.waitFor(&.{ .{ .mouse_report = false }, .{ .absent = effort_picker } });
+}
+
+test "a wheel step after the picker closes keeps the notice" {
+    var rig: Rig = undefined;
+    try rig.init(&.{
+        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .model = "gpt-5.6-sol",
+    });
+    defer rig.deinit();
+    try rig.keys("/effort\r");
+    try rig.waitFor(&.{.{ .text = effort_picker }});
+    try rig.keys("\x1b");
+    try rig.waitFor(&.{.{ .status = "You canceled the effort selection." }});
+
+    try rig.keyFrame("\x1b[<64;1;1M\x1b[<65;1;1M");
+    try rig.expectSees(&.{.{ .status = "You canceled the effort selection." }});
 }
 
 test "a pending callback submission cancels the active sign-in" {

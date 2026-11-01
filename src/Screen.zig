@@ -17,7 +17,7 @@ const wording = @import("wording.zig");
 const Screen = @This();
 
 pub const editor_caption_rows_max: usize = 3;
-const picker_scrolls_max = 8;
+const picker_positions_max = 8;
 const retry_note = "Drinky asked the model to continue from the committed work.";
 
 gpa: std.mem.Allocator,
@@ -47,7 +47,7 @@ result_page: ?ResultPage = null,
 confirmation: ?ui.status.Confirmation = null,
 notice_id: u64 = 0,
 picker_depth: usize = 0,
-picker_scrolls: [picker_scrolls_max]usize = undefined,
+picker_positions: [picker_positions_max]ui.Picker.Position = undefined,
 
 pub const Time = struct {
     awake_ms: i64,
@@ -685,7 +685,7 @@ pub fn setDraft(self: *Screen, text: []const u8) !void {
 }
 
 pub fn openPicker(self: *Screen, options: *const PickerOptions) !void {
-    const scroll = self.stepScroll(options.depth);
+    const step = self.stepPosition(options.depth);
     const title = try self.gpa.dupe(u8, options.title);
     errdefer self.gpa.free(title);
     const owned = try self.gpa.alloc(ui.Picker.Option, options.options.len);
@@ -701,7 +701,11 @@ pub fn openPicker(self: *Screen, options: *const PickerOptions) !void {
     const picker = try ui.Picker.init(self.gpa, title, owned, &.{
         .current = options.current,
         .preselected = options.preselected,
-        .position = if (options.cursor) |cursor| .{ .cursor = cursor, .scroll = scroll } else null,
+        .position = if (options.cursor) |cursor| .{
+            .cursor = cursor,
+            .scroll = step.scroll,
+            .rotation = step.rotation,
+        } else null,
         .can_step_back = options.depth > 0,
     });
     self.leaveWidget();
@@ -709,15 +713,16 @@ pub fn openPicker(self: *Screen, options: *const PickerOptions) !void {
     self.picker_depth = options.depth;
 }
 
-fn stepScroll(self: *Screen, depth: usize) usize {
-    const previous = self.activePicker() orelse return 0;
+fn stepPosition(self: *Screen, depth: usize) ui.Picker.Position {
+    const previous = self.activePicker() orelse return .{};
     if (depth > self.picker_depth) {
-        if (self.picker_depth < picker_scrolls_max)
-            self.picker_scrolls[self.picker_depth] = previous.window.scroll;
-        return 0;
+        if (self.picker_depth < picker_positions_max)
+            self.picker_positions[self.picker_depth] = previous.position();
+        return .{};
     }
-    if (depth < self.picker_depth and depth < picker_scrolls_max) return self.picker_scrolls[depth];
-    return 0;
+    if (depth < self.picker_depth and depth < picker_positions_max)
+        return self.picker_positions[depth];
+    return .{};
 }
 
 pub fn closePicker(self: *Screen) void {
@@ -811,7 +816,7 @@ pub fn restore(self: *Screen, snapshot: *const application.Snapshot) !void {
     restored.directory_shown = self.directory_shown;
     restored.mcp_access = self.mcp_access;
     restored.statistics = snapshot.statistics;
-    restored.picker_scrolls = self.picker_scrolls;
+    restored.picker_positions = self.picker_positions;
     restored.picker_depth = self.picker_depth;
     try restored.appendIntro();
     try restored.transcript.block_list.ensureUnusedCapacity(self.gpa, snapshot.records.len);
@@ -3350,7 +3355,7 @@ fn expectBodyRows(emulator: *const terminal.testing.Emulator, expected: []const 
     }
 }
 
-test "a step back restores the scroll row of the parent picker" {
+test "a step back restores the scroll row and the rotation of the parent picker" {
     const gpa = std.testing.allocator;
     var rig: Rig = undefined;
     rig.init();
@@ -3363,13 +3368,17 @@ test "a step back restores the scroll row of the parent picker" {
     for (0..30) |_| try rig.screen.activePicker().?.moveDown();
     gpa.free(try rig.paintPlain(80));
     for (0..10) |_| try rig.screen.activePicker().?.moveUp();
+    for (0..5) |_| try rig.screen.activePicker().?.rotateDown();
     gpa.free(try rig.paintPlain(80));
-    const scroll = rig.screen.activePicker().?.window.scroll;
+    const parent = rig.screen.activePicker().?;
+    const scroll = parent.window.scroll;
+    const cursor = parent.cursor;
     try std.testing.expect(scroll > 0);
     try rig.screen.openPicker(&.{ .title = "Child", .options = options[0..2], .depth = 1 });
-    try rig.screen.openPicker(&.{ .title = "Parent", .options = &options, .cursor = 20 });
+    try rig.screen.openPicker(&.{ .title = "Parent", .options = &options, .cursor = cursor });
     gpa.free(try rig.paintPlain(80));
     try std.testing.expectEqual(scroll, rig.screen.activePicker().?.window.scroll);
+    try std.testing.expectEqual(@as(usize, 5), rig.screen.activePicker().?.rotation);
 }
 
 test "a picker position restores the selected row" {

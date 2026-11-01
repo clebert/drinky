@@ -37,6 +37,7 @@ const Mode = enum {
     screen_alternate,
     scroll_alternate,
     keyboard_alternate,
+    mouse_report,
 
     fn setSequence(self: Mode) []const u8 {
         return switch (self) {
@@ -46,6 +47,7 @@ const Mode = enum {
             .cursor => escape.cursor_hide,
             .screen_alternate => escape.screen_alternate_set,
             .scroll_alternate => escape.scroll_alternate_set,
+            .mouse_report => escape.mouse_report_set,
         };
     }
 
@@ -57,6 +59,7 @@ const Mode = enum {
             .cursor => escape.cursor_show,
             .screen_alternate => escape.screen_alternate_reset,
             .scroll_alternate => escape.scroll_alternate_reset,
+            .mouse_report => escape.mouse_report_reset,
         };
     }
 };
@@ -140,6 +143,7 @@ const device_vtable: Device.VTable = .{
     .waitResize = waitResize,
     .size = size,
     .setAlternateScreen = setAlternateScreen,
+    .setMouseReport = setMouseReport,
     .writer = writer,
 };
 
@@ -204,6 +208,11 @@ fn setAlternateScreen(ptr: *anyopaque, enabled: bool) std.Io.Writer.Error!void {
     try setAlternateScreenWith(&self.raw_state, &self.out_stream.interface, enabled);
 }
 
+fn setMouseReport(ptr: *anyopaque, enabled: bool) std.Io.Writer.Error!void {
+    const self: *Tty = @ptrCast(@alignCast(ptr));
+    try setMouseReportWith(&self.raw_state, &self.out_stream.interface, enabled);
+}
+
 fn writer(ptr: *anyopaque) *std.Io.Writer {
     const self: *Tty = @ptrCast(@alignCast(ptr));
     return &self.out_stream.interface;
@@ -239,6 +248,17 @@ fn setAlternateScreenWith(state: *RawState, output: *std.Io.Writer, enabled: boo
     try output.writeAll(escape.cursor_show);
     try output.flush();
     state.resets_pending.remove(.screen_alternate);
+}
+
+fn setMouseReportWith(state: *RawState, output: *std.Io.Writer, enabled: bool) !void {
+    if (state.resets_pending.contains(.mouse_report) == enabled) return;
+    if (enabled) {
+        try state.set(output, .mouse_report);
+    } else {
+        try output.writeAll(Mode.mouse_report.resetSequence());
+        state.resets_pending.remove(.mouse_report);
+    }
+    try output.flush();
 }
 
 fn cleanupWith(state: *RawState, output: *std.Io.Writer, termios: Termios) void {
@@ -336,6 +356,8 @@ const TestWriter = struct {
         screen_alternate_reset,
         scroll_alternate_set,
         scroll_alternate_reset,
+        mouse_report_set,
+        mouse_report_reset,
         keyboard_reset,
         paste_reset,
         newline,
@@ -389,6 +411,8 @@ const TestWriter = struct {
         if (std.mem.eql(u8, bytes, escape.screen_alternate_reset)) return .screen_alternate_reset;
         if (std.mem.eql(u8, bytes, escape.scroll_alternate_set)) return .scroll_alternate_set;
         if (std.mem.eql(u8, bytes, escape.scroll_alternate_reset)) return .scroll_alternate_reset;
+        if (std.mem.eql(u8, bytes, escape.mouse_report_set)) return .mouse_report_set;
+        if (std.mem.eql(u8, bytes, escape.mouse_report_reset)) return .mouse_report_reset;
         if (std.mem.eql(u8, bytes, escape.keyboard_reset)) return .keyboard_reset;
         if (std.mem.eql(u8, bytes, escape.paste_reset)) return .paste_reset;
         if (std.mem.eql(u8, bytes, "\r\n")) return .newline;
@@ -557,6 +581,32 @@ test "each alternate screen transition pairs its own keyboard and scroll modes" 
             output.operations[0..output.operations_len],
         );
     }
+}
+
+test "a mouse report changes once per transition, and cleanup ends a report that stays on" {
+    var output: TestWriter = .{};
+    var control: TestControl = .{};
+    var state: RawState = .{};
+    for ([_]bool{ true, true, false, false, true }) |enabled| {
+        try setMouseReportWith(&state, &output.interface, enabled);
+    }
+    cleanupWith(&state, &output.interface, control.termios());
+    cleanupWith(&state, &output.interface, control.termios());
+    try std.testing.expectEqual(RawState{}, state);
+    try std.testing.expectEqualSlices(
+        TestWriter.Operation,
+        &.{
+            .mouse_report_set,
+            .flush,
+            .mouse_report_reset,
+            .flush,
+            .mouse_report_set,
+            .flush,
+            .mouse_report_reset,
+            .flush,
+        },
+        output.operations[0..output.operations_len],
+    );
 }
 
 test "setup failure restores cooked mode and only reverses attempted terminal modes" {

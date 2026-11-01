@@ -26,10 +26,12 @@ pub const Key = union(enum) {
     page_down,
     home,
     end,
+    wheel_up,
+    wheel_down,
     unknown,
 };
 
-const Decoded = struct { key: Key, consumed: usize, in_paste: bool = false };
+const Decoded = struct { key: ?Key, consumed: usize, in_paste: bool = false };
 
 const paste_flush_len = 1 << 20;
 
@@ -41,6 +43,8 @@ const enter_key = 13;
 const escape_key = 27;
 const shift_bit = 0b001;
 const ctrl_bit = 0b100;
+const wheel_up_button = 64;
+const wheel_down_button = 65;
 
 pub fn init(gpa: std.mem.Allocator) Input {
     return .{ .gpa = gpa, .pending = .empty, .start = 0, .in_paste = false };
@@ -73,12 +77,15 @@ pub fn takeEscape(self: *Input) bool {
 }
 
 pub fn next(self: *Input) ?Key {
-    const data = self.pending.items[self.start..];
-    if (data.len == 0) return null;
-    const decoded = (if (self.in_paste) decodePasteBody(data) else decode(data)) orelse return null;
-    self.in_paste = decoded.in_paste;
-    self.start += decoded.consumed;
-    return decoded.key;
+    while (self.start < self.pending.items.len) {
+        const data = self.pending.items[self.start..];
+        const decoded = (if (self.in_paste) decodePasteBody(data) else decode(data)) orelse
+            return null;
+        self.in_paste = decoded.in_paste;
+        self.start += decoded.consumed;
+        if (decoded.key) |key| return key;
+    }
+    return null;
 }
 
 fn decode(data: []const u8) ?Decoded {
@@ -158,7 +165,7 @@ fn decodePasteBody(body: []const u8) ?Decoded {
     };
 }
 
-fn mapControlSequence(parameters: []const u8, final: u8) Key {
+fn mapControlSequence(parameters: []const u8, final: u8) ?Key {
     if (final == '~') {
         if (std.mem.eql(u8, parameters, "1") or std.mem.eql(u8, parameters, "7")) return .home;
         if (std.mem.eql(u8, parameters, "4") or std.mem.eql(u8, parameters, "8")) return .end;
@@ -167,7 +174,19 @@ fn mapControlSequence(parameters: []const u8, final: u8) Key {
         return .unknown;
     }
     if (final == 'u') return mapCsiU(parameters);
+    if (std.mem.startsWith(u8, parameters, "<")) return mapMouseReport(parameters[1..], final);
     return mapFinal(final);
+}
+
+fn mapMouseReport(parameters: []const u8, final: u8) ?Key {
+    if (final != 'M') return null;
+    const button_end = std.mem.findScalar(u8, parameters, ';') orelse parameters.len;
+    const button = std.fmt.parseInt(u8, parameters[0..button_end], 10) catch return null;
+    return switch (button) {
+        wheel_up_button => .wheel_up,
+        wheel_down_button => .wheel_down,
+        else => null,
+    };
 }
 
 fn mapCsiU(parameters: []const u8) Key {
@@ -272,6 +291,13 @@ test "a csi or ss3 sequence decodes as an arrow key or a navigation key" {
     try expectKeys("\x1b[H\x1b[1~\x1b[7~", &.{ .home, .home, .home });
     try expectKeys("\x1b[F\x1b[4~\x1b[8~", &.{ .end, .end, .end });
     try expectKeys("\x1b[5~\x1b[6~", &.{ .page_up, .page_down });
+}
+
+test "an sgr mouse report decodes a wheel step and yields no key for every other report" {
+    try expectKeys("\x1b[<64;10;5M\x1b[<65;1;1M", &.{ .wheel_up, .wheel_down });
+    try expectKeys("a\x1b[<0;3;4M\x1b[<0;3;4mb", &.{ .{ .char = 'a' }, .{ .char = 'b' } });
+    try expectKeys("\x1b[<66;1;1M\x1b[<80;1;1M", &.{});
+    try expectKeys("\x1b[<64;1;1m\x1b[<999;1;1M\x1b[<M\r", &.{.enter});
 }
 
 test "a modified arrow decodes as the bare key" {

@@ -16,6 +16,7 @@ pub const FakeDevice = struct {
     changes: std.atomic.Value(u32),
     window: View.Size,
     alternate: bool,
+    mouse_report: bool,
     conversation: Emulator,
     page: Emulator,
     frame_count: usize,
@@ -37,6 +38,7 @@ pub const FakeDevice = struct {
     pub const Snapshot = struct {
         rows: []const []const u8,
         alternate: bool,
+        mouse_report: bool,
     };
 
     const WaitError = error{ TestDeviceStopped, TestDeviceTimeout };
@@ -46,6 +48,7 @@ pub const FakeDevice = struct {
         .waitResize = waitResize,
         .size = size,
         .setAlternateScreen = setAlternateScreen,
+        .setMouseReport = setMouseReport,
         .writer = writer,
     };
 
@@ -63,6 +66,7 @@ pub const FakeDevice = struct {
             .changes = .init(0),
             .window = window,
             .alternate = false,
+            .mouse_report = false,
             .conversation = conversation,
             .page = page,
             .frame_count = 0,
@@ -153,7 +157,7 @@ pub const FakeDevice = struct {
         const document = self.screen().document.items;
         const rows = try arena.alloc([]const u8, document.len);
         for (rows, document) |*row, source| row.* = try arena.dupe(u8, source.items);
-        return .{ .rows = rows, .alternate = self.alternate };
+        return .{ .rows = rows, .alternate = self.alternate, .mouse_report = self.mouse_report };
     }
 
     pub fn outputBytes(self: *FakeDevice, gpa: std.mem.Allocator) error{OutOfMemory}![]u8 {
@@ -269,6 +273,13 @@ pub const FakeDevice = struct {
             self.page = fresh;
         }
         self.alternate = enabled;
+    }
+
+    fn setMouseReport(ptr: *anyopaque, enabled: bool) std.Io.Writer.Error!void {
+        const self: *FakeDevice = @ptrCast(@alignCast(ptr));
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.mouse_report = enabled;
     }
 
     fn writer(ptr: *anyopaque) *std.Io.Writer {

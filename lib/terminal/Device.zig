@@ -12,6 +12,7 @@ pub const VTable = struct {
     waitResize: *const fn (ptr: *anyopaque) std.Io.File.ReadStreamingError!void,
     size: *const fn (ptr: *anyopaque) ?View.Size,
     setAlternateScreen: *const fn (ptr: *anyopaque, enabled: bool) std.Io.Writer.Error!void,
+    setMouseReport: *const fn (ptr: *anyopaque, enabled: bool) std.Io.Writer.Error!void,
     writer: *const fn (ptr: *anyopaque) *std.Io.Writer,
 };
 
@@ -29,6 +30,10 @@ pub fn size(self: Device) ?View.Size {
 
 pub fn setAlternateScreen(self: Device, enabled: bool) std.Io.Writer.Error!void {
     return self.vtable.setAlternateScreen(self.ptr, enabled);
+}
+
+pub fn setMouseReport(self: Device, enabled: bool) std.Io.Writer.Error!void {
+    return self.vtable.setMouseReport(self.ptr, enabled);
 }
 
 pub fn writer(self: Device) *std.Io.Writer {

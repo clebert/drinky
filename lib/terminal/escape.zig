@@ -32,6 +32,9 @@ pub const screen_alternate_reset = "\x1b[?1049l";
 pub const scroll_alternate_set = "\x1b[?1007s\x1b[?1007h";
 pub const scroll_alternate_reset = "\x1b[?1007r";
 
+pub const mouse_report_set = "\x1b[?1000h\x1b[?1006h";
+pub const mouse_report_reset = "\x1b[?1006l\x1b[?1000l";
+
 pub const screen_clear_below = "\x1b[0J";
 pub const screen_repaint = "\x1b[2J\x1b[H";
 pub const screen_reset = screen_repaint ++ "\x1b[3J";
