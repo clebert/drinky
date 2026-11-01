@@ -26,16 +26,11 @@ pub const Scene = union(enum) {
 pub const Tail = union(enum) {
     prompt: Prompt,
     turn: Turn,
-    picking: Picking,
+    picking: *const ui.Picker,
 
     const Prompt = struct {
         caption: ?ui.Caption,
         editor: *const ui.Editor,
-    };
-
-    const Picking = struct {
-        picker: *const ui.Picker,
-        activity: ?ui.paint.Activity,
     };
 
     const Turn = struct {
@@ -83,7 +78,7 @@ const Component = union(enum) {
     block: *ui.Block,
     tool_box: ui.paint.Box,
     editor: EditorPresentation,
-    picker: Tail.Picking,
+    picker: *const ui.Picker,
     status: *const ui.status.Info,
 
     fn measure(self: *const Component, size: terminal.View.Size) usize {
@@ -92,7 +87,7 @@ const Component = union(enum) {
             .tool_box => |box| ui.paint.boxRows(&box, size.columns),
             .editor => |presentation| presentation.rows(size),
             .status => 1,
-            .picker => |picking| picking.picker.rows(size),
+            .picker => |picker| picker.rows(size),
         };
     }
 
@@ -107,10 +102,7 @@ const Component = union(enum) {
             .tool_box => |box| try ui.paint.box(placement, .text, &box),
             .status => |info| try ui.status.render(placement, info),
             .editor => |presentation| try presentation.render(placement, viewport_rows),
-            .picker => |picking| try picking.picker.render(placement, &.{
-                .viewport_rows = viewport_rows,
-                .activity = picking.activity,
-            }),
+            .picker => |picker| try picker.render(placement, viewport_rows),
         }
     }
 };
@@ -270,8 +262,8 @@ fn tailSlot(tail: *const Tail, offset: usize) Slot {
             .activity = null,
             .caption = prompt.caption,
         }),
-        .picking => |picking| return .{
-            .component = .{ .picker = picking },
+        .picking => |picker| return .{
+            .component = .{ .picker = picker },
             .id = id_input,
             .leading_blank = true,
         },
@@ -412,7 +404,7 @@ const Rig = struct {
             .tail = .{ .turn = .{
                 .tools = options.tools,
                 .tracks = options.tracks,
-                .activity = .{ .motion_tick = 0, .progress_age_ticks = 0 },
+                .activity = .{ .style = .sweep, .motion_tick = 0 },
                 .editor = &self.editor,
             } },
             .status = &test_status,

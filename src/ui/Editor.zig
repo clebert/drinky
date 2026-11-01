@@ -1165,12 +1165,12 @@ test "activity crosses the frame edges without changing the editor height" {
 
     const first = try renderedWithOptions(gpa, &editor, size, &.{
         .viewport_rows = size.rows,
-        .activity = .{ .motion_tick = 0, .progress_age_ticks = 0 },
+        .activity = .{ .style = .sweep, .motion_tick = 0 },
     });
     defer gpa.free(first);
     const second = try renderedWithOptions(gpa, &editor, size, &.{
         .viewport_rows = size.rows,
-        .activity = .{ .motion_tick = 3, .progress_age_ticks = 0 },
+        .activity = .{ .style = .sweep, .motion_tick = 3 },
     });
     defer gpa.free(second);
 

@@ -24,17 +24,12 @@ const unbounded = std.math.maxInt(usize);
 
 gpa: std.mem.Allocator,
 title: []const u8,
-options: []const Option,
-cursor: usize,
-rotation: usize,
-current: ?usize,
+body: Body,
 content: std.ArrayList(u8),
 line_roles: std.ArrayList(role.Name),
 window: paint.Window,
 cursor_offset: usize,
 columns: usize,
-can_step_back: bool,
-wait: ?[]const u8,
 marks: std.ArrayList(paint.Mark),
 
 pub const Option = struct {
@@ -74,6 +69,34 @@ const Start = struct {
     can_step_back: bool = false,
 };
 
+const Body = union(enum) {
+    list: List,
+    wait: Wait,
+
+    fn deinit(self: *const Body, gpa: std.mem.Allocator) void {
+        switch (self.*) {
+            .list => |*list| {
+                for (list.options) |*option| option.deinit(gpa);
+                gpa.free(list.options);
+            },
+            .wait => |*wait| gpa.free(wait.text),
+        }
+    }
+};
+
+const List = struct {
+    options: []const Option,
+    cursor: usize,
+    rotation: usize,
+    current: ?usize,
+    can_step_back: bool,
+};
+
+const Wait = struct {
+    text: []const u8,
+    tick: u64 = 0,
+};
+
 const Range = struct {
     start: usize,
     end: usize,
@@ -109,20 +132,33 @@ pub fn init(
     const opened: Position = start.position orelse .{
         .cursor = start.preselected orelse start.current orelse 0,
     };
+    const owned_title = try gpa.dupe(u8, title);
+    errdefer gpa.free(owned_title);
+    const owned_options = try gpa.alloc(Option, options.len);
+    var count: usize = 0;
+    errdefer {
+        for (owned_options[0..count]) |*option| option.deinit(gpa);
+        gpa.free(owned_options);
+    }
+    for (options, owned_options) |*source, *target| {
+        target.* = try source.dupe(gpa);
+        count += 1;
+    }
     var self: Picker = .{
         .gpa = gpa,
-        .title = title,
-        .options = options,
-        .cursor = @min(opened.cursor, index_max),
-        .rotation = @min(opened.rotation, index_max),
-        .current = start.current,
+        .title = owned_title,
+        .body = .{ .list = .{
+            .options = owned_options,
+            .cursor = @min(opened.cursor, index_max),
+            .rotation = @min(opened.rotation, index_max),
+            .current = start.current,
+            .can_step_back = start.can_step_back,
+        } },
         .content = .empty,
         .line_roles = .empty,
         .window = .{ .scroll = @min(opened.scroll, index_max) },
         .cursor_offset = 0,
         .columns = unbounded,
-        .can_step_back = start.can_step_back,
-        .wait = null,
         .marks = .empty,
     };
     errdefer self.content.deinit(gpa);
@@ -133,60 +169,86 @@ pub fn init(
 }
 
 pub fn deinit(self: *Picker) void {
-    self.freeOptions();
+    self.gpa.free(self.title);
+    self.body.deinit(self.gpa);
     self.content.deinit(self.gpa);
     self.line_roles.deinit(self.gpa);
     self.marks.deinit(self.gpa);
 }
 
 pub fn beginWait(self: *Picker, text: []const u8) !void {
-    self.freeOptions();
-    self.options = &.{};
-    self.cursor = 0;
-    self.rotation = 0;
-    self.current = null;
+    const owned = try self.gpa.dupe(u8, text);
+    self.body.deinit(self.gpa);
+    self.body = .{ .wait = .{ .text = owned } };
     self.window = .{};
-    self.wait = text;
-    errdefer {
-        self.wait = null;
-        self.marks.clearRetainingCapacity();
-        self.content.clearRetainingCapacity();
-        self.line_roles.clearRetainingCapacity();
-    }
     try self.compose();
 }
 
-fn freeOptions(self: *Picker) void {
-    for (self.options) |*option| option.deinit(self.gpa);
-    self.gpa.free(self.options);
+pub fn cursor(self: *const Picker) ?usize {
+    return switch (self.body) {
+        .list => |*list| list.cursor,
+        .wait => null,
+    };
 }
 
 pub fn position(self: *const Picker) Position {
-    return .{ .cursor = self.cursor, .scroll = self.window.scroll, .rotation = self.rotation };
+    return switch (self.body) {
+        .list => |*list| .{
+            .cursor = list.cursor,
+            .scroll = self.window.scroll,
+            .rotation = list.rotation,
+        },
+        .wait => .{},
+    };
+}
+
+pub fn activity(self: *const Picker) ?paint.Activity {
+    return switch (self.body) {
+        .list => null,
+        .wait => |*wait| .{ .style = .sweep, .motion_tick = wait.tick },
+    };
+}
+
+pub fn advanceFrame(self: *Picker) void {
+    switch (self.body) {
+        .list => {},
+        .wait => |*wait| wait.tick +%= 1,
+    }
 }
 
 pub fn moveUp(self: *Picker) !void {
-    if (self.options.len == 0) return;
-    self.cursor = if (self.cursor == 0) self.options.len - 1 else self.cursor - 1;
+    const list = self.activeList() orelse return;
+    if (list.options.len == 0) return;
+    list.cursor = if (list.cursor == 0) list.options.len - 1 else list.cursor - 1;
     try self.compose();
 }
 
 pub fn moveDown(self: *Picker) !void {
-    if (self.options.len == 0) return;
-    self.cursor = if (self.cursor + 1 >= self.options.len) 0 else self.cursor + 1;
+    const list = self.activeList() orelse return;
+    if (list.options.len == 0) return;
+    list.cursor = if (list.cursor + 1 >= list.options.len) 0 else list.cursor + 1;
     try self.compose();
 }
 
 pub fn rotateUp(self: *Picker) !void {
-    if (self.options.len == 0) return;
-    self.rotation = (self.rotation + self.options.len - 1) % self.options.len;
+    const list = self.activeList() orelse return;
+    if (list.options.len == 0) return;
+    list.rotation = (list.rotation + list.options.len - 1) % list.options.len;
     try self.moveUp();
 }
 
 pub fn rotateDown(self: *Picker) !void {
-    if (self.options.len == 0) return;
-    self.rotation = (self.rotation + 1) % self.options.len;
+    const list = self.activeList() orelse return;
+    if (list.options.len == 0) return;
+    list.rotation = (list.rotation + 1) % list.options.len;
     try self.moveDown();
+}
+
+fn activeList(self: *Picker) ?*List {
+    return switch (self.body) {
+        .list => |*list| list,
+        .wait => null,
+    };
 }
 
 pub fn reflow(self: *Picker, size: terminal.View.Size) !void {
@@ -212,15 +274,11 @@ fn extent(self: *const Picker, size: terminal.View.Size) paint.Window.Extent {
     };
 }
 
-pub fn render(
-    self: *const Picker,
-    placement: *const paint.Placement,
-    options: *const paint.RenderOptions,
-) !void {
+pub fn render(self: *const Picker, placement: *const paint.Placement, viewport_rows: usize) !void {
     const caption_rows = try self.renderCaption(placement);
     const shown = self.window.shown(self.extent(.{
         .columns = placement.columns,
-        .rows = options.viewport_rows,
+        .rows = viewport_rows,
     }));
     var frame_placement = placement.*;
     frame_placement.base = placement.base + caption_rows;
@@ -231,7 +289,7 @@ pub fn render(
         .hidden_below = shown.hidden_below,
         .line_roles = self.line_roles.items,
         .marks = self.marks.items,
-        .activity = options.activity,
+        .activity = self.activity(),
     });
 }
 
@@ -246,12 +304,10 @@ fn captionRows(self: *const Picker, columns: usize) usize {
 fn caption(self: *const Picker) Caption {
     return .{
         .title = self.title,
-        .controls = if (self.wait != null)
-            hint_wait
-        else if (self.can_step_back)
-            hint_back
-        else
-            hint_cancel,
+        .controls = switch (self.body) {
+            .list => |*list| if (list.can_step_back) hint_back else hint_cancel,
+            .wait => hint_wait,
+        },
         .rows_max = 3,
     };
 }
@@ -261,19 +317,23 @@ fn compose(self: *Picker) !void {
     self.line_roles.clearRetainingCapacity();
     self.marks.clearRetainingCapacity();
     self.cursor_offset = 0;
-
-    if (self.wait) |text| {
-        try self.startLine(.muted);
-        try self.content.appendSlice(self.gpa, pad_plain);
-        try self.content.appendSlice(self.gpa, text);
-        return self.cut(.{ .start = 0, .columns_max = self.columns });
+    switch (self.body) {
+        .list => |*list| try self.composeList(list),
+        .wait => |*wait| {
+            try self.startLine(.muted);
+            try self.content.appendSlice(self.gpa, pad_plain);
+            try self.content.appendSlice(self.gpa, wait.text);
+            try self.cut(.{ .start = 0, .columns_max = self.columns });
+        },
     }
+}
 
-    for (0..self.options.len) |row_index| {
-        const index = (self.rotation + row_index) % self.options.len;
-        const option = &self.options[index];
-        const chosen = index == self.cursor;
-        const current = self.current == index;
+fn composeList(self: *Picker, list: *const List) !void {
+    for (0..list.options.len) |row_index| {
+        const index = (list.rotation + row_index) % list.options.len;
+        const option = &list.options[index];
+        const chosen = index == list.cursor;
+        const current = list.current == index;
         const line_role: role.Name = if (chosen) .selection else .text;
         try self.startLine(line_role);
         if (chosen) self.cursor_offset = self.content.items.len;
@@ -371,24 +431,19 @@ test "navigation rolls over at both ends and the cursor tracks the selection" {
     defer picker.deinit();
 
     try picker.moveUp();
-    try std.testing.expectEqual(@as(usize, 1), picker.cursor);
+    try std.testing.expectEqual(@as(usize, 1), picker.cursor().?);
     try picker.moveDown();
-    try std.testing.expectEqual(@as(usize, 0), picker.cursor);
+    try std.testing.expectEqual(@as(usize, 0), picker.cursor().?);
     try picker.moveDown();
-    try std.testing.expectEqual(@as(usize, 1), picker.cursor);
+    try std.testing.expectEqual(@as(usize, 1), picker.cursor().?);
     try picker.moveDown();
-    try std.testing.expectEqual(@as(usize, 0), picker.cursor);
+    try std.testing.expectEqual(@as(usize, 0), picker.cursor().?);
 }
 
 fn testPicker(gpa: std.mem.Allocator, labels: []const []const u8, start: *const Start) !Picker {
     const options = try gpa.alloc(Option, labels.len);
-    errdefer gpa.free(options);
-    var count: usize = 0;
-    errdefer for (options[0..count]) |*option| option.deinit(gpa);
-    for (labels, options) |label, *option| {
-        option.* = .{ .name = try gpa.dupe(u8, label) };
-        count += 1;
-    }
+    defer gpa.free(options);
+    for (labels, options) |label, *option| option.* = .{ .name = label };
     return try Picker.init(gpa, "Pick", options, start);
 }
 
@@ -428,23 +483,13 @@ test "the frame holds the option rows alone and the caption stays above it" {
 
 test "a current name is underlined, an extra is muted, and pressure is warning" {
     const gpa = std.testing.allocator;
-    const options = try gpa.alloc(Option, 4);
-    options[0] = .{ .name = try gpa.dupe(u8, "high") };
-    options[1] = .{
-        .name = try gpa.dupe(u8, "medium"),
-        .extra = try gpa.dupe(u8, "The model folds this level to low."),
+    const options = [_]Option{
+        .{ .name = "high" },
+        .{ .name = "medium", .extra = "The model folds this level to low." },
+        .{ .name = "max", .extra = "The model drops this level.", .extra_pressure = true },
+        .{ .name = "google-cloud-key", .tag = "Not loaded", .tag_pressure = true },
     };
-    options[2] = .{
-        .name = try gpa.dupe(u8, "max"),
-        .extra = try gpa.dupe(u8, "The model drops this level."),
-        .extra_pressure = true,
-    };
-    options[3] = .{
-        .name = try gpa.dupe(u8, "google-cloud-key"),
-        .tag = try gpa.dupe(u8, "Not loaded"),
-        .tag_pressure = true,
-    };
-    var picker = try Picker.init(gpa, "Pick", options, &.{ .current = 0, .preselected = 1 });
+    var picker = try Picker.init(gpa, "Pick", &options, &.{ .current = 0, .preselected = 1 });
     defer picker.deinit();
     const size: terminal.View.Size = .{ .columns = 80, .rows = 24 };
     const painted = try renderForTest(gpa, &picker, size);
@@ -465,9 +510,9 @@ test "option text is not extra or tag chrome" {
         "Notes · The output limit is unknown.",
         "google-cloud-key (Not loaded)",
     };
-    const options = try gpa.alloc(Option, labels.len);
-    for (labels, options) |label, *option| option.* = .{ .name = try gpa.dupe(u8, label) };
-    var picker = try Picker.init(gpa, "Skill", options, &.{});
+    var options: [labels.len]Option = undefined;
+    for (labels, &options) |label, *option| option.* = .{ .name = label };
+    var picker = try Picker.init(gpa, "Skill", &options, &.{});
     defer picker.deinit();
 
     const painted = try renderForTest(gpa, &picker, .{ .columns = 80, .rows = 24 });
@@ -484,7 +529,7 @@ fn renderForTest(
     rig.init(gpa);
     defer rig.deinit();
     const placement = try rig.begin(&.{ .columns = size.columns, .rows = size.rows, .pages = 4 });
-    try picker.render(&placement, &.{ .viewport_rows = size.rows });
+    try picker.render(&placement, size.rows);
     return gpa.dupe(u8, try rig.painted());
 }
 
@@ -511,36 +556,34 @@ test "a list that waits drops its rows, states the wait, and moves its frame edg
     });
     defer picker.deinit();
     const size: terminal.View.Size = .{ .columns = 60, .rows = 24 };
+    const listed = try renderForTest(gpa, &picker, size);
+    defer gpa.free(listed);
+    try testing.expectHides(listed, &.{"━"});
 
     try picker.beginWait("Drinky fetches the model list.");
     try picker.reflow(size);
-    try std.testing.expectEqual(@as(usize, 0), picker.cursor);
+    try std.testing.expect(picker.cursor() == null);
     try std.testing.expectEqual(@as(usize, 4), picker.rows(size));
 
     try picker.moveDown();
     try picker.moveUp();
-    try std.testing.expectEqual(@as(usize, 0), picker.cursor);
+    try std.testing.expect(picker.cursor() == null);
 
     const painted = try renderForTest(gpa, &picker, size);
     defer gpa.free(painted);
     try testing.expectShows(painted, &.{
         "Esc: Cancel",
         comptime role.sequence(.muted) ++ "   Drinky fetches the model list.",
+        "━",
     });
     try testing.expectHides(painted, &.{ "Esc: Back", "Enter: Select", "claude", "Refresh" });
     try testing.expectHides(painted, &.{"(Current)"});
     try std.testing.expectEqual(@as(usize, 4), testing.paintedRows(painted));
-    try testing.expectHides(painted, &.{"━"});
 
-    var rig: testing.Rig = undefined;
-    rig.init(gpa);
-    defer rig.deinit();
-    const placement = try rig.begin(&.{ .columns = size.columns, .rows = size.rows, .pages = 4 });
-    try picker.render(&placement, &.{
-        .viewport_rows = size.rows,
-        .activity = .{ .motion_tick = 3, .progress_age_ticks = 0 },
-    });
-    try testing.expectShows(try rig.painted(), &.{"━"});
+    picker.advanceFrame();
+    const moved = try renderForTest(gpa, &picker, size);
+    defer gpa.free(moved);
+    try std.testing.expect(!std.mem.eql(u8, painted, moved));
 }
 
 test "the opening row applies the preselection, current value, and saved position" {
@@ -576,7 +619,7 @@ test "the opening row applies the preselection, current value, and saved positio
     }) |case| {
         var picker = try testPicker(gpa, &labels, &case.start);
         defer picker.deinit();
-        try std.testing.expectEqual(case.cursor, picker.cursor);
+        try std.testing.expectEqual(case.cursor, picker.cursor().?);
         try std.testing.expectEqual(case.scroll, picker.window.scroll);
         const size: terminal.View.Size = .{ .columns = 80, .rows = 24 };
         try picker.reflow(size);
@@ -592,7 +635,7 @@ test "the opening row applies the preselection, current value, and saved positio
 
     var empty = try testPicker(gpa, &.{}, &.{ .position = .{ .cursor = 4 } });
     defer empty.deinit();
-    try std.testing.expectEqual(@as(usize, 0), empty.cursor);
+    try std.testing.expectEqual(@as(usize, 0), empty.cursor().?);
 }
 
 test "the key hint states the step above a later step" {
@@ -687,7 +730,7 @@ test "a tall option list scrolls the window to keep the selection in view" {
         try picker.moveDown();
         try picker.reflow(size);
     }
-    try std.testing.expectEqual(@as(usize, 19), picker.cursor);
+    try std.testing.expectEqual(@as(usize, 19), picker.cursor().?);
     try std.testing.expectEqual(@as(usize, 14), picker.window.scroll);
 
     const bottom = try renderForTest(gpa, &picker, size);
@@ -703,7 +746,7 @@ test "a tall option list scrolls the window to keep the selection in view" {
         try picker.moveUp();
         try picker.reflow(size);
     }
-    try std.testing.expectEqual(@as(usize, 0), picker.cursor);
+    try std.testing.expectEqual(@as(usize, 0), picker.cursor().?);
     try std.testing.expectEqual(@as(usize, 0), picker.window.scroll);
 
     const top = try renderForTest(gpa, &picker, size);
@@ -717,7 +760,7 @@ test "a tall option list scrolls the window to keep the selection in view" {
 
     try picker.moveUp();
     try picker.reflow(size);
-    try std.testing.expectEqual(@as(usize, 19), picker.cursor);
+    try std.testing.expectEqual(@as(usize, 19), picker.cursor().?);
     try std.testing.expectEqual(@as(usize, 14), picker.window.scroll);
 }
 
@@ -749,7 +792,7 @@ test "a wheel turn rotates the options under a fixed selection row, and arrows k
         _ = lines.next();
         for (turn.rows) |row| try std.testing.expectEqualStrings(row, lines.next().?);
     }
-    try std.testing.expectEqual(@as(usize, 0), picker.cursor);
+    try std.testing.expectEqual(@as(usize, 0), picker.cursor().?);
 
     try picker.moveDown();
     try picker.reflow(size);
@@ -774,6 +817,6 @@ test "a wheel turn rotates the options under a fixed selection row, and arrows k
         try tall.rotateDown();
         try tall.reflow(short);
     }
-    try std.testing.expectEqual(@as(usize, 3), tall.cursor);
+    try std.testing.expectEqual(@as(usize, 3), tall.cursor().?);
     try std.testing.expectEqual(@as(usize, 3), tall.window.scroll);
 }

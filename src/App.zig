@@ -1069,7 +1069,7 @@ fn startFlow(self: *App, step: Flow.Step) !void {
 fn openStep(self: *App, step: Flow.Step) !void {
     const flow = &self.flow.?;
     const resolved = Flow.resolve(self.controller, step);
-    if (!std.meta.eql(flow.step, resolved)) flow.push(self.screen.activePicker().?.cursor);
+    if (!std.meta.eql(flow.step, resolved)) flow.push(self.screen.activePicker().?.cursor().?);
     try self.showStep(resolved, .{});
 }
 fn showStep(self: *App, step: Flow.Step, options: struct { cursor: ?usize = null }) !void {
@@ -1101,7 +1101,7 @@ fn backFlow(self: *App) !void {
 }
 fn selectRow(self: *App) !void {
     const flow = &self.flow.?;
-    const item = flow.target(self.screen.activePicker().?.cursor);
+    const item = flow.target(self.screen.activePicker().?.cursor().?);
     switch (item) {
         .command => |value| try self.runCommand(value, "", .help),
         .vendor => |account| try self.openStep(.{ .account = account }),

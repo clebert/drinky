@@ -92,7 +92,7 @@ pub const Change = union(enum) {
 pub const Widget = union(enum) {
     prompt,
     turn: Turn,
-    picking: Picking,
+    picking: ui.Picker,
     page: ui.Page,
 };
 
@@ -137,6 +137,7 @@ pub const Turn = struct {
 
     fn activity(self: *const Turn) ui.paint.Activity {
         return .{
+            .style = .sweep,
             .motion_tick = self.activity_tick,
             .progress_age_ticks = self.activity_tick -% self.progress_tick_last,
             .caret_tick = self.caret_tick,
@@ -309,24 +310,6 @@ pub const Call = struct {
     }
 };
 
-const Picking = struct {
-    picker: ui.Picker,
-    title: []const u8,
-    wait_text: []const u8 = "",
-    wait_tick: ?u64,
-
-    fn deinit(self: *Picking, gpa: std.mem.Allocator) void {
-        self.picker.deinit();
-        gpa.free(self.title);
-        gpa.free(self.wait_text);
-    }
-
-    fn activity(self: *const Picking) ?ui.paint.Activity {
-        const tick = self.wait_tick orelse return null;
-        return .{ .motion_tick = tick, .progress_age_ticks = 0 };
-    }
-};
-
 pub fn init(gpa: std.mem.Allocator, writer: *std.Io.Writer, effort: application.Effort) Screen {
     var self: Screen = .{
         .gpa = gpa,
@@ -393,7 +376,7 @@ fn deinitWidget(self: *Screen) void {
     switch (self.widget) {
         .prompt => {},
         .turn => |*turn| turn.deinit(self.gpa),
-        .picking => |*picking| picking.deinit(self.gpa),
+        .picking => |*picker| picker.deinit(),
         .page => |*page| page.deinit(),
     }
 }
@@ -686,19 +669,7 @@ pub fn setDraft(self: *Screen, text: []const u8) !void {
 
 pub fn openPicker(self: *Screen, options: *const PickerOptions) !void {
     const step = self.stepPosition(options.depth);
-    const title = try self.gpa.dupe(u8, options.title);
-    errdefer self.gpa.free(title);
-    const owned = try self.gpa.alloc(ui.Picker.Option, options.options.len);
-    var count: usize = 0;
-    errdefer {
-        for (owned[0..count]) |*option| option.deinit(self.gpa);
-        self.gpa.free(owned);
-    }
-    for (options.options, owned) |*source, *target| {
-        target.* = try source.dupe(self.gpa);
-        count += 1;
-    }
-    const picker = try ui.Picker.init(self.gpa, title, owned, &.{
+    const picker = try ui.Picker.init(self.gpa, options.title, options.options, &.{
         .current = options.current,
         .preselected = options.preselected,
         .position = if (options.cursor) |cursor| .{
@@ -709,7 +680,7 @@ pub fn openPicker(self: *Screen, options: *const PickerOptions) !void {
         .can_step_back = options.depth > 0,
     });
     self.leaveWidget();
-    self.widget = .{ .picking = .{ .picker = picker, .title = title, .wait_tick = null } };
+    self.widget = .{ .picking = picker };
     self.picker_depth = options.depth;
 }
 
@@ -727,8 +698,8 @@ fn stepPosition(self: *Screen, depth: usize) ui.Picker.Position {
 
 pub fn closePicker(self: *Screen) void {
     switch (self.widget) {
-        .picking => |*picking| {
-            picking.deinit(self.gpa);
+        .picking => |*picker| {
+            picker.deinit();
             self.widget = .prompt;
         },
         .prompt, .turn, .page => {},
@@ -736,13 +707,7 @@ pub fn closePicker(self: *Screen) void {
 }
 
 pub fn beginPickerWait(self: *Screen, text: []const u8) !void {
-    const picking = &self.widget.picking;
-    const owned = try self.gpa.dupe(u8, text);
-    errdefer self.gpa.free(owned);
-    try picking.picker.beginWait(owned);
-    self.gpa.free(picking.wait_text);
-    picking.wait_text = owned;
-    picking.wait_tick = 0;
+    try self.widget.picking.beginWait(text);
 }
 
 pub fn openPage(self: *Screen, options: *const ui.Page.Options) !void {
@@ -911,12 +876,9 @@ pub fn paint(
                 },
             };
         },
-        .picking => |*picking| picking: {
-            try picking.picker.reflow(size);
-            break :picking .{ .picking = .{
-                .picker = &picking.picker,
-                .activity = picking.activity(),
-            } };
+        .picking => |*picker| picking: {
+            try picker.reflow(size);
+            break :picking .{ .picking = picker };
         },
         .page => unreachable,
     };
@@ -972,10 +934,10 @@ pub fn advanceFrame(self: *Screen, now_ms: i64) bool {
             const activity = turn.activity();
             activity_changed = ui.paint.activityChanged(&activity, self.columns);
         },
-        .picking => |*picking| if (picking.wait_tick) |*tick| {
-            tick.* +%= 1;
-            const activity = picking.activity().?;
-            activity_changed = ui.paint.activityChanged(&activity, self.columns);
+        .picking => |*picker| {
+            picker.advanceFrame();
+            if (picker.activity()) |activity|
+                activity_changed = ui.paint.activityChanged(&activity, self.columns);
         },
         .page => |*page| if (self.pageWaiting(page)) {
             const wait = &self.page_wait.?;
@@ -989,7 +951,7 @@ pub fn advanceFrame(self: *Screen, now_ms: i64) bool {
 pub fn animating(self: *const Screen) bool {
     return switch (self.widget) {
         .turn => true,
-        .picking => |*picking| picking.wait_tick != null,
+        .picking => |*picker| picker.activity() != null,
         .page => |*page| self.pageWaiting(page),
         .prompt => false,
     };
@@ -997,7 +959,7 @@ pub fn animating(self: *const Screen) bool {
 
 pub fn activePicker(self: *Screen) ?*ui.Picker {
     return switch (self.widget) {
-        .picking => |*picking| &picking.picker,
+        .picking => |*picker| picker,
         .prompt, .turn, .page => null,
     };
 }
@@ -3372,13 +3334,13 @@ test "a step back restores the scroll row and the rotation of the parent picker"
     gpa.free(try rig.paintPlain(80));
     const parent = rig.screen.activePicker().?;
     const scroll = parent.window.scroll;
-    const cursor = parent.cursor;
+    const cursor = parent.cursor().?;
     try std.testing.expect(scroll > 0);
     try rig.screen.openPicker(&.{ .title = "Child", .options = options[0..2], .depth = 1 });
     try rig.screen.openPicker(&.{ .title = "Parent", .options = &options, .cursor = cursor });
     gpa.free(try rig.paintPlain(80));
     try std.testing.expectEqual(scroll, rig.screen.activePicker().?.window.scroll);
-    try std.testing.expectEqual(@as(usize, 5), rig.screen.activePicker().?.rotation);
+    try std.testing.expectEqual(@as(usize, 5), rig.screen.activePicker().?.position().rotation);
 }
 
 test "a picker position restores the selected row" {
@@ -3396,7 +3358,7 @@ test "a picker position restores the selected row" {
     defer gpa.free(painted);
     try testing.expectContains(painted, "> third");
     try rig.screen.openPicker(&.{ .title = "Step", .options = &options });
-    try std.testing.expectEqual(@as(usize, 0), rig.screen.activePicker().?.cursor);
+    try std.testing.expectEqual(@as(usize, 0), rig.screen.activePicker().?.cursor().?);
     rig.screen.closePicker();
 }
 
@@ -3495,7 +3457,7 @@ test "a snapshot keeps a local picker with its position and its wait" {
         const scroll = rig.screen.activePicker().?.window.scroll;
         try std.testing.expect(scroll > 0);
         try rig.screen.restore(&snapshot);
-        try std.testing.expectEqual(names.len - 1, rig.screen.activePicker().?.cursor);
+        try std.testing.expectEqual(names.len - 1, rig.screen.activePicker().?.cursor().?);
         try rig.screen.paint(size, rig.time, &no_caption);
         try std.testing.expectEqual(scroll, rig.screen.activePicker().?.window.scroll);
         try testing.expectContains(rig.screen.activePicker().?.content.items, " > row19");
