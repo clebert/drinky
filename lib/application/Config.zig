@@ -20,10 +20,12 @@ window_pages: usize = Settings.window_pages_default,
 verbose: bool = (Settings{}).verbose,
 mcp_access: bool = (Settings{}).mcp_access,
 gauge: Settings.Gauge = .{},
+animation: Settings.Animation = (Settings{}).animation,
 effort_default: ?core.Provider.Effort = null,
 user_instructions: discovery.instructions.Result,
 required_skills: []const RequiredSkill = &.{},
 effort_dropped: ?[]const u8 = null,
+animation_dropped: ?[]const u8 = null,
 bash_timeout_ms_dropped: ?u64 = null,
 window_pages_dropped: ?usize = null,
 gauge_dropped: ?Settings.Gauge = null,
@@ -92,6 +94,7 @@ const File = struct {
         mcp_access: bool = (Settings{}).mcp_access,
         gauge_percent_warning: f64 = gauge_default.percent_warning,
         gauge_percent_error: f64 = gauge_default.percent_error,
+        animation: JsonString = .{ .value = @tagName((Settings{}).animation) },
     };
 };
 
@@ -256,6 +259,12 @@ const keys = [_]Key{
         ),
     },
     .{
+        .path = "interface.animation",
+        .description = "The frame animation of the frontend while Drinky works. It takes one " ++
+            "of: " ++ animation_names ++ ". Drinky reports a name that it does not know and " ++
+            "keeps the default.",
+    },
+    .{
         .path = "default_effort",
         .description = "The reasoning effort that a session starts on. Drinky folds a level " ++
             "that the model does not support onto the nearest one it does. Only a new " ++
@@ -417,6 +426,7 @@ fn joinNames(comptime list: []const []const u8) []const u8 {
 }
 
 const effort_levels = joinNames(@typeInfo(core.Provider.Effort).@"enum".field_names);
+const animation_names = joinNames(@typeInfo(Settings.Animation).@"enum".field_names);
 
 const settings_lines = lines: {
     var text: []const u8 = "";
@@ -503,6 +513,7 @@ pub fn deinit(self: *Config, gpa: std.mem.Allocator) void {
     }
     gpa.free(self.required_skills);
     if (self.effort_dropped) |name| gpa.free(name);
+    if (self.animation_dropped) |name| gpa.free(name);
     for (self.unknown_keys) |key| gpa.free(key);
     gpa.free(self.unknown_keys);
 }
@@ -517,6 +528,10 @@ pub fn reports(
     if (self.effort_dropped) |dropped| try result.add(gpa, &.{ .effort_unknown = .{
         .value = dropped,
         .used = options.effort,
+    } });
+    if (self.animation_dropped) |dropped| try result.add(gpa, &.{ .animation_unknown = .{
+        .value = dropped,
+        .used = self.animation,
     } });
     if (self.bash_timeout_ms_dropped) |dropped| try result.add(gpa, &.{ .bash_timeout_ignored = .{
         .value = dropped,
@@ -637,6 +652,14 @@ fn loadFromData(gpa: std.mem.Allocator, io: std.Io, options: *const DataOptions)
         &effort_dropped,
         if (parsed.value.default_effort) |name| name.value else null,
     );
+    var animation_dropped: ?[]const u8 = null;
+    errdefer if (animation_dropped) |name| gpa.free(name);
+    const animation = try resolveEnum(
+        Settings.Animation,
+        gpa,
+        &animation_dropped,
+        interface.animation.value,
+    ) orelse (Settings{}).animation;
     var bash_timeout_ms_dropped: ?u64 = null;
     const bash_timeout_ms = resolveBashTimeout(&bash_timeout_ms_dropped, bash.timeout_ms);
     var window_pages_dropped: ?usize = null;
@@ -676,10 +699,12 @@ fn loadFromData(gpa: std.mem.Allocator, io: std.Io, options: *const DataOptions)
         .verbose = interface.verbose,
         .mcp_access = interface.mcp_access,
         .gauge = gauge,
+        .animation = animation,
         .effort_default = effort_default,
         .user_instructions = user_instructions,
         .required_skills = required_skills,
         .effort_dropped = effort_dropped,
+        .animation_dropped = animation_dropped,
         .bash_timeout_ms_dropped = bash_timeout_ms_dropped,
         .window_pages_dropped = window_pages_dropped,
         .gauge_dropped = gauge_dropped,
@@ -1148,6 +1173,35 @@ test "load resolves default_effort, dropping an unknown level" {
     try std.testing.expect(empty.effort_dropped == null);
 }
 
+test "load resolves the animation, and an unknown name keeps the default and is reported" {
+    var config = try loadDataForTest(
+        \\{ "interface": { "animation": "sweep" } }
+    );
+    defer config.deinit(std.testing.allocator);
+    try std.testing.expectEqual(Settings.Animation.sweep, config.animation);
+    try std.testing.expect(config.animation_dropped == null);
+
+    var empty = try loadDataForTest("{}");
+    defer empty.deinit(std.testing.allocator);
+    try std.testing.expectEqual((Settings{}).animation, empty.animation);
+    try std.testing.expect(empty.animation_dropped == null);
+
+    var dropped = try loadDataForTest(
+        \\{ "interface": { "animation": "bounce" } }
+    );
+    defer dropped.deinit(std.testing.allocator);
+    try std.testing.expectEqual((Settings{}).animation, dropped.animation);
+    var report = try dropped.reports(std.testing.allocator, .{
+        .effort = .high,
+        .required_capped = false,
+    });
+    defer report.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), report.events().len);
+    const unknown = report.events()[0].animation_unknown;
+    try std.testing.expectEqualStrings("bounce", unknown.value);
+    try std.testing.expectEqual((Settings{}).animation, unknown.used);
+}
+
 test "a configured name must be a JSON string" {
     try expectLoadError(error.UnexpectedToken,
         \\{ "user_instructions": { "path": "instructions.md" } }
@@ -1241,6 +1295,7 @@ test "the config document names the file, each key, and each limit, and its exam
         ),
         "- `default_effort` — string, default: unset.",
         "- `interface.verbose` — boolean, default: false.",
+        "- `interface.animation` — string, default: orbit.",
         "- `user_instructions[].path` — string, required.",
     };
     for (stated_keys) |line| try std.testing.expect(std.mem.find(u8, text, line) != null);
@@ -1385,6 +1440,7 @@ fn checkLoadAllocationFailure(gpa: std.mem.Allocator, io: std.Io, home: []const 
     try std.testing.expectEqual(@as(usize, 1), config.user_instructions.files().len);
     try std.testing.expectEqual(@as(usize, 1), config.user_instructions.reports.events().len);
     try std.testing.expect(config.effort_dropped != null);
+    try std.testing.expect(config.animation_dropped != null);
     try std.testing.expectEqual(@as(usize, 3), config.unknown_keys.len);
     var reports_result = try config.reports(gpa, .{ .effort = .xhigh, .required_capped = false });
     defer reports_result.deinit(gpa);
@@ -1405,7 +1461,7 @@ test "the config load frees every partial allocation" {
         .data =
         \\{ "user_instructions": [{ "path": "first.md" }, { "path": "missing.md" }],
         \\  "future": { "openai-api-key": "nope" }, "default_effort": "nope",
-        \\  "unknown": 1, "interface": { "transcript_mode": "unknown" } }
+        \\  "unknown": 1, "interface": { "transcript_mode": "unknown", "animation": "nope" } }
         ,
     });
     const home = tree.root;

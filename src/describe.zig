@@ -17,6 +17,7 @@ const config_keys = struct {
         "interface.gauge_percent_warning",
     );
     const gauge_percent_error = application.support.config.keyPath("interface.gauge_percent_error");
+    const animation = application.support.config.keyPath("interface.animation");
     const bash_timeout = application.support.config.keyPath("bash.timeout_ms");
 };
 
@@ -271,7 +272,16 @@ fn writePreferences(writer: *std.Io.Writer) std.Io.Writer.Error!void {
             "A verbosity toggle or terminal reset repaints the complete transcript.\n\n" ++
             "The config keys `" ++ config_keys.gauge_percent_warning ++ "` and " ++
             "`" ++ config_keys.gauge_percent_error ++ "` set the warning and error colors. " ++
-            "The context gauge and quota windows use those thresholds.\n",
+            "The context gauge and quota windows use those thresholds.\n\n" ++
+            "The frame of the editor or a picker animates while Drinky works. " ++
+            "The config key `" ++ config_keys.animation ++ "` selects the animation. " ++
+            "Each animation moves a heavy segment. An orbit segment circles the frame. " ++
+            "A sweep segment crosses the top edge, then the bottom edge. " ++
+            "In a turn, the segment grows when the turn reports no new data for " ++
+            "0.5 seconds. A running timer does not count as new data. " ++
+            "The segment stops at the width of one frame edge. " ++
+            "New data gives it its normal length again. " ++
+            "The segment uses the cyan color of the terminal palette.\n",
     );
 }
 
@@ -399,7 +409,7 @@ fn checkReference(gpa: std.mem.Allocator) !void {
     for ([_][]const u8{
         config_keys.verbose,             config_keys.mcp_access,
         config_keys.window_pages,        config_keys.gauge_percent_warning,
-        config_keys.gauge_percent_error,
+        config_keys.gauge_percent_error, config_keys.animation,
     }) |key| try std.testing.expect(std.mem.find(u8, text[preferences..headless], key) != null);
     for ([_][]const u8{
         application.reference.effort_levels,    application.support.environment.model,

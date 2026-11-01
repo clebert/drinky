@@ -9,9 +9,10 @@ const Message = @import("Message.zig");
 const role = @import("role.zig");
 const testing = @import("testing.zig");
 
-const sweep_length_default: usize = 6;
-const sweep_growth_delay_ticks: u64 = 31;
-const sweep_growth_interval_ticks: u64 = 6;
+const segment_length: usize = 6;
+pub const segment_step_ticks: u64 = 2;
+const segment_growth_delay_ticks: u64 = 31;
+const segment_growth_interval_ticks: u64 = 6;
 const caret_blink_ticks: u64 = 37;
 
 pub const NoticeStyle = struct {
@@ -223,12 +224,10 @@ const BoxWrap = struct {
 };
 
 pub const Activity = struct {
-    style: Style,
+    style: application.Settings.Animation,
     motion_tick: u64,
     progress_age_ticks: ?u64 = null,
     caret_tick: ?u64 = null,
-
-    pub const Style = enum { sweep };
 };
 
 const Cut = struct {
@@ -312,21 +311,10 @@ const FrameEdge = enum {
     }
 };
 
-const FrameGlyph = enum {
-    light,
-    heavy,
-    left_light_right_heavy,
-    left_heavy_right_light,
-};
-
 const Frame = struct {
     columns: usize,
     activity: ?Activity,
 };
-
-const FrameCell = struct { glyph: FrameGlyph, active: bool };
-
-const HorizontalWeights = struct { left: bool, right: bool };
 
 const FrameRange = struct { edge: FrameEdge, start: usize, end: usize };
 
@@ -444,10 +432,8 @@ fn segmentCut(
 pub fn activityChanged(activity: *const Activity, columns: usize) bool {
     if (activity.caret_tick) |caret_tick| if (caretBlinkChanged(caret_tick)) return true;
     if (columns == 0) return false;
-    return switch (activity.style) {
-        .sweep => sweepHead(activity.motion_tick, columns) !=
-            sweepHead(activity.motion_tick -% 1, columns),
-    };
+    return activity.motion_tick % segment_step_ticks == 0 or
+        trackGrew(activity.progress_age_ticks, columns);
 }
 
 pub const ellipsis = "…";
@@ -799,73 +785,89 @@ fn drawFrameRange(
     options: *const FrameRange,
 ) !void {
     std.debug.assert(options.start <= options.end and options.end <= frame.columns);
-    var first = true;
-    var active = false;
     var column = options.start;
     while (column < options.end) {
-        const cell = frameCell(frame, options.edge, column);
-        if (first or cell.active != active) {
-            first = false;
-            active = cell.active;
-            try role.apply(sink, if (active) .activity else .input_frame);
-        }
+        const active = activityAt(frame, options.edge, column);
         var run_end = column + 1;
-        while (run_end < options.end) : (run_end += 1) {
-            const next = frameCell(frame, options.edge, run_end);
-            if (next.active != cell.active or next.glyph != cell.glyph) break;
+        while (run_end < options.end and
+            activityAt(frame, options.edge, run_end) == active) : (run_end += 1)
+        {}
+        const count = run_end - column;
+        if (active) {
+            try role.apply(sink, .activity);
+            try sink.repeat("━", count);
+        } else {
+            try role.apply(sink, .input_frame);
+            try sink.repeat("─", count);
         }
-        try writeFrameGlyph(sink, cell.glyph, run_end - column);
         column = run_end;
     }
 }
 
-fn frameCell(frame: *const Frame, edge: FrameEdge, column: usize) FrameCell {
-    std.debug.assert(column < frame.columns);
-    const active = activityAt(frame, edge, column);
-    const left = active and column > 0 and activityAt(frame, edge, column - 1);
-    const right = active and column + 1 < frame.columns and
-        activityAt(frame, edge, column + 1);
-    return .{
-        .glyph = if (active)
-            activityGlyph(.{ .left = left, .right = right })
-        else
-            .light,
-        .active = active,
-    };
-}
-
 fn activityAt(frame: *const Frame, edge: FrameEdge, column: usize) bool {
+    std.debug.assert(column < frame.columns);
     const activity = frame.activity orelse return false;
-    const position = switch (edge) {
-        .top => column,
-        .bottom => frame.columns + column,
-    };
-    return switch (activity.style) {
-        .sweep => sweepCovers(&activity, &.{ .columns = frame.columns, .position = position }),
-    };
+    return segmentCovers(&activity, &.{
+        .columns = frame.columns,
+        .edge = edge,
+        .column = column,
+    });
 }
 
-fn sweepCovers(activity: *const Activity, track: *const struct {
+fn segmentCovers(activity: *const Activity, cell: *const struct {
+    columns: usize,
+    edge: FrameEdge,
+    column: usize,
+}) bool {
+    return trackCovers(activity, &.{
+        .columns = cell.columns,
+        .position = switch (cell.edge) {
+            .top => cell.column,
+            .bottom => switch (activity.style) {
+                .orbit => 2 * cell.columns - 1 - cell.column,
+                .sweep => cell.columns + cell.column,
+            },
+        },
+    });
+}
+
+fn trackCovers(activity: *const Activity, track: *const struct {
     columns: usize,
     position: usize,
 }) bool {
+    std.debug.assert(track.columns > 0);
     const track_columns = 2 * track.columns;
-    const head = sweepHead(activity.motion_tick, track.columns);
+    const step = @divFloor(activity.motion_tick, segment_step_ticks);
+    const offset = trackLengthBase(track.columns) - 1;
+    const head: usize = @intCast((step +% offset) % track_columns);
     const distance = if (head >= track.position)
         head - track.position
     else
         track_columns - (track.position - head);
-    return distance < sweepLength(activity.progress_age_ticks, track.columns);
+    return distance < trackLength(activity.progress_age_ticks, track.columns);
 }
 
-fn sweepHead(motion_tick: u64, columns: usize) usize {
+fn trackLengthBase(columns: usize) usize {
     std.debug.assert(columns > 0);
-    const track_columns = 2 * columns;
-    const track_columns_u64: u64 = @intCast(track_columns);
-    const phase: usize = @intCast(motion_tick % track_columns_u64);
-    const offset = @min(sweep_length_default, columns) - 1;
-    const wrap_at = track_columns - offset;
-    return if (phase >= wrap_at) phase - wrap_at else phase + offset;
+    return @min(segment_length, columns);
+}
+
+fn trackLength(maybe_progress_age_ticks: ?u64, columns: usize) usize {
+    const length_base = trackLengthBase(columns);
+    const progress_age_ticks = maybe_progress_age_ticks orelse return length_base;
+    if (progress_age_ticks < segment_growth_delay_ticks) return length_base;
+    const growth_max: u64 = @intCast(columns - length_base);
+    const growth_steps = 1 + @divFloor(
+        progress_age_ticks - segment_growth_delay_ticks,
+        segment_growth_interval_ticks,
+    );
+    return length_base + @as(usize, @intCast(@min(growth_steps, growth_max)));
+}
+
+fn trackGrew(maybe_progress_age_ticks: ?u64, columns: usize) bool {
+    const progress_age_ticks = maybe_progress_age_ticks orelse return false;
+    return progress_age_ticks > 0 and
+        trackLength(progress_age_ticks, columns) != trackLength(progress_age_ticks - 1, columns);
 }
 
 fn caretVisible(caret_tick: u64) bool {
@@ -874,43 +876,6 @@ fn caretVisible(caret_tick: u64) bool {
 
 fn caretBlinkChanged(caret_tick: u64) bool {
     return caret_tick % caret_blink_ticks == 0;
-}
-
-fn sweepLength(maybe_progress_age_ticks: ?u64, columns: usize) usize {
-    std.debug.assert(columns > 0);
-    const length_max = columns;
-    const length_base = @min(sweep_length_default, length_max);
-    const progress_age_ticks = maybe_progress_age_ticks orelse return length_base;
-    const growth_max: u64 = @intCast(length_max - length_base);
-    const growth_steps: u64 = if (progress_age_ticks < sweep_growth_delay_ticks)
-        0
-    else
-        1 + @divFloor(
-            progress_age_ticks - sweep_growth_delay_ticks,
-            sweep_growth_interval_ticks,
-        );
-    return length_base + @as(usize, @intCast(@min(growth_steps, growth_max)));
-}
-
-fn activityGlyph(weights: HorizontalWeights) FrameGlyph {
-    if (weights.left) return if (weights.right)
-        .heavy
-    else
-        .left_heavy_right_light;
-    return if (weights.right) .left_light_right_heavy else .heavy;
-}
-
-fn writeFrameGlyph(
-    sink: *terminal.View.Sink,
-    glyph: FrameGlyph,
-    count: usize,
-) !void {
-    switch (glyph) {
-        .light => try sink.repeat("─", count),
-        .heavy => try sink.repeat("━", count),
-        .left_light_right_heavy => try sink.repeat("╼", count),
-        .left_heavy_right_light => try sink.repeat("╾", count),
-    }
 }
 
 test "the command gutter narrows with the row and keeps one column for text" {
@@ -1032,22 +997,6 @@ test "a box row sheds the carriage return of a CRLF break" {
     try testing.expectHides(painted, &.{"\u{FFFD}"});
 }
 
-test "activity at column zero emits no unused frame role" {
-    const gpa = std.testing.allocator;
-    const painted = try paintedFramed(gpa, 20, &.{
-        .body = "x",
-        .body_rows = 1,
-        .activity = .{ .style = .sweep, .motion_tick = 0 },
-    });
-    defer gpa.free(painted);
-
-    const segment = comptime role.sequence(.activity) ++ "╼━━━━╾" ++
-        role.sequence(.input_frame) ++ "─";
-    try testing.expectShows(painted, &.{segment});
-    const unused = comptime role.sequence(.input_frame) ++ role.sequence(.activity);
-    try testing.expectHides(painted, &.{unused});
-}
-
 test "a frame edge label reads as muted text between the frame glyphs" {
     const gpa = std.testing.allocator;
     const painted = try paintedFramed(gpa, 20, &.{
@@ -1062,84 +1011,160 @@ test "a frame edge label reads as muted text between the frame glyphs" {
     try testing.expectShows(painted, &.{label});
 }
 
-test "a frame edge label resets faint before a right activity segment" {
+test "a segment paints heavy glyphs in the activity role and emits no unused frame role" {
+    const gpa = std.testing.allocator;
+    const painted = try paintedFramed(gpa, 20, &.{
+        .body = "x",
+        .body_rows = 1,
+        .activity = .{ .style = .orbit, .motion_tick = 0 },
+    });
+    defer gpa.free(painted);
+
+    const top = comptime role.sequence(.activity) ++ core.text.repeat("━", 6) ++
+        role.sequence(.input_frame) ++ core.text.repeat("─", 14);
+    try testing.expectShows(painted, &.{top});
+    const unused = comptime role.sequence(.input_frame) ++ role.sequence(.activity);
+    try testing.expectHides(painted, &.{unused});
+}
+
+test "a frame edge label resets faint before a segment that follows it" {
     const gpa = std.testing.allocator;
     const painted = try paintedFramed(gpa, 20, &.{
         .body = core.text.repeat("a\n", 3) ++ "x",
         .body_rows = 1,
         .hidden_above = 3,
-        .activity = .{ .style = .sweep, .motion_tick = 16 },
+        .activity = .{ .style = .orbit, .motion_tick = 14 * segment_step_ticks },
     });
     defer gpa.free(painted);
 
     const segment = comptime role.sequence(.muted) ++ " ↑ Hidden: 3 \x1b[0m" ++
-        role.sequence(.activity) ++ "╼";
+        role.sequence(.activity) ++ core.text.repeat("━", 4);
     try testing.expectShows(painted, &.{segment});
 }
 
-test "one activity segment starts at the top left and crosses both frame edge boundaries" {
-    const light = core.text.repeat("─", 15);
-    try expectEdges(20, null, .{ core.text.repeat("─", 20), core.text.repeat("─", 20) });
-    try expectEdges(20, .{ .style = .sweep, .motion_tick = 0 }, .{
-        "╼━━━━╾" ++ core.text.repeat("─", 14),
-        core.text.repeat("─", 20),
-    });
-    try expectEdges(20, .{ .style = .sweep, .motion_tick = 15 }, .{
-        light ++ "╼━━━╾",
-        "━" ++ core.text.repeat("─", 19),
-    });
-    try expectEdges(20, .{ .style = .sweep, .motion_tick = 35 }, .{
-        "━" ++ core.text.repeat("─", 19),
-        light ++ "╼━━━╾",
-    });
-}
-
-fn expectEdges(columns: usize, activity: ?Activity, edges: [2][]const u8) !void {
-    const gpa = std.testing.allocator;
-    const painted = try paintedFramed(gpa, columns, &.{
-        .body = "x",
-        .body_rows = 1,
-        .activity = activity,
-    });
-    defer gpa.free(painted);
-    const plain = try terminal.testing.plainText(gpa, painted);
-    defer gpa.free(plain);
-    var rows = std.mem.splitSequence(u8, plain, "\r\n");
-    try std.testing.expectEqualStrings(edges[0], rows.next().?);
-    try std.testing.expectEqualStrings("x", rows.next().?);
-    try std.testing.expectEqualStrings(edges[1], rows.next().?);
-}
-
-test "activity moves across the complete virtual line" {
-    const steps = [_][2][]const u8{
-        .{ "╼━━━╾", "─────" },
-        .{ "─╼━━╾", "━────" },
-        .{ "──╼━╾", "╼╾───" },
-        .{ "───╼╾", "╼━╾──" },
-        .{ "────━", "╼━━╾─" },
-        .{ "─────", "╼━━━╾" },
-        .{ "━────", "─╼━━╾" },
-        .{ "╼╾───", "──╼━╾" },
-        .{ "╼━╾──", "───╼╾" },
-        .{ "╼━━╾─", "────━" },
-        .{ "╼━━━╾", "─────" },
+test "each style moves a segment one column per step along its path over both frame edges" {
+    const cases = [_]struct {
+        style: application.Settings.Animation,
+        step: u64,
+        columns: usize,
+        edges: [2][]const u8,
+    }{
+        .{ .style = .orbit, .step = 0, .columns = 10, .edges = .{ "######----", "----------" } },
+        .{ .style = .orbit, .step = 7, .columns = 10, .edges = .{ "-------###", "-------###" } },
+        .{ .style = .orbit, .step = 17, .columns = 10, .edges = .{ "###-------", "###-------" } },
+        .{ .style = .sweep, .step = 7, .columns = 10, .edges = .{ "-------###", "###-------" } },
+        .{ .style = .sweep, .step = 17, .columns = 10, .edges = .{ "###-------", "-------###" } },
+        .{ .style = .orbit, .step = 0, .columns = 1, .edges = .{ "#", "-" } },
+        .{ .style = .orbit, .step = 1, .columns = 1, .edges = .{ "-", "#" } },
     };
-    for (steps, 0..) |edges, tick| {
-        try expectEdges(5, .{ .style = .sweep, .motion_tick = tick }, edges);
+    for (cases) |case| {
+        for (0..segment_step_ticks) |offset| {
+            const activity: Activity = .{
+                .style = case.style,
+                .motion_tick = case.step * segment_step_ticks + offset,
+            };
+            try expectCovered(&activity, case.columns, &case.edges);
+        }
     }
+}
 
-    try std.testing.expect(activityChanged(
-        &.{ .style = .sweep, .motion_tick = 1, .caret_tick = 1 },
-        5,
-    ));
-    try std.testing.expect(activityChanged(
-        &.{ .style = .sweep, .motion_tick = 1, .progress_age_ticks = 31, .caret_tick = 1 },
-        1,
-    ));
-    try std.testing.expect(!activityChanged(
-        &.{ .style = .sweep, .motion_tick = 1, .progress_age_ticks = 31, .caret_tick = 1 },
-        0,
-    ));
+fn expectCovered(activity: *const Activity, columns: usize, edges: *const [2][]const u8) !void {
+    for ([_]FrameEdge{ .top, .bottom }, edges) |edge, expected| {
+        var shown: [10]u8 = undefined;
+        for (shown[0..columns], 0..) |*slot, column| {
+            const covered = segmentCovers(activity, &.{
+                .columns = columns,
+                .edge = edge,
+                .column = column,
+            });
+            slot.* = if (covered) '#' else '-';
+        }
+        try std.testing.expectEqualStrings(expected, shown[0..columns]);
+    }
+}
+
+test "a quiet segment grows at its back up to one frame edge" {
+    const cases = [_]struct {
+        style: application.Settings.Animation,
+        step: u64,
+        age_ticks: ?u64,
+        columns: usize,
+        edges: [2][]const u8,
+    }{
+        .{ .style = .orbit, .step = 0, .age_ticks = null, .columns = 10, .edges = .{
+            "######----",
+            "----------",
+        } },
+        .{ .style = .orbit, .step = 0, .age_ticks = 30, .columns = 10, .edges = .{
+            "######----",
+            "----------",
+        } },
+        .{ .style = .orbit, .step = 0, .age_ticks = 31, .columns = 10, .edges = .{
+            "######----",
+            "#---------",
+        } },
+        .{ .style = .orbit, .step = 0, .age_ticks = 36, .columns = 10, .edges = .{
+            "######----",
+            "#---------",
+        } },
+        .{ .style = .orbit, .step = 0, .age_ticks = 37, .columns = 10, .edges = .{
+            "######----",
+            "##--------",
+        } },
+        .{ .style = .orbit, .step = 7, .age_ticks = 37, .columns = 10, .edges = .{
+            "-----#####",
+            "-------###",
+        } },
+        .{ .style = .orbit, .step = 0, .age_ticks = 1000, .columns = 10, .edges = .{
+            "######----",
+            "####------",
+        } },
+        .{ .style = .sweep, .step = 0, .age_ticks = 37, .columns = 10, .edges = .{
+            "######----",
+            "--------##",
+        } },
+        .{ .style = .orbit, .step = 0, .age_ticks = 1000, .columns = 4, .edges = .{
+            "####",
+            "----",
+        } },
+    };
+    for (cases) |case| {
+        try expectCovered(&.{
+            .style = case.style,
+            .motion_tick = case.step * segment_step_ticks,
+            .progress_age_ticks = case.age_ticks,
+        }, case.columns, &case.edges);
+    }
+}
+
+test "each style repaints at each segment step" {
+    const step = segment_step_ticks;
+    try std.testing.expect(activityChanged(&.{ .style = .orbit, .motion_tick = step }, 5));
+    try std.testing.expect(activityChanged(&.{ .style = .sweep, .motion_tick = step }, 1));
+    try std.testing.expect(!activityChanged(&.{ .style = .orbit, .motion_tick = step }, 0));
+    try std.testing.expect(!activityChanged(&.{ .style = .orbit, .motion_tick = step + 1 }, 5));
+}
+
+test "a segment repaints between steps only when it grows" {
+    const cases = [_]struct {
+        style: application.Settings.Animation,
+        age_ticks: u64,
+        changed: bool,
+    }{
+        .{ .style = .orbit, .age_ticks = 31, .changed = true },
+        .{ .style = .orbit, .age_ticks = 32, .changed = false },
+        .{ .style = .sweep, .age_ticks = 37, .changed = true },
+        .{ .style = .orbit, .age_ticks = 289, .changed = true },
+        .{ .style = .orbit, .age_ticks = 295, .changed = false },
+    };
+    for (cases) |case| {
+        const activity: Activity = .{
+            .style = case.style,
+            .motion_tick = segment_step_ticks + 1,
+            .progress_age_ticks = case.age_ticks,
+        };
+        try std.testing.expectEqual(case.changed, activityChanged(&activity, 50));
+    }
 }
 
 test "each flip of the caret blink repaints" {
@@ -1247,39 +1272,6 @@ test "a line role resumes behind a mark" {
     const row = comptime "\r\n" ++ role.sequence(.muted) ++ "ab" ++ role.sequence(.accent) ++
         "[x]\x1b[0m" ++ role.sequence(.muted) ++ "cd\x1b[0m\r\n";
     try testing.expectShows(painted, &.{row});
-}
-
-test "a sweep grows after a quiet grace period up to one frame edge unless it has no progress age" {
-    const gpa = std.testing.allocator;
-    const cases = [_]struct { age_ticks: ?u64, columns: usize, cells: usize }{
-        .{ .age_ticks = null, .columns = 50, .cells = 6 },
-        .{ .age_ticks = 0, .columns = 50, .cells = 6 },
-        .{ .age_ticks = 30, .columns = 50, .cells = 6 },
-        .{ .age_ticks = 31, .columns = 50, .cells = 7 },
-        .{ .age_ticks = 36, .columns = 50, .cells = 7 },
-        .{ .age_ticks = 37, .columns = 50, .cells = 8 },
-        .{ .age_ticks = 283, .columns = 50, .cells = 49 },
-        .{ .age_ticks = 288, .columns = 50, .cells = 49 },
-        .{ .age_ticks = 289, .columns = 50, .cells = 50 },
-        .{ .age_ticks = 300, .columns = 50, .cells = 50 },
-        .{ .age_ticks = 0, .columns = 4, .cells = 4 },
-        .{ .age_ticks = 0, .columns = 1, .cells = 1 },
-    };
-    for (cases) |case| {
-        const painted = try paintedFramed(gpa, case.columns, &.{
-            .body = "x",
-            .body_rows = 1,
-            .activity = .{
-                .style = .sweep,
-                .motion_tick = 0,
-                .progress_age_ticks = case.age_ticks,
-            },
-        });
-        defer gpa.free(painted);
-        var cells: usize = 0;
-        for ([_][]const u8{ "━", "╼", "╾" }) |glyph| cells += std.mem.count(u8, painted, glyph);
-        try std.testing.expectEqual(case.cells, cells);
-    }
 }
 
 test "overflow labels compact before disappearing" {

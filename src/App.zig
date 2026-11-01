@@ -1806,7 +1806,7 @@ fn borderAbove(rows: []const []const u8, end: usize) ?usize {
     var index = end;
     while (index > 0) {
         index -= 1;
-        for ([_][]const u8{ "─", "━", "╼", "╾" }) |glyph| {
+        for ([_][]const u8{ "─", "━" }) |glyph| {
             if (std.mem.startsWith(u8, rows[index], glyph)) return index;
         }
     }
@@ -3011,7 +3011,8 @@ test "the start reports each dropped config value and each notice" {
         .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
         .config = "{\"default_effort\":\"turbo\",\"bash\":{\"timeout_ms\":1}," ++
             "\"interface\":{\"window_pages\":0,\"gauge_percent_warning\":90," ++
-            "\"gauge_percent_error\":10},\"user_instructions\":[{\"path\":\"missing.md\"}]," ++
+            "\"gauge_percent_error\":10,\"animation\":\"bounce\"}," ++
+            "\"user_instructions\":[{\"path\":\"missing.md\"}]," ++
             "\"required_skills\":[" ++ core.text.repeat(rule ++ ",", tools.SkillGuard.rules_max) ++
             rule ++ "]," ++
             "\"mystery\":1}",
@@ -3029,6 +3030,8 @@ test "the start reports each dropped config value and each notice" {
         .{ .absent = "↑/↓: Move" },
         .{ .text = "Drinky ignored the configured default effort level \"turbo\" because Drinky " ++
             "does not know that level. Drinky uses the effort level \"xhigh\"." },
+        .{ .text = "Drinky ignored the configured animation \"bounce\" because Drinky does not " ++
+            "know that animation. Drinky uses the animation \"orbit\"." },
         .{ .text = "Drinky ignored the configured command timeout 1 because" },
         .{ .text = "Drinky ignored the configured window page count 0 because the count must " ++
             "be from 1 to 64. Drinky uses the default count of 8 pages." },

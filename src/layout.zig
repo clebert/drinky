@@ -26,11 +26,16 @@ pub const Scene = union(enum) {
 pub const Tail = union(enum) {
     prompt: Prompt,
     turn: Turn,
-    picking: *const ui.Picker,
+    picking: Picking,
 
     const Prompt = struct {
         caption: ?ui.Caption,
         editor: *const ui.Editor,
+    };
+
+    const Picking = struct {
+        picker: *const ui.Picker,
+        activity: ?ui.paint.Activity,
     };
 
     const Turn = struct {
@@ -78,7 +83,7 @@ const Component = union(enum) {
     block: *ui.Block,
     tool_box: ui.paint.Box,
     editor: EditorPresentation,
-    picker: *const ui.Picker,
+    picker: Tail.Picking,
     status: *const ui.status.Info,
 
     fn measure(self: *const Component, size: terminal.View.Size) usize {
@@ -87,7 +92,7 @@ const Component = union(enum) {
             .tool_box => |box| ui.paint.boxRows(&box, size.columns),
             .editor => |presentation| presentation.rows(size),
             .status => 1,
-            .picker => |picker| picker.rows(size),
+            .picker => |picking| picking.picker.rows(size),
         };
     }
 
@@ -102,7 +107,10 @@ const Component = union(enum) {
             .tool_box => |box| try ui.paint.box(placement, .text, &box),
             .status => |info| try ui.status.render(placement, info),
             .editor => |presentation| try presentation.render(placement, viewport_rows),
-            .picker => |picker| try picker.render(placement, viewport_rows),
+            .picker => |picking| try picking.picker.render(placement, &.{
+                .viewport_rows = viewport_rows,
+                .activity = picking.activity,
+            }),
         }
     }
 };
@@ -262,8 +270,8 @@ fn tailSlot(tail: *const Tail, offset: usize) Slot {
             .activity = null,
             .caption = prompt.caption,
         }),
-        .picking => |picker| return .{
-            .component = .{ .picker = picker },
+        .picking => |picking| return .{
+            .component = .{ .picker = picking },
             .id = id_input,
             .leading_blank = true,
         },

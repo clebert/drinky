@@ -167,9 +167,12 @@ tool. Everything else is not a finding.
 
 `README.md`, `BACKLOG.md`, this file, and the skills under `.agents/skills/` are the documents.
 Prettier formats every document, and `.prettierrc.json` configures it. `README.md` states the stable
-product and stays concise. `BACKLOG.md` holds the open direction, and a line leaves it when its work
-lands. `TODO.md` is its inbox, and Git ignores it. When a change alters a fact, update every
-document and every text in the code that states the fact.
+product and stays concise. It gives the onboarding facts first and presents the main features and
+integrations. It is no manual. The `describe_drinky` reference documents the commands, the config
+keys, and the key bindings. Ask the user before you document a new feature in `README.md`.
+`BACKLOG.md` holds the open direction, and a line leaves it when its work lands. `TODO.md` is its
+inbox, and Git ignores it. When a change alters a fact, update every document and every text in the
+code that states the fact.
 
 Write the documents and every text that Drinky shows to the user in ASD-STE100 Simplified Technical
 English.

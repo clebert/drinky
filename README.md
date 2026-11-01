@@ -5,7 +5,9 @@ A dependency-free terminal coding agent.
 <img src="www/drinky.png" alt="Drinky" width="400">
 
 Drinky can read, search, and change files or run commands in the working directory. The conversation
-stays in the terminal scrollback. Drinky saves no conversation to resume.
+stays in the terminal scrollback. Drinky saves no conversation to resume. `/handoff` carries the
+current task into a new conversation. It leaves out tool calls and reasoning, so it usually works
+even after a context overflow.
 
 Drinky supports Anthropic, OpenAI, xAI, OpenRouter, DeepSeek, and Gemini Enterprise Agent Platform
 (Vertex AI). It learns models from the providers and uses public metadata for prices and model
@@ -23,6 +25,8 @@ keyboard protocol and grapheme cluster processing gives the best experience.
 zig build -Doptimize=safe
 ./zig-out/bin/drinky
 ```
+
+Type `/` to list the commands. Ask Drinky about its commands, key bindings, or config.
 
 ## Accounts
 
@@ -44,10 +48,21 @@ Use `/login` to sign in or switch accounts. Use `/model` to select a model.
 
 Drinky is not affiliated with the providers.
 
+## Instructions and skills
+
+Drinky reads each `AGENTS.md` file from the Git root down to the working directory. It finds skills
+in `~/.agents/skills/` and in each `.agents/skills/` directory on that path, and loads a skill on
+demand.
+
+The `required_skills` config key pairs a path pattern with a skill. Drinky sends the skill to the
+model when a tool first touches a matching file. It refuses a write or an edit of that file until
+the conversation holds the skill.
+
 ## Headless mode
 
 Use `drinky run` to answer a prompt without a terminal. A run reads the prompt from stdin and writes
-the final reply to stdout. It uses the instructions and tools of a terminal session.
+the final reply to stdout. It uses the instructions and tools of a terminal session. The command
+`drinky models` lists the values of the `--model` flag.
 
 ```sh
 ./zig-out/bin/drinky run --model openai-plan/gpt-5.5 --effort high <<'EOF'
@@ -55,19 +70,17 @@ Review the uncommitted changes.
 EOF
 ```
 
-A run through the bash tool adds its available costs to the parent session total after each model
-attempt. It adds no transcript summary. Keep the bash invocation open with `wait` for background
-runs.
-
-Use `drinky models` to list the saved models of signed-in accounts.
+The model can start a run through the bash tool, for example to review its work as a second agent.
+The session total then includes the available costs of the run.
 
 ## MCP
 
-A local MCP client can control running Drinky instances. Type `/mcp` in an instance to turn MCP
-access to that instance on or off. Access starts off. Set `interface.mcp_access` to `true` in the
-config file to turn it on at startup. While access is on, the status line shows `MCP: on`. The
-client starts `drinky mcp` as its stdio server. The server speaks MCP `2026-07-28` and finds each
-instance with MCP access, so one server entry covers all instances.
+A local MCP client can control running Drinky instances. For example, a ChatGPT voice chat can
+delegate project work to Drinky through the Codex runtime of the ChatGPT desktop app.
+
+Type `/mcp` in an instance to turn MCP access to that instance on or off. Access starts off unless
+the config file turns it on. The client starts `drinky mcp` as its stdio server. The server speaks
+MCP `2026-07-28` and finds each instance with MCP access, so one server entry covers all instances.
 
 The client can read the state, send messages, load skills, cancel work, clear the conversation,
 fetch a model list, and select the model and the effort. It cannot rewind the conversation, prepare
@@ -75,11 +88,11 @@ a handoff, or sign in.
 
 ## Config file
 
-The optional `~/.drinky/config.json` file controls instructions, request limits, and interface
-settings. Drinky reads it at startup and does not change it. The config file holds no secrets.
-Credentials and remembered model choices live under `~/.drinky/`.
+The optional `~/.drinky/config.json` file controls instructions, required skills, request and
+command limits, the default effort, and interface settings. The `describe_drinky` reference
+documents each key, so Drinky can explain the file.
 
-## Terminal status
+## Rex and Herdr
 
 Drinky reports its state through the
 [Program Status Protocol](https://www.superlogical.com/rex/docs/build/program-status) (OSC 7501) and

@@ -37,6 +37,7 @@ branch_buffer: [application.branch_bytes_max]u8,
 branch_length: ?usize,
 window_pages: usize,
 gauge: application.Settings.Gauge,
+animation: application.Settings.Animation = (application.Settings{}).animation,
 display_roots: format.Roots,
 intro: []const u8 = "",
 startup_failures: std.ArrayList([]const u8) = .empty,
@@ -133,15 +134,6 @@ pub const Turn = struct {
     fn releaseCalls(self: *Turn, gpa: std.mem.Allocator) void {
         for (self.calls.items) |*call| call.deinit(gpa);
         self.calls.clearRetainingCapacity();
-    }
-
-    fn activity(self: *const Turn) ui.paint.Activity {
-        return .{
-            .style = .sweep,
-            .motion_tick = self.activity_tick,
-            .progress_age_ticks = self.activity_tick -% self.progress_tick_last,
-            .caret_tick = self.caret_tick,
-        };
     }
 
     fn boxes(self: *Turn, gpa: std.mem.Allocator, now_ms: i64) ![]const ui.paint.Box {
@@ -774,6 +766,7 @@ pub fn restore(self: *Screen, snapshot: *const application.Snapshot) !void {
     restored.verbose = self.verbose;
     restored.window_pages = snapshot.settings.window_pages;
     restored.gauge = snapshot.settings.gauge;
+    restored.animation = snapshot.settings.animation;
     restored.display_roots = .{
         .working_directory = snapshot.working_directory,
         .home_directory = snapshot.home_directory,
@@ -871,14 +864,17 @@ pub fn paint(
                 .turn = .{
                     .tools = boxes,
                     .tracks = tracks,
-                    .activity = turn.activity(),
+                    .activity = self.turnActivity(turn),
                     .editor = &self.editor,
                 },
             };
         },
         .picking => |*picker| picking: {
             try picker.reflow(size);
-            break :picking .{ .picking = picker };
+            break :picking .{ .picking = .{
+                .picker = picker,
+                .activity = picker.activity(self.animation),
+            } };
         },
         .page => unreachable,
     };
@@ -931,12 +927,12 @@ pub fn advanceFrame(self: *Screen, now_ms: i64) bool {
         .turn => |*turn| {
             turn.activity_tick +%= 1;
             turn.caret_tick +%= 1;
-            const activity = turn.activity();
+            const activity = self.turnActivity(turn);
             activity_changed = ui.paint.activityChanged(&activity, self.columns);
         },
         .picking => |*picker| {
             picker.advanceFrame();
-            if (picker.activity()) |activity|
+            if (picker.activity(self.animation)) |activity|
                 activity_changed = ui.paint.activityChanged(&activity, self.columns);
         },
         .page => |*page| if (self.pageWaiting(page)) {
@@ -948,10 +944,19 @@ pub fn advanceFrame(self: *Screen, now_ms: i64) bool {
     return activity_changed;
 }
 
+fn turnActivity(self: *const Screen, turn: *const Turn) ui.paint.Activity {
+    return .{
+        .style = self.animation,
+        .motion_tick = turn.activity_tick,
+        .progress_age_ticks = turn.activity_tick -% turn.progress_tick_last,
+        .caret_tick = turn.caret_tick,
+    };
+}
+
 pub fn animating(self: *const Screen) bool {
     return switch (self.widget) {
         .turn => true,
-        .picking => |*picker| picker.activity() != null,
+        .picking => |*picker| picker.activity(self.animation) != null,
         .page => |*page| self.pageWaiting(page),
         .prompt => false,
     };
@@ -3054,6 +3059,37 @@ test "a conversation clear drops every block and the statistics" {
     try rig.expectKinds(&.{.intro});
     try std.testing.expectEqual(@as(f64, 0), rig.screen.statusInfo(0).cost);
     try std.testing.expectEqualStrings("claude-sonnet-4-6", rig.screen.statusInfo(0).model.?);
+}
+
+test "a turn segment grows without an update and an update returns it to its base length" {
+    const gpa = std.testing.allocator;
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    var emulator = try terminal.testing.Emulator.init(gpa, 40);
+    defer emulator.deinit();
+    const size: terminal.View.Size = .{ .columns = 40, .rows = 24 };
+    emulator.resize(size.rows);
+    try rig.start("hi");
+    try rig.paintInto(&emulator, size);
+    try std.testing.expectEqual(@as(usize, 6), activityCells(&emulator));
+
+    for (0..37) |_| _ = rig.screen.advanceFrame(0);
+    try rig.paintInto(&emulator, size);
+    try std.testing.expectEqual(@as(usize, 8), activityCells(&emulator));
+
+    try rig.apply(&.text_started);
+    try rig.apply(&.{ .text = "hello" });
+    try rig.paintInto(&emulator, size);
+    try std.testing.expectEqual(@as(usize, 6), activityCells(&emulator));
+}
+
+fn activityCells(emulator: *const terminal.testing.Emulator) usize {
+    var cells: usize = 0;
+    for (emulator.document.items[emulator.screen_top..]) |row| {
+        cells += std.mem.count(u8, row.items, "━");
+    }
+    return cells;
 }
 
 test "a picker displays public options and waits with animation" {

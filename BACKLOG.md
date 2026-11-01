@@ -39,6 +39,8 @@ when the user drops it.
 - Drinky loads each instruction file and each skill in every environment. A condition on an
   environment variable can limit a file to Rex (`REX_SESSION`) or Herdr (`HERDR_ENV`). All Rex and
   Herdr instructions then move to such files.
+- A retry wait shows no progress. The frame can empty over the delay that the `attempt_failed` event
+  holds. Retries are rare, so the gain is small.
 - The instructions do not tell the agent to use Rex tabs. Inside Rex, the agent can open a visual
   preview or a test script in a separate Rex tab without a request. The rule fits a Rex-only
   instruction file from the idea above.

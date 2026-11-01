@@ -202,10 +202,10 @@ pub fn position(self: *const Picker) Position {
     };
 }
 
-pub fn activity(self: *const Picker) ?paint.Activity {
+pub fn activity(self: *const Picker, style: application.Settings.Animation) ?paint.Activity {
     return switch (self.body) {
         .list => null,
-        .wait => |*wait| .{ .style = .sweep, .motion_tick = wait.tick },
+        .wait => |*wait| .{ .style = style, .motion_tick = wait.tick },
     };
 }
 
@@ -274,11 +274,15 @@ fn extent(self: *const Picker, size: terminal.View.Size) paint.Window.Extent {
     };
 }
 
-pub fn render(self: *const Picker, placement: *const paint.Placement, viewport_rows: usize) !void {
+pub fn render(
+    self: *const Picker,
+    placement: *const paint.Placement,
+    options: *const paint.RenderOptions,
+) !void {
     const caption_rows = try self.renderCaption(placement);
     const shown = self.window.shown(self.extent(.{
         .columns = placement.columns,
-        .rows = viewport_rows,
+        .rows = options.viewport_rows,
     }));
     var frame_placement = placement.*;
     frame_placement.base = placement.base + caption_rows;
@@ -289,7 +293,7 @@ pub fn render(self: *const Picker, placement: *const paint.Placement, viewport_r
         .hidden_below = shown.hidden_below,
         .line_roles = self.line_roles.items,
         .marks = self.marks.items,
-        .activity = self.activity(),
+        .activity = options.activity,
     });
 }
 
@@ -529,7 +533,10 @@ fn renderForTest(
     rig.init(gpa);
     defer rig.deinit();
     const placement = try rig.begin(&.{ .columns = size.columns, .rows = size.rows, .pages = 4 });
-    try picker.render(&placement, size.rows);
+    try picker.render(&placement, &.{
+        .viewport_rows = size.rows,
+        .activity = picker.activity(.sweep),
+    });
     return gpa.dupe(u8, try rig.painted());
 }
 
@@ -580,7 +587,7 @@ test "a list that waits drops its rows, states the wait, and moves its frame edg
     try testing.expectHides(painted, &.{"(Current)"});
     try std.testing.expectEqual(@as(usize, 4), testing.paintedRows(painted));
 
-    picker.advanceFrame();
+    for (0..paint.segment_step_ticks) |_| picker.advanceFrame();
     const moved = try renderForTest(gpa, &picker, size);
     defer gpa.free(moved);
     try std.testing.expect(!std.mem.eql(u8, painted, moved));

@@ -1174,8 +1174,7 @@ test "activity crosses the frame edges without changing the editor height" {
     });
     defer gpa.free(second);
 
-    for ([_][]const u8{ "╼", "━", "╾" }) |glyph|
-        try testing.expectShows(first, &.{glyph});
+    try testing.expectShows(first, &.{"━"});
     for ([_][]const u8{ "┌", "┐", "│", "└", "┘", "┃" }) |glyph|
         try testing.expectHides(first, &.{glyph});
     try std.testing.expect(!std.mem.eql(u8, first, second));

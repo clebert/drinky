@@ -566,6 +566,7 @@ fn init(self: *Controller, gpa: std.mem.Allocator, io: std.Io, options: *const O
         .verbose = config.verbose,
         .mcp_access = config.mcp_access,
         .gauge = config.gauge,
+        .animation = config.animation,
     };
     self.surface = .init(
         gpa,
@@ -1707,7 +1708,7 @@ test "session startup exposes validated settings and acknowledges unchanged proj
     var rig: testing.Rig = undefined;
     try rig.init(
         &.{ .config = "{\"interface\":{\"verbose\":true,\"mcp_access\":true,\"window_pages\":64," ++
-            "\"gauge_percent_warning\":10,\"gauge_percent_error\":20}}" },
+            "\"gauge_percent_warning\":10,\"gauge_percent_error\":20,\"animation\":\"sweep\"}}" },
     );
     defer rig.deinit();
     const initial = try rig.snapshot();
@@ -1717,6 +1718,7 @@ test "session startup exposes validated settings and acknowledges unchanged proj
     try std.testing.expect(initial.settings.mcp_access);
     try std.testing.expectEqual(@as(usize, 64), initial.settings.window_pages);
     try std.testing.expectEqual(@as(f64, 10), initial.settings.gauge.percent_warning);
+    try std.testing.expectEqual(Settings.Animation.sweep, initial.settings.animation);
     try std.testing.expectEqualStrings("main", initial.state.branch.?);
     for (0..2) |_| try std.testing.expect(rig.send(&.refresh_project).accepted());
     try rig.tree.write(".git/HEAD", "ref: refs/heads/changed\n");

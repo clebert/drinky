@@ -114,6 +114,7 @@ fn prerequisite(
 fn startupReport(value: *const application.Record.Event) bool {
     return switch (value.*) {
         .effort_unknown,
+        .animation_unknown,
         .bash_timeout_ignored,
         .window_pages_ignored,
         .gauge_ignored,
@@ -190,6 +191,7 @@ fn severity(value: *const application.Record.Event) ui.Message.Severity {
         .tool_rounds_exhausted,
         .request_failed,
         .effort_unknown,
+        .animation_unknown,
         .bash_timeout_ignored,
         .window_pages_ignored,
         .gauge_ignored,
@@ -392,6 +394,11 @@ fn writeEvent(
         .effort_unknown => |unknown| try writer.print(
             "Drinky ignored the configured default effort level \"{s}\" because Drinky does " ++
                 "not know that level. Drinky uses the effort level \"{t}\".",
+            .{ unknown.value, unknown.used },
+        ),
+        .animation_unknown => |unknown| try writer.print(
+            "Drinky ignored the configured animation \"{s}\" because Drinky does not know " ++
+                "that animation. Drinky uses the animation \"{t}\".",
             .{ unknown.value, unknown.used },
         ),
         .bash_timeout_ignored => |range| try writer.print(

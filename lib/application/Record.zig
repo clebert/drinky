@@ -88,6 +88,7 @@ pub const Event = union(enum) {
     tool_rounds_exhausted,
     request_failed: Failure,
     effort_unknown: EffortUnknown,
+    animation_unknown: AnimationUnknown,
     bash_timeout_ignored: Range,
     window_pages_ignored: Range,
     gauge_ignored: GaugeShares,
@@ -224,6 +225,7 @@ pub const Event = union(enum) {
     };
     pub const Substitution = struct { requested: []const u8, served: []const u8 };
     pub const EffortUnknown = struct { value: []const u8, used: core.Provider.Effort };
+    pub const AnimationUnknown = struct { value: []const u8, used: Settings.Animation };
     pub const Range = struct { value: u64, min: u64, max: u64, used: u64 };
     pub const GaugeShares = struct {
         dropped: Settings.Gauge,
