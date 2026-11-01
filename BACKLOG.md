@@ -35,3 +35,10 @@ when the user drops it.
   such a call after their time limit when the call accepts a cancel.
 
 ## Ideas
+
+- Drinky loads each instruction file and each skill in every environment. A condition on an
+  environment variable can limit a file to Rex (`REX_SESSION`) or Herdr (`HERDR_ENV`). All Rex and
+  Herdr instructions then move to such files.
+- The instructions do not tell the agent to use Rex tabs. Inside Rex, the agent can open a visual
+  preview or a test script in a separate Rex tab without a request. The rule fits a Rex-only
+  instruction file from the idea above.
