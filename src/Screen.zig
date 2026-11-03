@@ -870,7 +870,7 @@ pub fn paint(
             };
         },
         .picking => |*picker| picking: {
-            try picker.reflow(size);
+            try picker.reflow(size, layout.pickerRows(size.rows));
             break :picking .{ .picking = .{
                 .picker = picker,
                 .activity = picker.activity(self.animation),
@@ -3110,6 +3110,132 @@ test "a picker displays public options and waits with animation" {
     try std.testing.expect(!rig.screen.animating());
     rig.screen.closePicker();
     try std.testing.expect(rig.screen.widget == .prompt);
+}
+
+test "a short terminal keeps the picker selection visible after a resize or a move" {
+    const gpa = std.testing.allocator;
+    var names: [8][5]u8 = undefined;
+    var options: [8]ui.Picker.Option = undefined;
+    for (&options, &names, 0..) |*option, *name, index|
+        option.* = .{ .name = try std.fmt.bufPrint(name, "row{d:0>2}", .{index}) };
+
+    for ([_]usize{ 40, 8, 80 }) |columns| {
+        var rig: Rig = undefined;
+        rig.init();
+        defer rig.deinit();
+        try rig.addUser("Earlier message.");
+        try rig.screen.openPicker(&.{ .title = "Command", .options = &options });
+        var emulator = try terminal.testing.Emulator.init(gpa, columns);
+        defer emulator.deinit();
+
+        for ([_]usize{ 6, 24, 1, 2, 3, 4, 5, 8 }) |rows| {
+            const size: terminal.View.Size = .{ .columns = columns, .rows = rows };
+            emulator.resize(rows);
+            for (0..options.len + 1) |_| {
+                try rig.paintInto(&emulator, size);
+                const picker = rig.screen.activePicker().?;
+                var buffer: [16]u8 = undefined;
+                const selected = try std.fmt.bufPrint(
+                    &buffer,
+                    " > {s}",
+                    .{options[picker.cursor().?].name},
+                );
+                var visible = false;
+                const end = @min(emulator.document.items.len, emulator.screen_top + rows);
+                for (emulator.document.items[emulator.screen_top..end]) |row| {
+                    if (std.mem.find(u8, row.items, selected) == null) continue;
+                    visible = true;
+                    break;
+                }
+                if (!visible) {
+                    std.debug.print("The {d} by {d} terminal hides \"{s}\".\n", .{
+                        columns, rows, selected,
+                    });
+                    return error.TestExpectedSelection;
+                }
+                try picker.moveDown();
+            }
+        }
+    }
+}
+
+test "a one-row picker shows notices and confirmations before its selection" {
+    const gpa = std.testing.allocator;
+    for ([_]usize{ 80, 24 }) |columns| {
+        var rig: Rig = undefined;
+        rig.init();
+        defer rig.deinit();
+        try rig.screen.openPicker(&.{ .title = "Command", .options = &.{.{ .name = "row" }} });
+        var emulator = try terminal.testing.Emulator.init(gpa, columns);
+        defer emulator.deinit();
+        const size: terminal.View.Size = .{ .columns = columns, .rows = 1 };
+        emulator.resize(size.rows);
+        try rig.paintInto(&emulator, size);
+        try emulator.expectScreen(&.{" > row"});
+
+        const cases = [_]struct {
+            severity: ui.Message.Severity,
+            confirmation: ?ui.status.Confirmation = null,
+            expected: []const u8,
+        }{
+            .{ .severity = .warning, .confirmation = .rewind, .expected = "⚠ Press Enter again" },
+            .{ .severity = .information, .expected = "ℹ Notice." },
+            .{ .severity = .warning, .expected = "⚠ Notice." },
+            .{ .severity = .failure, .expected = "⚠ Notice." },
+        };
+        for (cases) |case| {
+            const notice = try ui.Message.print(gpa, case.severity, "Notice.", .{});
+            if (case.confirmation) |confirmation|
+                rig.screen.confirm(confirmation, notice)
+            else
+                rig.screen.setNotice(notice);
+            try rig.paintInto(&emulator, size);
+            try testing.expectContains(
+                emulator.document.items[emulator.screen_top].items,
+                case.expected,
+            );
+            rig.screen.clearNotice();
+            try rig.paintInto(&emulator, size);
+            try emulator.expectScreen(&.{" > row"});
+        }
+    }
+}
+
+test "picker option counts use the full height and reserve only visible borders" {
+    const gpa = std.testing.allocator;
+    var names: [16][5]u8 = undefined;
+    var options: [16]ui.Picker.Option = undefined;
+    for (&options, &names, 0..) |*option, *name, index|
+        option.* = .{ .name = try std.fmt.bufPrint(name, "row{d:0>2}", .{index}) };
+    const cases = [_]struct { rows: usize, options: usize }{
+        .{ .rows = 20, .options = 6 },
+        .{ .rows = 24, .options = 7 },
+        .{ .rows = 40, .options = 11 },
+        .{ .rows = 3, .options = 2 },
+    };
+    var matched = true;
+    for (cases) |case| {
+        var rig: Rig = undefined;
+        rig.init();
+        defer rig.deinit();
+        try rig.screen.openPicker(&.{ .title = "Command", .options = &options });
+        var emulator = try terminal.testing.Emulator.init(gpa, 80);
+        defer emulator.deinit();
+        const size: terminal.View.Size = .{ .columns = 80, .rows = case.rows };
+        emulator.resize(size.rows);
+        try rig.paintInto(&emulator, size);
+        var count: usize = 0;
+        for (emulator.document.items[emulator.screen_top..]) |row| {
+            if (std.mem.startsWith(u8, row.items, " > row") or
+                std.mem.startsWith(u8, row.items, "   row")) count += 1;
+        }
+        if (count == case.options) continue;
+        std.debug.print("Terminal height: {d} rows. Option count: {d}. Expected count: {d}.\n", .{
+            case.rows, count, case.options,
+        });
+        matched = false;
+    }
+    try std.testing.expect(matched);
 }
 
 test "a picker opening releases every partial allocation" {

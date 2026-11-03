@@ -254,9 +254,10 @@ pub const Window = struct {
     pub const Extent = struct {
         body_rows: usize,
         viewport_rows: usize,
+        body_rows_max: usize = std.math.maxInt(usize),
 
         fn visibleRows(self: Extent) usize {
-            return @min(self.body_rows, bodyLimit(self.viewport_rows));
+            return @min(self.body_rows, bodyLimit(self.viewport_rows), self.body_rows_max);
         }
 
         pub fn rows(self: Extent) usize {
@@ -290,6 +291,7 @@ pub const Window = struct {
 const Framing = struct {
     body: []const u8,
     body_rows: usize,
+    edges: bool = true,
     caret: ?terminal.View.Caret = null,
     hidden_above: usize = 0,
     hidden_below: usize = 0,
@@ -611,7 +613,7 @@ fn boxRowText(sink: *terminal.View.Sink, text: []const u8, row: *const BoxRow) !
     });
 }
 
-const frame_edge_rows = 2;
+pub const frame_edge_rows = 2;
 const label_lead_columns = 3;
 
 fn bodyLimit(viewport_rows: usize) usize {
@@ -630,7 +632,7 @@ pub fn framed(placement: *const Placement, framing: *const Framing) !void {
         true;
     const maybe_caret = if (caret_shown) framing.caret else null;
     var line = placement.base;
-    try frameEdgeRow(placement, &frame, &line, .top, framing.hidden_above);
+    if (framing.edges) try frameEdgeRow(placement, &frame, &line, .top, framing.hidden_above);
     var iterator = terminal.width.wrapper(framing.body, placement.columns);
     const window_end = framing.hidden_above +| framing.body_rows;
     var source_offset: usize = 0;
@@ -658,7 +660,7 @@ pub fn framed(placement: *const Placement, framing: *const Framing) !void {
         body_count += 1;
     }
     std.debug.assert(body_count == framing.body_rows);
-    try frameEdgeRow(placement, &frame, &line, .bottom, framing.hidden_below);
+    if (framing.edges) try frameEdgeRow(placement, &frame, &line, .bottom, framing.hidden_below);
 }
 
 fn framedRow(

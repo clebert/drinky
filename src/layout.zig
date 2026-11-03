@@ -9,6 +9,7 @@ const ui = @import("ui/root.zig");
 const id_page = std.math.maxInt(usize);
 const id_input = id_page - 1;
 const id_status = id_page - 2;
+const status_rows = 1;
 
 pub const Scene = union(enum) {
     conversation: Conversation,
@@ -91,8 +92,8 @@ const Component = union(enum) {
             .block => |block| block.rows(size.columns),
             .tool_box => |box| ui.paint.boxRows(&box, size.columns),
             .editor => |presentation| presentation.rows(size),
-            .status => 1,
-            .picker => |picking| picking.picker.rows(size),
+            .status => status_rows,
+            .picker => |picking| picking.picker.rows(size, pickerRows(size.rows)),
         };
     }
 
@@ -110,7 +111,7 @@ const Component = union(enum) {
             .picker => |picking| try picking.picker.render(placement, &.{
                 .viewport_rows = viewport_rows,
                 .activity = picking.activity,
-            }),
+            }, pickerRows(viewport_rows)),
         }
     }
 };
@@ -119,6 +120,10 @@ const Slot = struct { component: Component, id: usize, leading_blank: bool };
 
 fn idTool(index: usize) usize {
     return id_status - 1 - index;
+}
+
+pub fn pickerRows(viewport_rows: usize) usize {
+    return @max(viewport_rows -| status_rows, 1);
 }
 
 pub fn project(
@@ -155,7 +160,9 @@ fn projectConversation(
 ) !void {
     std.debug.assert(scene.window_pages >= application.Settings.window_pages_min);
     std.debug.assert(scene.window_pages <= application.Settings.window_pages_max);
-    const total = scene.transcript.len + tailCount(&scene.tail) + 1;
+    const status_shown = scene.tail != .picking or size.rows > status_rows or
+        scene.status.notice != null;
+    const total = scene.transcript.len + tailCount(&scene.tail) + @intFromBool(status_shown);
     const capacity = size.rows * scene.window_pages;
 
     var rows: usize = 0;

@@ -251,7 +251,7 @@ fn activeList(self: *Picker) ?*List {
     };
 }
 
-pub fn reflow(self: *Picker, size: terminal.View.Size) !void {
+pub fn reflow(self: *Picker, size: terminal.View.Size, rows_max: usize) !void {
     if (self.columns != size.columns) {
         self.columns = size.columns;
         try self.compose();
@@ -260,17 +260,25 @@ pub fn reflow(self: *Picker, size: terminal.View.Size) !void {
         .offset = self.cursor_offset,
         .columns_max = size.columns,
     }).row;
-    self.window.follow(self.extent(size), cursor_row);
+    self.window.follow(self.extent(size, rows_max), cursor_row);
 }
 
-pub fn rows(self: *const Picker, size: terminal.View.Size) usize {
-    return self.captionRows(size.columns) + self.extent(size).rows();
+pub fn rows(self: *const Picker, size: terminal.View.Size, rows_max: usize) usize {
+    const caption_rows = self.caption(rows_max).rows(size.columns);
+    return caption_rows + self.extent(size, rows_max).rows() - paint.frame_edge_rows +
+        edgeRows(rows_max);
 }
 
-fn extent(self: *const Picker, size: terminal.View.Size) paint.Window.Extent {
+fn edgeRows(rows_max: usize) usize {
+    return if (rows_max > paint.frame_edge_rows) paint.frame_edge_rows else 0;
+}
+
+fn extent(self: *const Picker, size: terminal.View.Size, rows_max: usize) paint.Window.Extent {
+    const caption_rows = self.caption(rows_max).rows(size.columns);
     return .{
         .body_rows = terminal.width.rows(self.content.items, size.columns),
         .viewport_rows = size.rows,
+        .body_rows_max = @max(rows_max -| (caption_rows + edgeRows(rows_max)), 1),
     };
 }
 
@@ -278,17 +286,20 @@ pub fn render(
     self: *const Picker,
     placement: *const paint.Placement,
     options: *const paint.RenderOptions,
+    rows_max: usize,
 ) !void {
-    const caption_rows = try self.renderCaption(placement);
-    const shown = self.window.shown(self.extent(.{
+    const size: terminal.View.Size = .{
         .columns = placement.columns,
         .rows = options.viewport_rows,
-    }));
+    };
+    const caption_rows = try self.caption(rows_max).render(placement);
+    const shown = self.window.shown(self.extent(size, rows_max));
     var frame_placement = placement.*;
     frame_placement.base = placement.base + caption_rows;
     try paint.framed(&frame_placement, &.{
         .body = self.content.items,
         .body_rows = shown.body_rows,
+        .edges = edgeRows(rows_max) > 0,
         .hidden_above = shown.hidden_above,
         .hidden_below = shown.hidden_below,
         .line_roles = self.line_roles.items,
@@ -297,22 +308,14 @@ pub fn render(
     });
 }
 
-fn renderCaption(self: *const Picker, placement: *const paint.Placement) !usize {
-    return self.caption().render(placement);
-}
-
-fn captionRows(self: *const Picker, columns: usize) usize {
-    return self.caption().rows(columns);
-}
-
-fn caption(self: *const Picker) Caption {
+fn caption(self: *const Picker, rows_max: usize) Caption {
     return .{
         .title = self.title,
         .controls = switch (self.body) {
             .list => |*list| if (list.can_step_back) hint_back else hint_cancel,
             .wait => hint_wait,
         },
-        .rows_max = 3,
+        .rows_max = @min(3, rows_max -| (paint.frame_edge_rows + 1)),
     };
 }
 
@@ -457,7 +460,7 @@ test "the frame holds the option rows alone and the caption stays above it" {
     defer picker.deinit();
     const size: terminal.View.Size = .{ .columns = 80, .rows = 24 };
 
-    try std.testing.expectEqual(@as(usize, 5), picker.rows(size));
+    try std.testing.expectEqual(@as(usize, 5), picker.rows(size, size.rows));
     const painted = try renderForTest(gpa, &picker, size);
     defer gpa.free(painted);
     const title = comptime role.sequence(.accent) ++ "Pick\x1b[0m";
@@ -536,7 +539,7 @@ fn renderForTest(
     try picker.render(&placement, &.{
         .viewport_rows = size.rows,
         .activity = picker.activity(.sweep),
-    });
+    }, size.rows);
     return gpa.dupe(u8, try rig.painted());
 }
 
@@ -568,9 +571,9 @@ test "a list that waits drops its rows, states the wait, and moves its frame edg
     try testing.expectHides(listed, &.{"━"});
 
     try picker.beginWait("Drinky fetches the model list.");
-    try picker.reflow(size);
+    try picker.reflow(size, size.rows);
     try std.testing.expect(picker.cursor() == null);
-    try std.testing.expectEqual(@as(usize, 4), picker.rows(size));
+    try std.testing.expectEqual(@as(usize, 4), picker.rows(size, size.rows));
 
     try picker.moveDown();
     try picker.moveUp();
@@ -629,7 +632,7 @@ test "the opening row applies the preselection, current value, and saved positio
         try std.testing.expectEqual(case.cursor, picker.cursor().?);
         try std.testing.expectEqual(case.scroll, picker.window.scroll);
         const size: terminal.View.Size = .{ .columns = 80, .rows = 24 };
-        try picker.reflow(size);
+        try picker.reflow(size, size.rows);
         const painted = try renderForTest(gpa, &picker, size);
         defer gpa.free(painted);
         const plain = try terminal.testing.plainText(gpa, painted);
@@ -650,7 +653,7 @@ test "the key hint states the step above a later step" {
     const size: terminal.View.Size = .{ .columns = 60, .rows = 24 };
     var first = try testPicker(gpa, &.{ "alpha", "beta" }, &.{ .current = 0 });
     defer first.deinit();
-    try first.reflow(size);
+    try first.reflow(size, size.rows);
     const first_step = try renderForTest(gpa, &first, size);
     defer gpa.free(first_step);
     try testing.expectShows(first_step, &.{"Esc: Cancel"});
@@ -660,7 +663,7 @@ test "the key hint states the step above a later step" {
         .can_step_back = true,
     });
     defer later.deinit();
-    try later.reflow(size);
+    try later.reflow(size, size.rows);
     const later_step = try renderForTest(gpa, &later, size);
     defer gpa.free(later_step);
     const later_plain = try terminal.testing.plainText(gpa, later_step);
@@ -682,8 +685,8 @@ test "a row too wide for the window is cut and ends in an ellipsis" {
     defer picker.deinit();
     const size: terminal.View.Size = .{ .columns = 24, .rows = 24 };
 
-    try picker.reflow(size);
-    try std.testing.expectEqual(@as(usize, 7), picker.rows(size));
+    try picker.reflow(size, size.rows);
+    try std.testing.expectEqual(@as(usize, 7), picker.rows(size, size.rows));
 
     const painted = try renderForTest(gpa, &picker, size);
     defer gpa.free(painted);
@@ -701,7 +704,7 @@ test "a row too wide for the window is cut and ends in an ellipsis" {
 
     for ([_]usize{ 24, 8, 3, 1 }) |columns| {
         const narrow: terminal.View.Size = .{ .columns = columns, .rows = 24 };
-        try picker.reflow(narrow);
+        try picker.reflow(narrow, narrow.rows);
         const narrow_painted = try renderForTest(gpa, &picker, narrow);
         defer gpa.free(narrow_painted);
         const narrow_plain = try terminal.testing.plainText(gpa, narrow_painted);
@@ -712,7 +715,7 @@ test "a row too wide for the window is cut and ends in an ellipsis" {
     }
 
     const wide: terminal.View.Size = .{ .columns = 80, .rows = 24 };
-    try picker.reflow(wide);
+    try picker.reflow(wide, wide.rows);
     const whole = try renderForTest(gpa, &picker, wide);
     defer gpa.free(whole);
     try testing.expectShows(whole, &.{ "claude-sonnet-5", "(Current)" });
@@ -729,13 +732,13 @@ test "a tall option list scrolls the window to keep the selection in view" {
     defer picker.deinit();
     const size: terminal.View.Size = .{ .columns = 80, .rows = 20 };
 
-    try picker.reflow(size);
+    try picker.reflow(size, size.rows);
     try std.testing.expectEqual(@as(usize, 0), picker.window.scroll);
-    try std.testing.expectEqual(@as(usize, 9), picker.rows(size));
+    try std.testing.expectEqual(@as(usize, 9), picker.rows(size, size.rows));
 
     for (0..19) |_| {
         try picker.moveDown();
-        try picker.reflow(size);
+        try picker.reflow(size, size.rows);
     }
     try std.testing.expectEqual(@as(usize, 19), picker.cursor().?);
     try std.testing.expectEqual(@as(usize, 14), picker.window.scroll);
@@ -751,7 +754,7 @@ test "a tall option list scrolls the window to keep the selection in view" {
 
     for (0..19) |_| {
         try picker.moveUp();
-        try picker.reflow(size);
+        try picker.reflow(size, size.rows);
     }
     try std.testing.expectEqual(@as(usize, 0), picker.cursor().?);
     try std.testing.expectEqual(@as(usize, 0), picker.window.scroll);
@@ -766,7 +769,7 @@ test "a tall option list scrolls the window to keep the selection in view" {
     try testing.expectShows(top, &.{"↓ Hidden: 14"});
 
     try picker.moveUp();
-    try picker.reflow(size);
+    try picker.reflow(size, size.rows);
     try std.testing.expectEqual(@as(usize, 19), picker.cursor().?);
     try std.testing.expectEqual(@as(usize, 14), picker.window.scroll);
 }
@@ -789,7 +792,7 @@ test "a wheel turn rotates the options under a fixed selection row, and arrows k
     };
     for (turns) |turn| {
         if (turn.down) try picker.rotateDown() else try picker.rotateUp();
-        try picker.reflow(size);
+        try picker.reflow(size, size.rows);
         const painted = try renderForTest(gpa, &picker, size);
         defer gpa.free(painted);
         const plain = try terminal.testing.plainText(gpa, painted);
@@ -802,7 +805,7 @@ test "a wheel turn rotates the options under a fixed selection row, and arrows k
     try std.testing.expectEqual(@as(usize, 0), picker.cursor().?);
 
     try picker.moveDown();
-    try picker.reflow(size);
+    try picker.reflow(size, size.rows);
     const moved = try renderForTest(gpa, &picker, size);
     defer gpa.free(moved);
     try testing.expectShows(moved, &.{comptime role.sequence(.selection) ++ " > beta"});
@@ -817,12 +820,12 @@ test "a wheel turn rotates the options under a fixed selection row, and arrows k
     const short: terminal.View.Size = .{ .columns = 80, .rows = 20 };
     for (0..8) |_| {
         try tall.moveDown();
-        try tall.reflow(short);
+        try tall.reflow(short, short.rows);
     }
     try std.testing.expectEqual(@as(usize, 3), tall.window.scroll);
     for (0..15) |_| {
         try tall.rotateDown();
-        try tall.reflow(short);
+        try tall.reflow(short, short.rows);
     }
     try std.testing.expectEqual(@as(usize, 3), tall.cursor().?);
     try std.testing.expectEqual(@as(usize, 3), tall.window.scroll);
