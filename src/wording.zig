@@ -27,6 +27,31 @@ pub fn event(
     return .{ .content = content, .severity = severity(value) };
 }
 
+pub fn replyNotText(gpa: std.mem.Allocator) error{OutOfMemory}!ui.Message {
+    return ui.Message.print(
+        gpa,
+        .failure,
+        "The reply of the model is not valid text. Drinky cannot save it.",
+        .{},
+    );
+}
+
+pub fn gistUnread(
+    gpa: std.mem.Allocator,
+    failure: *const application.GistFailure,
+) error{OutOfMemory}!ui.Message {
+    return ui.Message.print(
+        gpa,
+        .failure,
+        "Drinky could not read the gist {s} because of error {t}.",
+        .{ failure.path, failure.cause },
+    );
+}
+
+pub fn gistInvalid(gpa: std.mem.Allocator, path: []const u8) error{OutOfMemory}!ui.Message {
+    return ui.Message.print(gpa, .failure, "The gist {s} holds no valid text.", .{path});
+}
+
 fn writeFailure(
     writer: *std.Io.Writer,
     value: *const application.Record.Event.Failure,
@@ -55,7 +80,7 @@ pub fn refusal(
         .no_conversation => try ui.Message.print(
             gpa,
             .warning,
-            "No conversation is available for a handoff.",
+            "No conversation is available for a gist.",
             .{},
         ),
         .skill_unreadable => |unreadable| try ui.Message.print(
@@ -80,6 +105,52 @@ pub fn refusal(
                 application.query.accountId(account),
             },
         ),
+        .gist_failed => |*failure| try gistFailure(gpa, command, failure),
+        .gist_invalid => |path| try gistInvalid(gpa, path),
+    };
+}
+
+fn gistFailure(
+    gpa: std.mem.Allocator,
+    command: *const application.Command,
+    failure: *const application.GistFailure,
+) error{OutOfMemory}!ui.Message {
+    const facts = .{ failure.path, failure.cause };
+    const because = " because of error {t}.";
+    return switch (command.*) {
+        .save_result, .apply_result => ui.Message.print(
+            gpa,
+            .failure,
+            "Drinky could not save the gist in {s}" ++ because,
+            facts,
+        ),
+        .apply_gist => gistUnread(gpa, failure),
+        .delete_gist => ui.Message.print(
+            gpa,
+            .failure,
+            "Drinky could not delete the gist {s}" ++ because,
+            facts,
+        ),
+        .send_message,
+        .invoke_skill,
+        .new_conversation,
+        .select_account,
+        .sign_out,
+        .submit_callback,
+        .fetch_models,
+        .select_model,
+        .set_effort,
+        .retry,
+        .remove_canceled_turn,
+        .rewind,
+        .prepare_gist,
+        .discard_result,
+        .cancel,
+        .dismiss_offer,
+        .dismiss_notice,
+        .refresh_project,
+        .snapshot,
+        => unreachable,
     };
 }
 
@@ -89,8 +160,9 @@ fn prerequisite(
     comptime lead: []const u8,
 ) error{OutOfMemory}!?ui.Message {
     const action = switch (command.*) {
-        .send_message, .invoke_skill, .retry, .apply_result => "send a message",
-        .prepare_handoff => "prepare a handoff",
+        .send_message, .invoke_skill, .retry => "send a message",
+        .prepare_gist => "write a gist",
+        .apply_result, .apply_gist => "apply a gist",
         .new_conversation,
         .select_account,
         .sign_out,
@@ -100,7 +172,9 @@ fn prerequisite(
         .set_effort,
         .remove_canceled_turn,
         .rewind,
+        .save_result,
         .discard_result,
+        .delete_gist,
         .cancel,
         .dismiss_offer,
         .dismiss_notice,
@@ -1134,9 +1208,39 @@ test "a refusal names the action of its command, and a silent refusal holds no t
             .text = "Sign in with /login before you send a message.",
         },
         .{
-            .command = .{ .prepare_handoff = "" },
+            .command = .{ .prepare_gist = "" },
             .refusal = .no_model,
-            .text = "Select a model with /model before you prepare a handoff.",
+            .text = "Select a model with /model before you write a gist.",
+        },
+        .{
+            .command = .{ .apply_gist = @splat(0) },
+            .refusal = .{ .gist_failed = .{ .path = "/g/0123456789ab.md", .cause = error.NotDir } },
+            .text = "Drinky could not read the gist /g/0123456789ab.md because of error NotDir.",
+        },
+        .{
+            .command = .{ .save_result = 1 },
+            .refusal = .{ .gist_failed = .{ .path = "/g", .cause = error.AccessDenied } },
+            .text = "Drinky could not save the gist in /g because of error AccessDenied.",
+        },
+        .{
+            .command = .{ .apply_result = 1 },
+            .refusal = .{ .gist_failed = .{ .path = "/g", .cause = error.NotDir } },
+            .text = "Drinky could not save the gist in /g because of error NotDir.",
+        },
+        .{
+            .command = .{ .apply_result = 1 },
+            .refusal = .no_model,
+            .text = "Select a model with /model before you apply a gist.",
+        },
+        .{
+            .command = .{ .apply_gist = @splat(0) },
+            .refusal = .{ .gist_invalid = "/g/0123456789ab.md" },
+            .text = "The gist /g/0123456789ab.md holds no valid text.",
+        },
+        .{
+            .command = .{ .delete_gist = @splat(0) },
+            .refusal = .{ .gist_failed = .{ .path = "/g/0123456789ab.md", .cause = error.IsDir } },
+            .text = "Drinky could not delete the gist /g/0123456789ab.md because of error IsDir.",
         },
         .{
             .command = .{ .invoke_skill = .{ .name = "other", .arguments = "", .line = "" } },

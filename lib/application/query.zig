@@ -7,6 +7,7 @@ const tools = @import("tools");
 const Choice = @import("Choice.zig");
 const Config = @import("Config.zig");
 const discovery = @import("discovery/root.zig");
+const Gists = @import("Gists.zig");
 const Turns = @import("Turns.zig");
 
 pub const account_count = accounts.Account.table.len;
@@ -37,13 +38,26 @@ pub const Effort = struct {
 
 pub const Turn = struct {
     id: u64,
-    line: []const u8,
+    prompt: Turns.Prompt,
     drops_mutating_turn: bool,
 };
 
 pub const Skill = struct {
     name: []const u8,
     description: []const u8,
+};
+
+pub const GistList = struct {
+    directory: []const u8,
+    listing: Listing,
+
+    pub const Listing = union(enum) { listed: Gists.Listing, unreadable: Gists.ListError };
+};
+
+pub const GistText = union(enum) {
+    text: []const u8,
+    invalid: []const u8,
+    failed: Gists.Failure,
 };
 
 pub const Operation = union(enum) {

@@ -34,6 +34,11 @@ const removal_caption: ui.Caption = .{
     .controls = "Ctrl+N: Remove and edit · Esc: Keep turn",
     .rows_max = Screen.editor_caption_rows_max,
 };
+const gist_removal_caption: ui.Caption = .{
+    .title = removal_caption.title,
+    .controls = "Ctrl+N: Remove · Esc: Keep turn",
+    .rows_max = Screen.editor_caption_rows_max,
+};
 const intro_text = blk: {
     var line: []const u8 = "";
     for (reference.key_hints) |hint| line = line ++ hint ++ ui.paint.separator;
@@ -69,6 +74,7 @@ program_status: ?ProgramStatus = null,
 unseen: ?Unseen = null,
 confirmation: ?Confirmation = null,
 flow: ?Flow = null,
+preview: ?Preview = null,
 pending: [pending_max]Transition = undefined,
 pending_count: usize = 0,
 edits: u64 = 0,
@@ -140,6 +146,10 @@ const PendingEscape = struct { deadline_ms: i64, mode: Mode };
 
 const Exit = enum { escape, ctrl_c, ctrl_d };
 
+const Preview = struct { id: application.GistId, row: usize };
+
+const GistsView = union(enum) { open: Origin, reopen: usize };
+
 const ProgramStatus = enum {
     idle,
     working,
@@ -179,11 +189,13 @@ const Confirmation = union(enum) {
     quit,
     removal: u64,
     rewind: u64,
+    delete_gist: application.GistId,
     cancel,
 
     fn confirms(self: Confirmation, event: *const terminal.Input.Key) bool {
         return switch (self) {
             .message, .rewind => event.* == .enter,
+            .delete_gist => event.* == .backspace,
             .quit => event.* == .ctrl and event.ctrl == 'd',
             .removal => event.* == .ctrl and event.ctrl == 'n',
             .cancel => event.* == .escape,
@@ -537,8 +549,8 @@ fn flushEscape(self: *App) !void {
 }
 
 fn mode(self: *const App) Mode {
-    if (self.flow) |*flow| return if (flow.fetch == null) .picker else .picker_fetch;
     if (self.screen.widget == .page) return .page;
+    if (self.flow) |*flow| return if (flow.fetch == null) .picker else .picker_fetch;
     return switch (self.work) {
         .idle => .prompt,
         .turn => |operation| .{ .turn = operation },
@@ -563,6 +575,7 @@ fn confirm(self: *App, confirmation: Confirmation, notice: ui.Message) void {
         .message => .message,
         .removal => .removal,
         .rewind => .rewind,
+        .delete_gist => .delete_gist,
         .quit, .cancel => unreachable,
     }, notice);
     self.confirmation = confirmation;
@@ -686,7 +699,10 @@ fn caption(self: *const App) ?ui.Caption {
         .prompt => switch (self.offer) {
             .none => null,
             .retry => retry_caption,
-            .removal => removal_caption,
+            .removal => |removal| if (removal.returns_line)
+                removal_caption
+            else
+                gist_removal_caption,
         },
         .turn, .picker, .picker_fetch, .page => null,
     };
@@ -954,11 +970,12 @@ fn runCommand(
             self.closeFlow();
             try self.reportNotice(.warning, "Drinky found no skill.", .{});
         },
-        .handoff => {
+        .gist => {
             self.closeFlow();
-            _ = try self.send(&.{ .prepare_handoff = tail });
-            if (origin == .help) try self.screen.setDraft(reference.line(.handoff));
+            _ = try self.send(&.{ .prepare_gist = tail });
+            if (origin == .help) try self.screen.setDraft(reference.line(.gist));
         },
+        .gists => try self.presentGists(.{ .open = origin }),
         .new => {
             self.closeFlow();
             const accepted = (try self.send(&.new_conversation)).accepted();
@@ -1000,6 +1017,50 @@ fn openCommandStep(self: *App, step: Flow.Step, origin: Origin) !void {
         },
         .help => try self.openStep(step),
     }
+}
+fn presentGists(self: *App, view: GistsView) !void {
+    const gists = self.controller.listGists();
+    const listed = switch (gists.listing) {
+        .listed => |listed| listed,
+        .unreadable => |cause| {
+            self.closeFlow();
+            return self.reportNotice(
+                .failure,
+                "Drinky could not read the gists in {s} because of error {t}.",
+                .{ gists.directory, cause },
+            );
+        },
+    };
+    const directory = try self.gpa.dupe(u8, gists.directory);
+    defer self.gpa.free(directory);
+    const unreadable = listed.unreadable;
+    const invalid = listed.invalid;
+    if (listed.entries.len == 0) self.closeFlow() else switch (view) {
+        .open => |origin| try self.openCommandStep(.gists, origin),
+        .reopen => |row| try self.showStep(.gists, .{ .cursor = row }),
+    }
+    if (unreadable > 0 and invalid > 0) return self.reportNotice(
+        .warning,
+        "Drinky could not read {d} gist{s} and found {d} invalid gist{s} in {s}.",
+        .{
+            unreadable,
+            application.support.pluralSuffix(unreadable),
+            invalid,
+            application.support.pluralSuffix(invalid),
+            directory,
+        },
+    );
+    if (unreadable > 0) return self.reportNotice(
+        .warning,
+        "Drinky could not read {d} gist{s} in {s}.",
+        .{ unreadable, application.support.pluralSuffix(unreadable), directory },
+    );
+    if (invalid > 0) return self.reportNotice(
+        .warning,
+        "Drinky found {d} invalid gist{s} in {s}.",
+        .{ invalid, application.support.pluralSuffix(invalid), directory },
+    );
+    if (self.flow == null) try self.reportNotice(.warning, "Drinky found no gist.", .{});
 }
 fn openCheckedStep(self: *App, checked: CheckedStep, origin: Origin) !void {
     if (self.work != .idle) return self.closeFlow();
@@ -1063,7 +1124,7 @@ fn startAccess(self: *App) !void {
 }
 fn startFlow(self: *App, step: Flow.Step) !void {
     self.closeFlow();
-    self.flow = .init(self.gpa);
+    self.flow = .init(self.gpa, self.io);
     try self.showStep(Flow.resolve(self.controller, step), .{});
 }
 fn openStep(self: *App, step: Flow.Step) !void {
@@ -1075,6 +1136,7 @@ fn openStep(self: *App, step: Flow.Step) !void {
 fn showStep(self: *App, step: Flow.Step, options: struct { cursor: ?usize = null }) !void {
     const flow = &self.flow.?;
     const shown = try flow.show(self.controller, &self.screen.choice, step);
+    if (shown.options.len == 0) return self.closeFlow();
     try self.screen.openPicker(&.{
         .title = shown.title,
         .options = shown.options,
@@ -1082,6 +1144,7 @@ fn showStep(self: *App, step: Flow.Step, options: struct { cursor: ?usize = null
         .preselected = shown.preselected,
         .cursor = options.cursor,
         .depth = flow.depth,
+        .deletes = shown.deletes,
     });
 }
 fn closeFlow(self: *App) void {
@@ -1153,7 +1216,66 @@ fn selectRow(self: *App) !void {
             const response = try self.send(&.{ .rewind = turn.id });
             if (response.recovered) |text| try self.prependDraft(text);
         },
+        .gist => |id| try self.openPreview(&id, self.screen.activePicker().?.cursor().?),
     }
+}
+fn openPreview(self: *App, id: *const application.GistId, row: usize) !void {
+    const read = self.controller.readGist(id);
+    const message = switch (read) {
+        .text => |text| {
+            self.screen.closePicker();
+            try self.screen.openPage(&.{ .title = "Gist", .content = text, .action = .apply });
+            self.preview = .{ .id = id.*, .row = row };
+            return;
+        },
+        .invalid => |path| try wording.gistInvalid(self.gpa, path),
+        .failed => |*failure| try wording.gistUnread(self.gpa, failure),
+    };
+    defer message.deinit(self.gpa);
+    try self.presentGists(.{ .reopen = row });
+    try self.showMessage(&message);
+}
+fn closePreview(self: *App) !void {
+    const row = self.preview.?.row;
+    self.preview = null;
+    self.screen.closePage();
+    try self.presentGists(.{ .reopen = row });
+}
+fn applyPreview(self: *App) !void {
+    const preview = self.preview.?;
+    self.preview = null;
+    self.screen.closePage();
+    const value: application.Command = .{ .apply_gist = preview.id };
+    const response = self.controller.submit(&value);
+    const refusal = if (response.refusal) |*refusal| refusal else return self.closeFlow();
+    const maybe_message = try wording.refusal(self.gpa, &value, refusal);
+    defer if (maybe_message) |message| message.deinit(self.gpa);
+    try self.presentGists(.{ .reopen = preview.row });
+    if (maybe_message) |*message| try self.showMessage(message);
+}
+fn deleteRow(self: *App) !void {
+    const flow = &self.flow.?;
+    const row = self.screen.activePicker().?.cursor().?;
+    const id = switch (flow.target(row)) {
+        .gist => |id| id,
+        .command,
+        .vendor,
+        .account,
+        .fetch,
+        .author,
+        .model,
+        .effort,
+        .sign_in,
+        .sign_out,
+        .skill,
+        .turn,
+        => return,
+    };
+    if (!self.armed(.{ .delete_gist = id })) return self.confirmTurn(.{ .delete_gist = id });
+    self.confirmation = null;
+    if (!(try self.send(&.{ .delete_gist = id })).accepted()) return;
+    try self.presentGists(.{ .reopen = row });
+    try self.reportNotice(.information, "Drinky deleted the gist.", .{});
 }
 fn takeOffer(self: *App) !void {
     switch (self.offer) {
@@ -1185,9 +1307,23 @@ fn closePage(self: *App) !void {
     }
     _ = try self.send(&.{ .discard_result = shown.id });
 }
+fn saveResult(self: *App) !void {
+    if (!try self.submitOnPage(&.{ .save_result = self.screen.result_page.?.id })) return;
+    self.clearDraft();
+    try self.reportNotice(.information, "Drinky saved the gist.", .{});
+}
 fn applyResult(self: *App) !void {
-    const shown = self.screen.result_page.?;
-    if ((try self.send(&.{ .apply_result = shown.id })).accepted()) self.clearDraft();
+    if (!try self.submitOnPage(&.{ .apply_result = self.screen.result_page.?.id })) return;
+    self.clearDraft();
+}
+fn submitOnPage(self: *App, value: *const application.Command) !bool {
+    const response = self.controller.submit(value);
+    const refusal = if (response.refusal) |*refusal| refusal else return true;
+    const message = try wording.refusal(self.gpa, value, refusal) orelse return false;
+    defer message.deinit(self.gpa);
+    const page = self.screen.activePage() orelse return false;
+    try page.setNotice(&message);
+    return false;
 }
 fn handleExit(self: *App, exit: Exit, notice_shown: bool) !void {
     const current = self.mode();
@@ -1224,7 +1360,7 @@ fn handleExit(self: *App, exit: Exit, notice_shown: bool) !void {
         },
         .turn => |operation| try self.cancelWork(operation),
         .sign_in => |sign_in| try self.cancelWork(sign_in.operation),
-        .page => try self.closePage(),
+        .page => if (self.preview != null) try self.closePreview() else try self.closePage(),
     }
 }
 fn handleKey(self: *App, event: *const terminal.Input.Key) !void {
@@ -1272,13 +1408,13 @@ fn handleKey(self: *App, event: *const terminal.Input.Key) !void {
                 .wheel_up => try picker.rotateUp(),
                 .wheel_down => try picker.rotateDown(),
                 .enter => try self.selectRow(),
+                .backspace => try self.deleteRow(),
                 .escape => unreachable,
                 .char,
                 .ctrl,
                 .paste,
                 .shift_enter,
                 .tab,
-                .backspace,
                 .left,
                 .right,
                 .page_up,
@@ -1297,15 +1433,24 @@ fn handleKey(self: *App, event: *const terminal.Input.Key) !void {
                 .rows = self.screen.rows,
             };
             switch (event.*) {
-                .enter => if (page.action == .apply) try self.applyResult(),
+                .enter => switch (page.action) {
+                    .save => try self.saveResult(),
+                    .close, .discard, .apply => {},
+                },
                 .up => page.moveUp(size),
                 .down => page.moveDown(size),
                 .page_up => page.pageUp(size),
                 .page_down => page.pageDown(size),
                 .home => page.moveHome(),
                 .end => page.moveEnd(size),
-                .char => |codepoint| if (codepoint == 'm' or codepoint == 'M') {
-                    page.toggleSource(size);
+                .char => |codepoint| switch (codepoint) {
+                    'm', 'M' => page.toggleSource(size),
+                    'a', 'A' => switch (page.action) {
+                        .save => try self.applyResult(),
+                        .apply => try self.applyPreview(),
+                        .close, .discard => {},
+                    },
+                    else => {},
                 },
                 .escape => unreachable,
                 .ctrl,
@@ -3151,7 +3296,7 @@ test "help keeps its command position across nested steps and fetch cancellation
     const model_caption = "Model: openai-api-key · ↑/↓: Move · Enter: Select · Esc: Back";
     try rig.keys("/help\r");
     try rig.waitFor(&.{.{ .text = help_caption }});
-    try rig.keys(core.text.repeat("\x1b[B", 5));
+    try rig.keys(core.text.repeat("\x1b[B", 6));
     try rig.waitFor(&.{.{ .text = " > /model" }});
     try rig.keys("\r");
     try rig.waitFor(&.{.{ .text = model_caption }});
@@ -3321,7 +3466,10 @@ test "a page on the alternate screen scrolls, toggles the source, and closes on 
     });
 }
 
-const handoff_wait_caption = "Handoff · Esc: Discard";
+const gist_wait_caption = "Gist · Esc: Discard";
+const gist_page_caption = "Gist · Enter: Save · A: Save and apply · Esc: Discard";
+const gist_preview_caption = "Gist · A: Apply · Esc: Back";
+const gist_picker = "Gist · ↑/↓: Move · Enter: Select · Backspace: Delete · Esc: Cancel";
 const wait_line = "Agent: work (waiting) · Time: 0s · Received: 0 B";
 
 const partial_failure_stream = "data: {\"type\":\"response.output_text.delta\"," ++
@@ -3344,7 +3492,7 @@ test "incomplete page replies use the transcript failure symbol and color" {
     defer rig.deinit();
     try rig.keys("Task.\r");
     try rig.waitFor(&.{ .{ .text = "done" }, .{ .activity = false } });
-    try rig.keys("/handoff\r");
+    try rig.keys("/gist\r");
     try rig.waitFor(&.{
         .{ .alternate_screen = true },
         .{ .text = testing.truncated_text },
@@ -3354,7 +3502,7 @@ test "incomplete page replies use the transcript failure symbol and color" {
     try testing.expectContains(output, "\x1b[31m⚠ " ++ testing.truncated_text);
 }
 
-test "a failed attempt adds its note below the wait line of the handoff until Esc" {
+test "a failed attempt adds its note below the wait line of the gist until Esc" {
     var rig: Rig = undefined;
     try rig.init(&.{
         .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
@@ -3367,9 +3515,9 @@ test "a failed attempt adds its note below the wait line of the handoff until Es
 
     try rig.keys("hello\r");
     try rig.waitFor(&.{ .{ .rows = &.{ "hello", "done" } }, .{ .activity = false } });
-    try rig.keys("/handoff\r");
+    try rig.keys("/gist\r");
     try rig.waitFor(&.{
-        .{ .text = handoff_wait_caption },
+        .{ .text = gist_wait_caption },
         .{ .text = wait_line },
         .{ .text = "Attempt 1 failed. The provider is overloaded. Drinky tries again in " },
     });
@@ -3378,7 +3526,7 @@ test "a failed attempt adds its note below the wait line of the handoff until Es
     try std.testing.expectEqual(@as(usize, 2), rig.transport.requests.items.len);
 }
 
-test "/handoff after a sign-out asks for a sign-in and sends no request" {
+test "/gist after a sign-out asks for a sign-in and sends no request" {
     var rig: Rig = undefined;
     try rig.init(&.{
         .store = accounts.testing.planStore("first"),
@@ -3396,16 +3544,16 @@ test "/handoff after a sign-out asks for a sign-in and sends no request" {
     try rig.waitFor(&.{.{ .text = "Sign in · ↑/↓" }});
     try rig.keys("\x1b");
     try rig.waitFor(&.{.{ .absent = "Sign in · ↑/↓" }});
-    try rig.keys("/handoff\r");
+    try rig.keys("/gist\r");
     try rig.waitFor(&.{
-        .{ .status = "Sign in with /login before you prepare a handoff." },
-        .{ .editor = "/handoff" },
+        .{ .status = "Sign in with /login before you write a gist." },
+        .{ .editor = "/gist" },
         .{ .alternate_screen = false },
     });
     try std.testing.expectEqual(@as(usize, 1), rig.transport.requests.items.len);
 }
 
-test "Herdr hears working while /handoff streams and idle after the page closes" {
+test "Herdr hears working while /gist streams and idle after the page closes" {
     const gpa = std.testing.allocator;
     var herdr: testing.FakeHerdr = undefined;
     try herdr.init(gpa, std.testing.io);
@@ -3432,24 +3580,23 @@ test "Herdr hears working while /handoff streams and idle after the page closes"
     try expectHerdrState(&herdr, "working");
     hold.released.set(std.testing.io);
     try expectHerdrState(&herdr, "idle");
-    try rig.keys("/handoff\r");
+    try rig.keys("/gist\r");
     try stall.reached.wait(std.testing.io);
     try expectHerdrState(&herdr, "working");
-    try rig.waitFor(&.{.{ .text = handoff_wait_caption }});
+    try rig.waitFor(&.{.{ .text = gist_wait_caption }});
     try rig.keys("\x1b");
     try rig.waitFor(&.{.{ .alternate_screen = false }});
     try expectHerdrState(&herdr, "idle");
 }
 
-test "/handoff restores its command after discard and applies a preview with Enter" {
+test "/gist restores its command after a discard and saves the gist with Enter" {
     var rig: Rig = undefined;
     try rig.init(&.{
         .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
         .replies = &.{
             .{ .body = providers.testing.reply_stream },
-            .{ .body = providers.testing.replyStream("First handoff.") },
-            .{ .body = providers.testing.replyStream("Resume the task.") },
-            .{ .body = providers.testing.replyStream("Continued.") },
+            .{ .body = providers.testing.replyStream("First gist.\\nBody.") },
+            .{ .body = providers.testing.replyStream("Resume the task.\\nKeep the tests.") },
         },
         .model = "gpt-5.6-sol",
     });
@@ -3457,41 +3604,193 @@ test "/handoff restores its command after discard and applies a preview with Ent
 
     try rig.keys("Original task.\r");
     try rig.waitFor(&.{ .{ .rows = &.{ "Original task.", "done" } }, .{ .activity = false } });
-    try rig.keys("/handoff Keep the constraints.\r");
+    try rig.keys("/gist Keep the constraints.\r");
     try rig.waitFor(&.{
         .{ .alternate_screen = true },
-        .{ .text = "Handoff · Enter: Apply · Esc: Discard" },
-        .{ .text = "First handoff." },
+        .{ .text = gist_page_caption },
+        .{ .text = "First gist." },
     });
     try rig.keys("\x1b");
     try rig.waitFor(&.{
         .{ .alternate_screen = false },
-        .{ .editor = "/handoff Keep the constraints." },
+        .{ .editor = "/gist Keep the constraints." },
         .{ .rows = &.{ "Original task.", "done" } },
     });
     try rig.keys("\r");
-    try rig.waitFor(&.{ .{ .text = "Resume the task." }, .{ .text = "Enter: Apply" } });
+    try rig.waitFor(&.{ .{ .text = "Resume the task." }, .{ .text = gist_page_caption } });
     try rig.keys("\r");
     try rig.waitFor(&.{
         .{ .alternate_screen = false },
-        .{ .rows = &.{ "Resume the task.", "Continued." } },
-        .{ .absent = "Original task." },
+        .{ .status = "Drinky saved the gist." },
+        .{ .rows = &.{ "Original task.", "done" } },
         .{ .editor = "" },
-        .{ .activity = false },
     });
-    try rig.keys("/rewind\r");
-    try rig.waitFor(&.{.{ .text = rewind_picker }});
-    try rig.keys("\r");
-    try rig.waitFor(&.{ .{ .editor = "Resume the task." }, .{ .absent = "Continued." } });
+    try std.testing.expectEqual(@as(usize, 3), rig.transport.requests.items.len);
+    try rig.keys("/gists\r");
+    try rig.waitFor(&.{ .{ .text = gist_picker }, .{ .line = " > Resume the task. (0m)" } });
 }
 
-test "a handoff from the command picker restores its command after a discard" {
+test "/gists previews a gist, returns with Esc, and applies it with A" {
+    var rig: Rig = undefined;
+    try rig.init(&.{
+        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .files = &.{.{ ".drinky/gists/0123456789ab.md", "# Resume the task\nKeep the tests." }},
+        .replies = &.{
+            .{ .body = providers.testing.reply_stream },
+            .{ .body = providers.testing.replyStream("Continued.") },
+        },
+        .model = "gpt-5.6-sol",
+    });
+    defer rig.deinit();
+    try rig.keys("Original task.\r");
+    try rig.waitFor(&.{ .{ .text = "done" }, .{ .activity = false } });
+    try rig.keys("/gists\r");
+    try rig.waitFor(&.{ .{ .text = gist_picker }, .{ .line = " > Resume the task (0m)" } });
+    try rig.keys("\r");
+    try rig.waitFor(&.{
+        .{ .alternate_screen = true },
+        .{ .text = gist_preview_caption },
+        .{ .text = "Keep the tests." },
+    });
+    try rig.keys("\x1b");
+    try rig.waitFor(&.{
+        .{ .alternate_screen = false },
+        .{ .text = gist_picker },
+        .{ .line = " > Resume the task (0m)" },
+        .{ .rows = &.{ "Original task.", "done" } },
+    });
+    try rig.keys("\r");
+    try rig.waitFor(&.{.{ .text = gist_preview_caption }});
+    try rig.keys("\ra");
+    try rig.waitFor(&.{
+        .{ .alternate_screen = false },
+        .{ .rows = &.{ "→ Gist: Resume the task", "Keep the tests.", "Continued." } },
+        .{ .absent = "Original task." },
+        .{ .absent = gist_picker },
+        .{ .activity = false },
+    });
+    try expectRequested(
+        &rig,
+        "\"text\":\"<gist>\\n# Resume the task\\nKeep the tests.\\n</gist>\"",
+    );
+    try rig.keys("/rewind\r");
+    try rig.waitFor(&.{ .{ .text = rewind_picker }, .{ .line = " > Gist: Resume the task" } });
+    try rig.keys("\r");
+    try rig.waitFor(&.{
+        .{ .editor = "" },
+        .{ .absent = "Gist: Resume the task" },
+        .{ .absent = "Continued." },
+    });
+}
+
+test "/gists hides invalid and unreadable gists, counts them, and deletes after a warning" {
+    var rig: Rig = undefined;
+    try rig.init(&.{
+        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .files = &.{
+            .{ ".drinky/gists/aaaaaaaaaaaa.md", " \n" },
+            .{ ".drinky/gists/dddddddddddd.md", "Title\x00Body." },
+            .{ ".drinky/gists/bbbbbbbbbbbb.md/unreadable", "" },
+        },
+        .model = "gpt-5.6-sol",
+    });
+    defer rig.deinit();
+    try rig.keys("/gists\r");
+    try rig.waitFor(&.{
+        .{ .status = "Drinky could not read 1 gist and found 2 invalid gists in " },
+        .{ .editor = "/gists" },
+        .{ .absent = gist_picker },
+    });
+    try rig.tmp.dir.deleteTree(std.testing.io, ".drinky/gists/bbbbbbbbbbbb.md");
+    try rig.tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = ".drinky/gists/0123456789ab.md",
+        .data = "Kept gist\nBody.",
+    });
+    try rig.keys("\r");
+    try rig.waitFor(&.{
+        .{ .text = gist_picker },
+        .{ .line = " > Kept gist (0m)" },
+        .{ .status = "Drinky found 2 invalid gists in " },
+    });
+    try rig.keys("\r");
+    try rig.waitFor(&.{.{ .text = gist_preview_caption }});
+    for ([_][]const u8{ "\x03", "\x04" }) |exit| {
+        try rig.keys(exit);
+        try rig.waitFor(&.{
+            .{ .alternate_screen = false },
+            .{ .text = gist_picker },
+            .{ .line = " > Kept gist (0m)" },
+        });
+        try rig.keys("\r");
+        try rig.waitFor(&.{.{ .text = gist_preview_caption }});
+    }
+    try rig.keys("\x1b");
+    try rig.waitFor(&.{ .{ .alternate_screen = false }, .{ .line = " > Kept gist (0m)" } });
+    try rig.keys("\x7f");
+    try rig.waitFor(&.{.{ .status = "Press Backspace again to delete the gist." }});
+    try rig.keys("\x7f");
+    try rig.waitFor(&.{
+        .{ .status = "Drinky deleted the gist." },
+        .{ .absent = gist_picker },
+        .{ .editor = "" },
+    });
+}
+
+test "a list that /gists cannot read again after a preview closes with its failure" {
+    var rig: Rig = undefined;
+    try rig.init(&.{
+        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .files = &.{.{ ".drinky/gists/0123456789ab.md", "Kept gist\nBody." }},
+        .model = "gpt-5.6-sol",
+    });
+    defer rig.deinit();
+    try rig.keys("/gists\r");
+    try rig.waitFor(&.{.{ .line = " > Kept gist (0m)" }});
+    try rig.keys("\r");
+    try rig.waitFor(&.{.{ .text = gist_preview_caption }});
+    try rig.tmp.dir.deleteTree(std.testing.io, ".drinky/gists");
+    try rig.tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".drinky/gists", .data = "" });
+    try rig.keys("\x1b");
+    try rig.waitFor(&.{
+        .{ .alternate_screen = false },
+        .{ .status = "Drinky could not read the gists in " },
+        .{ .status = "because of error NotDir." },
+        .{ .absent = gist_picker },
+    });
+}
+
+test "a failed save keeps the page and shows its failure on the page" {
+    var rig: Rig = undefined;
+    try rig.init(&.{
+        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .files = &.{.{ ".drinky/gists", "blocked" }},
+        .replies = &.{
+            .{ .body = providers.testing.reply_stream },
+            .{ .body = providers.testing.replyStream("Kept gist.\\nBody.") },
+        },
+        .model = "gpt-5.6-sol",
+    });
+    defer rig.deinit();
+    try rig.keys("Task.\r");
+    try rig.waitFor(&.{ .{ .text = "done" }, .{ .activity = false } });
+    try rig.keys("/gist\r");
+    try rig.waitFor(&.{.{ .text = "Kept gist." }});
+    try rig.keys("\r");
+    try rig.waitFor(&.{
+        .{ .alternate_screen = true },
+        .{ .text = gist_page_caption },
+        .{ .text = "Kept gist." },
+        .{ .text = "because of error NotDir." },
+    });
+}
+
+test "a gist from the command picker restores its command after a discard" {
     var rig: Rig = undefined;
     try rig.init(&.{
         .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
         .replies = &.{
             .{ .body = providers.testing.reply_stream },
-            .{ .body = providers.testing.replyStream("Handoff text.") },
+            .{ .body = providers.testing.replyStream("Gist text.\\nBody.") },
         },
         .model = "gpt-5.6-sol",
     });
@@ -3501,12 +3800,12 @@ test "a handoff from the command picker restores its command after a discard" {
     try rig.keys("/help\r");
     try rig.waitFor(&.{.{ .text = "Command ·" }});
     try rig.keys("\x1b[B\r");
-    try rig.waitFor(&.{.{ .text = "Handoff · Enter: Apply" }});
+    try rig.waitFor(&.{.{ .text = "Gist · Enter: Save" }});
     try rig.keys("\x1b");
-    try rig.waitFor(&.{ .{ .alternate_screen = false }, .{ .editor = "/handoff" } });
+    try rig.waitFor(&.{ .{ .alternate_screen = false }, .{ .editor = "/gist" } });
 }
 
-test "handoff exits cancel generation without applying it or losing the command" {
+test "gist exits cancel generation without saving it or losing the command" {
     for ([_][]const u8{ "\x1b", "\x03", "\x04" }) |exit| {
         var stall: providers.testing.FakeTransport.Stall = .{ .io = std.testing.io };
         var rig: Rig = undefined;
@@ -3522,17 +3821,17 @@ test "handoff exits cancel generation without applying it or losing the command"
         defer rig.deinit();
         try rig.keys("Original task.\r");
         try rig.waitFor(&.{ .{ .text = "done" }, .{ .activity = false } });
-        try rig.keys("/handoff Keep the goal.\r");
+        try rig.keys("/gist Keep the goal.\r");
         try stall.reached.wait(std.testing.io);
         try rig.waitFor(&.{
-            .{ .text = handoff_wait_caption },
-            .{ .absent = "Enter: Apply" },
+            .{ .text = gist_wait_caption },
+            .{ .absent = "Enter: Save" },
         });
         try rig.keys("\r");
         try rig.keys(exit);
         try rig.waitFor(&.{
             .{ .alternate_screen = false },
-            .{ .editor = "/handoff Keep the goal." },
+            .{ .editor = "/gist Keep the goal." },
             .{ .rows = &.{ "Original task.", "done" } },
         });
         try std.testing.expect(stall.canceled);
@@ -3545,7 +3844,7 @@ test "handoff exits cancel generation without applying it or losing the command"
     }
 }
 
-test "a failed or truncated handoff cannot apply, and its command survives" {
+test "a failed, truncated, or non-text gist cannot save, and its command survives" {
     var rig: Rig = undefined;
     try rig.init(&.{
         .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
@@ -3553,42 +3852,55 @@ test "a failed or truncated handoff cannot apply, and its command survives" {
             .{ .body = providers.testing.reply_stream },
             .{ .body = partial_failure_stream },
             .{ .body = cut_stream },
+            .{ .body = providers.testing.replyStream("Title\\u0000Body.") },
         },
         .model = "gpt-5.6-sol",
     });
     defer rig.deinit();
     try rig.keys("Original task.\r");
     try rig.waitFor(&.{ .{ .text = "done" }, .{ .activity = false } });
-    try rig.keys("/handoff Keep checks.\r");
+    try rig.keys("/gist Keep checks.\r");
     try rig.waitFor(&.{
         .{ .text = "The provider is overloaded." },
-        .{ .absent = "Enter: Apply" },
+        .{ .absent = "Enter: Save" },
     });
     try rig.keys("\rM");
     try rig.waitFor(&.{ .{ .text = "M: Render" }, .{ .text = "partial" } });
     try rig.keys("\x1b");
-    try rig.waitFor(&.{ .{ .alternate_screen = false }, .{ .editor = "/handoff Keep checks." } });
+    try rig.waitFor(&.{ .{ .alternate_screen = false }, .{ .editor = "/gist Keep checks." } });
     try rig.keys("\r");
     try rig.waitFor(
-        &.{ .{ .text = testing.truncated_text }, .{ .absent = "Enter: Apply" } },
+        &.{ .{ .text = testing.truncated_text }, .{ .absent = "Enter: Save" } },
     );
     try rig.keys("\r\x1b");
     try rig.waitFor(&.{
         .{ .alternate_screen = false },
-        .{ .editor = "/handoff Keep checks." },
+        .{ .editor = "/gist Keep checks." },
         .{ .rows = &.{ "Original task.", "done" } },
     });
-    try std.testing.expectEqual(@as(usize, 3), rig.transport.requests.items.len);
+    try rig.keys("\r");
+    try rig.waitFor(&.{
+        .{ .text = "The reply of the model is not valid text. Drinky cannot save it." },
+        .{ .text = gist_wait_caption },
+        .{ .absent = "Enter: Save" },
+    });
+    try rig.keys("\ra\x1b");
+    try rig.waitFor(&.{
+        .{ .alternate_screen = false },
+        .{ .editor = "/gist Keep checks." },
+        .{ .rows = &.{ "Original task.", "done" } },
+    });
+    try std.testing.expectEqual(@as(usize, 4), rig.transport.requests.items.len);
 }
 
-test "an applied handoff has the normal canceled-turn edit action" {
+test "the removal of a canceled gist turn leaves the editor empty" {
     var stall: providers.testing.FakeTransport.Stall = .{ .io = std.testing.io };
     var rig: Rig = undefined;
     try rig.init(&.{
         .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
         .replies = &.{
             .{ .body = providers.testing.reply_stream },
-            .{ .body = providers.testing.replyStream("Resume this task.") },
+            .{ .body = providers.testing.replyStream("Resume this task.\\nBody.") },
             .{ .stall = &stall },
         },
         .model = "gpt-5.6-sol",
@@ -3596,32 +3908,33 @@ test "an applied handoff has the normal canceled-turn edit action" {
     defer rig.deinit();
     try rig.keys("Original task.\r");
     try rig.waitFor(&.{ .{ .text = "done" }, .{ .activity = false } });
-    try rig.keys("/handoff\r");
-    try rig.waitFor(&.{.{ .text = "Handoff · Enter: Apply" }});
-    try expectRequested(&rig, "\"text\":\"Prepare the handoff.\"");
-    try rig.keys("\r");
+    try rig.keys("/gist\r");
+    try rig.waitFor(&.{.{ .text = gist_page_caption }});
+    try expectRequested(&rig, "\"text\":\"Write the gist.\"");
+    try rig.keys("a");
     try stall.reached.wait(std.testing.io);
     try rig.keys("\x1b");
-    try rig.waitFor(&.{.{ .text = "Canceled turn" }});
+    try rig.waitFor(&.{.{ .text = "Canceled turn · Ctrl+N: Remove · Esc: Keep turn" }});
     try rig.keys("\x0e");
     try rig.waitFor(&.{
-        .{ .editor = "Resume this task." },
+        .{ .editor = "" },
+        .{ .absent = "Gist: Resume this task." },
         .{ .absent = "Original task." },
         .{ .absent = "Canceled turn" },
     });
 }
 
-test "a handoff without a conversation refuses and keeps its command" {
+test "a gist without a conversation refuses and keeps its command" {
     var rig: Rig = undefined;
     try rig.init(&.{
         .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
         .model = "gpt-5.6-sol",
     });
     defer rig.deinit();
-    try rig.keys("/handoff Keep tests.\r");
+    try rig.keys("/gist Keep tests.\r");
     try rig.waitFor(&.{
-        .{ .status = "No conversation is available for a handoff." },
-        .{ .editor = "/handoff Keep tests." },
+        .{ .status = "No conversation is available for a gist." },
+        .{ .editor = "/gist Keep tests." },
         .{ .alternate_screen = false },
     });
     try std.testing.expectEqual(@as(usize, 0), rig.transport.requests.items.len);
@@ -3771,13 +4084,13 @@ test "the terminal hears working while a model fetch runs" {
     try expectProgramStatuses(&rig, &.{ idle_status, working_status, idle_status });
 }
 
-test "the terminal hears done after a complete handoff and error after a cut one" {
+test "the terminal hears done after a complete gist and error after a cut one" {
     var rig: Rig = undefined;
     try rig.init(&.{
         .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
         .replies = &.{
             .{ .body = providers.testing.reply_stream },
-            .{ .body = providers.testing.replyStream("Resume the task.") },
+            .{ .body = providers.testing.replyStream("Resume the task.\\nBody.") },
             .{ .body = cut_stream },
         },
         .model = "gpt-5.6-sol",
@@ -3786,10 +4099,10 @@ test "the terminal hears done after a complete handoff and error after a cut one
 
     try rig.keys("Task.\r");
     try rig.waitFor(&.{ .{ .text = "done" }, .{ .activity = false } });
-    try rig.keys("/handoff\r");
-    try rig.waitFor(&.{.{ .text = "Handoff · Enter: Apply" }});
+    try rig.keys("/gist\r");
+    try rig.waitFor(&.{.{ .text = "Gist · Enter: Save" }});
     try rig.keys("\x1b");
-    try rig.waitFor(&.{ .{ .alternate_screen = false }, .{ .editor = "/handoff" } });
+    try rig.waitFor(&.{ .{ .alternate_screen = false }, .{ .editor = "/gist" } });
     try rig.keys("\r");
     try rig.waitFor(&.{.{ .text = testing.truncated_text }});
     const done_status = "state=done:app=drinky";

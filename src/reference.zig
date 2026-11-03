@@ -11,7 +11,8 @@ pub const key_hints = [_][]const u8{
 
 pub const Command = enum {
     effort,
-    handoff,
+    gist,
+    gists,
     help,
     login,
     logout,
@@ -34,10 +35,11 @@ pub const Command = enum {
 
 pub const commands: std.enums.EnumArray(Command, Command.Facts) = .init(.{
     .effort = .{ .summary = "Set the reasoning effort" },
-    .handoff = .{
-        .summary = "Prepare a handoff for the current task",
+    .gist = .{
+        .summary = "Write and review a gist of the current task",
         .tail = "an optional instruction",
     },
+    .gists = .{ .summary = "Read, apply, or delete a saved gist" },
     .help = .{ .summary = "List every command", .alias = "/" },
     .login = .{ .summary = "Sign in or switch the account" },
     .logout = .{ .summary = "Drop the credentials of an account" },

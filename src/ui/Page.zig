@@ -30,7 +30,7 @@ layout_bytes: usize,
 action: Action,
 
 pub const Presentation = enum { markdown, source };
-pub const Action = enum { close, discard, apply };
+pub const Action = enum { close, discard, save, apply };
 pub const Options = struct {
     title: []const u8,
     content: []const u8,
@@ -247,7 +247,8 @@ fn controls(self: *const Page) []const u8 {
             inline else => |presentation| (switch (action) {
                 .close => "Esc: Close",
                 .discard => "Esc: Discard",
-                .apply => "Enter: Apply · Esc: Discard",
+                .save => "Enter: Save · A: Save and apply · Esc: Discard",
+                .apply => "A: Apply · Esc: Back",
             }) ++ " · " ++ (switch (presentation) {
                 .markdown => "M: Source",
                 .source => "M: Render",

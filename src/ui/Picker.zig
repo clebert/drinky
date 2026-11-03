@@ -12,9 +12,10 @@ const testing = @import("testing.zig");
 
 const Picker = @This();
 
-const hint_cancel = "↑/↓: Move · Enter: Select · Esc: Cancel";
-const hint_back = "↑/↓: Move · Enter: Select · Esc: Back";
-const hint_wait = "Esc: Cancel";
+const hint_select = "↑/↓: Move · Enter: Select · ";
+const hint_delete = "Backspace: Delete · ";
+const hint_cancel = "Esc: Cancel";
+const hint_back = "Esc: Back";
 const tag_current = " (Current)";
 const tag_open = " (";
 const tag_close = ")";
@@ -67,6 +68,7 @@ const Start = struct {
     preselected: ?usize = null,
     position: ?Position = null,
     can_step_back: bool = false,
+    deletes: bool = false,
 };
 
 const Body = union(enum) {
@@ -90,6 +92,7 @@ const List = struct {
     rotation: usize,
     current: ?usize,
     can_step_back: bool,
+    deletes: bool,
 };
 
 const Wait = struct {
@@ -153,6 +156,7 @@ pub fn init(
             .rotation = @min(opened.rotation, index_max),
             .current = start.current,
             .can_step_back = start.can_step_back,
+            .deletes = start.deletes,
         } },
         .content = .empty,
         .line_roles = .empty,
@@ -312,10 +316,20 @@ fn caption(self: *const Picker, rows_max: usize) Caption {
     return .{
         .title = self.title,
         .controls = switch (self.body) {
-            .list => |*list| if (list.can_step_back) hint_back else hint_cancel,
-            .wait => hint_wait,
+            .list => |*list| listControls(list),
+            .wait => hint_cancel,
         },
         .rows_max = @min(3, rows_max -| (paint.frame_edge_rows + 1)),
+    };
+}
+
+fn listControls(list: *const List) []const u8 {
+    return switch (list.deletes) {
+        inline else => |deletes| switch (list.can_step_back) {
+            inline else => |can_step_back| hint_select ++
+                (if (deletes) hint_delete else "") ++
+                (if (can_step_back) hint_back else hint_cancel),
+        },
     };
 }
 

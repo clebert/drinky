@@ -20,6 +20,7 @@ const fold_extra = "The model folds this level to {s}.";
 const drop_extra = "The model drops this level.";
 
 gpa: std.mem.Allocator,
+io: std.Io,
 step: Step = .help,
 title: std.ArrayList(u8) = .empty,
 options: std.ArrayList(ui.Picker.Option) = .empty,
@@ -41,11 +42,12 @@ pub const Step = union(enum) {
     logout,
     skill,
     rewind,
+    gists,
 
     fn reopens(self: Step) bool {
         return switch (self) {
             .help, .vendor, .account, .author, .models => true,
-            .author_models, .effort, .login, .logout, .skill, .rewind => false,
+            .author_models, .effort, .login, .logout, .skill, .rewind, .gists => false,
         };
     }
 
@@ -59,6 +61,7 @@ pub const Step = union(enum) {
             .logout => "You canceled the sign-out selection.",
             .skill => "You canceled the skill selection.",
             .rewind => "You canceled the prompt selection.",
+            .gists => "You canceled the gist selection. The gists stay.",
         };
     }
 };
@@ -75,6 +78,7 @@ const Target = union(enum) {
     sign_out: usize,
     skill: []const u8,
     turn: Turn,
+    gist: application.GistId,
 
     const Named = struct { account: usize, name: []const u8 };
     const Turn = struct { id: u64, mutated: bool };
@@ -83,7 +87,7 @@ const Target = union(enum) {
         switch (self.*) {
             .author, .model => |named| gpa.free(named.name),
             .skill => |skill_name| gpa.free(skill_name),
-            .command, .vendor, .account, .fetch, .effort, .sign_in, .sign_out, .turn => {},
+            .command, .vendor, .account, .fetch, .effort, .sign_in, .sign_out, .turn, .gist => {},
         }
     }
 };
@@ -102,6 +106,7 @@ const Shown = struct {
     options: []const ui.Picker.Option,
     current: ?usize = null,
     preselected: ?usize = null,
+    deletes: bool = false,
 };
 
 const AuthorRow = struct {
@@ -115,8 +120,8 @@ const AuthorRow = struct {
     }
 };
 
-pub fn init(gpa: std.mem.Allocator) Flow {
-    return .{ .gpa = gpa };
+pub fn init(gpa: std.mem.Allocator, io: std.Io) Flow {
+    return .{ .gpa = gpa, .io = io };
 }
 
 pub fn deinit(self: *Flow) void {
@@ -312,7 +317,10 @@ pub fn show(
             try self.setTitle("Prompt", .{});
             const turns = controller.listTurns();
             for (turns) |turn| {
-                const copy = try self.gpa.dupe(u8, turn.line);
+                const copy = switch (turn.prompt) {
+                    .line => |line| try self.gpa.dupe(u8, line),
+                    .gist => |title| try format.gistLabel(self.gpa, title),
+                };
                 defer self.gpa.free(copy);
                 try self.addRow(
                     .{ .turn = .{ .id = turn.id, .mutated = turn.drops_mutating_turn } },
@@ -320,6 +328,16 @@ pub fn show(
                 );
             }
             if (self.targets.items.len > 0) shown.preselected = self.targets.items.len - 1;
+        },
+        .gists => {
+            try self.setTitle("Gist", .{});
+            shown.deletes = true;
+            const entries = switch (controller.listGists().listing) {
+                .listed => |listed| listed.entries,
+                .unreadable => &.{},
+            };
+            const now_ms = std.Io.Timestamp.now(self.io, .real).toMilliseconds();
+            for (entries) |*gist| try self.addGistRow(gist, now_ms);
         },
     }
     shown.title = self.title.items;
@@ -407,10 +425,21 @@ fn addRow(self: *Flow, item: Target, row: *const ui.Picker.Option) error{OutOfMe
             .name = try self.gpa.dupe(u8, named.name),
         } },
         .skill => |name| .{ .skill = try self.gpa.dupe(u8, name) },
-        .command, .vendor, .account, .fetch, .effort, .sign_in, .sign_out, .turn => item,
+        .command, .vendor, .account, .fetch, .effort, .sign_in, .sign_out, .turn, .gist => item,
     };
     self.options.appendAssumeCapacity(option);
     self.targets.appendAssumeCapacity(owned);
+}
+
+fn addGistRow(self: *Flow, gist: *const application.GistEntry, now_ms: i64) !void {
+    const name = try self.gpa.dupe(u8, gist.title);
+    defer self.gpa.free(name);
+    var buffer: [24]u8 = undefined;
+    const age_s: u64 = @intCast(@divFloor(@max(now_ms - gist.saved_ms, 0), std.time.ms_per_s));
+    try self.addRow(.{ .gist = gist.id }, &.{
+        .name = format.singleLine(name),
+        .tag = format.coarseDuration(&buffer, age_s),
+    });
 }
 
 fn addFetchRow(self: *Flow, account: usize, count: usize) error{OutOfMemory}!void {
@@ -496,7 +525,7 @@ test "the model flow resolves single choices and lists vendors, accounts, and mo
     });
     defer rig.deinit();
     const choice = try currentChoice(&rig);
-    var flow: Flow = .init(std.testing.allocator);
+    var flow: Flow = .init(std.testing.allocator, std.testing.io);
     defer flow.deinit();
 
     try std.testing.expectEqual(Step.vendor, resolve(rig.controller, .vendor));
@@ -561,7 +590,7 @@ test "the current mark follows the active account and not only the model name" {
     });
     defer rig.deinit();
     const choice = try currentChoice(&rig);
-    var flow: Flow = .init(std.testing.allocator);
+    var flow: Flow = .init(std.testing.allocator, std.testing.io);
     defer flow.deinit();
     const step = resolve(rig.controller, .vendor);
     const listed = try flow.show(rig.controller, &choice, step);
@@ -589,7 +618,7 @@ test "the author step ranks authors and preselects a remembered author absent fr
     });
     defer rig.deinit();
     var choice = try currentChoice(&rig);
-    var flow: Flow = .init(std.testing.allocator);
+    var flow: Flow = .init(std.testing.allocator, std.testing.io);
     defer flow.deinit();
     const account = accounts.testing.openrouter_api_key;
 
@@ -645,7 +674,7 @@ test "the effort rows mark the current level and each level that the model folds
     var rig: application.testing.Rig = undefined;
     try rig.init(&.{});
     defer rig.deinit();
-    var flow: Flow = .init(std.testing.allocator);
+    var flow: Flow = .init(std.testing.allocator, std.testing.io);
     defer flow.deinit();
     const shown = try flow.show(rig.controller, &try currentChoice(&rig), .effort);
     try expectRows(&shown, "Effort", &.{ "low", "medium", "high", "xhigh", "max" });
@@ -680,7 +709,7 @@ test "the sign-in rows mark the active, the signed-in, the set, and the failed a
             "\"expires_ms\":4102444800000}}",
     });
     defer rig.deinit();
-    var flow: Flow = .init(std.testing.allocator);
+    var flow: Flow = .init(std.testing.allocator, std.testing.io);
     defer flow.deinit();
     const choice = try currentChoice(&rig);
     const login = try flow.show(rig.controller, &choice, .login);
@@ -738,7 +767,7 @@ test "the skill rows sort by name and hold the first sentence of each descriptio
     var rig: application.testing.Rig = undefined;
     try rig.init(&.{ .files = &files });
     defer rig.deinit();
-    var flow: Flow = .init(std.testing.allocator);
+    var flow: Flow = .init(std.testing.allocator, std.testing.io);
     defer flow.deinit();
     const shown = try flow.show(rig.controller, &try currentChoice(&rig), .skill);
     try std.testing.expectEqualStrings("Skill", shown.title);
@@ -765,7 +794,7 @@ test "the prompt rows show each typed line on one row and carry the consequence 
         _ = rig.send(&.{ .send_message = line });
         try rig.expectTurn(.stopped);
     }
-    var flow: Flow = .init(std.testing.allocator);
+    var flow: Flow = .init(std.testing.allocator, std.testing.io);
     defer flow.deinit();
     const shown = try flow.show(rig.controller, &try currentChoice(&rig), .rewind);
     try expectRows(&shown, "Prompt", &.{ "first", "look at this: the file", "last" });
@@ -775,13 +804,70 @@ test "the prompt rows show each typed line on one row and carry the consequence 
         try std.testing.expectEqual(mutated, flow.target(row).turn.mutated);
 }
 
+test "the gist rows show each title on one row with its age, and a rewind names a gist" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var rig: application.testing.Rig = undefined;
+    try rig.init(&.{ .replies = &.{
+        .{ .body = providers.testing.reply_stream },
+        .{ .body = providers.testing.replyStream("# Saved \\u001b[31mtitle\\nBody.") },
+        .{ .body = providers.testing.reply_stream },
+    } });
+    defer rig.deinit();
+    _ = rig.send(&.{ .send_message = "Task." });
+    try rig.expectTurn(.stopped);
+    const id = rig.send(&.{ .prepare_gist = "" }).operation.?;
+    const ready = try rig.result();
+    ready.deinit(gpa);
+    _ = rig.send(&.{ .save_result = id });
+    try writeAged(&rig, ".drinky/gists/0123456789ab.md", "Older title\nBody.", 3);
+    try writeAged(&rig, ".drinky/gists/aaaaaaaaaaaa.md", "\n \n", 5);
+    try rig.tree.directory(".drinky/gists/fedcba987654.md");
+    var flow: Flow = .init(gpa, io);
+    defer flow.deinit();
+    const shown = try flow.show(rig.controller, &try currentChoice(&rig), .gists);
+    try expectRows(&shown, "Gist", &.{ "Saved [31mtitle", "Older title" });
+    try std.testing.expect(shown.deletes);
+    try std.testing.expectEqual(@as(?usize, null), shown.current);
+    for ([_][]const u8{ "0m", "3d" }, shown.options) |tag, option| {
+        try std.testing.expectEqualStrings(tag, option.tag.?);
+        try std.testing.expect(!option.tag_pressure);
+    }
+    const older: application.GistId = .{ 0x01, 0x23, 0x45, 0x67, 0x89, 0xab };
+    try std.testing.expectEqual(older, flow.target(1).gist);
+    try std.testing.expect(rig.send(&.{ .apply_gist = flow.target(0).gist }).accepted());
+    try rig.expectTurn(.stopped);
+    const rewind = try flow.show(rig.controller, &try currentChoice(&rig), .rewind);
+    try expectRows(&rewind, "Prompt", &.{"Gist: Saved [31mtitle"});
+}
+
+fn writeAged(
+    rig: *application.testing.Rig,
+    sub_path: []const u8,
+    text: []const u8,
+    days: i96,
+) !void {
+    const io = std.testing.io;
+    try rig.tree.write(sub_path, text);
+    var file = try rig.tree.tmp.dir.openFile(io, sub_path, .{ .mode = .read_write });
+    defer file.close(io);
+    const now_ns = std.Io.Timestamp.now(io, .real).toNanoseconds();
+    try file.setTimestamps(io, .{ .modify_timestamp = .{
+        .new = .fromNanoseconds(now_ns - days * std.time.ns_per_day),
+    } });
+}
+
 test "the rows of each step release every partial allocation" {
     var rig: application.testing.Rig = undefined;
     try rig.init(&.{
-        .files = &.{.{
-            ".agents/skills/demo/SKILL.md",
-            "---\nname: demo\ndescription: Demo. More.\n---\nBody.\n",
-        }},
+        .files = &.{
+            .{
+                ".agents/skills/demo/SKILL.md",
+                "---\nname: demo\ndescription: Demo. More.\n---\nBody.\n",
+            },
+            .{ ".drinky/gists/0123456789ab.md", "Title\nBody." },
+            .{ ".drinky/gists/fedcba987654.md/unreadable", "" },
+        },
         .replies = &.{.{ .body = providers.testing.reply_stream }},
     });
     defer rig.deinit();
@@ -800,7 +886,7 @@ fn checkRows(
     controller: *application.Controller,
     choice: *const application.Choice,
 ) !void {
-    var flow: Flow = .init(gpa);
+    var flow: Flow = .init(gpa, std.testing.io);
     defer flow.deinit();
     const account = accounts.testing.openai_api_key;
     const steps = [_]Step{
@@ -814,6 +900,7 @@ fn checkRows(
         .logout,
         .skill,
         .rewind,
+        .gists,
     };
     for (steps) |step| _ = try flow.show(controller, choice, step);
     try flow.setAuthor("gpt-5.6-sol");

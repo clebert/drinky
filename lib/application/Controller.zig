@@ -6,6 +6,7 @@ const tools = @import("tools");
 const billing = @import("billing.zig");
 const Choice = @import("Choice.zig");
 const Clients = @import("Clients.zig");
+const Gists = @import("Gists.zig");
 const Harness = @import("Harness.zig");
 const Live = @import("Live.zig");
 const project = @import("project.zig");
@@ -25,23 +26,36 @@ const Controller = @This();
 const retry_request = "<retry_request>\nFailure: {t}\n{s}{s}{s}" ++
     "Continue from the last committed checkpoint.\n</retry_request>";
 
-const handoff_system = "You prepare a handoff for a fresh coding-agent conversation. " ++
-    "The messages hold the user prompts and the final answers of the agent. " ++
-    "They omit tool calls, tool results, and intermediate texts. " ++
-    "The last user message asks for the handoff. " ++
-    "Its optional instruction guides the handoff, not work on the repository. " ++
-    "Summarize only the current task. Preserve its goal, constraints, decisions, " ++
-    "completed work, verification results, and remaining work. " ++
+const gist_system = "You write a gist for a fresh coding-agent conversation. " ++
+    "A gist is a compressed summary that lets the next agent continue the work. " ++
+    "The messages hold the user prompts, the texts of the agent between its tool calls, " ++
+    "and its final answers. They omit tool calls, tool results, reasoning, and the skills " ++
+    "that the agent loaded. A user prompt can hold a skill that the user invoked. " ++
+    "Treat that skill as instructions, not as words that the user typed. " ++
+    "A user message inside <gist> tags holds an earlier gist, not text that the user typed. " ++
+    "Keep its facts unless later messages replace them. " ++
+    "The last user message asks for the gist. " ++
+    "Its optional instruction guides the gist, not work on the repository. " ++
+    "Describe the current state of the work, not its history. " ++
+    "Start with one line of plain text that holds a short title. " ++
+    "Then state the goal and the requirements in effect. " ++
+    "A later requirement replaces an earlier one, and a withdrawn requirement disappears. " ++
+    "Keep the exact words of the user for hard constraints. " ++
+    "State each decision with its reason, and tell user decisions from agent decisions. " ++
+    "State the learnings: facts about the code, failed approaches, and traps. " ++
+    "State the completed work, the verification results, and the remaining work. " ++
+    "Reduce each finished part to one line. Drop learnings that no longer affect open work. " ++
     "Preserve pending user decisions and the current workflow, including any interview. " ++
     "Name the relevant files and any skills that the next agent must read again. " ++
     "Distinguish verified results from assumptions and failed or incomplete checks. " ++
     "Copy paths, commands, and technical identifiers exactly. " ++
     "Keep the language of the task. Be concise without a fixed word count. " ++
     "Write a self-contained user message for the next agent. " ++
-    "Tell it to resume the task and ask for any user decision that still blocks it. " ++
-    "Do not invent facts or add unrelated tasks. Output only the handoff.";
-const handoff_request = "Prepare the handoff.";
-const handoff_instruction = handoff_request ++ "\n<instruction>\n{s}\n</instruction>";
+    "Tell it to resume the work and ask for any user decision that still blocks it. " ++
+    "Do not invent facts or add unrelated tasks. Output only the gist.";
+const gist_request = "Write the gist.";
+const gist_instruction = gist_request ++ "\n<instruction>\n{s}\n</instruction>";
+const gist_message = "<gist>\n{s}\n</gist>";
 
 gpa: std.mem.Allocator,
 io: std.Io,
@@ -58,6 +72,7 @@ turns: Turns,
 working_directory: []const u8,
 home_directory: []const u8,
 branch_root: ?[]const u8 = null,
+gists: Gists = undefined,
 branch_buffer: [project.head_bytes_max]u8 = undefined,
 branch_length: ?usize = null,
 notice: ?Record.Event = null,
@@ -73,6 +88,8 @@ fetch_end: ?Event.FetchEnd = null,
 paste_pending: bool = false,
 response: Response = .{},
 recovered: ?[]const u8 = null,
+failed_path: ?[]u8 = null,
+gist_read: ?[]u8 = null,
 found_models: std.ArrayList(accounts.Model) = .empty,
 model_facts: std.ArrayList(query.Model) = .empty,
 turn_facts: std.ArrayList(query.Turn) = .empty,
@@ -130,6 +147,14 @@ pub const Handle = opaque {
     pub fn listSkills(handle: *Handle) []const query.Skill {
         const self = controllerOf(handle);
         return self.skillFacts() catch core.fatal.outOfMemory();
+    }
+    pub fn listGists(handle: *Handle) query.GistList {
+        const self = controllerOf(handle);
+        return self.gistFacts() catch core.fatal.outOfMemory();
+    }
+    pub fn readGist(handle: *Handle, id: *const Gists.Id) query.GistText {
+        const self = controllerOf(handle);
+        return self.gistText(id) catch core.fatal.outOfMemory();
     }
     pub fn state(handle: *Handle) State {
         return controllerOf(handle).currentState();
@@ -192,9 +217,12 @@ pub const Command = union(enum) {
     retry,
     remove_canceled_turn: u64,
     rewind: u64,
-    prepare_handoff: []const u8,
+    prepare_gist: []const u8,
+    save_result: u64,
     apply_result: u64,
     discard_result: u64,
+    apply_gist: Gists.Id,
+    delete_gist: Gists.Id,
     cancel: u64,
     dismiss_offer,
     dismiss_notice: u64,
@@ -225,6 +253,8 @@ pub const Refusal = union(enum) {
     skill_unreadable: SkillUnreadable,
     account_unloaded: Unloaded,
     credential_missing: usize,
+    gist_failed: Gists.Failure,
+    gist_invalid: []const u8,
 
     pub const SkillUnreadable = struct { name: []const u8, cause: tools.skill_file.ReadError };
     pub const Unloaded = struct { account: usize, cause: accounts.Registry.LoadError };
@@ -355,7 +385,7 @@ const Offer = union(enum) {
 const TurnStart = struct {
     text: []const u8,
     start: usize,
-    line: ?[]const u8,
+    prompt: ?Turns.Prompt,
 };
 
 const Mark = struct {
@@ -538,6 +568,8 @@ fn init(self: *Controller, gpa: std.mem.Allocator, io: std.Io, options: *const O
     errdefer self.account_registry.deinit();
     self.home_directory = try homeDirectory(gpa, io, directories);
     errdefer gpa.free(self.home_directory);
+    self.gists = try .init(gpa, self.home_directory);
+    errdefer self.gists.deinit();
     if (options.startup == .session) {
         self.saved = try accounts.State.open(
             gpa,
@@ -625,6 +657,7 @@ fn deinit(self: *Controller) void {
     self.model_facts.deinit(self.gpa);
     self.turn_facts.deinit(self.gpa);
     self.skill_facts.deinit(self.gpa);
+    if (self.gist_read) |owned| self.gpa.free(owned);
     if (self.ready) {
         if (self.notice) |*notice| notice.deinit(self.gpa);
         self.dropResult();
@@ -634,6 +667,7 @@ fn deinit(self: *Controller) void {
         self.session.deinit();
         self.clients.deinit();
         if (self.startup == .session) self.saved.deinit();
+        self.gists.deinit();
         self.gpa.free(self.home_directory);
         self.account_registry.deinit();
         self.harness.deinit(self.gpa);
@@ -758,11 +792,11 @@ fn turnFacts(self: *Controller) error{OutOfMemory}![]const query.Turn {
     for (0..turns.len) |offset| {
         const index = turns.len - 1 - offset;
         dropped = dropped or turns[index].mutated;
-        const line = turns[index].line orelse continue;
+        const prompt = turns[index].prompt orelse continue;
         first -= 1;
         self.turn_facts.items[first] = .{
             .id = turns[index].id,
-            .line = line,
+            .prompt = prompt,
             .drops_mutating_turn = dropped,
         };
     }
@@ -778,6 +812,37 @@ fn skillFacts(self: *Controller) error{OutOfMemory}![]const query.Skill {
         .description = skill.description,
     });
     return self.skill_facts.items;
+}
+
+fn gistFacts(self: *Controller) error{OutOfMemory}!query.GistList {
+    const listing: query.GistList.Listing = if (self.gists.list(self.io)) |listed|
+        .{ .listed = listed }
+    else |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => |cause| .{ .unreadable = cause },
+    };
+    return .{ .directory = self.gists.directory, .listing = listing };
+}
+
+fn gistText(self: *Controller, id: *const Gists.Id) error{OutOfMemory}!query.GistText {
+    if (self.gist_read) |owned| self.gpa.free(owned);
+    self.gist_read = null;
+    const path = try self.gists.path(self.gpa, id);
+    const text = self.gists.read(self.gpa, self.io, id) catch |err| {
+        self.gist_read = path;
+        return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => |cause| .{ .failed = .{ .path = path, .cause = cause } },
+        };
+    };
+    if (Gists.parse(text) == null) {
+        self.gpa.free(text);
+        self.gist_read = path;
+        return .{ .invalid = path };
+    }
+    self.gpa.free(path);
+    self.gist_read = text;
+    return .{ .text = text };
 }
 
 fn sync(self: *Controller) !void {
@@ -855,6 +920,8 @@ fn nextOperation(self: *Controller) u64 {
 fn releaseResponse(self: *Controller) void {
     if (self.recovered) |text| self.gpa.free(text);
     self.recovered = null;
+    if (self.failed_path) |path| self.gpa.free(path);
+    self.failed_path = null;
     self.response = .{};
 }
 
@@ -901,7 +968,7 @@ fn invokeSkill(self: *Controller, skill: *const Command.Skill) !void {
     const start = self.surface.transcript.entries().len;
     try self.surface.appendSkillNote(&.{ .name = target.name, .source = target.path });
     if (skill.arguments.len > 0) try self.surface.appendUser(skill.arguments);
-    try self.runTurn(&.{ .text = content, .start = start, .line = skill.line });
+    try self.runTurn(&.{ .text = content, .start = start, .prompt = .{ .line = skill.line } });
 }
 
 fn newConversation(self: *Controller) !void {
@@ -1010,7 +1077,7 @@ fn retry(self: *Controller) !void {
     const start = self.surface.transcript.entries().len;
     try self.surface.appendRetryNote();
     errdefer self.surface.transcript.truncate(start);
-    try self.runTurn(&.{ .text = request, .start = start, .line = null });
+    try self.runTurn(&.{ .text = request, .start = start, .prompt = null });
 }
 
 fn removeCanceledTurn(self: *Controller, id: u64) !void {
@@ -1024,7 +1091,7 @@ fn removeCanceledTurn(self: *Controller, id: u64) !void {
 fn rewindTo(self: *Controller, id: u64) !void {
     if (self.refuseBusy()) return;
     const index = self.turns.find(id) orelse return self.refuse(.unknown_target);
-    if (self.turns.all()[index].line == null) return self.refuse(.unknown_target);
+    if (self.turns.all()[index].prompt == null) return self.refuse(.unknown_target);
     try self.rewind(index);
     try self.sync();
 }
@@ -1044,14 +1111,14 @@ fn rewind(self: *Controller, turn: usize) !void {
 fn startUserTurn(self: *Controller, text: []const u8) !void {
     const start = self.surface.transcript.entries().len;
     try self.surface.appendUser(text);
-    try self.runTurn(&.{ .text = text, .start = start, .line = text });
+    try self.runTurn(&.{ .text = text, .start = start, .prompt = .{ .line = text } });
 }
 
 fn runTurn(self: *Controller, turn: *const TurnStart) !void {
     std.debug.assert(self.work == .idle);
     try self.refreshBranch();
     const id = self.nextOperation();
-    try self.turns.begin(&.{ .id = id, .start = turn.start, .line = turn.line });
+    try self.turns.begin(&.{ .id = id, .start = turn.start, .prompt = turn.prompt });
     errdefer self.turns.truncate(self.turns.all().len - 1);
     try self.session.send(&.{ .prompt = turn.text });
     self.dropOffer();
@@ -1196,7 +1263,7 @@ fn endTurn(self: *Controller, outcome: *const core.Session.Outcome) !void {
     const turns = self.turns.all();
     switch (outcome.*) {
         .stopped, .exhausted => {},
-        .canceled => if (turns[turns.len - 1].line != null) {
+        .canceled => if (turns[turns.len - 1].prompt != null) {
             self.offer = .removal;
         },
         .failed => |*failure| {
@@ -1424,18 +1491,18 @@ fn logoutAccount(self: *Controller, account: usize) !void {
     try self.handOff(account, .{ .rejected = false });
 }
 
-fn prepareHandoff(self: *Controller, instruction: []const u8) !void {
+fn prepareGist(self: *Controller, instruction: []const u8) !void {
     if (self.refuseBusy()) return;
     if (try self.refusePrerequisite()) return;
     if (self.turns.all().len == 0) return self.refuse(.no_conversation);
     const owned: ?[]u8 = if (instruction.len == 0)
         null
     else
-        try self.gpa.print(handoff_instruction, .{instruction});
+        try self.gpa.print(gist_instruction, .{instruction});
     defer if (owned) |text| self.gpa.free(text);
     try self.session.send(&.{ .aside = .{
-        .system = handoff_system,
-        .text = owned orelse handoff_request,
+        .system = gist_system,
+        .text = owned orelse gist_request,
     } });
     const id = self.nextOperation();
     self.work = .{ .aside = .{ .id = id } };
@@ -1457,7 +1524,10 @@ fn endAside(self: *Controller, outcome: *const core.Session.Outcome) !void {
     if (canceled) return self.dropResult();
     const phase: State.Result.Phase = switch (outcome.*) {
         .stopped => |reason| switch (reason) {
-            .complete => .complete,
+            .complete => if (Gists.parse(result.text.items) == null)
+                .{ .incomplete = .not_text }
+            else
+                .complete,
             .truncated => .{ .incomplete = .truncated },
         },
         .failed => |*failure| .{ .incomplete = .{ .failed = .from(failure) } },
@@ -1468,19 +1538,75 @@ fn endAside(self: *Controller, outcome: *const core.Session.Outcome) !void {
     result.phase = owned;
 }
 
+fn saveResult(self: *Controller, id: u64) !void {
+    if (self.refuseBusy()) return;
+    const text = self.completeResult(id) orelse return self.refuse(.stale);
+    self.gists.save(self.io, text) catch |err| return self.refuseGist(null, err);
+    self.dropResult();
+}
+
 fn applyResult(self: *Controller, id: u64) !void {
     if (self.refuseBusy()) return;
-    const result = if (self.result) |*result| result else return self.refuse(.stale);
-    if (result.id != id or result.phase != .complete or result.conversation != self.conversation)
-        return self.refuse(.stale);
+    const result_text = self.completeResult(id) orelse return self.refuse(.stale);
     if (try self.refusePrerequisite()) return;
-    const preview = try self.gpa.dupe(u8, result.text.items);
-    defer self.gpa.free(preview);
+    self.gists.save(self.io, result_text) catch |err| return self.refuseGist(null, err);
+    const text = try self.gpa.dupe(u8, result_text);
+    defer self.gpa.free(text);
+    try self.applyText(text, &(Gists.parse(text) orelse unreachable));
+}
+
+fn completeResult(self: *const Controller, id: u64) ?[]const u8 {
+    const result = if (self.result) |*result| result else return null;
+    const current = result.id == id and result.conversation == self.conversation;
+    if (!current or result.phase != .complete) return null;
+    return result.text.items;
+}
+
+fn applyGist(self: *Controller, id: *const Gists.Id) !void {
+    if (self.refuseBusy()) return;
+    if (try self.refusePrerequisite()) return;
+    const text = self.gists.read(self.gpa, self.io, id) catch |err| return self.refuseGist(id, err);
+    defer self.gpa.free(text);
+    const parsed = Gists.parse(text) orelse {
+        const path = try self.gists.path(self.gpa, id);
+        self.failed_path = path;
+        return self.refuse(.{ .gist_invalid = path });
+    };
+    try self.applyText(text, &parsed);
+}
+
+fn applyText(self: *Controller, text: []const u8, parsed: *const Gists.Parsed) !void {
+    const message = try self.gpa.print(gist_message, .{text});
+    defer self.gpa.free(message);
     try self.session.send(&.clear);
     self.dropResult();
     self.clearConversation();
-    try self.surface.appendUser(preview);
-    try self.runTurn(&.{ .text = preview, .start = 0, .line = preview });
+    try self.surface.appendGistNote(parsed.title);
+    if (parsed.body.len > 0) try self.surface.appendUser(parsed.body);
+    try self.runTurn(&.{ .text = message, .start = 0, .prompt = .{ .gist = parsed.title } });
+}
+
+fn deleteGist(self: *Controller, id: *const Gists.Id) !void {
+    if (self.refuseBusy()) return;
+    self.gists.delete(self.io, id) catch |err| return self.refuseGist(id, err);
+}
+
+fn refuseGist(
+    self: *Controller,
+    maybe_id: ?*const Gists.Id,
+    err: Gists.Error,
+) error{ OutOfMemory, Canceled }!void {
+    switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Canceled => return error.Canceled,
+        else => {},
+    }
+    const path = if (maybe_id) |id|
+        try self.gists.path(self.gpa, id)
+    else
+        try self.gpa.dupe(u8, self.gists.directory);
+    self.failed_path = path;
+    self.refuse(.{ .gist_failed = .{ .path = path, .cause = err } });
 }
 
 fn discardResult(self: *Controller, id: u64) !void {
@@ -1542,7 +1668,12 @@ fn currentOffer(self: *const Controller) State.Offer {
         .removal => removal: {
             const turns = self.turns.all();
             const last = turns[turns.len - 1];
-            break :removal .{ .removal = .{ .turn = last.id, .mutated = last.mutated } };
+            const returns_line = if (last.prompt) |prompt| prompt == .line else false;
+            break :removal .{ .removal = .{
+                .turn = last.id,
+                .mutated = last.mutated,
+                .returns_line = returns_line,
+            } };
         },
     };
 }
@@ -1586,9 +1717,12 @@ fn execute(self: *Controller, value: *const Command) !void {
             .retry,
             .remove_canceled_turn,
             .rewind,
-            .prepare_handoff,
+            .prepare_gist,
+            .save_result,
             .apply_result,
             .discard_result,
+            .apply_gist,
+            .delete_gist,
             .dismiss_offer,
             .dismiss_notice,
             .refresh_project,
@@ -1612,9 +1746,12 @@ fn execute(self: *Controller, value: *const Command) !void {
         .retry,
         .remove_canceled_turn,
         .rewind,
-        .prepare_handoff,
+        .prepare_gist,
+        .save_result,
         .apply_result,
         .discard_result,
+        .apply_gist,
+        .delete_gist,
         .cancel,
         .dismiss_offer,
         => {},
@@ -1636,9 +1773,12 @@ fn execute(self: *Controller, value: *const Command) !void {
         .retry => try self.retry(),
         .remove_canceled_turn => |id| try self.removeCanceledTurn(id),
         .rewind => |id| try self.rewindTo(id),
-        .prepare_handoff => |instruction| try self.prepareHandoff(instruction),
+        .prepare_gist => |instruction| try self.prepareGist(instruction),
+        .save_result => |id| try self.saveResult(id),
         .apply_result => |id| try self.applyResult(id),
         .discard_result => |id| try self.discardResult(id),
+        .apply_gist => |*id| try self.applyGist(id),
+        .delete_gist => |*id| try self.deleteGist(id),
         .cancel => |id| try self.cancelWork(id),
     }
 }
@@ -1761,6 +1901,8 @@ test "ordered snapshots include the streamed text of a running turn" {
     try std.testing.expectEqualStrings("partial answer", ended.records[1].content.model.items);
 }
 
+const sample_gist: Gists.Id = .{ 0x01, 0x23, 0x45, 0x67, 0x89, 0xab };
+
 fn expectRefusal(response: Response, expected: Refusal) !void {
     const refusal = response.refusal orelse return error.TestExpectedRefusal;
     try std.testing.expectEqualDeep(expected, refusal);
@@ -1850,7 +1992,7 @@ test "state-dependent refusals name their reason and change nothing" {
     defer rig.deinit();
     const initial = try rig.snapshot();
     defer initial.deinit(std.testing.allocator);
-    try expectRefusal(rig.send(&.{ .prepare_handoff = "" }), .no_conversation);
+    try expectRefusal(rig.send(&.{ .prepare_gist = "" }), .no_conversation);
     try expectRefusal(rig.send(&.{ .invoke_skill = .{
         .name = "missing",
         .arguments = "",
@@ -1859,6 +2001,7 @@ test "state-dependent refusals name their reason and change nothing" {
     try expectRefusal(rig.send(&.{ .rewind = 1 }), .unknown_target);
     try expectRefusal(rig.send(&.retry), .stale);
     try expectRefusal(rig.send(&.{ .remove_canceled_turn = 1 }), .stale);
+    try expectRefusal(rig.send(&.{ .save_result = 1 }), .stale);
     try expectRefusal(rig.send(&.{ .apply_result = 1 }), .stale);
     try expectRefusal(rig.send(&.{ .discard_result = 1 }), .stale);
     try expectRefusal(rig.send(&.{ .cancel = 1 }), .stale);
@@ -1970,7 +2113,7 @@ test "unchanged selections are accepted with a notice and change nothing" {
     }
 }
 
-test "model prerequisites refuse skills, handoffs, and retry offers" {
+test "model prerequisites refuse skills, gists, and retry offers" {
     var rig: testing.Rig = undefined;
     try rig.init(&.{
         .variables = &.{.{ "XAI_API_KEY", "xai-key" }},
@@ -2000,7 +2143,8 @@ test "model prerequisites refuse skills, handoffs, and retry offers" {
         .arguments = "task",
         .line = "/skill:demo task",
     } }), .no_model);
-    try expectRefusal(rig.send(&.{ .prepare_handoff = "" }), .no_model);
+    try expectRefusal(rig.send(&.{ .prepare_gist = "" }), .no_model);
+    try expectRefusal(rig.send(&.{ .apply_gist = sample_gist }), .no_model);
     try expectRefusal(rig.send(&.{ .send_message = "Another task." }), .no_model);
     const unchanged = try rig.snapshot();
     defer unchanged.deinit(std.testing.allocator);
@@ -2085,13 +2229,13 @@ test "a result state carries the text that grows until the result completes" {
     var rig: testing.Rig = undefined;
     try rig.init(&.{ .replies = &.{
         .{ .body = providers.testing.reply_stream },
-        .{ .body = providers.testing.replyStream("Resume the task.") },
+        .{ .body = providers.testing.replyStream("Resume the task.\\nBody.") },
     } });
     defer rig.deinit();
     _ = rig.send(&.{ .send_message = "hello" });
     try rig.expectTurn(.stopped);
     rig.skip();
-    const prepared = rig.send(&.{ .prepare_handoff = "" });
+    const prepared = rig.send(&.{ .prepare_gist = "" });
     const id = prepared.operation.?;
     const shown = try rig.state(.aside);
     defer shown.deinit(std.testing.allocator);
@@ -2105,13 +2249,13 @@ test "a result state carries the text that grows until the result completes" {
         const result = event.state.result.?;
         try std.testing.expectEqual(id, result.id);
         try std.testing.expect(result.text.len >= shown_length);
-        try std.testing.expect(std.mem.startsWith(u8, "Resume the task.", result.text));
+        try std.testing.expect(std.mem.startsWith(u8, "Resume the task.\nBody.", result.text));
         shown_length = result.text.len;
         if (event.state.work == .idle) break;
     } else return error.TestExpectedEnd;
     const reading = try rig.snapshot();
     defer reading.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("Resume the task.", reading.state.result.?.text);
+    try std.testing.expectEqualStrings("Resume the task.\nBody.", reading.state.result.?.text);
     try std.testing.expect(reading.state.result.?.phase == .complete);
     try std.testing.expect(rig.send(&.{ .discard_result = id }).accepted());
     const discarded = try rig.snapshot();
@@ -2212,7 +2356,7 @@ test "turn facts mark mutating work, and a rewind applies at once through a stab
     }
     const turns = rig.controller.listTurns();
     try std.testing.expectEqual(@as(usize, 2), turns.len);
-    try std.testing.expectEqualStrings("First task.", turns[0].line);
+    try std.testing.expectEqualDeep(Turns.Prompt{ .line = "First task." }, turns[0].prompt);
     try std.testing.expect(turns[0].drops_mutating_turn);
     try std.testing.expect(!turns[1].drops_mutating_turn);
     const first_id = turns[0].id;
@@ -2281,7 +2425,8 @@ test "a removed skill turn recovers the exact submitted line" {
     try stall.reached.wait(std.testing.io);
     _ = rig.send(&.{ .cancel = started.operation.? });
     try rig.expectTurn(.canceled);
-    try std.testing.expectEqualStrings(line, rig.controller.listTurns()[0].line);
+    const prompt = rig.controller.listTurns()[0].prompt;
+    try std.testing.expectEqualDeep(Turns.Prompt{ .line = line }, prompt);
     const turn = rig.controller.listTurns()[0].id;
     try std.testing.expectEqualStrings(
         line,
@@ -2502,7 +2647,7 @@ test "snapshot event copies release every partial allocation" {
     defer rig.deinit();
     _ = rig.send(&.{ .send_message = "hello" });
     try rig.expectTurn(.stopped);
-    _ = rig.send(&.{ .prepare_handoff = "" });
+    _ = rig.send(&.{ .prepare_gist = "" });
     const result = try rig.result();
     result.deinit(std.testing.allocator);
     _ = rig.send(&.{ .set_effort = .high });
@@ -2985,7 +3130,7 @@ test "a model selection switches the account and the model without a picker" {
     } }, testing.eventOf(switched.records, .use_changed).?);
 }
 
-test "a canceled handoff stays active until its end and then drops its result" {
+test "a canceled gist stays active until its end and then drops its result" {
     var stall: providers.testing.FakeTransport.Stall = .{ .io = std.testing.io };
     var rig: testing.Rig = undefined;
     try rig.init(&.{ .replies = &.{
@@ -2995,11 +3140,11 @@ test "a canceled handoff stays active until its end and then drops its result" {
     defer rig.deinit();
     _ = rig.send(&.{ .send_message = "hello" });
     try rig.expectTurn(.stopped);
-    const operation = rig.send(&.{ .prepare_handoff = "" }).operation.?;
+    const operation = rig.send(&.{ .prepare_gist = "" }).operation.?;
     try stall.reached.wait(std.testing.io);
     try expectRefusal(rig.send(&.{ .discard_result = operation }), .busy);
     try std.testing.expect(rig.send(&.{ .cancel = operation }).accepted());
-    try expectRefusal(rig.send(&.{ .prepare_handoff = "" }), .busy);
+    try expectRefusal(rig.send(&.{ .prepare_gist = "" }), .busy);
     const ended = try rig.state(.idle);
     defer ended.deinit(std.testing.allocator);
     try std.testing.expect(ended.result == null);
@@ -3007,87 +3152,309 @@ test "a canceled handoff stays active until its end and then drops its result" {
     try std.testing.expectEqual(@as(usize, 2), rig.transport.requests.items.len);
 }
 
-test "handoffs preserve dialogue, regenerate previews, and replace the conversation on apply" {
+test "each save writes a new gist, and a listing names the directory and the titles" {
     const gpa = std.testing.allocator;
     var rig: testing.Rig = undefined;
     try rig.init(&.{ .replies = &.{
         .{ .body = providers.testing.reply_stream },
-        .{ .body = providers.testing.replyStream("First handoff.") },
-        .{ .body = providers.testing.replyStream("Resume the task.") },
-        .{ .body = providers.testing.replyStream("Continued.") },
+        .{ .body = providers.testing.replyStream("# First gist\\nBody.") },
+        .{ .body = providers.testing.replyStream("Second gist\\nBody.") },
     } });
     defer rig.deinit();
+    const empty = rig.controller.listGists();
+    try std.testing.expectEqual(@as(usize, 0), empty.listing.listed.entries.len);
+    try std.testing.expectEqualStrings(try rig.tree.path(".drinky/gists"), empty.directory);
     _ = rig.send(&.{ .send_message = "Original task." });
     try rig.expectTurn(.stopped);
-    const instruction = "Keep the constraints.";
-    const first_id = rig.send(&.{ .prepare_handoff = instruction }).operation.?;
+
+    const first_id = rig.send(&.{ .prepare_gist = "Keep the constraints." }).operation.?;
     const first = try rig.result();
     defer first.deinit(gpa);
-    try std.testing.expectEqualStrings("First handoff.", first.state.result.?.text);
-    try std.testing.expect(first.state.result.?.phase == .complete);
     try testing.expectUsers(first.records, &.{"Original task."});
-    try expectRequest(&rig, 1, "\"instructions\":\"You prepare a handoff for a fresh coding-agent");
+    try expectRequest(&rig, 1, "\"instructions\":\"You write a gist for a fresh coding-agent");
     try expectRequest(&rig, 1, "\"effort\":\"high\"");
     try expectRequest(&rig, 1, "\"input\":[{\"type\":\"message\",\"role\":\"user\"," ++
         "\"content\":[{\"type\":\"input_text\",\"text\":\"Original task.\"}]}," ++
         "{\"type\":\"message\",\"role\":\"assistant\"," ++
         "\"content\":[{\"type\":\"output_text\",\"text\":\"done\"}]}," ++
         "{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\"," ++
-        "\"text\":\"Prepare the handoff.\\n<instruction>\\nKeep the constraints.\\n" ++
+        "\"text\":\"Write the gist.\\n<instruction>\\nKeep the constraints.\\n" ++
         "</instruction>\"}]}]");
     for ([_][]const u8{ "\"tools\"", "\"prompt_cache_key\"" }) |field|
         try std.testing.expect(std.mem.find(u8, rig.transport.requests.items[1], field) == null);
-    _ = rig.send(&.{ .discard_result = first_id });
-    try expectRefusal(rig.send(&.{ .apply_result = first_id }), .stale);
-    const second_id = rig.send(&.{ .prepare_handoff = instruction }).operation.?;
+    try std.testing.expect(rig.send(&.{ .save_result = first_id }).accepted());
+    try expectRefusal(rig.send(&.{ .save_result = first_id }), .stale);
+    const saved = try rig.snapshot();
+    defer saved.deinit(gpa);
+    try std.testing.expect(saved.state.result == null);
+    try testing.expectUsers(saved.records, &.{"Original task."});
+
+    const second_id = rig.send(&.{ .prepare_gist = "" }).operation.?;
     const second = try rig.result();
     defer second.deinit(gpa);
-    try std.testing.expectEqualStrings("Resume the task.", second.state.result.?.text);
-    try std.testing.expectEqual(@as(usize, 3), rig.transport.requests.items.len);
-    try std.testing.expectEqual(
-        @as(usize, 1),
-        std.mem.count(u8, rig.transport.requests.items[2], "Prepare the handoff."),
-    );
-    try std.testing.expect(std.mem.find(
-        u8,
-        rig.transport.requests.items[2],
-        "First handoff.",
-    ) == null);
-    try std.testing.expect(rig.send(&.{ .apply_result = second_id }).accepted());
+    try std.testing.expect(rig.send(&.{ .save_result = second_id }).accepted());
+    const entries = rig.controller.listGists().listing.listed.entries;
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    var titles: [2][]const u8 = .{ entries[0].title, entries[1].title };
+    std.mem.sortUnstable([]const u8, &titles, {}, lessText);
+    try std.testing.expectEqualStrings("First gist", titles[0]);
+    try std.testing.expectEqualStrings("Second gist", titles[1]);
+    for (entries) |*entry| {
+        var buffer: [32]u8 = undefined;
+        const hex = std.fmt.bytesToHex(entry.id, .lower);
+        const sub_path = try std.mem.print(&buffer, ".drinky/gists/{s}.md", .{&hex});
+        const stat = try rig.tree.tmp.dir.statFile(std.testing.io, sub_path, .{});
+        try std.testing.expectEqual(@as(u32, 0o600), stat.permissions.toMode() & 0o777);
+    }
+}
+
+fn lessText(_: void, left: []const u8, right: []const u8) bool {
+    return std.mem.lessThan(u8, left, right);
+}
+
+test "an apply of a result saves it and continues in a new conversation with the marked text" {
+    const gpa = std.testing.allocator;
+    var rig: testing.Rig = undefined;
+    try rig.init(&.{ .replies = &.{
+        .{ .body = providers.testing.reply_stream },
+        .{ .body = providers.testing.replyStream("Resume the task.\\nKeep the tests.") },
+        .{ .body = providers.testing.replyStream("Continued.") },
+    } });
+    defer rig.deinit();
+    _ = rig.send(&.{ .send_message = "Original task." });
+    try rig.expectTurn(.stopped);
+    const id = rig.send(&.{ .prepare_gist = "" }).operation.?;
+    const ready = try rig.result();
+    ready.deinit(gpa);
+
+    try std.testing.expect(rig.send(&.{ .apply_result = id }).accepted());
     try rig.expectTurn(.stopped);
     const continued = try rig.snapshot();
     defer continued.deinit(gpa);
     try std.testing.expect(continued.state.result == null);
-    try testing.expectUsers(continued.records, &.{"Resume the task."});
-    try std.testing.expectEqualStrings("Resume the task.", rig.controller.listTurns()[0].line);
-    try expectRequest(&rig, 3, "\"text\":\"Resume the task.\"");
-    try expectRequest(&rig, 3, "\"effort\":\"high\"");
+    try testing.expectUsers(continued.records, &.{"Keep the tests."});
+    try std.testing.expectEqualDeep(
+        Record.Note{ .gist = .{ .title = "Resume the task." } },
+        continued.records[0].content.user_note,
+    );
+    const turn = rig.controller.listTurns()[0];
+    try std.testing.expectEqualDeep(Turns.Prompt{ .gist = "Resume the task." }, turn.prompt);
+    try expectRequest(
+        &rig,
+        2,
+        "\"text\":\"<gist>\\nResume the task.\\nKeep the tests.\\n</gist>\"",
+    );
     try std.testing.expect(std.mem.find(
         u8,
-        rig.transport.requests.items[3],
+        rig.transport.requests.items[2],
         "Original task.",
     ) == null);
+    const entries = rig.controller.listGists().listing.listed.entries;
+    try std.testing.expectEqual(@as(usize, 1), entries.len);
+    try std.testing.expectEqualStrings("Resume the task.", entries[0].title);
+    const rewound = rig.send(&.{ .rewind = turn.id });
+    try std.testing.expect(rewound.accepted());
+    try std.testing.expect(rewound.recovered == null);
 }
 
-test "a handoff of an older conversation cannot apply" {
+test "an applied gist file reads its text, and a title alone shows only the note" {
+    const gpa = std.testing.allocator;
+    var rig: testing.Rig = undefined;
+    try rig.init(&.{
+        .files = &.{
+            .{ ".drinky/gists/0123456789ab.md", "# Saved task\nKeep the tests." },
+            .{ ".drinky/gists/aaaaaaaaaaaa.md", "Title alone\n\n" },
+        },
+        .replies = &.{
+            .{ .body = providers.testing.reply_stream },
+            .{ .body = providers.testing.reply_stream },
+            .{ .body = providers.testing.reply_stream },
+        },
+    });
+    defer rig.deinit();
+    _ = rig.send(&.{ .send_message = "Original task." });
+    try rig.expectTurn(.stopped);
+    const read = rig.controller.readGist(&sample_gist);
+    try std.testing.expectEqualStrings("# Saved task\nKeep the tests.", read.text);
+
+    try std.testing.expect(rig.send(&.{ .apply_gist = sample_gist }).accepted());
+    try rig.expectTurn(.stopped);
+    try expectRequest(&rig, 1, "\"text\":\"<gist>\\n# Saved task\\nKeep the tests.\\n</gist>\"");
+    const applied = try rig.snapshot();
+    defer applied.deinit(gpa);
+    try testing.expectUsers(applied.records, &.{"Keep the tests."});
+
+    try std.testing.expect(rig.send(&.{ .apply_gist = @splat(0xaa) }).accepted());
+    try rig.expectTurn(.stopped);
+    const alone = try rig.snapshot();
+    defer alone.deinit(gpa);
+    try testing.expectUsers(alone.records, &.{});
+    try std.testing.expectEqualDeep(
+        Record.Note{ .gist = .{ .title = "Title alone" } },
+        alone.records[0].content.user_note,
+    );
+}
+
+test "a listing sorts newest first, counts hidden gists, and a read names its failure" {
+    var rig: testing.Rig = undefined;
+    try rig.init(&.{
+        .files = &.{
+            .{ ".drinky/gists/0123456789ab.md", "Kept\nBody." },
+            .{ ".drinky/gists/eeeeeeeeeeee.md", "# Older\nBody." },
+            .{ ".drinky/gists/aaaaaaaaaaaa.md", " \n\t\n" },
+            .{ ".drinky/gists/dddddddddddd.md", "Title\n\xe9t\xe9" },
+            .{ ".drinky/gists/ffffffffffff.md", "Title\x00Body." },
+            .{ ".drinky/gists/bbbbbbbbbbbb.md/unreadable", "" },
+            .{ ".drinky/gists/notes.md", "Not a gist." },
+            .{ ".drinky/gists/cccccccccccc.txt", "Not a gist." },
+        },
+        .replies = &.{.{ .body = providers.testing.reply_stream }},
+    });
+    defer rig.deinit();
+    for ([_]struct { name: []const u8, seconds: i96 }{
+        .{ .name = ".drinky/gists/0123456789ab.md", .seconds = 2_000 },
+        .{ .name = ".drinky/gists/eeeeeeeeeeee.md", .seconds = 1_000 },
+    }) |stamp| {
+        var file = try rig.tree.tmp.dir.openFile(std.testing.io, stamp.name, .{
+            .mode = .read_write,
+        });
+        defer file.close(std.testing.io);
+        try file.setTimestamps(std.testing.io, .{ .modify_timestamp = .{
+            .new = .fromNanoseconds(stamp.seconds * std.time.ns_per_s),
+        } });
+    }
+    const expected: Gists.Listing = .{
+        .entries = &.{
+            .{ .id = sample_gist, .title = "Kept", .saved_ms = 2_000_000 },
+            .{ .id = @splat(0xee), .title = "Older", .saved_ms = 1_000_000 },
+        },
+        .unreadable = 1,
+        .invalid = 3,
+    };
+    try std.testing.expectEqualDeep(expected, rig.controller.listGists().listing.listed);
+
+    const invalid_paths = [_][]const u8{
+        try rig.tree.path(".drinky/gists/aaaaaaaaaaaa.md"),
+        try rig.tree.path(".drinky/gists/dddddddddddd.md"),
+    };
+    for ([_]Gists.Id{ @splat(0xaa), @splat(0xdd) }, invalid_paths) |id, path|
+        try std.testing.expectEqualStrings(path, rig.controller.readGist(&id).invalid);
+    const reads = [_]struct { id: Gists.Id, name: []const u8, cause: Gists.Error }{
+        .{ .id = @splat(0xbb), .name = "bbbbbbbbbbbb.md", .cause = error.IsDir },
+        .{ .id = @splat(0xcc), .name = "cccccccccccc.md", .cause = error.FileNotFound },
+    };
+    for (reads) |case| {
+        var buffer: [64]u8 = undefined;
+        const sub_path = try std.mem.print(&buffer, ".drinky/gists/{s}", .{case.name});
+        const path = try rig.tree.path(sub_path);
+        try std.testing.expectEqualDeep(
+            query.GistText{ .failed = .{ .path = path, .cause = case.cause } },
+            rig.controller.readGist(&case.id),
+        );
+    }
+    _ = rig.send(&.{ .send_message = "Task." });
+    try rig.expectTurn(.stopped);
+    for ([_]Gists.Id{ @splat(0xaa), @splat(0xdd) }, invalid_paths) |id, path| {
+        const refusal: Refusal = .{ .gist_invalid = path };
+        try expectRefusal(rig.send(&.{ .apply_gist = id }), refusal);
+    }
+}
+
+test "a deletion repeats without a failure even without its directory, and a missing gist refuses" {
+    var rig: testing.Rig = undefined;
+    try rig.init(&.{
+        .files = &.{.{ ".drinky/gists/0123456789ab.md", "Gist\nBody." }},
+        .replies = &.{.{ .body = providers.testing.reply_stream }},
+    });
+    defer rig.deinit();
+    try std.testing.expect(rig.send(&.{ .delete_gist = sample_gist }).accepted());
+    try std.testing.expect(rig.send(&.{ .delete_gist = sample_gist }).accepted());
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        rig.controller.listGists().listing.listed.entries.len,
+    );
+    const path = try rig.tree.path(".drinky/gists/0123456789ab.md");
+    try expectRefusal(rig.send(&.{ .apply_gist = sample_gist }), .{ .gist_failed = .{
+        .path = path,
+        .cause = error.FileNotFound,
+    } });
+    try rig.tree.tmp.dir.deleteTree(std.testing.io, ".drinky/gists");
+    try std.testing.expect(rig.send(&.{ .delete_gist = sample_gist }).accepted());
+}
+
+test "a failed save keeps the result and the conversation for another attempt" {
+    const gpa = std.testing.allocator;
     var rig: testing.Rig = undefined;
     try rig.init(&.{ .replies = &.{
         .{ .body = providers.testing.reply_stream },
-        .{ .body = providers.testing.replyStream("Handoff.") },
+        .{ .body = providers.testing.replyStream("Gist\\nBody.") },
+    } });
+    defer rig.deinit();
+    _ = rig.send(&.{ .send_message = "Task." });
+    try rig.expectTurn(.stopped);
+    try rig.tree.write(".drinky/gists", "blocked");
+    const id = rig.send(&.{ .prepare_gist = "" }).operation.?;
+    const ready = try rig.result();
+    ready.deinit(gpa);
+    const directory = try rig.tree.path(".drinky/gists");
+    for ([_]Command{ .{ .save_result = id }, .{ .apply_result = id } }) |value| {
+        const refused = rig.send(&value);
+        try std.testing.expectEqualDeep(Refusal{ .gist_failed = .{
+            .path = directory,
+            .cause = error.NotDir,
+        } }, refused.refusal.?);
+    }
+    const kept = try rig.snapshot();
+    defer kept.deinit(gpa);
+    try std.testing.expect(kept.state.result.?.phase == .complete);
+    try testing.expectUsers(kept.records, &.{"Task."});
+    try rig.tree.tmp.dir.deleteFile(std.testing.io, ".drinky/gists");
+    try std.testing.expect(rig.send(&.{ .save_result = id }).accepted());
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        rig.controller.listGists().listing.listed.entries.len,
+    );
+}
+
+test "a result that is not text stays incomplete and cannot save" {
+    var rig: testing.Rig = undefined;
+    try rig.init(&.{ .replies = &.{
+        .{ .body = providers.testing.reply_stream },
+        .{ .body = providers.testing.replyStream("Title\\u0000Body.") },
+    } });
+    defer rig.deinit();
+    _ = rig.send(&.{ .send_message = "Task." });
+    try rig.expectTurn(.stopped);
+    const id = rig.send(&.{ .prepare_gist = "" }).operation.?;
+    const ended = try rig.result();
+    defer ended.deinit(std.testing.allocator);
+    const not_text: State.Result.Phase = .{ .incomplete = .not_text };
+    try std.testing.expectEqualDeep(not_text, ended.state.result.?.phase);
+    try expectRefusal(rig.send(&.{ .save_result = id }), .stale);
+    try expectRefusal(rig.send(&.{ .apply_result = id }), .stale);
+}
+
+test "a gist of an older conversation cannot save or apply" {
+    var rig: testing.Rig = undefined;
+    try rig.init(&.{ .replies = &.{
+        .{ .body = providers.testing.reply_stream },
+        .{ .body = providers.testing.replyStream("Gist.\\nBody.") },
         .{ .body = providers.testing.reply_stream },
     } });
     defer rig.deinit();
     _ = rig.send(&.{ .send_message = "Original task." });
     try rig.expectTurn(.stopped);
-    const id = rig.send(&.{ .prepare_handoff = "" }).operation.?;
+    const id = rig.send(&.{ .prepare_gist = "" }).operation.?;
     const ready = try rig.result();
     ready.deinit(std.testing.allocator);
     _ = rig.send(&.{ .send_message = "Later task." });
     try rig.expectTurn(.stopped);
+    try expectRefusal(rig.send(&.{ .save_result = id }), .stale);
     try expectRefusal(rig.send(&.{ .apply_result = id }), .stale);
-    const unchanged = try rig.snapshot();
-    defer unchanged.deinit(std.testing.allocator);
-    try testing.expectUsers(unchanged.records, &.{ "Original task.", "Later task." });
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        rig.controller.listGists().listing.listed.entries.len,
+    );
 }
 
 test "a rejected plan credential yields to the credential that another instance saved" {

@@ -39,7 +39,10 @@ pub const Source = union(Kind) {
 
 pub const Note = union(enum) {
     skill: core.Session.Event.SkillLoaded,
+    gist: Gist,
     retry,
+
+    pub const Gist = struct { title: []const u8 };
 };
 
 pub const Result = struct {
@@ -418,6 +421,7 @@ fn dupeNote(gpa: std.mem.Allocator, note: *const Note) error{OutOfMemory}!Note {
             errdefer gpa.free(name);
             break :skill .{ .skill = .{ .name = name, .source = try gpa.dupe(u8, skill.source) } };
         },
+        .gist => |gist| .{ .gist = .{ .title = try gpa.dupe(u8, gist.title) } },
         .retry => .retry,
     };
 }
@@ -459,6 +463,7 @@ pub fn deinit(self: *Record, gpa: std.mem.Allocator) void {
                 gpa.free(skill.name);
                 gpa.free(skill.source);
             },
+            .gist => |gist| gpa.free(gist.title),
             .retry => {},
         },
         .tool_result => |*result| {

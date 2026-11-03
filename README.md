@@ -5,9 +5,10 @@ A dependency-free terminal coding agent.
 <img src="www/drinky.png" alt="Drinky" width="400">
 
 Drinky can read, search, and change files or run commands in the working directory. The conversation
-stays in the terminal scrollback. Drinky saves no conversation to resume. `/handoff` carries the
-current task into a new conversation. It leaves out tool calls and reasoning, so it usually works
-even after a context overflow.
+stays in the terminal scrollback. Drinky saves no transcript. `/gist` writes a compressed summary of
+the current task, and Drinky saves it after a review. `/gists` carries a saved gist into a new
+conversation. A gist leaves out tool calls and reasoning, so it usually works even after a context
+overflow.
 
 Drinky supports Anthropic, OpenAI, xAI, OpenRouter, DeepSeek, and Gemini Enterprise Agent Platform
 (Vertex AI). It learns models from the providers and uses public metadata for prices and model
@@ -83,8 +84,8 @@ the config file turns it on. The client starts `drinky mcp` as its stdio server.
 MCP `2026-07-28` and finds each instance with MCP access, so one server entry covers all instances.
 
 The client can read the state, send messages, load skills, cancel work, clear the conversation,
-fetch a model list, and select the model and the effort. It cannot rewind the conversation, prepare
-a handoff, or sign in.
+fetch a model list, and select the model and the effort. It cannot rewind the conversation, use
+gists, or sign in.
 
 ## Config file
 

@@ -78,6 +78,7 @@ pub const PickerOptions = struct {
     preselected: ?usize = null,
     cursor: ?usize = null,
     depth: usize = 0,
+    deletes: bool = false,
 };
 
 pub const Change = union(enum) {
@@ -429,6 +430,7 @@ fn blockFrom(self: *Screen, record: *const application.Record) !ui.Block {
         .user => |text| try .init(self.gpa, &.{ .user = text.items }),
         .user_note => |*note| switch (note.*) {
             .skill => |*skill| try self.skillBlock(skill),
+            .gist => |*gist| try self.gistBlock(gist),
             .retry => try .init(self.gpa, &.{ .user_note = .{ .text = retry_note } }),
         },
         .model => |text| try .init(self.gpa, &.{ .model = text.items }),
@@ -485,6 +487,12 @@ fn skillBlock(self: *Screen, skill: *const application.SkillLoaded) !ui.Block {
         .text = text,
         .segment_ends = &.{ "Skill: ".len + shown_name.len, text.len },
     } });
+}
+
+fn gistBlock(self: *Screen, gist: *const application.Record.Note.Gist) !ui.Block {
+    const text = try format.gistLabel(self.gpa, gist.title);
+    defer self.gpa.free(text);
+    return .init(self.gpa, &.{ .user_note = .{ .text = text } });
 }
 
 fn toolBlock(self: *Screen, result: *const application.Record.Result) !ui.Block {
@@ -599,22 +607,26 @@ fn showResult(self: *Screen, maybe_result: ?*const application.State.Result) !vo
     };
     if (self.result_page == null or self.result_page.?.id != result.id) {
         self.leaveWidget();
-        try self.openPage(&.{ .title = "Handoff", .content = "" });
+        try self.openPage(&.{ .title = "Gist", .content = "" });
     }
     self.result_page = .{ .id = result.id, .phase = result.phase };
     const page = self.activePage().?;
     const shown_text = page.text();
     if (result.text.len > shown_text.len) try page.append(result.text[shown_text.len..]);
-    page.action = if (result.phase == .complete) .apply else .discard;
+    page.action = switch (result.phase) {
+        .complete => .save,
+        .generating, .incomplete => .discard,
+    };
     switch (result.phase) {
         .generating => |*generating| try self.showGenerating(page, generating),
         .complete => self.endPageWait(page),
         .incomplete => |notice| {
             self.endPageWait(page);
-            const message = try wording.event(self.gpa, &switch (notice) {
-                .truncated => .reply_truncated,
-                .failed => |failure| .{ .request_failed = failure },
-            });
+            const message = switch (notice) {
+                .truncated => try wording.event(self.gpa, &.reply_truncated),
+                .not_text => try wording.replyNotText(self.gpa),
+                .failed => |failure| try wording.event(self.gpa, &.{ .request_failed = failure }),
+            };
             defer message.deinit(self.gpa);
             if (!sameMessage(&page.notice, &message)) try page.setNotice(&message);
         },
@@ -670,6 +682,7 @@ pub fn openPicker(self: *Screen, options: *const PickerOptions) !void {
             .rotation = step.rotation,
         } else null,
         .can_step_back = options.depth > 0,
+        .deletes = options.deletes,
     });
     self.leaveWidget();
     self.widget = .{ .picking = picker };
@@ -3308,12 +3321,12 @@ test "a waiting page ticks its time, counts reasoning bytes, adds a note, and st
     try testing.expectContains(thinking, "Agent: work (thinking) · Time: 2s · Received: 2.0 KiB");
     try testing.expectContains(thinking, "Attempt 1 failed.");
 
-    try rig.screen.activePage().?.append("Handoff.");
+    try rig.screen.activePage().?.append("Gist.");
     try std.testing.expect(!rig.screen.animating());
     try std.testing.expect(!rig.screen.advanceFrame(9_000));
     const answered = try rig.paintPlain(80);
     defer gpa.free(answered);
-    try testing.expectContains(answered, "Handoff.");
+    try testing.expectContains(answered, "Gist.");
     try std.testing.expect(std.mem.find(u8, answered, "Agent: work") == null);
     rig.screen.closePage();
 }
@@ -3432,7 +3445,7 @@ test "a result that completes without text ends its wait line" {
     try rig.paintInto(&emulator, size);
     try testing.expectContains(
         emulator.document.items[emulator.screen_top].items,
-        "Handoff · Enter: Apply",
+        "Gist · Enter: Save",
     );
     for (emulator.document.items) |row|
         try std.testing.expect(std.mem.find(u8, row.items, "Agent: work") == null);

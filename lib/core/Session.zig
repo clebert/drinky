@@ -594,9 +594,9 @@ const fixture = struct {
     const canceled_text = "Drinky canceled the call before it received its result. " ++
         "The call can have completed some or all of its work.";
     const unstarted_text = "Drinky did not run the call because the turn ended.";
-    const handoff: Aside.Request = .{
+    const gist: Aside.Request = .{
         .system = "Summarize the task.",
-        .text = "Prepare a handoff.",
+        .text = "Write the gist.",
     };
 
     fn message(text: []const u8) Provider.Event {
@@ -1227,7 +1227,7 @@ test "an aside streams its reply outside the conversation with its system text a
     );
 }
 
-test "an aside sends each prompt with the final answer of its turn and no tools" {
+test "an aside sends each prompt with the agent texts of its turn and no tools or skills" {
     var harness: testing.Harness = undefined;
     try harness.init(std.testing.allocator, std.testing.io, &.{});
     defer harness.deinit();
@@ -1249,21 +1249,22 @@ test "an aside sends each prompt with the final answer of its turn and no tools"
             fixture.stop_complete,
         } },
         .{ .done = &.{.{ .failed = .{ .reason = .network } }} },
-        .{ .done = &.{ fixture.message("Handoff."), fixture.stop_complete } },
+        .{ .done = &.{ fixture.message("Gist."), fixture.stop_complete } },
         .{ .done = &.{ fixture.message("Next."), fixture.stop_complete } },
     });
     _ = try harness.turn("a");
     try std.testing.expect(std.mem.endsWith(u8, try harness.turn("b"), "failed:network:"));
-    try harness.session.send(&.{ .aside = fixture.handoff });
+    try harness.session.send(&.{ .aside = fixture.gist });
     try std.testing.expectEqualStrings(
-        \\aside_text:Handoff.
+        \\aside_text:Gist.
         \\aside_ended:complete
     , try harness.until("aside_ended"));
     _ = try harness.turn("c");
 
     const provider = &harness.provider;
     try std.testing.expectEqualStrings(
-        "model-a|user:a|assistant:Checked.|assistant:Done.|user:b|user:Prepare a handoff.",
+        "model-a|user:a|assistant:Let me check.|assistant:Checked.|assistant:Done.|user:b|" ++
+            "user:Write the gist.",
         provider.requests.items[3],
     );
     try std.testing.expectEqualStrings(
@@ -1278,7 +1279,7 @@ test "an aside sends each prompt with the final answer of its turn and no tools"
         provider.requests.items[4],
     );
     const requests = [_]Aside.Request{
-        fixture.handoff,
+        fixture.gist,
         .{ .system = "Be brief.", .text = "The long answer." },
     };
     try testing.checkCopyAllocationFailures(Aside.Request, &requests);

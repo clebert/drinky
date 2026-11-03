@@ -29,9 +29,9 @@ its usage source before the stop of every reply.
 ## Controller
 
 The controller exposes an opaque handle with semantic commands, queries, synchronous responses,
-events, and snapshots. A command names its target by an account, a model, a turn id, or an operation
-id. No client repeats a turn rule on the records. The controller validates the target and the
-current state of each command. It asks for no confirmation.
+events, and snapshots. A command names its target by an account, a model, a turn id, an operation
+id, or a gist id. No client repeats a turn rule on the records. The controller validates the target
+and the current state of each command. It asks for no confirmation.
 
 A refusal, a startup refusal, a notice, and a record event are typed facts with data fields. Each
 client words them. A client dismisses a notice by its id. A stale notice id changes no state.

@@ -392,6 +392,9 @@ pub fn appendRetryNote(self: *Surface) !void {
 pub fn appendSkillNote(self: *Surface, skill: *const core.Session.Event.SkillLoaded) !void {
     try self.transcript.append(&.{ .user_note = .{ .skill = skill.* } }, .{});
 }
+pub fn appendGistNote(self: *Surface, title: []const u8) !void {
+    try self.transcript.append(&.{ .user_note = .{ .gist = .{ .title = title } } }, .{});
+}
 pub fn replaceEvent(self: *Surface, index: usize, event: *const Record.Event) !void {
     try self.transcript.replaceEvent(index, event);
 }

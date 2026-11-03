@@ -84,25 +84,16 @@ fn requestItems(self: *const Aside) error{OutOfMemory}![]Conversation.Item {
         const prompt = history[turn_start.item];
         std.debug.assert(prompt == .message and prompt.message.role == .user);
         try items.append(self.gpa, prompt);
-        const rounds = history[turn_start.item + 1 .. end];
-        for (rounds[answerStart(rounds)..]) |item| {
-            if (item == .message) try items.append(self.gpa, item);
-        }
+        for (history[turn_start.item + 1 .. end]) |item| switch (item) {
+            .message => |message| switch (message.role) {
+                .assistant => try items.append(self.gpa, item),
+                .user => {},
+            },
+            .reasoning, .tool_call, .tool_result => {},
+        };
     }
     try items.append(self.gpa, .{ .message = .{ .role = .user, .text = self.request.text } });
     return items.toOwnedSlice(self.gpa);
-}
-
-fn answerStart(items: []const Conversation.Item) usize {
-    for (0..items.len) |offset| {
-        const index = items.len - offset;
-        switch (items[index - 1]) {
-            .message => |message| if (message.role == .user) return index,
-            .reasoning => {},
-            .tool_call, .tool_result => return index,
-        }
-    }
-    return 0;
 }
 
 fn reply(self: *const Aside, shown: *bool, request: *const Provider.Request) Reply {

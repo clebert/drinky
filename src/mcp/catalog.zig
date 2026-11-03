@@ -149,7 +149,8 @@ pub const definitions = [_]Definition{
     .{
         .name = "list_turns",
         .description = "List the prompts of the conversation, with the oldest prompt first. " ++
-            "Each prompt has the operation id of its turn.",
+            "Each prompt has the operation id of its turn. A turn that applied a saved gist " ++
+            "has the gist title as its prompt and gist set to true.",
         .hints = read_only,
     },
     .{
@@ -558,11 +559,15 @@ fn writeTurns(
     try json.objectField("turns");
     try json.beginArray();
     for (shown) |*turn| {
-        const prompt = clip(turn.line, prompt_bytes_max);
+        const text = switch (turn.prompt) {
+            .line, .gist => |value| value,
+        };
+        const prompt = clip(text, prompt_bytes_max);
         try json.beginObject();
         try protocol.field(json, "operation", OperationId{ .value = turn.id });
         try protocol.field(json, "prompt", prompt);
-        try protocol.field(json, "prompt_truncated", prompt.len < turn.line.len);
+        try protocol.field(json, "prompt_truncated", prompt.len < text.len);
+        try protocol.field(json, "gist", turn.prompt == .gist);
         try json.endObject();
     }
     try json.endArray();
@@ -690,6 +695,7 @@ fn writeRefusal(
                 .{ application.query.accountSetting(account).?, id },
             );
         },
+        .gist_failed, .gist_invalid => unreachable,
     };
     try protocol.field(json, "message", message);
     try json.endObject();
@@ -819,6 +825,36 @@ test "the catalog maps outcomes, refusals, and malformed requests to their conte
     const read = try Reply.of(&facts, request("get_state", "{}"));
     defer read.deinit();
     try std.testing.expectEqualStrings("/work", try read.text("working_directory"));
+}
+
+test "a turn that applied a gist lists the gist title as its prompt" {
+    var rig: application.testing.Rig = undefined;
+    try rig.init(&.{ .replies = &.{
+        .{ .body = providers.testing.reply_stream },
+        .{ .body = providers.testing.replyStream("Resume the task.\\nKeep the tests.") },
+        .{ .body = providers.testing.reply_stream },
+    } });
+    defer rig.deinit();
+    _ = rig.send(&.{ .send_message = "Task." });
+    try rig.expectTurn(.stopped);
+    const id = rig.send(&.{ .prepare_gist = "" }).operation.?;
+    const ready = try rig.result();
+    ready.deinit(std.testing.allocator);
+    _ = rig.send(&.{ .apply_result = id });
+    try rig.expectTurn(.stopped);
+    const facts: Facts = .{
+        .controller = rig.controller,
+        .instance = "0123456789ab".*,
+        .working_directory = "/work",
+        .interaction = false,
+    };
+    const listed = try Reply.of(&facts, request("list_turns", "{}"));
+    defer listed.deinit();
+    const turns = (try mcp_testing.member(listed.content, "turns")).array.items;
+    try std.testing.expectEqual(@as(usize, 1), turns.len);
+    const prompt = try mcp_testing.member(turns[0], "prompt");
+    try std.testing.expectEqualStrings("Resume the task.", prompt.string);
+    try std.testing.expect((try mcp_testing.member(turns[0], "gist")).bool);
 }
 
 test "a clip keeps whole UTF-8 sequences" {

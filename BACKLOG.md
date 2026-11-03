@@ -24,7 +24,7 @@ when the user drops it.
   allocator can consume a pending cancel. Without the strip, two cancel tests of `Session` fail in
   about one of three runs. A Debug build of Drinky records stacks through the same allocator, so it
   can hang or lose a cancel too. Trigger: a Zig release that fixes both defects.
-- An unauthorized failure of `/handoff` does not reject the credential. The page only shows the
+- An unauthorized failure of `/gist` does not reject the credential. The page only shows the
   failure, and the next turn rejects the credential. When a turn fails as unauthorized, the
   controller calls `rejectCredential`, which can sign out and report that no account remains. The
   terminal then opens the sign-in picker. The terminal cannot show that picker over an open result
@@ -33,6 +33,9 @@ when the user drops it.
   directories without a time limit. A file system call that does not return stops the start. A
   pending macOS privacy prompt causes such a call. The tools and the skill file reads already stop
   such a call after their time limit when the call accepts a cancel.
+- `/gists` scans at most 4096 entries of `~/.drinky/gists/` in directory order, not by age. Past
+  that limit, gists leave the list without a notice, and the newest gists can be among them. Each
+  save creates a file, and a gist stays until a deletion, so the count only grows.
 
 ## Ideas
 
@@ -41,6 +44,7 @@ when the user drops it.
   Herdr instructions then move to such files.
 - A retry wait shows no progress. The frame can empty over the delay that the `attempt_failed` event
   holds. Retries are rare, so the gain is small.
+- An MCP client cannot list, write, apply, or delete gists. Only the terminal uses gists.
 - The instructions do not tell the agent to use Rex tabs. Inside Rex, the agent can open a visual
   preview or a test script in a separate Rex tab without a request. The rule fits a Rex-only
   instruction file from the idea above.

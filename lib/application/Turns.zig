@@ -12,9 +12,20 @@ list: std.ArrayList(Turn),
 pub const Turn = struct {
     id: u64,
     range: Transcript.Range,
-    line: ?[]const u8,
+    prompt: ?Prompt,
     mutated: bool,
     end: ?End = null,
+};
+
+pub const Prompt = union(enum) {
+    line: []const u8,
+    gist: []const u8,
+
+    fn text(self: *const Prompt) []const u8 {
+        return switch (self.*) {
+            inline else => |value| value,
+        };
+    }
 };
 
 pub const End = struct {
@@ -44,14 +55,16 @@ pub fn find(self: *const Turns, id: u64) ?usize {
 
 pub fn begin(
     self: *Turns,
-    options: *const struct { id: u64, start: usize, line: ?[]const u8 },
+    options: *const struct { id: u64, start: usize, prompt: ?Prompt },
 ) error{OutOfMemory}!void {
     try self.list.ensureUnusedCapacity(self.gpa, 1);
-    const line = if (options.line) |text| try self.gpa.dupe(u8, text) else null;
+    const prompt: ?Prompt = if (options.prompt) |value| switch (value) {
+        inline else => |text, tag| @unionInit(Prompt, @tagName(tag), try self.gpa.dupe(u8, text)),
+    } else null;
     self.list.appendAssumeCapacity(.{
         .id = options.id,
         .range = .{ .start = options.start, .end = options.start },
-        .line = line,
+        .prompt = prompt,
         .mutated = false,
     });
 }
@@ -70,17 +83,20 @@ pub fn end(self: *Turns, block_count: usize, ended: *const End) error{OutOfMemor
     turn.range.end = block_count;
 }
 
-pub fn takeLine(self: *Turns, index: usize) []const u8 {
+pub fn takeLine(self: *Turns, index: usize) ?[]const u8 {
     const turn = &self.list.items[index];
-    const line = turn.line.?;
-    turn.line = null;
+    const line = switch (turn.prompt orelse return null) {
+        .line => |line| line,
+        .gist => return null,
+    };
+    turn.prompt = null;
     return line;
 }
 
 pub fn truncate(self: *Turns, count: usize) void {
     std.debug.assert(count <= self.list.items.len);
     for (self.list.items[count..]) |turn| {
-        if (turn.line) |line| self.gpa.free(line);
+        if (turn.prompt) |prompt| self.gpa.free(prompt.text());
         const ended = turn.end orelse continue;
         ended.outcome.deinit(self.gpa);
         self.gpa.free(ended.answer);

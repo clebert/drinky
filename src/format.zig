@@ -60,6 +60,23 @@ pub fn durationSeconds(buffer: []u8, milliseconds: i64, rounding: Rounding) []co
     }) catch unreachable;
 }
 
+pub fn coarseDuration(buffer: []u8, seconds: u64) []const u8 {
+    const unit: struct { size: u64, suffix: []const u8 } = if (seconds < std.time.s_per_hour)
+        .{ .size = std.time.s_per_min, .suffix = "m" }
+    else if (seconds < std.time.s_per_day)
+        .{ .size = std.time.s_per_hour, .suffix = "h" }
+    else
+        .{ .size = std.time.s_per_day, .suffix = "d" };
+    return std.mem.print(buffer, "{d}{s}", .{ @divFloor(seconds, unit.size), unit.suffix }) catch
+        unreachable;
+}
+
+pub fn gistLabel(gpa: std.mem.Allocator, title: []const u8) error{OutOfMemory}![]u8 {
+    const copy = try gpa.dupe(u8, title);
+    defer gpa.free(copy);
+    return gpa.print("Gist: {s}", .{singleLine(copy)});
+}
+
 pub fn singleLine(text: []u8) []u8 {
     var length: usize = 0;
     var blank = false;
@@ -119,6 +136,21 @@ test durationSeconds {
     try std.testing.expectEqualStrings("1m 0s", durationSeconds(&buffer, 59_001, .up));
     try std.testing.expectEqualStrings("1m 31s", durationSeconds(&buffer, 90_500, .up));
     try std.testing.expectEqualStrings("0s", durationSeconds(&buffer, -1, .up));
+}
+
+test coarseDuration {
+    var buffer: [24]u8 = undefined;
+    const cases = [_]struct { seconds: u64, text: []const u8 }{
+        .{ .seconds = 59, .text = "0m" },
+        .{ .seconds = 60, .text = "1m" },
+        .{ .seconds = 3_599, .text = "59m" },
+        .{ .seconds = 3_600, .text = "1h" },
+        .{ .seconds = 86_399, .text = "23h" },
+        .{ .seconds = 86_400, .text = "1d" },
+        .{ .seconds = 40 * 86_400, .text = "40d" },
+    };
+    for (cases) |case|
+        try std.testing.expectEqualStrings(case.text, coarseDuration(&buffer, case.seconds));
 }
 
 test bytes {

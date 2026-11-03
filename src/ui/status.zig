@@ -30,7 +30,7 @@ pub const Info = struct {
     confirmation: ?Confirmation = null,
 };
 
-pub const Confirmation = enum { message, removal, rewind };
+pub const Confirmation = enum { message, removal, rewind, delete_gist };
 
 pub const Quota = struct {
     windows: application.Quota,
@@ -205,6 +205,7 @@ pub fn render(placement: *const paint.Placement, info: *const Info) !void {
             },
             .removal => "Press Ctrl+N again to remove the canceled turn. Tool changes stay.",
             .rewind => "Press Enter again to rewind. Tool changes stay.",
+            .delete_gist => "Press Backspace again to delete the gist.",
         } else notice.content;
         return paint.notice(placement, &style, text);
     }
@@ -437,12 +438,8 @@ fn waitSeconds(reset_seconds: ?u64, age_ms: i64) ?u64 {
 }
 
 fn writeWait(out: *std.Io.Writer, seconds: u64) !void {
-    const minute = 60;
-    const hour = 60 * minute;
-    const day = 24 * hour;
-    if (seconds < hour) return out.print("{d}m", .{@max(1, @divFloor(seconds, minute))});
-    if (seconds < day) return out.print("{d}h", .{@divFloor(seconds, hour)});
-    return out.print("{d}d", .{@divFloor(seconds, day)});
+    var buffer: [24]u8 = undefined;
+    try out.writeAll(format.coarseDuration(&buffer, @max(seconds, std.time.s_per_min)));
 }
 
 fn writeQuotaLabel(out: *std.Io.Writer, maybe_minutes: ?u32) !void {
@@ -983,6 +980,11 @@ test "semantic confirmations keep the terminal text, roles, and width reductions
             .kind = .rewind,
             .content = "",
             .expected = "Press Enter again to rewind. Tool changes stay.",
+        },
+        .{
+            .kind = .delete_gist,
+            .content = "",
+            .expected = "Press Backspace again to delete the gist.",
         },
     };
     for (cases) |case| for (std.enums.values(Message.Severity)) |severity| {

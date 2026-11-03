@@ -18,6 +18,9 @@ pub const Response = controller.Response;
 pub const Refusal = controller.Refusal;
 pub const StartupRefusal = controller.StartupRefusal;
 pub const query = @import("query.zig");
+pub const GistId = @import("Gists.zig").Id;
+pub const GistEntry = @import("Gists.zig").Entry;
+pub const GistFailure = @import("Gists.zig").Failure;
 pub const SkillLoaded = core.Session.Event.SkillLoaded;
 
 pub const Snapshot = @import("Snapshot.zig");

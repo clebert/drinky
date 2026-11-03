@@ -155,20 +155,24 @@ fn writeCommands(writer: *std.Io.Writer) !void {
         \\User and model messages keep their complete text.
         \\
         \\`/rewind` lists the prompts of the conversation, with the oldest prompt first. A row
-        \\holds a user message or the typed line of a skill command. A retry gets no row.
-        \\Enter drops the chosen turn and every later turn. It returns the line to the editor
-        \\as editable text. Tool changes and the cost stay. When a turn that the rewind
-        \\drops ran `write`, `edit`, or `bash`, Enter warns first and rewinds on the second press.
+        \\holds a user message, the typed line of a skill command, or an applied gist. A retry
+        \\gets no row. Enter drops the chosen turn and every later turn. It returns the line of a
+        \\message or a skill command to the editor as editable text. Tool changes and the cost
+        \\stay. When a turn that the rewind drops ran `write`, `edit`, or `bash`, Enter warns
+        \\first and rewinds on the second press.
         \\
-        \\`/handoff` prepares a concise handoff for the current task with the current model.
-        \\The request holds each user prompt and the final answer of its turn. It omits tool
-        \\calls, tool results, reasoning, and intermediate texts, so it stays small and can work
-        \\after a context overflow. It offers no tools and uses the effort of normal turns. A last
-        \\user message asks for the handoff, and an optional instruction after the command joins
-        \\it. The command leaves the conversation unchanged and streams the handoff into a
-        \\read-only page. Until the first text arrives, the page shows a wait line as
-        \\`Agent: work (waiting) · Time: 0s · Received: 0 B`. The time ticks every second. The
-        \\state changes to thinking when reasoning text arrives, and Received counts its bytes.
+        \\`/gist` writes a gist of the current task with the current model. A gist is a
+        \\compressed summary that lets a new conversation continue the work. Drinky saves no
+        \\transcript. The request holds each user prompt, the agent texts between tool calls, and
+        \\the final answer of each turn. A skill that the user invoked counts as a user prompt.
+        \\The request omits tool calls, tool results, reasoning, and the skills that the model
+        \\loaded, so it stays small. A request that exceeds the context window fails. The request
+        \\offers no tools and uses the effort of normal turns. A last user message asks for the
+        \\gist, and an optional instruction after the command joins it. The command leaves the
+        \\conversation unchanged and streams the gist into a read-only page. Until the first text
+        \\arrives, the page shows a wait line as `Agent: work (waiting) · Time: 0s · Received: 0 B`.
+        \\The time ticks every second. The state changes to thinking when reasoning text arrives,
+        \\and Received counts its bytes.
         \\A failed attempt adds its note below the line.
         \\The wait line uses the transcript work-row layout.
         \\It stays on one row and removes Received before Time as the terminal narrows.
@@ -178,17 +182,39 @@ fn writeCommands(writer: *std.Io.Writer) !void {
         \\A failure note or an incomplete reply note uses red with ⚠.
         \\The notes stay separate from the model text in both page presentations.
         \\The cost of the request joins the session cost.
-        \\Enter applies a complete handoff. Drinky clears the conversation as /new does and sends
-        \\the handoff as a normal user message. The model resumes the task and asks for any user
-        \\decision that still blocks it. Normal rewind, retry, and canceled-turn edit behavior
-        \\applies.
-        \\Rewind cannot recover the old conversation after Apply.
+        \\The first line of the gist that holds text is its title, without heading marks.
+        \\Enter saves a complete gist, closes the page, and shows a notice.
+        \\A saves a complete gist and applies it at once.
+        \\Each save creates a new gist.
+        \\A failed save shows its failure on the page, and Enter or A tries again.
         \\Esc, Ctrl+C, and Ctrl+D cancel generation or discard the preview. Each exit closes only
         \\the page and restores the original command with its instruction to the editor.
-        \\Drinky cannot apply a failed or truncated handoff.
+        \\Drinky cannot save a failed or truncated gist.
         \\Every invocation generates a fresh preview.
-        \\The handoff has no fixed word count. It preserves the goal, constraints, decisions,
-        \\completed work, verification results, remaining work, and pending user decisions.
+        \\The gist has no fixed word count. It states the goal, the requirements in effect, the
+        \\decisions, the learnings, the completed and remaining work, and the pending user
+        \\decisions. It describes the current state of the work, not its history.
+        \\
+        \\`/gists` lists the gists in `~/.drinky/gists/`, with the newest gist first. All
+        \\repositories and working directories share these gists. A row shows the title and the
+        \\age of the gist. The list hides each invalid gist file. An invalid file holds only
+        \\spaces, tabs, and line breaks, or it holds invalid UTF-8 or a NUL byte. The list also
+        \\hides the gist files that Drinky cannot read. A notice gives the count of each kind and
+        \\the directory.
+        \\Enter opens the selected gist in a read-only page. A applies the gist. Esc, Ctrl+C, and
+        \\Ctrl+D close only the page and return to the list.
+        \\An apply clears the conversation as /new does and sends the gist inside `<gist>` tags
+        \\as a normal user message. The transcript shows the note `Gist:` with the title, in the
+        \\style of a skill note. The rest of the gist follows as a user message. The model resumes
+        \\the task and asks for any user decision that still blocks it.
+        \\In `/rewind`, the row of an applied gist shows `Gist:` with the title.
+        \\A rewind to that row and the removal of that canceled turn return no text to the
+        \\editor.
+        \\`/gists` can apply a gist again.
+        \\Rewind cannot recover the old conversation after an apply.
+        \\Backspace warns first and deletes the selected gist on the second press.
+        \\Drinky keeps each gist until a deletion.
+        \\Each gist is a Markdown file that only its owner can read.
         \\
     , .{ .verbose = config_keys.verbose });
 }
@@ -210,9 +236,9 @@ fn writeKeys(writer: *std.Io.Writer) !void {
         \\- Ctrl+N acts on the offer that the caption above the editor names. Under `Failed turn`,
         \\  Ctrl+N asks the model to continue from the committed work. The draft stays. Under
         \\  `Canceled turn`, Ctrl+N removes the canceled turn from the conversation and returns its
-        \\  line to the editor as editable text. Tool changes stay. After a turn that ran
-        \\  `write`, `edit`, or `bash`, Ctrl+N warns first and removes the turn on the second
-        \\  press.
+        \\  line to the editor as editable text. An applied gist returns no line. Tool changes
+        \\  stay. After a turn that ran `write`, `edit`, or `bash`, Ctrl+N warns first and removes
+        \\  the turn on the second press.
         \\- Esc dismisses a waiting offer. A dismissed canceled turn stays in the conversation. A
         \\  new turn, `/new`, and a rewind with `/rewind` dismiss the offer too.
         \\
@@ -362,8 +388,8 @@ fn writeAccess(writer: *std.Io.Writer) std.Io.Writer.Error!void {
         \\work, and continue a failed turn. It can also clear the conversation, fetch a model list,
         \\and select a saved model and the effort. The terminal shows a notice when a client clears
         \\the conversation. A client cannot rewind the conversation or remove a turn. It cannot
-        \\prepare or apply a handoff, or sign in or out. A remote request that changes the
-        \\instance fails while the terminal shows a picker, a page, or a sign-in.
+        \\write, apply, or delete a gist, and it cannot sign in or out. A remote request that
+        \\changes the instance fails while the terminal shows a picker, a page, or a sign-in.
         \\
         \\MCP access lets another agent submit work to this agent. Drinky has no permission gate or
         \\sandbox, so access is as powerful as the terminal.

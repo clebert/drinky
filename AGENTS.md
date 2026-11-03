@@ -73,8 +73,8 @@ These rules outrank existing behavior and repository precedent.
 - A failure is not a decision. Every draft and user message survives a failure. Out of memory is the
   exception. It ends Drinky, and the draft is lost.
 - `user_note` is the role of a message that Drinky writes for the user. An event reports session
-  state. A user message holds typed text, the text of an MCP request, or a handoff that the user
-  applied.
+  state. A user message holds typed text, the text of an MCP request, or the body of a gist that the
+  user applied.
 
 ### Terminal policies
 

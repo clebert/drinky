@@ -35,7 +35,7 @@ pub const Offer = union(enum) {
     retry,
     removal: Removal,
 
-    pub const Removal = struct { turn: u64, mutated: bool };
+    pub const Removal = struct { turn: u64, mutated: bool, returns_line: bool };
 };
 pub const Result = struct {
     id: u64,
@@ -53,7 +53,7 @@ pub const Result = struct {
         thinking: bool = false,
         retry: ?Record.Event.Attempt = null,
     };
-    pub const Notice = union(enum) { truncated, failed: Record.Event.Failure };
+    pub const Notice = union(enum) { truncated, not_text, failed: Record.Event.Failure };
 };
 
 pub fn dupe(self: *const State, gpa: std.mem.Allocator) error{OutOfMemory}!State {

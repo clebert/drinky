@@ -161,8 +161,8 @@ test "a command line during work gets a refusal that names the work, and a messa
             "command /verbose takes no argument." },
         .{ .line = "/effort", .work = .turn, .severity = .warning, .text = "The command " ++
             "/effort cannot run while a turn runs." },
-        .{ .line = "/handoff Keep it.", .work = .turn, .severity = .warning, .text = "The " ++
-            "command /handoff cannot run while a turn runs." },
+        .{ .line = "/gist Keep it.", .work = .turn, .severity = .warning, .text = "The " ++
+            "command /gist cannot run while a turn runs." },
         .{ .line = "/model", .work = .fetch, .severity = .warning, .text = "The command " ++
             "/model cannot run while a model fetch runs." },
         .{ .line = "/nope", .work = .fetch, .severity = .warning, .text = "Drinky does not " ++
@@ -193,12 +193,13 @@ test "a line resolves its command, its aliases, its skill, and its trimmed tail"
     const cases = [_]struct { line: []const u8, command: reference.Command }{
         .{ .line = "/", .command = .help },
         .{ .line = "/skill:", .command = .skill },
-        .{ .line = "/handoff x", .command = .handoff },
+        .{ .line = "/gist x", .command = .gist },
+        .{ .line = "/gists", .command = .gists },
     };
     for (cases) |case| try std.testing.expectEqual(case.command, lookup(name(case.line).?).?);
     try std.testing.expectEqualStrings("alpha", skillName(name("/skill:alpha it").?).?);
     try std.testing.expect(skillName("skill:") == null);
-    const line = "/handoff Keep decisions.\nPreserve the checks.\n";
+    const line = "/gist Keep decisions.\nPreserve the checks.\n";
     try std.testing.expectEqualStrings(
         "Keep decisions.\nPreserve the checks.",
         tail(line, name(line).?),
