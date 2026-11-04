@@ -52,11 +52,7 @@ pub const Work = struct {
             try writer.print("{s}{s})", .{ identity_prefix, value });
             options.ends[0] = writer.buffered().len;
             var time_buffer: [24]u8 = undefined;
-            const time = format.durationSeconds(
-                &time_buffer,
-                self.elapsed_ms,
-                .down,
-            );
+            const time = format.durationSeconds(&time_buffer, self.elapsed_ms);
             try writer.print("{s}Time: {s}", .{ paint.separator, time });
             options.ends[1] = writer.buffered().len;
             if (self.tools) |tools| try writer.print("{s}Tools: {d}", .{ paint.separator, tools });

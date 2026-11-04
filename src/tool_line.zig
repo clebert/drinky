@@ -21,19 +21,14 @@ pub const Line = struct {
     }
 };
 
-pub const Phase = enum { streaming, queued, running };
-
-const State = enum { streaming, queued, running, complete, partial, canceled, failed };
+const State = enum { complete, partial, canceled, failed };
 
 pub const Options = struct {
     name: []const u8,
-    phase: Phase = .running,
     subject: []const u8 = "",
     subject_kind: ?application.ToolDescription.Kind = null,
-    output: ?*const application.ToolOutput = null,
+    output: *const application.ToolOutput,
     elapsed_ms: ?i64 = null,
-    timeout_ms: ?u64 = null,
-    received_bytes: ?usize = null,
 };
 
 const Parts = struct {
@@ -116,17 +111,12 @@ pub fn render(gpa: std.mem.Allocator, options: *const Options) error{OutOfMemory
 }
 
 fn write(parts: *Parts, options: *const Options) !void {
-    const state: State = if (options.output) |output|
-        if (output.conditions.contains(.canceled))
-            .canceled
-        else if (output.hasFailure())
-            .failed
-        else if (partial(output)) .partial else .complete
-    else switch (options.phase) {
-        .streaming => .streaming,
-        .queued => .queued,
-        .running => .running,
-    };
+    const output = options.output;
+    const state: State = if (output.conditions.contains(.canceled))
+        .canceled
+    else if (output.hasFailure())
+        .failed
+    else if (partial(output)) .partial else .complete;
     const name = try parts.gpa.dupe(u8, options.name);
     defer parts.gpa.free(name);
     const shown_name = format.singleLine(name);
@@ -136,76 +126,50 @@ fn write(parts: *Parts, options: *const Options) !void {
         .end = parts.writer.buffered().len,
         .dim = true,
         .role = switch (state) {
-            .streaming, .queued, .running => .activity,
             .complete => .success,
             .partial, .canceled => .warning,
             .failed => .@"error",
         },
     };
+    var time_buffer: [24]u8 = undefined;
     if (options.elapsed_ms) |elapsed_ms| {
-        var buffer: [24]u8 = undefined;
-        const shown = if (options.output == null)
-            format.durationSeconds(&buffer, elapsed_ms, .down)
-        else
-            application.support.duration(&buffer, elapsed_ms);
-        try parts.print("Time: {s}", .{shown});
-    } else if (options.output) |output| {
-        if (output.measures.get(.duration_ms)) |duration_ms| {
-            var buffer: [24]u8 = undefined;
-            try parts.print(
-                "Time: {s}",
-                .{application.support.duration(&buffer, @intCast(duration_ms))},
-            );
-        }
+        try parts.print("Time: {s}", .{application.support.duration(&time_buffer, elapsed_ms)});
+    } else if (output.measures.get(.duration_ms)) |duration_ms| {
+        try parts.print(
+            "Time: {s}",
+            .{application.support.duration(&time_buffer, @intCast(duration_ms))},
+        );
     }
-    if (options.output) |output| {
-        if (output.measures.get(.exit_code)) |code| try parts.print("Exit code: {d}", .{code});
-    }
+    if (output.measures.get(.exit_code)) |code| try parts.print("Exit code: {d}", .{code});
     const command = options.subject_kind == .command;
     if (!command and options.subject.len > 0) try parts.print("{s}", .{options.subject});
-    if (options.output) |output| {
-        if (output.conditions.contains(.terminated)) try parts.print("Status: terminated", .{});
-        if (output.conditions.contains(.timed_out)) try parts.print("Status: timed out", .{});
-        if (output.conditions.contains(.overflowed)) try parts.print("Status: output limit", .{});
-        try writeStops(parts, output);
-        if (output.measures.get(.entries_unread)) |count| try parts.warn(
-            "Unreadable: {d} {s}",
-            .{ count, application.support.entryNoun(count) },
-        );
-        if (output.measures.get(.files_oversized)) |count| try parts.warn(
-            "Skipped: {d} large file{s}",
-            .{ count, application.support.pluralSuffix(count) },
-        );
-        if (output.conditions.contains(.line_truncated)) try parts.print("Line: truncated", .{});
-        if (output.conditions.contains(.lines_truncated)) try parts.print("Lines: truncated", .{});
-        if (output.conditions.contains(.output_truncated)) {
-            try parts.print("Output: truncated", .{});
-        }
-        if (output.measures.get(.matches)) |count| try parts.print("Matches: {d}", .{count});
-        try writeLines(parts, output);
-        if (output.measures.get(.matches_omitted)) |count| {
-            try parts.print("Omitted matches: {d}", .{count});
-        }
-    }
-    if (options.received_bytes) |bytes| {
-        var buffer: [16]u8 = undefined;
-        try parts.print("Received: {s}", .{format.bytes(&buffer, bytes)});
-    }
-    if (options.timeout_ms) |timeout_ms| {
-        var buffer: [24]u8 = undefined;
-        try parts.print("Timeout: {s}", .{
-            format.durationSeconds(&buffer, @intCast(timeout_ms), .up),
-        });
+    if (output.conditions.contains(.terminated)) try parts.print("Status: terminated", .{});
+    if (output.conditions.contains(.timed_out)) try parts.print("Status: timed out", .{});
+    if (output.conditions.contains(.overflowed)) try parts.print("Status: output limit", .{});
+    try writeStops(parts, output);
+    if (output.measures.get(.entries_unread)) |count| try parts.warn(
+        "Unreadable: {d} {s}",
+        .{ count, application.support.entryNoun(count) },
+    );
+    if (output.measures.get(.files_oversized)) |count| try parts.warn(
+        "Skipped: {d} large file{s}",
+        .{ count, application.support.pluralSuffix(count) },
+    );
+    if (output.conditions.contains(.line_truncated)) try parts.print("Line: truncated", .{});
+    if (output.conditions.contains(.lines_truncated)) try parts.print("Lines: truncated", .{});
+    if (output.conditions.contains(.output_truncated)) try parts.print("Output: truncated", .{});
+    if (output.measures.get(.matches)) |count| try parts.print("Matches: {d}", .{count});
+    try writeLines(parts, output);
+    if (output.measures.get(.matches_omitted)) |count| {
+        try parts.print("Omitted matches: {d}", .{count});
     }
     if (command) {
         const start = parts.writer.buffered().len + 1;
         try parts.writer.print("\n{s}", .{options.subject});
         parts.command = .{ .start = start, .end = parts.writer.buffered().len };
     }
-    if (options.output) |output| {
-        if (state == .failed and output.measures.count() == 0) {
-            try parts.writer.print("\nError: {s}", .{output.content});
-        }
+    if (state == .failed and output.measures.count() == 0) {
+        try parts.writer.print("\nError: {s}", .{output.content});
     }
 }
 
@@ -459,50 +423,49 @@ test "a tool names its subject and preserves each command line below its metadat
         .{
             .name = "read",
             .subject = .{ .kind = .path, .text = "/home/you/work/src/App.zig" },
-            .expected = "Tool: read (running) · File: src/App.zig",
+            .expected = "Tool: read (complete) · File: src/App.zig",
         },
         .{
             .name = "write",
             .subject = .{ .kind = .path, .text = "/home/you/.drinky/notes.md" },
-            .expected = "Tool: write (running) · File: ~/.drinky/notes.md",
+            .expected = "Tool: write (complete) · File: ~/.drinky/notes.md",
         },
         .{
             .name = "edit",
             .subject = .{ .kind = .path, .text = "/etc/hosts" },
-            .expected = "Tool: edit (running) · File: /etc/hosts",
+            .expected = "Tool: edit (complete) · File: /etc/hosts",
         },
         .{
             .name = "find",
             .subject = .{ .kind = .pattern, .text = "/home/you/work/**/*.zig" },
-            .expected = "Tool: find (running) · Pattern: /home/you/work/**/*.zig",
+            .expected = "Tool: find (complete) · Pattern: /home/you/work/**/*.zig",
         },
         .{
             .name = "bash",
             .subject = .{ .kind = .command, .text = "cat <<'EOF'\n  one\n\n  two\nEOF" },
-            .expected = "Tool: bash (running)\ncat <<'EOF'\n  one\n\n  two\nEOF",
+            .expected = "Tool: bash (complete)\ncat <<'EOF'\n  one\n\n  two\nEOF",
         },
         .{
             .name = "grep",
             .subject = .{ .kind = .pattern, .text = " \t " },
-            .expected = "Tool: grep (running)",
+            .expected = "Tool: grep (complete)",
         },
         .{
             .name = "describe_drinky",
             .subject = null,
-            .expected = "Tool: describe_drinky (running)",
+            .expected = "Tool: describe_drinky (complete)",
         },
     };
+    const output: core.Tool.Output = .{};
     for (cases) |case| {
-        const description: tools.Registry.Description = .{
-            .subject = case.subject,
-            .timeout_ms = null,
-        };
+        const description: tools.Registry.Description = .{ .subject = case.subject };
         const shown = try subject(gpa, &description, &roots);
         defer gpa.free(shown);
         const line = try render(gpa, &.{
             .name = case.name,
             .subject = shown,
             .subject_kind = if (case.subject) |value| value.kind else null,
+            .output = &output,
         });
         defer line.deinit(gpa);
         try std.testing.expectEqualStrings(case.expected, line.text);

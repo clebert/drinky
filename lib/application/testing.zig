@@ -2,7 +2,6 @@ const std = @import("std");
 const accounts = @import("accounts");
 const core = @import("core");
 const providers = @import("providers");
-const tools = @import("tools");
 const Choice = @import("Choice.zig");
 const Controller = @import("Controller.zig");
 const Record = @import("Record.zig");
@@ -416,13 +415,7 @@ pub const Reduction = struct {
 
     pub fn init(self: *Reduction, gpa: std.mem.Allocator, choice: Choice) void {
         self.* = .{
-            .surface = .init(
-                gpa,
-                std.testing.io,
-                .{ .ptr = self, .vtable = &vtable },
-                choice,
-                (tools.Context.Bash{}).timeout_ms,
-            ),
+            .surface = .init(gpa, std.testing.io, .{ .ptr = self, .vtable = &vtable }, choice),
             .published = .{ .choice = choice },
         };
     }

@@ -7,11 +7,6 @@ pub const Roots = struct {
     home_directory: []const u8 = "",
 };
 
-const Rounding = enum {
-    down,
-    up,
-};
-
 pub fn bytes(buffer: []u8, count: usize) []const u8 {
     if (count < 1024) return std.mem.print(buffer, "{d} B", .{count}) catch unreachable;
     const tenths_kib = @divFloor(count * 10, 1024);
@@ -46,12 +41,9 @@ pub fn path(
     return gpa.dupe(u8, target);
 }
 
-pub fn durationSeconds(buffer: []u8, milliseconds: i64, rounding: Rounding) []const u8 {
+pub fn durationSeconds(buffer: []u8, milliseconds: i64) []const u8 {
     const total: u64 = @intCast(@max(milliseconds, 0));
-    const seconds = switch (rounding) {
-        .down => @divFloor(total, std.time.ms_per_s),
-        .up => @divCeil(total, std.time.ms_per_s),
-    };
+    const seconds = @divFloor(total, std.time.ms_per_s);
     if (seconds < std.time.s_per_min)
         return std.mem.print(buffer, "{d}s", .{seconds}) catch unreachable;
     return std.mem.print(buffer, "{d}m {d}s", .{
@@ -119,23 +111,15 @@ test path {
 
 test durationSeconds {
     var buffer: [24]u8 = undefined;
-    try std.testing.expectEqualStrings("0s", durationSeconds(&buffer, 0, .down));
-    try std.testing.expectEqualStrings("0s", durationSeconds(&buffer, 999, .down));
-    try std.testing.expectEqualStrings("1s", durationSeconds(&buffer, 1_000, .down));
-    try std.testing.expectEqualStrings("30s", durationSeconds(&buffer, 30_400, .down));
-    try std.testing.expectEqualStrings("59s", durationSeconds(&buffer, 59_999, .down));
-    try std.testing.expectEqualStrings("1m 0s", durationSeconds(&buffer, 60_000, .down));
-    try std.testing.expectEqualStrings("2m 5s", durationSeconds(&buffer, 125_400, .down));
-    try std.testing.expectEqualStrings("60m 0s", durationSeconds(&buffer, 3_600_000, .down));
-    try std.testing.expectEqualStrings("0s", durationSeconds(&buffer, -1, .down));
-
-    try std.testing.expectEqualStrings("0s", durationSeconds(&buffer, 0, .up));
-    try std.testing.expectEqualStrings("1s", durationSeconds(&buffer, 1, .up));
-    try std.testing.expectEqualStrings("2s", durationSeconds(&buffer, 1_500, .up));
-    try std.testing.expectEqualStrings("30s", durationSeconds(&buffer, 30_000, .up));
-    try std.testing.expectEqualStrings("1m 0s", durationSeconds(&buffer, 59_001, .up));
-    try std.testing.expectEqualStrings("1m 31s", durationSeconds(&buffer, 90_500, .up));
-    try std.testing.expectEqualStrings("0s", durationSeconds(&buffer, -1, .up));
+    try std.testing.expectEqualStrings("0s", durationSeconds(&buffer, 0));
+    try std.testing.expectEqualStrings("0s", durationSeconds(&buffer, 999));
+    try std.testing.expectEqualStrings("1s", durationSeconds(&buffer, 1_000));
+    try std.testing.expectEqualStrings("30s", durationSeconds(&buffer, 30_400));
+    try std.testing.expectEqualStrings("59s", durationSeconds(&buffer, 59_999));
+    try std.testing.expectEqualStrings("1m 0s", durationSeconds(&buffer, 60_000));
+    try std.testing.expectEqualStrings("2m 5s", durationSeconds(&buffer, 125_400));
+    try std.testing.expectEqualStrings("60m 0s", durationSeconds(&buffer, 3_600_000));
+    try std.testing.expectEqualStrings("0s", durationSeconds(&buffer, -1));
 }
 
 test coarseDuration {

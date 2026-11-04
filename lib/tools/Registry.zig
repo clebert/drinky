@@ -25,34 +25,16 @@ const Entry = struct {
     tool: core.Tool,
     run: *const fn (*const Context, []const u8) Context.Error!core.Tool.Output,
     subject: ?Subject = null,
-    timeout: Timeout = .none,
+    timeout_ms: ?u64 = null,
 
     const Subject = struct {
         argument: []const u8,
         kind: Description.Kind,
     };
-
-    const Timeout = union(enum) {
-        none,
-        argument: []const u8,
-        fixed: u64,
-
-        fn defaultMs(self: *const Timeout, timeout_ms_configured: u64) ?u64 {
-            return switch (self.*) {
-                .none => null,
-                .argument => bash.timeoutMs(&.{
-                    .timeout_seconds = null,
-                    .timeout_ms_configured = timeout_ms_configured,
-                }),
-                .fixed => |fixed_ms| fixed_ms,
-            };
-        }
-    };
 };
 
 pub const Description = struct {
     subject: ?Subject,
-    timeout_ms: ?u64,
 
     pub const Subject = struct {
         kind: Kind,
@@ -71,37 +53,36 @@ const entries = [_]Entry{
         .tool = read.spec,
         .run = read.run,
         .subject = .{ .argument = "path", .kind = .path },
-        .timeout = .{ .fixed = fs.timeout_ms },
+        .timeout_ms = fs.timeout_ms,
     },
     .{
         .tool = write.spec,
         .run = write.run,
         .subject = .{ .argument = "path", .kind = .path },
-        .timeout = .{ .fixed = fs.timeout_ms },
+        .timeout_ms = fs.timeout_ms,
     },
     .{
         .tool = edit.spec,
         .run = edit.run,
         .subject = .{ .argument = "path", .kind = .path },
-        .timeout = .{ .fixed = fs.timeout_ms },
+        .timeout_ms = fs.timeout_ms,
     },
     .{
         .tool = find.spec,
         .run = find.run,
         .subject = .{ .argument = "pattern", .kind = .pattern },
-        .timeout = .{ .fixed = search.timeout_ms },
+        .timeout_ms = search.timeout_ms,
     },
     .{
         .tool = grep.spec,
         .run = grep.run,
         .subject = .{ .argument = "pattern", .kind = .pattern },
-        .timeout = .{ .fixed = search.timeout_ms },
+        .timeout_ms = search.timeout_ms,
     },
     .{
         .tool = bash.spec,
         .run = bash.run,
         .subject = .{ .argument = "command", .kind = .command },
-        .timeout = .{ .argument = "timeout_seconds" },
     },
     .{ .tool = describe_drinky.spec, .run = describe_drinky.run },
 };
@@ -133,10 +114,10 @@ fn run(
         "Drinky does not recognize the tool {s}.",
         .{call.name},
     );
-    const deadline: core.timeout.Deadline = switch (entry.timeout) {
-        .fixed => |timeout_ms| .start(self.host.io, timeout_ms),
-        .none, .argument => .unbounded,
-    };
+    const deadline: core.timeout.Deadline = if (entry.timeout_ms) |timeout_ms|
+        .start(self.host.io, timeout_ms)
+    else
+        .unbounded;
     const context: Context = .{
         .gpa = gpa,
         .host = self.host,
@@ -201,23 +182,15 @@ fn reset(ptr: *anyopaque) void {
 pub fn describe(
     gpa: std.mem.Allocator,
     call: *const core.Tool.Call,
-    timeout_ms_configured: u64,
 ) error{OutOfMemory}!Description {
-    const entry = entryNamed(call.name) orelse return .{ .subject = null, .timeout_ms = null };
+    const entry = entryNamed(call.name) orelse return .{ .subject = null };
+    const subject = entry.subject orelse return .{ .subject = null };
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
-    const arguments = (try parseArguments(arena.allocator(), call.arguments)) orelse return .{
-        .subject = null,
-        .timeout_ms = entry.timeout.defaultMs(timeout_ms_configured),
-    };
-    const timeout_ms = readTimeoutMs(entry, arena.allocator(), &arguments, timeout_ms_configured);
-    const subject = entry.subject orelse return .{ .subject = null, .timeout_ms = timeout_ms };
-    const text = stringArgument(&arguments, subject.argument) orelse
-        return .{ .subject = null, .timeout_ms = timeout_ms };
-    return .{
-        .subject = .{ .kind = subject.kind, .text = try gpa.dupe(u8, text) },
-        .timeout_ms = timeout_ms,
-    };
+    const arguments = (try parseArguments(arena.allocator(), call.arguments)) orelse
+        return .{ .subject = null };
+    const text = stringArgument(&arguments, subject.argument) orelse return .{ .subject = null };
+    return .{ .subject = .{ .kind = subject.kind, .text = try gpa.dupe(u8, text) } };
 }
 
 fn entryNamed(name: []const u8) ?*const Entry {
@@ -262,27 +235,6 @@ fn stringArgument(arguments: *const std.json.ObjectMap, name: []const u8) ?[]con
         .string => |text| text,
         else => null,
     };
-}
-
-fn readTimeoutMs(
-    entry: *const Entry,
-    arena: std.mem.Allocator,
-    arguments: *const std.json.ObjectMap,
-    timeout_ms_configured: u64,
-) ?u64 {
-    const name = switch (entry.timeout) {
-        .argument => |argument| argument,
-        .none, .fixed => return entry.timeout.defaultMs(timeout_ms_configured),
-    };
-    const raw = arguments.get(name) orelse .null;
-    const seconds: ?u64 = switch (raw) {
-        .null => null,
-        else => std.json.parseFromValueLeaky(u64, arena, raw, .{}) catch return null,
-    };
-    return bash.timeoutMs(&.{
-        .timeout_seconds = seconds,
-        .timeout_ms_configured = timeout_ms_configured,
-    });
 }
 
 test "the specs mark the tools that change files or run commands" {
@@ -582,7 +534,7 @@ test describe {
             .id = "",
             .name = case.name,
             .arguments = case.input,
-        }, 120_000);
+        });
         defer description.deinit(gpa);
         const expected = case.expected orelse {
             try std.testing.expect(description.subject == null);
@@ -591,66 +543,5 @@ test describe {
         const subject = description.subject.?;
         try std.testing.expectEqual(expected.kind, subject.kind);
         try std.testing.expectEqualStrings(expected.text, subject.text);
-    }
-}
-
-test "a described call reports the timeout it runs under" {
-    const gpa = std.testing.allocator;
-    const cases = [_]struct { name: []const u8, input: []const u8, expected: ?u64 }{
-        .{ .name = "bash", .input = "{\"command\":\"true\"}", .expected = 120_000 },
-        .{
-            .name = "bash",
-            .input = "{\"command\":\"true\",\"timeout_seconds\":5}",
-            .expected = 5_000,
-        },
-        .{
-            .name = "bash",
-            .input = "{\"command\":\"true\",\"timeout_seconds\":0}",
-            .expected = Context.Bash.timeout_ms_min,
-        },
-        .{ .name = "find", .input = "{\"pattern\":\"*.zig\"}", .expected = search.timeout_ms },
-        .{
-            .name = "grep",
-            .input = "{\"pattern\":\"x\",\"timeout_seconds\":5}",
-            .expected = search.timeout_ms,
-        },
-        .{ .name = "read", .input = "{\"path\":\"a\"}", .expected = fs.timeout_ms },
-        .{ .name = "describe_drinky", .input = "{}", .expected = null },
-        .{ .name = "nonesuch", .input = "{}", .expected = null },
-        .{ .name = "bash", .input = "{\"comm", .expected = 120_000 },
-        .{
-            .name = "bash",
-            .input = "{\"command\":\"x\",\"timeout_seconds\":-5}",
-            .expected = null,
-        },
-        .{
-            .name = "bash",
-            .input = "{\"command\":\"x\",\"timeout_seconds\":\"5\"}",
-            .expected = 5_000,
-        },
-        .{
-            .name = "bash",
-            .input = "{\"command\":\"x\",\"timeout_seconds\":5.0}",
-            .expected = 5_000,
-        },
-        .{
-            .name = "bash",
-            .input = "{\"command\":\"x\",\"timeout_seconds\":null}",
-            .expected = 120_000,
-        },
-        .{
-            .name = "bash",
-            .input = "{\"command\":\"x\",\"timeout_seconds\":1.5}",
-            .expected = null,
-        },
-    };
-    for (cases) |case| {
-        const description = try describe(gpa, &.{
-            .id = "",
-            .name = case.name,
-            .arguments = case.input,
-        }, 120_000);
-        defer description.deinit(gpa);
-        try std.testing.expectEqual(case.expected, description.timeout_ms);
     }
 }

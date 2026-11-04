@@ -605,7 +605,6 @@ fn init(self: *Controller, gpa: std.mem.Allocator, io: std.Io, options: *const O
         io,
         .{ .ptr = self, .vtable = &surface_sink_vtable },
         self.choice,
-        config.bash.timeout_ms,
     );
     self.surface.muted = true;
     errdefer self.surface.deinit();

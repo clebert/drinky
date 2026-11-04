@@ -436,7 +436,7 @@ fn dupeAuthorization(
     return .{ .account = authorization.account, .url = url, .code = code };
 }
 
-pub fn dupeDescription(
+fn dupeDescription(
     gpa: std.mem.Allocator,
     description: *const tools.Registry.Description,
 ) error{OutOfMemory}!tools.Registry.Description {

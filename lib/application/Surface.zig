@@ -20,7 +20,6 @@ turn: ?Turn = null,
 statistics: Statistics = .{},
 statistics_published: Statistics = .{},
 choice: Choice,
-bash_timeout_ms: u64,
 thinking_active: ?usize = null,
 muted: bool = false,
 answer: std.ArrayList(u8) = .empty,
@@ -161,9 +160,10 @@ pub const Call = struct {
     phase: Phase,
     bytes: usize = 0,
     opened_ms: i64,
-    description: tools.Registry.Description = .{ .subject = null, .timeout_ms = null },
+    description: tools.Registry.Description = .{ .subject = null },
 
-    pub const Phase = union(enum) { streaming, queued, running: Live.Call.Running, done };
+    pub const Phase = union(enum) { streaming, queued, running: Running, done };
+    const Running = struct { started_ms: i64 };
 
     pub fn init(gpa: std.mem.Allocator, options: *const struct {
         name: []const u8,
@@ -190,7 +190,6 @@ pub fn init(
     io: std.Io,
     sink: Controller.Sink,
     choice: Choice,
-    bash_timeout_ms: u64,
 ) Surface {
     return .{
         .gpa = gpa,
@@ -198,7 +197,6 @@ pub fn init(
         .sink = sink,
         .choice = choice,
         .transcript = .init(gpa),
-        .bash_timeout_ms = bash_timeout_ms,
         .live_hash = hashLive(&.{}),
     };
 }
@@ -236,18 +234,11 @@ pub fn live(self: *Surface) Live {
     const turn = self.activeTurn() orelse return .{};
     for (turn.blocks.items) |*block| {
         const call = if (block.call) |*call| call else continue;
+        if (call.phase == .done) continue;
         self.live_calls.appendAssumeCapacity(.{
-            .id = call.record_id,
             .name = call.name,
-            .phase = switch (call.phase) {
-                .streaming => .streaming,
-                .queued => .queued,
-                .running => |running| .{ .running = running },
-                .done => continue,
-            },
             .argument_bytes = call.bytes,
             .opened_ms = call.opened_ms,
-            .description = call.description,
         });
     }
     return .{ .calls = self.live_calls.items, .thinking = self.thinking_active != null };
@@ -259,18 +250,8 @@ fn hashLive(state: *const Live) u64 {
     var hasher: std.hash.Wyhash = .init(0);
     std.hash.autoHash(&hasher, state.thinking);
     for (state.calls) |*call| {
-        std.hash.autoHash(&hasher, .{
-            call.id,
-            call.phase,
-            call.argument_bytes,
-            call.opened_ms,
-            call.description.timeout_ms,
-            call.name.len,
-        });
+        std.hash.autoHash(&hasher, .{ call.argument_bytes, call.opened_ms, call.name.len });
         hasher.update(call.name);
-        const subject = call.description.subject orelse continue;
-        std.hash.autoHash(&hasher, .{ subject.kind, subject.text.len });
-        hasher.update(subject.text);
     }
     return hasher.final();
 }
@@ -295,7 +276,7 @@ pub fn chosenModel(self: *const Surface) ?*const accounts.Model {
 }
 
 pub fn describeCall(self: *Surface, call: *Call, tool_call: *const core.Tool.Call) !void {
-    const description = try tools.Registry.describe(self.gpa, tool_call, self.bash_timeout_ms);
+    const description = try tools.Registry.describe(self.gpa, tool_call);
     call.description.deinit(self.gpa);
     call.description = description;
     if (!std.mem.eql(u8, call.name, tool_call.name)) {
@@ -309,7 +290,7 @@ pub fn appendUnknownResult(
     result: *const core.Session.Event.ToolResult,
     now_ms: i64,
 ) !void {
-    const description = try tools.Registry.describe(self.gpa, &result.call, self.bash_timeout_ms);
+    const description = try tools.Registry.describe(self.gpa, &result.call);
     defer description.deinit(self.gpa);
     try self.transcript.append(&.{ .tool_result = .{
         .name = result.call.name,

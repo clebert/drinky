@@ -98,10 +98,10 @@ fn writeCommands(writer: *std.Io.Writer) !void {
         \\The `complete` status uses green, and `failed` uses red.
         \\The tool statuses `partial` and `canceled` use yellow.
         \\The work statuses `truncated` and `canceled` use yellow too.
-        \\The `queued`, `streaming`, and `running` statuses use cyan.
         \\
-        \\Verbose on shows complete thinking text, a row for each tool call, and complete bash
-        \\commands.
+        \\Verbose on shows complete thinking text, a row for each finished tool call, and
+        \\complete bash commands.
+        \\A tool call row joins the transcript when its call finishes.
         \\Complete commands keep their source line breaks.
         \\Verbose off folds each run of thinking and tool calls into one work row.
         \\Agent text, a session event, or a user note ends a run. A new model step does not end it.
@@ -113,6 +113,8 @@ fn writeCommands(writer: *std.Io.Writer) !void {
         \\Otherwise, it lists each unfinished tool name once, without a call count.
         \\The list includes calls that stream, wait in the queue, or run.
         \\The activity is `waiting` when no thinking or unfinished tool call exists.
+        \\Verbose on shows the open work row only while a tool call is unfinished.
+        \\Its activity then lists only the tool names.
         \\The row reserves no activity width and adds no activity padding.
         \\The open run stays below the transcript.
         \\The final status is `complete`, `canceled`, `failed`, or `truncated`.
@@ -127,9 +129,7 @@ fn writeCommands(writer: *std.Io.Writer) !void {
         \\It never removes the first segment, and it truncates that segment only when necessary.
         \\Time has the next priority, followed by the bash exit code, file or pattern, limit
         \\details, counts, and secondary measures.
-        \\Received bytes and timeout values have the lowest priority.
-        \\A running call with a time limit shows its time and the limit.
-        \\After the call, the time comes from the tool.
+        \\The time comes from the tool.
         \\`bash`, `find`, and `grep` measure it, except after an early failure.
         \\A canceled call that started shows the time until the cancel.
         \\A search that stops at a limit or skips entries shows `partial`.

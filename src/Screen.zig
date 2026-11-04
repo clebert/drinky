@@ -104,11 +104,10 @@ pub const Turn = struct {
     activity_tick: u64,
     progress_tick_last: u64,
     caret_tick: u64,
-    box_view: std.ArrayList(ui.paint.Box),
-    box_hashes: std.ArrayList(u64),
-    box_tracks: std.ArrayList(layout.Track),
     work_line: std.ArrayList(u8),
     work_ends: [ui.Block.Work.Summary.segment_count]usize,
+    work_hash: ?u64,
+    work_track: layout.Track,
 
     const empty: Turn = .{
         .calls = .empty,
@@ -116,19 +115,17 @@ pub const Turn = struct {
         .activity_tick = 0,
         .progress_tick_last = 0,
         .caret_tick = 0,
-        .box_view = .empty,
-        .box_hashes = .empty,
-        .box_tracks = .empty,
         .work_line = .empty,
         .work_ends = undefined,
+        .work_hash = null,
+        .work_track = .{},
     };
+
+    const WorkOptions = struct { now_ms: i64, open: ?Transcript.Run, verbose: bool };
 
     fn deinit(self: *Turn, gpa: std.mem.Allocator) void {
         self.releaseCalls(gpa);
         self.calls.deinit(gpa);
-        self.box_view.deinit(gpa);
-        self.box_hashes.deinit(gpa);
-        self.box_tracks.deinit(gpa);
         self.work_line.deinit(gpa);
     }
 
@@ -137,26 +134,22 @@ pub const Turn = struct {
         self.calls.clearRetainingCapacity();
     }
 
-    fn boxes(self: *Turn, gpa: std.mem.Allocator, now_ms: i64) ![]const ui.paint.Box {
-        self.box_view.clearRetainingCapacity();
-        for (self.calls.items) |*call| {
-            try self.box_view.append(gpa, .{
-                .text = try call.text(gpa, now_ms),
-                .segment_ends = call.line.?.segment_ends,
-                .status = call.line.?.status,
-                .qualifiers = call.line.?.qualifiers,
-                .command = call.line.?.command,
-            });
-        }
-        return self.box_view.items;
+    fn work(self: *Turn, gpa: std.mem.Allocator, options: *const WorkOptions) !?layout.Work {
+        const box = try self.workBox(gpa, options) orelse {
+            self.work_hash = null;
+            return null;
+        };
+        const hash = std.hash.Wyhash.hash(0, box.text);
+        if (self.work_hash) |previous| {
+            self.work_track.changed = previous != hash;
+        } else self.work_track = .{ .changed = true };
+        self.work_hash = hash;
+        return .{ .box = box, .track = &self.work_track };
     }
 
-    fn workBoxes(
-        self: *Turn,
-        gpa: std.mem.Allocator,
-        options: *const struct { now_ms: i64, open: ?Transcript.Run },
-    ) ![]const ui.paint.Box {
-        self.box_view.clearRetainingCapacity();
+    fn workBox(self: *Turn, gpa: std.mem.Allocator, options: *const WorkOptions) !?ui.paint.Box {
+        if (options.verbose and self.calls.items.len == 0) return null;
+        const thinking = self.thinking and !options.verbose;
         var started_ms: ?i64 = null;
         var summary: ui.Block.Work.Summary = .{
             .elapsed_ms = 0,
@@ -171,17 +164,17 @@ pub const Turn = struct {
         }
         var activity_text: std.ArrayList(u8) = .empty;
         defer activity_text.deinit(gpa);
-        if (self.thinking) try activity_text.appendSlice(gpa, "thinking");
+        if (thinking) try activity_text.appendSlice(gpa, "thinking");
         for (self.calls.items, 0..) |*call, index| {
             started_ms = @min(started_ms orelse call.opened_ms, call.opened_ms);
-            if (self.thinking or self.liveCallBefore(index, call.name)) continue;
+            if (thinking or self.liveCallBefore(index, call.name)) continue;
             if (activity_text.items.len > 0) try activity_text.appendSlice(gpa, ", ");
             const name_start = activity_text.items.len;
             try activity_text.appendSlice(gpa, call.name);
             const shown = format.singleLine(activity_text.items[name_start..]);
             activity_text.shrinkRetainingCapacity(name_start + shown.len);
         }
-        summary.elapsed_ms = options.now_ms - (started_ms orelse return &.{});
+        summary.elapsed_ms = options.now_ms - (started_ms orelse return null);
         self.work_line.clearRetainingCapacity();
         var out: std.Io.Writer.Allocating = .fromArrayList(gpa, &self.work_line);
         defer self.work_line = out.toArrayList();
@@ -189,11 +182,7 @@ pub const Turn = struct {
             .activity = activity_text.items,
             .ends = &self.work_ends,
         }) catch return error.OutOfMemory;
-        try self.box_view.append(
-            gpa,
-            ui.Block.Work.box(out.written(), &self.work_ends, null),
-        );
-        return self.box_view.items;
+        return ui.Block.Work.box(out.written(), &self.work_ends, null);
     }
 
     fn liveCallBefore(self: *const Turn, index: usize, name: []const u8) bool {
@@ -202,104 +191,18 @@ pub const Turn = struct {
         }
         return false;
     }
-
-    fn trackBoxes(self: *Turn, gpa: std.mem.Allocator) ![]layout.Track {
-        std.debug.assert(self.box_tracks.items.len == self.box_hashes.items.len);
-        const count = self.box_view.items.len;
-        try self.box_tracks.ensureTotalCapacity(gpa, count);
-        try self.box_hashes.ensureTotalCapacity(gpa, count);
-        for (self.box_view.items, 0..) |box, index| {
-            const hash = std.hash.Wyhash.hash(0, box.text);
-            if (index < self.box_hashes.items.len) {
-                self.box_tracks.items[index].changed = self.box_hashes.items[index] != hash;
-                self.box_hashes.items[index] = hash;
-            } else {
-                self.box_tracks.appendAssumeCapacity(.{ .changed = true });
-                self.box_hashes.appendAssumeCapacity(hash);
-            }
-        }
-        self.box_tracks.shrinkRetainingCapacity(count);
-        self.box_hashes.shrinkRetainingCapacity(count);
-        return self.box_tracks.items;
-    }
 };
 
 pub const Call = struct {
     name: []const u8,
-    phase: application.Live.Call.Phase,
-    subject: []const u8,
-    subject_kind: ?application.ToolDescription.Kind,
     opened_ms: i64,
-    timeout_ms: ?u64,
-    line: ?tool_line.Line,
-    elapsed_seconds: ?i64,
 
-    fn init(
-        gpa: std.mem.Allocator,
-        live: *const application.Live.Call,
-        roots: *const format.Roots,
-    ) !Call {
-        const name = try gpa.dupe(u8, live.name);
-        errdefer gpa.free(name);
-        const subject = try tool_line.subject(gpa, &live.description, roots);
-        errdefer gpa.free(subject);
-        const subject_kind = if (live.description.subject) |value| value.kind else null;
-        const line = try tool_line.render(gpa, &.{
-            .name = live.name,
-            .phase = switch (live.phase) {
-                .streaming => .streaming,
-                .queued => .queued,
-                .running => .running,
-            },
-            .subject = subject,
-            .subject_kind = subject_kind,
-            .timeout_ms = switch (live.phase) {
-                .running => live.description.timeout_ms,
-                .streaming, .queued => null,
-            },
-            .received_bytes = switch (live.phase) {
-                .running => null,
-                .streaming, .queued => live.argument_bytes,
-            },
-        });
-        return .{
-            .name = name,
-            .phase = live.phase,
-            .subject = subject,
-            .subject_kind = subject_kind,
-            .opened_ms = live.opened_ms,
-            .timeout_ms = live.description.timeout_ms,
-            .line = line,
-            .elapsed_seconds = null,
-        };
+    fn init(gpa: std.mem.Allocator, live: *const application.Live.Call) !Call {
+        return .{ .name = try gpa.dupe(u8, live.name), .opened_ms = live.opened_ms };
     }
 
     fn deinit(self: *Call, gpa: std.mem.Allocator) void {
         gpa.free(self.name);
-        gpa.free(self.subject);
-        if (self.line) |*line| line.deinit(gpa);
-    }
-
-    fn text(self: *Call, gpa: std.mem.Allocator, now_ms: i64) ![]const u8 {
-        const running = switch (self.phase) {
-            .running => |running| running,
-            .streaming, .queued => return self.line.?.text,
-        };
-        const timeout_ms = self.timeout_ms orelse return self.line.?.text;
-        const seconds = @divFloor(@max(now_ms - running.started_ms, 0), std.time.ms_per_s);
-        if (self.elapsed_seconds == seconds) return self.line.?.text;
-        const line = try tool_line.render(gpa, &.{
-            .name = self.name,
-            .phase = .running,
-            .subject = self.subject,
-            .subject_kind = self.subject_kind,
-            .elapsed_ms = seconds * std.time.ms_per_s,
-            .timeout_ms = timeout_ms,
-        });
-        if (self.line) |*previous| previous.deinit(gpa);
-        self.line = line;
-        self.elapsed_seconds = seconds;
-        return line.text;
     }
 };
 
@@ -529,7 +432,7 @@ fn showLive(self: *Screen, live: *const application.Live) !void {
     }
     try calls.ensureTotalCapacity(self.gpa, live.calls.len);
     for (live.calls) |*call|
-        calls.appendAssumeCapacity(try .init(self.gpa, call, &self.display_roots));
+        calls.appendAssumeCapacity(try .init(self.gpa, call));
     turn.releaseCalls(self.gpa);
     turn.calls.deinit(self.gpa);
     turn.calls = calls;
@@ -855,7 +758,7 @@ pub fn paint(
 
     const tail: layout.Tail = switch (self.widget) {
         .prompt => prompt: {
-            self.editor.reflow(size);
+            self.editor.reflow(size, layout.editorRows(size.rows));
             break :prompt .{
                 .prompt = .{
                     .caption = caption.*,
@@ -864,19 +767,15 @@ pub fn paint(
             };
         },
         .turn => |*turn| turn: {
-            self.editor.reflow(size);
-            const boxes = if (self.verbose)
-                try turn.boxes(self.gpa, time.awake_ms)
-            else
-                try turn.workBoxes(self.gpa, &.{
-                    .now_ms = time.awake_ms,
-                    .open = self.transcript.openWork(),
-                });
-            const tracks = try turn.trackBoxes(self.gpa);
+            self.editor.reflow(size, layout.editorRows(size.rows));
+            const work = try turn.work(self.gpa, &.{
+                .now_ms = time.awake_ms,
+                .open = self.transcript.openWork(),
+                .verbose = self.verbose,
+            });
             break :turn .{
                 .turn = .{
-                    .tools = boxes,
-                    .tracks = tracks,
+                    .work = work,
                     .activity = self.turnActivity(turn),
                     .editor = &self.editor,
                 },
@@ -1176,7 +1075,7 @@ const overloaded_attempt: application.Record.Event.Attempt = .{
     .delay_ms = 0,
 };
 
-test "tool metadata keeps its state and removes whole segments during and after a call" {
+test "tool metadata removes whole segments after a call" {
     const gpa = std.testing.allocator;
     var rig: Rig = undefined;
     rig.init();
@@ -1189,14 +1088,7 @@ test "tool metadata keeps its state and removes whole segments during and after 
     };
     try rig.apply(&.{ .tool_call_started = call.name });
     try rig.apply(&.{ .tool_call_arguments = call.arguments });
-    const streamed = try rig.paintPlain(80);
-    defer gpa.free(streamed);
-    try testing.expectContains(streamed, "Tool: read (streaming) · Received:");
     try rig.apply(&.{ .tool_started = call });
-    const running = try rig.paintPlain(30);
-    defer gpa.free(running);
-    try testing.expectContains(running, "Tool: read (running)");
-    try std.testing.expect(std.mem.find(u8, running, "File:") == null);
     var output: core.Tool.Output = .{};
     output.measures.put(.lines, 120);
     try rig.apply(&.{ .tool_result = .{ .call = call, .output = output } });
@@ -1220,7 +1112,7 @@ test "tool metadata keeps its state and removes whole segments during and after 
         "a very long path with a · separator.zig · Lines: 120");
 }
 
-test "a verbose command keeps its gutter rows when its call completes" {
+test "a completed verbose command keeps its source lines in the gutter" {
     const gpa = std.testing.allocator;
     var rig: Rig = undefined;
     rig.init();
@@ -1234,7 +1126,19 @@ test "a verbose command keeps its gutter rows when its call completes" {
     };
     try rig.apply(&.{ .tool_call_started = call.name });
     try rig.apply(&.{ .tool_started = call });
-    rig.time.awake_ms = 3_000;
+    var output: core.Tool.Output = .{};
+    output.measures.put(.duration_ms, 3_000);
+    output.measures.put(.exit_code, 0);
+    output.measures.put(.lines, 1);
+    try rig.apply(&.{ .tool_result = .{ .call = call, .output = output } });
+    try rig.apply(&.committed);
+    try rig.end(&.{ .stopped = .complete });
+    const painted = try rig.paintPlain(48);
+    defer gpa.free(painted);
+    var rows = std.mem.splitSequence(u8, painted, "\r\n");
+    while (rows.next()) |row| {
+        if (std.mem.startsWith(u8, row, "Tool: bash (complete)")) break;
+    } else return error.TestUnexpectedResult;
     const expected = [_][]const u8{
         "$ cat <<'EOF'",
         "    first",
@@ -1243,25 +1147,8 @@ test "a verbose command keeps its gutter rows when its call completes" {
         "↪ its final-word",
         "  EOF",
     };
-    for ([_][]const u8{ "Tool: bash (running)", "Tool: bash (complete)" }, 0..) |identity, stage| {
-        const painted = try rig.paintPlain(48);
-        defer gpa.free(painted);
-        var rows = std.mem.splitSequence(u8, painted, "\r\n");
-        while (rows.next()) |row| {
-            if (std.mem.startsWith(u8, row, identity)) break;
-        } else return error.TestUnexpectedResult;
-        for (expected) |line| {
-            try std.testing.expectEqualStrings(line, std.mem.trimEnd(u8, rows.next().?, " "));
-        }
-        if (stage == 0) {
-            var output: core.Tool.Output = .{};
-            output.measures.put(.duration_ms, 3_000);
-            output.measures.put(.exit_code, 0);
-            output.measures.put(.lines, 1);
-            try rig.apply(&.{ .tool_result = .{ .call = call, .output = output } });
-            try rig.apply(&.committed);
-            try rig.end(&.{ .stopped = .complete });
-        }
+    for (expected) |line| {
+        try std.testing.expectEqualStrings(line, std.mem.trimEnd(u8, rows.next().?, " "));
     }
 }
 
@@ -1279,11 +1166,8 @@ test "a running tool uses the final call name instead of the streamed name" {
     } });
     const painted = try rig.paintPlain(80);
     defer gpa.free(painted);
-    try testing.expectContains(
-        painted,
-        "Tool: write (running) · Time: 0s · File: a.zig · Timeout: 10s",
-    );
-    try std.testing.expect(std.mem.find(u8, painted, "Tool: partial") == null);
+    try expectSummary(painted, "Agent: work (write) · Time: 0s · Tools: 0 · Received: 0 B");
+    try std.testing.expect(std.mem.find(u8, painted, "partial") == null);
 }
 
 test "a canceled call shows the time that it ran, and a call that never ran shows none" {
@@ -1635,6 +1519,116 @@ test "a verbose work end above the window keeps the scrollback" {
     defer gpa.free(after);
     try testing.expectContains(after, "answer");
     try std.testing.expect(std.mem.find(u8, rig.out.written(), "\x1b[3J") == null);
+}
+
+test "a tool call taller than the window keeps the scrollback while it runs and when it ends" {
+    const gpa = std.testing.allocator;
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    try std.testing.expect(rig.screen.verbose);
+    try rig.start("prompt");
+    var arguments: std.Io.Writer.Allocating = .init(gpa);
+    defer arguments.deinit();
+    try arguments.writer.writeAll("{\"command\":\"");
+    for (0..40) |index| try arguments.writer.print("echo {d}\\n", .{index});
+    try arguments.writer.writeAll("\"}");
+    const call: core.Tool.Call = .{
+        .id = "bash",
+        .name = "bash",
+        .arguments = arguments.written(),
+    };
+    try rig.apply(&.{ .tool_call_started = call.name });
+    try rig.apply(&.{ .tool_call_arguments = call.arguments });
+    try rig.apply(&.{ .tool_started = call });
+    var emulator = try terminal.testing.Emulator.init(gpa, 80);
+    defer emulator.deinit();
+    const size: terminal.View.Size = .{ .columns = 80, .rows = 24 };
+    emulator.resize(size.rows);
+    for (0..3) |second| {
+        rig.time.awake_ms = @intCast(second * std.time.ms_per_s);
+        try rig.paintInto(&emulator, size);
+        try std.testing.expect(
+            std.mem.find(u8, rig.out.written(), terminal.escape.screen_reset) == null,
+        );
+    }
+    var output: core.Tool.Output = .{};
+    output.measures.put(.duration_ms, 3_000);
+    output.measures.put(.exit_code, 0);
+    try rig.apply(&.{ .tool_result = .{ .call = call, .output = output } });
+    try rig.paintInto(&emulator, size);
+    try std.testing.expect(
+        std.mem.find(u8, rig.out.written(), terminal.escape.screen_reset) == null,
+    );
+    var command_rows: usize = 0;
+    for (emulator.document.items) |row| {
+        const text = std.mem.trimEnd(u8, row.items, " ");
+        command_rows += @intFromBool(std.mem.startsWith(u8, text, "$ echo ") or
+            std.mem.startsWith(u8, text, "  echo "));
+    }
+    try std.testing.expectEqual(@as(usize, 40), command_rows);
+}
+
+test "the smallest window keeps one draft row inside the animated editor frame" {
+    const gpa = std.testing.allocator;
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    try rig.screen.setDraft("1\n2\n3\n4\n5\n6\n7");
+    try rig.start("prompt");
+    var emulator = try terminal.testing.Emulator.init(gpa, 80);
+    defer emulator.deinit();
+    const size: terminal.View.Size = .{ .columns = 80, .rows = 4 };
+    emulator.resize(size.rows);
+    try rig.paintInto(&emulator, size);
+    for (0..40) |_| {
+        _ = rig.screen.advanceFrame(0);
+        try rig.paintInto(&emulator, size);
+        try std.testing.expect(
+            std.mem.find(u8, rig.out.written(), terminal.escape.screen_reset) == null,
+        );
+    }
+    const top = emulator.document.items[emulator.screen_top].items;
+    try std.testing.expect(std.mem.find(u8, top, "─") != null or
+        std.mem.find(u8, top, "━") != null);
+    const caret = emulator.document.items[emulator.screen_top + 1].items;
+    try std.testing.expectEqualStrings("7", std.mem.trim(u8, caret, " "));
+}
+
+test "a tall draft in a short window keeps the scrollback while the turn streams and runs a tool" {
+    const gpa = std.testing.allocator;
+    for ([_]bool{ true, false }) |verbose| {
+        var rig: Rig = undefined;
+        rig.init();
+        defer rig.deinit();
+        rig.screen.setVerbose(verbose);
+        try rig.screen.setDraft("1\n2\n3\n4\n5\n6\n7");
+        try rig.start("prompt");
+        try rig.apply(&.reasoning_started);
+        var emulator = try terminal.testing.Emulator.init(gpa, 80);
+        defer emulator.deinit();
+        const size: terminal.View.Size = .{ .columns = 80, .rows = 8 };
+        emulator.resize(size.rows);
+        try rig.paintInto(&emulator, size);
+        const call: core.Tool.Call = .{
+            .id = "bash",
+            .name = "bash",
+            .arguments = "{\"command\":\"zig build\"}",
+        };
+        for (0..8) |step| {
+            if (step < 4) try rig.apply(&.{ .reasoning = "word " });
+            if (step == 4) {
+                try rig.apply(&.{ .tool_call_started = call.name });
+                try rig.apply(&.{ .tool_started = call });
+            }
+            rig.time.awake_ms += std.time.ms_per_s;
+            _ = rig.screen.advanceFrame(rig.time.awake_ms);
+            try rig.paintInto(&emulator, size);
+            try std.testing.expect(
+                std.mem.find(u8, rig.out.written(), terminal.escape.screen_reset) == null,
+            );
+        }
+    }
 }
 
 test "a verbosity toggle repaints the complete transcript beyond the window limit" {
@@ -2237,19 +2231,24 @@ test "a canceled run that drops a streaming call keeps the received bytes of its
     try expectSummary(canceled, "Agent: work (canceled) · Time: 0s · Tools: 0 · Received: 3 B");
 }
 
-test "a tool call streams as a row, runs with its subject and timer, and ends as a block" {
+test "a verbose tool call streams and runs in the work row and ends as a block" {
     const gpa = std.testing.allocator;
     var rig: Rig = undefined;
     rig.init();
     defer rig.deinit();
     try rig.start("run it");
+    try rig.apply(&.reasoning_started);
+    try rig.apply(&.{ .reasoning = "plan" });
+    const thinking = try rig.paintPlain(80);
+    defer gpa.free(thinking);
+    try std.testing.expect(std.mem.find(u8, thinking, "Agent: work") == null);
 
     try rig.apply(&.{ .tool_call_started = "bash" });
     try rig.apply(&.{ .tool_call_arguments = "{\"command\":" });
     try rig.apply(&.{ .tool_call_arguments = "\"zig build\"}" });
     const streamed = try rig.paintPlain(80);
     defer gpa.free(streamed);
-    try testing.expectContains(streamed, "Tool: bash (streaming) · Received: 23 B");
+    try expectSummary(streamed, "Agent: work (bash) · Time: 0s · Tools: 0 · Received: 4 B");
 
     rig.time.awake_ms = 1_000;
     try rig.apply(&.{ .tool_started = .{
@@ -2260,8 +2259,8 @@ test "a tool call streams as a row, runs with its subject and timer, and ends as
     rig.time.awake_ms = 13_400;
     const running = try rig.paintPlain(80);
     defer gpa.free(running);
-    try testing.expectContains(running, "Tool: bash (running) · Time: 12s · Timeout: 2m 0s");
-    try testing.expectContains(running, "\r\n$ zig build");
+    try expectSummary(running, "Agent: work (bash) · Time: 13s · Tools: 0 · Received: 4 B");
+    try std.testing.expect(std.mem.find(u8, running, "$ zig build") == null);
 
     var output: core.Tool.Output = .{ .content = "ok\n" };
     output.measures.put(.duration_ms, 1500);
@@ -2271,8 +2270,8 @@ test "a tool call streams as a row, runs with its subject and timer, and ends as
         .call = .{ .id = "c1", .name = "bash", .arguments = "{\"command\":\"zig build\"}" },
         .output = output,
     } });
-    try rig.expectKinds(&.{ .user, .tool_result });
-    const block = rig.blocks()[1].content.tool_result;
+    try rig.expectKinds(&.{ .user, .thinking, .tool_result });
+    const block = rig.blocks()[2].content.tool_result;
     try std.testing.expectEqualStrings(
         "Tool: bash (complete) · Time: 1.5s · Exit code: 0 · Lines: 1\nzig build",
         block.text.items,
@@ -2280,7 +2279,8 @@ test "a tool call streams as a row, runs with its subject and timer, and ends as
     try std.testing.expect(block.status.role == .success);
     const done = try rig.paintPlain(80);
     defer gpa.free(done);
-    try std.testing.expect(std.mem.find(u8, done, "(streaming)") == null);
+    try std.testing.expect(std.mem.find(u8, done, "Agent: work") == null);
+    try testing.expectContains(done, "\r\n$ zig build");
 
     try rig.apply(&.committed);
     try rig.end(&.{ .stopped = .complete });
@@ -2321,7 +2321,7 @@ test "a failed tool result keeps its sentence below the call row" {
     try rig.end(&.{ .stopped = .complete });
 }
 
-test "pending and completed calls keep the draft and show the command in the gutter" {
+test "a pending or completed call keeps the draft across verbosity toggles" {
     const gpa = std.testing.allocator;
     var rig: Rig = undefined;
     rig.init();
@@ -2336,12 +2336,9 @@ test "pending and completed calls keep the draft and show the command in the gut
     try rig.apply(&.{ .tool_call_started = call.name });
     try rig.apply(&.{ .tool_started = call });
     for (0..2) |stage| {
-        const painted = try rig.paintPlain(40);
-        defer gpa.free(painted);
-        try testing.expectContains(painted, "\r\n$ git diff --check");
-        try testing.expectContains(painted, "\r\n  last-line");
         rig.screen.setVerbose(!rig.screen.verbose);
         rig.screen.setVerbose(!rig.screen.verbose);
+        gpa.free(try rig.paintPlain(40));
         const draft = try rig.screen.editor.expanded();
         defer gpa.free(draft);
         try std.testing.expectEqualStrings("draft", draft);
@@ -2601,60 +2598,6 @@ test "tool results keep file metadata neutral across terminal widths" {
         defer std.testing.allocator.free(ellipsis);
         try testing.expectContains(rig.out.written(), ellipsis);
     }
-}
-
-test "active calls color their complete identities" {
-    var rig: Rig = undefined;
-    rig.init();
-    defer rig.deinit();
-    try rig.start("prompt");
-    try rig.apply(&.{ .tool_call_started = "read" });
-    try rig.apply(&.{ .tool_call_arguments = "{}" });
-    try rig.apply(&.{ .tool_call_started = "write" });
-    const queued = try rig.paintPlain(80);
-    defer std.testing.allocator.free(queued);
-    try testing.expectContains(rig.out.written(), "\x1b[36m\x1b[2mTool: read (queued)\x1b[0m");
-    try testing.expectContains(rig.out.written(), "\x1b[36m\x1b[2mTool: write (streaming)\x1b[0m");
-    try std.testing.expect(std.mem.find(u8, rig.out.written(), "\x1b[36;7m") == null);
-    try rig.apply(&.{ .tool_started = .{ .id = "read", .name = "read", .arguments = "{}" } });
-    const running = try rig.paintPlain(80);
-    defer std.testing.allocator.free(running);
-    try testing.expectContains(rig.out.written(), "\x1b[36m\x1b[2mTool: read (running)\x1b[0m");
-    try std.testing.expect(std.mem.find(u8, rig.out.written(), "\x1b[36;7m") == null);
-}
-
-test "queued calls read as queued until each one runs" {
-    const gpa = std.testing.allocator;
-    var rig: Rig = undefined;
-    rig.init();
-    defer rig.deinit();
-    try rig.start("hi");
-    try rig.apply(&.{ .tool_call_started = "read" });
-    try rig.apply(&.{ .tool_call_arguments = "{}" });
-    try rig.apply(&.{ .tool_call_started = "write" });
-    const two = try rig.paintPlain(80);
-    defer gpa.free(two);
-    try testing.expectContains(two, "Tool: read (queued) · Received: 2 B");
-    try testing.expectContains(two, "Tool: write (streaming) · Received: 0 B");
-
-    try rig.apply(&.{ .tool_started = .{ .id = "c1", .name = "read", .arguments = "{}" } });
-    const one = try rig.paintPlain(80);
-    defer gpa.free(one);
-    try testing.expectContains(one, "Tool: read (running) · Time: 0s · Timeout: 10s");
-    try std.testing.expect(std.mem.find(u8, one, "Received: 2 B") == null);
-    try testing.expectContains(one, "Tool: write (queued) · Received: 0 B");
-    try rig.apply(&.{ .tool_result = .{
-        .call = .{ .id = "c1", .name = "read", .arguments = "{}" },
-        .output = .{ .content = "x" },
-    } });
-    try rig.apply(&.{ .tool_started = .{ .id = "w1", .name = "write", .arguments = "{}" } });
-    try rig.apply(&.{ .tool_result = .{
-        .call = .{ .id = "w1", .name = "write", .arguments = "{}" },
-        .output = .{ .content = "x" },
-    } });
-    try rig.expectKinds(&.{ .user, .tool_result, .tool_result });
-    try rig.apply(&.committed);
-    try rig.end(&.{ .stopped = .complete });
 }
 
 test "a reasoning discard keeps a retained call result that arrived after the reasoning" {
@@ -3093,6 +3036,15 @@ test "a turn segment grows without an update and an update returns it to its bas
 
     try rig.apply(&.text_started);
     try rig.apply(&.{ .text = "hello" });
+    try rig.paintInto(&emulator, size);
+    try std.testing.expectEqual(@as(usize, 6), activityCells(&emulator));
+
+    try rig.apply(&.{ .tool_call_started = "bash" });
+    for (0..37) |_| _ = rig.screen.advanceFrame(0);
+    try rig.paintInto(&emulator, size);
+    try std.testing.expectEqual(@as(usize, 8), activityCells(&emulator));
+
+    try rig.apply(&.{ .tool_call_arguments = "{" });
     try rig.paintInto(&emulator, size);
     try std.testing.expectEqual(@as(usize, 6), activityCells(&emulator));
 }

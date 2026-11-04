@@ -45,6 +45,13 @@ when the user drops it.
 - A retry wait shows no progress. The frame can empty over the delay that the `attempt_failed` event
   holds. Retries are rare, so the gain is small.
 - An MCP client cannot list, write, apply, or delete gists. Only the terminal uses gists.
+- The `Received` value of a work row counts only kept work. A streamed call adds no bytes until it
+  finishes, and a discard or a cancel can lower the value. A value that counts every received byte
+  and never decreases needs a count in the application. The application then also needs the run
+  boundary that the client uses. In verbose mode, the work row shows only while a tool call is
+  unfinished. Its `Received` and `Time` values also include the thinking before the call. The values
+  then look like measures of that call. A separate meaning in verbose mode changes the values at a
+  `/verbose` toggle during a run.
 - The instructions do not tell the agent to use Rex tabs. Inside Rex, the agent can open a visual
   preview or a test script in a separate Rex tab without a request. The rule fits a Rex-only
   instruction file from the idea above.

@@ -93,7 +93,7 @@ pub fn run(context: *const Context, input_json: []const u8) Context.Error!core.T
     }));
 }
 
-pub fn timeoutMs(source: *const struct {
+fn timeoutMs(source: *const struct {
     timeout_seconds: ?u64,
     timeout_ms_configured: u64,
 }) u64 {

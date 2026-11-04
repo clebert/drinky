@@ -9,6 +9,7 @@ const ui = @import("ui/root.zig");
 const id_page = std.math.maxInt(usize);
 const id_input = id_page - 1;
 const id_status = id_page - 2;
+const id_work = id_page - 3;
 const status_rows = 1;
 
 pub const Scene = union(enum) {
@@ -40,11 +41,15 @@ pub const Tail = union(enum) {
     };
 
     const Turn = struct {
-        tools: []const ui.paint.Box,
-        tracks: []Track,
+        work: ?Work,
         activity: ui.paint.Activity,
         editor: *const ui.Editor,
     };
+};
+
+pub const Work = struct {
+    box: ui.paint.Box,
+    track: *Track,
 };
 
 pub const Track = struct {
@@ -59,7 +64,7 @@ const EditorPresentation = struct {
 
     fn rows(self: *const EditorPresentation, size: terminal.View.Size) usize {
         const caption_rows = if (self.caption) |caption| caption.rows(size.columns) else 0;
-        return caption_rows + self.editor.rows(size);
+        return caption_rows + self.editor.rows(size, editorRows(size.rows));
     }
 
     fn render(
@@ -76,13 +81,13 @@ const EditorPresentation = struct {
         try self.editor.render(&editor_placement, &.{
             .viewport_rows = viewport_rows,
             .activity = self.activity,
-        });
+        }, editorRows(viewport_rows));
     }
 };
 
 const Component = union(enum) {
     block: *ui.Block,
-    tool_box: ui.paint.Box,
+    work: ui.paint.Box,
     editor: EditorPresentation,
     picker: Tail.Picking,
     status: *const ui.status.Info,
@@ -90,7 +95,7 @@ const Component = union(enum) {
     fn measure(self: *const Component, size: terminal.View.Size) usize {
         return switch (self.*) {
             .block => |block| block.rows(size.columns),
-            .tool_box => |box| ui.paint.boxRows(&box, size.columns),
+            .work => |box| ui.paint.boxRows(&box, size.columns),
             .editor => |presentation| presentation.rows(size),
             .status => status_rows,
             .picker => |picking| picking.picker.rows(size, pickerRows(size.rows)),
@@ -105,7 +110,7 @@ const Component = union(enum) {
     ) !void {
         switch (self.*) {
             .block => |block| try block.render(gpa, placement),
-            .tool_box => |box| try ui.paint.box(placement, .text, &box),
+            .work => |box| try ui.paint.box(placement, .text, &box),
             .status => |info| try ui.status.render(placement, info),
             .editor => |presentation| try presentation.render(placement, viewport_rows),
             .picker => |picking| try picking.picker.render(placement, &.{
@@ -118,12 +123,16 @@ const Component = union(enum) {
 
 const Slot = struct { component: Component, id: usize, leading_blank: bool };
 
-fn idTool(index: usize) usize {
-    return id_status - 1 - index;
-}
-
 pub fn pickerRows(viewport_rows: usize) usize {
     return @max(viewport_rows -| status_rows, 1);
+}
+
+pub fn editorRows(viewport_rows: usize) usize {
+    const gap_rows = 1;
+    const work_rows = 1;
+    const transcript_rows_shown = 1;
+    return viewport_rows -|
+        (status_rows + gap_rows + work_rows + gap_rows + transcript_rows_shown);
 }
 
 pub fn project(
@@ -228,30 +237,28 @@ fn projectConversation(
 
 fn slotRewritten(scene: *const Scene.Conversation, index: usize, epoch: u64) bool {
     if (index < scene.transcript.len) return scene.transcript[index].takeRewritten(epoch);
-    const offset = index - scene.transcript.len;
-    return switch (scene.tail) {
-        .turn => |turn| offset < turn.tracks.len and
-            turn.tracks[offset].changed and
-            turn.tracks[offset].epoch == epoch,
-        .prompt, .picking => false,
-    };
+    const work = workAt(&scene.tail, index - scene.transcript.len) orelse return false;
+    return work.track.changed and work.track.epoch == epoch;
 }
 
 fn stampSlot(scene: *const Scene.Conversation, index: usize, epoch: u64) void {
     if (index < scene.transcript.len) return scene.transcript[index].stampEpoch(epoch);
-    const offset = index - scene.transcript.len;
-    switch (scene.tail) {
-        .turn => |turn| if (offset < turn.tracks.len) {
-            turn.tracks[offset].epoch = epoch;
-        },
-        .prompt, .picking => {},
-    }
+    const work = workAt(&scene.tail, index - scene.transcript.len) orelse return;
+    work.track.epoch = epoch;
+}
+
+fn workAt(tail: *const Tail, offset: usize) ?Work {
+    if (offset > 0) return null;
+    return switch (tail.*) {
+        .turn => |turn| turn.work,
+        .prompt, .picking => null,
+    };
 }
 
 fn tailCount(tail: *const Tail) usize {
     return switch (tail.*) {
         .prompt, .picking => 1,
-        .turn => |turn| turn.tools.len + 1,
+        .turn => |turn| if (turn.work == null) 1 else 2,
     };
 }
 
@@ -283,9 +290,9 @@ fn tailSlot(tail: *const Tail, offset: usize) Slot {
             .leading_blank = true,
         },
         .turn => |turn| {
-            if (offset < turn.tools.len) return .{
-                .component = .{ .tool_box = turn.tools[offset] },
-                .id = idTool(offset),
+            if (workAt(tail, offset)) |work| return .{
+                .component = .{ .work = work.box },
+                .id = id_work,
                 .leading_blank = true,
             };
             return editorSlot(&.{
@@ -374,8 +381,7 @@ const Rig = struct {
 
     const TurnOptions = struct {
         window_pages: usize = application.Settings.window_pages_default,
-        tools: []const ui.paint.Box = &.{},
-        tracks: []Track = &.{},
+        work: ?Work = null,
     };
 
     fn init() Rig {
@@ -417,8 +423,7 @@ const Rig = struct {
             .window_pages = options.window_pages,
             .transcript = self.transcript.block_list.items,
             .tail = .{ .turn = .{
-                .tools = options.tools,
-                .tracks = options.tracks,
+                .work = options.work,
                 .activity = .{ .style = .sweep, .motion_tick = 0 },
                 .editor = &self.editor,
             } },
@@ -427,25 +432,25 @@ const Rig = struct {
     }
 };
 
-test "a turn tail stacks tool boxes above the active editor" {
+test "a turn tail shows its work row above the active editor" {
     const gpa = std.testing.allocator;
     var rig: Rig = .init();
     defer rig.deinit();
 
-    const tools = [_]ui.paint.Box{
-        .{ .text = "readbox", .segment_ends = &.{} },
-        .{ .text = "grepbox", .segment_ends = &.{} },
-    };
-    const scene = rig.turn(&.{ .tools = &tools });
+    try rig.add(&.{ .user = "useryy" });
+    var track: Track = .{};
+    const scene = rig.turn(&.{
+        .work = .{ .box = .{ .text = "workbox", .segment_ends = &.{} }, .track = &track },
+    });
     const painted = try projected(gpa, .{ .columns = 40, .rows = 24 }, &scene);
     defer gpa.free(painted);
 
-    const first = std.mem.find(u8, painted, "readbox").?;
-    const second = std.mem.find(u8, painted, "grepbox").?;
+    const user = std.mem.find(u8, painted, "useryy").?;
+    const work = std.mem.find(u8, painted, "workbox").?;
     const activity = std.mem.find(u8, painted, "━").?;
     const footer = std.mem.find(u8, painted, "footerqq").?;
-    try std.testing.expect(first < second);
-    try std.testing.expect(second < activity);
+    try std.testing.expect(user < work);
+    try std.testing.expect(work < activity);
     try std.testing.expect(activity < footer);
     try ui.testing.expectHides(painted, &.{"Working…"});
 }
@@ -686,57 +691,47 @@ test "a block rewrite above the window repaints the complete transcript" {
     try std.testing.expect(!resetSince(fresh_screen.out.written(), painted));
 }
 
-test "a tool rewrite above the window repaints the complete transcript" {
+test "a work row rewrite above the window repaints the complete transcript" {
     const gpa = std.testing.allocator;
     var rig: Rig = .init();
     defer rig.deinit();
 
-    var tools: [6]ui.paint.Box = undefined;
-    for (&tools, 0..) |*box, index| {
-        var buffer: [16]u8 = undefined;
-        const text = try std.mem.print(&buffer, "tool{d}", .{index});
-        box.* = .{ .text = try gpa.dupe(u8, text), .segment_ends = &.{} };
-    }
-    defer for (tools) |box| gpa.free(box.text);
-    var tracks: [tools.len]Track = @splat(.{});
+    var track: Track = .{};
+    const scene = rig.turn(&.{
+        .window_pages = application.Settings.window_pages_min,
+        .work = .{ .box = .{ .text = "workbox", .segment_ends = &.{} }, .track = &track },
+    });
+    for ([_]struct { rows: usize, above: bool }{
+        .{ .rows = 12, .above = false },
+        .{ .rows = 4, .above = true },
+    }) |case| {
+        var screen: ui.testing.Rig = undefined;
+        screen.init(gpa);
+        defer screen.deinit();
+        const size: terminal.View.Size = .{ .columns = 40, .rows = case.rows };
+        track = .{ .epoch = screen.view.resetEpoch() };
+        try project(gpa, &screen.view, size, &scene);
+        try std.testing.expectEqual(
+            case.above,
+            std.mem.find(u8, screen.out.written(), "workbox") == null,
+        );
 
-    var screen: ui.testing.Rig = undefined;
-    screen.init(gpa);
-    defer screen.deinit();
-    const size: terminal.View.Size = .{ .columns = 40, .rows = 12 };
-    const scene = rig.turn(
-        &.{
-            .window_pages = application.Settings.window_pages_min,
-            .tools = &tools,
-            .tracks = &tracks,
-        },
-    );
-    for (&tracks) |*track| track.epoch = screen.view.resetEpoch();
-    try project(gpa, &screen.view, size, &scene);
-    try ui.testing.expectHides(screen.out.written(), &.{"tool0"});
-    try ui.testing.expectShows(screen.out.written(), &.{"tool5"});
+        track.changed = true;
+        var painted = screen.out.written().len;
+        try project(gpa, &screen.view, size, &scene);
+        try std.testing.expectEqual(case.above, resetSince(screen.out.written(), painted));
+        track.changed = false;
+        for (0..3) |_| {
+            painted = screen.out.written().len;
+            try project(gpa, &screen.view, size, &scene);
+            try std.testing.expect(!resetSince(screen.out.written(), painted));
+        }
 
-    tracks[tools.len - 1].changed = true;
-    var painted = screen.out.written().len;
-    try project(gpa, &screen.view, size, &scene);
-    try std.testing.expect(!resetSince(screen.out.written(), painted));
-    tracks[tools.len - 1].changed = false;
-
-    tracks[0].changed = true;
-    painted = screen.out.written().len;
-    try project(gpa, &screen.view, size, &scene);
-    try std.testing.expect(resetSince(screen.out.written(), painted));
-    tracks[0].changed = false;
-    for (0..3) |_| {
+        track = .{ .changed = true };
         painted = screen.out.written().len;
         try project(gpa, &screen.view, size, &scene);
         try std.testing.expect(!resetSince(screen.out.written(), painted));
     }
-
-    tracks[1] = .{ .changed = true };
-    painted = screen.out.written().len;
-    try project(gpa, &screen.view, size, &scene);
-    try std.testing.expect(!resetSince(screen.out.written(), painted));
 }
 
 test "the retained window follows the configured page count" {
