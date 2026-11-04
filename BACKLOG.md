@@ -14,16 +14,18 @@ when the user drops it.
 ## Open items
 
 - A failed test shows no stack trace, because `build.zig` sets `strip = true` for each test module.
-  It also sets the strip for the generators of `zig build unicode` and `zig build commonmark`.
-  Without it, a generator hangs at its first allocation. Two defects of Zig 0.17.0 block the removal
-  of the strip. On macOS 27.0, the MachO unwinder panics with `switch on corrupt value` at
-  `std/debug/SelfInfo/MachO.zig:406`. The compact unwind data holds an arm64 mode that the unwinder
-  does not know. The test allocator records a stack at each allocation, so a test hits that panic.
-  The panic handler then waits on the lock of the unwinder, and the test hangs. Also,
-  `std.debug.captureCurrentStackTrace` does not block cancellation, so a stack capture in the test
-  allocator can consume a pending cancel. Without the strip, two cancel tests of `Session` fail in
-  about one of three runs. A Debug build of Drinky records stacks through the same allocator, so it
-  can hang or lose a cancel too. Trigger: a Zig release that fixes both defects.
+  It also sets the strip for the generators of `zig build unicode` and `zig build commonmark`. Zig
+  0.17.1 fixes the MachO unwinder panic on macOS 27.0. That panic hung a generator without the
+  strip, so the generators no longer need it. A defect of Zig 0.17.1 blocks the removal of the strip
+  for the test modules. `std.debug.captureCurrentStackTrace` does not block cancellation. The
+  capture locks the mutex of `std.debug.SelfInfo`, and that lock can consume a pending cancel. The
+  stack iterator catches `error.Canceled` and continues with the frame pointers. The test allocator
+  records a stack at each allocation. The test runner builds `std.testing.io` on that allocator, so
+  a separate allocator in a test does not prevent the defect. Without the strip, two cancel tests of
+  `Session` fail in about one of three runs. A Debug build of Drinky records stacks through the same
+  allocator, so it can lose a cancel too. The pull request
+  [ziglang/zig#36010](https://codeberg.org/ziglang/zig/pulls/36010) adds the missing cancel
+  protection. Trigger: a Zig release that fixes the defect.
 - An unauthorized failure of `/gist` does not reject the credential. The page only shows the
   failure, and the next turn rejects the credential. When a turn fails as unauthorized, the
   controller calls `rejectCredential`, which can sign out and report that no account remains. The
