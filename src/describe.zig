@@ -274,9 +274,13 @@ fn writeKeys(writer: *std.Io.Writer) !void {
         \\circular. While a picker shows its options, the wheel does not scroll the terminal
         \\scrollback.
         \\
-        \\This section names the keys of the prompt, a sign-in, a model fetch, and a turn. It
-        \\also names the mouse wheel of a picker. A full-window page states its own keys in its
-        \\header, and the editor carries the movement keys of a text field.
+        \\In a picker, Esc, Ctrl+C, and Ctrl+D go back one step. At the first step, they close
+        \\the picker. During a model fetch in a picker, each of these keys cancels only the fetch
+        \\and keeps the step.
+        \\
+        \\This section names the keys of the prompt, a sign-in, a model fetch, a turn, and a
+        \\picker. A full-window page states its own keys in its header, and the editor carries the
+        \\movement keys of a text field.
         \\
     , .{ reference.repeat_window_ms, reference.repeat_window_ms });
 }

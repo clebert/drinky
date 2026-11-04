@@ -812,17 +812,12 @@ fn finishFetch(self: *App, ended: *const application.Event.FetchEnd) !void {
     const fetch = flow.fetch orelse return self.reportFetch(ended);
     if (fetch.operation != ended.operation) return;
     flow.fetch = null;
-    const exit = fetch.exit orelse {
+    if (!fetch.canceled) {
         if (ended.outcome == .listed) return self.showStep(flow.step, .{});
         return self.closeFlow();
-    };
-    switch (exit) {
-        .command => try self.cancelFlow(),
-        .step => {
-            try self.showStep(flow.step, .{});
-            try self.reportNotice(.information, fetch_cancel_notice, .{});
-        },
     }
+    try self.showStep(flow.step, .{});
+    try self.reportNotice(.information, fetch_cancel_notice, .{});
 }
 fn reportFetch(self: *App, ended: *const application.Event.FetchEnd) !void {
     switch (ended.outcome) {
@@ -1293,10 +1288,10 @@ fn takeOffer(self: *App) !void {
 fn cancelWork(self: *App, operation: u64) !void {
     _ = try self.send(&.{ .cancel = operation });
 }
-fn exitFetch(self: *App, exit: Flow.Fetch.Exit) !void {
+fn cancelFetch(self: *App) !void {
     const fetch = &self.flow.?.fetch.?;
-    if (fetch.exit != null) return;
-    fetch.exit = exit;
+    if (fetch.canceled) return;
+    fetch.canceled = true;
     _ = try self.send(&.{ .cancel = fetch.operation });
 }
 fn closePage(self: *App) !void {
@@ -1353,8 +1348,8 @@ fn handleExit(self: *App, exit: Exit, notice_shown: bool) !void {
             .ctrl_c => self.clearOrQuit(),
             .ctrl_d => try self.quitOrWarn(),
         },
-        .picker => if (exit == .escape) try self.backFlow() else try self.cancelFlow(),
-        .picker_fetch => try self.exitFetch(if (exit == .escape) .step else .command),
+        .picker => try self.backFlow(),
+        .picker_fetch => try self.cancelFetch(),
         .fetch => |fetch| if ((try self.send(&.{ .cancel = fetch.operation })).accepted()) {
             try self.reportNotice(.information, fetch_cancel_notice, .{});
         },
@@ -3246,42 +3241,41 @@ test "Ctrl+C clears the draft, and a second Ctrl+C at once quits" {
 
 const model_picker = "Model: openai-api-key · ↑/↓";
 
-test "Esc ends a model fetch at its step, and Ctrl+C ends the whole command" {
-    var step_stall: providers.testing.FakeTransport.Stall = .{ .io = std.testing.io };
-    var command_stall: providers.testing.FakeTransport.Stall = .{ .io = std.testing.io };
+test "each exit ends a model fetch at its step, and an exit at the first step closes the picker" {
+    var stalls: [3]providers.testing.FakeTransport.Stall = @splat(.{ .io = std.testing.io });
     var rig: Rig = undefined;
     try rig.init(&.{
         .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
-        .replies = &.{ .{ .stall = &step_stall }, .{ .stall = &command_stall } },
+        .replies = &.{
+            .{ .stall = &stalls[0] },
+            .{ .stall = &stalls[1] },
+            .{ .stall = &stalls[2] },
+        },
     });
     defer rig.deinit();
 
     try rig.keys("/model\r");
     try rig.waitFor(&.{.{ .text = model_picker }});
-    try rig.keys("\r");
-    try step_stall.reached.wait(std.testing.io);
-    try rig.waitFor(&.{
-        .{ .absent = model_picker },
-        .{ .text = Flow.fetch_wait_text },
-    });
-    try rig.keys("\x1b");
-    try rig.waitFor(&.{
-        .{ .text = model_picker },
-        .{ .absent = Flow.fetch_wait_text },
-        .{ .status = "You canceled the model fetch." },
-    });
-    try std.testing.expect(step_stall.canceled);
-
-    try rig.keys("\r");
-    try command_stall.reached.wait(std.testing.io);
-    try rig.waitFor(&.{.{ .text = Flow.fetch_wait_text }});
-    try rig.keys("\x03");
+    for ([_][]const u8{ "\x1b", "\x03", "\x04" }, &stalls) |exit, *stall| {
+        try rig.keys("\r");
+        try stall.reached.wait(std.testing.io);
+        try rig.waitFor(&.{
+            .{ .absent = model_picker },
+            .{ .text = Flow.fetch_wait_text },
+        });
+        try rig.keys(exit);
+        try rig.waitFor(&.{
+            .{ .text = model_picker },
+            .{ .absent = Flow.fetch_wait_text },
+            .{ .status = "You canceled the model fetch." },
+        });
+        try std.testing.expect(stall.canceled);
+    }
+    try rig.keys("\x04");
     try rig.waitFor(&.{
         .{ .absent = "Model: openai-api-key · " },
-        .{ .absent = Flow.fetch_wait_text },
         .{ .status = "You canceled the model selection." },
     });
-    try std.testing.expect(command_stall.canceled);
 }
 
 test "help keeps its command position across nested steps and fetch cancellations" {
@@ -3315,11 +3309,12 @@ test "help keeps its command position across nested steps and fetch cancellation
     try rig.waitFor(&.{ .{ .text = help_caption }, .{ .text = " > /model" } });
     try rig.keys("\r");
     try rig.waitFor(&.{.{ .text = "Model: openai-api-key · ↑/↓" }});
-    try rig.keys("\x03");
-    try rig.waitFor(&.{
-        .{ .absent = "Model: openai-api-key · " },
-        .{ .status = "You canceled the model selection." },
-    });
+    for ([_][]const u8{ "\x03", "\x04" }) |exit| {
+        try rig.keys(exit);
+        try rig.waitFor(&.{ .{ .text = help_caption }, .{ .text = " > /model" } });
+        try rig.keys("\r");
+        try rig.waitFor(&.{.{ .text = "Model: openai-api-key · ↑/↓" }});
+    }
 }
 
 test "a completed model fetch reopens its step with the fetched models" {

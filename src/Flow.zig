@@ -92,12 +92,7 @@ const Target = union(enum) {
     }
 };
 
-pub const Fetch = struct {
-    operation: u64,
-    exit: ?Exit = null,
-
-    pub const Exit = enum { step, command };
-};
+pub const Fetch = struct { operation: u64, canceled: bool = false };
 
 const Entry = struct { step: Step, cursor: usize };
 
