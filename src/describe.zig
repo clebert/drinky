@@ -107,8 +107,11 @@ fn writeCommands(writer: *std.Io.Writer) !void {
         \\Agent text, a session event, or a user note ends a run. A new model step does not end it.
         \\The open work row shows the activity in parentheses and the time of the run.
         \\Each work row shows the count of finished tool calls and the received bytes.
+        \\The open work row adds the count of unfinished calls, as in `Tools: 1 (2 active)`.
         \\The open work row updates these values while the run continues.
-        \\The received bytes count the thinking text and the arguments of finished tool calls.
+        \\The received bytes count the thinking text and the arguments of each tool call.
+        \\A retry, a cancel, or a failure can drop an unfinished call.
+        \\The count then loses the bytes of that call.
         \\The activity is `thinking` while thinking is active.
         \\Otherwise, it lists each unfinished tool name once, without a call count.
         \\The list includes calls that stream, wait in the queue, or run.

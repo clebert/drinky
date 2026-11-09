@@ -44,7 +44,11 @@ pub const Work = struct {
         pub fn write(
             self: *const Summary,
             writer: *std.Io.Writer,
-            options: *const struct { activity: []const u8, ends: *[segment_count]usize },
+            options: *const struct {
+                activity: []const u8,
+                tools_active: usize,
+                ends: *[segment_count]usize,
+            },
         ) std.Io.Writer.Error!void {
             const value = if (self.status) |status|
                 @tagName(status)
@@ -55,7 +59,11 @@ pub const Work = struct {
             const time = format.durationSeconds(&time_buffer, self.elapsed_ms);
             try writer.print("{s}Time: {s}", .{ paint.separator, time });
             options.ends[1] = writer.buffered().len;
-            if (self.tools) |tools| try writer.print("{s}Tools: {d}", .{ paint.separator, tools });
+            if (self.tools) |tools| {
+                try writer.print("{s}Tools: {d}", .{ paint.separator, tools });
+                if (options.tools_active > 0)
+                    try writer.print(" ({d} active)", .{options.tools_active});
+            }
             options.ends[2] = writer.buffered().len;
             var bytes_buffer: [16]u8 = undefined;
             const bytes = format.bytes(&bytes_buffer, self.received_bytes);
@@ -68,6 +76,7 @@ pub const Work = struct {
             var writer: std.Io.Writer = .fixed(&result.buffer);
             self.write(&writer, &.{
                 .activity = if (options.thinking) "thinking" else "",
+                .tools_active = 0,
                 .ends = &result.ends,
             }) catch unreachable;
             result.length = writer.buffered().len;
