@@ -10,7 +10,6 @@ const role = @import("role.zig");
 const testing = @import("testing.zig");
 
 const segment_length: usize = 6;
-pub const segment_step_ticks: u64 = 2;
 const segment_growth_delay_ticks: u64 = 31;
 const segment_growth_interval_ticks: u64 = 6;
 const caret_blink_ticks: u64 = 37;
@@ -431,13 +430,6 @@ fn segmentCut(
     return .{ .kept = text[0..end], .shortened = false };
 }
 
-pub fn activityChanged(activity: *const Activity, columns: usize) bool {
-    if (activity.caret_tick) |caret_tick| if (caretBlinkChanged(caret_tick)) return true;
-    if (columns == 0) return false;
-    return activity.motion_tick % segment_step_ticks == 0 or
-        trackGrew(activity.progress_age_ticks, columns);
-}
-
 pub const ellipsis = "…";
 
 pub fn cut(text: []const u8, columns_max: usize) Cut {
@@ -839,9 +831,8 @@ fn trackCovers(activity: *const Activity, track: *const struct {
 }) bool {
     std.debug.assert(track.columns > 0);
     const track_columns = 2 * track.columns;
-    const step = @divFloor(activity.motion_tick, segment_step_ticks);
     const offset = trackLengthBase(track.columns) - 1;
-    const head: usize = @intCast((step +% offset) % track_columns);
+    const head: usize = @intCast((activity.motion_tick +% offset) % track_columns);
     const distance = if (head >= track.position)
         head - track.position
     else
@@ -866,18 +857,8 @@ fn trackLength(maybe_progress_age_ticks: ?u64, columns: usize) usize {
     return length_base + @as(usize, @intCast(@min(growth_steps, growth_max)));
 }
 
-fn trackGrew(maybe_progress_age_ticks: ?u64, columns: usize) bool {
-    const progress_age_ticks = maybe_progress_age_ticks orelse return false;
-    return progress_age_ticks > 0 and
-        trackLength(progress_age_ticks, columns) != trackLength(progress_age_ticks - 1, columns);
-}
-
 fn caretVisible(caret_tick: u64) bool {
     return caret_tick % (2 * caret_blink_ticks) < caret_blink_ticks;
-}
-
-fn caretBlinkChanged(caret_tick: u64) bool {
-    return caret_tick % caret_blink_ticks == 0;
 }
 
 test "the command gutter narrows with the row and keeps one column for text" {
@@ -1035,7 +1016,7 @@ test "a frame edge label resets faint before a segment that follows it" {
         .body = core.text.repeat("a\n", 3) ++ "x",
         .body_rows = 1,
         .hidden_above = 3,
-        .activity = .{ .style = .orbit, .motion_tick = 14 * segment_step_ticks },
+        .activity = .{ .style = .orbit, .motion_tick = 14 },
     });
     defer gpa.free(painted);
 
@@ -1044,29 +1025,24 @@ test "a frame edge label resets faint before a segment that follows it" {
     try testing.expectShows(painted, &.{segment});
 }
 
-test "each style moves a segment one column per step along its path over both frame edges" {
+test "each style moves a segment one column per tick along its path over both frame edges" {
     const cases = [_]struct {
         style: application.Settings.Animation,
-        step: u64,
+        tick: u64,
         columns: usize,
         edges: [2][]const u8,
     }{
-        .{ .style = .orbit, .step = 0, .columns = 10, .edges = .{ "######----", "----------" } },
-        .{ .style = .orbit, .step = 7, .columns = 10, .edges = .{ "-------###", "-------###" } },
-        .{ .style = .orbit, .step = 17, .columns = 10, .edges = .{ "###-------", "###-------" } },
-        .{ .style = .sweep, .step = 7, .columns = 10, .edges = .{ "-------###", "###-------" } },
-        .{ .style = .sweep, .step = 17, .columns = 10, .edges = .{ "###-------", "-------###" } },
-        .{ .style = .orbit, .step = 0, .columns = 1, .edges = .{ "#", "-" } },
-        .{ .style = .orbit, .step = 1, .columns = 1, .edges = .{ "-", "#" } },
+        .{ .style = .orbit, .tick = 0, .columns = 10, .edges = .{ "######----", "----------" } },
+        .{ .style = .orbit, .tick = 7, .columns = 10, .edges = .{ "-------###", "-------###" } },
+        .{ .style = .orbit, .tick = 17, .columns = 10, .edges = .{ "###-------", "###-------" } },
+        .{ .style = .sweep, .tick = 7, .columns = 10, .edges = .{ "-------###", "###-------" } },
+        .{ .style = .sweep, .tick = 17, .columns = 10, .edges = .{ "###-------", "-------###" } },
+        .{ .style = .orbit, .tick = 0, .columns = 1, .edges = .{ "#", "-" } },
+        .{ .style = .orbit, .tick = 1, .columns = 1, .edges = .{ "-", "#" } },
     };
     for (cases) |case| {
-        for (0..segment_step_ticks) |offset| {
-            const activity: Activity = .{
-                .style = case.style,
-                .motion_tick = case.step * segment_step_ticks + offset,
-            };
-            try expectCovered(&activity, case.columns, &case.edges);
-        }
+        const activity: Activity = .{ .style = case.style, .motion_tick = case.tick };
+        try expectCovered(&activity, case.columns, &case.edges);
     }
 }
 
@@ -1088,44 +1064,44 @@ fn expectCovered(activity: *const Activity, columns: usize, edges: *const [2][]c
 test "a quiet segment grows at its back up to one frame edge" {
     const cases = [_]struct {
         style: application.Settings.Animation,
-        step: u64,
+        tick: u64,
         age_ticks: ?u64,
         columns: usize,
         edges: [2][]const u8,
     }{
-        .{ .style = .orbit, .step = 0, .age_ticks = null, .columns = 10, .edges = .{
+        .{ .style = .orbit, .tick = 0, .age_ticks = null, .columns = 10, .edges = .{
             "######----",
             "----------",
         } },
-        .{ .style = .orbit, .step = 0, .age_ticks = 30, .columns = 10, .edges = .{
+        .{ .style = .orbit, .tick = 0, .age_ticks = 30, .columns = 10, .edges = .{
             "######----",
             "----------",
         } },
-        .{ .style = .orbit, .step = 0, .age_ticks = 31, .columns = 10, .edges = .{
+        .{ .style = .orbit, .tick = 0, .age_ticks = 31, .columns = 10, .edges = .{
             "######----",
             "#---------",
         } },
-        .{ .style = .orbit, .step = 0, .age_ticks = 36, .columns = 10, .edges = .{
+        .{ .style = .orbit, .tick = 0, .age_ticks = 36, .columns = 10, .edges = .{
             "######----",
             "#---------",
         } },
-        .{ .style = .orbit, .step = 0, .age_ticks = 37, .columns = 10, .edges = .{
+        .{ .style = .orbit, .tick = 0, .age_ticks = 37, .columns = 10, .edges = .{
             "######----",
             "##--------",
         } },
-        .{ .style = .orbit, .step = 7, .age_ticks = 37, .columns = 10, .edges = .{
+        .{ .style = .orbit, .tick = 7, .age_ticks = 37, .columns = 10, .edges = .{
             "-----#####",
             "-------###",
         } },
-        .{ .style = .orbit, .step = 0, .age_ticks = 1000, .columns = 10, .edges = .{
+        .{ .style = .orbit, .tick = 0, .age_ticks = 1000, .columns = 10, .edges = .{
             "######----",
             "####------",
         } },
-        .{ .style = .sweep, .step = 0, .age_ticks = 37, .columns = 10, .edges = .{
+        .{ .style = .sweep, .tick = 0, .age_ticks = 37, .columns = 10, .edges = .{
             "######----",
             "--------##",
         } },
-        .{ .style = .orbit, .step = 0, .age_ticks = 1000, .columns = 4, .edges = .{
+        .{ .style = .orbit, .tick = 0, .age_ticks = 1000, .columns = 4, .edges = .{
             "####",
             "----",
         } },
@@ -1133,52 +1109,10 @@ test "a quiet segment grows at its back up to one frame edge" {
     for (cases) |case| {
         try expectCovered(&.{
             .style = case.style,
-            .motion_tick = case.step * segment_step_ticks,
+            .motion_tick = case.tick,
             .progress_age_ticks = case.age_ticks,
         }, case.columns, &case.edges);
     }
-}
-
-test "each style repaints at each segment step" {
-    const step = segment_step_ticks;
-    try std.testing.expect(activityChanged(&.{ .style = .orbit, .motion_tick = step }, 5));
-    try std.testing.expect(activityChanged(&.{ .style = .sweep, .motion_tick = step }, 1));
-    try std.testing.expect(!activityChanged(&.{ .style = .orbit, .motion_tick = step }, 0));
-    try std.testing.expect(!activityChanged(&.{ .style = .orbit, .motion_tick = step + 1 }, 5));
-}
-
-test "a segment repaints between steps only when it grows" {
-    const cases = [_]struct {
-        style: application.Settings.Animation,
-        age_ticks: u64,
-        changed: bool,
-    }{
-        .{ .style = .orbit, .age_ticks = 31, .changed = true },
-        .{ .style = .orbit, .age_ticks = 32, .changed = false },
-        .{ .style = .sweep, .age_ticks = 37, .changed = true },
-        .{ .style = .orbit, .age_ticks = 289, .changed = true },
-        .{ .style = .orbit, .age_ticks = 295, .changed = false },
-    };
-    for (cases) |case| {
-        const activity: Activity = .{
-            .style = case.style,
-            .motion_tick = segment_step_ticks + 1,
-            .progress_age_ticks = case.age_ticks,
-        };
-        try std.testing.expectEqual(case.changed, activityChanged(&activity, 50));
-    }
-}
-
-test "each flip of the caret blink repaints" {
-    try std.testing.expect(activityChanged(
-        &.{ .style = .sweep, .motion_tick = 1, .caret_tick = caret_blink_ticks },
-        0,
-    ));
-    try std.testing.expect(!activityChanged(
-        &.{ .style = .sweep, .motion_tick = 1, .caret_tick = caret_blink_ticks + 1 },
-        0,
-    ));
-    try std.testing.expect(!activityChanged(&.{ .style = .sweep, .motion_tick = 0 }, 0));
 }
 
 test "an animated input places its caret on the first of two equal halves alone" {

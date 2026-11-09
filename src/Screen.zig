@@ -846,13 +846,11 @@ pub fn advanceFrame(self: *Screen, now_ms: i64) bool {
         .turn => |*turn| {
             turn.activity_tick +%= 1;
             turn.caret_tick +%= 1;
-            const activity = self.turnActivity(turn);
-            activity_changed = ui.paint.activityChanged(&activity, self.columns);
+            activity_changed = true;
         },
         .picking => |*picker| {
             picker.advanceFrame();
-            if (picker.activity(self.animation)) |activity|
-                activity_changed = ui.paint.activityChanged(&activity, self.columns);
+            activity_changed = picker.activity(self.animation) != null;
         },
         .page => |*page| if (self.pageWaiting(page)) {
             const wait = &self.page_wait.?;

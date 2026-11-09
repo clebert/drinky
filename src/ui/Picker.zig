@@ -604,7 +604,7 @@ test "a list that waits drops its rows, states the wait, and moves its frame edg
     try testing.expectHides(painted, &.{"(Current)"});
     try std.testing.expectEqual(@as(usize, 4), testing.paintedRows(painted));
 
-    for (0..paint.segment_step_ticks) |_| picker.advanceFrame();
+    picker.advanceFrame();
     const moved = try renderForTest(gpa, &picker, size);
     defer gpa.free(moved);
     try std.testing.expect(!std.mem.eql(u8, painted, moved));
