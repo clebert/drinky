@@ -29,6 +29,7 @@ const Options = struct {
     skills: []const discovery.skills.Skill,
     required_skills: []const tools.SkillGuard.Rule,
     surface: discovery.skills.Skill.Surface,
+    sandbox: ?*const tools.Sandbox,
 };
 
 const InstructionsOptions = struct {
@@ -53,6 +54,7 @@ fn write(
     try writer.writeAll("\n\n## Frontend\n\n");
     try writer.writeAll(options.frontend_instructions);
     try writeEnvironment(gpa, writer, options);
+    try writeSandbox(gpa, writer, options.sandbox);
     const project_files = options.project_instructions.files();
     try writePrecedence(writer, options);
     if (options.user_instructions.len > 0) try writeInstructions(gpa, writer, &.{
@@ -164,6 +166,32 @@ fn writeEnvironment(
     try writer.writeAll("</environment>");
 }
 
+fn writeSandbox(
+    gpa: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    maybe_sandbox: ?*const tools.Sandbox,
+) !void {
+    try writer.writeAll("\n\n## Sandbox\n\n");
+    const sandbox = maybe_sandbox orelse
+        return writer.writeAll("Drinky runs the tools without a sandbox on this system.");
+    try writer.writeAll(
+        "Commands and the file tools can write only in the directories below.\n" ++
+            "A command fails with \"Operation not permitted\" when it writes elsewhere.\n" ++
+            "The write tool and the edit tool refuse a path elsewhere.\n" ++
+            "Programs with the setuid bit, such as ps and sudo, do not start.\n" ++
+            "A program that starts its own sandbox fails, so run swift build with " ++
+            "--disable-sandbox.\n" ++
+            "Ask the user to run a command that needs more access.\n\n" ++
+            "<writable_directories>\n",
+    );
+    for (sandbox.directories) |directory| {
+        try writer.writeAll("  <directory>");
+        try writePath(gpa, writer, directory);
+        try writer.writeAll("</directory>\n");
+    }
+    try writer.writeAll("</writable_directories>");
+}
+
 fn anyAdvertised(options: *const Options) bool {
     for (options.skills) |*skill| {
         if (skill.advertised(options.surface)) return true;
@@ -256,6 +284,8 @@ test "UTC date formatting handles bounds and a leap day" {
 const test_core = default_core ++ "\n\n## Frontend\n\n" ++
     testing.frontend_default.instructions;
 
+const no_sandbox = "\n\n## Sandbox\n\nDrinky runs the tools without a sandbox on this system.";
+
 const no_instructions: discovery.instructions.Result = .init(std.testing.allocator, .project);
 
 fn emptyOptions() Options {
@@ -268,6 +298,7 @@ fn emptyOptions() Options {
         .skills = &.{},
         .required_skills = &.{},
         .surface = .session,
+        .sandbox = null,
     };
 }
 
@@ -301,7 +332,7 @@ test "a wall clock outside the supported years empties the date but composes" {
         test_core ++ "\n\n## Environment\n\n<environment>\n" ++
             "  <current_date />\n" ++
             "  <working_directory>/work</working_directory>\n" ++
-            "  <repository_root />\n</environment>",
+            "  <repository_root />\n</environment>" ++ no_sandbox,
         prompt,
     );
 }
@@ -442,7 +473,7 @@ test "configured user instructions have their own section" {
             "  <current_date>2026-08-02</current_date>\n" ++
             "  <working_directory>/work</working_directory>\n" ++
             "  <repository_root />\n" ++
-            "</environment>\n\n" ++
+            "</environment>" ++ no_sandbox ++ "\n\n" ++
             "## Instruction precedence\n\n" ++
             "Drinky gives you instructions from the sources below. Where two conflict, obey " ++
             "this order:\n\n" ++
@@ -511,6 +542,34 @@ test "the required skills section names every rule and stays out without one" {
     try std.testing.expect(std.mem.find(u8, plain, "## Required skills") == null);
 }
 
+test "the sandbox section lists each writable directory after the environment" {
+    const gpa = std.testing.allocator;
+    const sandbox: tools.Sandbox = .{
+        .directories = &.{ "/work", "/tmp/a&b" },
+        .files = &.{"/home/.drinky/auth.json"},
+    };
+    var options = emptyOptions();
+    options.sandbox = &sandbox;
+    const prompt = try compose(gpa, &options);
+    defer gpa.free(prompt);
+    try std.testing.expect(std.mem.endsWith(
+        u8,
+        prompt,
+        "</environment>\n\n## Sandbox\n\n" ++
+            "Commands and the file tools can write only in the directories below.\n" ++
+            "A command fails with \"Operation not permitted\" when it writes elsewhere.\n" ++
+            "The write tool and the edit tool refuse a path elsewhere.\n" ++
+            "Programs with the setuid bit, such as ps and sudo, do not start.\n" ++
+            "A program that starts its own sandbox fails, so run swift build with " ++
+            "--disable-sandbox.\n" ++
+            "Ask the user to run a command that needs more access.\n\n" ++
+            "<writable_directories>\n" ++
+            "  <directory>/work</directory>\n" ++
+            "  <directory>/tmp/a&amp;b</directory>\n" ++
+            "</writable_directories>",
+    ));
+}
+
 test "generated paths cannot add prompt lines or controls" {
     const gpa = std.testing.allocator;
     var options = emptyOptions();
@@ -552,7 +611,7 @@ test "a session lists a skill that its metadata hides from a run, and a run leav
         test_core ++ "\n\n## Environment\n\n<environment>\n" ++
             "  <current_date>1970-01-01</current_date>\n" ++
             "  <working_directory>/work</working_directory>\n" ++
-            "  <repository_root />\n</environment>",
+            "  <repository_root />\n</environment>" ++ no_sandbox,
         run_prompt,
     );
 }
@@ -577,7 +636,7 @@ test "empty project and skill sections are omitted independently" {
         test_core ++ "\n\n## Environment\n\n<environment>\n" ++
             "  <current_date>1970-01-01</current_date>\n" ++
             "  <working_directory>/work&amp;space</working_directory>\n" ++
-            "  <repository_root />\n</environment>",
+            "  <repository_root />\n</environment>" ++ no_sandbox,
         empty_prompt,
     );
 

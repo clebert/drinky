@@ -6,6 +6,7 @@ pub const format = @import("format.zig");
 pub const fs = @import("fs.zig");
 pub const read = @import("read.zig");
 pub const Registry = @import("Registry.zig");
+pub const Sandbox = @import("Sandbox.zig");
 pub const skill_file = @import("skill_file.zig");
 pub const SkillGuard = @import("SkillGuard.zig");
 pub const testing = @import("testing.zig");

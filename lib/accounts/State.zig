@@ -68,7 +68,7 @@ pub fn deinit(self: *State) void {
 }
 
 pub fn open(gpa: std.mem.Allocator, io: std.Io, options: *const OpenOptions) !State {
-    const path = try json_store.locate(gpa, &options.directories, "state.json");
+    const path = try json_store.locate(gpa, &options.directories, .state);
     errdefer gpa.free(path);
     const project = try gpa.dupe(u8, options.project);
     errdefer gpa.free(project);
@@ -453,7 +453,7 @@ test "temporary store contention leaves project-state saving enabled" {
     var state = try openForTest(gpa, clock.io(), home);
     defer state.deinit();
     try state.seed(testing.anthropic_api_key, "claude-opus-5", .low);
-    const lock_path = try gpa.print("{s}.lock", .{state.path});
+    const lock_path = try json_store.lockPath(gpa, state.path);
     defer gpa.free(lock_path);
     {
         var held = try std.Io.Dir.cwd().createFile(io, lock_path, .{

@@ -81,8 +81,11 @@ pub fn run(context: *const Context, input_json: []const u8) Context.Error!core.T
         };
     defer gpa.free(updated);
 
-    fs.writeFile(gpa, io, deadline, &.{ .path = path, .data = updated }) catch |err|
-        return fs.writeFailure(gpa, err, path);
+    fs.writeFile(gpa, io, deadline, &.{
+        .path = path,
+        .data = updated,
+        .sandbox = context.host.sandbox,
+    }) catch |err| return fs.writeFailure(gpa, err, path);
     var result = try output.sentence(gpa, "Drinky edited {s}.", .{path});
     result.measures.put(.lines_removed, format.lines(old));
     result.measures.put(.lines_added, format.lines(new));

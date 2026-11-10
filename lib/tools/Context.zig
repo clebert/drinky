@@ -2,6 +2,8 @@ const std = @import("std");
 
 const core = @import("core");
 
+const Sandbox = @import("Sandbox.zig");
+
 gpa: std.mem.Allocator,
 host: Host,
 sink: core.Runner.Sink,
@@ -16,6 +18,7 @@ pub const Host = struct {
     bash: Bash = .{},
     search: Search = .{},
     document: []const u8 = "",
+    sandbox: ?*const Sandbox = null,
 };
 
 pub const Bash = struct {

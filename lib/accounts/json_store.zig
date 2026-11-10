@@ -50,15 +50,28 @@ pub const Directories = struct {
     home: []const u8,
 };
 
+pub const Name = enum { auth, config, metadata, models, state };
+
 pub fn locate(
     gpa: std.mem.Allocator,
     directories: *const Directories,
-    name: []const u8,
+    name: Name,
 ) error{OutOfMemory}![]u8 {
+    const file_name = switch (name) {
+        .auth => "auth.json",
+        .config => "config.json",
+        .metadata => "metadata.json",
+        .models => "models.json",
+        .state => "state.json",
+    };
     return std.Io.Dir.path.resolve(
         gpa,
-        &.{ directories.working_directory, directories.home, ".drinky", name },
+        &.{ directories.working_directory, directories.home, ".drinky", file_name },
     );
+}
+
+pub fn lockPath(gpa: std.mem.Allocator, path: []const u8) error{OutOfMemory}![]u8 {
+    return gpa.print("{s}.lock", .{path});
 }
 
 pub fn openReadable(gpa: std.mem.Allocator, io: std.Io, path: []const u8) error{OutOfMemory}!?File {
@@ -168,7 +181,7 @@ fn ensureParent(io: std.Io, path: []const u8) !void {
 }
 
 fn lockFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !std.Io.File {
-    const lock_path = try gpa.print("{s}.lock", .{path});
+    const lock_path = try lockPath(gpa, path);
     defer gpa.free(lock_path);
     for (0..lock_attempts_max) |attempt| {
         const file = std.Io.Dir.cwd().createFile(io, lock_path, .{
@@ -289,7 +302,7 @@ test "a store file lies in .drinky below the home, which resolves against the wo
         .{ .home = "", .expected = "/work/.drinky/auth.json" },
     }) |case| {
         const directories: Directories = .{ .working_directory = "/work", .home = case.home };
-        const located = try locate(gpa, &directories, "auth.json");
+        const located = try locate(gpa, &directories, .auth);
         defer gpa.free(located);
         try std.testing.expectEqualStrings(case.expected, located);
     }

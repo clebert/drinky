@@ -8,6 +8,7 @@ const CostPipe = @import("CostPipe.zig");
 const format = @import("format.zig");
 const output = @import("output.zig");
 const parse = @import("parse.zig");
+const Sandbox = @import("Sandbox.zig");
 const testing = @import("testing.zig");
 
 const capture_bytes_max = 8 << 20;
@@ -212,7 +213,11 @@ fn spawnCommand(
     var arena: std.heap.ArenaAllocator = .init(context.gpa);
     defer arena.deinit();
     const command_z = try arena.allocator().dupeSentinel(u8, command, 0);
-    const argv = [_:null]?[*:0]const u8{ "bash", "-c", command_z.ptr };
+    const unsandboxed = [_:null]?[*:0]const u8{ "bash", "-c", command_z.ptr };
+    var argv: [*:null]const ?[*:0]const u8 = &unsandboxed;
+    if (context.host.sandbox) |sandbox| {
+        if (!Sandbox.inherited()) argv = (try sandbox.argv(arena.allocator(), command_z)).ptr;
+    }
     const environ = try commandEnviron(arena.allocator(), context, files.cost.handle);
     const path = context.host.environ.getPosix("PATH") orelse std.Io.Threaded.default_PATH;
 
@@ -229,7 +234,7 @@ fn spawnCommand(
         .out_handle = files.output.handle,
         .error_handle = error_files[1].handle,
         .cost_handle = files.cost.handle,
-        .argv = &argv,
+        .argv = argv,
         .environ = environ.ptr,
         .path = path,
     };
@@ -333,6 +338,9 @@ fn createCommandSession() !void {
 
 fn execCommand(setup: *const ChildSetup) std.process.SpawnError {
     const name = std.mem.span(setup.argv[0].?);
+    if (std.mem.findScalar(u8, name, '/') != null) return commandExecError(std.posix.errno(
+        std.posix.system.execve(setup.argv[0].?, setup.argv, setup.environ),
+    ));
     var path_buffer: [std.posix.PATH_MAX]u8 = undefined;
     var search = std.mem.tokenizeScalar(u8, setup.path, ':');
     var access_denied = false;
@@ -809,11 +817,87 @@ test "bash starts a command in a separate session" {
         .host = .{ .io = std.testing.io },
     };
     const result = try run(&context,
-        \\{"command":"case $(ps -o stat= -p $$) in *s*) exit 0;; *) exit 1;; esac"}
+        \\{"command":"/bin/sh -c 'kill -STOP $$' >/dev/null 2>&1 & echo $$ $!"}
     );
     defer result.deinit(gpa);
-    try std.testing.expectEqualStrings("(No output)", result.content);
     try std.testing.expect(!result.hasFailure());
+    var fields = std.mem.tokenizeAny(u8, result.content, " \n");
+    const shell = try std.fmt.parseInt(std.posix.pid_t, fields.next().?, 10);
+    const background = try std.fmt.parseInt(std.posix.pid_t, fields.next().?, 10);
+    defer std.posix.kill(background, .KILL) catch {};
+    try std.testing.expectEqual(shell, sessionOf(background));
+}
+
+fn sessionOf(process_id: std.posix.pid_t) std.posix.pid_t {
+    return switch (builtin.os.tag) {
+        .linux => @intCast(@as(isize, @bitCast(std.os.linux.getsid(process_id)))),
+        else => libc.getsid(process_id),
+    };
+}
+
+const libc = struct {
+    extern "c" fn getsid(process_id: std.c.pid_t) std.c.pid_t;
+};
+
+test "a command inside an inherited sandbox starts no second sandbox" {
+    if (!Sandbox.inherited()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const sandbox: Sandbox = .{ .directories = &.{"/nonexistent/drinky"}, .files = &.{} };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = std.testing.io, .sandbox = &sandbox },
+    };
+    const result = try run(&context,
+        \\{"command":"echo started"}
+    );
+    defer result.deinit(gpa);
+    try std.testing.expectEqualStrings("started\n", result.content);
+}
+
+test "a sandboxed command writes only to its sandbox, opens a pty, and reports its costs" {
+    if (!Sandbox.available or Sandbox.inherited()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const inside_name = "in\"side(1).d";
+    try tmp.dir.createDirPath(io, inside_name);
+    try tmp.dir.createDirPath(io, "store");
+    const root = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(root);
+    const inside = try std.Io.Dir.path.join(gpa, &.{ root, inside_name });
+    defer gpa.free(inside);
+    const store_file = try std.Io.Dir.path.join(gpa, &.{ root, "store", "auth.json" });
+    defer gpa.free(store_file);
+    var atomic = try tmp.dir.createFileAtomic(io, "store/auth.json", .{ .replace = true });
+    defer atomic.deinit(io);
+    const replacement_name = std.fmt.hex(atomic.file_basename_hex);
+
+    var costs: testing.Costs = .{};
+    defer costs.deinit();
+    const sandbox: Sandbox = .{ .directories = &.{inside}, .files = &.{store_file} };
+    const context: Context = .{
+        .gpa = gpa,
+        .host = .{ .io = io, .sandbox = &sandbox },
+        .sink = costs.sink(),
+    };
+    const command = try gpa.print(
+        "cd '{s}' && : > '{s}/new' && : > store/auth.json && : > store/{s} && echo allowed; " ++
+            "{{ : > outside; }} 2>/dev/null || echo outside denied; " ++
+            "{{ : > store/other; }} 2>/dev/null || echo sibling denied; " ++
+            "{{ script -q /dev/null true; }} >/dev/null 2>&1 && echo pty opened; " ++
+            charge_command,
+        .{ root, inside_name, &replacement_name },
+    );
+    defer gpa.free(command);
+    const result = try runWithTimeout(&context, command, Context.Bash.timeout_ms_max);
+    defer result.deinit(gpa);
+    try std.testing.expectEqualStrings(
+        "allowed\noutside denied\nsibling denied\npty opened\n",
+        result.content,
+    );
+    try costs.expect(&.{2.5});
 }
 
 test "bash hands the environment of its host to the command" {

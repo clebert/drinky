@@ -572,7 +572,7 @@ pub fn load(
     io: std.Io,
     directories: *const accounts.json_store.Directories,
 ) !Config {
-    const path = try accounts.json_store.locate(gpa, directories, "config.json");
+    const path = try accounts.json_store.locate(gpa, directories, .config);
     defer gpa.free(path);
     const directory = std.Io.Dir.path.dirname(path).?;
     const cwd = std.Io.Dir.cwd();

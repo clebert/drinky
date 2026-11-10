@@ -7,6 +7,7 @@ const format = @import("format.zig");
 const fs = @import("fs.zig");
 const output = @import("output.zig");
 const parse = @import("parse.zig");
+const Sandbox = @import("Sandbox.zig");
 const testing = @import("testing.zig");
 
 pub const spec: core.Tool = .{
@@ -41,8 +42,11 @@ pub fn run(context: *const Context, input_json: []const u8) Context.Error!core.T
     const content = parsed.value.content;
 
     const io = context.host.io;
-    fs.writeFile(gpa, io, &context.deadline, &.{ .path = path, .data = content }) catch |err|
-        return fs.writeFailure(gpa, err, path);
+    fs.writeFile(gpa, io, &context.deadline, &.{
+        .path = path,
+        .data = content,
+        .sandbox = context.host.sandbox,
+    }) catch |err| return fs.writeFailure(gpa, err, path);
     var result = try output.sentence(gpa, "Drinky wrote {d} byte{s} to {s}.", .{
         content.len,
         core.text.pluralSuffix(content.len),
@@ -236,6 +240,64 @@ test "a write that the time limit stops says that the file can hold either conte
         const data = try tmp.dir.readFileAlloc(io, "f.txt", gpa, .limited(64));
         defer gpa.free(data);
         try std.testing.expectEqualStrings(case.kept, data);
+    }
+}
+
+test "a sandboxed write reaches only the real paths that the sandbox allows" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "inside/sub");
+    try tmp.dir.createDirPath(io, "outside");
+    try tmp.dir.createDirPath(io, "store");
+    try tmp.dir.symLink(io, "../outside/linked.txt", "inside/link.txt", .{});
+    try tmp.dir.symLink(io, "../outside", "inside/folder", .{ .is_directory = true });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(root);
+    const inside = try std.Io.Dir.path.join(gpa, &.{ root, "inside" });
+    defer gpa.free(inside);
+    const store_file = try std.Io.Dir.path.join(gpa, &.{ root, "store", "auth.json" });
+    defer gpa.free(store_file);
+    const sandbox: Sandbox = .{ .directories = &.{inside}, .files = &.{store_file} };
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = io, .sandbox = &sandbox },
+    };
+    const cases = [_]struct { path: []const u8, written: []const u8, allowed: bool }{
+        .{ .path = "inside/sub/new.txt", .written = "inside/sub/new.txt", .allowed = true },
+        .{ .path = "store/auth.json", .written = "store/auth.json", .allowed = true },
+        .{ .path = "store/other.json", .written = "store/other.json", .allowed = false },
+        .{ .path = "outside/new.txt", .written = "outside/new.txt", .allowed = false },
+        .{ .path = "inside/link.txt", .written = "outside/linked.txt", .allowed = false },
+        .{ .path = "inside/folder/new.txt", .written = "outside/new.txt", .allowed = false },
+        .{
+            .path = "inside/sub/../../outside/up.txt",
+            .written = "outside/up.txt",
+            .allowed = false,
+        },
+    };
+    for (cases) |case| {
+        var path_buffer: [160]u8 = undefined;
+        const path = try std.mem.print(
+            &path_buffer,
+            ".zig-cache/tmp/{s}/{s}",
+            .{ tmp.sub_path, case.path },
+        );
+        const input = try std.json.Stringify.valueAlloc(gpa, .{
+            .path = path,
+            .content = "x",
+        }, .{});
+        defer gpa.free(input);
+        const result = try run(&context, input);
+        defer result.deinit(gpa);
+        try std.testing.expectEqual(!case.allowed, result.hasFailure());
+        const exists = if (tmp.dir.access(io, case.written, .{})) true else |_| false;
+        try std.testing.expectEqual(case.allowed, exists);
+        if (!case.allowed) try std.testing.expect(
+            std.mem.endsWith(u8, result.content, "because the path is outside the sandbox."),
+        );
     }
 }
 

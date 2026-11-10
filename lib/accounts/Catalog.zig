@@ -70,9 +70,9 @@ pub fn init(
     io: std.Io,
     directories: *const json_store.Directories,
 ) !Catalog {
-    const models_path = try json_store.locate(gpa, directories, "models.json");
+    const models_path = try json_store.locate(gpa, directories, .models);
     errdefer gpa.free(models_path);
-    const metadata_path = try json_store.locate(gpa, directories, "metadata.json");
+    const metadata_path = try json_store.locate(gpa, directories, .metadata);
     errdefer gpa.free(metadata_path);
 
     var catalog: Catalog = .{

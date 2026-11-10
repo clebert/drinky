@@ -50,3 +50,9 @@ when the user drops it.
 - The instructions do not tell the agent to use Rex tabs. Inside Rex, the agent can open a visual
   preview or a test script in a separate Rex tab without a request. The rule fits a Rex-only
   instruction file from the idea above.
+- A `--readonly` flag can block every write of the tools. Drinky then also leaves out the `write`
+  and `edit` tools.
+- An `--offline` flag can block the network of the commands. A nested `drinky run` then fails, so
+  the review and second-opinion skills stop working.
+- The sandbox has a fixed list of writable caches: `~/.cache/zig` and `~/.npm`. A config key can add
+  more directories.

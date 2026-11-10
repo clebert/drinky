@@ -176,7 +176,7 @@ pub fn Store(comptime Flow: type) type {
                 .gpa = gpa,
                 .io = io,
                 .link = options.link,
-                .path = try json_store.locate(gpa, &options.directories, "auth.json"),
+                .path = try json_store.locate(gpa, &options.directories, .auth),
                 .account = options.account,
                 .tokens = null,
                 .save_pending = false,
@@ -1148,7 +1148,7 @@ test "a busy store retries a refreshed credential before the next request" {
 
     var path_buffer: [128]u8 = undefined;
     const path = try storePath(&path_buffer, &tmp);
-    const lock_path = try gpa.print("{s}.lock", .{path});
+    const lock_path = try json_store.lockPath(gpa, path);
     defer gpa.free(lock_path);
     {
         var held = try std.Io.Dir.cwd().createFile(io, lock_path, .{

@@ -4,11 +4,12 @@ A dependency-free terminal coding agent.
 
 <img src="www/drinky.png" alt="Drinky" width="400">
 
-Drinky can read, search, and change files or run commands in the working directory. The conversation
-stays in the terminal scrollback. Drinky saves no transcript. `/gist` writes a compressed summary of
-the current task, and Drinky saves it after a review. `/gists` carries a saved gist into a new
-conversation. A gist leaves out tool calls and reasoning, so it usually works even after a context
-overflow.
+Drinky can read, search, and change files or run commands in the working directory. On macOS, a
+sandbox limits these changes to the project and a few temporary and cache directories. The
+conversation stays in the terminal scrollback. Drinky saves no transcript. `/gist` writes a
+compressed summary of the current task, and Drinky saves it after a review. `/gists` carries a saved
+gist into a new conversation. A gist leaves out tool calls and reasoning, so it usually works even
+after a context overflow.
 
 Drinky supports Anthropic, OpenAI, xAI, OpenRouter, DeepSeek, and Gemini Enterprise Agent Platform
 (Vertex AI). It learns models from the providers and uses public metadata for prices and model
@@ -100,10 +101,15 @@ Drinky reports its state through the
 to [Herdr](https://herdr.dev). A terminal such as [Rex](https://www.superlogical.com/) can then show
 when Drinky works, waits for the user, or has a result.
 
-## Security
+## Sandbox and security
 
-Drinky has no permission gate or sandbox. Use a container for an untrusted repository. MCP access
-lets any process of the same user submit work to the instance.
+On macOS, Drinky starts each command through `sandbox-exec`. Commands and the file tools can write
+only in the project, the temporary and cache directories of the user, `~/.cache/zig`, `~/.npm`, and
+the account files of Drinky. Reads and the network stay open. Other systems have no sandbox.
+
+The sandbox guards against mistakes of the agent, not against a hostile agent. For an untrusted
+repository, a container gives more isolation. Drinky has no permission gate. MCP access lets any
+process of the same user submit work to the instance.
 
 ## License
 

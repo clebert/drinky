@@ -398,8 +398,8 @@ fn writeAccess(writer: *std.Io.Writer) std.Io.Writer.Error!void {
         \\write, apply, or delete a gist, and it cannot sign in or out. A remote request that
         \\changes the instance fails while the terminal shows a picker, a page, or a sign-in.
         \\
-        \\MCP access lets another agent submit work to this agent. Drinky has no permission gate or
-        \\sandbox, so access is as powerful as the terminal.
+        \\MCP access lets another agent submit work to this agent. Drinky has no permission gate, so
+        \\access is as powerful as the terminal.
         \\
     , .{ .mcp_access = config_keys.mcp_access });
 }

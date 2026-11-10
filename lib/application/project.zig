@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const core = @import("core");
+const tools = @import("tools");
 
 const testing = @import("testing.zig");
 
@@ -64,6 +65,20 @@ pub const head_bytes_max = 4096;
 const object_name_columns = 7;
 
 pub fn head(gpa: std.mem.Allocator, io: std.Io, root: []const u8) error{OutOfMemory}!?Head {
+    return readHead(gpa, io, root) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.Canceled => {
+            io.recancel();
+            return null;
+        },
+    };
+}
+
+fn readHead(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+) error{ OutOfMemory, Canceled }!?Head {
     const directory = try headDirectory(gpa, io, root) orelse return null;
     defer gpa.free(directory);
     const path = try std.Io.Dir.path.join(gpa, &.{ directory, "HEAD" });
@@ -73,10 +88,33 @@ pub fn head(gpa: std.mem.Allocator, io: std.Io, root: []const u8) error{OutOfMem
     return parseHead(data);
 }
 
-fn headDirectory(gpa: std.mem.Allocator, io: std.Io, root: []const u8) error{OutOfMemory}!?[]u8 {
+pub fn gitDirectory(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+) error{ OutOfMemory, Canceled }!?[]u8 {
+    const directory = try headDirectory(gpa, io, root) orelse return null;
+    errdefer gpa.free(directory);
+    const common_path = try std.Io.Dir.path.join(gpa, &.{ directory, "commondir" });
+    defer gpa.free(common_path);
+    const data = try readHeadFile(gpa, io, common_path) orelse return directory;
+    defer gpa.free(data);
+    const common = std.mem.trim(u8, data, " \t\r\n");
+    if (common.len == 0) return directory;
+    const resolved = try std.Io.Dir.path.resolve(gpa, &.{ directory, common });
+    gpa.free(directory);
+    return resolved;
+}
+
+fn headDirectory(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+) error{ OutOfMemory, Canceled }!?[]u8 {
     const marker_path = try std.Io.Dir.path.join(gpa, &.{ root, marker_name });
-    const stat = std.Io.Dir.cwd().statFile(io, marker_path, .{}) catch {
+    const stat = std.Io.Dir.cwd().statFile(io, marker_path, .{}) catch |err| {
         gpa.free(marker_path);
+        if (err == error.Canceled) return error.Canceled;
         return null;
     };
     if (stat.kind == .directory) return marker_path;
@@ -94,10 +132,15 @@ fn headDirectory(gpa: std.mem.Allocator, io: std.Io, root: []const u8) error{Out
     return try std.Io.Dir.path.resolve(gpa, &.{ root, target });
 }
 
-fn readHeadFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8) error{OutOfMemory}!?[]u8 {
+fn readHeadFile(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+) error{ OutOfMemory, Canceled }!?[]u8 {
     return std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(head_bytes_max)) catch |err|
         switch (err) {
             error.OutOfMemory => error.OutOfMemory,
+            error.Canceled => error.Canceled,
             else => null,
         };
 }
@@ -276,6 +319,68 @@ test "a head reads the Git directory that a marker file names, and a missing hea
 
     try tree.write("next/.git", "nothing\n");
     try std.testing.expect(try head(gpa, io, worktree_root) == null);
+}
+
+test "the Git directory of a root is its marker, the target of its marker file, or a shared one" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tree: testing.Tree = try .init();
+    defer tree.deinit();
+    try tree.directory("plain");
+    try tree.directory("repo/.git/modules/part");
+    try tree.write("repo/.git/worktrees/next/commondir", "../..\n");
+    try tree.write("next/.git", "gitdir: ../repo/.git/worktrees/next\n");
+    try tree.write("part/.git", "gitdir: ../repo/.git/modules/part\n");
+
+    const cases = [_]struct { root: []const u8, expected: ?[]const u8 }{
+        .{ .root = "plain", .expected = null },
+        .{ .root = "repo", .expected = "repo/.git" },
+        .{ .root = "next", .expected = "repo/.git" },
+        .{ .root = "part", .expected = "repo/.git/modules/part" },
+    };
+    for (cases) |case| {
+        const found = try gitDirectory(gpa, io, try tree.path(case.root));
+        defer if (found) |directory| gpa.free(directory);
+        const expected = case.expected orelse {
+            try std.testing.expect(found == null);
+            continue;
+        };
+        try std.testing.expectEqualStrings(try tree.path(expected), found.?);
+    }
+}
+
+test "a cancel during a Git directory read reaches the caller" {
+    var tree: testing.Tree = try .init();
+    defer tree.deinit();
+    try tree.directory("repo/.git");
+    const canceling: tools.testing.CancelIo = .init(.file_open);
+    try std.testing.expectError(
+        error.Canceled,
+        gitDirectory(std.testing.allocator, canceling.io(), try tree.path("repo")),
+    );
+}
+
+test "a Git directory read returns every allocation failure and releases every partial allocation" {
+    var tree: testing.Tree = try .init();
+    defer tree.deinit();
+    try tree.write("repo/.git/worktrees/next/commondir", "../..\n");
+    try tree.write("next/.git", "gitdir: ../repo/.git/worktrees/next\n");
+    try std.testing.checkAllAllocationFailures(
+        core.testing.no_resize_allocator,
+        checkGitDirectory,
+        .{ try tree.path("next"), try tree.path("repo/.git") },
+    );
+}
+
+fn checkGitDirectory(
+    gpa: std.mem.Allocator,
+    root: []const u8,
+    expected: []const u8,
+) error{ OutOfMemory, Canceled, TestExpectedGitDirectory, TestExpectedEqual }!void {
+    const found = try gitDirectory(gpa, std.testing.io, root) orelse
+        return error.TestExpectedGitDirectory;
+    defer gpa.free(found);
+    try std.testing.expectEqualStrings(expected, found);
 }
 
 test "a head read returns every allocation failure and releases every partial allocation" {

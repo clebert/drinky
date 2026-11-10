@@ -21,8 +21,9 @@ infrastructure modules for its existing fakes.
   seam, and one dialect per wire: Responses, Messages, and Gemini. A dialect builds requests,
   classifies failures, and decodes frames into core events. A per-account switch is a dialect
   option.
-- `lib/tools` implements the tool seam. It owns the tool registry and required-skill checks. Tool
-  outputs separate model content from the conditions and measures that a client shows.
+- `lib/tools` implements the tool seam. It owns the tool registry, required-skill checks, and the
+  write sandbox of the tools. Tool outputs separate model content from the conditions and measures
+  that a client shows.
 - `lib/accounts` owns the account table, credentials, sign-in flows, model catalog, public metadata,
   usage sources, and saved state.
 - `lib/application` owns the shared controller, workflows, canonical transcript, work state,
@@ -31,8 +32,8 @@ infrastructure modules for its existing fakes.
   across turns, asides, sign-ins, and model fetches. Record changes use stable ids. Events and
   snapshots carry typed facts, not terminal layout, navigation, editor instructions, control
   bindings, or text for the user. The `interface` preferences are the exception. The application
-  also owns the config, discovery, shared model instructions, and tools. Config schemas, defaults,
-  validation, and neutral descriptions stay with the application.
+  also owns the config, discovery, shared model instructions, tools, and the writable paths of the
+  sandbox. Config schemas, defaults, validation, and neutral descriptions stay with the application.
 - `src` owns the native clients, terminal controls, editor, pages, drafts, confirmation policy, and
   text for the user. The terminal loop hosts the controller. Each native client supplies the words
   of every typed fact. The screen keeps a disposable presentation copy. Native clients use only

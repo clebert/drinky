@@ -40,6 +40,33 @@ const discovery =
     \\
 ;
 
+const sandbox =
+    \\
+    \\## Sandbox
+    \\
+    \\On macOS, Drinky starts each command of the `bash` tool through `/usr/bin/sandbox-exec`. The
+    \\`write` and `edit` tools check the same rules. A tool can write only to these places:
+    \\
+    \\- The Git root, or the working directory outside a repository.
+    \\- The Git directory of the root, also when it is outside the root, such as the shared
+    \\  directory of a worktree.
+    \\- The temporary directory in `TMPDIR` and `/tmp`.
+    \\- The cache directory of the user below `/var/folders/`. Clang and Swift keep their module
+    \\  caches there.
+    \\- `~/.cache/zig` and `~/.npm`.
+    \\- `auth.json` and `models.json` in `~/.drinky/`, so that a nested `drinky run` can save a
+    \\  refreshed sign-in and drop the models of a rejected account.
+    \\
+    \\A command fails with `Operation not permitted` when it writes elsewhere, and the `write` and
+    \\`edit` tools refuse such a path. Reads and the network stay open. Programs with the setuid
+    \\bit, such as `ps` and `sudo`, do not start. A program that starts its own sandbox fails, so
+    \\`swift build` needs `--disable-sandbox`. Drinky starts no second sandbox when it already runs
+    \\in one, such as in a nested `drinky run`. Its commands then stay in the outer sandbox. The
+    \\sandbox guards against mistakes of the agent, not against a hostile agent. On other systems,
+    \\Drinky runs the tools without a sandbox.
+    \\
+;
+
 const repository =
     \\
     \\## Repository
@@ -69,6 +96,7 @@ fn write(
     try writer.writeAll(configuration);
     try writer.writeAll(discovery);
     try writeSkillRules(writer);
+    try writer.writeAll(sandbox);
     try writer.writeAll(repository);
 }
 

@@ -3,6 +3,7 @@ const std = @import("std");
 const core = @import("core");
 
 const output = @import("output.zig");
+const Sandbox = @import("Sandbox.zig");
 
 pub const file_bytes_max = 16 << 20;
 pub const timeout_ms = 10 * std.time.ms_per_s;
@@ -13,6 +14,7 @@ const link_hops_max = 40;
 const Options = struct {
     path: []const u8,
     data: []const u8,
+    sandbox: ?*const Sandbox,
 };
 
 pub const ReadError = std.Io.Dir.ReadFileAllocError || Bound;
@@ -20,6 +22,8 @@ pub const ReadError = std.Io.Dir.ReadFileAllocError || Bound;
 const WriteError = WholeWriteError || Bound;
 
 const WholeWriteError = ResolveError ||
+    std.Io.Dir.RealPathFileAllocError ||
+    error{OutsideSandbox} ||
     std.Io.Dir.StatFileError ||
     std.Io.Dir.CreateFileAtomicError ||
     std.Io.File.Writer.Error ||
@@ -75,6 +79,12 @@ pub fn writeFailure(
             "respond. The file can hold the old or the new content.",
         .{ path, timeout_seconds },
     );
+    if (err == error.OutsideSandbox) return output.failure(
+        gpa,
+        .failed,
+        "Drinky cannot write {s} because the path is outside the sandbox.",
+        .{path},
+    );
     return output.cannot(gpa, err, "write", path);
 }
 
@@ -103,6 +113,7 @@ fn writeWhole(gpa: std.mem.Allocator, io: std.Io, options: *const Options) Whole
     const dir = std.Io.Dir.cwd();
     const target = try resolveLinks(gpa, io, dir, options.path);
     defer gpa.free(target);
+    if (options.sandbox) |sandbox| try checkSandbox(gpa, io, sandbox, target);
     const maybe_permissions: ?std.Io.File.Permissions = if (dir.statFile(io, target, .{})) |stat|
         stat.permissions
     else |err| switch (err) {
@@ -114,6 +125,23 @@ fn writeWhole(gpa: std.mem.Allocator, io: std.Io, options: *const Options) Whole
     try atomic.file.writeStreamingAll(io, options.data);
     if (maybe_permissions) |permissions| try atomic.file.setPermissions(io, permissions);
     try atomic.replace(io);
+}
+
+fn checkSandbox(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    sandbox: *const Sandbox,
+    target: []const u8,
+) (std.Io.Dir.RealPathFileAllocError || error{OutsideSandbox})!void {
+    const parent = std.Io.Dir.path.dirname(target) orelse ".";
+    const real_parent = try std.Io.Dir.cwd().realPathFileAlloc(io, parent, gpa);
+    defer gpa.free(real_parent);
+    const real_target = try std.Io.Dir.path.join(
+        gpa,
+        &.{ real_parent, std.Io.Dir.path.basename(target) },
+    );
+    defer gpa.free(real_target);
+    if (!sandbox.allows(real_target)) return error.OutsideSandbox;
 }
 
 fn resolveLinks(

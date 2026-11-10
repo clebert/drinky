@@ -7,6 +7,7 @@ const tools = @import("tools");
 const Config = @import("Config.zig");
 const describe = @import("describe.zig");
 const discovery = @import("discovery/root.zig");
+const sandbox = @import("sandbox.zig");
 const system_prompt = @import("system_prompt.zig");
 
 const Harness = @This();
@@ -17,6 +18,8 @@ skill_registry: discovery.skills.Registry,
 skill_guard: tools.SkillGuard,
 required_missing: std.ArrayList(Config.RequiredSkill),
 required_capped: bool,
+sandbox_arena: std.heap.ArenaAllocator,
+sandbox_policy: ?tools.Sandbox,
 system: []const u8,
 document: []const u8,
 tool_registry: tools.Registry,
@@ -58,6 +61,15 @@ pub fn init(self: *Harness, gpa: std.mem.Allocator, io: std.Io, options: *const 
     self.required_missing = .empty;
     errdefer self.required_missing.deinit(gpa);
     self.required_capped = try self.resolveRequiredSkills(gpa);
+    self.sandbox_arena = .init(gpa);
+    errdefer self.sandbox_arena.deinit();
+    self.sandbox_policy = try sandbox.policy(self.sandbox_arena.allocator(), io, &.{
+        .directories = directories,
+        .root = self.project_instructions.projectRoot() orelse cwd,
+        .environ = options.environ,
+    });
+    const tool_sandbox: ?*const tools.Sandbox =
+        if (self.sandbox_policy) |*policy| policy else null;
 
     self.system = try system_prompt.compose(gpa, &.{
         .current_time = std.Io.Clock.real.now(io),
@@ -68,6 +80,7 @@ pub fn init(self: *Harness, gpa: std.mem.Allocator, io: std.Io, options: *const 
         .skills = self.skill_registry.items(),
         .required_skills = self.skill_guard.rules(),
         .surface = options.surface,
+        .sandbox = tool_sandbox,
     });
     errdefer gpa.free(self.system);
     self.document = try describe.compose(gpa, &.{
@@ -81,6 +94,7 @@ pub fn init(self: *Harness, gpa: std.mem.Allocator, io: std.Io, options: *const 
             .environ = options.environ,
             .bash = self.config.bash,
             .document = self.document,
+            .sandbox = tool_sandbox,
         },
         .skill_guard = &self.skill_guard,
     };
@@ -89,6 +103,7 @@ pub fn init(self: *Harness, gpa: std.mem.Allocator, io: std.Io, options: *const 
 pub fn deinit(self: *Harness, gpa: std.mem.Allocator) void {
     gpa.free(self.document);
     gpa.free(self.system);
+    self.sandbox_arena.deinit();
     self.required_missing.deinit(gpa);
     self.skill_registry.deinit();
     self.project_instructions.deinit();

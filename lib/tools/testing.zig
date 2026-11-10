@@ -62,11 +62,12 @@ const Measured = struct { core.Tool.Measure, u64 };
 pub const CancelIo = struct {
     vtable: std.Io.VTable,
 
-    pub fn init(target: enum { file_open, file_write }) CancelIo {
+    pub fn init(target: enum { file_open, file_write, real_path }) CancelIo {
         var vtable = std.testing.io.vtable.*;
         switch (target) {
             .file_open => vtable.dirOpenFile = openFile,
             .file_write => vtable.operate = operate,
+            .real_path => vtable.dirRealPathFile = realPathFile,
         }
         return .{ .vtable = vtable };
     }
@@ -90,6 +91,15 @@ pub const CancelIo = struct {
     ) std.Io.Cancelable!std.Io.Operation.Result {
         if (operation == .file_write_streaming) return error.Canceled;
         return std.testing.io.vtable.operate(userdata, operation);
+    }
+
+    fn realPathFile(
+        _: ?*anyopaque,
+        _: std.Io.Dir,
+        _: []const u8,
+        _: []u8,
+    ) std.Io.Dir.RealPathFileError!usize {
+        return error.Canceled;
     }
 };
 
