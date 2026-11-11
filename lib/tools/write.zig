@@ -79,6 +79,59 @@ test "write creates a file with the given contents" {
     try std.testing.expectEqualStrings("hello\nworld\n", data);
 }
 
+const SwapIo = struct {
+    vtable: std.Io.VTable,
+
+    fn init() SwapIo {
+        var vtable = std.testing.io.vtable.*;
+        vtable.dirRealPath = realPath;
+        vtable.dirRealPathFile = realPathFile;
+        return .{ .vtable = vtable };
+    }
+
+    fn io(self: *const SwapIo) std.Io {
+        return .{ .userdata = std.testing.io.userdata, .vtable = &self.vtable };
+    }
+
+    fn swap(real: []const u8) std.Io.UnexpectedError!void {
+        if (!std.mem.eql(u8, std.Io.Dir.path.basename(real), "sub")) return;
+        swapDirectory(real) catch return error.Unexpected;
+    }
+
+    fn swapDirectory(real: []const u8) !void {
+        var moved_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const moved = try std.fmt.bufPrint(
+            &moved_buffer,
+            "{s}/moved",
+            .{std.Io.Dir.path.dirname(real).?},
+        );
+        const cwd = std.Io.Dir.cwd();
+        try cwd.rename(real, cwd, moved, std.testing.io);
+        try cwd.symLink(std.testing.io, "../outside", real, .{ .is_directory = true });
+    }
+
+    fn realPath(
+        userdata: ?*anyopaque,
+        dir: std.Io.Dir,
+        out_buffer: []u8,
+    ) std.Io.Dir.RealPathError!usize {
+        const length = try std.testing.io.vtable.dirRealPath(userdata, dir, out_buffer);
+        try swap(out_buffer[0..length]);
+        return length;
+    }
+
+    fn realPathFile(
+        userdata: ?*anyopaque,
+        dir: std.Io.Dir,
+        path: []const u8,
+        out_buffer: []u8,
+    ) std.Io.Dir.RealPathFileError!usize {
+        const length = try std.testing.io.vtable.dirRealPathFile(userdata, dir, path, out_buffer);
+        try swap(out_buffer[0..length]);
+        return length;
+    }
+};
+
 test "write overwrites an existing file entirely" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
@@ -299,6 +352,41 @@ test "a sandboxed write reaches only the real paths that the sandbox allows" {
             std.mem.endsWith(u8, result.content, "because the path is outside the sandbox."),
         );
     }
+}
+
+test "a directory that becomes a link after the sandbox check keeps the write in the sandbox" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "inside/sub");
+    try tmp.dir.createDirPath(io, "outside");
+    const root = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(root);
+    const inside = try std.Io.Dir.path.join(gpa, &.{ root, "inside" });
+    defer gpa.free(inside);
+    const sandbox: Sandbox = .{ .directories = &.{inside}, .files = &.{} };
+    const swap: SwapIo = .init();
+    const context: Context = .{
+        .sink = testing.discard_sink,
+        .gpa = gpa,
+        .host = .{ .io = swap.io(), .sandbox = &sandbox },
+    };
+    var input_buffer: [128]u8 = undefined;
+    const input = try std.mem.print(&input_buffer,
+        \\{{"path":".zig-cache/tmp/{s}/inside/sub/new.txt","content":"x"}}
+    , .{tmp.sub_path});
+
+    const result = try run(&context, input);
+    defer result.deinit(gpa);
+    var link_buffer: [64]u8 = undefined;
+    const link_len = try tmp.dir.readLink(io, "inside/sub", &link_buffer);
+    try std.testing.expectEqualStrings("../outside", link_buffer[0..link_len]);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "outside/new.txt", .{}));
+    try std.testing.expect(!result.hasFailure());
+    const data = try tmp.dir.readFileAlloc(io, "inside/moved/new.txt", gpa, .limited(64));
+    defer gpa.free(data);
+    try std.testing.expectEqualStrings("x", data);
 }
 
 test "write measures the lines of what it wrote" {

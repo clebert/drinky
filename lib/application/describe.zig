@@ -63,7 +63,8 @@ const sandbox =
     \\`swift build` needs `--disable-sandbox`. Drinky starts no second sandbox when it already runs
     \\in one, such as in a nested `drinky run`. Its commands then stay in the outer sandbox. The
     \\sandbox guards against mistakes of the agent, not against a hostile agent. On other systems,
-    \\Drinky runs the tools without a sandbox.
+    \\Drinky runs the tools without a sandbox. For protection against a hostile agent or an
+    \\untrusted repository, run Drinky in a container or a virtual machine.
     \\
 ;
 

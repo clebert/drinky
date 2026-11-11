@@ -22,7 +22,8 @@ pub const ReadError = std.Io.Dir.ReadFileAllocError || Bound;
 const WriteError = WholeWriteError || Bound;
 
 const WholeWriteError = ResolveError ||
-    std.Io.Dir.RealPathFileAllocError ||
+    std.Io.Dir.OpenError ||
+    std.Io.Dir.RealPathError ||
     error{OutsideSandbox} ||
     std.Io.Dir.StatFileError ||
     std.Io.Dir.CreateFileAtomicError ||
@@ -110,17 +111,22 @@ fn releaseWhole(data: *const []u8, args: *const std.meta.ArgsTuple(@TypeOf(readW
 }
 
 fn writeWhole(gpa: std.mem.Allocator, io: std.Io, options: *const Options) WholeWriteError!void {
-    const dir = std.Io.Dir.cwd();
-    const target = try resolveLinks(gpa, io, dir, options.path);
+    const target = try resolveLinks(gpa, io, std.Io.Dir.cwd(), options.path);
     defer gpa.free(target);
-    if (options.sandbox) |sandbox| try checkSandbox(gpa, io, sandbox, target);
-    const maybe_permissions: ?std.Io.File.Permissions = if (dir.statFile(io, target, .{})) |stat|
+    var parent = try std.Io.Dir.cwd().openDir(io, std.Io.Dir.path.dirname(target) orelse ".", .{});
+    defer parent.close(io);
+    const name = std.Io.Dir.path.basename(target);
+    if (options.sandbox) |sandbox| try checkSandbox(gpa, io, sandbox, &.{
+        .parent = parent,
+        .name = name,
+    });
+    const maybe_permissions: ?std.Io.File.Permissions = if (parent.statFile(io, name, .{})) |stat|
         stat.permissions
     else |err| switch (err) {
         error.FileNotFound => null,
         else => |other| return other,
     };
-    var atomic = try dir.createFileAtomic(io, target, .{ .replace = true });
+    var atomic = try parent.createFileAtomic(io, name, .{ .replace = true });
     defer atomic.deinit(io);
     try atomic.file.writeStreamingAll(io, options.data);
     if (maybe_permissions) |permissions| try atomic.file.setPermissions(io, permissions);
@@ -131,15 +137,11 @@ fn checkSandbox(
     gpa: std.mem.Allocator,
     io: std.Io,
     sandbox: *const Sandbox,
-    target: []const u8,
-) (std.Io.Dir.RealPathFileAllocError || error{OutsideSandbox})!void {
-    const parent = std.Io.Dir.path.dirname(target) orelse ".";
-    const real_parent = try std.Io.Dir.cwd().realPathFileAlloc(io, parent, gpa);
-    defer gpa.free(real_parent);
-    const real_target = try std.Io.Dir.path.join(
-        gpa,
-        &.{ real_parent, std.Io.Dir.path.basename(target) },
-    );
+    target: *const struct { parent: std.Io.Dir, name: []const u8 },
+) (std.Io.Dir.RealPathError || error{ OutOfMemory, OutsideSandbox })!void {
+    var real_parent: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const length = try target.parent.realPath(io, &real_parent);
+    const real_target = try std.Io.Dir.path.join(gpa, &.{ real_parent[0..length], target.name });
     defer gpa.free(real_target);
     if (!sandbox.allows(real_target)) return error.OutsideSandbox;
 }

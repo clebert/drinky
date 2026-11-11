@@ -108,9 +108,10 @@ On macOS, Drinky starts each command through `sandbox-exec`. Commands and the fi
 only in the project, the temporary and cache directories of the user, `~/.cache/zig`, `~/.npm`, and
 the account files of Drinky. Reads and the network stay open. Other systems have no sandbox.
 
-The sandbox guards against mistakes of the agent, not against a hostile agent. For an untrusted
-repository, a container gives more isolation. Drinky has no permission gate. MCP access lets any
-process of the same user submit work to the instance.
+The sandbox guards against mistakes of the agent, not against a hostile agent. For protection
+against a hostile agent or an untrusted repository, run Drinky in a container or a virtual machine.
+Drinky has no permission gate. MCP access lets any process of the same user submit work to the
+instance.
 
 ## License
 
