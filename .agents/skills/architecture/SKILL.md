@@ -22,9 +22,9 @@ bytes. The session is an actor with one command loop and one child task for a tu
 aside sends one request outside the conversation. It uses no tools and uses the model and the effort
 of a turn.
 
-The account registry is an actor with a child task for a sign-in or a model fetch. A row is an index
-into the account table. The `Client` in `lib/accounts` builds the provider of one row. It reports
-its usage source before the stop of every reply.
+The account registry is an actor with a child task for a sign-in, a key check, or a model fetch. A
+row is an index into the account table. The `Client` in `lib/accounts` builds the provider of one
+row. It reports its usage source before the stop of every reply.
 
 ## Controller
 

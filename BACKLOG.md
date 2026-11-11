@@ -38,6 +38,16 @@ when the user drops it.
 - `/gists` scans at most 4096 entries of `~/.drinky/gists/` in directory order, not by age. Past
   that limit, gists leave the list without a notice, and the newest gists can be among them. Each
   save creates a file, and a gist stays until a deletion, so the count only grows.
+- Drinky has no QwenCloud account. QwenCloud offers the OpenAI Responses protocol at
+  `/compatible-mode/v1/responses`, the Anthropic Messages protocol at `/apps/anthropic`, and a model
+  list at `/compatible-mode/v1/models`. QwenCloud has no OAuth, so each account takes a key in the
+  key step. The Token Plan subscription uses `https://token-plan.maas.qwencloudapi.com` and keys
+  with the prefix `sk-sp-`. Its terms allow only interactive use in coding tools. A pay-as-you-go
+  key starts with `sk-` or `sk-ws-` and works only in its region, such as
+  `https://ap-southeast-1.maas.qwencloudapi.com`. The two kinds of key do not work on the endpoint
+  of the other kind. The Responses API truncates an input above about 80% of the context window
+  without an error. The `auto` model of the Token Plan routes each request to a model that the
+  server selects. Source: <https://docs.qwencloud.com/llms.txt>.
 
 ## Ideas
 

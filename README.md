@@ -36,17 +36,18 @@ Type `/` to list the commands. Ask Drinky about its commands, key bindings, or c
 | -------------------- | ------------------------------------------------------------ |
 | `anthropic-plan`     | Claude Pro or Max login                                      |
 | `anthropic-api`      | Anthropic Console login, which mints and stores an API key   |
-| `anthropic-api-key`  | `ANTHROPIC_API_KEY`                                          |
+| `anthropic-api-key`  | Anthropic API key                                            |
 | `openai-plan`        | ChatGPT login                                                |
-| `openai-api-key`     | `OPENAI_API_KEY`                                             |
+| `openai-api-key`     | OpenAI API key                                               |
 | `xai-plan`           | SuperGrok or X Premium login with a device code              |
-| `xai-api-key`        | `XAI_API_KEY`                                                |
+| `xai-api-key`        | xAI API key                                                  |
 | `openrouter-api`     | OpenRouter login, which mints and stores an API key          |
-| `openrouter-api-key` | `OPENROUTER_API_KEY`                                         |
-| `deepseek-api-key`   | `DEEPSEEK_API_KEY`                                           |
+| `openrouter-api-key` | OpenRouter API key                                           |
+| `deepseek-api-key`   | DeepSeek API key                                             |
 | `google-cloud-key`   | `GOOGLE_APPLICATION_CREDENTIALS` and `GOOGLE_CLOUD_LOCATION` |
 
-Use `/login` to sign in or switch accounts. Use `/model` to select a model.
+Use `/login` to sign in or switch accounts. An API key account takes its key in the editor. Drinky
+saves the key after a check with the provider. Use `/model` to select a model.
 
 Drinky is not affiliated with the providers.
 

@@ -82,6 +82,9 @@ pub const Event = union(enum) {
     signed_out: SignedOut,
     credential_unremoved: AccountCause,
     credential_reloaded: Reload,
+    key_rejected: KeyRejection,
+    key_unchecked: AccountCause,
+    key_check_canceled: usize,
     models_fetched: Fetch,
     models_unfetched: FetchFailure,
     attempt_failed: Attempt,
@@ -184,6 +187,10 @@ pub const Event = union(enum) {
         next: Next,
 
         pub const Next = union(enum) { unchanged, none, use: Use };
+    };
+    pub const KeyRejection = struct {
+        account: usize,
+        key: enum { new, saved },
     };
     pub const Reload = struct {
         account: usize,

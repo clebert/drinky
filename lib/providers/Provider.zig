@@ -205,7 +205,7 @@ fn credentialFailed(self: *Provider, err: Credential.Error) core.Provider.Error!
         error.OutOfMemory => return error.OutOfMemory,
         error.Rejected => try self.fail(.{
             .reason = .unauthorized,
-            .message = "The server rejected the credential.",
+            .message = "The provider rejected the credential.",
         }),
         error.Network => try self.fail(.{
             .reason = .network,
@@ -452,7 +452,7 @@ test "a renewal that fails after a 401 reports the failure of the credential" {
     const cases = [_]struct { failure: Credential.Error, trace: []const u8 }{
         .{
             .failure = error.Rejected,
-            .trace = "failed:unauthorized|-|The server rejected the credential.\n",
+            .trace = "failed:unauthorized|-|The provider rejected the credential.\n",
         },
         .{
             .failure = error.Network,
@@ -624,7 +624,7 @@ test "a credential that cannot be a header value or that fails never reaches the
     rejected.init(std.testing.io, &.{ .replies = &.{.{ .body = complete_body }} });
     rejected.credential.token_fail = error.Rejected;
     defer rejected.deinit();
-    try rejected.expectTrace("failed:unauthorized|-|The server rejected the credential.\n");
+    try rejected.expectTrace("failed:unauthorized|-|The provider rejected the credential.\n");
     try std.testing.expectEqual(@as(usize, 0), rejected.transport.requests.items.len);
 
     var offline: Rig = undefined;

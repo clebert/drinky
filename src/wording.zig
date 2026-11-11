@@ -10,8 +10,8 @@ const ui = @import("ui/root.zig");
 const WriteError = std.Io.Writer.Error || error{OutOfMemory};
 
 const metadata_unsaved = " Drinky could not save the public metadata because of error {s}.";
-const credential_reloaded = "Drinky reloaded the refresh credential that another Drinky " ++
-    "instance saved. ";
+const credential_reloaded = "Drinky reloaded the credential that another Drinky instance " ++
+    "saved. ";
 
 pub fn event(
     gpa: std.mem.Allocator,
@@ -105,6 +105,12 @@ pub fn refusal(
                 application.query.accountId(account),
             },
         ),
+        .key_malformed => try ui.Message.print(
+            gpa,
+            .failure,
+            "Remove the spaces, tabs, and line breaks from the key.",
+            .{},
+        ),
         .gist_failed => |*failure| try gistFailure(gpa, command, failure),
         .gist_invalid => |path| try gistInvalid(gpa, path),
     };
@@ -137,6 +143,7 @@ fn gistFailure(
         .select_account,
         .sign_out,
         .submit_callback,
+        .submit_key,
         .fetch_models,
         .select_model,
         .set_effort,
@@ -167,6 +174,7 @@ fn prerequisite(
         .select_account,
         .sign_out,
         .submit_callback,
+        .submit_key,
         .fetch_models,
         .select_model,
         .set_effort,
@@ -221,6 +229,9 @@ fn startupReport(value: *const application.Record.Event) bool {
         .signed_out,
         .credential_unremoved,
         .credential_reloaded,
+        .key_rejected,
+        .key_unchecked,
+        .key_check_canceled,
         .models_fetched,
         .models_unfetched,
         .attempt_failed,
@@ -245,6 +256,7 @@ fn severity(value: *const application.Record.Event) ui.Message.Severity {
         .callback_received,
         .signed_out,
         .credential_reloaded,
+        .key_check_canceled,
         .attempt_failed,
         .turn_canceled,
         => .information,
@@ -260,6 +272,7 @@ fn severity(value: *const application.Record.Event) ui.Message.Severity {
         .callback_unreplayed,
         .sign_out_failed,
         .credential_unremoved,
+        .key_unchecked,
         .models_unfetched,
         .reply_truncated,
         .tool_rounds_exhausted,
@@ -276,6 +289,10 @@ fn severity(value: *const application.Record.Event) ui.Message.Severity {
         .reports_omitted,
         => .failure,
         .sign_in_failed => |sign_in| if (sign_in.reason == .canceled) .information else .failure,
+        .key_rejected => |rejection| switch (rejection.key) {
+            .new => .failure,
+            .saved => .information,
+        },
         .models_fetched => |fetched| if (fetched.metadata_error != null or
             fetched.models_save_error != null or fetched.metadata_save_error != null)
             .failure
@@ -430,6 +447,15 @@ fn writeEvent(
                 .step => |step| try writeStep(writer, reload.account, step),
             }
         },
+        .key_rejected => |rejection| try writer.writeAll(switch (rejection.key) {
+            .new => "The provider rejected the key.",
+            .saved => "Replace the key with " ++ reference.line(.login) ++ ".",
+        }),
+        .key_check_canceled => try writer.writeAll("You canceled the key check."),
+        .key_unchecked => |unchecked| try writer.print(
+            "Drinky could not check the key of {s} because of error {s}.",
+            .{ application.query.accountId(unchecked.account), unchecked.cause },
+        ),
         .models_fetched => |*fetched| try writeFetched(writer, fetched),
         .models_unfetched => |unfetched| {
             try writer.print(
@@ -1051,11 +1077,33 @@ test "an account change names the model, the model selection, or the model fetch
             .text = credential_reloaded ++ "Fetch the model list of openai-plan with /model.",
         },
         .{
+            .event = .{ .key_rejected = .{ .account = key, .key = .saved } },
+            .text = "Replace the key with /login.",
+        },
+        .{
+            .event = .{ .key_check_canceled = key },
+            .text = "You canceled the key check.",
+        },
+        .{
             .event = .{ .signed_in = .{ .account = plan, .model = null } },
             .text = "Drinky signed in to openai-plan.",
         },
     };
     for (&cases) |*case| try expectEvent(&case.event, .information, case.text);
+}
+
+test "a rejected or unchecked new key is a failure" {
+    const key = accounts.testing.xai_api_key;
+    try expectEvent(
+        &.{ .key_rejected = .{ .account = key, .key = .new } },
+        .failure,
+        "The provider rejected the key.",
+    );
+    try expectEvent(
+        &.{ .key_unchecked = .{ .account = key, .cause = "ModelListRequestFailed" } },
+        .failure,
+        "Drinky could not check the key of xai-api-key because of error ModelListRequestFailed.",
+    );
 }
 
 test "an unsaved credential names its path only when the store has one" {
@@ -1248,9 +1296,18 @@ test "a refusal names the action of its command, and a silent refusal holds no t
             .text = "Drinky could not load the skill demo because of error FileNotFound.",
         },
         .{
-            .command = .{ .select_account = accounts.testing.openai_plan },
-            .refusal = .{ .credential_missing = accounts.testing.xai_api_key },
-            .text = "Set XAI_API_KEY in the environment. Restart Drinky to use xai-api-key.",
+            .command = .{ .select_account = accounts.testing.google_cloud_key },
+            .refusal = .{ .credential_missing = accounts.testing.google_cloud_key },
+            .text = "Set GOOGLE_APPLICATION_CREDENTIALS and GOOGLE_CLOUD_LOCATION in the " ++
+                "environment. Restart Drinky to use google-cloud-key.",
+        },
+        .{
+            .command = .{ .submit_key = .{
+                .account = accounts.testing.xai_api_key,
+                .value = "a b",
+            } },
+            .refusal = .key_malformed,
+            .text = "Remove the spaces, tabs, and line breaks from the key.",
         },
         .{
             .command = .{ .select_account = accounts.testing.openai_plan },

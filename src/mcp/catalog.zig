@@ -695,7 +695,7 @@ fn writeRefusal(
                 .{ application.query.accountSetting(account).?, id },
             );
         },
-        .gist_failed, .gist_invalid => unreachable,
+        .key_malformed, .gist_failed, .gist_invalid => unreachable,
     };
     try protocol.field(json, "message", message);
     try json.endObject();

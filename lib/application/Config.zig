@@ -468,7 +468,7 @@ pub fn document(
         \\key. A file that Drinky cannot parse also lets the start succeed. Drinky then uses the
         \\default value of each key and records an event that names the error. The file holds no
         \\secret.
-        \\Each account without a login reads its setting from the environment:
+        \\Only the key file account reads its setting from the environment:
         \\
         \\{s}{s}
         \\### Models and effort

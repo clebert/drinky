@@ -440,7 +440,8 @@ const Rig = struct {
     };
 
     const Fixture = struct {
-        variables: []const [2][]const u8 = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        keys: []const [2][]const u8 = &.{.{ "openai-api-key", "sk-openai" }},
+        variables: []const [2][]const u8 = &.{},
         seeds: []const Seed = &.{
             .{ .account = accounts.testing.openai_api_key, .names = &.{"gpt-5.6-sol"} },
         },
@@ -464,6 +465,7 @@ const Rig = struct {
             defer catalog.deinit();
             try catalog.seed(seed.account, seed.names);
         }
+        try accounts.testing.saveKeys(gpa, io, self.directory, fixture.keys);
         self.environment = .init(gpa);
         errdefer self.environment.deinit();
         for (fixture.variables) |variable| try self.environment.put(variable[0], variable[1]);
@@ -597,16 +599,13 @@ test "a failed turn writes its failure to stderr and nothing to stdout" {
 
 test "a run refuses a nested start, then a blank or non-UTF-8 prompt, before it checks the model" {
     const Case = struct {
-        variables: []const [2][]const u8 = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        variables: []const [2][]const u8 = &.{},
         prompt: []const u8,
         refusal: []const u8,
     };
     const cases = [_]Case{
         .{
-            .variables = &.{
-                .{ "OPENAI_API_KEY", "sk-openai" },
-                .{ application.reference.nested, "1" },
-            },
+            .variables = &.{.{ application.reference.nested, "1" }},
             .prompt = " \n\t",
             .refusal = nested_refusal,
         },
@@ -630,7 +629,7 @@ test "a run refuses a nested start, then a blank or non-UTF-8 prompt, before it 
 
 test "a run refuses an unknown model and names why it cannot use an account" {
     const Case = struct {
-        variables: []const [2][]const u8 = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        variables: []const [2][]const u8 = &.{},
         model: []const u8,
         refusal: []const u8,
     };
@@ -652,8 +651,14 @@ test "a run refuses an unknown model and names why it cannot use an account" {
         },
         .{
             .model = "anthropic-api-key/claude-opus-5",
-            .refusal = "Set ANTHROPIC_API_KEY in the environment to use the account " ++
-                "anthropic-api-key.\n",
+            .refusal = "Drinky cannot use the account anthropic-api-key because it is signed " ++
+                "out. Sign in with /login in Drinky.\n",
+        },
+        .{
+            .variables = &.{.{ "GOOGLE_CLOUD_LOCATION", "eu" }},
+            .model = "google-cloud-key/gemini-3.5-pro",
+            .refusal = "Set GOOGLE_APPLICATION_CREDENTIALS and GOOGLE_CLOUD_LOCATION in the " ++
+                "environment to use the account google-cloud-key.\n",
         },
         .{
             .variables = &.{

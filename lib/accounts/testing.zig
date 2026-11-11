@@ -5,6 +5,7 @@ const providers = @import("providers");
 
 const Account = @import("Account.zig");
 const Catalog = @import("Catalog.zig");
+const json_store = @import("json_store.zig");
 const Metadata = @import("Metadata.zig");
 const Model = @import("Model.zig");
 const oauth = @import("oauth/root.zig");
@@ -144,6 +145,7 @@ pub const Rig = struct {
     const Options = struct {
         home: ?[]const u8 = null,
         store: ?[]const u8 = null,
+        keys: []const [2][]const u8 = &.{},
         variables: []const [2][]const u8 = &.{},
         replies: []const providers.testing.FakeTransport.Reply = &.{},
         timeouts: Registry.Timeouts = Registry.timeouts_default,
@@ -159,6 +161,7 @@ pub const Rig = struct {
             if (options.store) |store| try writeStore(io, &self.tmp.?, store);
             break :home try tmpHome(&self.home_buffer, &self.tmp.?);
         };
+        try saveKeys(gpa, io, home, options.keys);
         self.environment = .init(gpa);
         errdefer self.environment.deinit();
         for (options.variables) |variable| try self.environment.put(variable[0], variable[1]);
@@ -232,16 +235,44 @@ fn render(writer: *std.Io.Writer, event: *const Registry.Event) std.Io.Writer.Er
             } else |err| try writer.print("login_ended:{s}:failed:{t}", .{ id, err });
         },
         .fetch_ended => |ended| {
-            const id = Account.table[ended.account].id;
-            try writer.print("fetch_ended:{s}:{d}", .{ id, ended.refresh.count });
-            if (ended.refresh.models_error) |err| try writer.print(":{t}", .{err});
-            if (ended.refresh.models_save_error) |err| try writer.print(":save:{t}", .{err});
-            if (ended.refresh.metadata_error) |err| try writer.print(":metadata:{t}", .{err});
-            if (ended.refresh.metadata_save_error) |err| try writer.print(
-                ":metadata_save:{t}",
-                .{err},
-            );
+            try writer.print("fetch_ended:{s}", .{Account.table[ended.account].id});
+            try renderRefresh(writer, &ended.refresh);
         },
+        .key_checked => |ended| {
+            const id = Account.table[ended.account].id;
+            const checked = ended.outcome catch |err|
+                return writer.print("key_checked:{s}:failed:{t}", .{ id, err });
+            try writer.print("key_checked:{s}:{t}", .{ id, checked.commit });
+            try renderRefresh(writer, &checked.refresh);
+        },
+    }
+}
+
+fn renderRefresh(
+    writer: *std.Io.Writer,
+    refresh: *const Registry.Refresh,
+) std.Io.Writer.Error!void {
+    try writer.print(":{d}", .{refresh.count});
+    if (refresh.models_error) |err| try writer.print(":{t}", .{err});
+    if (refresh.models_save_error) |err| try writer.print(":save:{t}", .{err});
+    if (refresh.metadata_error) |err| try writer.print(":metadata:{t}", .{err});
+    if (refresh.metadata_save_error) |err| try writer.print(":metadata_save:{t}", .{err});
+}
+
+pub fn saveKeys(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    home: []const u8,
+    keys: []const [2][]const u8,
+) !void {
+    if (keys.len == 0) return;
+    const path = try json_store.locate(gpa, &.{ .working_directory = ".", .home = home }, .auth);
+    defer gpa.free(path);
+    for (keys) |entry| {
+        std.debug.assert(Account.index(entry[0]) != null);
+        try json_store.save(gpa, io, &.{ .path = path, .key = entry[0] }, .{
+            .api_key = entry[1],
+        }, .{});
     }
 }
 

@@ -154,6 +154,7 @@ pub const Rig = struct {
         authenticated: bool = true,
         selected_account: usize = accounts.testing.openai_api_key,
         store: ?[]const u8 = null,
+        keys: []const [2][]const u8 = &.{},
         variables: []const [2][]const u8 = &.{},
         models: []const struct { account: usize, names: []const []const u8 } = &.{.{
             .account = accounts.testing.openai_api_key,
@@ -174,10 +175,14 @@ pub const Rig = struct {
         try self.tree.write(".git/HEAD", "ref: refs/heads/main\n");
         try self.tree.write(".drinky/config.json", options.config);
         if (options.store) |store| try self.tree.write(".drinky/auth.json", store);
+        if (options.authenticated) {
+            const key = [_][2][]const u8{.{ "openai-api-key", "key" }};
+            try accounts.testing.saveKeys(gpa, io, self.tree.root, &key);
+        }
+        try accounts.testing.saveKeys(gpa, io, self.tree.root, options.keys);
         for (options.files) |file| try self.tree.write(file[0], file[1]);
         self.environment = .init(gpa);
         errdefer self.environment.deinit();
-        if (options.authenticated) try self.environment.put("OPENAI_API_KEY", "key");
         for (options.variables) |variable| try self.environment.put(variable[0], variable[1]);
         var catalog: accounts.testing.Rig = undefined;
         try catalog.init(gpa, io, &.{ .home = self.tree.root });

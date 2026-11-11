@@ -90,6 +90,7 @@ response: Response = .{},
 recovered: ?[]const u8 = null,
 failed_path: ?[]u8 = null,
 gist_read: ?[]u8 = null,
+key_read: ?[]u8 = null,
 found_models: std.ArrayList(accounts.Model) = .empty,
 model_facts: std.ArrayList(query.Model) = .empty,
 turn_facts: std.ArrayList(query.Turn) = .empty,
@@ -156,6 +157,10 @@ pub const Handle = opaque {
         const self = controllerOf(handle);
         return self.gistText(id) catch core.fatal.outOfMemory();
     }
+    pub fn readKey(handle: *Handle, account: usize) ?[]const u8 {
+        const self = controllerOf(handle);
+        return self.keyText(account) catch core.fatal.outOfMemory();
+    }
     pub fn state(handle: *Handle) State {
         return controllerOf(handle).currentState();
     }
@@ -211,6 +216,7 @@ pub const Command = union(enum) {
     select_account: usize,
     sign_out: usize,
     submit_callback: Callback,
+    submit_key: Key,
     fetch_models: usize,
     select_model: ModelChoice,
     set_effort: core.Provider.Effort,
@@ -231,6 +237,7 @@ pub const Command = union(enum) {
 
     pub const Skill = struct { name: []const u8, arguments: []const u8, line: []const u8 };
     pub const Callback = struct { operation: u64, line: []const u8 };
+    pub const Key = struct { account: usize, value: []const u8 };
     pub const ModelChoice = struct { account: usize, model: []const u8 };
 };
 pub const Response = struct {
@@ -253,6 +260,7 @@ pub const Refusal = union(enum) {
     skill_unreadable: SkillUnreadable,
     account_unloaded: Unloaded,
     credential_missing: usize,
+    key_malformed,
     gist_failed: Gists.Failure,
     gist_invalid: []const u8,
 
@@ -657,6 +665,7 @@ fn deinit(self: *Controller) void {
     self.turn_facts.deinit(self.gpa);
     self.skill_facts.deinit(self.gpa);
     if (self.gist_read) |owned| self.gpa.free(owned);
+    if (self.key_read) |owned| self.gpa.free(owned);
     if (self.ready) {
         if (self.notice) |*notice| notice.deinit(self.gpa);
         self.dropResult();
@@ -682,8 +691,8 @@ fn selectRun(self: *Controller, value: []const u8, effort: core.Provider.Effort)
         self.startup_refusal = if (self.account_registry.loadError(account)) |err|
             .{ .account_unloaded = .{ .account = account, .cause = err } }
         else switch (accounts.Account.table[account].credential) {
-            .store => .{ .signed_out = account },
-            .environment, .key_file => .{ .credential_missing = account },
+            .login, .key => .{ .signed_out = account },
+            .key_file => .{ .credential_missing = account },
         };
         return;
     }
@@ -821,6 +830,14 @@ fn gistFacts(self: *Controller) error{OutOfMemory}!query.GistList {
         else => |cause| .{ .unreadable = cause },
     };
     return .{ .directory = self.gists.directory, .listing = listing };
+}
+
+fn keyText(self: *Controller, account: usize) error{OutOfMemory}!?[]const u8 {
+    if (self.key_read) |owned| self.gpa.free(owned);
+    self.key_read = null;
+    if (account >= query.account_count) return null;
+    self.key_read = try self.account_registry.storedKey(account, self.gpa);
+    return self.key_read;
 }
 
 fn gistText(self: *Controller, id: *const Gists.Id) error{OutOfMemory}!query.GistText {
@@ -997,7 +1014,10 @@ fn selectAccount(self: *Controller, account: usize) !void {
     if (row.hasLogin()) return self.startLogin(account);
     if (self.account_registry.loadError(account)) |err|
         return self.refuse(.{ .account_unloaded = .{ .account = account, .cause = err } });
-    self.refuse(.{ .credential_missing = account });
+    self.refuse(switch (row.credential) {
+        .login, .key => .signed_out,
+        .key_file => .{ .credential_missing = account },
+    });
 }
 
 fn currentUse(self: *Controller) Record.Event.Use {
@@ -1013,10 +1033,33 @@ fn stepOf(self: *Controller, account: usize) Record.Event.Step {
 
 fn signOut(self: *Controller, account: usize) !void {
     if (self.refuseBusy()) return;
-    if (account >= query.account_count or !accounts.Account.table[account].hasLogin() or
-        !self.account_registry.isAuthenticated(account)) return self.refuse(.unknown_target);
+    if (account >= query.account_count) return self.refuse(.unknown_target);
+    const signs_out = switch (accounts.Account.table[account].credential) {
+        .login, .key => true,
+        .key_file => false,
+    };
+    if (!signs_out or !self.account_registry.isAuthenticated(account))
+        return self.refuse(.unknown_target);
     try self.logoutAccount(account);
     try self.sync();
+}
+
+fn submitKey(self: *Controller, entry: *const Command.Key) !void {
+    if (self.refuseBusy()) return;
+    if (entry.account >= query.account_count) return self.refuse(.unknown_target);
+    switch (accounts.Account.table[entry.account].credential) {
+        .key => {},
+        .login, .key_file => return self.refuse(.unknown_target),
+    }
+    const value = std.mem.trim(u8, entry.value, &std.ascii.whitespace);
+    if (value.len == 0 or std.mem.findAny(u8, value, &std.ascii.whitespace) != null)
+        return self.refuse(.key_malformed);
+    if (self.account_registry.holdsKey(entry.account, value))
+        return self.selectAccount(entry.account);
+    try self.account_registry.send(&.{ .check_key = .{ .account = entry.account, .key = value } });
+    const id = self.nextOperation();
+    self.work = .{ .sign_in = .{ .id = id, .account = entry.account, .callback = false } };
+    self.response.operation = id;
 }
 
 fn submitCallback(self: *Controller, callback: *const Command.Callback) !void {
@@ -1295,6 +1338,11 @@ fn offerRetry(self: *Controller, failure: *const core.Provider.Failure) !void {
 }
 
 fn rejectCredential(self: *Controller, account: usize) !bool {
+    switch (accounts.Account.table[account].credential) {
+        .login => {},
+        .key => return self.rejectKey(account),
+        .key_file => return false,
+    }
     var maybe_removal_error: ?accounts.oauth.store.Error = null;
     const recovered = self.account_registry.invalidate(account) catch |err| switch (err) {
         error.AccountHasNoRefreshCredential => return false,
@@ -1323,6 +1371,18 @@ fn rejectCredential(self: *Controller, account: usize) !bool {
     return recovered;
 }
 
+fn rejectKey(self: *Controller, account: usize) !bool {
+    if (!try self.account_registry.reloadKey(account)) {
+        try self.recordEvent(&.{ .key_rejected = .{ .account = account, .key = .saved } });
+        return false;
+    }
+    if (self.choice.isActive(account)) {
+        self.clients.close();
+        try self.sync();
+    }
+    return true;
+}
+
 fn handOff(self: *Controller, account: usize, options: struct { rejected: bool }) !void {
     self.adopt(self.account_registry.firstAuthenticated());
     try self.sync();
@@ -1345,7 +1405,13 @@ fn adopt(self: *Controller, maybe_account: ?usize) void {
 fn applyAccountsEvent(self: *Controller, event: *const accounts.Registry.Event) !void {
     switch (event.*) {
         .paste_replayed, .paste_refused => self.paste_pending = false,
-        .refused, .authorization, .browser_launch_failed, .login_ended, .fetch_ended => {},
+        .refused,
+        .authorization,
+        .browser_launch_failed,
+        .login_ended,
+        .fetch_ended,
+        .key_checked,
+        => {},
     }
     switch (event.*) {
         .refused => unreachable,
@@ -1355,6 +1421,7 @@ fn applyAccountsEvent(self: *Controller, event: *const accounts.Registry.Event) 
         .paste_refused => |refusal| try self.reportPasteRefusal(refusal),
         .login_ended => |*ended| try self.finishLogin(ended),
         .fetch_ended => |*ended| try self.finishFetch(ended),
+        .key_checked => |*ended| try self.finishCheck(ended),
     }
 }
 
@@ -1427,6 +1494,15 @@ fn finishLogin(self: *Controller, ended: *const accounts.Registry.Event.LoginEnd
             .signed_in = false,
         } });
     };
+    try self.completeSignIn(&sign_in, &committed);
+}
+
+fn completeSignIn(
+    self: *Controller,
+    sign_in: *const Work.SignIn,
+    committed: *const accounts.oauth.store.Commit,
+) !void {
+    const account = sign_in.account;
     self.adopt(account);
     try self.sync();
     const signed_in: Record.Event = .{ .signed_in = .{
@@ -1436,7 +1512,7 @@ fn finishLogin(self: *Controller, ended: *const accounts.Registry.Event.LoginEnd
     if (sign_in.record_index) |index| {
         try self.surface.replaceEvent(index, &signed_in);
     } else try self.recordEvent(&signed_in);
-    switch (committed) {
+    switch (committed.*) {
         .saved => {},
         .memory_only => |*failure| try self.recordEvent(&.{
             .credentials_unsaved = .from(account, failure),
@@ -1447,6 +1523,34 @@ fn finishLogin(self: *Controller, ended: *const accounts.Registry.Event.LoginEnd
         .account = account,
         .signed_in = true,
     } });
+}
+
+fn finishCheck(self: *Controller, ended: *const accounts.Registry.Event.KeyEnd) !void {
+    const sign_in = (self.activeSignIn() orelse return).*;
+    if (sign_in.account != ended.account) return;
+    self.work = .idle;
+    self.clearNotice();
+    const account = sign_in.account;
+    const checked = ended.outcome catch |err| {
+        const failure: Record.Event = switch (err) {
+            error.Canceled => .{ .key_check_canceled = account },
+            error.ModelListUnauthorized, error.KeyUnauthorized => .{
+                .key_rejected = .{ .account = account, .key = .new },
+            },
+            else => .{ .key_unchecked = .{ .account = account, .cause = @errorName(err) } },
+        };
+        try self.setNotice(&failure);
+        return self.emit(&.{ .sign_in_ended = .{
+            .operation = sign_in.id,
+            .account = account,
+            .signed_in = false,
+        } });
+    };
+    if (!sign_in.canceled) {
+        if (Record.Event.fromRefresh(account, &checked.refresh)) |report|
+            try self.recordEvent(&report);
+    }
+    try self.completeSignIn(&sign_in, &checked.commit);
 }
 
 fn endFetch(self: *Controller, fetch: *const Work.Fetch, outcome: query.FetchOutcome) void {
@@ -1710,6 +1814,7 @@ fn execute(self: *Controller, value: *const Command) !void {
             .select_account,
             .sign_out,
             .submit_callback,
+            .submit_key,
             .fetch_models,
             .select_model,
             .set_effort,
@@ -1739,6 +1844,7 @@ fn execute(self: *Controller, value: *const Command) !void {
         .select_account,
         .sign_out,
         .submit_callback,
+        .submit_key,
         .fetch_models,
         .select_model,
         .set_effort,
@@ -1766,6 +1872,7 @@ fn execute(self: *Controller, value: *const Command) !void {
         .select_account => |account| try self.selectAccount(account),
         .sign_out => |account| try self.signOut(account),
         .submit_callback => |*callback| try self.submitCallback(callback),
+        .submit_key => |*entry| try self.submitKey(entry),
         .fetch_models => |account| try self.fetchModels(account),
         .select_model => |*choice| try self.selectModel(choice),
         .set_effort => |level| try self.setEffort(level),
@@ -2005,8 +2112,16 @@ test "state-dependent refusals name their reason and change nothing" {
     try expectRefusal(rig.send(&.{ .discard_result = 1 }), .stale);
     try expectRefusal(rig.send(&.{ .cancel = 1 }), .stale);
     try expectRefusal(
-        rig.send(&.{ .sign_out = accounts.testing.openai_api_key }),
+        rig.send(&.{ .sign_out = accounts.testing.google_cloud_key }),
         .unknown_target,
+    );
+    try expectRefusal(rig.send(&.{ .submit_key = .{
+        .account = accounts.testing.openai_plan,
+        .value = "sk-plan",
+    } }), .unknown_target);
+    for ([_][]const u8{ " \n", "sk-a b", "sk-a\tb", "sk-a\nb" }) |value| try expectRefusal(
+        rig.send(&.{ .submit_key = .{ .account = accounts.testing.xai_api_key, .value = value } }),
+        .key_malformed,
     );
     try expectRefusal(rig.send(&.{ .select_model = .{
         .account = accounts.testing.openai_api_key,
@@ -2020,9 +2135,10 @@ test "state-dependent refusals name their reason and change nothing" {
         rig.send(&.{ .fetch_models = accounts.testing.openai_plan }),
         .signed_out,
     );
+    try expectRefusal(rig.send(&.{ .select_account = accounts.testing.xai_api_key }), .signed_out);
     try expectRefusal(
-        rig.send(&.{ .select_account = accounts.testing.xai_api_key }),
-        .{ .credential_missing = accounts.testing.xai_api_key },
+        rig.send(&.{ .select_account = accounts.testing.google_cloud_key }),
+        .{ .credential_missing = accounts.testing.google_cloud_key },
     );
     const unchanged = try rig.snapshot();
     defer unchanged.deinit(std.testing.allocator);
@@ -2115,7 +2231,7 @@ test "unchanged selections are accepted with a notice and change nothing" {
 test "model prerequisites refuse skills, gists, and retry offers" {
     var rig: testing.Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "XAI_API_KEY", "xai-key" }},
+        .keys = &.{.{ "xai-api-key", "xai-key" }},
         .files = &.{.{
             ".agents/skills/demo/SKILL.md",
             "---\nname: demo\ndescription: Test skill.\n---\nFollow the skill.\n",
@@ -2502,7 +2618,7 @@ test "a callback refusal keeps the sign-in" {
 test "account facts expose remembered models and authors of inactive accounts" {
     var rig: testing.Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENROUTER_API_KEY", "sk-or" }},
+        .keys = &.{.{ "openrouter-api-key", "sk-or" }},
         .remembered = &.{.{
             .account = accounts.testing.openrouter_api_key,
             .name = "openai/gpt-gone",
@@ -2519,11 +2635,11 @@ test "account facts expose remembered models and authors of inactive accounts" {
     const router = facts[accounts.testing.openrouter_api_key];
     try std.testing.expectEqualStrings("openrouter-api-key", router.id);
     try std.testing.expectEqualStrings("openrouter", router.vendor);
-    try std.testing.expect(router.authenticated and !router.login and router.authors);
+    try std.testing.expect(router.authenticated and router.credential == .key and router.authors);
     try std.testing.expectEqualStrings("openai/gpt-gone", router.remembered.?.model);
     try std.testing.expectEqualStrings("openai", router.remembered.?.author);
     const plan = facts[accounts.testing.openai_plan];
-    try std.testing.expect(!plan.authenticated and plan.login);
+    try std.testing.expect(!plan.authenticated and plan.credential == .login);
     try std.testing.expect(plan.remembered == null);
     const models = rig.controller.listModels(accounts.testing.openrouter_api_key);
     try std.testing.expectEqual(@as(usize, 2), models.len);
@@ -2958,7 +3074,7 @@ test "a rejected model fetch of another account keeps the active account usable"
     options.authenticated = true;
     options.selected_account = accounts.testing.openai_api_key;
     options.store = testing.expired_plan_store;
-    options.variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }};
+    options.keys = &.{.{ "openai-api-key", "sk-openai" }};
     options.models = &.{
         .{ .account = accounts.testing.openai_plan, .names = &.{"gpt-5.6-sol"} },
         .{ .account = accounts.testing.openai_api_key, .names = &.{"gpt-5.6-sol"} },
@@ -3039,23 +3155,120 @@ test "a cancel ends the credential renewal of a model fetch and keeps the accoun
     try expectRequest(&rig, 1, "https://auth.openai.com/oauth/token\n");
 }
 
-test "a rejected key credential keeps its account" {
+test "a rejected key keeps its account and yields to the key that another instance saved" {
+    const key = accounts.testing.openai_api_key;
     var rig: testing.Rig = undefined;
-    try rig.init(&.{ .replies = &.{rejected_reply} });
+    try rig.init(&.{ .replies = &.{
+        rejected_reply,
+        rejected_reply,
+        .{ .body = providers.testing.reply_stream },
+    } });
     defer rig.deinit();
     _ = rig.send(&.{ .send_message = "hello" });
     try rig.expectTurn(.failed);
     const snapshot = try rig.snapshot();
     defer snapshot.deinit(std.testing.allocator);
-    try std.testing.expectEqual(
-        @as(?usize, accounts.testing.openai_api_key),
-        snapshot.state.choice.account,
-    );
+    try std.testing.expectEqual(@as(?usize, key), snapshot.state.choice.account);
     try std.testing.expectEqualDeep(Record.Event.Failure{
         .reason = .unauthorized,
         .details = "401 Unauthorized: expired",
     }, testing.eventOf(snapshot.records, .request_failed).?);
-    try std.testing.expectEqual(@as(usize, 1), rig.transport.requests.items.len);
+    try std.testing.expectEqual(Record.Event.KeyRejection{
+        .account = key,
+        .key = .saved,
+    }, testing.eventOf(snapshot.records, .key_rejected).?);
+    try std.testing.expectEqualStrings("key", rig.controller.readKey(key).?);
+
+    try accounts.testing.saveKeys(
+        std.testing.allocator,
+        std.testing.io,
+        rig.tree.root,
+        &.{.{ "openai-api-key", "key-new" }},
+    );
+    _ = rig.send(&.{ .send_message = "again" });
+    try rig.expectTurn(.failed);
+    const reloaded = try rig.snapshot();
+    defer reloaded.deinit(std.testing.allocator);
+    try std.testing.expectEqual(Record.Event.Reload{
+        .account = key,
+        .next = .retry_turn,
+    }, testing.eventOf(reloaded.records, .credential_reloaded).?);
+    _ = rig.send(&.{ .send_message = "once more" });
+    try rig.expectTurn(.stopped);
+    try expectRequest(&rig, 1, "authorization: Bearer key\n");
+    try expectRequest(&rig, 2, "authorization: Bearer key-new\n");
+}
+
+test "a new key signs in after its check, and an unchanged key switches without a check" {
+    const key = accounts.testing.xai_api_key;
+    var rig: testing.Rig = undefined;
+    try rig.init(&.{ .replies = &.{
+        .{ .body = "{\"data\":[{\"id\":\"grok-4.6\"}]}" },
+        .{ .body = "{\"data\":[{\"id\":\"x-ai/grok-4.6\",\"context_length\":1}]}" },
+    } });
+    defer rig.deinit();
+    try std.testing.expect(rig.controller.readKey(key) == null);
+    const started = rig.send(&.{ .submit_key = .{ .account = key, .value = " xai-new\n" } });
+    const operation = started.operation.?;
+    const checking = try rig.snapshot();
+    defer checking.deinit(std.testing.allocator);
+    try std.testing.expectEqual(State.SignIn{
+        .operation = operation,
+        .account = key,
+        .callback = false,
+    }, checking.state.work.sign_in);
+    try expectRefusal(rig.send(&.{ .submit_key = .{ .account = key, .value = "x" } }), .busy);
+    const ended = try rig.eventOf(.sign_in_ended);
+    try std.testing.expect(ended.sign_in_ended.signed_in);
+    const signed_in = try rig.snapshot();
+    defer signed_in.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(?usize, key), signed_in.state.choice.account);
+    try std.testing.expectEqual(key, testing.eventOf(signed_in.records, .signed_in).?.account);
+    try std.testing.expectEqualStrings("xai-new", rig.controller.readKey(key).?);
+    try expectRequest(&rig, 0, "authorization: Bearer xai-new\n");
+
+    const other = accounts.testing.openai_api_key;
+    try std.testing.expect(rig.send(&.{ .select_account = other }).accepted());
+    const switched = rig.send(&.{ .submit_key = .{ .account = key, .value = "xai-new" } });
+    try std.testing.expect(switched.accepted() and switched.operation == null);
+    try std.testing.expectEqual(@as(?usize, key), rig.controller.state().choice.account);
+    try std.testing.expectEqual(@as(usize, 2), rig.transport.requests.items.len);
+
+    try std.testing.expect(rig.send(&.{ .sign_out = key }).accepted());
+    try std.testing.expect(rig.controller.readKey(key) == null);
+    try std.testing.expect(!rig.controller.listAccounts()[key].authenticated);
+}
+
+test "a failed key check keeps the account signed out and names the rejection or the error" {
+    const key = accounts.testing.deepseek_api_key;
+    var stall: providers.testing.FakeTransport.Stall = .{ .io = std.testing.io };
+    var rig: testing.Rig = undefined;
+    try rig.init(&.{ .replies = &.{
+        .{ .status = .unauthorized },
+        .{ .status = .internal_server_error },
+        .{ .stall = &stall },
+    } });
+    defer rig.deinit();
+    const notices = [_]Record.Event{
+        .{ .key_rejected = .{ .account = key, .key = .new } },
+        .{ .key_unchecked = .{ .account = key, .cause = "ModelListRequestFailed" } },
+        .{ .key_check_canceled = key },
+    };
+    for (notices, 0..) |notice, index| {
+        const started = rig.send(&.{ .submit_key = .{ .account = key, .value = "sk-wrong" } });
+        if (index == 2) {
+            try stall.reached.wait(std.testing.io);
+            try std.testing.expect(rig.send(&.{ .cancel = started.operation.? }).accepted());
+        }
+        const ended = try rig.eventOf(.sign_in_ended);
+        try std.testing.expect(!ended.sign_in_ended.signed_in);
+        const failed = try rig.snapshot();
+        defer failed.deinit(std.testing.allocator);
+        try std.testing.expectEqualDeep(notice, failed.state.notice.?);
+        try std.testing.expect(!rig.controller.listAccounts()[key].authenticated);
+    }
+    try std.testing.expect(stall.canceled);
+    try std.testing.expect(rig.controller.readKey(key) == null);
 }
 
 const choice_call_stream =
@@ -3105,7 +3318,7 @@ test "requests and tools use the selected model and effort across turns" {
 test "a model selection switches the account and the model without a picker" {
     var rig: testing.Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "ANTHROPIC_API_KEY", "sk-ant" }},
+        .keys = &.{.{ "anthropic-api-key", "sk-ant" }},
         .models = &.{
             .{ .account = accounts.testing.openai_api_key, .names = &.{"gpt-5.6-sol"} },
             .{ .account = accounts.testing.anthropic_api_key, .names = &.{"claude-fable-5"} },

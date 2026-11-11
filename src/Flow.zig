@@ -177,6 +177,14 @@ fn onlyMatch(facts: []const application.query.Account, maybe_vendor: ?usize) ?us
     return only;
 }
 
+pub fn signsOut(fact: *const application.query.Account) bool {
+    if (!fact.authenticated) return false;
+    return switch (fact.credential) {
+        .login, .key => true,
+        .key_file => false,
+    };
+}
+
 pub fn forAccount(facts: []const application.query.Account, account: usize) Step {
     return if (facts[account].authors) .{ .author = account } else .{ .models = account };
 }
@@ -268,9 +276,10 @@ pub fn show(
                 if (active) shown.current = index;
                 const tag: ?[]const u8 = if (active)
                     null
-                else if (fact.authenticated)
-                    (if (fact.login) "Signed in" else "Set")
-                else if (fact.load_failed)
+                else if (fact.authenticated) switch (fact.credential) {
+                    .login, .key => "Signed in",
+                    .key_file => "Set",
+                } else if (fact.load_failed)
                     "Not loaded"
                 else
                     null;
@@ -284,7 +293,7 @@ pub fn show(
         .logout => {
             try self.setTitle("Sign out", .{});
             for (&facts, 0..) |*fact, index| {
-                if (!fact.login or !fact.authenticated) continue;
+                if (!signsOut(fact)) continue;
                 try self.addRow(.{ .sign_out = index }, &.{ .name = fact.id });
             }
         },
@@ -507,7 +516,7 @@ fn firstSentence(description: []const u8) []const u8 {
 test "the model flow resolves single choices and lists vendors, accounts, and model rows" {
     var rig: application.testing.Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "ANTHROPIC_API_KEY", "sk-ant" }},
+        .keys = &.{.{ "anthropic-api-key", "sk-ant" }},
         .store = "{\"anthropic-plan\":{\"access\":\"a\",\"refresh\":\"r\"," ++
             "\"expires_ms\":4102444800000}}",
         .models = &.{
@@ -574,7 +583,7 @@ test "the current mark follows the active account and not only the model name" {
     var rig: application.testing.Rig = undefined;
     try rig.init(&.{
         .authenticated = false,
-        .variables = &.{.{ "ANTHROPIC_API_KEY", "sk-ant" }},
+        .keys = &.{.{ "anthropic-api-key", "sk-ant" }},
         .store = "{\"anthropic-plan\":{\"access\":\"a\",\"refresh\":\"r\"," ++
             "\"expires_ms\":4102444800000}}",
         .selected_account = accounts.testing.anthropic_plan,
@@ -604,7 +613,7 @@ test "the current mark follows the active account and not only the model name" {
 test "the author step ranks authors and preselects a remembered author absent from the list" {
     var rig: application.testing.Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENROUTER_API_KEY", "sk-or" }},
+        .keys = &.{.{ "openrouter-api-key", "sk-or" }},
         .remembered = &.{.{
             .account = accounts.testing.openrouter_api_key,
             .name = "beta/gone",
@@ -692,11 +701,11 @@ test "the effort rows mark the current level and each level that the model folds
     try std.testing.expectEqual(application.Effort.xhigh, flow.target(3).effort);
 }
 
-test "the sign-in rows mark the active, the signed-in, the set, and the failed accounts" {
+test "the sign-in rows mark the active, the signed-in, and the failed accounts" {
     var rig: application.testing.Rig = undefined;
     try rig.init(&.{
+        .keys = &.{.{ "anthropic-api-key", "sk-ant" }},
         .variables = &.{
-            .{ "ANTHROPIC_API_KEY", "sk-ant" },
             .{ "GOOGLE_APPLICATION_CREDENTIALS", "key.json" },
             .{ "GOOGLE_CLOUD_LOCATION", "europe-west4" },
         },
@@ -714,7 +723,7 @@ test "the sign-in rows mark the active, the signed-in, the set, and the failed a
     const tags = [_]struct { account: usize, tag: ?[]const u8, pressure: bool }{
         .{ .account = accounts.testing.anthropic_plan, .tag = "Signed in", .pressure = false },
         .{ .account = accounts.testing.anthropic_api, .tag = null, .pressure = false },
-        .{ .account = accounts.testing.anthropic_api_key, .tag = "Set", .pressure = false },
+        .{ .account = accounts.testing.anthropic_api_key, .tag = "Signed in", .pressure = false },
         .{ .account = accounts.testing.openai_api_key, .tag = null, .pressure = false },
         .{ .account = accounts.testing.google_cloud_key, .tag = "Not loaded", .pressure = true },
     };
@@ -729,7 +738,11 @@ test "the sign-in rows mark the active, the signed-in, the set, and the failed a
     }
     try std.testing.expectEqual(accounts.testing.anthropic_plan, flow.target(0).sign_in);
     const logout = try flow.show(rig.controller, &choice, .logout);
-    try expectRows(&logout, "Sign out", &.{"anthropic-plan"});
+    try expectRows(
+        &logout,
+        "Sign out",
+        &.{ "anthropic-plan", "anthropic-api-key", "openai-api-key" },
+    );
     try std.testing.expectEqual(accounts.testing.anthropic_plan, flow.target(0).sign_out);
 }
 

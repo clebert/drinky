@@ -251,6 +251,24 @@ fn writeKeys(writer: *std.Io.Writer) !void {
         \\- Esc or Ctrl+D cancels the sign-in and keeps the draft.
         \\- Ctrl+C clears a draft, and it cancels the sign-in at an empty editor.
         \\
+        \\A pick of an API key account in `/login` opens the key step. The caption shows
+        \\`Sign in:` and the account. The editor shows the saved key in plain text, and the draft
+        \\waits until the step ends. Drinky saves each key in `~/.drinky/auth.json`. The key step
+        \\takes these keys:
+        \\
+        \\- Enter checks a new or changed key with the provider. Drinky saves the key only when the
+        \\  check succeeds, and then opens the model step. A failed check leaves the editor as it
+        \\  is.
+        \\- Enter on an unchanged key switches to the account at once.
+        \\- Enter on an empty editor warns first and removes the saved key on the second press.
+        \\  Without a saved key, Enter on an empty editor does nothing.
+        \\- Esc or Ctrl+D closes the step and returns the draft.
+        \\- Ctrl+C clears the editor, and it closes the step at an empty editor.
+        \\
+        \\During the check, Esc and Ctrl+D stop only the check, and the step stays open. Enter does
+        \\nothing then. Ctrl+C clears the editor, and it stops the check at an empty editor. A saved
+        \\key that the provider later rejects stays saved until a replacement or `/logout`.
+        \\
         \\A model fetch outside the model picker shows the caption `Model fetch:` and its account
         \\above the editor. An MCP client can start such a fetch. The fetch takes these keys:
         \\
@@ -281,9 +299,9 @@ fn writeKeys(writer: *std.Io.Writer) !void {
         \\the picker. During a model fetch in a picker, each of these keys cancels only the fetch
         \\and keeps the step.
         \\
-        \\This section names the keys of the prompt, a sign-in, a model fetch, a turn, and a
-        \\picker. A full-window page states its own keys in its header, and the editor carries the
-        \\movement keys of a text field.
+        \\This section names the keys of the prompt, a sign-in, a key step, a model fetch, a turn,
+        \\and a picker. A full-window page states its own keys in its header, and the editor
+        \\carries the movement keys of a text field.
         \\
     , .{ reference.repeat_window_ms, reference.repeat_window_ms });
 }

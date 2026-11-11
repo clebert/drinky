@@ -9,6 +9,7 @@ const Catalog = @import("Catalog.zig");
 const Client = @import("Client.zig");
 const google = @import("google/root.zig");
 const json_store = @import("json_store.zig");
+const Key = @import("Key.zig");
 const Metadata = @import("Metadata.zig");
 const Model = @import("Model.zig");
 const oauth = @import("oauth/root.zig");
@@ -47,6 +48,8 @@ pub const FetchError = paging.Error ||
     Metadata.FetchError ||
     oauth.store.TokenError ||
     error{SignedOut};
+
+pub const CheckError = FetchError || openrouter.key.Error;
 
 pub const Timeouts = std.EnumArray(Account.Vendor, providers.Transport.Timeouts);
 
@@ -109,11 +112,17 @@ pub const Sink = core.actor.Sink(Event);
 const Command = union(enum) {
     login: usize,
     fetch: usize,
+    check_key: KeyCheck,
     paste: []const u8,
     cancel,
 
+    const KeyCheck = struct { account: usize, key: []const u8 };
+
     fn dupe(self: *const Command, gpa: std.mem.Allocator) error{OutOfMemory}!Command {
         return switch (self.*) {
+            .check_key => |check| .{
+                .check_key = .{ .account = check.account, .key = try gpa.dupe(u8, check.key) },
+            },
             .paste => |line| .{ .paste = try gpa.dupe(u8, line) },
             .login, .fetch, .cancel => self.*,
         };
@@ -121,6 +130,7 @@ const Command = union(enum) {
 
     fn deinit(self: *const Command, gpa: std.mem.Allocator) void {
         switch (self.*) {
+            .check_key => |check| gpa.free(check.key),
             .paste => |line| gpa.free(line),
             .login, .fetch, .cancel => {},
         }
@@ -135,11 +145,12 @@ pub const Event = union(enum) {
     paste_refused: Paste,
     login_ended: LoginEnd,
     fetch_ended: FetchEnd,
+    key_checked: KeyEnd,
 
     pub const Refusal = struct {
         account: usize,
-        command: enum { login, fetch },
-        reason: enum { busy, no_login, signed_out },
+        command: enum { login, fetch, check },
+        reason: enum { busy, no_login, no_key, signed_out },
     };
 
     pub const Authorization = struct {
@@ -188,17 +199,28 @@ pub const Event = union(enum) {
         refresh: Refresh,
     };
 
+    pub const KeyEnd = struct {
+        account: usize,
+        outcome: CheckError!Checked,
+    };
+
+    pub const Checked = struct {
+        commit: oauth.store.Commit,
+        refresh: Refresh,
+    };
+
     pub fn dupe(self: *const Event, gpa: std.mem.Allocator) error{OutOfMemory}!Event {
         return switch (self.*) {
             .authorization => |*authorization| .{ .authorization = try authorization.dupe(gpa) },
             .login_ended => |ended| .{ .login_ended = .{
                 .account = ended.account,
-                .outcome = if (ended.outcome) |login| switch (login) {
-                    .saved => |path| .{ .saved = try gpa.dupe(u8, path) },
-                    .memory_only => |failure| .{ .memory_only = .{
-                        .path = try gpa.dupe(u8, failure.path),
-                        .save_error = failure.save_error,
-                    } },
+                .outcome = if (ended.outcome) |login| try dupeCommit(gpa, &login) else |err| err,
+            } },
+            .key_checked => |ended| .{ .key_checked = .{
+                .account = ended.account,
+                .outcome = if (ended.outcome) |checked| .{
+                    .commit = try dupeCommit(gpa, &checked.commit),
+                    .refresh = checked.refresh,
                 } else |err| err,
             } },
             .refused,
@@ -213,19 +235,34 @@ pub const Event = union(enum) {
     pub fn deinit(self: *const Event, gpa: std.mem.Allocator) void {
         switch (self.*) {
             .authorization => |*authorization| authorization.deinit(gpa),
-            .login_ended => |ended| {
-                const login = ended.outcome catch return;
-                switch (login) {
-                    .saved => |path| gpa.free(path),
-                    .memory_only => |failure| gpa.free(failure.path),
-                }
-            },
+            .login_ended => |ended| freeCommit(gpa, &(ended.outcome catch return)),
+            .key_checked => |ended| freeCommit(gpa, &(ended.outcome catch return).commit),
             .refused,
             .browser_launch_failed,
             .paste_replayed,
             .paste_refused,
             .fetch_ended,
             => {},
+        }
+    }
+
+    fn dupeCommit(
+        gpa: std.mem.Allocator,
+        commit: *const oauth.store.Commit,
+    ) error{OutOfMemory}!oauth.store.Commit {
+        return switch (commit.*) {
+            .saved => |path| .{ .saved = try gpa.dupe(u8, path) },
+            .memory_only => |failure| .{ .memory_only = .{
+                .path = try gpa.dupe(u8, failure.path),
+                .save_error = failure.save_error,
+            } },
+        };
+    }
+
+    fn freeCommit(gpa: std.mem.Allocator, commit: *const oauth.store.Commit) void {
+        switch (commit.*) {
+            .saved => |path| gpa.free(path),
+            .memory_only => |failure| gpa.free(failure.path),
         }
     }
 };
@@ -251,7 +288,8 @@ const Slot = union(enum) {
 
     fn deinit(self: *Slot) void {
         switch (self.*) {
-            .absent, .key => {},
+            .absent => {},
+            .key => |*key| key.deinit(),
             .login => |*login| switch (login.*) {
                 inline else => |*store| store.deinit(),
             },
@@ -268,44 +306,25 @@ const Login = union(Account.Login) {
     openrouter: oauth.Store(openrouter.oauth),
 };
 
-const Key = struct {
-    value: []const u8,
-
-    const vtable: providers.Credential.VTable = .{ .token = token, .renew = renew };
-
-    fn credential(self: *Key) providers.Credential {
-        return .{ .ptr = self, .vtable = &vtable };
-    }
-
-    fn token(ptr: *anyopaque, gpa: std.mem.Allocator) providers.Credential.Error!?[]const u8 {
-        const self: *Key = @ptrCast(@alignCast(ptr));
-        return try gpa.dupe(u8, self.value);
-    }
-
-    fn renew(ptr: *anyopaque) providers.Credential.Error!bool {
-        _ = ptr;
-        return false;
-    }
-};
-
 const Mail = union(enum) {
     command: Command,
     shown: Event.Authorization,
     browser_launch_failed: usize,
     login_ended: oauth.store.SignInError!oauth.store.Commit,
     fetch_ended: Refresh,
+    key_checked: CheckError!Event.Checked,
 
     pub fn deinit(self: *const Mail, gpa: std.mem.Allocator) void {
         switch (self.*) {
             .command => |*command| command.deinit(gpa),
             .shown => |*authorization| authorization.deinit(gpa),
-            .browser_launch_failed, .login_ended, .fetch_ended => {},
+            .browser_launch_failed, .login_ended, .fetch_ended, .key_checked => {},
         }
     }
 };
 
 const Worker = struct {
-    kind: enum { login, fetch },
+    kind: enum { login, fetch, check },
     account: usize,
     path_buffer: [oauth.callback.path_bytes_max]u8,
     path_length: usize,
@@ -402,10 +421,7 @@ fn load(
         .timeouts = self.timeouts.get(row.vendor),
     };
     switch (row.credential) {
-        .environment => |name| {
-            const key = environment.get(name) orelse return .absent;
-            return .{ .key = .{ .value = key } };
-        },
+        .key => return .{ .key = try self.openKey(row, options, load_error) },
         .key_file => {
             const key_path = environment.get(key_file_path_variable) orelse return .absent;
             const location = environment.get(key_file_location_variable) orelse return .absent;
@@ -421,12 +437,32 @@ fn load(
             };
             return .{ .google = auth };
         },
-        .store => |flow| return .{ .login = try self.openLogin(flow, &.{
+        .login => |flow| return .{ .login = try self.openLogin(flow, &.{
             .directories = options.directories,
             .account = row.id,
             .link = link,
         }, load_error) },
     }
+}
+
+fn openKey(
+    self: *Registry,
+    row: *const Account,
+    options: *const Options,
+    load_error: *?LoadError,
+) error{OutOfMemory}!Key {
+    var key = try Key.init(self.gpa, self.io, &.{
+        .directories = options.directories,
+        .account = row.id,
+    });
+    key.load() catch |err| switch (err) {
+        error.OutOfMemory => {
+            key.deinit();
+            return error.OutOfMemory;
+        },
+        else => load_error.* = err,
+    };
+    return key;
 }
 
 fn openLogin(
@@ -471,7 +507,8 @@ pub fn send(self: *Registry, command: *const Command) error{OutOfMemory}!void {
 pub fn isAuthenticated(self: *Registry, index: usize) bool {
     return switch (self.slots[index]) {
         .absent => false,
-        .key, .google => true,
+        .key => |*key| key.signedIn(),
+        .google => true,
         .login => |*login| switch (login.*) {
             inline else => |*store| store.signedIn(),
         },
@@ -541,8 +578,8 @@ pub fn takesPaste(account: *const Account) bool {
 
 fn callback(account: *const Account) ?Callback {
     const login = switch (account.credential) {
-        .store => |flow| flow,
-        .environment, .key_file => return null,
+        .login => |flow| flow,
+        .key, .key_file => return null,
     };
     switch (login) {
         inline else => |tag| {
@@ -564,7 +601,12 @@ pub fn logout(self: *Registry, index: usize) !void {
             self.load_errors[index] = null;
             self.catalog.dropAccount(index);
         },
-        .absent, .key, .google => return error.AccountHasNoLogout,
+        .key => |*key| {
+            try key.remove();
+            self.load_errors[index] = null;
+            self.catalog.dropAccount(index);
+        },
+        .absent, .google => return error.AccountHasNoLogout,
     }
 }
 
@@ -586,6 +628,35 @@ pub fn invalidate(
             .api_key => return error.AccountHasNoRefreshCredential,
         },
     }
+}
+
+pub fn holdsKey(self: *Registry, index: usize, value: []const u8) bool {
+    return switch (self.slots[index]) {
+        .key => |*key| key.holds(value),
+        .absent, .login, .google => false,
+    };
+}
+
+pub fn storedKey(
+    self: *Registry,
+    index: usize,
+    gpa: std.mem.Allocator,
+) error{OutOfMemory}!?[]u8 {
+    return switch (self.slots[index]) {
+        .key => |*key| key.stored(gpa),
+        .absent, .login, .google => null,
+    };
+}
+
+pub fn reloadKey(self: *Registry, index: usize) error{OutOfMemory}!bool {
+    const key = switch (self.slots[index]) {
+        .key => |*key| key,
+        .absent, .login, .google => return false,
+    };
+    if (!try key.reload()) return false;
+    self.load_errors[index] = null;
+    self.catalog.dropAccount(index);
+    return true;
 }
 
 pub fn findModel(self: *Registry, index: usize, name: []const u8) ?Model {
@@ -621,6 +692,7 @@ fn serve(self: *Registry) core.actor.Mailbox(Mail, mail_capacity).Error!void {
             .browser_launch_failed => |account| self.emit(&.{ .browser_launch_failed = account }),
             .login_ended => |outcome| self.endLogin(outcome),
             .fetch_ended => |result| self.endFetch(result),
+            .key_checked => |outcome| self.endCheck(outcome),
         }
     }
 }
@@ -629,6 +701,7 @@ fn handle(self: *Registry, command: Command) void {
     switch (command) {
         .login => |index| self.startLogin(index),
         .fetch => |index| self.startFetch(index),
+        .check_key => |check| self.startCheck(check),
         .paste => |line| {
             defer self.gpa.free(line);
             self.paste(line);
@@ -640,39 +713,52 @@ fn handle(self: *Registry, command: Command) void {
 fn startLogin(self: *Registry, index: usize) void {
     if (self.worker != null) return self.refuse(index, .login, .busy);
     if (!Account.table[index].hasLogin()) return self.refuse(index, .login, .no_login);
-    self.startWorker(.login, index, runLogin);
+    self.startWorker(.login, index, runLogin, .{ self, index }) catch |err|
+        self.emit(&.{ .login_ended = .{ .account = index, .outcome = err } });
 }
 
 fn startFetch(self: *Registry, index: usize) void {
     if (self.worker != null) return self.refuse(index, .fetch, .busy);
     if (!self.isAuthenticated(index)) return self.refuse(index, .fetch, .signed_out);
-    self.startWorker(.fetch, index, runFetch);
+    self.startWorker(.fetch, index, runFetch, .{ self, index }) catch |err|
+        self.emit(&.{ .fetch_ended = .{ .account = index, .refresh = .{ .models_error = err } } });
+}
+
+fn startCheck(self: *Registry, check: Command.KeyCheck) void {
+    const index = check.account;
+    if (self.worker != null) {
+        self.gpa.free(check.key);
+        return self.refuse(index, .check, .busy);
+    }
+    const key = switch (self.slots[index]) {
+        .key => |*key| key,
+        .absent, .login, .google => {
+            self.gpa.free(check.key);
+            return self.refuse(index, .check, .no_key);
+        },
+    };
+    self.startWorker(.check, index, runCheck, .{ self, index, key, check.key }) catch |err| {
+        self.gpa.free(check.key);
+        self.emit(&.{ .key_checked = .{ .account = index, .outcome = err } });
+    };
 }
 
 fn startWorker(
     self: *Registry,
     kind: @FieldType(Worker, "kind"),
     index: usize,
-    comptime work: fn (*Registry, usize) Mail,
-) void {
+    comptime work: anytype,
+    args: std.meta.ArgsTuple(@TypeOf(work)),
+) std.Io.ConcurrentError!void {
     self.worker = .{
         .kind = kind,
         .account = index,
         .path_buffer = undefined,
         .path_length = 0,
     };
-    self.mailbox.start(self.io, work, .{ self, index }) catch |err| {
+    self.mailbox.start(self.io, work, args) catch |err| {
         self.worker = null;
-        return switch (kind) {
-            .login => self.emit(&.{ .login_ended = .{
-                .account = index,
-                .outcome = err,
-            } }),
-            .fetch => self.emit(&.{ .fetch_ended = .{
-                .account = index,
-                .refresh = .{ .models_error = err },
-            } }),
-        };
+        return err;
     };
 }
 
@@ -706,6 +792,45 @@ fn runFetch(self: *Registry, index: usize) Mail {
     return .{ .fetch_ended = self.refresh(index) };
 }
 
+fn runCheck(self: *Registry, index: usize, key: *Key, candidate: []const u8) Mail {
+    defer self.gpa.free(candidate);
+    const checked = self.checkKey(index, key, candidate);
+    if (checked) |_| {} else |err| if (err == error.OutOfMemory) core.fatal.outOfMemory();
+    return .{ .key_checked = checked };
+}
+
+fn checkKey(
+    self: *Registry,
+    index: usize,
+    key: *Key,
+    candidate: []const u8,
+) CheckError!Event.Checked {
+    const deadline = core.timeout.Deadline.start(self.io, self.timeoutsOf(index).connect_ms);
+    const row = &Account.table[index];
+    const listed: ?[]Model = switch (row.model_source) {
+        .public => switch (row.vendor) {
+            .openrouter => public: {
+                try openrouter.key.verify(self.gpa, self.io, self.transport, &deadline, candidate);
+                break :public null;
+            },
+            .anthropic, .openai, .xai, .deepseek, .google => unreachable,
+        },
+        .messages => try self.requestMessages(row.dialect.messages, &deadline, candidate),
+        .responses => try self.requestResponses(row, &deadline, candidate),
+        .codex, .gemini => unreachable,
+    };
+    defer if (listed) |models| self.gpa.free(models);
+    const metadata = Metadata.fetch(self.gpa, self.io, self.transport, &deadline);
+    if (metadata) |_| {} else |err| if (err == error.Canceled) return error.Canceled;
+    const commit = try key.commit(candidate);
+    var result: Refresh = .{};
+    if (listed) |models| {
+        recordSave(&result.models_save_error, self.catalog.setAccount(index, models));
+    }
+    self.finishRefresh(index, metadata, &result);
+    return .{ .commit = commit, .refresh = result };
+}
+
 fn endLogin(self: *Registry, outcome: oauth.store.SignInError!oauth.store.Commit) void {
     const account = self.reap() orelse return;
     self.emit(&.{ .login_ended = .{ .account = account, .outcome = outcome } });
@@ -714,6 +839,11 @@ fn endLogin(self: *Registry, outcome: oauth.store.SignInError!oauth.store.Commit
 fn endFetch(self: *Registry, result: Refresh) void {
     const account = self.reap() orelse return;
     self.emit(&.{ .fetch_ended = .{ .account = account, .refresh = result } });
+}
+
+fn endCheck(self: *Registry, outcome: CheckError!Event.Checked) void {
+    const account = self.reap() orelse return;
+    self.emit(&.{ .key_checked = .{ .account = account, .outcome = outcome } });
 }
 
 fn reap(self: *Registry) ?usize {
@@ -776,9 +906,7 @@ fn emit(self: *Registry, event: *const Event) void {
 fn refresh(self: *Registry, index: usize) Refresh {
     const deadline = core.timeout.Deadline.start(self.io, self.timeoutsOf(index).connect_ms);
     var result: Refresh = .{};
-    const public = Account.table[index].model_source == .public;
-
-    if (!public) {
+    if (Account.table[index].model_source != .public) {
         if (self.fetchModels(index, &deadline)) |discovered| {
             defer self.gpa.free(discovered);
             recordSave(&result.models_save_error, self.catalog.setAccount(index, discovered));
@@ -789,18 +917,31 @@ fn refresh(self: *Registry, index: usize) Refresh {
         if (isCanceled(FetchError, result.models_error)) return result;
         if (isCanceled(json_store.SaveError, result.models_save_error)) return result;
     }
-    if (Metadata.fetch(self.gpa, self.io, self.transport, &deadline)) |metadata| {
+    const metadata = Metadata.fetch(self.gpa, self.io, self.transport, &deadline);
+    self.finishRefresh(index, metadata, &result);
+    return result;
+}
+
+fn finishRefresh(
+    self: *Registry,
+    index: usize,
+    fetched: Metadata.FetchError!Metadata,
+    result: *Refresh,
+) void {
+    if (fetched) |metadata| {
         recordSave(&result.metadata_save_error, self.catalog.setMetadata(metadata));
     } else |err| {
         if (err == error.OutOfMemory) core.fatal.outOfMemory();
-        if (public) result.models_error = err else result.metadata_error = err;
+        if (Account.table[index].model_source == .public)
+            result.models_error = err
+        else
+            result.metadata_error = err;
     }
 
     var listed: std.ArrayList(Model) = .empty;
     defer listed.deinit(self.gpa);
     self.catalog.list(index, &listed, self.gpa) catch core.fatal.outOfMemory();
     result.count = listed.items.len;
-    return result;
 }
 
 fn modelsUrl(gpa: std.mem.Allocator, row: *const Account) error{OutOfMemory}![]u8 {
@@ -857,24 +998,22 @@ fn requestModels(
     defer secrets.deinit();
     const copies = secrets.allocator();
     switch (row.model_source) {
-        .messages => return anthropic.models.fetch(self.gpa, self.io, self.transport, deadline, &.{
-            .identity = row.dialect.messages,
-            .token = try self.fetchToken(index, deadline, copies),
-        }),
+        .messages => return self.requestMessages(
+            row.dialect.messages,
+            deadline,
+            try self.fetchToken(index, deadline, copies),
+        ),
+        .responses => return self.requestResponses(
+            row,
+            deadline,
+            try self.fetchToken(index, deadline, copies),
+        ),
         .codex => {
             const token = try self.fetchToken(index, deadline, copies);
             const account_id = (try slot.login.chatgpt.copyField("account_id", copies)) orelse "";
             return openai.models.fetchSubscription(self.gpa, self.io, self.transport, deadline, &.{
                 .token = token,
                 .account_id = account_id,
-            });
-        },
-        .responses => {
-            const endpoint = try modelsUrl(self.gpa, row);
-            defer self.gpa.free(endpoint);
-            return responses.models.fetch(self.gpa, self.io, self.transport, deadline, &.{
-                .endpoint = endpoint,
-                .token = try self.fetchToken(index, deadline, copies),
             });
         },
         .gemini => return google.models.fetch(self.gpa, self.io, self.transport, deadline, &.{
@@ -885,6 +1024,32 @@ fn requestModels(
     }
 }
 
+fn requestMessages(
+    self: *Registry,
+    identity: providers.Messages.Identity,
+    deadline: *const core.timeout.Deadline,
+    token: []const u8,
+) FetchError![]Model {
+    return anthropic.models.fetch(self.gpa, self.io, self.transport, deadline, &.{
+        .identity = identity,
+        .token = token,
+    });
+}
+
+fn requestResponses(
+    self: *Registry,
+    row: *const Account,
+    deadline: *const core.timeout.Deadline,
+    token: []const u8,
+) FetchError![]Model {
+    const endpoint = try modelsUrl(self.gpa, row);
+    defer self.gpa.free(endpoint);
+    return responses.models.fetch(self.gpa, self.io, self.transport, deadline, &.{
+        .endpoint = endpoint,
+        .token = token,
+    });
+}
+
 fn fetchToken(
     self: *Registry,
     index: usize,
@@ -892,7 +1057,7 @@ fn fetchToken(
     copies: std.mem.Allocator,
 ) ![]const u8 {
     return switch (self.slots[index]) {
-        .key => |key| key.value,
+        .key => |*key| (try key.copy(copies)) orelse error.SignedOut,
         .login => |*login| switch (login.*) {
             inline else => |*store| switch (comptime @TypeOf(store.*).flow.secret) {
                 .access_token => deadline.run(
@@ -909,7 +1074,7 @@ fn fetchToken(
     };
 }
 
-test "the environment keys authenticate their accounts, and a login account comes first" {
+test "the saved keys authenticate their accounts, and a login account comes first" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -917,10 +1082,18 @@ test "the environment keys authenticate their accounts, and a login account come
     var home_buffer: [128]u8 = undefined;
     const home = try testing.tmpHome(&home_buffer, &tmp);
 
+    var none: testing.Rig = undefined;
+    try none.init(gpa, io, &.{
+        .home = home,
+        .variables = &.{.{ "ANTHROPIC_API_KEY", "sk-ant" }},
+    });
+    defer none.deinit();
+    try std.testing.expect(none.registry.firstAuthenticated() == null);
+
     var keys: testing.Rig = undefined;
-    try keys.init(gpa, io, &.{ .home = home, .variables = &.{
-        .{ "ANTHROPIC_API_KEY", "sk-ant" },
-        .{ "OPENAI_API_KEY", "sk-openai" },
+    try keys.init(gpa, io, &.{ .home = home, .keys = &.{
+        .{ "anthropic-api-key", "sk-ant" },
+        .{ "openai-api-key", "sk-openai" },
     } });
     defer keys.deinit();
     try std.testing.expect(keys.registry.isAuthenticated(testing.anthropic_api_key));
@@ -934,21 +1107,14 @@ test "the environment keys authenticate their accounts, and a login account come
     try expectToken("sk-ant", keys.registry.credential(testing.anthropic_api_key).?);
     try std.testing.expect(!try keys.registry.credential(testing.anthropic_api_key).?.renew());
 
-    var none: testing.Rig = undefined;
-    try none.init(gpa, io, &.{ .home = home });
-    defer none.deinit();
-    try std.testing.expect(none.registry.firstAuthenticated() == null);
-
     try testing.writeStore(io, &tmp,
         \\{ "openai-plan":
         \\    { "access": "a", "refresh": "r", "expires_ms": 4102444800000,
-        \\      "account_id": "account" } }
+        \\      "account_id": "account" },
+        \\  "anthropic-api-key": { "api_key": "sk-ant" } }
     );
     var signed_in: testing.Rig = undefined;
-    try signed_in.init(gpa, io, &.{
-        .home = home,
-        .variables = &.{.{ "ANTHROPIC_API_KEY", "sk-ant" }},
-    });
+    try signed_in.init(gpa, io, &.{ .home = home });
     defer signed_in.deinit();
     try std.testing.expect(signed_in.registry.isAuthenticated(testing.openai_plan));
     try std.testing.expectEqual(testing.openai_plan, signed_in.registry.firstAuthenticated().?);
@@ -962,14 +1128,15 @@ test "a malformed store leaves its accounts signed out, and the other accounts s
     defer tmp.cleanup();
     var home_buffer: [128]u8 = undefined;
     const home = try testing.tmpHome(&home_buffer, &tmp);
-    const variables = [_][2][]const u8{.{ "ANTHROPIC_API_KEY", "sk-ant" }};
 
     try testing.writeStore(io, &tmp,
         \\{ "openai-plan": { "access": "a" },
-        \\  "xai-plan": { "access": "a", "refresh": "r", "expires_ms": 4102444800000 } }
+        \\  "xai-plan": { "access": "a", "refresh": "r", "expires_ms": 4102444800000 },
+        \\  "xai-api-key": { "key": "xai" },
+        \\  "anthropic-api-key": { "api_key": "sk-ant" } }
     );
     var entry: testing.Rig = undefined;
-    try entry.init(gpa, io, &.{ .home = home, .variables = &variables });
+    try entry.init(gpa, io, &.{ .home = home });
     defer entry.deinit();
     try std.testing.expect(!entry.registry.isAuthenticated(testing.openai_plan));
     try std.testing.expectEqual(
@@ -979,22 +1146,27 @@ test "a malformed store leaves its accounts signed out, and the other accounts s
     try std.testing.expect(entry.registry.isAuthenticated(testing.xai_plan));
     try std.testing.expect(entry.registry.loadError(testing.xai_plan) == null);
     try std.testing.expect(entry.registry.isAuthenticated(testing.anthropic_api_key));
+    try std.testing.expect(!entry.registry.isAuthenticated(testing.xai_api_key));
+    try std.testing.expectEqual(
+        @as(?LoadError, error.BadCredentials),
+        entry.registry.loadError(testing.xai_api_key),
+    );
     try entry.registry.logout(testing.openai_plan);
     try std.testing.expect(entry.registry.loadError(testing.openai_plan) == null);
 
     try testing.writeStore(io, &tmp, "not json");
     var file: testing.Rig = undefined;
-    try file.init(gpa, io, &.{ .home = home, .variables = &variables });
+    try file.init(gpa, io, &.{ .home = home });
     defer file.deinit();
     for (Account.table, 0..) |row, index| {
-        if (row.credential != .store) continue;
+        if (row.credential == .key_file) continue;
         try std.testing.expect(!file.registry.isAuthenticated(index));
         try std.testing.expectEqual(
             @as(?LoadError, error.BadCredentials),
             file.registry.loadError(index),
         );
     }
-    try std.testing.expectEqual(testing.anthropic_api_key, file.registry.firstAuthenticated().?);
+    try std.testing.expect(file.registry.firstAuthenticated() == null);
 }
 
 test "a client opens for an authenticated account and not for a signed-out one" {
@@ -1011,7 +1183,7 @@ test "a client opens for an authenticated account and not for a signed-out one" 
     try rig.init(gpa, io, &.{
         .home = home,
         .timeouts = timeouts,
-        .variables = &.{.{ "XAI_API_KEY", "xai-key" }},
+        .keys = &.{.{ "xai-api-key", "xai-key" }},
     });
     defer rig.deinit();
 
@@ -1094,11 +1266,14 @@ test "the key file account loads from the key file and records a failed load" {
     );
 
     var bad_location: testing.Rig = undefined;
-    try bad_location.init(gpa, io, &.{ .home = home, .variables = &.{
-        .{ "ANTHROPIC_API_KEY", "sk-ant" },
-        .{ "GOOGLE_APPLICATION_CREDENTIALS", key_path },
-        .{ "GOOGLE_CLOUD_LOCATION", "europe-west4" },
-    } });
+    try bad_location.init(gpa, io, &.{
+        .home = home,
+        .keys = &.{.{ "anthropic-api-key", "sk-ant" }},
+        .variables = &.{
+            .{ "GOOGLE_APPLICATION_CREDENTIALS", key_path },
+            .{ "GOOGLE_CLOUD_LOCATION", "europe-west4" },
+        },
+    });
     defer bad_location.deinit();
     try std.testing.expectEqual(
         @as(?LoadError, error.BadLocation),
@@ -1112,7 +1287,7 @@ test "the key file account loads from the key file and records a failed load" {
 
 test "an account has a callback listener exactly when it has a callback login" {
     for (&Account.table) |*account| {
-        const callback_login = account.hasLogin() and account.credential.store != .grok;
+        const callback_login = account.hasLogin() and account.credential.login != .grok;
         try std.testing.expectEqual(callback_login, callback(account) != null);
     }
     try std.testing.expectEqual(
@@ -1143,7 +1318,7 @@ test "an account has a callback listener exactly when it has a callback login" {
     );
 }
 
-test "logout and invalidation refuse the accounts without a store credential" {
+test "logout refuses the key file, and invalidation refuses each account without a refresh token" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1151,18 +1326,12 @@ test "logout and invalidation refuse the accounts without a store credential" {
     var home_buffer: [128]u8 = undefined;
     const home = try testing.tmpHome(&home_buffer, &tmp);
     var rig: testing.Rig = undefined;
-    try rig.init(gpa, io, &.{ .home = home, .variables = &.{.{ "ANTHROPIC_API_KEY", "sk-ant" }} });
+    try rig.init(gpa, io, &.{ .home = home, .keys = &.{.{ "anthropic-api-key", "sk-ant" }} });
     defer rig.deinit();
-    for ([_]usize{
-        testing.anthropic_api_key,
-        testing.openai_api_key,
-        testing.xai_api_key,
-        testing.openrouter_api_key,
-        testing.deepseek_api_key,
-        testing.google_cloud_key,
-    }) |index| {
-        try std.testing.expectError(error.AccountHasNoLogout, rig.registry.logout(index));
-    }
+    try std.testing.expectError(
+        error.AccountHasNoLogout,
+        rig.registry.logout(testing.google_cloud_key),
+    );
     for ([_]usize{
         testing.anthropic_api,
         testing.anthropic_api_key,
@@ -1282,6 +1451,7 @@ test "a logout removes the store entry and the model list" {
     const home = try testing.tmpHome(&home_buffer, &tmp);
     try testing.writeStore(io, &tmp,
         \\{ "openrouter-api": { "api_key": "sk-or-v1-x" },
+        \\  "deepseek-api-key": { "api_key": "sk-deepseek" },
         \\  "anthropic-api": { "api_key": "sk-ant-api03-x" } }
     );
 
@@ -1291,17 +1461,135 @@ test "a logout removes the store entry and the model list" {
     try std.testing.expect(rig.registry.isAuthenticated(testing.openrouter_api));
     try std.testing.expect(rig.registry.isAuthenticated(testing.anthropic_api));
     try expectToken("sk-or-v1-x", rig.registry.credential(testing.openrouter_api).?);
+    try rig.seed(testing.deepseek_api_key, &.{"deepseek-v4-pro"});
 
     try rig.registry.logout(testing.openrouter_api);
+    try rig.registry.logout(testing.deepseek_api_key);
     try std.testing.expect(!rig.registry.isAuthenticated(testing.openrouter_api));
     try std.testing.expect(rig.registry.credential(testing.openrouter_api) == null);
+    try std.testing.expect(!rig.registry.isAuthenticated(testing.deepseek_api_key));
+    try std.testing.expect(!rig.registry.offersModel(testing.deepseek_api_key));
     try std.testing.expect(rig.registry.isAuthenticated(testing.anthropic_api));
     var path_buffer: [160]u8 = undefined;
     const store_path = try testing.tmpPath(&path_buffer, &tmp, ".drinky/auth.json");
     var file = (try json_store.open(gpa, io, store_path)).?;
     defer file.deinit();
     try std.testing.expect(file.entry("openrouter-api") == null);
+    try std.testing.expect(file.entry("deepseek-api-key") == null);
     try std.testing.expect(file.entry("anthropic-api") != null);
+}
+
+test "a key check saves a listed key, and a rejected key stays out of the store" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var rig: testing.Rig = undefined;
+    try rig.init(gpa, io, &.{ .replies = &.{
+        .{ .status = .unauthorized },
+        .{ .body = "{\"data\":[{\"id\":\"deepseek-v4-pro\"}]}" },
+        .{ .body = "{\"data\":[{\"id\":\"deepseek/deepseek-v4-pro\",\"context_length\":1}]}" },
+    } });
+    defer rig.deinit();
+    try rig.registry.start();
+    const account = testing.deepseek_api_key;
+
+    try rig.registry.send(&.{ .check_key = .{ .account = account, .key = "sk-wrong" } });
+    try rig.recorder.expect("key_checked:deepseek-api-key:failed:ModelListUnauthorized");
+    try std.testing.expect(!rig.registry.isAuthenticated(account));
+    var path_buffer: [160]u8 = undefined;
+    const store_path = try testing.tmpPath(&path_buffer, &rig.tmp.?, ".drinky/auth.json");
+    try std.testing.expect(try json_store.open(gpa, io, store_path) == null);
+
+    try rig.registry.send(&.{ .check_key = .{ .account = account, .key = "sk-right" } });
+    try rig.recorder.expect("key_checked:deepseek-api-key:saved:1");
+    try std.testing.expect(rig.registry.holdsKey(account, "sk-right"));
+    try expectToken("sk-right", rig.registry.credential(account).?);
+    try std.testing.expect(rig.registry.findModel(account, "deepseek-v4-pro") != null);
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        rig.transport.requests.items[0],
+        "GET https://api.deepseek.com/v1/models\nauthorization: Bearer sk-wrong\n",
+    ));
+    var file = (try json_store.open(gpa, io, store_path)).?;
+    defer file.deinit();
+    const entry = file.entry("deepseek-api-key").?;
+    try std.testing.expectEqualStrings("sk-right", entry.get("api_key").?.string);
+}
+
+test "a cancel during the metadata request of a key check leaves the key unsaved" {
+    var stall: providers.testing.FakeTransport.Stall = .{ .io = std.testing.io };
+    var rig: testing.Rig = undefined;
+    try rig.init(std.testing.allocator, std.testing.io, &.{ .replies = &.{
+        .{ .body = "{\"data\":[{\"id\":\"deepseek-v4-pro\"}]}" },
+        .{ .stall = &stall },
+    } });
+    defer rig.deinit();
+    try rig.registry.start();
+    const account = testing.deepseek_api_key;
+
+    try rig.registry.send(&.{ .check_key = .{ .account = account, .key = "sk-right" } });
+    try stall.reached.wait(std.testing.io);
+    try rig.registry.send(&.cancel);
+    try rig.recorder.expect("key_checked:deepseek-api-key:failed:Canceled");
+    try std.testing.expect(stall.canceled);
+    try std.testing.expect(!rig.registry.isAuthenticated(account));
+    try std.testing.expect(!rig.registry.offersModel(account));
+}
+
+test "an OpenRouter key check asks for the key and then takes the public list" {
+    var rig: testing.Rig = undefined;
+    try rig.init(std.testing.allocator, std.testing.io, &.{ .replies = &.{
+        .{ .body = "{\"data\":{\"label\":\"sk-or-v1-x\"}}" },
+        .{ .body = "{\"data\":[{\"id\":\"openai/gpt-5.6-sol\"," ++
+            "\"context_length\":1050000,\"supported_parameters\":[\"tools\"]}]}" },
+    } });
+    defer rig.deinit();
+    try rig.registry.start();
+
+    try rig.registry.send(&.{
+        .check_key = .{ .account = testing.openrouter_api_key, .key = "sk-or-v1-x" },
+    });
+    try rig.recorder.expect("key_checked:openrouter-api-key:saved:1");
+    const requests = rig.transport.requests.items;
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        requests[0],
+        "GET https://openrouter.ai/api/v1/key\nauthorization: Bearer sk-or-v1-x\n",
+    ));
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        requests[1],
+        "GET https://openrouter.ai/api/v1/models\n",
+    ));
+}
+
+test "a key reload adopts the key of another instance, and a stored key prefers the file" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var rig: testing.Rig = undefined;
+    try rig.init(gpa, io, &.{ .keys = &.{.{ "deepseek-api-key", "sk-old" }} });
+    defer rig.deinit();
+    const account = testing.deepseek_api_key;
+    try rig.seed(account, &.{"deepseek-v4-pro"});
+    var home_buffer: [128]u8 = undefined;
+    const home = try testing.tmpHome(&home_buffer, &rig.tmp.?);
+
+    try std.testing.expect(!try rig.registry.reloadKey(account));
+    try testing.saveKeys(gpa, io, home, &.{.{ "deepseek-api-key", "sk-new" }});
+    const stored = (try rig.registry.storedKey(account, gpa)).?;
+    defer gpa.free(stored);
+    try std.testing.expectEqualStrings("sk-new", stored);
+    try std.testing.expect(rig.registry.holdsKey(account, "sk-old"));
+
+    try std.testing.expect(try rig.registry.reloadKey(account));
+    try std.testing.expect(rig.registry.holdsKey(account, "sk-new"));
+    try std.testing.expect(!rig.registry.offersModel(account));
+
+    try testing.writeStore(io, &rig.tmp.?, "{}");
+    try std.testing.expect(!try rig.registry.reloadKey(account));
+    const kept = (try rig.registry.storedKey(account, gpa)).?;
+    defer gpa.free(kept);
+    try std.testing.expectEqualStrings("sk-new", kept);
+    try std.testing.expect(try rig.registry.storedKey(testing.anthropic_plan, gpa) == null);
 }
 
 test "a failed cache write reports a failed save, not a failed fetch" {
@@ -1312,7 +1600,7 @@ test "a failed cache write reports a failed save, not a failed fetch" {
     const io = clock.io();
     var rig: testing.Rig = undefined;
     try rig.init(gpa, io, &.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
         .replies = &.{
             .{ .body = "{\"data\":[{\"id\":\"gpt-5.6-sol\"}]}" },
             .{ .body = "{\"data\":[{\"id\":\"openai/gpt-5.6-sol\",\"context_length\":1050000}]}" },
@@ -1337,9 +1625,9 @@ test "an expired window ends both parts of a fetch without a request" {
     clock.init(gpa, std.time.ms_per_hour);
     defer clock.deinit();
     var rig: testing.Rig = undefined;
-    try rig.init(gpa, clock.io(), &.{ .variables = &.{
-        .{ "ANTHROPIC_API_KEY", "sk-ant" },
-        .{ "OPENAI_API_KEY", "sk-openai" },
+    try rig.init(gpa, clock.io(), &.{ .keys = &.{
+        .{ "anthropic-api-key", "sk-ant" },
+        .{ "openai-api-key", "sk-openai" },
     } });
     defer rig.deinit();
     try rig.registry.start();
@@ -1357,7 +1645,7 @@ test "a canceled list ends the fetch before the metadata request" {
     var stall: providers.testing.FakeTransport.Stall = .{ .io = std.testing.io };
     var rig: testing.Rig = undefined;
     try rig.init(std.testing.allocator, std.testing.io, &.{
-        .variables = &.{.{ "ANTHROPIC_API_KEY", "sk-ant" }},
+        .keys = &.{.{ "anthropic-api-key", "sk-ant" }},
         .replies = &.{.{ .stall = &stall }},
     });
     defer rig.deinit();
@@ -1374,7 +1662,7 @@ test "a canceled list ends the fetch before the metadata request" {
 test "a refused list still asks for the public metadata" {
     var rig: testing.Rig = undefined;
     try rig.init(std.testing.allocator, std.testing.io, &.{
-        .variables = &.{.{ "ANTHROPIC_API_KEY", "sk-ant" }},
+        .keys = &.{.{ "anthropic-api-key", "sk-ant" }},
         .replies = &.{
             .{ .fail = error.ConnectionRefused },
             .{ .status = .internal_server_error },
@@ -1397,7 +1685,7 @@ test "a refused list still asks for the public metadata" {
 test "an OpenRouter fetch runs no list request and reports a failed body as the list" {
     var rig: testing.Rig = undefined;
     try rig.init(std.testing.allocator, std.testing.io, &.{
-        .variables = &.{.{ "OPENROUTER_API_KEY", "sk-or" }},
+        .keys = &.{.{ "openrouter-api-key", "sk-or" }},
         .replies = &.{
             .{ .status = .internal_server_error },
             .{ .body = "{\"data\":[{\"id\":\"openai/gpt-5.6-sol\"," ++
@@ -1423,7 +1711,7 @@ test "an OpenRouter fetch runs no list request and reports a failed body as the 
 test "a command without its account or its sign-in is refused" {
     var rig: testing.Rig = undefined;
     try rig.init(std.testing.allocator, std.testing.io, &.{
-        .variables = &.{.{ "XAI_API_KEY", "xai-key" }},
+        .keys = &.{.{ "xai-api-key", "xai-key" }},
     });
     defer rig.deinit();
     try rig.registry.start();
@@ -1432,6 +1720,8 @@ test "a command without its account or its sign-in is refused" {
     try rig.recorder.expect("refused:anthropic-api-key:fetch:signed_out");
     try rig.registry.send(&.{ .login = testing.xai_api_key });
     try rig.recorder.expect("refused:xai-api-key:login:no_login");
+    try rig.registry.send(&.{ .check_key = .{ .account = testing.xai_plan, .key = "xai" } });
+    try rig.recorder.expect("refused:xai-plan:check:no_key");
     try rig.registry.send(&.{ .paste = "code=a&state=b" });
     try rig.recorder.expect("paste_refused:not_waiting");
     try std.testing.expectEqual(@as(usize, 0), rig.transport.requests.items.len);
@@ -1441,7 +1731,7 @@ test "a fetch runs as a child task that a cancel ends, and a command meanwhile i
     var stall: providers.testing.FakeTransport.Stall = .{ .io = std.testing.io };
     var rig: testing.Rig = undefined;
     try rig.init(std.testing.allocator, std.testing.io, &.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
         .replies = &.{.{ .stall = &stall }},
     });
     defer rig.deinit();
@@ -1453,6 +1743,8 @@ test "a fetch runs as a child task that a cancel ends, and a command meanwhile i
     try rig.recorder.expect("refused:anthropic-plan:login:busy");
     try rig.registry.send(&.{ .fetch = testing.openai_api_key });
     try rig.recorder.expect("refused:openai-api-key:fetch:busy");
+    try rig.registry.send(&.{ .check_key = .{ .account = testing.xai_api_key, .key = "xai" } });
+    try rig.recorder.expect("refused:xai-api-key:check:busy");
     try rig.registry.send(&.cancel);
     try rig.recorder.expect("fetch_ended:openai-api-key:0:Canceled");
     try std.testing.expect(stall.canceled);
@@ -1465,7 +1757,7 @@ test "a worker task that cannot start ends its fetch or its sign-in with the fai
     defer threaded.deinit();
     var rig: testing.Rig = undefined;
     try rig.init(gpa, threaded.io(), &.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
     });
     defer rig.deinit();
     try rig.registry.start();
@@ -1474,6 +1766,8 @@ test "a worker task that cannot start ends its fetch or its sign-in with the fai
     try rig.recorder.expect("fetch_ended:openai-api-key:0:ConcurrencyUnavailable");
     try rig.registry.send(&.{ .login = testing.anthropic_plan });
     try rig.recorder.expect("login_ended:anthropic-plan:failed:ConcurrencyUnavailable");
+    try rig.registry.send(&.{ .check_key = .{ .account = testing.xai_api_key, .key = "xai" } });
+    try rig.recorder.expect("key_checked:xai-api-key:failed:ConcurrencyUnavailable");
     try rig.registry.send(&.{ .fetch = testing.openai_api_key });
     try rig.recorder.expect("fetch_ended:openai-api-key:0:ConcurrencyUnavailable");
 }
@@ -1592,6 +1886,11 @@ test "a copy of each event owns its bytes, and a failed copy leaks nothing" {
         .{ .authorization = .{ .account = 0, .url = "u", .code = null, .callback_path = null } },
         .{ .login_ended = .{ .account = 0, .outcome = error.Canceled } },
         .{ .refused = .{ .account = 0, .command = .login, .reason = .busy } },
+        .{ .key_checked = .{ .account = 0, .outcome = .{
+            .commit = .{ .memory_only = .{ .path = "/auth.json", .save_error = error.StoreBusy } },
+            .refresh = .{ .count = 1 },
+        } } },
+        .{ .key_checked = .{ .account = 0, .outcome = error.ModelListUnauthorized } },
     };
     try core.testing.checkCopyAllocationFailures(Event, &events);
 }

@@ -17,7 +17,7 @@ pub const Account = struct {
     id: []const u8,
     vendor: []const u8,
     authenticated: bool,
-    login: bool,
+    credential: std.meta.Tag(accounts.Account.Credential),
     load_failed: bool,
     authors: bool,
     remembered: ?Remembered,
@@ -109,7 +109,7 @@ pub fn accountsOf(
             .id = row.id,
             .vendor = @tagName(row.vendor),
             .authenticated = registry.isAuthenticated(index),
-            .login = row.hasLogin(),
+            .credential = row.credential,
             .load_failed = registry.loadError(index) != null,
             .authors = row.model_source == .public,
             .remembered = if (remembered) |name|

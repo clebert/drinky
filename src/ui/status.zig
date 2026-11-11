@@ -30,7 +30,7 @@ pub const Info = struct {
     confirmation: ?Confirmation = null,
 };
 
-pub const Confirmation = enum { message, removal, rewind, delete_gist };
+pub const Confirmation = enum { message, removal, rewind, delete_gist, remove_key };
 
 pub const Quota = struct {
     windows: application.Quota,
@@ -206,6 +206,7 @@ pub fn render(placement: *const paint.Placement, info: *const Info) !void {
             .removal => "Press Ctrl+N again to remove the canceled turn. Tool changes stay.",
             .rewind => "Press Enter again to rewind. Tool changes stay.",
             .delete_gist => "Press Backspace again to delete the gist.",
+            .remove_key => "Press Enter again to remove the saved key.",
         } else notice.content;
         return paint.notice(placement, &style, text);
     }
@@ -985,6 +986,11 @@ test "semantic confirmations keep the terminal text, roles, and width reductions
             .kind = .delete_gist,
             .content = "",
             .expected = "Press Backspace again to delete the gist.",
+        },
+        .{
+            .kind = .remove_key,
+            .content = "",
+            .expected = "Press Enter again to remove the saved key.",
         },
     };
     for (cases) |case| for (std.enums.values(Message.Severity)) |severity| {

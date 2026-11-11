@@ -18,10 +18,11 @@ description:
 
 ## Accounts
 
-An account identifier reads `vendor-product`, as in `anthropic-plan`. A `-key` suffix marks a
-credential that an environment variable holds or names, as in `anthropic-api-key`. An identifier
-without it signs in through an OAuth login. The `id` field of a table row is the only spelling of an
-identifier. A model under an account reads `account/model`.
+An account identifier reads `vendor-product`, as in `anthropic-plan`. A `-key` suffix marks a key
+that the user enters, as in `anthropic-api-key`, or a key file that an environment variable names,
+as in `google-cloud-key`. An identifier without it signs in through an OAuth login. The `id` field
+of a table row is the only spelling of an identifier. A model under an account reads
+`account/model`.
 
 - **vendor**: The `Account.Vendor` tag: `anthropic`, `openai`, `xai`, `openrouter`, `deepseek`, or
   `google`.

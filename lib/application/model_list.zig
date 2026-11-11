@@ -58,9 +58,14 @@ test "model listing returns every allocation failure and releases every partial 
     try catalog.init(std.testing.allocator, std.testing.io, &.{ .home = tree.root });
     try catalog.seed(accounts.testing.openai_api_key, &.{ "gpt-5.6-sol", "gpt-5.6-luna" });
     catalog.deinit();
+    try accounts.testing.saveKeys(
+        std.testing.allocator,
+        std.testing.io,
+        tree.root,
+        &.{.{ "openai-api-key", "key" }},
+    );
     var environment: std.process.Environ.Map = .init(std.testing.allocator);
     defer environment.deinit();
-    try environment.put("OPENAI_API_KEY", "key");
     try std.testing.checkAllAllocationFailures(
         core.testing.no_resize_allocator,
         checkComposition,

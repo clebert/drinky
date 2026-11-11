@@ -43,9 +43,9 @@ const Dialect = union(enum) {
     };
 };
 
-const Credential = union(enum) {
-    environment: []const u8,
-    store: Login,
+pub const Credential = union(enum) {
+    login: Login,
+    key,
     key_file,
 };
 
@@ -72,7 +72,7 @@ pub const table = [_]Account{
         .id = "anthropic-plan",
         .vendor = .anthropic,
         .dialect = .{ .messages = .subscription },
-        .credential = .{ .store = .claude },
+        .credential = .{ .login = .claude },
         .model_source = .messages,
         .usage = .head,
     },
@@ -80,7 +80,7 @@ pub const table = [_]Account{
         .id = "anthropic-api",
         .vendor = .anthropic,
         .dialect = .{ .messages = .console },
-        .credential = .{ .store = .console },
+        .credential = .{ .login = .console },
         .model_source = .messages,
         .usage = .none,
     },
@@ -88,7 +88,7 @@ pub const table = [_]Account{
         .id = "anthropic-api-key",
         .vendor = .anthropic,
         .dialect = .{ .messages = .api_key },
-        .credential = .{ .environment = "ANTHROPIC_API_KEY" },
+        .credential = .key,
         .model_source = .messages,
         .usage = .none,
     },
@@ -99,7 +99,7 @@ pub const table = [_]Account{
             .base_url = "https://chatgpt.com/backend-api/codex",
             .codex = true,
         } },
-        .credential = .{ .store = .chatgpt },
+        .credential = .{ .login = .chatgpt },
         .model_source = .codex,
         .usage = .head,
     },
@@ -107,7 +107,7 @@ pub const table = [_]Account{
         .id = "openai-api-key",
         .vendor = .openai,
         .dialect = .{ .responses = .{ .base_url = "https://api.openai.com/v1" } },
-        .credential = .{ .environment = "OPENAI_API_KEY" },
+        .credential = .key,
         .model_source = .responses,
         .usage = .none,
     },
@@ -115,7 +115,7 @@ pub const table = [_]Account{
         .id = "xai-plan",
         .vendor = .xai,
         .dialect = .{ .responses = .{ .base_url = "https://api.x.ai/v1" } },
-        .credential = .{ .store = .grok },
+        .credential = .{ .login = .grok },
         .model_source = .responses,
         .usage = .{ .xai_billing = xai_billing_url },
     },
@@ -123,7 +123,7 @@ pub const table = [_]Account{
         .id = "xai-api-key",
         .vendor = .xai,
         .dialect = .{ .responses = .{ .base_url = "https://api.x.ai/v1" } },
-        .credential = .{ .environment = "XAI_API_KEY" },
+        .credential = .key,
         .model_source = .responses,
         .usage = .none,
     },
@@ -134,7 +134,7 @@ pub const table = [_]Account{
             .base_url = "https://openrouter.ai/api/v1",
             .switches = .{ .plain_reasoning = true, .require_parameters = true },
         } },
-        .credential = .{ .store = .openrouter },
+        .credential = .{ .login = .openrouter },
         .model_source = .public,
         .usage = .{ .openrouter_credits = openrouter_credits_url },
     },
@@ -145,7 +145,7 @@ pub const table = [_]Account{
             .base_url = "https://openrouter.ai/api/v1",
             .switches = .{ .plain_reasoning = true, .require_parameters = true },
         } },
-        .credential = .{ .environment = "OPENROUTER_API_KEY" },
+        .credential = .key,
         .model_source = .public,
         .usage = .{ .openrouter_credits = openrouter_credits_url },
     },
@@ -156,7 +156,7 @@ pub const table = [_]Account{
             .base_url = "https://api.deepseek.com/v1",
             .switches = .{ .plain_reasoning = true },
         } },
-        .credential = .{ .environment = "DEEPSEEK_API_KEY" },
+        .credential = .key,
         .model_source = .responses,
         .usage = .{ .deepseek_balance = deepseek_balance_url },
     },
@@ -173,19 +173,29 @@ pub const table = [_]Account{
 comptime {
     for (&table) |*row| {
         const login: ?Login = switch (row.credential) {
-            .store => |flow| flow,
-            .environment, .key_file => null,
+            .login => |flow| flow,
+            .key, .key_file => null,
         };
         const fetchable = switch (row.model_source) {
             .messages => row.dialect == .messages and
-                (row.credential == .environment or login == .claude or login == .console),
+                (row.credential == .key or login == .claude or login == .console),
             .codex => login == .chatgpt,
-            .responses => row.credential == .environment or login == .grok,
+            .responses => row.credential == .key or login == .grok,
             .gemini => row.credential == .key_file,
             .public => true,
         };
         if (!fetchable) {
             @compileError("The model source of a row must match its dialect and its credential.");
+        }
+        const checkable = switch (row.model_source) {
+            .messages, .responses, .public => true,
+            .codex, .gemini => false,
+        };
+        if (row.credential == .key and !checkable) {
+            @compileError("A key row must take a model source that can check a new key.");
+        }
+        if (row.model_source == .public and row.vendor != .openrouter) {
+            @compileError("Only an OpenRouter row can take the public model list.");
         }
     }
 }
@@ -198,7 +208,7 @@ pub fn index(id: []const u8) ?usize {
 }
 
 pub fn hasLogin(self: *const Account) bool {
-    return self.credential == .store;
+    return self.credential == .login;
 }
 
 pub fn requiresOutputLimit(self: *const Account) bool {
@@ -210,9 +220,8 @@ pub fn requiresOutputLimit(self: *const Account) bool {
 
 pub fn setting(self: *const Account) ?[]const u8 {
     return switch (self.credential) {
-        .environment => |name| name,
         .key_file => key_file_setting,
-        .store => null,
+        .login, .key => null,
     };
 }
 
@@ -222,7 +231,7 @@ test "an account identifier starts with its vendor and ends in -key without a lo
         try std.testing.expect(std.mem.startsWith(u8, account.id, prefix));
         try std.testing.expect(std.mem.findAny(u8, account.id, "_/") == null);
         try std.testing.expectEqual(position, index(account.id).?);
-        try std.testing.expectEqual(!account.hasLogin(), account.setting() != null);
+        try std.testing.expectEqual(account.credential == .key_file, account.setting() != null);
         try std.testing.expectEqual(account.id[prefix.len], '-');
         try std.testing.expectEqual(!account.hasLogin(), std.mem.endsWith(u8, account.id, "-key"));
     }
@@ -232,18 +241,12 @@ test "an account identifier starts with its vendor and ends in -key without a lo
     try std.testing.expect(index("") == null);
 }
 
-test "an account names the setting that the login picker shows" {
-    const cases = [_][2][]const u8{
-        .{ "anthropic-api-key", "ANTHROPIC_API_KEY" },
-        .{ "openai-api-key", "OPENAI_API_KEY" },
-        .{ "xai-api-key", "XAI_API_KEY" },
-        .{ "openrouter-api-key", "OPENROUTER_API_KEY" },
-        .{ "deepseek-api-key", "DEEPSEEK_API_KEY" },
-        .{ "google-cloud-key", key_file_setting },
-    };
-    for (cases) |case| {
-        try std.testing.expectEqualStrings(case[1], table[index(case[0]).?].setting().?);
-    }
+test "only the key file account names a setting of the environment" {
+    try std.testing.expectEqualStrings(
+        "GOOGLE_APPLICATION_CREDENTIALS and GOOGLE_CLOUD_LOCATION",
+        table[index("google-cloud-key").?].setting().?,
+    );
+    try std.testing.expect(table[index("deepseek-api-key").?].setting() == null);
     try std.testing.expect(table[index("anthropic-api").?].setting() == null);
 }
 
@@ -274,7 +277,7 @@ test "a usage source belongs to the plan and the pool accounts alone" {
             .deepseek_balance
         else if (!account.hasLogin())
             .none
-        else if (account.credential.store == .console)
+        else if (account.credential.login == .console)
             .none
         else
             .head;

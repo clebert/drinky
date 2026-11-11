@@ -23,6 +23,7 @@ const fetch_message_notice = "Drinky sends no message while a model fetch runs. 
 const fetch_cancel_notice = "You canceled the model fetch.";
 const access_failure = "Drinky could not turn on MCP access because of error {s}.";
 const login_callback_controls = "Enter: Replay callback URL · Esc: Cancel";
+const key_controls = "Enter: Save key · Esc: Cancel";
 const cancel_controls = "Esc: Cancel";
 const retry_caption: ui.Caption = .{
     .title = "Failed turn",
@@ -74,6 +75,7 @@ program_status: ?ProgramStatus = null,
 unseen: ?Unseen = null,
 confirmation: ?Confirmation = null,
 flow: ?Flow = null,
+key_step: ?KeyStep = null,
 preview: ?Preview = null,
 pending: [pending_max]Transition = undefined,
 pending_count: usize = 0,
@@ -138,7 +140,10 @@ const Mode = union(enum) {
     picker_fetch,
     page,
     sign_in: application.State.SignIn,
+    key: usize,
 };
+
+const KeyStep = struct { account: usize, draft: ui.Editor };
 
 const Origin = enum { line, help };
 
@@ -190,11 +195,12 @@ const Confirmation = union(enum) {
     removal: u64,
     rewind: u64,
     delete_gist: application.GistId,
+    remove_key: usize,
     cancel,
 
     fn confirms(self: Confirmation, event: *const terminal.Input.Key) bool {
         return switch (self) {
-            .message, .rewind => event.* == .enter,
+            .message, .rewind, .remove_key => event.* == .enter,
             .delete_gist => event.* == .backspace,
             .quit => event.* == .ctrl and event.ctrl == 'd',
             .removal => event.* == .ctrl and event.ctrl == 'n',
@@ -299,6 +305,7 @@ pub fn deinit(self: *App) void {
     self.stopQueue();
     self.endpoint.deinit();
     self.closeFlow();
+    self.closeKeyStep();
     self.controller.destroy();
     self.closeQueue();
     self.herdr.deinit();
@@ -552,7 +559,7 @@ fn mode(self: *const App) Mode {
     if (self.screen.widget == .page) return .page;
     if (self.flow) |*flow| return if (flow.fetch == null) .picker else .picker_fetch;
     return switch (self.work) {
-        .idle => .prompt,
+        .idle => if (self.key_step) |*step| .{ .key = step.account } else .prompt,
         .turn => |operation| .{ .turn = operation },
         .fetch => |fetch| .{ .fetch = fetch },
         .sign_in => |sign_in| .{ .sign_in = sign_in },
@@ -576,6 +583,7 @@ fn confirm(self: *App, confirmation: Confirmation, notice: ui.Message) void {
         .removal => .removal,
         .rewind => .rewind,
         .delete_gist => .delete_gist,
+        .remove_key => .remove_key,
         .quit, .cancel => unreachable,
     }, notice);
     self.confirmation = confirmation;
@@ -696,6 +704,11 @@ fn caption(self: *const App) ?ui.Caption {
             .controls = cancel_controls,
             .rows_max = Screen.editor_caption_rows_max,
         },
+        .key => .{
+            .title = self.work_title[0..self.work_title_length],
+            .controls = key_controls,
+            .rows_max = Screen.editor_caption_rows_max,
+        },
         .prompt => switch (self.offer) {
             .none => null,
             .retry => retry_caption,
@@ -746,7 +759,7 @@ fn serveRemote(self: *App, request: *mcp.Endpoint.Request) !void {
         .instance = instance,
         .working_directory = self.working_directory,
         .interaction = switch (self.mode()) {
-            .picker, .picker_fetch, .page, .sign_in => true,
+            .picker, .picker_fetch, .page, .sign_in, .key => true,
             .prompt, .turn, .fetch => false,
         },
     }, request.line);
@@ -791,10 +804,12 @@ fn settle(self: *App) !void {
     while (index < self.pending_count) : (index += 1) {
         switch (self.pending[index]) {
             .sign_in => |ended| if (ended.signed_in) {
+                self.closeKeyStep();
                 try self.startFlow(Flow.forAccount(&self.controller.listAccounts(), ended.account));
             },
             .fetch => |ended| try self.finishFetch(&ended),
             .no_account => {
+                self.closeKeyStep();
                 self.closeFlow();
                 try self.startFlow(.login);
             },
@@ -869,20 +884,26 @@ fn adopt(self: *App, value: *const application.State) void {
     }
     self.work = value.work;
     self.offer = value.offer;
-    const title = switch (value.work) {
-        .sign_in => |sign_in| std.fmt.bufPrint(
-            &self.work_title,
-            "Sign in: {s}",
-            .{application.query.accountId(sign_in.account)},
-        ),
-        .fetch => |fetch| std.fmt.bufPrint(
-            &self.work_title,
-            "Model fetch: {s}",
-            .{application.query.accountId(fetch.account)},
-        ),
-        .idle, .turn, .aside => return,
-    };
-    self.work_title_length = (title catch unreachable).len;
+    switch (value.work) {
+        .sign_in => |sign_in| self.setSignInTitle(sign_in.account),
+        .fetch => |fetch| {
+            const title = std.fmt.bufPrint(
+                &self.work_title,
+                "Model fetch: {s}",
+                .{application.query.accountId(fetch.account)},
+            ) catch unreachable;
+            self.work_title_length = title.len;
+        },
+        .idle, .turn, .aside => {},
+    }
+}
+fn setSignInTitle(self: *App, account: usize) void {
+    const title = std.fmt.bufPrint(
+        &self.work_title,
+        "Sign in: {s}",
+        .{application.query.accountId(account)},
+    ) catch unreachable;
+    self.work_title_length = title.len;
 }
 fn send(self: *App, value: *const application.Command) !application.Response {
     const response = self.controller.submit(value);
@@ -893,6 +914,10 @@ fn send(self: *App, value: *const application.Command) !application.Response {
     return response;
 }
 fn submit(self: *App) !void {
+    switch (self.mode()) {
+        .key => |account| return self.submitKey(account),
+        .prompt, .turn, .fetch, .picker, .picker_fetch, .page, .sign_in => {},
+    }
     const confirmed = self.armed(.message);
     self.confirmation = null;
     if (self.screen.editor.blank()) return;
@@ -900,6 +925,7 @@ fn submit(self: *App) !void {
     defer self.gpa.free(text);
     switch (self.mode()) {
         .sign_in => |sign_in| {
+            if (self.key_step != null) return;
             const response = try self.send(&.{ .submit_callback = .{
                 .operation = sign_in.operation,
                 .line = text,
@@ -909,8 +935,46 @@ fn submit(self: *App) !void {
         .turn => try self.submitDuringWork(text, .turn),
         .fetch => try self.submitDuringWork(text, .fetch),
         .prompt => if (confirmed) try self.sendMessage(text) else try self.submitLine(text),
-        .picker, .picker_fetch, .page => unreachable,
+        .picker, .picker_fetch, .page, .key => unreachable,
     }
+}
+fn submitKey(self: *App, account: usize) !void {
+    const confirmed = self.armed(.{ .remove_key = account });
+    self.confirmation = null;
+    if (self.screen.editor.blank()) {
+        if (!self.controller.listAccounts()[account].authenticated) return;
+        if (!confirmed) return self.confirmTurn(.{ .remove_key = account });
+        if ((try self.send(&.{ .sign_out = account })).accepted()) self.closeKeyStep();
+        return;
+    }
+    const text = try self.screen.editor.expanded();
+    defer self.gpa.free(text);
+    const response = try self.send(&.{ .submit_key = .{ .account = account, .value = text } });
+    if (response.accepted() and response.operation == null) self.closeKeyStep();
+}
+fn openKeyStep(self: *App, account: usize) !void {
+    var editor = ui.Editor.init(self.gpa);
+    errdefer editor.deinit();
+    try editor.insert(self.controller.readKey(account) orelse "");
+    self.key_step = .{ .account = account, .draft = self.screen.editor };
+    self.screen.editor = editor;
+    self.screen.markEdited();
+    self.setSignInTitle(account);
+}
+fn closeKeyStep(self: *App) void {
+    const step = self.key_step orelse return;
+    self.key_step = null;
+    self.screen.editor.deinit();
+    self.screen.editor = step.draft;
+    self.screen.markEdited();
+}
+fn cancelKeyStep(self: *App, account: usize) !void {
+    self.closeKeyStep();
+    const message = try wording.event(self.gpa, &.{
+        .sign_in_failed = .from(account, error.Canceled),
+    });
+    defer message.deinit(self.gpa);
+    try self.showMessage(&message);
 }
 fn submitLine(self: *App, line: []const u8) !void {
     const command_name = command.name(line) orelse return self.sendMessage(line);
@@ -944,7 +1008,7 @@ fn sendMessage(self: *App, line: []const u8) !void {
     switch (self.mode()) {
         .turn => try self.reportNotice(.information, turn_message_notice, .{}),
         .fetch => try self.reportNotice(.information, fetch_message_notice, .{}),
-        .prompt, .picker, .picker_fetch, .page, .sign_in => {},
+        .prompt, .picker, .picker_fetch, .page, .sign_in, .key => {},
     }
 }
 fn runCommand(
@@ -1078,7 +1142,7 @@ fn missingTarget(self: *App, checked: CheckedStep) ?ui.Message {
             .content = "Sign in to an account before you select a model.",
         },
         .logout => for (&facts) |*fact| {
-            if (fact.login and fact.authenticated) break null;
+            if (Flow.signsOut(fact)) break null;
         } else .{ .severity = .failure, .content = "No accounts are signed in." },
         .rewind => if (self.controller.listTurns().len > 0)
             null
@@ -1188,7 +1252,10 @@ fn selectRow(self: *App) !void {
         },
         .sign_in => |account| {
             self.closeFlow();
-            _ = try self.send(&.{ .select_account = account });
+            switch (self.controller.listAccounts()[account].credential) {
+                .key => try self.openKeyStep(account),
+                .login, .key_file => _ = try self.send(&.{ .select_account = account }),
+            }
         },
         .sign_out => |account| {
             self.closeFlow();
@@ -1323,10 +1390,11 @@ fn submitOnPage(self: *App, value: *const application.Command) !bool {
 fn handleExit(self: *App, exit: Exit, notice_shown: bool) !void {
     const current = self.mode();
     if (exit == .ctrl_d and current != .prompt) self.ctrl_d_ms_last = self.nowMs();
-    if (exit == .ctrl_c and
-        (current == .prompt or current == .turn or current == .fetch or current == .sign_in) and
-        !self.draftEmpty())
-    {
+    const editing = switch (current) {
+        .prompt, .turn, .fetch, .sign_in, .key => true,
+        .picker, .picker_fetch, .page => false,
+    };
+    if (exit == .ctrl_c and editing and !self.draftEmpty()) {
         if (current == .prompt) self.clearOrQuit() else self.clearDraft();
         return;
     }
@@ -1340,7 +1408,7 @@ fn handleExit(self: *App, exit: Exit, notice_shown: bool) !void {
             }
             return self.cancelWork(operation);
         },
-        .prompt, .fetch, .picker, .picker_fetch, .page, .sign_in => {},
+        .prompt, .fetch, .picker, .picker_fetch, .page, .sign_in, .key => {},
     };
     switch (current) {
         .prompt => switch (exit) {
@@ -1355,6 +1423,7 @@ fn handleExit(self: *App, exit: Exit, notice_shown: bool) !void {
         },
         .turn => |operation| try self.cancelWork(operation),
         .sign_in => |sign_in| try self.cancelWork(sign_in.operation),
+        .key => |account| try self.cancelKeyStep(account),
         .page => if (self.preview != null) try self.closePreview() else try self.closePage(),
     }
 }
@@ -1368,7 +1437,7 @@ fn handleKey(self: *App, event: *const terminal.Input.Key) !void {
         _ = self.controller.submit(&.{ .dismiss_notice = self.screen.notice_id });
     if (exitOf(event)) |exit| return self.handleExit(exit, notice_shown);
     switch (self.mode()) {
-        .prompt, .turn, .fetch, .sign_in => {
+        .prompt, .turn, .fetch, .sign_in, .key => {
             if (try self.editKey(event)) return;
             switch (event.*) {
                 .enter => try self.submit(),
@@ -1537,7 +1606,8 @@ test "the status line leaves out the project in a Herdr or Rex pane and shows it
     for (cases) |case| {
         var rig: Rig = undefined;
         try rig.init(&.{
-            .variables = &.{ .{ "OPENAI_API_KEY", "sk-openai" }, .{ "TERM_PROGRAM", case[0] } },
+            .keys = &.{.{ "openai-api-key", "sk-openai" }},
+            .variables = &.{.{ "TERM_PROGRAM", case[0] }},
             .model = "gpt-5.6-sol",
             .herdr = case[1],
         });
@@ -1551,7 +1621,7 @@ test "the status line leaves out the project in a Herdr or Rex pane and shows it
 test "startup keeps shell scrollback, and a verbosity toggle clears it" {
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "key" }},
+        .keys = &.{.{ "openai-api-key", "key" }},
         .model = "gpt-5.6-sol",
         .history = core.text.repeat("Shell history line.\r\n", 60),
     });
@@ -1572,7 +1642,7 @@ test "startup keeps shell scrollback, and a verbosity toggle clears it" {
 test "terminal turns use frontend instructions and append replies to the transcript" {
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
         .replies = &.{
             .{ .body = providers.testing.reply_stream },
             .{ .body = providers.testing.reply_stream },
@@ -1652,6 +1722,7 @@ const Rig = struct {
         start: bool = true,
         history: []const u8 = "",
         variables: []const [2][]const u8 = &.{},
+        keys: []const [2][]const u8 = &.{},
         store: ?[]const u8 = null,
         config: ?[]const u8 = null,
         files: []const [2][]const u8 = &.{},
@@ -1683,6 +1754,7 @@ const Rig = struct {
         errdefer self.environment.deinit();
         for (options.variables) |variable| try self.environment.put(variable[0], variable[1]);
         if (options.store) |data| try accounts.testing.writeStore(io, &self.tmp, data);
+        try accounts.testing.saveKeys(gpa, io, self.directory, options.keys);
         try self.writeConfig(options);
         if (options.model) |name| try self.writeModel(name, options.model_accounts);
         for (options.files) |file| {
@@ -1989,7 +2061,7 @@ const overloaded_event = "⚠ The provider is overloaded. Details: 500 Internal 
 test "a failed turn ends at the prompt with its event, and the message stays" {
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
         .replies = &.{ failed_reply, failed_reply },
         .model = "gpt-5.6-sol",
     });
@@ -2035,7 +2107,7 @@ const failed_reply: providers.testing.FakeTransport.Reply = .{
 test "a failed turn or retry offers a retry that Esc dismisses and Ctrl+N sends with the draft" {
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
         .replies = &.{
             failed_reply,
             failed_reply,
@@ -2091,7 +2163,7 @@ test "Ctrl+N removes a canceled turn, keeps the later events, and returns its li
     };
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
         .replies = &replies,
         .model = "gpt-5.6-sol",
     });
@@ -2132,7 +2204,7 @@ test "Ctrl+N warns before it removes a canceled turn that ran a mutating tool" {
     };
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
         .replies = &replies,
         .model = "gpt-5.6-sol",
     });
@@ -2170,7 +2242,7 @@ test "a canceled retry offers no removal, and a new turn and /new drop the offer
     };
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
         .replies = &replies,
         .model = "gpt-5.6-sol",
     });
@@ -2218,7 +2290,7 @@ test "Ctrl+N returns the command line of a canceled skill turn" {
     const replies = [_]providers.testing.FakeTransport.Reply{.{ .stall = &stall }};
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
         .files = &.{.{
             ".agents/skills/demo/SKILL.md",
             "---\nname: demo\ndescription: Demo.\n---\nBody.\n",
@@ -2248,7 +2320,7 @@ test "/rewind returns the chosen prompt to the editor and drops its turn and eve
         @splat(.{ .body = providers.testing.reply_stream });
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
         .replies = &replies,
         .model = "gpt-5.6-sol",
     });
@@ -2301,7 +2373,7 @@ test "/rewind warns before it drops a turn that ran a mutating tool" {
     };
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
         .replies = &replies,
         .model = "gpt-5.6-sol",
     });
@@ -2358,7 +2430,7 @@ test "a signed-out submit and a submit without a model are refused with a notice
     });
 
     var keyed: Rig = undefined;
-    try keyed.init(&.{ .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }} });
+    try keyed.init(&.{ .keys = &.{.{ "openai-api-key", "sk-openai" }} });
     defer keyed.deinit();
     try keyed.waitFor(&.{.{ .status = "Model: openai-api-key/none" }});
     try keyed.keys("hello\r");
@@ -2373,7 +2445,7 @@ const effort_picker = "Effort · ↑/↓";
 test "a slash command opens its picker, a pick applies, and Esc leaves with a notice" {
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
         .replies = &.{.{ .body = providers.testing.reply_stream }},
         .model = "gpt-5.6-sol",
     });
@@ -2405,7 +2477,7 @@ test "a slash command opens its picker, a pick applies, and Esc leaves with a no
 test "a picker turns on mouse reports, rotates on a wheel step, and ends the reports on Esc" {
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
         .model = "gpt-5.6-sol",
     });
     defer rig.deinit();
@@ -2424,7 +2496,7 @@ test "a picker turns on mouse reports, rotates on a wheel step, and ends the rep
 test "a wheel step after the picker closes keeps the notice" {
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
         .model = "gpt-5.6-sol",
     });
     defer rig.deinit();
@@ -2454,7 +2526,7 @@ test "a lone Esc waits 50 ms and repaints without a resize" {
     for ([_]i64{ 49, 50 }) |elapsed_ms| {
         var rig: Rig = undefined;
         try rig.init(&.{
-            .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+            .keys = &.{.{ "openai-api-key", "sk-openai" }},
             .model = "gpt-5.6-sol",
         });
         defer rig.deinit();
@@ -2494,7 +2566,7 @@ test "a lone Esc waits 50 ms and repaints without a resize" {
 test "an arrow sequence split within the Esc delay stays one key" {
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
         .model = "gpt-5.6-sol",
     });
     defer rig.deinit();
@@ -2525,7 +2597,7 @@ test "an arrow sequence split within the Esc delay stays one key" {
 test "Ctrl+C and Ctrl+D in a picker end its command with its notice" {
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
         .model = "gpt-5.6-sol",
     });
     defer rig.deinit();
@@ -2547,7 +2619,7 @@ const refusal_offer = "Enter: Send as a message";
 test "a refused command line reaches the model on the next Enter" {
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
         .replies = &.{.{ .body = providers.testing.reply_stream }},
         .model = "gpt-5.6-sol",
     });
@@ -2566,7 +2638,7 @@ test "a refused command line reaches the model on the next Enter" {
 test "a dismissed command confirmation stays absent after a terminal snapshot" {
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "key" }},
+        .keys = &.{.{ "openai-api-key", "key" }},
         .model = "gpt-5.6-sol",
     });
     defer rig.deinit();
@@ -2604,7 +2676,7 @@ test "a command that its state refuses keeps its line" {
 test "/new clears the conversation, and the next request starts fresh" {
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
         .replies = &.{
             .{ .body = providers.testing.reply_stream },
             .{ .body = providers.testing.reply_stream },
@@ -2653,7 +2725,7 @@ test "startup verbosity selects thinking text or summaries at the terminal bound
     for (cases) |case| {
         var rig: Rig = undefined;
         try rig.init(&.{
-            .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+            .keys = &.{.{ "openai-api-key", "sk-openai" }},
             .config = case.config,
             .replies = &.{.{ .body = body }},
             .model = "gpt-5.6-sol",
@@ -2691,7 +2763,7 @@ test "verbose uses the startup config and toggles during a turn without sending 
     var hold: providers.testing.FakeTransport.Hold = .{ .io = std.testing.io };
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
         .config = "{\"interface\":{\"verbose\":false}}",
         .replies = &.{.{ .body = providers.testing.reply_stream, .hold = &hold }},
         .model = "gpt-5.6-sol",
@@ -2735,7 +2807,7 @@ test "command lines during a turn get a notice and keep the draft" {
     var hold: providers.testing.FakeTransport.Hold = .{ .io = std.testing.io };
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
         .replies = &.{.{ .body = providers.testing.reply_stream, .hold = &hold }},
         .model = "gpt-5.6-sol",
     });
@@ -2770,7 +2842,7 @@ test "Enter during a turn keeps the text, and Ctrl+D with a draft warns before i
     };
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
         .replies = &replies,
         .model = "gpt-5.6-sol",
     });
@@ -2805,7 +2877,7 @@ test "a Ctrl+D that ends a turn or closes a page warns before the next Ctrl+D qu
     };
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
         .replies = &replies,
         .model = "gpt-5.6-sol",
     });
@@ -2836,7 +2908,7 @@ test "a Ctrl+D that ends a turn or closes a page warns before the next Ctrl+D qu
 test "a notice that replaces the send offer of a refused command line withdraws the offer" {
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
         .replies = &.{.{ .body = providers.testing.reply_stream }},
         .model = "gpt-5.6-sol",
     });
@@ -3009,7 +3081,7 @@ test "Esc with a draft warns before it cancels the turn, and Ctrl+D cancels at o
     };
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
         .replies = &replies,
         .model = "gpt-5.6-sol",
     });
@@ -3047,7 +3119,7 @@ test "Esc in a turn clears another notice first, and Ctrl+C clears a draft befor
     const replies = [_]providers.testing.FakeTransport.Reply{.{ .stall = &stall }};
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
         .replies = &replies,
         .model = "gpt-5.6-sol",
     });
@@ -3112,7 +3184,7 @@ test "exit keys during a slow cancel cannot block the end of the turn" {
     };
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
         .replies = &replies,
         .model = "gpt-5.6-sol",
     });
@@ -3126,29 +3198,153 @@ test "exit keys during a slow cancel cannot block the end of the turn" {
     try rig.waitFor(&.{ .{ .activity = false }, .{ .editor = "x" } });
 }
 
-test "the login picker opens with the accounts, and a set key account switches at once" {
-    var rig: Rig = undefined;
-    try rig.init(&.{
-        .variables = &.{ .{ "OPENAI_API_KEY", "sk-openai" }, .{ "XAI_API_KEY", "xai" } },
-        .model = "gpt-5.6-sol",
-    });
-    defer rig.deinit();
+const xai_key_caption = "Sign in: xai-api-key · Enter: Save key · Esc: Cancel";
+
+fn openXaiKeyStep(rig: *Rig) !void {
     try rig.keys("/login\r");
     try rig.waitFor(&.{ .{ .text = "Sign in · ↑/↓" }, .{ .text = " > openai-api-key" } });
     try rig.keys("\x1b[B\x1b[B\r");
+    try rig.waitFor(&.{ .{ .absent = "Sign in · ↑/↓" }, .{ .text = xai_key_caption } });
+}
+
+test "the login picker opens the key step with the saved key, and an unchanged key switches" {
+    var rig: Rig = undefined;
+    try rig.init(&.{
+        .keys = &.{ .{ "openai-api-key", "sk-openai" }, .{ "xai-api-key", "xai" } },
+        .model = "gpt-5.6-sol",
+    });
+    defer rig.deinit();
+    try openXaiKeyStep(&rig);
+    try rig.waitFor(&.{.{ .editor = "xai" }});
+    try rig.keys("\r");
     try rig.waitFor(&.{
-        .{ .absent = "Sign in · ↑/↓" },
+        .{ .absent = xai_key_caption },
+        .{ .editor = "" },
         .{ .status = "Model: xai-api-key/none" },
         .{ .text = "Drinky now uses xai-api-key. " ++
             "Fetch the model list of xai-api-key with /model." },
     });
+    try std.testing.expectEqual(@as(usize, 0), rig.transport.requests.items.len);
+}
+
+test "the key step keeps the draft aside and returns it when the step ends" {
+    var hold: providers.testing.FakeTransport.Hold = .{ .io = std.testing.io };
+    var rig: Rig = undefined;
+    try rig.init(&.{
+        .store = accounts.testing.planStore("first"),
+        .model = "gpt-5.6-sol",
+        .model_accounts = &.{accounts.testing.openai_plan},
+        .replies = &.{
+            .{ .status = .unauthorized, .body = "{\"error\":{}}", .hold = &hold },
+            .{ .status = .bad_request, .body = "{\"error\":\"invalid_grant\"}" },
+        },
+    });
+    defer rig.deinit();
+    defer hold.released.set(std.testing.io);
+    try rig.waitFor(&.{.{ .status = "Model: openai-plan/gpt-5.6-sol" }});
+    try rig.keys("hello\r");
+    try hold.reached.wait(std.testing.io);
+    try rig.keys("draft");
+    hold.released.set(std.testing.io);
+    try rig.waitFor(&.{.{ .text = "Sign in · ↑/↓" }});
+    try rig.keys(core.text.repeat("\x1b[B", accounts.testing.xai_api_key) ++ "\r");
+    try rig.waitFor(&.{ .{ .text = xai_key_caption }, .{ .editor = "" } });
+    try rig.keys("xai\x1b");
+    try rig.waitFor(&.{ .{ .absent = xai_key_caption }, .{ .editor = "draft" } });
+}
+
+test "the key step checks a new key, keeps a refused key, and closes on Esc" {
+    var stall: providers.testing.FakeTransport.Stall = .{ .io = std.testing.io };
+    var rig: Rig = undefined;
+    try rig.init(&.{
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
+        .model = "gpt-5.6-sol",
+        .replies = &.{ .{ .stall = &stall }, .{ .status = .unauthorized } },
+    });
+    defer rig.deinit();
+    try openXaiKeyStep(&rig);
+    try rig.waitFor(&.{.{ .editor = "" }});
+    try rig.keys("\r");
+    try rig.waitFor(&.{ .{ .text = xai_key_caption }, .{ .editor = "" } });
+    try rig.keys("xai-bad\r");
+    try stall.reached.wait(std.testing.io);
+    try rig.waitFor(&.{.{ .text = "Sign in: xai-api-key · Esc: Cancel" }});
+    try rig.keys("\x1b");
+    try rig.waitFor(&.{
+        .{ .status = "You canceled the key check." },
+        .{ .text = xai_key_caption },
+        .{ .editor = "xai-bad" },
+    });
+    try std.testing.expect(stall.canceled);
+    try rig.keys("\r");
+    try rig.waitFor(&.{
+        .{ .status = "The provider rejected the key." },
+        .{ .text = xai_key_caption },
+        .{ .editor = "xai-bad" },
+    });
+    try rig.keys(" x\r");
+    try rig.waitFor(&.{
+        .{ .status = "Remove the spaces, tabs, and line breaks from the key." },
+        .{ .editor = "xai-bad x" },
+    });
+    try rig.keys("\x1b");
+    try rig.waitFor(&.{
+        .{ .status = "You canceled the sign-in to xai-api-key." },
+        .{ .absent = xai_key_caption },
+        .{ .editor = "" },
+    });
+    try std.testing.expectEqual(@as(usize, 2), rig.transport.requests.items.len);
+    try testing.expectContains(rig.transport.requests.items[1], "Bearer xai-bad\n");
+}
+
+test "a checked key signs in and opens the model step" {
+    var rig: Rig = undefined;
+    try rig.init(&.{
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
+        .model = "gpt-5.6-sol",
+        .replies = &.{
+            .{ .body = "{\"data\":[{\"id\":\"grok-4.6\"}]}" },
+            .{ .body = "{\"data\":[{\"id\":\"x-ai/grok-4.6\",\"context_length\":1}]}" },
+        },
+    });
+    defer rig.deinit();
+    try openXaiKeyStep(&rig);
+    try rig.keys("xai-new\r");
+    try rig.waitFor(&.{
+        .{ .absent = xai_key_caption },
+        .{ .text = "Model: xai-api-key · ↑/↓" },
+        .{ .text = "Drinky signed in to xai-api-key." },
+    });
+}
+
+test "an empty key step warns first and then removes the saved key" {
+    var rig: Rig = undefined;
+    try rig.init(&.{
+        .keys = &.{ .{ "openai-api-key", "sk-openai" }, .{ "xai-api-key", "xai" } },
+        .model = "gpt-5.6-sol",
+    });
+    defer rig.deinit();
+    try openXaiKeyStep(&rig);
+    try rig.waitFor(&.{.{ .editor = "xai" }});
+    try rig.keys("\x03");
+    try rig.waitFor(&.{ .{ .editor = "" }, .{ .text = xai_key_caption } });
+    try rig.keys("\r");
+    try rig.waitFor(&.{.{ .status = "Press Enter again to remove the saved key." }});
+    try rig.keys("\r");
+    try rig.waitFor(&.{
+        .{ .text = "Drinky signed out of xai-api-key." },
+        .{ .absent = xai_key_caption },
+        .{ .editor = "" },
+    });
+    try std.testing.expect(!rig.app.controller.listAccounts()[accounts.testing.xai_api_key]
+        .authenticated);
 }
 
 test "the start reports each dropped config value and each notice" {
     const rule = "{\"glob\":\"*.md\",\"skill\":\"docs\"}";
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
         .config = "{\"default_effort\":\"turbo\",\"bash\":{\"timeout_ms\":1}," ++
             "\"interface\":{\"window_pages\":0,\"gauge_percent_warning\":90," ++
             "\"gauge_percent_error\":10,\"animation\":\"bounce\"}," ++
@@ -3184,7 +3380,7 @@ test "the start reports each dropped config value and each notice" {
 
     var corrupt: Rig = undefined;
     try corrupt.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
         .config = "{ not json",
         .window = .{ .columns = 400, .rows = 40 },
     });
@@ -3198,7 +3394,7 @@ test "the start reports each dropped config value and each notice" {
 test "the start escapes a control character in an unknown config key" {
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
         .config = "{\"\\u001b[2J\":1}",
     });
     defer rig.deinit();
@@ -3217,7 +3413,7 @@ test "a start without an account opens the sign-in picker with a notice" {
 
 test "an exit key that closes a page drops the rest of its read" {
     var rig: Rig = undefined;
-    try rig.init(&.{ .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }} });
+    try rig.init(&.{ .keys = &.{.{ "openai-api-key", "sk-openai" }} });
     defer rig.deinit();
     try rig.keys("/system\r");
     try rig.waitFor(&.{.{ .alternate_screen = true }});
@@ -3229,7 +3425,7 @@ test "an exit key that closes a page drops the rest of its read" {
 
 test "Ctrl+C clears the draft, and a second Ctrl+C at once quits" {
     var rig: Rig = undefined;
-    try rig.init(&.{ .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }} });
+    try rig.init(&.{ .keys = &.{.{ "openai-api-key", "sk-openai" }} });
     defer rig.deinit();
     try rig.keys("draft");
     try rig.waitFor(&.{.{ .editor = "draft" }});
@@ -3245,7 +3441,7 @@ test "each exit ends a model fetch at its step, and an exit at the first step cl
     var stalls: [3]providers.testing.FakeTransport.Stall = @splat(.{ .io = std.testing.io });
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
         .replies = &.{
             .{ .stall = &stalls[0] },
             .{ .stall = &stalls[1] },
@@ -3282,7 +3478,7 @@ test "help keeps its command position across nested steps and fetch cancellation
     var stalls: [2]providers.testing.FakeTransport.Stall = @splat(.{ .io = std.testing.io });
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
         .replies = &.{ .{ .stall = &stalls[0] }, .{ .stall = &stalls[1] } },
     });
     defer rig.deinit();
@@ -3372,7 +3568,7 @@ test "a model fetch that signs out the last account opens the sign-in picker" {
 test "Esc on the models of an author returns to the author step at that author" {
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENROUTER_API_KEY", "sk-or" }},
+        .keys = &.{.{ "openrouter-api-key", "sk-or" }},
         .files = &.{.{
             ".drinky/metadata.json",
             "{\"openrouter\":{\"models\":[" ++
@@ -3397,7 +3593,7 @@ test "Esc on the models of an author returns to the author step at that author" 
 test "/logout signs out of the chosen account and hands the session to the next one" {
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
         .store = accounts.testing.planStore("first"),
         .model = "gpt-5.6-sol",
         .model_accounts = &.{ accounts.testing.openai_plan, accounts.testing.openai_api_key },
@@ -3421,7 +3617,7 @@ const system_lead = "You are a coding assistant.";
 test "a page on the alternate screen scrolls, toggles the source, and closes on Esc" {
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
         .config = "{\"user_instructions\":[{\"path\":\"long.md\"}]}",
         .files = &.{.{
             ".drinky/long.md",
@@ -3477,7 +3673,7 @@ test "incomplete page replies use the transcript failure symbol and color" {
     const gpa = std.testing.allocator;
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
         .replies = &.{
             .{ .body = providers.testing.reply_stream },
             .{ .body = cut_stream },
@@ -3500,7 +3696,7 @@ test "incomplete page replies use the transcript failure symbol and color" {
 test "a failed attempt adds its note below the wait line of the gist until Esc" {
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
         .config = "{\"request\":{\"attempts_max\":2,\"delay_ms_initial\":60000," ++
             "\"delay_ms_max\":60000}}",
         .replies = &.{ .{ .body = providers.testing.reply_stream }, failed_reply },
@@ -3563,7 +3759,7 @@ test "Herdr hears working while /gist streams and idle after the page closes" {
     };
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
         .replies = &replies,
         .model = "gpt-5.6-sol",
         .herdr = herdr.endpoint(),
@@ -3587,7 +3783,7 @@ test "Herdr hears working while /gist streams and idle after the page closes" {
 test "/gist restores its command after a discard and saves the gist with Enter" {
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
         .replies = &.{
             .{ .body = providers.testing.reply_stream },
             .{ .body = providers.testing.replyStream("First gist.\\nBody.") },
@@ -3628,7 +3824,7 @@ test "/gist restores its command after a discard and saves the gist with Enter" 
 test "/gists previews a gist, returns with Esc, and applies it with A" {
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
         .files = &.{.{ ".drinky/gists/0123456789ab.md", "# Resume the task\nKeep the tests." }},
         .replies = &.{
             .{ .body = providers.testing.reply_stream },
@@ -3681,7 +3877,7 @@ test "/gists previews a gist, returns with Esc, and applies it with A" {
 test "/gists hides invalid and unreadable gists, counts them, and deletes after a warning" {
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
         .files = &.{
             .{ ".drinky/gists/aaaaaaaaaaaa.md", " \n" },
             .{ ".drinky/gists/dddddddddddd.md", "Title\x00Body." },
@@ -3734,7 +3930,7 @@ test "/gists hides invalid and unreadable gists, counts them, and deletes after 
 test "a list that /gists cannot read again after a preview closes with its failure" {
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
         .files = &.{.{ ".drinky/gists/0123456789ab.md", "Kept gist\nBody." }},
         .model = "gpt-5.6-sol",
     });
@@ -3757,7 +3953,7 @@ test "a list that /gists cannot read again after a preview closes with its failu
 test "a failed save keeps the page and shows its failure on the page" {
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
         .files = &.{.{ ".drinky/gists", "blocked" }},
         .replies = &.{
             .{ .body = providers.testing.reply_stream },
@@ -3782,7 +3978,7 @@ test "a failed save keeps the page and shows its failure on the page" {
 test "a gist from the command picker restores its command after a discard" {
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
         .replies = &.{
             .{ .body = providers.testing.reply_stream },
             .{ .body = providers.testing.replyStream("Gist text.\\nBody.") },
@@ -3805,7 +4001,7 @@ test "gist exits cancel generation without saving it or losing the command" {
         var stall: providers.testing.FakeTransport.Stall = .{ .io = std.testing.io };
         var rig: Rig = undefined;
         try rig.init(&.{
-            .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+            .keys = &.{.{ "openai-api-key", "sk-openai" }},
             .replies = &.{
                 .{ .body = providers.testing.reply_stream },
                 .{ .stall = &stall },
@@ -3842,7 +4038,7 @@ test "gist exits cancel generation without saving it or losing the command" {
 test "a failed, truncated, or non-text gist cannot save, and its command survives" {
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
         .replies = &.{
             .{ .body = providers.testing.reply_stream },
             .{ .body = partial_failure_stream },
@@ -3892,7 +4088,7 @@ test "the removal of a canceled gist turn leaves the editor empty" {
     var stall: providers.testing.FakeTransport.Stall = .{ .io = std.testing.io };
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
         .replies = &.{
             .{ .body = providers.testing.reply_stream },
             .{ .body = providers.testing.replyStream("Resume this task.\\nBody.") },
@@ -3922,7 +4118,7 @@ test "the removal of a canceled gist turn leaves the editor empty" {
 test "a gist without a conversation refuses and keeps its command" {
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
         .model = "gpt-5.6-sol",
     });
     defer rig.deinit();
@@ -3954,7 +4150,7 @@ test "Herdr hears working during a turn, blocked at a retry offer, and idle afte
     const replies = [_]providers.testing.FakeTransport.Reply{ held_failure, failed_reply };
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
         .replies = &replies,
         .model = "gpt-5.6-sol",
         .herdr = herdr.endpoint(),
@@ -3993,7 +4189,7 @@ const working_status = "state=working:app=drinky";
 test "the terminal hears working during a turn, done until a key, and a clear at exit" {
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
         .replies = &.{.{ .body = providers.testing.reply_stream }},
         .model = "gpt-5.6-sol",
     });
@@ -4020,7 +4216,7 @@ test "the terminal hears error after a failed turn and idle after a key or a can
     };
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
         .replies = &replies,
         .model = "gpt-5.6-sol",
     });
@@ -4064,7 +4260,7 @@ test "the terminal hears working while a model fetch runs" {
     var stall: providers.testing.FakeTransport.Stall = .{ .io = std.testing.io };
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
         .replies = &.{.{ .stall = &stall }},
     });
     defer rig.deinit();
@@ -4082,7 +4278,7 @@ test "the terminal hears working while a model fetch runs" {
 test "the terminal hears done after a complete gist and error after a cut one" {
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
         .replies = &.{
             .{ .body = providers.testing.reply_stream },
             .{ .body = providers.testing.replyStream("Resume the task.\\nBody.") },
@@ -4145,7 +4341,7 @@ fn expectProgramStatuses(rig: *Rig, expected: []const []const u8) !void {
 
 test "Ctrl+D at an empty prompt ends the run" {
     var rig: Rig = undefined;
-    try rig.init(&.{ .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }} });
+    try rig.init(&.{ .keys = &.{.{ "openai-api-key", "sk-openai" }} });
     defer rig.deinit();
     try rig.waitFor(&.{.{ .text = "/help: Commands" }});
     try rig.keys("\x04");
@@ -4154,7 +4350,7 @@ test "Ctrl+D at an empty prompt ends the run" {
 
 test "a closed input ends the run and leaves the alternate screen" {
     var rig: Rig = undefined;
-    try rig.init(&.{ .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }} });
+    try rig.init(&.{ .keys = &.{.{ "openai-api-key", "sk-openai" }} });
     defer rig.deinit();
     try rig.keys("/system\r");
     try rig.waitFor(&.{.{ .alternate_screen = true }});
@@ -4166,7 +4362,7 @@ test "a closed input ends the run and leaves the alternate screen" {
 test "a resize repaints the frame at the new width" {
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
         .window = .{ .columns = 80, .rows = 24 },
     });
     defer rig.deinit();
@@ -4178,7 +4374,7 @@ test "a resize repaints the frame at the new width" {
 test "paste labels keep their sequence across an immediate new draft" {
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "key" }},
+        .keys = &.{.{ "openai-api-key", "key" }},
         .model = "gpt-5.6-sol",
         .replies = &.{.{ .body = providers.testing.reply_stream }},
     });
@@ -4227,7 +4423,7 @@ test "exits after page and turn responses use the authoritative state" {
         var stall: providers.testing.FakeTransport.Stall = .{ .io = std.testing.io };
         var rig: Rig = undefined;
         try rig.init(&.{
-            .variables = &.{.{ "OPENAI_API_KEY", "key" }},
+            .keys = &.{.{ "openai-api-key", "key" }},
             .model = "gpt-5.6-sol",
             .replies = &.{.{ .stall = &stall }},
         });
@@ -4253,7 +4449,7 @@ test "exits after page and turn responses use the authoritative state" {
 test "a frame timer task failure withdraws the send as message confirmation" {
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "key" }},
+        .keys = &.{.{ "openai-api-key", "key" }},
         .model = "gpt-5.6-sol",
         .replies = &.{.{ .body = providers.testing.reply_stream }},
     });
@@ -4275,7 +4471,7 @@ const access_on = "MCP access is on.";
 test "/mcp publishes the instance, and a second gateway reads the outcome of a remote turn" {
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
         .replies = &.{.{ .body = providers.testing.reply_stream }},
         .model = "gpt-5.6-sol",
     });
@@ -4318,7 +4514,7 @@ test "remote reads keep the notice and the draft, and a second message is refuse
     var hold: providers.testing.FakeTransport.Hold = .{ .io = std.testing.io };
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
         .replies = &.{.{ .body = providers.testing.reply_stream, .hold = &hold }},
         .model = "gpt-5.6-sol",
     });
@@ -4368,7 +4564,7 @@ test "the end of access keeps the accepted turn and revokes the instance id" {
     var hold: providers.testing.FakeTransport.Hold = .{ .io = std.testing.io };
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
         .replies = &.{.{ .body = providers.testing.reply_stream, .hold = &hold }},
         .model = "gpt-5.6-sol",
     });
@@ -4402,7 +4598,7 @@ test "an Esc warning of an ended turn does not cancel a later remote turn at onc
     var holds: [2]providers.testing.FakeTransport.Hold = @splat(.{ .io = std.testing.io });
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
         .replies = &.{
             .{ .body = providers.testing.reply_stream, .hold = &holds[0] },
             .{ .body = providers.testing.reply_stream, .hold = &holds[1] },
@@ -4437,7 +4633,7 @@ test "a remote turn withdraws a quit warning and its confirmation" {
     var hold: providers.testing.FakeTransport.Hold = .{ .io = std.testing.io };
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
         .replies = &.{.{ .body = providers.testing.reply_stream, .hold = &hold }},
         .model = "gpt-5.6-sol",
     });
@@ -4463,7 +4659,7 @@ test "a remote turn withdraws a quit warning and its confirmation" {
 test "a remote notice that replaces a quit warning withdraws its confirmation" {
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
         .model = "gpt-5.6-sol",
     });
     defer rig.deinit();
@@ -4488,7 +4684,7 @@ test "an Esc at the prompt does not reach a remote turn that starts within its w
     var hold: providers.testing.FakeTransport.Hold = .{ .io = std.testing.io };
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
         .replies = &.{.{ .body = providers.testing.reply_stream, .hold = &hold }},
         .model = "gpt-5.6-sol",
     });
@@ -4518,7 +4714,7 @@ test "an Esc at the prompt does not reach a remote turn that starts within its w
 test "remote changes fail while the terminal shows a picker, and remote reads still work" {
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
         .model = "gpt-5.6-sol",
     });
     defer rig.deinit();
@@ -4631,7 +4827,7 @@ fn expectFetchOutcome(
 test "a remote clear keeps the draft and names the MCP client, and a terminal clear does not" {
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "sk-openai" }},
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
         .replies = &.{
             .{ .body = providers.testing.reply_stream },
             .{ .body = providers.testing.reply_stream },
@@ -4670,7 +4866,7 @@ test "a remote clear keeps the draft and names the MCP client, and a terminal cl
 test "the status line shows MCP access while it is on and keeps it across a snapshot" {
     var rig: Rig = undefined;
     try rig.init(&.{
-        .variables = &.{.{ "OPENAI_API_KEY", "key" }},
+        .keys = &.{.{ "openai-api-key", "key" }},
         .model = "gpt-5.6-sol",
     });
     defer rig.deinit();
