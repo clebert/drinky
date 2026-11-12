@@ -132,10 +132,14 @@ pub const Handle = opaque {
     }
     pub fn listAccounts(handle: *Handle) [query.account_count]query.Account {
         const self = controllerOf(handle);
+        if (self.work == .idle)
+            self.account_registry.reloadCredentials() catch core.fatal.outOfMemory();
         return query.accountsOf(&self.account_registry, self.rememberedNames());
     }
     pub fn listModels(handle: *Handle, account: usize) []const query.Model {
         const self = controllerOf(handle);
+        if (self.work == .idle)
+            self.account_registry.reloadModels() catch core.fatal.outOfMemory();
         return self.modelFacts(account) catch core.fatal.outOfMemory();
     }
     pub fn effort(handle: *Handle) query.Effort {
@@ -2647,6 +2651,40 @@ test "account facts expose remembered models and authors of inactive accounts" {
     try std.testing.expectEqualStrings("qwen", models[0].author);
     try std.testing.expect(!models[0].output_limit_unknown);
     try std.testing.expectEqual(@as(usize, 0), rig.transport.requests.items.len);
+}
+
+test "the account and model lists take the saves of another instance after the work ends" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const deepseek = accounts.testing.deepseek_api_key;
+    var stall: providers.testing.FakeTransport.Stall = .{ .io = io };
+    var rig: testing.Rig = undefined;
+    try rig.init(&.{ .replies = &.{.{ .stall = &stall }} });
+    defer rig.deinit();
+    const started = rig.send(&.{ .send_message = "Task." });
+    try stall.reached.wait(io);
+
+    var other: accounts.testing.Rig = undefined;
+    try other.init(gpa, io, &.{
+        .home = rig.tree.root,
+        .keys = &.{.{ "deepseek-api-key", "sk-deepseek" }},
+    });
+    defer other.deinit();
+    try other.seed(deepseek, &.{"deepseek-v4-pro"});
+    try std.testing.expect(!rig.controller.listAccounts()[deepseek].authenticated);
+    try std.testing.expectEqual(@as(usize, 0), rig.controller.listModels(deepseek).len);
+
+    try std.testing.expect(rig.send(&.{ .cancel = started.operation.? }).accepted());
+    try rig.expectTurn(.canceled);
+    try std.testing.expect(rig.controller.listAccounts()[deepseek].authenticated);
+    const models = rig.controller.listModels(deepseek);
+    try std.testing.expectEqual(@as(usize, 1), models.len);
+    try std.testing.expectEqualStrings("deepseek-v4-pro", models[0].name);
+
+    const selected = rig.send(&.{ .select_account = deepseek });
+    try std.testing.expect(selected.accepted() and selected.operation == null);
+    try std.testing.expectEqual(@as(?usize, deepseek), rig.controller.state().choice.account);
+    try std.testing.expectEqual(@as(usize, 1), rig.transport.requests.items.len);
 }
 
 test "effort facts name the requested level and the fold of each level" {

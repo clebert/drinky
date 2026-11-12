@@ -39,7 +39,7 @@ const SaveOptions = struct {
     keys_max: ?usize = null,
 };
 
-const RemoveCondition = struct {
+const Condition = struct {
     key: []const u8,
     field: []const u8,
     expected: []const u8,
@@ -130,11 +130,34 @@ pub fn replace(
     try replaceFile(io, path, body);
 }
 
+pub fn saveMatchingString(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    condition: *const Condition,
+    entry: anytype,
+) SaveError!bool {
+    try ensureParent(io, path);
+    var lock_file = try lockFile(gpa, io, path);
+    defer lock_file.close(io);
+
+    const existing = try readExisting(gpa, io, path);
+    defer if (existing) |data| gpa.free(data);
+    if (existing) |data| {
+        if (!try stringMatches(gpa, data, condition)) return false;
+    }
+
+    const body = try serialize(gpa, existing, condition.key, entry, .{});
+    defer gpa.free(body);
+    try replaceFile(io, path, body);
+    return true;
+}
+
 pub fn removeMatchingString(
     gpa: std.mem.Allocator,
     io: std.Io,
     path: []const u8,
-    condition: *const RemoveCondition,
+    condition: *const Condition,
 ) SaveError!bool {
     try ensureParent(io, path);
     var lock_file = try lockFile(gpa, io, path);
@@ -212,7 +235,7 @@ fn readExisting(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !?[]u8 {
 fn stringMatches(
     gpa: std.mem.Allocator,
     existing: []const u8,
-    condition: *const RemoveCondition,
+    condition: *const Condition,
 ) error{ OutOfMemory, CorruptStore }!bool {
     var file = try parse(gpa, existing);
     defer file.deinit();

@@ -20,7 +20,9 @@ io: std.Io,
 models_path: []const u8,
 metadata_path: []const u8,
 lists: [Account.table.len][]Model,
+lists_unsaved: std.StaticBitSet(Account.table.len),
 metadata: Metadata,
+metadata_unsaved: bool,
 mutex: std.Io.Mutex,
 
 const Encoded = struct {
@@ -81,7 +83,9 @@ pub fn init(
         .models_path = models_path,
         .metadata_path = metadata_path,
         .lists = @splat(&.{}),
+        .lists_unsaved = .empty,
         .metadata = .{ .gpa = gpa, .entries = &.{} },
+        .metadata_unsaved = false,
         .mutex = .init,
     };
     errdefer catalog.freeLists();
@@ -95,6 +99,13 @@ pub fn deinit(self: *Catalog) void {
     self.metadata.deinit();
     self.gpa.free(self.models_path);
     self.gpa.free(self.metadata_path);
+}
+
+pub fn reload(self: *Catalog) error{OutOfMemory}!void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    try self.loadAccounts();
+    try self.loadMetadata();
 }
 
 pub fn isEmpty(self: *Catalog, index: usize) bool {
@@ -161,7 +172,9 @@ pub fn setAccount(
     defer self.mutex.unlock(self.io);
     self.gpa.free(self.lists[index]);
     self.lists[index] = models;
+    self.lists_unsaved.set(index);
     try self.saveAccount(index);
+    self.lists_unsaved.unset(index);
 }
 
 pub fn dropAccount(self: *Catalog, index: usize) void {
@@ -169,12 +182,13 @@ pub fn dropAccount(self: *Catalog, index: usize) void {
     defer self.mutex.unlock(self.io);
     self.gpa.free(self.lists[index]);
     self.lists[index] = &.{};
+    self.lists_unsaved.unset(index);
     json_store.remove(self.gpa, self.io, &.{
         .path = self.models_path,
         .key = Account.table[index].id,
     }) catch |err| switch (err) {
         error.OutOfMemory => core.fatal.outOfMemory(),
-        else => {},
+        else => self.lists_unsaved.set(index),
     };
 }
 
@@ -183,7 +197,9 @@ pub fn setMetadata(self: *Catalog, metadata: Metadata) json_store.SaveError!void
     defer self.mutex.unlock(self.io);
     self.metadata.deinit();
     self.metadata = metadata;
+    self.metadata_unsaved = true;
     try self.saveMetadata();
+    self.metadata_unsaved = false;
 }
 
 fn freeLists(self: *Catalog) void {
@@ -194,6 +210,7 @@ fn loadAccounts(self: *Catalog) error{OutOfMemory}!void {
     var file = try json_store.openReadable(self.gpa, self.io, self.models_path) orelse return;
     defer file.deinit();
     for (&Account.table, 0..) |*row, index| {
+        if (self.lists_unsaved.isSet(index)) continue;
         const entry = file.entry(row.id) orelse continue;
         const listed = providers.json.array(entry.getPtr(models_key)) orelse continue;
         const models = try json.models(self.gpa, listed.items, decodeModel);
@@ -203,6 +220,7 @@ fn loadAccounts(self: *Catalog) error{OutOfMemory}!void {
 }
 
 fn loadMetadata(self: *Catalog) error{OutOfMemory}!void {
+    if (self.metadata_unsaved) return;
     var file = try json_store.openReadable(self.gpa, self.io, self.metadata_path) orelse return;
     defer file.deinit();
 
@@ -640,7 +658,7 @@ test "a metadata save replaces the entries of every vendor at once" {
     try std.testing.expectEqual(@as(?u64, 1_050_000), described.context_window);
 }
 
-test "a locked cache file keeps the fetched list of this session" {
+test "a reload keeps a list, drop, or metadata that a locked cache refused until a write succeeds" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -653,19 +671,58 @@ test "a locked cache file keeps the fetched list of this session" {
     defer clock.deinit();
     var catalog = try init(gpa, clock.io(), &.{ .working_directory = ".", .home = home });
     defer catalog.deinit();
-    var directory = try tmp.dir.createDirPathOpen(io, ".drinky", .{});
-    directory.close(io);
+    try tmp.dir.createDirPath(io, ".drinky");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".drinky/models.json",
+        .data =
+        \\{ "anthropic-api-key":
+        \\    { "models": [ { "name": "claude-older", "context_window": 10 } ] } }
+        ,
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".drinky/metadata.json",
+        .data =
+        \\{ "openrouter": { "models": [ { "name": "older/model", "context_window": 10 } ] } }
+        ,
+    });
 
-    var held = try tmp.dir.createFile(io, ".drinky/models.json.lock", .{ .lock = .exclusive });
-    defer held.close(io);
+    var held_models = try tmp.dir.createFile(io, ".drinky/models.json.lock", .{
+        .lock = .exclusive,
+    });
+    var held_metadata = try tmp.dir.createFile(io, ".drinky/metadata.json.lock", .{
+        .lock = .exclusive,
+    });
+    defer held_metadata.close(io);
 
     const fetched = [_]Model{vendorModel("claude-opus-4-8", 1_000_000, .high)};
     try std.testing.expectError(
         error.StoreBusy,
         catalog.setAccount(testing.anthropic_api_key, &fetched),
     );
-    try std.testing.expect(!catalog.isEmpty(testing.anthropic_api_key));
+    try std.testing.expectError(error.StoreBusy, describe(&catalog, &.{
+        .{ .vendor = .openrouter, .model = vendorModel("fresh/model", 10, null) },
+    }));
+    try catalog.reload();
     try std.testing.expect(catalog.find(testing.anthropic_api_key, "claude-opus-4-8") != null);
+    try std.testing.expect(catalog.find(testing.anthropic_api_key, "claude-older") == null);
+    try std.testing.expect(catalog.find(testing.openrouter_api, "fresh/model") != null);
+    try std.testing.expect(catalog.find(testing.openrouter_api, "older/model") == null);
+
+    catalog.dropAccount(testing.anthropic_api_key);
+    try catalog.reload();
+    try std.testing.expect(catalog.isEmpty(testing.anthropic_api_key));
+
+    held_models.close(io);
+    catalog.dropAccount(testing.anthropic_api_key);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = ".drinky/models.json",
+        .data =
+        \\{ "anthropic-api-key":
+        \\    { "models": [ { "name": "claude-newer", "context_window": 10 } ] } }
+        ,
+    });
+    try catalog.reload();
+    try std.testing.expect(catalog.find(testing.anthropic_api_key, "claude-newer") != null);
 }
 
 test "a cached limit that is not a count reads as unstated" {

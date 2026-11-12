@@ -133,6 +133,8 @@ pub fn Store(comptime Flow: type) type {
         path: []const u8,
         account: []const u8,
         tokens: ?Tokens,
+        refresh_stored: ?[]const u8,
+        refresh_rejected: ?[]const u8,
         save_pending: bool,
         mutex: std.Io.Mutex,
 
@@ -179,6 +181,8 @@ pub fn Store(comptime Flow: type) type {
                 .path = try json_store.locate(gpa, &options.directories, .auth),
                 .account = options.account,
                 .tokens = null,
+                .refresh_stored = null,
+                .refresh_rejected = null,
                 .save_pending = false,
                 .mutex = .init,
             };
@@ -186,6 +190,8 @@ pub fn Store(comptime Flow: type) type {
 
         pub fn deinit(self: *Self) void {
             if (self.tokens) |tokens| tokens.deinit(self.gpa);
+            self.forgetStored();
+            if (self.refresh_rejected) |rejected| self.gpa.free(rejected);
             self.gpa.free(self.path);
         }
 
@@ -193,6 +199,12 @@ pub fn Store(comptime Flow: type) type {
             var file = (try openStore(self.gpa, self.io, self.path)) orelse return false;
             defer file.deinit();
             return self.loadEntry(&file);
+        }
+
+        pub fn reload(self: *Self) Error!void {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            _ = try self.load();
         }
 
         pub fn signedIn(self: *Self) bool {
@@ -276,6 +288,9 @@ pub fn Store(comptime Flow: type) type {
                 .field = "refresh",
                 .expected = tokens.refresh,
             }) catch |err| {
+                const rejected = try self.gpa.dupe(u8, tokens.refresh);
+                if (self.refresh_rejected) |old| self.gpa.free(old);
+                self.refresh_rejected = rejected;
                 self.clear();
                 return switch (err) {
                     error.CorruptStore => error.BadCredentials,
@@ -287,8 +302,15 @@ pub fn Store(comptime Flow: type) type {
             return self.load();
         }
 
+        fn rejects(self: *const Self, entry: *const std.json.ObjectMap) bool {
+            const rejected = self.refresh_rejected orelse return false;
+            const stored = providers.json.string(entry.getPtr("refresh")) orelse return false;
+            return std.mem.eql(u8, stored, rejected);
+        }
+
         fn loadEntry(self: *Self, file: *const json_store.File) Error!bool {
             const entry = file.entry(self.account) orelse return false;
+            if (self.rejects(entry)) return false;
             const info = @typeInfo(Tokens).@"struct";
             var tokens: Tokens = undefined;
             var filled: usize = 0;
@@ -310,6 +332,7 @@ pub fn Store(comptime Flow: type) type {
                 };
                 filled = index + 1;
             }
+            try self.markStored(&tokens);
             if (self.tokens) |old| old.deinit(self.gpa);
             self.tokens = tokens;
             self.save_pending = false;
@@ -353,6 +376,7 @@ pub fn Store(comptime Flow: type) type {
             var stored = self.*;
             stored.mutex = .init;
             stored.tokens = null;
+            stored.refresh_stored = null;
             defer stored.clear();
             const loaded = stored.load() catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
@@ -362,7 +386,9 @@ pub fn Store(comptime Flow: type) type {
             if (std.mem.eql(u8, self.tokens.?.refresh, stored.tokens.?.refresh)) return false;
             self.clear();
             self.tokens = stored.tokens;
+            self.refresh_stored = stored.refresh_stored;
             stored.tokens = null;
+            stored.refresh_stored = null;
             return true;
         }
 
@@ -432,6 +458,7 @@ pub fn Store(comptime Flow: type) type {
             defer self.mutex.unlock(self.io);
             if (self.tokens) |old| old.deinit(self.gpa);
             self.tokens = tokens;
+            self.forgetStored();
             self.save() catch |save_error| switch (save_error) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return .{ .memory_only = .{
@@ -445,15 +472,27 @@ pub fn Store(comptime Flow: type) type {
         fn clear(self: *Self) void {
             if (self.tokens) |tokens| tokens.deinit(self.gpa);
             self.tokens = null;
+            self.forgetStored();
             self.save_pending = false;
+        }
+
+        fn markStored(self: *Self, tokens: *const Tokens) error{OutOfMemory}!void {
+            const stored = switch (comptime Flow.secret) {
+                .access_token => try self.gpa.dupe(u8, tokens.refresh),
+                .api_key => return,
+            };
+            self.forgetStored();
+            self.refresh_stored = stored;
+        }
+
+        fn forgetStored(self: *Self) void {
+            if (self.refresh_stored) |stored| self.gpa.free(stored);
+            self.refresh_stored = null;
         }
 
         fn save(self: *Self) Error!void {
             const tokens = self.tokens orelse return error.NotAuthenticated;
-            json_store.save(self.gpa, self.io, &.{
-                .path = self.path,
-                .key = self.account,
-            }, tokens, .{}) catch |err| {
+            const written = self.write(&tokens) catch |err| {
                 self.save_pending = true;
                 return switch (err) {
                     error.CorruptStore => error.BadCredentials,
@@ -461,6 +500,22 @@ pub fn Store(comptime Flow: type) type {
                 };
             };
             self.save_pending = false;
+            if (written) try self.markStored(&tokens);
+        }
+
+        fn write(self: *Self, tokens: *const Tokens) json_store.SaveError!bool {
+            const expected = self.refresh_stored orelse {
+                try json_store.save(self.gpa, self.io, &.{
+                    .path = self.path,
+                    .key = self.account,
+                }, tokens.*, .{});
+                return true;
+            };
+            return json_store.saveMatchingString(self.gpa, self.io, self.path, &.{
+                .key = self.account,
+                .field = "refresh",
+                .expected = expected,
+            }, tokens.*);
         }
     };
 }
@@ -1108,6 +1163,45 @@ test "invalidation preserves a newer refresh token from another instance" {
     try expectStoredRefresh(io, &tmp, "new_refresh");
 }
 
+test "a reload skips the rejected credential that a failed removal left, and takes a new one" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var clock: core.testing.ClockIo = undefined;
+    clock.init(gpa);
+    defer clock.deinit();
+    var subject = try signedInSubject(clock.io(), &tmp, &.{
+        .access = "rejected_access",
+        .refresh = "rejected_refresh",
+        .expires_ms = std.math.maxInt(i64),
+    });
+    defer subject.deinit();
+
+    var path_buffer: [128]u8 = undefined;
+    const lock_path = try json_store.lockPath(gpa, try storePath(&path_buffer, &tmp));
+    defer gpa.free(lock_path);
+    {
+        var held = try std.Io.Dir.cwd().createFile(io, lock_path, .{
+            .truncate = false,
+            .lock = .exclusive,
+            .permissions = .fromMode(0o600),
+        });
+        defer held.close(io);
+        try std.testing.expectError(error.StoreBusy, subject.invalidate());
+    }
+    try subject.reload();
+    try std.testing.expect(!subject.signedIn());
+
+    try saveTokens(io, &tmp, &.{
+        .access = "new_access",
+        .refresh = "new_refresh",
+        .expires_ms = std.math.maxInt(i64),
+    });
+    try subject.reload();
+    try expectField("refresh", "new_refresh", &subject);
+}
+
 test "an expired access token is refreshed and saved again" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -1128,6 +1222,47 @@ test "an expired access token is refreshed and saved again" {
     defer loaded.deinit();
     try std.testing.expect(try loaded.load());
     try expectAccess("fresh", &loaded);
+}
+
+test "a refresh uses its fresh token and keeps the sign-out or sign-in of another instance" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    test_refresh = .grant;
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var subject = try signedInSubject(io, &tmp, &.{
+            .access = "stale",
+            .refresh = "old",
+            .expires_ms = 0,
+        });
+        defer subject.deinit();
+        var path_buffer: [128]u8 = undefined;
+        const path = try storePath(&path_buffer, &tmp);
+        try json_store.remove(gpa, io, &.{ .path = path, .key = test_account });
+
+        try expectAccess("fresh", &subject);
+        var file = (try json_store.open(gpa, io, path)).?;
+        defer file.deinit();
+        try std.testing.expect(file.entry(test_account) == null);
+    }
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var subject = try signedInSubject(io, &tmp, &.{
+        .access = "stale",
+        .refresh = "old",
+        .expires_ms = 0,
+    });
+    defer subject.deinit();
+    try saveTokens(io, &tmp, &.{
+        .access = "other_access",
+        .refresh = "other",
+        .expires_ms = std.math.maxInt(i64),
+    });
+
+    try expectAccess("fresh", &subject);
+    try expectStoredRefresh(io, &tmp, "other");
 }
 
 test "a busy store retries a refreshed credential before the next request" {

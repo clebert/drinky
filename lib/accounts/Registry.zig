@@ -659,6 +659,28 @@ pub fn reloadKey(self: *Registry, index: usize) error{OutOfMemory}!bool {
     return true;
 }
 
+pub fn reloadCredentials(self: *Registry) error{OutOfMemory}!void {
+    for (&self.slots, &self.load_errors, 0..) |*slot, *load_error, index| {
+        if (self.isAuthenticated(index)) continue;
+        const loaded: oauth.store.Error!void = switch (slot.*) {
+            .absent, .google => continue,
+            .key => |*key| key.load(),
+            .login => |*login| switch (login.*) {
+                inline else => |*store| store.reload(),
+            },
+        };
+        load_error.* = null;
+        loaded catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => load_error.* = err,
+        };
+    }
+}
+
+pub fn reloadModels(self: *Registry) error{OutOfMemory}!void {
+    try self.catalog.reload();
+}
+
 pub fn findModel(self: *Registry, index: usize, name: []const u8) ?Model {
     return self.catalog.find(index, name);
 }
@@ -1590,6 +1612,56 @@ test "a key reload adopts the key of another instance, and a stored key prefers 
     defer gpa.free(kept);
     try std.testing.expectEqualStrings("sk-new", kept);
     try std.testing.expect(try rig.registry.storedKey(testing.anthropic_plan, gpa) == null);
+}
+
+test "a reload takes new sign-ins and model lists, keeps a held key, and resets a load error" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var home_buffer: [128]u8 = undefined;
+    const home = try testing.tmpHome(&home_buffer, &tmp);
+    var rig: testing.Rig = undefined;
+    try rig.init(gpa, io, &.{ .home = home, .keys = &.{.{ "openai-api-key", "sk-mine" }} });
+    defer rig.deinit();
+
+    var other: testing.Rig = undefined;
+    try other.init(gpa, io, &.{ .home = home, .keys = &.{
+        .{ "openai-api-key", "sk-other" },
+        .{ "deepseek-api-key", "sk-deepseek" },
+    } });
+    defer other.deinit();
+    try other.seed(testing.deepseek_api_key, &.{"deepseek-v4-pro"});
+    var path_buffer: [160]u8 = undefined;
+    const store_path = try testing.tmpPath(&path_buffer, &tmp, ".drinky/auth.json");
+    try json_store.save(gpa, io, &.{ .path = store_path, .key = "xai-plan" }, .{
+        .access = "a",
+        .refresh = "r",
+        .expires_ms = 4102444800000,
+    }, .{});
+    try json_store.save(gpa, io, &.{ .path = store_path, .key = "anthropic-api-key" }, .{
+        .key = "malformed",
+    }, .{});
+
+    try rig.registry.reloadCredentials();
+    try std.testing.expect(rig.registry.isAuthenticated(testing.deepseek_api_key));
+    try std.testing.expect(rig.registry.isAuthenticated(testing.xai_plan));
+    try std.testing.expect(rig.registry.holdsKey(testing.openai_api_key, "sk-mine"));
+    try std.testing.expect(!rig.registry.isAuthenticated(testing.anthropic_api_key));
+    try std.testing.expectEqual(
+        @as(?LoadError, error.BadCredentials),
+        rig.registry.loadError(testing.anthropic_api_key),
+    );
+    try testing.saveKeys(gpa, io, home, &.{.{ "anthropic-api-key", "sk-ant" }});
+    try rig.registry.reloadCredentials();
+    try std.testing.expect(rig.registry.isAuthenticated(testing.anthropic_api_key));
+    try std.testing.expect(rig.registry.loadError(testing.anthropic_api_key) == null);
+
+    try std.testing.expect(!rig.registry.offersModel(testing.deepseek_api_key));
+    try rig.registry.reloadModels();
+    const listed = rig.registry.findModel(testing.deepseek_api_key, "deepseek-v4-pro");
+    try std.testing.expect(listed != null);
+    try std.testing.expectEqual(@as(usize, 0), rig.transport.requests.items.len);
 }
 
 test "a failed cache write reports a failed save, not a failed fetch" {
