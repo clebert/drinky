@@ -61,7 +61,8 @@ agent. Ignore the remaining steps of this skill.
    preference as a requirement or hide evidence that challenges the proposal. Include the full
    proposal when the second agent cannot access its source.
 
-4. Start one second agent with the `bash` tool and a `timeout_seconds` value of 3600:
+4. Start one second agent in the foreground with the `bash` tool and a `timeout_seconds` value of
+   3600:
 
    ```sh
    drinky run --model "$DRINKY_MODEL" --effort "$DRINKY_EFFORT" <<'EOF'

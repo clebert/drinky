@@ -47,7 +47,7 @@ and ignore the rest of this skill.
    instead. When a variable is empty, ask for that value without a default. Show the output of
    `drinky models` only on request. In a later round, use the model and the effort of the last round
    without a question. Use other values only when the user names them.
-3. Start the reviewer with the `bash` tool and a `timeout_seconds` value of 3600:
+3. Start the reviewer in the foreground with the `bash` tool and a `timeout_seconds` value of 3600:
 
    ```sh
    drinky run --model "$DRINKY_MODEL" --effort "$DRINKY_EFFORT" <<'EOF'

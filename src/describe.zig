@@ -349,7 +349,12 @@ fn writeHeadless(writer: *std.Io.Writer) !void {
         \\  Each model attempt reports its cost when it ends, including a failed attempt with usage.
         \\  A run uses its own model prices unless the provider reports a charge.
         \\  A run adds no summary to the transcript or tool output.
-        \\  Keep the bash invocation open with `wait` for background runs.
+        \\- A `bash` call ends when its command ends and every process closes the output of the
+        \\  call. A background process that keeps that output open holds the call. At the time
+        \\  limit, Drinky stops every process in the process group of the command.
+        \\- A run loses each cost that it reports after its `bash` call ends. A lost cost fails the
+        \\  run with exit code 1 after its reply. Keep the call open with `wait` for a background
+        \\  run.
         \\- The `--model` flag and the `--effort` flag are required.
         \\- The `--model` flag takes an `account/model` value. The command `drinky models` lists
         \\  the values of each signed-in account with a saved model list. The user fetches a list

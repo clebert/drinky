@@ -23,6 +23,8 @@ const ChildErrorInt = @Int(.unsigned, @sizeOf(anyerror) * 8);
 
 const replacement = "\u{FFFD}";
 
+const process_group_stopped = "Drinky stopped every process in the process group of the command.";
+
 pub const spec: core.Tool = .{
     .name = "bash",
     .description = "Run a bash command in the working directory and return its combined " ++
@@ -574,13 +576,14 @@ fn render(
             },
             .timed_out => |timeout_ms| {
                 var limit_buffer: [24]u8 = undefined;
-                try result_writer.writer.print("[The command timed out after {s}.]", .{
+                try result_writer.writer.print("[The command timed out after {s}. {s}]", .{
                     format.duration(&limit_buffer, @intCast(timeout_ms)),
+                    process_group_stopped,
                 });
             },
             .oversized => try result_writer.writer.print(
-                "[The command produced more than {d} MiB of output, so Drinky stopped it.]",
-                .{capture_bytes_max >> 20},
+                "[The command produced more than {d} MiB of output. {s}]",
+                .{ capture_bytes_max >> 20, process_group_stopped },
             ),
         }
     }
@@ -1241,7 +1244,8 @@ test "a timed-out command keeps its output and states the stop" {
     defer result.deinit(gpa);
     try std.testing.expect(result.hasFailure());
     try std.testing.expectEqualStrings(
-        "started\n\n\n[The command timed out after 200ms.]",
+        "started\n\n\n[The command timed out after 200ms. " ++
+            "Drinky stopped every process in the process group of the command.]",
         result.content,
     );
     try testing.expectTimed(&result, &.{.{ .lines, 1 }});
@@ -1360,7 +1364,8 @@ test "an oversized command keeps its output tail and states the stop" {
     try std.testing.expect(std.mem.find(
         u8,
         result.content,
-        "[The command produced more than 8 MiB of output, so Drinky stopped it.]",
+        "[The command produced more than 8 MiB of output. " ++
+            "Drinky stopped every process in the process group of the command.]",
     ) != null);
     try std.testing.expect(std.mem.find(u8, result.content, "Drinky omitted") != null);
     try std.testing.expect(result.measures.get(.duration_ms) != null);
