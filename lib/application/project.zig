@@ -95,15 +95,36 @@ pub fn gitDirectory(
 ) error{ OutOfMemory, Canceled }!?[]u8 {
     const directory = try headDirectory(gpa, io, root) orelse return null;
     errdefer gpa.free(directory);
+    const common = try commonDirectory(gpa, io, directory) orelse return directory;
+    gpa.free(directory);
+    return common;
+}
+
+pub fn mainCheckout(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+) error{ OutOfMemory, Canceled }!?[]u8 {
+    const directory = try headDirectory(gpa, io, root) orelse return null;
+    defer gpa.free(directory);
+    const common = try commonDirectory(gpa, io, directory) orelse return null;
+    defer gpa.free(common);
+    if (!std.mem.eql(u8, std.Io.Dir.path.basename(common), marker_name)) return null;
+    return try gpa.dupe(u8, std.Io.Dir.path.dirname(common).?);
+}
+
+fn commonDirectory(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    directory: []const u8,
+) error{ OutOfMemory, Canceled }!?[]u8 {
     const common_path = try std.Io.Dir.path.join(gpa, &.{ directory, "commondir" });
     defer gpa.free(common_path);
-    const data = try readHeadFile(gpa, io, common_path) orelse return directory;
+    const data = try readHeadFile(gpa, io, common_path) orelse return null;
     defer gpa.free(data);
     const common = std.mem.trim(u8, data, " \t\r\n");
-    if (common.len == 0) return directory;
-    const resolved = try std.Io.Dir.path.resolve(gpa, &.{ directory, common });
-    gpa.free(directory);
-    return resolved;
+    if (common.len == 0) return null;
+    return try std.Io.Dir.path.resolve(gpa, &.{ directory, common });
 }
 
 fn headDirectory(
@@ -321,7 +342,7 @@ test "a head reads the Git directory that a marker file names, and a missing hea
     try std.testing.expect(try head(gpa, io, worktree_root) == null);
 }
 
-test "the Git directory of a root is its marker, the target of its marker file, or a shared one" {
+test "a root names its Git directory, and only a linked worktree names a main checkout" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var tree: testing.Tree = try .init();
@@ -331,22 +352,35 @@ test "the Git directory of a root is its marker, the target of its marker file, 
     try tree.write("repo/.git/worktrees/next/commondir", "../..\n");
     try tree.write("next/.git", "gitdir: ../repo/.git/worktrees/next\n");
     try tree.write("part/.git", "gitdir: ../repo/.git/modules/part\n");
+    try tree.write("store/work.git/worktrees/bare/commondir", "../..\n");
+    try tree.write("bare/.git", "gitdir: ../store/work.git/worktrees/bare\n");
 
-    const cases = [_]struct { root: []const u8, expected: ?[]const u8 }{
-        .{ .root = "plain", .expected = null },
-        .{ .root = "repo", .expected = "repo/.git" },
-        .{ .root = "next", .expected = "repo/.git" },
-        .{ .root = "part", .expected = "repo/.git/modules/part" },
+    const cases = [_]struct { root: []const u8, git: ?[]const u8, checkout: ?[]const u8 }{
+        .{ .root = "plain", .git = null, .checkout = null },
+        .{ .root = "repo", .git = "repo/.git", .checkout = null },
+        .{ .root = "next", .git = "repo/.git", .checkout = "repo" },
+        .{ .root = "part", .git = "repo/.git/modules/part", .checkout = null },
+        .{ .root = "bare", .git = "store/work.git", .checkout = null },
     };
     for (cases) |case| {
-        const found = try gitDirectory(gpa, io, try tree.path(case.root));
-        defer if (found) |directory| gpa.free(directory);
-        const expected = case.expected orelse {
-            try std.testing.expect(found == null);
-            continue;
-        };
-        try std.testing.expectEqualStrings(try tree.path(expected), found.?);
+        const root = try tree.path(case.root);
+        const git_directory = try gitDirectory(gpa, io, root);
+        defer if (git_directory) |directory| gpa.free(directory);
+        try expectTreePath(&tree, case.git, git_directory);
+        const checkout = try mainCheckout(gpa, io, root);
+        defer if (checkout) |directory| gpa.free(directory);
+        try expectTreePath(&tree, case.checkout, checkout);
     }
+}
+
+fn expectTreePath(
+    tree: *testing.Tree,
+    maybe_expected: ?[]const u8,
+    maybe_found: ?[]const u8,
+) !void {
+    const expected = maybe_expected orelse return std.testing.expect(maybe_found == null);
+    const found = maybe_found orelse return error.TestExpectedPath;
+    try std.testing.expectEqualStrings(try tree.path(expected), found);
 }
 
 test "a cancel during a Git directory read reaches the caller" {
@@ -360,7 +394,7 @@ test "a cancel during a Git directory read reaches the caller" {
     );
 }
 
-test "a Git directory read returns every allocation failure and releases every partial allocation" {
+test "Git reads return every allocation failure and release every partial allocation" {
     var tree: testing.Tree = try .init();
     defer tree.deinit();
     try tree.write("repo/.git/worktrees/next/commondir", "../..\n");
@@ -369,6 +403,11 @@ test "a Git directory read returns every allocation failure and releases every p
         core.testing.no_resize_allocator,
         checkGitDirectory,
         .{ try tree.path("next"), try tree.path("repo/.git") },
+    );
+    try std.testing.checkAllAllocationFailures(
+        core.testing.no_resize_allocator,
+        checkMainCheckout,
+        .{ try tree.path("next"), try tree.path("repo") },
     );
 }
 
@@ -379,6 +418,17 @@ fn checkGitDirectory(
 ) error{ OutOfMemory, Canceled, TestExpectedGitDirectory, TestExpectedEqual }!void {
     const found = try gitDirectory(gpa, std.testing.io, root) orelse
         return error.TestExpectedGitDirectory;
+    defer gpa.free(found);
+    try std.testing.expectEqualStrings(expected, found);
+}
+
+fn checkMainCheckout(
+    gpa: std.mem.Allocator,
+    root: []const u8,
+    expected: []const u8,
+) error{ OutOfMemory, Canceled, TestExpectedMainCheckout, TestExpectedEqual }!void {
+    const found = try mainCheckout(gpa, std.testing.io, root) orelse
+        return error.TestExpectedMainCheckout;
     defer gpa.free(found);
     try std.testing.expectEqualStrings(expected, found);
 }

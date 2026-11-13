@@ -476,6 +476,8 @@ pub fn document(
         \\- This file names no model. Drinky learns every model from the provider, and the user
         \\  fetches that list through the frontend. Drinky remembers the model of each
         \\  account per project in a separate state file.
+        \\- A linked Git worktree shares the project of its main checkout when the shared Git
+        \\  directory is the `.git` directory of that checkout.
         \\- `default_effort` takes one of: {s}. Without the key, Drinky uses {s}.
         \\- Drinky remembers the effort level of each project in that same state file, and that
         \\  memory outranks this file. An explicit effort change updates a project that

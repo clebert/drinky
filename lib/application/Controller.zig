@@ -583,12 +583,18 @@ fn init(self: *Controller, gpa: std.mem.Allocator, io: std.Io, options: *const O
     self.gists = try .init(gpa, self.home_directory);
     errdefer self.gists.deinit();
     if (options.startup == .session) {
+        const maybe_root = self.harness.project_instructions.projectRoot();
+        const maybe_checkout = if (maybe_root) |root|
+            try project.mainCheckout(gpa, io, root)
+        else
+            null;
+        defer if (maybe_checkout) |checkout| gpa.free(checkout);
         self.saved = try accounts.State.open(
             gpa,
             io,
             &.{
                 .directories = directories.*,
-                .project = self.harness.project_instructions.projectRoot() orelse cwd,
+                .project = maybe_checkout orelse maybe_root orelse cwd,
             },
         );
     }
@@ -1976,6 +1982,23 @@ test "session startup exposes validated settings and acknowledges unchanged proj
     const snapshot = try rig.snapshot();
     defer snapshot.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("changed", snapshot.state.branch.?);
+}
+
+test "a linked worktree starts with the saved effort of its main checkout" {
+    var rig: testing.Rig = undefined;
+    try rig.init(&.{
+        .files = &.{
+            .{ ".git/worktrees/next/HEAD", "ref: refs/heads/next\n" },
+            .{ ".git/worktrees/next/commondir", "../..\n" },
+            .{ "next/.git", "gitdir: ../.git/worktrees/next\n" },
+        },
+        .working_directory = "next",
+    });
+    defer rig.deinit();
+    const initial = try rig.snapshot();
+    defer initial.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("next", initial.state.branch.?);
+    try std.testing.expectEqual(core.Provider.Effort.high, initial.state.choice.effort);
 }
 
 test "ordered snapshots include the streamed text of a running turn" {

@@ -162,6 +162,7 @@ pub const Rig = struct {
         }},
         remembered: []const struct { account: usize, name: []const u8 } = &.{},
         files: []const [2][]const u8 = &.{},
+        working_directory: ?[]const u8 = null,
     };
 
     pub fn init(self: *Rig, options: *const Options) !void {
@@ -218,8 +219,12 @@ pub const Rig = struct {
         self.loopback = .{ .io = io };
         self.mail = .init(&self.mail_buffer);
         errdefer self.closeMail();
+        const working_directory = if (options.working_directory) |sub_path|
+            try self.tree.path(sub_path)
+        else
+            self.tree.root;
         self.controller = try Controller.Handle.create(options.allocator, io, &.{
-            .directories = .{ .working_directory = self.tree.root, .home = self.tree.root },
+            .directories = .{ .working_directory = working_directory, .home = self.tree.root },
             .environment = &self.environment,
             .startup = options.startup,
             .frontend = options.frontend,
