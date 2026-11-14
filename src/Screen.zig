@@ -37,7 +37,8 @@ branch_buffer: [application.branch_bytes_max]u8,
 branch_length: ?usize,
 window_pages: usize,
 gauge: application.Settings.Gauge,
-animation: application.Settings.Animation = (application.Settings{}).animation,
+animation: ui.paint.Animation,
+seed: u64,
 display_roots: format.Roots,
 intro: []const u8 = "",
 startup_failures: std.ArrayList([]const u8) = .empty,
@@ -99,29 +100,25 @@ pub const Widget = union(enum) {
 };
 
 pub const Turn = struct {
-    calls: std.ArrayList(Call),
+    calls: std.ArrayList(application.Live.Call),
     thinking: bool,
-    activity_tick: u64,
-    progress_tick_last: u64,
     caret_tick: u64,
     work_line: std.ArrayList(u8),
     work_ends: [ui.Block.Work.Summary.segment_count]usize,
     work_hash: ?u64,
     work_track: layout.Track,
 
+    const WorkOptions = struct { now_ms: i64, open: ?Transcript.Run, verbose: bool };
+
     const empty: Turn = .{
         .calls = .empty,
         .thinking = false,
-        .activity_tick = 0,
-        .progress_tick_last = 0,
         .caret_tick = 0,
         .work_line = .empty,
         .work_ends = undefined,
         .work_hash = null,
         .work_track = .{},
     };
-
-    const WorkOptions = struct { now_ms: i64, open: ?Transcript.Run, verbose: bool };
 
     fn deinit(self: *Turn, gpa: std.mem.Allocator) void {
         self.releaseCalls(gpa);
@@ -176,15 +173,31 @@ pub const Turn = struct {
             activity_text.shrinkRetainingCapacity(name_start + shown.len);
         }
         summary.elapsed_ms = options.now_ms - (started_ms orelse return null);
+        var command_buffer: [command_bytes_max]u8 = undefined;
         self.work_line.clearRetainingCapacity();
         var out: std.Io.Writer.Allocating = .fromArrayList(gpa, &self.work_line);
         defer self.work_line = out.toArrayList();
         summary.write(&out.writer, &.{
             .activity = activity_text.items,
             .tools_active = self.calls.items.len,
+            .command = self.runningCommand(&command_buffer),
             .ends = &self.work_ends,
         }) catch return error.OutOfMemory;
         return ui.Block.Work.box(out.written(), &self.work_ends, null);
+    }
+
+    fn runningCommand(self: *const Turn, buffer: []u8) ?[]const u8 {
+        for (self.calls.items) |*call| switch (call.phase) {
+            .pending => {},
+            .running => |running| {
+                const subject = running.subject orelse continue;
+                switch (subject.kind) {
+                    .command => return format.mainCommand(buffer, subject.text),
+                    .path, .pattern => {},
+                }
+            },
+        };
+        return null;
     }
 
     fn liveCallBefore(self: *const Turn, index: usize, name: []const u8) bool {
@@ -195,25 +208,14 @@ pub const Turn = struct {
     }
 };
 
-pub const Call = struct {
-    name: []const u8,
-    argument_bytes: usize,
-    opened_ms: i64,
+const command_bytes_max = 128;
 
-    fn init(gpa: std.mem.Allocator, live: *const application.Live.Call) !Call {
-        return .{
-            .name = try gpa.dupe(u8, live.name),
-            .argument_bytes = live.argument_bytes,
-            .opened_ms = live.opened_ms,
-        };
-    }
-
-    fn deinit(self: *Call, gpa: std.mem.Allocator) void {
-        gpa.free(self.name);
-    }
-};
-
-pub fn init(gpa: std.mem.Allocator, writer: *std.Io.Writer, effort: application.Effort) Screen {
+pub fn init(
+    gpa: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    effort: application.Effort,
+    seed: u64,
+) Screen {
     var self: Screen = .{
         .gpa = gpa,
         .transcript = .init(gpa),
@@ -231,6 +233,8 @@ pub fn init(gpa: std.mem.Allocator, writer: *std.Io.Writer, effort: application.
         .branch_length = null,
         .window_pages = application.Settings.window_pages_default,
         .gauge = .{},
+        .animation = .init((application.Settings{}).animation, seed),
+        .seed = seed,
         .display_roots = .{},
     };
     self.page_view.preserveScrollback();
@@ -332,7 +336,7 @@ pub fn applyChange(self: *Screen, change: *const Change) !void {
         .statistics => |statistics| self.statistics = statistics,
         .clear_conversation => try self.clearConversation(),
     }
-    if (self.activeTurn()) |turn| turn.progress_tick_last = turn.activity_tick;
+    if (self.activeTurn() != null) self.animation.markProgress();
 }
 
 fn blockFrom(self: *Screen, record: *const application.Record) !ui.Block {
@@ -432,14 +436,14 @@ fn showLive(self: *Screen, live: *const application.Live) !void {
         std.debug.assert(live.calls.len == 0 and !live.thinking);
         return;
     };
-    var calls: std.ArrayList(Call) = .empty;
+    var calls: std.ArrayList(application.Live.Call) = .empty;
     errdefer {
         for (calls.items) |*call| call.deinit(self.gpa);
         calls.deinit(self.gpa);
     }
     try calls.ensureTotalCapacity(self.gpa, live.calls.len);
     for (live.calls) |*call|
-        calls.appendAssumeCapacity(try .init(self.gpa, call));
+        calls.appendAssumeCapacity(try call.dupe(self.gpa));
     turn.releaseCalls(self.gpa);
     turn.calls.deinit(self.gpa);
     turn.calls = calls;
@@ -476,6 +480,7 @@ fn appendIntro(self: *Screen) !void {
 fn beginTurn(self: *Screen) void {
     std.debug.assert(self.widget == .prompt);
     self.widget = .{ .turn = .empty };
+    self.animation.restart();
 }
 
 fn endTurn(self: *Screen) void {
@@ -623,6 +628,7 @@ pub fn closePicker(self: *Screen) void {
 
 pub fn beginPickerWait(self: *Screen, text: []const u8) !void {
     try self.widget.picking.beginWait(text);
+    self.animation.restart();
 }
 
 pub fn openPage(self: *Screen, options: *const ui.Page.Options) !void {
@@ -679,7 +685,7 @@ pub fn branch(self: *const Screen) ?[]const u8 {
 
 pub fn restore(self: *Screen, snapshot: *const application.Snapshot) !void {
     const state = &snapshot.state;
-    var restored = Screen.init(self.gpa, self.view.writer, state.choice.effort);
+    var restored = Screen.init(self.gpa, self.view.writer, state.choice.effort, self.seed);
     errdefer restored.deinit();
     restored.intro = self.intro;
     restored.startup_failures = self.startup_failures;
@@ -689,7 +695,8 @@ pub fn restore(self: *Screen, snapshot: *const application.Snapshot) !void {
     restored.verbose = self.verbose;
     restored.window_pages = snapshot.settings.window_pages;
     restored.gauge = snapshot.settings.gauge;
-    restored.animation = snapshot.settings.animation;
+    restored.animation = self.animation;
+    restored.animation.restyle(snapshot.settings.animation, self.seed);
     restored.display_roots = .{
         .working_directory = snapshot.working_directory,
         .home_directory = snapshot.home_directory,
@@ -775,6 +782,20 @@ pub fn paint(
         },
         .turn => |*turn| turn: {
             self.editor.reflow(size, layout.editorRows(size.rows));
+            const shown = self.editor.shownRows(size, layout.editorRows(size.rows));
+            self.animation.fit(&.{
+                .columns = size.columns,
+                .top_label_end = ui.paint.hiddenLabelEnd(&.{
+                    .edge = .top,
+                    .more = shown.hidden_above,
+                    .columns = size.columns,
+                }),
+                .bottom_label_end = ui.paint.hiddenLabelEnd(&.{
+                    .edge = .bottom,
+                    .more = shown.hidden_below,
+                    .columns = size.columns,
+                }),
+            });
             const work = try turn.work(self.gpa, &.{
                 .now_ms = time.awake_ms,
                 .open = self.transcript.openWork(),
@@ -783,17 +804,21 @@ pub fn paint(
             break :turn .{
                 .turn = .{
                     .work = work,
-                    .activity = self.turnActivity(turn),
+                    .activity = self.animation.activity(&.{
+                        .grows = true,
+                        .caret_tick = turn.caret_tick,
+                    }),
                     .editor = &self.editor,
                 },
             };
         },
         .picking => |*picker| picking: {
             try picker.reflow(size, layout.pickerRows(size.rows));
-            break :picking .{ .picking = .{
-                .picker = picker,
-                .activity = picker.activity(self.animation),
-            } };
+            const activity: ?ui.paint.Activity = if (picker.waiting()) activity: {
+                self.animation.fit(&.{ .columns = size.columns });
+                break :activity self.animation.activity(&.{ .grows = false });
+            } else null;
+            break :picking .{ .picking = .{ .picker = picker, .activity = activity } };
         },
         .page => unreachable,
     };
@@ -844,13 +869,13 @@ pub fn advanceFrame(self: *Screen, now_ms: i64) bool {
     var activity_changed = false;
     switch (self.widget) {
         .turn => |*turn| {
-            turn.activity_tick +%= 1;
+            self.animation.advance();
             turn.caret_tick +%= 1;
             activity_changed = true;
         },
-        .picking => |*picker| {
-            picker.advanceFrame();
-            activity_changed = picker.activity(self.animation) != null;
+        .picking => |*picker| if (picker.waiting()) {
+            self.animation.advance();
+            activity_changed = true;
         },
         .page => |*page| if (self.pageWaiting(page)) {
             const wait = &self.page_wait.?;
@@ -861,19 +886,10 @@ pub fn advanceFrame(self: *Screen, now_ms: i64) bool {
     return activity_changed;
 }
 
-fn turnActivity(self: *const Screen, turn: *const Turn) ui.paint.Activity {
-    return .{
-        .style = self.animation,
-        .motion_tick = turn.activity_tick,
-        .progress_age_ticks = turn.activity_tick -% turn.progress_tick_last,
-        .caret_tick = turn.caret_tick,
-    };
-}
-
 pub fn animating(self: *const Screen) bool {
     return switch (self.widget) {
         .turn => true,
-        .picking => |*picker| picker.activity(self.animation) != null,
+        .picking => |*picker| picker.waiting(),
         .page => |*page| self.pageWaiting(page),
         .prompt => false,
     };
@@ -954,7 +970,7 @@ const Rig = struct {
 
     fn initWith(self: *Rig, gpa: std.mem.Allocator, writer: ?*std.Io.Writer) void {
         self.out = .init(gpa);
-        self.screen = Screen.init(gpa, writer orelse &self.out.writer, .high);
+        self.screen = Screen.init(gpa, writer orelse &self.out.writer, .high, 1);
         const choice: application.Choice = .{
             .account = accounts.testing.anthropic_plan,
             .model = testModel(),
@@ -1412,7 +1428,7 @@ fn checkToolAllocations(gpa: std.mem.Allocator) !void {
 
 test "a device write failure stays distinct from an allocation failure" {
     var writer: std.Io.Writer = .failing;
-    var screen = Screen.init(std.testing.allocator, &writer, .high);
+    var screen = Screen.init(std.testing.allocator, &writer, .high, 1);
     defer screen.deinit();
     try std.testing.expectError(
         error.WriteFailed,
@@ -1871,7 +1887,7 @@ test "a work row folds thinking and finished calls across steps until agent text
     defer gpa.free(running);
     try expectSummary(
         running,
-        "Agent: work (bash) · Time: 4s · Tools: 1 (1 active) · Received: 20 B",
+        "Agent: work (bash) · Time: 4s · Tools: 1 (1 active) · $ zig build",
     );
     try std.testing.expect(std.mem.find(u8, running, "Tool:") == null);
 
@@ -2289,9 +2305,9 @@ test "a verbose tool call streams and runs in the work row and ends as a block" 
     defer gpa.free(running);
     try expectSummary(
         running,
-        "Agent: work (bash) · Time: 13s · Tools: 0 (1 active) · Received: 27 B",
+        "Agent: work (bash) · Time: 13s · Tools: 0 (1 active) · $ zig build",
     );
-    try std.testing.expect(std.mem.find(u8, running, "$ zig build") == null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, running, "$ zig build"));
 
     var output: core.Tool.Output = .{ .content = "ok\n" };
     output.measures.put(.duration_ms, 1500);
@@ -2382,7 +2398,7 @@ test "a pending or completed call keeps the draft across verbosity toggles" {
     }
 }
 
-test "verbose off hides each command, and verbose on keeps its complete text" {
+test "verbose off shows the main command in the work row, and verbose on shows the full command" {
     const gpa = std.testing.allocator;
     const cases = [_]struct { arguments: []const u8, hidden: []const u8 }{
         .{
@@ -2416,9 +2432,9 @@ test "verbose off hides each command, and verbose on keeps its complete text" {
         defer gpa.free(running);
         try expectSummary(
             running,
-            "Agent: work (bash) · Time: 0s · Tools: 0 (1 active) · Received: 0 B",
+            "Agent: work (bash) · Time: 0s · Tools: 0 (1 active) · $ echo · Received: 0 B",
         );
-        try std.testing.expect(std.mem.find(u8, running, "$ echo") == null);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, running, "$ echo"));
         try std.testing.expect(std.mem.find(u8, running, case.hidden) == null);
 
         var output: core.Tool.Output = .{ .content = sentence };
@@ -3051,11 +3067,133 @@ test "a conversation clear drops every block and the statistics" {
     try std.testing.expectEqualStrings("claude-sonnet-4-6", rig.screen.statusInfo(0).model.?);
 }
 
+test "the work row names the main command of the running bash call alone" {
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    try rig.start("prompt");
+    const call: core.Tool.Call = .{
+        .id = "c1",
+        .name = "bash",
+        .arguments = "{\"command\":\"cd lib && git push origin main\"}",
+    };
+    try rig.apply(&.{ .tool_call_started = call.name });
+    try rig.apply(&.{ .tool_call_arguments = call.arguments });
+    try expectWorkCommand(&rig, null);
+    try rig.apply(&.{ .tool_started = call });
+    try expectWorkCommand(&rig, "· $ git push · Received: 44 B");
+    try rig.apply(&.{ .tool_result = .{ .call = call, .output = .{ .content = "ok" } } });
+    const read: core.Tool.Call = .{
+        .id = "c2",
+        .name = "read",
+        .arguments = "{\"path\":\"src/App.zig\"}",
+    };
+    try rig.apply(&.{ .tool_call_started = read.name });
+    try rig.apply(&.{ .tool_started = read });
+    try expectWorkCommand(&rig, null);
+}
+
+fn expectWorkCommand(rig: *Rig, maybe_segment: ?[]const u8) !void {
+    const painted = try rig.paintPlain(120);
+    defer std.testing.allocator.free(painted);
+    var lines = std.mem.splitScalar(u8, painted, '\n');
+    while (lines.next()) |line| {
+        const row = std.mem.trim(u8, line, "\r ");
+        if (!std.mem.startsWith(u8, row, "Agent: work (") or
+            std.mem.startsWith(u8, row, "Agent: work (complete)")) continue;
+        if (maybe_segment) |segment| {
+            if (std.mem.endsWith(u8, row, segment)) return;
+        } else if (std.mem.find(u8, row, "$ ") == null) return;
+    }
+    std.debug.print("expected a work row that ends with \"{?s}\" in:\n{s}\n", .{
+        maybe_segment,
+        painted,
+    });
+    return error.TestExpectedWorkCommand;
+}
+
+test "new data during a turn neither delays nor resets the chomper" {
+    const gpa = std.testing.allocator;
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    var emulator = try terminal.testing.Emulator.init(gpa, 80);
+    defer emulator.deinit();
+    const size: terminal.View.Size = .{ .columns = 80, .rows = 24 };
+    emulator.resize(size.rows);
+    try rig.start("prompt");
+    try rig.paintInto(&emulator, size);
+    try rig.apply(&.text_started);
+    for (0..8) |_| {
+        _ = rig.screen.advanceFrame(0);
+        try rig.apply(&.{ .text = "x" });
+    }
+    try rig.paintInto(&emulator, size);
+    try std.testing.expect(screenRowStarts(&emulator, "   ●─"));
+}
+
+fn screenRowStarts(emulator: *const terminal.testing.Emulator, prefix: []const u8) bool {
+    for (emulator.document.items[emulator.screen_top..]) |row| {
+        if (std.mem.startsWith(u8, row.items, prefix)) return true;
+    }
+    return false;
+}
+
+test "a waiting picker frame shows the chomper like the editor frame of a turn" {
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    const options = [_]ui.Picker.Option{.{ .name = "row" }};
+    try rig.screen.openPicker(&.{ .title = "Step", .options = &options, .depth = 1 });
+    try rig.screen.beginPickerWait(Flow.fetch_wait_text);
+    try expectChomper(&rig);
+    try rig.start("prompt");
+    try expectChomper(&rig);
+}
+
+fn expectChomper(rig: *Rig) !void {
+    for (0..8) |_| {
+        _ = rig.screen.advanceFrame(0);
+        const painted = try rig.paintPlain(80);
+        defer std.testing.allocator.free(painted);
+        if (std.mem.find(u8, painted, "ᗧ") != null) return;
+    }
+    return error.TestExpectedChomper;
+}
+
+test "the game keeps its level from one turn to the next" {
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    try rig.start("first");
+    std.testing.allocator.free(try rig.paintPlain(80));
+    for (0..6000) |_| _ = rig.screen.advanceFrame(0);
+    const first = try rig.paintPlain(80);
+    defer std.testing.allocator.free(first);
+    const start = std.mem.find(u8, first, " Level ") orelse return error.TestExpectedLevel;
+    const end = std.mem.findPos(u8, first, start, "─") orelse return error.TestExpectedLevel;
+    const label = first[start..end];
+    try rig.apply(&.committed);
+    try rig.end(&.{ .stopped = .complete });
+    try rig.start("second");
+    const second = try rig.paintPlain(80);
+    defer std.testing.allocator.free(second);
+    try testing.expectContains(second, label);
+}
+
 test "a turn segment grows without an update and an update returns it to its base length" {
     const gpa = std.testing.allocator;
     var rig: Rig = undefined;
     rig.init();
     defer rig.deinit();
+    try rig.screen.restore(&.{
+        .records = &.{},
+        .statistics = .{},
+        .state = .{ .choice = rig.screen.choice },
+        .settings = .{ .animation = .orbit },
+        .working_directory = "/work",
+        .home_directory = "/home",
+    });
     var emulator = try terminal.testing.Emulator.init(gpa, 40);
     defer emulator.deinit();
     const size: terminal.View.Size = .{ .columns = 40, .rows = 24 };

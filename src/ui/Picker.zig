@@ -1,5 +1,4 @@
 const std = @import("std");
-const application = @import("application");
 
 const core = @import("core");
 const terminal = @import("terminal");
@@ -97,7 +96,6 @@ const List = struct {
 
 const Wait = struct {
     text: []const u8,
-    tick: u64 = 0,
 };
 
 const Range = struct {
@@ -206,18 +204,11 @@ pub fn position(self: *const Picker) Position {
     };
 }
 
-pub fn activity(self: *const Picker, style: application.Settings.Animation) ?paint.Activity {
+pub fn waiting(self: *const Picker) bool {
     return switch (self.body) {
-        .list => null,
-        .wait => |*wait| .{ .style = style, .motion_tick = wait.tick },
+        .list => false,
+        .wait => true,
     };
-}
-
-pub fn advanceFrame(self: *Picker) void {
-    switch (self.body) {
-        .list => {},
-        .wait => |*wait| wait.tick +%= 1,
-    }
 }
 
 pub fn moveUp(self: *Picker) !void {
@@ -546,13 +537,25 @@ fn renderForTest(
     picker: *const Picker,
     size: terminal.View.Size,
 ) ![]u8 {
+    return renderAtTick(gpa, picker, size, 0);
+}
+
+fn renderAtTick(
+    gpa: std.mem.Allocator,
+    picker: *const Picker,
+    size: terminal.View.Size,
+    tick: u64,
+) ![]u8 {
     var rig: testing.Rig = undefined;
     rig.init(gpa);
     defer rig.deinit();
     const placement = try rig.begin(&.{ .columns = size.columns, .rows = size.rows, .pages = 4 });
     try picker.render(&placement, &.{
         .viewport_rows = size.rows,
-        .activity = picker.activity(.sweep),
+        .activity = if (picker.waiting())
+            .{ .motion = .{ .segment = .{ .style = .sweep, .tick = tick } } }
+        else
+            null,
     }, size.rows);
     return gpa.dupe(u8, try rig.painted());
 }
@@ -604,8 +607,7 @@ test "a list that waits drops its rows, states the wait, and moves its frame edg
     try testing.expectHides(painted, &.{"(Current)"});
     try std.testing.expectEqual(@as(usize, 4), testing.paintedRows(painted));
 
-    picker.advanceFrame();
-    const moved = try renderForTest(gpa, &picker, size);
+    const moved = try renderAtTick(gpa, &picker, size, 1);
     defer gpa.free(moved);
     try std.testing.expect(!std.mem.eql(u8, painted, moved));
 }
@@ -762,7 +764,7 @@ test "a tall option list scrolls the window to keep the selection in view" {
     const selected = comptime role.sequence(.selection) ++ " > row19\x1b[0m";
     try testing.expectShows(bottom, &.{selected});
     try testing.expectHides(bottom, &.{"row00"});
-    try testing.expectShows(bottom, &.{"↑ Hidden: 14"});
+    try testing.expectShows(bottom, &.{"↑14"});
     try testing.expectShows(bottom, &.{"Pick"});
     try testing.expectShows(bottom, &.{"Esc: Cancel"});
 
@@ -779,8 +781,8 @@ test "a tall option list scrolls the window to keep the selection in view" {
     try testing.expectShows(top, &.{"Esc: Cancel"});
     try testing.expectShows(top, &.{"row00"});
     try testing.expectHides(top, &.{"row19"});
-    try testing.expectHides(top, &.{"↑ Hidden"});
-    try testing.expectShows(top, &.{"↓ Hidden: 14"});
+    try testing.expectHides(top, &.{comptime role.sequence(.muted) ++ " ↑"});
+    try testing.expectShows(top, &.{"↓14"});
 
     try picker.moveUp();
     try picker.reflow(size, size.rows);

@@ -5,9 +5,13 @@ const core = @import("core");
 const terminal = @import("terminal");
 
 const attribute = @import("attribute.zig");
+const Chomp = @import("Chomp.zig");
 const Message = @import("Message.zig");
 const role = @import("role.zig");
 const testing = @import("testing.zig");
+
+pub const frame_ms = 16;
+pub const command_marker = "$ ";
 
 const segment_length: usize = 6;
 const segment_growth_delay_ticks: u64 = 31;
@@ -202,7 +206,7 @@ const BoxWrap = struct {
     fn init(line: *const BoxLines.Line, room: usize) BoxWrap {
         const lead = terminal.width.truncate(switch (line.part) {
             .detail => "",
-            .command_start => "$ ",
+            .command_start => command_marker,
             .command_rest => "  ",
         }, room -| 1);
         const lead_columns = terminal.width.ofText(lead);
@@ -223,10 +227,99 @@ const BoxWrap = struct {
 };
 
 pub const Activity = struct {
-    style: application.Settings.Animation,
-    motion_tick: u64,
-    progress_age_ticks: ?u64 = null,
+    motion: Motion,
     caret_tick: ?u64 = null,
+
+    pub const Motion = union(enum) {
+        segment: Segment,
+        chomp: *const Chomp,
+    };
+
+    pub const Segment = struct {
+        style: Style,
+        tick: u64,
+        progress_age_ticks: ?u64 = null,
+
+        pub const Style = enum { orbit, sweep };
+    };
+};
+
+pub const Animation = union(enum) {
+    segment: Segment,
+    chomp: Chomp,
+
+    pub const Segment = struct {
+        style: Activity.Segment.Style,
+        tick: u64 = 0,
+        progress_tick_last: u64 = 0,
+    };
+
+    pub fn init(style: application.Settings.Animation, seed: u64) Animation {
+        return switch (style) {
+            .orbit => .{ .segment = .{ .style = .orbit } },
+            .sweep => .{ .segment = .{ .style = .sweep } },
+            .chomp => .{ .chomp = .init(seed) },
+        };
+    }
+
+    pub fn restyle(self: *Animation, style: application.Settings.Animation, seed: u64) void {
+        const current: application.Settings.Animation = switch (self.*) {
+            .segment => |*segment| switch (segment.style) {
+                .orbit => .orbit,
+                .sweep => .sweep,
+            },
+            .chomp => .chomp,
+        };
+        if (current != style) self.* = .init(style, seed);
+    }
+
+    pub fn restart(self: *Animation) void {
+        switch (self.*) {
+            .segment => |*segment| segment.* = .{ .style = segment.style },
+            .chomp => {},
+        }
+    }
+
+    pub fn fit(self: *Animation, layout: *const Chomp.Layout) void {
+        switch (self.*) {
+            .segment => {},
+            .chomp => |*chomp| chomp.fit(layout),
+        }
+    }
+
+    pub fn advance(self: *Animation) void {
+        switch (self.*) {
+            .segment => |*segment| segment.tick +%= 1,
+            .chomp => |*chomp| chomp.advance(),
+        }
+    }
+
+    pub fn markProgress(self: *Animation) void {
+        switch (self.*) {
+            .segment => |*segment| segment.progress_tick_last = segment.tick,
+            .chomp => {},
+        }
+    }
+
+    pub fn activity(
+        self: *const Animation,
+        options: *const struct { grows: bool, caret_tick: ?u64 = null },
+    ) Activity {
+        return .{
+            .motion = switch (self.*) {
+                .segment => |*segment| .{ .segment = .{
+                    .style = segment.style,
+                    .tick = segment.tick,
+                    .progress_age_ticks = if (options.grows)
+                        segment.tick -% segment.progress_tick_last
+                    else
+                        null,
+                } },
+                .chomp => |*chomp| .{ .chomp = chomp },
+            },
+            .caret_tick = options.caret_tick,
+        };
+    }
 };
 
 const Cut = struct {
@@ -264,7 +357,7 @@ pub const Window = struct {
         }
     };
 
-    const Shown = struct {
+    pub const Shown = struct {
         body_rows: usize,
         hidden_above: usize,
         hidden_below: usize,
@@ -729,7 +822,7 @@ fn frameEdgeCells(
         .columns = frame.columns,
     });
     if (maybe_label) |label| {
-        const label_end = label_lead_columns + 1 + terminal.width.ofText(label) + 1;
+        const label_end = labelColumns(label);
         try drawFrameRange(sink, frame, &.{
             .edge = edge,
             .start = 0,
@@ -756,21 +849,25 @@ fn frameEdgeCells(
 
 fn moreLabel(buffer: *[32]u8, options: *const LabelOptions) ?[]const u8 {
     if (options.more == 0) return null;
-    const full = std.mem.print(buffer, "{s} Hidden: {d}", .{
+    const label = std.mem.print(buffer, "{s}{d}", .{
         options.edge.arrow(),
         options.more,
     }) catch return null;
-    if (labelFits(options.columns, full)) return full;
-    const compact = std.mem.print(buffer, "{s}{d}", .{
-        options.edge.arrow(),
-        options.more,
-    }) catch return null;
-    return if (labelFits(options.columns, compact)) compact else null;
+    return if (labelFits(options.columns, label)) label else null;
+}
+
+pub fn hiddenLabelEnd(options: *const LabelOptions) ?usize {
+    var buffer: [32]u8 = undefined;
+    const label = moreLabel(&buffer, options) orelse return null;
+    return labelColumns(label);
+}
+
+fn labelColumns(label: []const u8) usize {
+    return label_lead_columns + 1 + terminal.width.ofText(label) + 1;
 }
 
 fn labelFits(columns: usize, label: []const u8) bool {
-    const used = label_lead_columns + 1 + terminal.width.ofText(label) + 1;
-    return columns > used;
+    return columns > labelColumns(label);
 }
 
 fn drawFrameRange(
@@ -779,12 +876,19 @@ fn drawFrameRange(
     options: *const FrameRange,
 ) !void {
     std.debug.assert(options.start <= options.end and options.end <= frame.columns);
+    const maybe_segment: ?*const Activity.Segment = if (frame.activity) |*activity|
+        switch (activity.motion) {
+            .segment => |*segment| segment,
+            .chomp => |chomp| return drawChompRange(sink, chomp, options),
+        }
+    else
+        null;
     var column = options.start;
     while (column < options.end) {
-        const active = activityAt(frame, options.edge, column);
+        const active = activityAt(maybe_segment, frame, options.edge, column);
         var run_end = column + 1;
         while (run_end < options.end and
-            activityAt(frame, options.edge, run_end) == active) : (run_end += 1)
+            activityAt(maybe_segment, frame, options.edge, run_end) == active) : (run_end += 1)
         {}
         const count = run_end - column;
         if (active) {
@@ -798,26 +902,52 @@ fn drawFrameRange(
     }
 }
 
-fn activityAt(frame: *const Frame, edge: FrameEdge, column: usize) bool {
+fn drawChompRange(
+    sink: *terminal.View.Sink,
+    chomp: *const Chomp,
+    options: *const FrameRange,
+) !void {
+    const edge: Chomp.Edge = switch (options.edge) {
+        .top => .top,
+        .bottom => .bottom,
+    };
+    var maybe_role: ?role.Name = null;
+    for (options.start..options.end) |column| {
+        const cell = chomp.cell(edge, column);
+        if (maybe_role != cell.role) {
+            if (maybe_role != null) try attribute.apply(sink, .reset);
+            try role.apply(sink, cell.role);
+            maybe_role = cell.role;
+        }
+        try sink.text(cell.glyph);
+    }
+}
+
+fn activityAt(
+    maybe_segment: ?*const Activity.Segment,
+    frame: *const Frame,
+    edge: FrameEdge,
+    column: usize,
+) bool {
     std.debug.assert(column < frame.columns);
-    const activity = frame.activity orelse return false;
-    return segmentCovers(&activity, &.{
+    const segment = maybe_segment orelse return false;
+    return segmentCovers(segment, &.{
         .columns = frame.columns,
         .edge = edge,
         .column = column,
     });
 }
 
-fn segmentCovers(activity: *const Activity, cell: *const struct {
+fn segmentCovers(segment: *const Activity.Segment, cell: *const struct {
     columns: usize,
     edge: FrameEdge,
     column: usize,
 }) bool {
-    return trackCovers(activity, &.{
+    return trackCovers(segment, &.{
         .columns = cell.columns,
         .position = switch (cell.edge) {
             .top => cell.column,
-            .bottom => switch (activity.style) {
+            .bottom => switch (segment.style) {
                 .orbit => 2 * cell.columns - 1 - cell.column,
                 .sweep => cell.columns + cell.column,
             },
@@ -825,19 +955,19 @@ fn segmentCovers(activity: *const Activity, cell: *const struct {
     });
 }
 
-fn trackCovers(activity: *const Activity, track: *const struct {
+fn trackCovers(segment: *const Activity.Segment, track: *const struct {
     columns: usize,
     position: usize,
 }) bool {
     std.debug.assert(track.columns > 0);
     const track_columns = 2 * track.columns;
     const offset = trackLengthBase(track.columns) - 1;
-    const head: usize = @intCast((activity.motion_tick +% offset) % track_columns);
+    const head: usize = @intCast((segment.tick +% offset) % track_columns);
     const distance = if (head >= track.position)
         head - track.position
     else
         track_columns - (track.position - head);
-    return distance < trackLength(activity.progress_age_ticks, track.columns);
+    return distance < trackLength(segment.progress_age_ticks, track.columns);
 }
 
 fn trackLengthBase(columns: usize) usize {
@@ -989,7 +1119,7 @@ test "a frame edge label reads as muted text between the frame glyphs" {
     });
     defer gpa.free(painted);
 
-    const label = comptime role.sequence(.muted) ++ " ↑ Hidden: 3 \x1b[0m" ++
+    const label = comptime role.sequence(.muted) ++ " ↑3 \x1b[0m" ++
         role.sequence(.input_frame);
     try testing.expectShows(painted, &.{label});
 }
@@ -999,7 +1129,7 @@ test "a segment paints heavy glyphs in the activity role and emits no unused fra
     const painted = try paintedFramed(gpa, 20, &.{
         .body = "x",
         .body_rows = 1,
-        .activity = .{ .style = .orbit, .motion_tick = 0 },
+        .activity = .{ .motion = .{ .segment = .{ .style = .orbit, .tick = 0 } } },
     });
     defer gpa.free(painted);
 
@@ -1010,24 +1140,45 @@ test "a segment paints heavy glyphs in the activity role and emits no unused fra
     try testing.expectHides(painted, &.{unused});
 }
 
+test "a chomp frame paints the chomper in its role one line cell behind the hidden label" {
+    const gpa = std.testing.allocator;
+    var chomp: Chomp = .init(1);
+    chomp.fit(&.{
+        .columns = 30,
+        .bottom_label_end = hiddenLabelEnd(&.{ .edge = .bottom, .more = 5, .columns = 30 }),
+    });
+    for (0..2) |_| chomp.advance();
+    const painted = try paintedFramed(gpa, 30, &.{
+        .body = core.text.repeat("a\n", 5) ++ "x",
+        .body_rows = 1,
+        .hidden_below = 5,
+        .activity = .{ .motion = .{ .chomp = &chomp } },
+    });
+    defer gpa.free(painted);
+
+    const start = comptime role.sequence(.muted) ++ " ↓5 \x1b[0m" ++ role.sequence(.input_frame) ++
+        "─\x1b[0m" ++ role.sequence(.chomper) ++ "ᗧ";
+    try testing.expectShows(painted, &.{start});
+}
+
 test "a frame edge label resets faint before a segment that follows it" {
     const gpa = std.testing.allocator;
     const painted = try paintedFramed(gpa, 20, &.{
         .body = core.text.repeat("a\n", 3) ++ "x",
         .body_rows = 1,
         .hidden_above = 3,
-        .activity = .{ .style = .orbit, .motion_tick = 14 },
+        .activity = .{ .motion = .{ .segment = .{ .style = .orbit, .tick = 7 } } },
     });
     defer gpa.free(painted);
 
-    const segment = comptime role.sequence(.muted) ++ " ↑ Hidden: 3 \x1b[0m" ++
-        role.sequence(.activity) ++ core.text.repeat("━", 4);
+    const segment = comptime role.sequence(.muted) ++ " ↑3 \x1b[0m" ++
+        role.sequence(.activity) ++ core.text.repeat("━", 6);
     try testing.expectShows(painted, &.{segment});
 }
 
 test "each style moves a segment one column per tick along its path over both frame edges" {
     const cases = [_]struct {
-        style: application.Settings.Animation,
+        style: Activity.Segment.Style,
         tick: u64,
         columns: usize,
         edges: [2][]const u8,
@@ -1041,16 +1192,20 @@ test "each style moves a segment one column per tick along its path over both fr
         .{ .style = .orbit, .tick = 1, .columns = 1, .edges = .{ "-", "#" } },
     };
     for (cases) |case| {
-        const activity: Activity = .{ .style = case.style, .motion_tick = case.tick };
-        try expectCovered(&activity, case.columns, &case.edges);
+        const segment: Activity.Segment = .{ .style = case.style, .tick = case.tick };
+        try expectCovered(&segment, case.columns, &case.edges);
     }
 }
 
-fn expectCovered(activity: *const Activity, columns: usize, edges: *const [2][]const u8) !void {
+fn expectCovered(
+    segment: *const Activity.Segment,
+    columns: usize,
+    edges: *const [2][]const u8,
+) !void {
     for ([_]FrameEdge{ .top, .bottom }, edges) |edge, expected| {
         var shown: [10]u8 = undefined;
         for (shown[0..columns], 0..) |*slot, column| {
-            const covered = segmentCovers(activity, &.{
+            const covered = segmentCovers(segment, &.{
                 .columns = columns,
                 .edge = edge,
                 .column = column,
@@ -1063,7 +1218,7 @@ fn expectCovered(activity: *const Activity, columns: usize, edges: *const [2][]c
 
 test "a quiet segment grows at its back up to one frame edge" {
     const cases = [_]struct {
-        style: application.Settings.Animation,
+        style: Activity.Segment.Style,
         tick: u64,
         age_ticks: ?u64,
         columns: usize,
@@ -1109,7 +1264,7 @@ test "a quiet segment grows at its back up to one frame edge" {
     for (cases) |case| {
         try expectCovered(&.{
             .style = case.style,
-            .motion_tick = case.tick,
+            .tick = case.tick,
             .progress_age_ticks = case.age_ticks,
         }, case.columns, &case.edges);
     }
@@ -1135,8 +1290,7 @@ test "an animated input places its caret on the first of two equal halves alone"
             .body_rows = 1,
             .caret = .{ .row = 1, .column = 2 },
             .activity = .{
-                .style = .sweep,
-                .motion_tick = 0,
+                .motion = .{ .segment = .{ .style = .sweep, .tick = 0 } },
                 .caret_tick = sample.caret_tick,
             },
         });
@@ -1210,10 +1364,10 @@ test "a line role resumes behind a mark" {
     try testing.expectShows(painted, &.{row});
 }
 
-test "overflow labels compact before disappearing" {
+test "an overflow label shows the arrow and the count, and disappears when it does not fit" {
     const gpa = std.testing.allocator;
     const cases = [_]struct { columns: usize, label: ?[]const u8 }{
-        .{ .columns = 18, .label = "↑ Hidden: 17" },
+        .{ .columns = 18, .label = "↑17" },
         .{ .columns = 9, .label = "↑17" },
         .{ .columns = 8, .label = null },
     };

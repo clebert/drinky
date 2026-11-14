@@ -4,13 +4,13 @@ window_pages: usize = window_pages_default,
 verbose: bool = false,
 mcp_access: bool = false,
 gauge: Gauge = .{},
-animation: Animation = .orbit,
+animation: Animation = .chomp,
 
 pub const window_pages_default: usize = 8;
 pub const window_pages_min: usize = 1;
 pub const window_pages_max: usize = 64;
 
-pub const Animation = enum { orbit, sweep };
+pub const Animation = enum { orbit, sweep, chomp };
 
 pub const Gauge = struct {
     percent_warning: f64 = 75,

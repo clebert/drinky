@@ -1297,7 +1297,7 @@ test "the config document names the file, each key, and each limit, and its exam
         ),
         "- `default_effort` — string, default: unset.",
         "- `interface.verbose` — boolean, default: false.",
-        "- `interface.animation` — string, default: orbit.",
+        "- `interface.animation` — string, default: chomp.",
         "- `user_instructions[].path` — string, required.",
     };
     for (stated_keys) |line| try std.testing.expect(std.mem.find(u8, text, line) != null);

@@ -1,5 +1,6 @@
 const std = @import("std");
 const core = @import("core");
+const Live = @import("Live.zig");
 const Record = @import("Record.zig");
 const Surface = @import("Surface.zig");
 const testing = @import("testing.zig");
@@ -251,6 +252,46 @@ fn recordOutcome(self: *Surface, outcome: *const core.Session.Outcome) !void {
         .failed => |*failure| .{ .request_failed = .from(failure) },
     };
     try self.transcript.append(&.{ .event = event }, .{});
+}
+
+test "a tool call is pending while it streams and names its subject once it runs" {
+    var reduction: testing.Reduction = undefined;
+    reduction.init(std.testing.allocator, .{ .effort = .high });
+    defer reduction.deinit();
+    try reduction.start("prompt");
+    const call: core.Tool.Call = .{
+        .id = "call",
+        .name = "bash",
+        .arguments = "{\"command\":\"git push\"}",
+    };
+    const time: Surface.Time = .{ .awake_ms = 1, .boot_ms = 1 };
+    _ = try reduction.apply(&.{ .tool_call_started = "bash" }, time);
+    _ = try reduction.apply(&.{ .tool_call_arguments = call.arguments }, time);
+    const streaming = lastLive(&reduction).?;
+    try std.testing.expectEqual(1, streaming.calls.len);
+    try std.testing.expect(streaming.calls[0].phase == .pending);
+
+    _ = try reduction.apply(&.{ .tool_started = call }, time);
+    const running = lastLive(&reduction).?;
+    try std.testing.expectEqual(1, running.calls.len);
+    switch (running.calls[0].phase) {
+        .pending => return error.TestUnexpectedResult,
+        .running => |state| {
+            const subject = state.subject.?;
+            try std.testing.expectEqual(.command, subject.kind);
+            try std.testing.expectEqualStrings("git push", subject.text);
+        },
+    }
+}
+
+fn lastLive(reduction: *const testing.Reduction) ?*const Live {
+    var index = reduction.events.items.len;
+    while (index > 0) {
+        index -= 1;
+        const event = &reduction.events.items[index];
+        if (event.* == .live) return &event.live;
+    }
+    return null;
 }
 
 test "a turn reduction frees each partial allocation" {

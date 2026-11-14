@@ -120,7 +120,7 @@ const UiEvent = union(enum) {
 const FrameGrid = struct {
     deadline_ns: i96,
 
-    const interval_ns = 16 * std.time.ns_per_ms;
+    const interval_ns = ui.paint.frame_ms * std.time.ns_per_ms;
 
     fn reset(now_ns: i96) FrameGrid {
         return .{ .deadline_ns = now_ns };
@@ -238,13 +238,25 @@ fn keep(self: *App, event: UiEvent) void {
         std.debug.assert(self.queue_closing.load(.acquire));
     };
 }
+
+fn randomSeed(io: std.Io) u64 {
+    var bytes: [@sizeOf(u64)]u8 = undefined;
+    io.random(&bytes);
+    return std.mem.readInt(u64, &bytes, .little);
+}
+
 pub fn init(self: *App, gpa: std.mem.Allocator, io: std.Io, options: *const Options) !void {
     self.* = .{
         .gpa = gpa,
         .io = io,
         .device = options.device,
         .controller = undefined,
-        .screen = .init(gpa, options.device.writer(), application.reference.effort_default),
+        .screen = .init(
+            gpa,
+            options.device.writer(),
+            application.reference.effort_default,
+            randomSeed(io),
+        ),
         .input = .init(gpa),
         .queue = undefined,
         .herdr = .init(io),
@@ -1803,7 +1815,8 @@ const Rig = struct {
         var directory = try self.tmp.dir.createDirPathOpen(io, ".drinky", .{});
         defer directory.close(io);
         const data = options.config orelse
-            "{\"request\":{\"attempts_max\":2,\"delay_ms_initial\":0,\"delay_ms_max\":0}}";
+            "{\"request\":{\"attempts_max\":2,\"delay_ms_initial\":0,\"delay_ms_max\":0}," ++
+                "\"interface\":{\"animation\":\"orbit\"}}";
         try directory.writeFile(io, .{ .sub_path = "config.json", .data = data });
     }
 
@@ -2718,9 +2731,15 @@ test "startup verbosity selects thinking text or summaries at the terminal bound
         "\"text\":\"visible thinking\"}],\"encrypted_content\":\"proof\"}}\n\n" ++
         providers.testing.reply_stream;
     const cases = [_]struct { config: []const u8, verbose: bool }{
-        .{ .config = "{}", .verbose = false },
-        .{ .config = "{\"interface\":{\"verbose\":true}}", .verbose = true },
-        .{ .config = "{\"interface\":{\"verbose\":false}}", .verbose = false },
+        .{ .config = "{\"interface\":{\"animation\":\"orbit\"}}", .verbose = false },
+        .{
+            .config = "{\"interface\":{\"verbose\":true,\"animation\":\"orbit\"}}",
+            .verbose = true,
+        },
+        .{
+            .config = "{\"interface\":{\"verbose\":false,\"animation\":\"orbit\"}}",
+            .verbose = false,
+        },
     };
     for (cases) |case| {
         var rig: Rig = undefined;
@@ -2764,7 +2783,7 @@ test "verbose uses the startup config and toggles during a turn without sending 
     var rig: Rig = undefined;
     try rig.init(&.{
         .keys = &.{.{ "openai-api-key", "sk-openai" }},
-        .config = "{\"interface\":{\"verbose\":false}}",
+        .config = "{\"interface\":{\"verbose\":false,\"animation\":\"orbit\"}}",
         .replies = &.{.{ .body = providers.testing.reply_stream, .hold = &hold }},
         .model = "gpt-5.6-sol",
     });
@@ -2798,7 +2817,7 @@ test "verbose uses the startup config and toggles during a turn without sending 
     );
     defer std.testing.allocator.free(configured);
     try std.testing.expectEqualStrings(
-        "{\"interface\":{\"verbose\":false}}",
+        "{\"interface\":{\"verbose\":false,\"animation\":\"orbit\"}}",
         configured,
     );
 }
@@ -3367,7 +3386,7 @@ test "the start reports each dropped config value and each notice" {
         .{ .text = "Drinky ignored the configured default effort level \"turbo\" because Drinky " ++
             "does not know that level. Drinky uses the effort level \"xhigh\"." },
         .{ .text = "Drinky ignored the configured animation \"bounce\" because Drinky does not " ++
-            "know that animation. Drinky uses the animation \"orbit\"." },
+            "know that animation. Drinky uses the animation \"chomp\"." },
         .{ .text = "Drinky ignored the configured command timeout 1 because" },
         .{ .text = "Drinky ignored the configured window page count 0 because the count must " ++
             "be from 1 to 64. Drinky uses the default count of 8 pages." },
@@ -3698,7 +3717,7 @@ test "a failed attempt adds its note below the wait line of the gist until Esc" 
     try rig.init(&.{
         .keys = &.{.{ "openai-api-key", "sk-openai" }},
         .config = "{\"request\":{\"attempts_max\":2,\"delay_ms_initial\":60000," ++
-            "\"delay_ms_max\":60000}}",
+            "\"delay_ms_max\":60000},\"interface\":{\"animation\":\"orbit\"}}",
         .replies = &.{ .{ .body = providers.testing.reply_stream }, failed_reply },
         .model = "gpt-5.6-sol",
     });

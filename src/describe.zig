@@ -109,6 +109,12 @@ fn writeCommands(writer: *std.Io.Writer) !void {
         \\Each work row shows the count of finished tool calls and the received bytes.
         \\The open work row adds the count of unfinished calls, as in `Tools: 1 (2 active)`.
         \\The open work row updates these values while the run continues.
+        \\While a `bash` call runs, the open work row shows the main command of the call after the
+        \\tool count.
+        \\An example is `$ zig build test` for `cd lib && zig build test --summary all`.
+        \\The main command has the program and at most two words after it.
+        \\Other tools and commands without a main command show no command.
+        \\Verbose on and verbose off show the command in the same way.
         \\The received bytes count the thinking text and the arguments of each tool call.
         \\A retry, a cancel, or a failure can drop an unfinished call.
         \\The count then loses the bytes of that call.
@@ -148,7 +154,8 @@ fn writeCommands(writer: *std.Io.Writer) !void {
         \\Complete tool error sentences wrap, even at very small widths.
         \\Work rows start with `Agent: work (activity)` while open and `Agent: work (status)` after
         \\completion.
-        \\The time has the next priority, followed by the tool count and the received bytes.
+        \\The time has the next priority, followed by the tool count, the command, and the received
+        \\bytes.
         \\A work row truncates the value in parentheses only when its complete identity
         \\does not fit.
         \\It keeps the complete prefix and closing parenthesis when at least 15 columns remain.
@@ -326,7 +333,30 @@ fn writePreferences(writer: *std.Io.Writer) std.Io.Writer.Error!void {
             "The context gauge and quota windows use those thresholds.\n\n" ++
             "The frame of the editor or a picker animates while Drinky works. " ++
             "The config key `" ++ config_keys.animation ++ "` selects the animation. " ++
-            "Each animation moves a heavy segment. An orbit segment circles the frame. " ++
+            "The default animation `chomp` is a small game on the frame. " ++
+            "A chomper eats the bottom edge from left to right. " ++
+            "It starts at once, and new data does not stop it. " ++
+            "At the right end, the chomper goes through a tunnel, and the next level starts. " ++
+            "The top edge shows the level. " ++
+            "Each lap along the bottom edge has at most one event. " ++
+            "A power pellet makes a ghost flee. " ++
+            "An eaten ghost shows the score 200 on the top edge. " ++
+            "In another event, a ghost chases the chomper. " ++
+            "A heart calls a partner. " ++
+            "A moon makes the chomper sleep on the cell of the moon. " ++
+            "A hole moves the chomper ahead. " ++
+            "A note makes the chomper leave a trail of notes. " ++
+            "A bottom edge with fewer than 40 free columns has no events. " ++
+            "A box can hide the item of an event. " ++
+            "A chased chomper escapes, or the ghost catches it. " ++
+            "A catch ends the game, and the next game starts at level 1. " ++
+            "A change of the terminal width starts a new lap at the same level. " ++
+            "A change of the width after a catch starts the next game at once. " ++
+            "The chance of a catch rises with the time of the game. " ++
+            "At the median, a game lasts about five minutes of animation. " ++
+            "The game continues from one turn to the next until Drinky stops. " ++
+            "The animations `orbit` and `sweep` move a heavy segment. " ++
+            "An orbit segment circles the frame. " ++
             "A sweep segment crosses the top edge, then the bottom edge. " ++
             "In a turn, the segment grows when the turn reports no new data for " ++
             "0.5 seconds. A running timer does not count as new data. " ++

@@ -19,6 +19,13 @@ pub const Name = enum {
     input_frame,
     activity,
     selection,
+    chomper,
+    partner,
+    love,
+    ghost,
+    ghost_scared,
+    score,
+    score_fading,
 };
 
 pub fn sequence(comptime name: Name) []const u8 {
@@ -37,6 +44,13 @@ pub fn sequence(comptime name: Name) []const u8 {
         .input_frame => "\x1b[35m",
         .activity => "\x1b[36m",
         .selection => "\x1b[7m",
+        .chomper => "\x1b[33m",
+        .partner => "\x1b[35m",
+        .love => "\x1b[31m",
+        .ghost => "\x1b[31m",
+        .ghost_scared => "\x1b[34m",
+        .score => "\x1b[36m",
+        .score_fading => "\x1b[2;36m",
     };
 }
 

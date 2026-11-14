@@ -39,7 +39,7 @@ pub const Work = struct {
         received_bytes: usize,
         status: ?application.Record.Work.Status,
 
-        pub const segment_count = 4;
+        pub const segment_count = 5;
 
         pub fn write(
             self: *const Summary,
@@ -47,6 +47,7 @@ pub const Work = struct {
             options: *const struct {
                 activity: []const u8,
                 tools_active: usize,
+                command: ?[]const u8,
                 ends: *[segment_count]usize,
             },
         ) std.Io.Writer.Error!void {
@@ -65,10 +66,13 @@ pub const Work = struct {
                     try writer.print(" ({d} active)", .{options.tools_active});
             }
             options.ends[2] = writer.buffered().len;
+            if (options.command) |command|
+                try writer.print("{s}{s}{s}", .{ paint.separator, paint.command_marker, command });
+            options.ends[3] = writer.buffered().len;
             var bytes_buffer: [16]u8 = undefined;
             const bytes = format.bytes(&bytes_buffer, self.received_bytes);
             try writer.print("{s}Received: {s}", .{ paint.separator, bytes });
-            options.ends[3] = writer.buffered().len;
+            options.ends[4] = writer.buffered().len;
         }
 
         pub fn row(self: *const Summary, options: *const struct { thinking: bool }) Row {
@@ -77,6 +81,7 @@ pub const Work = struct {
             self.write(&writer, &.{
                 .activity = if (options.thinking) "thinking" else "",
                 .tools_active = 0,
+                .command = null,
                 .ends = &result.ends,
             }) catch unreachable;
             result.length = writer.buffered().len;

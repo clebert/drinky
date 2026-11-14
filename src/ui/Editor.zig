@@ -421,6 +421,14 @@ pub fn reflow(self: *Editor, size: terminal.View.Size, rows_max: usize) void {
     self.window.follow(self.extent(size, rows_max), caret_row);
 }
 
+pub fn shownRows(
+    self: *const Editor,
+    size: terminal.View.Size,
+    rows_max: usize,
+) paint.Window.Shown {
+    return self.window.shown(self.extent(size, rows_max));
+}
+
 pub fn rows(self: *const Editor, size: terminal.View.Size, rows_max: usize) usize {
     return self.extent(size, rows_max).rows();
 }
@@ -1170,12 +1178,12 @@ test "activity crosses the frame edges without changing the editor height" {
 
     const first = try renderedWithOptions(gpa, &editor, size, &.{
         .viewport_rows = size.rows,
-        .activity = .{ .style = .sweep, .motion_tick = 0 },
+        .activity = .{ .motion = .{ .segment = .{ .style = .sweep, .tick = 0 } } },
     });
     defer gpa.free(first);
     const second = try renderedWithOptions(gpa, &editor, size, &.{
         .viewport_rows = size.rows,
-        .activity = .{ .style = .sweep, .motion_tick = 3 },
+        .activity = .{ .motion = .{ .segment = .{ .style = .sweep, .tick = 3 } } },
     });
     defer gpa.free(second);
 
@@ -1405,16 +1413,16 @@ test "a tall body caps its rows and scrolls the window to keep the caret in view
     try std.testing.expectEqual(@as(usize, 8), editor.rows(size, size.rows));
     const bottom = try rendered(gpa, &editor, size);
     defer gpa.free(bottom);
-    try testing.expectShows(bottom, &.{"↑ Hidden: 4"});
-    try testing.expectHides(bottom, &.{"↓ Hidden"});
+    try testing.expectShows(bottom, &.{"↑4"});
+    try testing.expectHides(bottom, &.{comptime role.sequence(.muted) ++ " ↓"});
     try expectCaretAt(&editor, size, .{ .row = 6, .column = 2 });
 
     for (0..9) |_| editor.moveUp(80);
     editor.reflow(size, size.rows);
     const top = try rendered(gpa, &editor, size);
     defer gpa.free(top);
-    try testing.expectHides(top, &.{"↑ Hidden"});
-    try testing.expectShows(top, &.{"↓ Hidden: 4"});
+    try testing.expectHides(top, &.{comptime role.sequence(.muted) ++ " ↑"});
+    try testing.expectShows(top, &.{"↓4"});
     try expectCaretAt(&editor, size, .{ .row = 1, .column = 2 });
 }
 
@@ -1428,8 +1436,8 @@ test "the frame edges report the rows scrolled out of view" {
 
     const painted = try rendered(gpa, &editor, .{ .columns = 40, .rows = 20 });
     defer gpa.free(painted);
-    try testing.expectShows(painted, &.{"↑ Hidden: 1"});
-    try testing.expectShows(painted, &.{"↓ Hidden: 3"});
+    try testing.expectShows(painted, &.{"↑1"});
+    try testing.expectShows(painted, &.{"↓3"});
     try testing.expectShows(painted, &.{"l6"});
     try testing.expectHides(painted, &.{"l0"});
     try testing.expectHides(painted, &.{"l9"});

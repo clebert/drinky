@@ -424,7 +424,7 @@ const Rig = struct {
             .transcript = self.transcript.block_list.items,
             .tail = .{ .turn = .{
                 .work = options.work,
-                .activity = .{ .style = .sweep, .motion_tick = 0 },
+                .activity = .{ .motion = .{ .segment = .{ .style = .sweep, .tick = 0 } } },
                 .editor = &self.editor,
             } },
             .status = &test_status,

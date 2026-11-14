@@ -234,11 +234,16 @@ pub fn live(self: *Surface) Live {
     const turn = self.activeTurn() orelse return .{};
     for (turn.blocks.items) |*block| {
         const call = if (block.call) |*call| call else continue;
-        if (call.phase == .done) continue;
+        const phase: Live.Call.Phase = switch (call.phase) {
+            .streaming, .queued => .pending,
+            .running => .{ .running = .{ .subject = call.description.subject } },
+            .done => continue,
+        };
         self.live_calls.appendAssumeCapacity(.{
             .name = call.name,
             .argument_bytes = call.bytes,
             .opened_ms = call.opened_ms,
+            .phase = phase,
         });
     }
     return .{ .calls = self.live_calls.items, .thinking = self.thinking_active != null };
@@ -252,6 +257,14 @@ fn hashLive(state: *const Live) u64 {
     for (state.calls) |*call| {
         std.hash.autoHash(&hasher, .{ call.argument_bytes, call.opened_ms, call.name.len });
         hasher.update(call.name);
+        std.hash.autoHash(&hasher, std.meta.activeTag(call.phase));
+        switch (call.phase) {
+            .pending => {},
+            .running => |running| if (running.subject) |subject| {
+                std.hash.autoHash(&hasher, .{ subject.kind, subject.text.len });
+                hasher.update(subject.text);
+            },
+        }
     }
     return hasher.final();
 }
