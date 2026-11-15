@@ -349,6 +349,8 @@ fn writePreferences(writer: *std.Io.Writer) std.Io.Writer.Error!void {
             "A bottom edge with fewer than 40 free columns has no events. " ++
             "A box can hide the item of an event. " ++
             "A chased chomper escapes, or the ghost catches it. " ++
+            "After an escape, the ghost curses on the top edge. " ++
+            "A catch leaves a grave on the bottom edge and RIP on the top edge. " ++
             "A catch ends the game, and the next game starts at level 1. " ++
             "A change of the terminal width starts a new lap at the same level. " ++
             "A change of the width after a catch starts the next game at once. " ++

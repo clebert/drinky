@@ -140,6 +140,8 @@ const Range = struct { low: isize, high: isize };
 
 const Fade = struct { frames: u32, blink_below: u32 };
 
+const Word = struct { text: *const [word_columns]u8, start: ?isize, role: role.Name };
+
 const Event = union(Kind) {
     hunt: Hunt,
     chase: Chase,
@@ -167,9 +169,11 @@ const Chase = union(enum) {
     rise: Ghost,
     alert: Ghost,
     run: Run,
-    stop: Ghost,
+    stop: Ending,
     hit: Ghost,
-    dead: Ghost,
+    dead: Ending,
+
+    const Ending = struct { column: isize, word_start: ?isize, frames: u32 = 0 };
 
     const Outcome = enum { escape, caught };
 
@@ -257,7 +261,11 @@ const fade_blink_frames = 6;
 const rise_frames = 24;
 const alert_frames = 36;
 const hit_frames = 32;
-const dead_frames = 60;
+const curse_frames = 60;
+const curse_swap_frames = 10;
+const dead_frames = 130;
+const grave_frames = 48;
+const rip_frames = 60;
 const struck_frames = 30;
 const meet_frames = 120;
 const yawn_frames = 40;
@@ -278,13 +286,16 @@ const score_fade_frames = 60;
 
 const anchor_top = [_]isize{0};
 const nap_top = [_]isize{ 0, 2, 3 };
-const score_top = offsets: {
-    var offsets: [score_text.len]isize = undefined;
+const word_top = offsets: {
+    var offsets: [word_columns]isize = undefined;
     for (&offsets, 0..) |*offset, index| offset.* = index;
     break :offsets offsets;
 };
 
-const score_text = "200";
+const word_columns = 3;
+const score_text: *const [word_columns]u8 = "200";
+const rip_text: *const [word_columns]u8 = "RIP";
+const curse_texts = [_]*const [word_columns]u8{ "#@!", "@#$" };
 
 const level_prefix = " Level ";
 const game_over_text = " Game over ";
@@ -304,6 +315,7 @@ const glyph_dot = "·";
 const glyph_ghost = "ᗣ";
 const glyph_sleep = "ᶻ";
 const glyph_moon = "☾";
+const glyph_grave = "✝";
 
 const frame_cell: Cell = .{ .glyph = "─", .role = .input_frame };
 const blank_cell: Cell = .{ .glyph = " ", .role = .text };
@@ -312,6 +324,7 @@ const ghost_cell: Cell = .{ .glyph = glyph_ghost, .role = .ghost };
 const pellet_cell: Cell = .{ .glyph = glyph_shut, .role = .text };
 const pellet_small_cell: Cell = .{ .glyph = glyph_small, .role = .text };
 const moon_cell: Cell = .{ .glyph = glyph_moon, .role = .text };
+const grave_cell: Cell = .{ .glyph = glyph_grave, .role = .text };
 
 pub fn init(seed: u64) Chomp {
     return .{ .prng = .init(seed) };
@@ -714,7 +727,7 @@ fn tickHunt(self: *Chomp, layout: *const Layout, lap: *Lap, hunt: *Hunt) Step {
                 lap.hold = catch_hold_frames;
                 hunt.* = .{ .burst = .{
                     .column = column,
-                    .score_start = self.nearestClear(layout, column - 1, &score_top),
+                    .score_start = self.nearestClear(layout, column - 1, &word_top),
                 } };
             } else if (power.frames == 0) hunt.* = .{ .recover = .{ .column = column } };
             return .walks;
@@ -792,24 +805,30 @@ fn tickChase(self: *Chomp, layout: *const Layout, lap: *const Lap, chase: *Chase
                 },
                 .escape => {},
             }
-            if (lap.inTunnel(layout)) chase.* = .{ .stop = .{ .column = ghost } };
+            if (lap.inTunnel(layout)) chase.* = .{ .stop = .{
+                .column = ghost,
+                .word_start = self.nearestClear(layout, ghost - 1, &word_top),
+            } };
             return .walks;
         },
-        .stop => |*ghost| {
-            ghost.frames += 1;
-            return if (ghost.frames >= fade_frames) .ends else .walks;
+        .stop => |*ending| {
+            ending.frames += 1;
+            return if (ending.frames >= curse_frames + fade_frames) .ends else .walks;
         },
         .hit => |*ghost| {
             ghost.frames += 1;
             if (ghost.frames >= hit_frames) {
                 const column = ghost.column;
-                chase.* = .{ .dead = .{ .column = column } };
+                chase.* = .{ .dead = .{
+                    .column = column,
+                    .word_start = self.nearestClear(layout, lap.chomper.position - 1, &word_top),
+                } };
             }
             return .waits;
         },
-        .dead => |*ghost| {
-            ghost.frames += 1;
-            return if (ghost.frames >= dead_frames) .loses_game else .waits;
+        .dead => |*ending| {
+            ending.frames += 1;
+            return if (ending.frames >= dead_frames) .loses_game else .waits;
         },
     }
 }
@@ -1014,16 +1033,16 @@ fn chaseChomper(chase: *const Chase) Look {
             .odd = glyph_left,
             .even = glyph_right,
         })),
-        .dead => |*ghost| if (ghost.frames < 12)
+        .dead => |*ending| if (ending.frames < 12)
             lookOf(glyph_shut)
-        else if (ghost.frames < 24)
+        else if (ending.frames < 24)
             lookOf(glyph_small)
-        else if (ghost.frames < 36)
+        else if (ending.frames < 36)
             lookOf(glyph_dot)
-        else if (ghost.frames < 48)
+        else if (ending.frames < grave_frames)
             lookOf(glyph_spark)
         else
-            .hidden,
+            .{ .cell = grave_cell },
     };
 }
 
@@ -1129,7 +1148,9 @@ fn chaseBottom(chase: *const Chase, column: isize) ?Cell {
         },
         .alert, .hit => |*ghost| if (ghost.column == column) return ghost_cell,
         .run => |*run| if (run.ghost == column) return ghost_cell,
-        .stop, .dead => |*ghost| if (ghost.column == column) return fadeCell(ghost.frames),
+        .stop => |*ending| if (ending.column == column)
+            return fadeCell(ending.frames -| curse_frames),
+        .dead => |*ending| if (ending.column == column) return fadeCell(ending.frames),
     }
     return null;
 }
@@ -1147,7 +1168,17 @@ fn eventTop(lap: *const Lap, column: isize) ?Cell {
     switch (event.*) {
         .chase => |*chase| switch (chase.*) {
             .alert => if (column == chomper_position) return .{ .glyph = "!", .role = .chomper },
-            .wait, .rise, .run, .stop, .hit, .dead => {},
+            .stop => |*ending| if (ending.frames < curse_frames) return wordCell(&.{
+                .text = curse_texts[@divFloor(ending.frames, curse_swap_frames) % curse_texts.len],
+                .start = ending.word_start,
+                .role = .ghost,
+            }, column),
+            .dead => |*ending| if (ending.frames >= rip_frames) return wordCell(&.{
+                .text = rip_text,
+                .start = ending.word_start,
+                .role = .text,
+            }, column),
+            .wait, .rise, .run, .hit => {},
         },
         .love => |*love| switch (love.*) {
             .struck => |frames| if (column == chomper_position and @divFloor(frames, 6) % 2 == 0)
@@ -1170,7 +1201,11 @@ fn eventTop(lap: *const Lap, column: isize) ?Cell {
             .wait, .hurry => {},
         },
         .hunt => |*hunt| switch (hunt.*) {
-            .burst => |*burst| return scoreCell(burst, column),
+            .burst => |*burst| return wordCell(&.{
+                .text = score_text,
+                .start = burst.score_start,
+                .role = if (burst.frames < score_bright_frames) .score else .score_fading,
+            }, column),
             .roam, .power, .recover => {},
         },
         .hole, .music => {},
@@ -1178,14 +1213,11 @@ fn eventTop(lap: *const Lap, column: isize) ?Cell {
     return null;
 }
 
-fn scoreCell(burst: *const Hunt.Burst, column: isize) ?Cell {
-    const start = burst.score_start orelse return null;
-    if (column < start or column >= start + score_text.len) return null;
+fn wordCell(word: *const Word, column: isize) ?Cell {
+    const start = word.start orelse return null;
+    if (column < start or column >= start + word_columns) return null;
     const index: usize = @intCast(column - start);
-    return .{
-        .glyph = score_text[index..][0..1],
-        .role = if (burst.frames < score_bright_frames) .score else .score_fading,
-    };
+    return .{ .glyph = word.text[index..][0..1], .role = word.role };
 }
 
 fn meetCell(meet: *const Love.Meet, column: isize) ?Cell {
@@ -1610,6 +1642,65 @@ test "an eaten ghost shows the score on the top edge" {
             break true;
     } else false;
     try std.testing.expect(shown);
+}
+
+test "a ghost that misses the chomper curses above itself before it fades" {
+    var chomp = try chaseLap();
+    const stopped = for (0..4000) |_| {
+        chomp.advance();
+        if (chaseStage(&chomp) == .stop) break true;
+    } else false;
+    try std.testing.expect(stopped);
+    const ghost = glyphColumn(&chomp, &.{
+        .edge = .bottom,
+        .columns = 80,
+        .glyph = glyph_ghost,
+    }) orelse return error.TestExpectedGhost;
+    const curse = glyphColumn(&chomp, &.{
+        .edge = .top,
+        .columns = 80,
+        .glyph = "#",
+    }) orelse return error.TestExpectedCurse;
+    try std.testing.expect(edgeShows(&chomp, &.{ .edge = .top, .columns = 80, .text = "#@!" }));
+    try std.testing.expect(ghost >= curse and ghost < curse + word_columns);
+    for (0..curse_frames - 1) |_| chomp.advance();
+    try std.testing.expectEqualStrings(glyph_ghost, chomp.cell(.bottom, ghost).glyph);
+    try std.testing.expect(edgeShows(&chomp, &.{ .edge = .top, .columns = 80, .text = "@" }));
+    chomp.advance();
+    try std.testing.expectEqual(@as(?std.meta.Tag(Chase), .stop), chaseStage(&chomp));
+    try std.testing.expect(!edgeShows(&chomp, &.{ .edge = .top, .columns = 80, .text = "@" }));
+}
+
+test "a caught chomper leaves a grave under RIP on the top edge" {
+    var chomp: Chomp = .init(0);
+    chomp.fit(&.{ .columns = 80 });
+    const caught = for (0..1_000_000) |_| {
+        chomp.advance();
+        if (chaseStage(&chomp) == .dead) break true;
+    } else false;
+    try std.testing.expect(caught);
+    for (0..rip_frames) |_| chomp.advance();
+    const grave = glyphColumn(&chomp, &.{
+        .edge = .bottom,
+        .columns = 80,
+        .glyph = glyph_grave,
+    }) orelse return error.TestExpectedGrave;
+    const rip = glyphColumn(&chomp, &.{
+        .edge = .top,
+        .columns = 80,
+        .glyph = "R",
+    }) orelse return error.TestExpectedRip;
+    try std.testing.expect(edgeShows(&chomp, &.{ .edge = .top, .columns = 80, .text = rip_text }));
+    try std.testing.expect(grave >= rip and grave < rip + word_columns);
+}
+
+fn chaseLap() !Chomp {
+    for (0..64) |seed| {
+        var chomp: Chomp = .init(seed);
+        chomp.fit(&.{ .columns = 80 });
+        if (chaseStage(&chomp) == .wait) return chomp;
+    }
+    return error.TestExpectedChase;
 }
 
 fn lapWith(glyph: []const u8) !struct { chomp: Chomp, column: usize } {
