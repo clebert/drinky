@@ -611,12 +611,10 @@ fn draftEmpty(self: *const App) bool {
 
 fn clearDraft(self: *App) void {
     self.screen.editor.clear();
-    self.screen.markEdited();
 }
 
 fn prependDraft(self: *App, text: []const u8) !void {
     try self.screen.editor.prependText(text);
-    self.screen.markEdited();
 }
 
 fn editKey(self: *App, event: *const terminal.Input.Key) !bool {
@@ -646,7 +644,6 @@ fn editKey(self: *App, event: *const terminal.Input.Key) !bool {
         .unknown,
         => return false,
     }
-    self.screen.markEdited();
     self.edits +%= 1;
     return true;
 }
@@ -970,7 +967,6 @@ fn openKeyStep(self: *App, account: usize) !void {
     try editor.insert(self.controller.readKey(account) orelse "");
     self.key_step = .{ .account = account, .draft = self.screen.editor };
     self.screen.editor = editor;
-    self.screen.markEdited();
     self.setSignInTitle(account);
 }
 fn closeKeyStep(self: *App) void {
@@ -978,7 +974,6 @@ fn closeKeyStep(self: *App) void {
     self.key_step = null;
     self.screen.editor.deinit();
     self.screen.editor = step.draft;
-    self.screen.markEdited();
 }
 fn cancelKeyStep(self: *App, account: usize) !void {
     self.closeKeyStep();

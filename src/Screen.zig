@@ -102,7 +102,6 @@ pub const Widget = union(enum) {
 pub const Turn = struct {
     calls: std.ArrayList(application.Live.Call),
     thinking: bool,
-    caret_tick: u64,
     work_line: std.ArrayList(u8),
     work_ends: [ui.Block.Work.Summary.segment_count]usize,
     work_hash: ?u64,
@@ -113,7 +112,6 @@ pub const Turn = struct {
     const empty: Turn = .{
         .calls = .empty,
         .thinking = false,
-        .caret_tick = 0,
         .work_line = .empty,
         .work_ends = undefined,
         .work_hash = null,
@@ -326,10 +324,7 @@ pub fn applyChange(self: *Screen, change: *const Change) !void {
         },
         .remove_records => |ids| {
             self.transcript.remove(ids);
-            if (self.widget != .turn) {
-                self.view.resetScreen();
-                self.markEdited();
-            }
+            if (self.widget != .turn) self.view.resetScreen();
         },
         .live => |live| try self.showLive(live),
         .statistics => |statistics| self.statistics = statistics,
@@ -582,7 +577,6 @@ pub fn setDraft(self: *Screen, text: []const u8) !void {
     try editor.insert(text);
     self.editor.deinit();
     self.editor = editor;
-    self.markEdited();
 }
 
 pub fn openPicker(self: *Screen, options: *const PickerOptions) !void {
@@ -803,10 +797,7 @@ pub fn paint(
             break :turn .{
                 .turn = .{
                     .work = work,
-                    .activity = self.animation.activity(&.{
-                        .grows = true,
-                        .caret_tick = turn.caret_tick,
-                    }),
+                    .activity = self.animation.activity(&.{ .grows = true }),
                     .editor = &self.editor,
                 },
             };
@@ -860,16 +851,11 @@ pub fn parkCursor(self: *Screen) !void {
     try self.view.parkCursor();
 }
 
-pub fn markEdited(self: *Screen) void {
-    if (self.activeTurn()) |turn| turn.caret_tick = 0;
-}
-
 pub fn advanceFrame(self: *Screen, now_ms: i64) bool {
     var activity_changed = false;
     switch (self.widget) {
-        .turn => |*turn| {
+        .turn => {
             self.animation.advance();
-            turn.caret_tick +%= 1;
             activity_changed = true;
         },
         .picking => |*picker| if (picker.waiting()) {
@@ -3218,6 +3204,23 @@ test "a turn segment grows without an update and an update returns it to its bas
     try rig.apply(&.{ .tool_call_arguments = "{" });
     try rig.paintInto(&emulator, size);
     try std.testing.expectEqual(@as(usize, 6), activityCells(&emulator));
+}
+
+test "a turn keeps the caret of the editor visible on every frame" {
+    const gpa = std.testing.allocator;
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    var emulator = try terminal.testing.Emulator.init(gpa, 40);
+    defer emulator.deinit();
+    const size: terminal.View.Size = .{ .columns = 40, .rows = 24 };
+    emulator.resize(size.rows);
+    try rig.start("hi");
+    for (0..100) |_| {
+        _ = rig.screen.advanceFrame(0);
+        try rig.paintInto(&emulator, size);
+        try std.testing.expect(emulator.cursor_visible);
+    }
 }
 
 fn activityCells(emulator: *const terminal.testing.Emulator) usize {

@@ -16,7 +16,6 @@ pub const command_marker = "$ ";
 const segment_length: usize = 6;
 const segment_growth_delay_ticks: u64 = 31;
 const segment_growth_interval_ticks: u64 = 6;
-const caret_blink_ticks: u64 = 37;
 
 pub const NoticeStyle = struct {
     role: role.Name,
@@ -228,7 +227,6 @@ const BoxWrap = struct {
 
 pub const Activity = struct {
     motion: Motion,
-    caret_tick: ?u64 = null,
 
     pub const Motion = union(enum) {
         segment: Segment,
@@ -303,7 +301,7 @@ pub const Animation = union(enum) {
 
     pub fn activity(
         self: *const Animation,
-        options: *const struct { grows: bool, caret_tick: ?u64 = null },
+        options: *const struct { grows: bool },
     ) Activity {
         return .{
             .motion = switch (self.*) {
@@ -317,7 +315,6 @@ pub const Animation = union(enum) {
                 } },
                 .chomp => |*chomp| .{ .chomp = chomp },
             },
-            .caret_tick = options.caret_tick,
         };
     }
 };
@@ -706,16 +703,10 @@ fn bodyLimit(viewport_rows: usize) usize {
 }
 
 pub fn framed(placement: *const Placement, framing: *const Framing) !void {
-    const maybe_activity = framing.activity;
     const frame: Frame = .{
         .columns = placement.columns,
-        .activity = maybe_activity,
+        .activity = framing.activity,
     };
-    const caret_shown = if (maybe_activity) |activity|
-        caretVisible(activity.caret_tick orelse 0)
-    else
-        true;
-    const maybe_caret = if (caret_shown) framing.caret else null;
     var line = placement.base;
     if (framing.edges) try frameEdgeRow(placement, &frame, &line, .top, framing.hidden_above);
     var iterator = terminal.width.wrapper(framing.body, placement.columns);
@@ -732,7 +723,7 @@ pub fn framed(placement: *const Placement, framing: *const Framing) !void {
         const roles = framing.line_roles;
         const maybe_role = if (source_line < roles.len) roles[source_line] else null;
         const content = terminal.width.rowText(framing.body[span.start..span.end]);
-        try framedRow(placement, &maybe_caret, &line, &.{
+        try framedRow(placement, &framing.caret, &line, &.{
             .content = content,
             .offset = span.start,
             .role = maybe_role,
@@ -741,7 +732,7 @@ pub fn framed(placement: *const Placement, framing: *const Framing) !void {
         body_count += 1;
     }
     if (framing.trailing_row and index >= framing.hidden_above and index < window_end) {
-        try framedRow(placement, &maybe_caret, &line, &.{ .content = "" });
+        try framedRow(placement, &framing.caret, &line, &.{ .content = "" });
         body_count += 1;
     }
     std.debug.assert(body_count == framing.body_rows);
@@ -985,10 +976,6 @@ fn trackLength(maybe_progress_age_ticks: ?u64, columns: usize) usize {
         segment_growth_interval_ticks,
     );
     return length_base + @as(usize, @intCast(@min(growth_steps, growth_max)));
-}
-
-fn caretVisible(caret_tick: u64) bool {
-    return caret_tick % (2 * caret_blink_ticks) < caret_blink_ticks;
 }
 
 test "the command gutter narrows with the row and keeps one column for text" {
@@ -1267,35 +1254,6 @@ test "a quiet segment grows at its back up to one frame edge" {
             .tick = case.tick,
             .progress_age_ticks = case.age_ticks,
         }, case.columns, &case.edges);
-    }
-}
-
-test "an animated input places its caret on the first of two equal halves alone" {
-    const gpa = std.testing.allocator;
-    const samples = [_]struct { caret_tick: u64, shown: bool }{
-        .{ .caret_tick = 0, .shown = true },
-        .{ .caret_tick = caret_blink_ticks - 1, .shown = true },
-        .{ .caret_tick = caret_blink_ticks, .shown = false },
-        .{ .caret_tick = 2 * caret_blink_ticks - 1, .shown = false },
-        .{ .caret_tick = 2 * caret_blink_ticks, .shown = true },
-    };
-    for (samples) |sample| {
-        var rig: testing.Rig = undefined;
-        rig.init(gpa);
-        defer rig.deinit();
-
-        const placement = try rig.begin(&.{ .columns = 20, .rows = 4 });
-        try framed(&placement, &.{
-            .body = "hi",
-            .body_rows = 1,
-            .caret = .{ .row = 1, .column = 2 },
-            .activity = .{
-                .motion = .{ .segment = .{ .style = .sweep, .tick = 0 } },
-                .caret_tick = sample.caret_tick,
-            },
-        });
-        const shown = std.mem.find(u8, try rig.painted(), terminal.escape.cursor_show) != null;
-        try std.testing.expectEqual(sample.shown, shown);
     }
 }
 
