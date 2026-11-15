@@ -35,9 +35,12 @@ when the user drops it.
   directories without a time limit. A file system call that does not return stops the start. A
   pending macOS privacy prompt causes such a call. The tools and the skill file reads already stop
   such a call after their time limit when the call accepts a cancel.
-- `/gists` scans at most 4096 entries of `~/.drinky/gists/` in directory order, not by age. Past
-  that limit, gists leave the list without a notice, and the newest gists can be among them. Each
-  save creates a file, and a gist stays until a deletion, so the count only grows.
+- `/gists` does not always list the newest gists. The list sorts only the gists that its scan reads.
+  The scan stops after 4096 entries of `~/.drinky/gists/` in directory order. The file names are
+  random ids, so the directory order has no relation to age. With 8202 gists, the list held only 3
+  to 5 of the 10 newest gists. Past the limit, gists leave the list without a notice. Each save
+  creates a file, and a gist stays until a deletion, so the count only grows. The list must stay
+  shared across all repositories and show the newest gists first.
 - Drinky has no QwenCloud account. QwenCloud offers the OpenAI Responses protocol at
   `/compatible-mode/v1/responses`, the Anthropic Messages protocol at `/apps/anthropic`, and a model
   list at `/compatible-mode/v1/models`. QwenCloud has no OAuth, so each account takes a key in the
@@ -48,6 +51,66 @@ when the user drops it.
   of the other kind. The Responses API truncates an input above about 80% of the context window
   without an error. The `auto` model of the Token Plan routes each request to a model that the
   server selects. Source: <https://docs.qwencloud.com/llms.txt>.
+- Drinky sends no message while a turn runs. The controller refuses the message as `busy`, and the
+  draft stays. The MCP tool `send_message` gets the same refusal. A message cannot steer the running
+  turn or wait for the next turn. `Turn` already adds a queued required skill as a user message at a
+  round boundary. A user message can join the conversation at the same point. A waiting message must
+  survive a cancel. The design must define how Esc, `/rewind`, and Ctrl+N treat a waiting message.
+- Drinky has no sandbox outside macOS. Linux has Landlock since Linux 5.13. Source:
+  <https://docs.kernel.org/userspace-api/landlock.html>. The Zig standard library has the Landlock
+  system call numbers but no wrappers. Landlock limits the calling thread and its children. An
+  unprivileged process must set `no_new_privs` before it applies the rules. The `bash` tool already
+  runs its own setup between `fork` and `execve`, so the rules can apply there. The available access
+  rights grow with the ABI version of the kernel, so the rules must adapt to that version. A kernel
+  without Landlock needs a fallback without a sandbox. CI runs on `ubuntu-latest`, so CI can run the
+  Linux tests. Zig skips the analysis of a branch for another system. A macOS host checks the Linux
+  code only with `zig build test -Dtarget=x86_64-linux`, and it cannot run those tests.
+- Drinky sends no image to a model. The `read` tool refuses a binary file, so the model cannot
+  inspect a screenshot or a rendered result. Each wire documents an image in a tool result. In
+  Messages, the `tool_result` content takes `image` blocks. Source:
+  <https://platform.claude.com/docs/en/agents-and-tools/tool-use/handle-tool-calls>. In Responses,
+  the `output` of `function_call_output` takes an array of image objects. Source:
+  <https://developers.openai.com/api/docs/guides/function-calling>. The ChatGPT plan backend takes
+  an image in a tool result too. The Codex client sends it there in
+  `codex-rs/core/src/tools/handlers/view_image.rs` of `openai/codex`. The xAI, OpenRouter, and
+  DeepSeek accounts need their own check. In Gemini 3, a `functionResponse` part takes nested
+  `inlineData` parts with PNG, JPEG, or WebP data. This feature is a preview. Source:
+  <https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/tools/function-calling>.
+  The source of the public metadata lists the input types of each model in
+  `architecture.input_modalities` of <https://openrouter.ai/api/v1/models>. Some models list only
+  `text`. The public metadata does not hold the input types yet. `Tool.Output.content` holds only
+  text, so every layer changes. The Zig standard library has no image decoder, so Drinky cannot
+  scale an image down. Drinky can read the dimensions from the file header and refuse an image above
+  the limit. Anthropic accepts at most 8000×8000 px. Above 20 images in one request, a stricter
+  limit applies. Drinky sends every image again with each request, so a long session reaches that
+  limit. Source: <https://platform.claude.com/docs/en/build-with-claude/vision>.
+- The `edit` tool replaces one unique span in each call. A rename or a change at several places
+  takes one call for each place, or a rewrite of the whole file. A list of replacements or a flag
+  for every occurrence can save model steps and tokens. A flag works with the current parameter
+  types `string`, `integer`, and `boolean`. A list of replacements needs an array type in
+  `core.Tool.Parameter.Type`, the shared schema writer `json.writeParametersSchema`, and the input
+  check of the tools.
+- Drinky reads the config file, the instruction files, and the skill list only at startup. A new
+  skill or a config change takes effect only after a restart. A clear of the conversation can read
+  them again. The clears are `/new`, a clear through MCP, and the apply of a gist. A change of the
+  system prompt during a conversation invalidates the Anthropic prompt cache of the system prompt
+  and of all messages. Source:
+  <https://platform.claude.com/docs/en/build-with-claude/prompt-caching>. The `interface` keys set
+  the initial values of `/verbose` and `/mcp`. A reload must keep or reset these session values by
+  an explicit rule. `Harness.init` builds the config, the discovery, and the system prompt once.
+  Each part that copied an old value must take the new value. The missing time limit of the start
+  discovery applies to each reload too.
+- A rewind keeps the file changes of the turns that it drops. The removal of a canceled turn keeps
+  them too. Drinky can save a snapshot of the work tree before each turn. A rewind can then offer a
+  restore as a separate choice. A temporary index through `GIT_INDEX_FILE`, `git add -A`, and
+  `git write-tree` records new files and leaves the index of the user unchanged. The restore must
+  also leave that index unchanged. `git stash create` leaves out untracked files, so it cannot
+  remove a file that a turn created. A snapshot holds no ignored file and no change outside the Git
+  root. Outside a repository, Drinky has no snapshot. The snapshot needs the `git` program, so
+  Drinky must turn the restore off without it. A restore overwrites the manual changes of the user
+  after the turn, so its confirmation must list the changed files. Each snapshot writes the large
+  untracked files that `.gitignore` does not cover into `.git/objects`. The snapshot needs a size
+  limit.
 
 ## Ideas
 
