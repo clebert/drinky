@@ -106,8 +106,8 @@ fn writeCommands(writer: *std.Io.Writer) !void {
         \\Verbose off folds each run of thinking and tool calls into one work row.
         \\Agent text, a session event, or a user note ends a run. A new model step does not end it.
         \\The open work row shows the activity in parentheses and the time of the run.
-        \\Each work row shows the count of finished tool calls and the received bytes.
-        \\The open work row adds the count of unfinished calls, as in `Tools: 1 (2 active)`.
+        \\Each work row shows the count of tool calls and the received bytes.
+        \\The open work row counts finished and unfinished calls.
         \\The open work row updates these values while the run continues.
         \\While a `bash` call runs, the open work row shows the main command of the call after the
         \\tool count.
@@ -117,7 +117,7 @@ fn writeCommands(writer: *std.Io.Writer) !void {
         \\Verbose on and verbose off show the command in the same way.
         \\The received bytes count the thinking text and the arguments of each tool call.
         \\A retry, a cancel, or a failure can drop an unfinished call.
-        \\The count then loses the bytes of that call.
+        \\The tool count and the received bytes then lose that call.
         \\The activity is `thinking` while thinking is active.
         \\Otherwise, it lists each unfinished tool name once, without a call count.
         \\The list includes calls that stream, wait in the queue, or run.

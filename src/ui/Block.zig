@@ -46,7 +46,6 @@ pub const Work = struct {
             writer: *std.Io.Writer,
             options: *const struct {
                 activity: []const u8,
-                tools_active: usize,
                 command: ?[]const u8,
                 ends: *[segment_count]usize,
             },
@@ -60,11 +59,7 @@ pub const Work = struct {
             const time = format.durationSeconds(&time_buffer, self.elapsed_ms);
             try writer.print("{s}Time: {s}", .{ paint.separator, time });
             options.ends[1] = writer.buffered().len;
-            if (self.tools) |tools| {
-                try writer.print("{s}Tools: {d}", .{ paint.separator, tools });
-                if (options.tools_active > 0)
-                    try writer.print(" ({d} active)", .{options.tools_active});
-            }
+            if (self.tools) |tools| try writer.print("{s}Tools: {d}", .{ paint.separator, tools });
             options.ends[2] = writer.buffered().len;
             if (options.command) |command|
                 try writer.print("{s}{s}{s}", .{ paint.separator, paint.command_marker, command });
@@ -80,7 +75,6 @@ pub const Work = struct {
             var writer: std.Io.Writer = .fixed(&result.buffer);
             self.write(&writer, &.{
                 .activity = if (options.thinking) "thinking" else "",
-                .tools_active = 0,
                 .command = null,
                 .ends = &result.ends,
             }) catch unreachable;

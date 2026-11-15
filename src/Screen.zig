@@ -150,13 +150,13 @@ pub const Turn = struct {
         var started_ms: ?i64 = null;
         var summary: ui.Block.Work.Summary = .{
             .elapsed_ms = 0,
-            .tools = 0,
+            .tools = self.calls.items.len,
             .received_bytes = 0,
             .status = null,
         };
         if (options.open) |run| {
             started_ms = run.started_ms;
-            summary.tools = run.tools;
+            summary.tools = run.tools + self.calls.items.len;
             summary.received_bytes = run.received_bytes;
         }
         var activity_text: std.ArrayList(u8) = .empty;
@@ -179,7 +179,6 @@ pub const Turn = struct {
         defer self.work_line = out.toArrayList();
         summary.write(&out.writer, &.{
             .activity = activity_text.items,
-            .tools_active = self.calls.items.len,
             .command = self.runningCommand(&command_buffer),
             .ends = &self.work_ends,
         }) catch return error.OutOfMemory;
@@ -1189,7 +1188,7 @@ test "a running tool uses the final call name instead of the streamed name" {
     defer gpa.free(painted);
     try expectSummary(
         painted,
-        "Agent: work (write) · Time: 0s · Tools: 0 (1 active) · Received: 0 B",
+        "Agent: work (write) · Time: 0s · Tools: 1 · Received: 0 B",
     );
     try std.testing.expect(std.mem.find(u8, painted, "partial") == null);
 }
@@ -1887,7 +1886,7 @@ test "a work row folds thinking and finished calls across steps until agent text
     defer gpa.free(running);
     try expectSummary(
         running,
-        "Agent: work (bash) · Time: 4s · Tools: 1 (1 active) · $ zig build",
+        "Agent: work (bash) · Time: 4s · Tools: 2 · $ zig build · Received: 20 B",
     );
     try std.testing.expect(std.mem.find(u8, running, "Tool:") == null);
 
@@ -1938,7 +1937,7 @@ test "verbose off names the work that runs now and hides the rows of running cal
     defer gpa.free(streamed);
     try expectSummary(
         streamed,
-        "Agent: work (read, grep) · Time: 2s · Tools: 0 (3 active) · Received: 2 B",
+        "Agent: work (read, grep) · Time: 2s · Tools: 3 · Received: 2 B",
     );
     try std.testing.expect(std.mem.find(u8, streamed, "Tool:") == null);
 
@@ -1996,7 +1995,7 @@ test "work activities keep unfinished tools, isolate thinking, and wait between 
     defer gpa.free(streamed);
     try expectSummary(
         streamed,
-        "Agent: work (read, grep) · Time: 0s · Tools: 0 (3 active) · Received: 6 B",
+        "Agent: work (read, grep) · Time: 0s · Tools: 3 · Received: 6 B",
     );
     try std.testing.expect(std.mem.find(u8, streamed, "Now:") == null);
 
@@ -2006,14 +2005,14 @@ test "work activities keep unfinished tools, isolate thinking, and wait between 
     defer gpa.free(thinking);
     try expectSummary(
         thinking,
-        "Agent: work (thinking) · Time: 0s · Tools: 0 (3 active) · Received: 10 B",
+        "Agent: work (thinking) · Time: 0s · Tools: 3 · Received: 10 B",
     );
     for (&calls) |*call| try rig.apply(&.{ .tool_started = call.* });
     const running = try rig.paintPlain(80);
     defer gpa.free(running);
     try expectSummary(
         running,
-        "Agent: work (read, grep) · Time: 0s · Tools: 0 (3 active) · Received: 10 B",
+        "Agent: work (read, grep) · Time: 0s · Tools: 3 · Received: 10 B",
     );
 
     for ([_]usize{ 0, 2 }) |index| {
@@ -2021,9 +2020,9 @@ test "work activities keep unfinished tools, isolate thinking, and wait between 
         const active = try rig.paintPlain(80);
         defer gpa.free(active);
         try expectSummary(active, if (index == 0)
-            "Agent: work (grep, read) · Time: 0s · Tools: 1 (2 active) · Received: 10 B"
+            "Agent: work (grep, read) · Time: 0s · Tools: 3 · Received: 10 B"
         else
-            "Agent: work (grep) · Time: 0s · Tools: 2 (1 active) · Received: 10 B");
+            "Agent: work (grep) · Time: 0s · Tools: 3 · Received: 10 B");
     }
     try rig.apply(&.{ .tool_result = .{ .call = calls[1], .output = .{} } });
     try rig.apply(&.committed);
@@ -2085,10 +2084,10 @@ test "work activities keep complete Unicode graphemes and the closing parenthesi
     const cases = [_]struct { columns: usize, expected: []const u8 }{
         .{
             .columns = 80,
-            .expected = "Agent: work (読む👩‍💻) · Time: 0s · Tools: 0 (1 active) · Received: 0 B",
+            .expected = "Agent: work (読む👩‍💻) · Time: 0s · Tools: 1 · Received: 0 B",
         },
-        .{ .columns = 53, .expected = "Agent: work (読む👩‍💻) · Time: 0s · Tools: 0 (1 active)" },
-        .{ .columns = 52, .expected = "Agent: work (読む👩‍💻) · Time: 0s" },
+        .{ .columns = 42, .expected = "Agent: work (読む👩‍💻) · Time: 0s · Tools: 1" },
+        .{ .columns = 41, .expected = "Agent: work (読む👩‍💻) · Time: 0s" },
         .{ .columns = 31, .expected = "Agent: work (読む👩‍💻) · Time: 0s" },
         .{ .columns = 20, .expected = "Agent: work (読む👩‍💻)" },
         .{ .columns = 19, .expected = "Agent: work (読む…)" },
@@ -2263,7 +2262,7 @@ test "the open work row counts a streaming call until a cancel drops the call" {
     defer gpa.free(open);
     try expectSummary(
         open,
-        "Agent: work (read) · Time: 0s · Tools: 0 (1 active) · Received: 15 B",
+        "Agent: work (read) · Time: 0s · Tools: 1 · Received: 15 B",
     );
     try rig.apply(&.{ .tail_discarded = 2 });
     try rig.end(&.canceled);
@@ -2291,7 +2290,7 @@ test "a verbose tool call streams and runs in the work row and ends as a block" 
     defer gpa.free(streamed);
     try expectSummary(
         streamed,
-        "Agent: work (bash) · Time: 0s · Tools: 0 (1 active) · Received: 27 B",
+        "Agent: work (bash) · Time: 0s · Tools: 1 · Received: 27 B",
     );
 
     rig.time.awake_ms = 1_000;
@@ -2305,7 +2304,7 @@ test "a verbose tool call streams and runs in the work row and ends as a block" 
     defer gpa.free(running);
     try expectSummary(
         running,
-        "Agent: work (bash) · Time: 13s · Tools: 0 (1 active) · $ zig build",
+        "Agent: work (bash) · Time: 13s · Tools: 1 · $ zig build · Received: 27 B",
     );
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, running, "$ zig build"));
 
@@ -2432,7 +2431,7 @@ test "verbose off shows the main command in the work row, and verbose on shows t
         defer gpa.free(running);
         try expectSummary(
             running,
-            "Agent: work (bash) · Time: 0s · Tools: 0 (1 active) · $ echo · Received: 0 B",
+            "Agent: work (bash) · Time: 0s · Tools: 1 · $ echo · Received: 0 B",
         );
         try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, running, "$ echo"));
         try std.testing.expect(std.mem.find(u8, running, case.hidden) == null);
