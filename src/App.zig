@@ -2153,11 +2153,7 @@ test "a failed turn or retry offers a retry that Esc dismisses and Ctrl+N sends 
         .{ .activity = false },
         .{ .editor = "draft" },
     });
-    try expectRequested(
-        &rig,
-        "\"text\":\"<retry_request>\\nFailure: overloaded\\nDetails: 500 Internal Server " ++
-            "Error: down\\nContinue from the last committed checkpoint.\\n</retry_request>\"",
-    );
+    try std.testing.expectEqual(@as(usize, 6), rig.transport.requests.items.len);
     try rig.keys("\x0e");
     try rig.waitFor(&.{
         .{ .rows = &.{ retry_note, retry_note, "done" } },

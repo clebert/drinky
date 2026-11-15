@@ -1172,7 +1172,11 @@ fn runTurn(self: *Controller, turn: *const TurnStart) !void {
     const id = self.nextOperation();
     try self.turns.begin(&.{ .id = id, .start = turn.start, .prompt = turn.prompt });
     errdefer self.turns.truncate(self.turns.all().len - 1);
-    try self.session.send(&.{ .prompt = turn.text });
+    const command: core.Session.Command = if (turn.prompt == null)
+        .{ .retry = turn.text }
+    else
+        .{ .prompt = turn.text };
+    try self.session.send(&command);
     self.dropOffer();
     self.surface.beginTurn();
     self.conversation +%= 1;
@@ -2437,10 +2441,52 @@ test "a new turn publishes no previous retry or removal offer" {
         defer active.deinit(std.testing.allocator);
         try std.testing.expect(active.offer == .none);
         try rig.expectTurn(.stopped);
-        if (case.retry) try testing.expectContains(
-            rig.transport.requests.items[1],
-            "Continue from the last committed checkpoint.",
+    }
+}
+
+test "a retry adds one continue request only after a committed model message" {
+    const failure: providers.testing.FakeTransport.Reply = .{ .status = .bad_request };
+    const done: providers.testing.FakeTransport.Reply = .{
+        .body = providers.testing.reply_stream,
+    };
+    const partial: providers.testing.FakeTransport.Reply = .{
+        .body = "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_1\"," ++
+            "\"delta\":\"Partial\"}\n\n" ++
+            "data: {\"type\":\"error\",\"message\":\"stopped\"}\n\n",
+    };
+    const continue_request = "<retry_request>\\nFailure: invalid_request\\nDetails: stopped\\n" ++
+        "Continue from the last committed checkpoint.\\n</retry_request>";
+    const cases = [_]struct {
+        replies: []const providers.testing.FakeTransport.Reply,
+        continued: bool,
+    }{
+        .{ .replies = &.{ failure, failure, done }, .continued = false },
+        .{
+            .replies = &.{ .{ .body = testing.write_call_stream }, failure, failure, done },
+            .continued = false,
+        },
+        .{ .replies = &.{ partial, failure, done }, .continued = true },
+    };
+    for (cases) |case| {
+        var rig: testing.Rig = undefined;
+        try rig.init(&.{ .replies = case.replies });
+        defer rig.deinit();
+        _ = rig.send(&.{ .send_message = "Task." });
+        try rig.expectTurn(.failed);
+        try std.testing.expect(rig.send(&.retry).accepted());
+        try rig.expectTurn(.failed);
+        try std.testing.expect(rig.send(&.retry).accepted());
+        try rig.expectTurn(.stopped);
+        const requests = rig.transport.requests.items;
+        try std.testing.expectEqual(case.replies.len, requests.len);
+        const retried = requests.len - 2;
+        try std.testing.expectEqualStrings(requests[retried], requests[retried + 1]);
+        try std.testing.expectEqual(
+            @as(usize, @intFromBool(case.continued)),
+            std.mem.count(u8, requests[retried], continue_request),
         );
+        if (!case.continued)
+            try std.testing.expectEqualStrings(requests[retried - 1], requests[retried]);
     }
 }
 

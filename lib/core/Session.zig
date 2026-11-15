@@ -79,6 +79,7 @@ pub const Setup = struct {
 
 pub const Command = union(enum) {
     prompt: []const u8,
+    retry: []const u8,
     aside: Aside.Request,
     cancel,
     configure: Setup,
@@ -88,6 +89,7 @@ pub const Command = union(enum) {
     fn dupe(self: *const Command, gpa: std.mem.Allocator) error{OutOfMemory}!Command {
         return switch (self.*) {
             .prompt => |text| .{ .prompt = try gpa.dupe(u8, text) },
+            .retry => |text| .{ .retry = try gpa.dupe(u8, text) },
             .aside => |*request| .{ .aside = try request.dupe(gpa) },
             .configure => |*setup| .{ .configure = try setup.dupe(gpa) },
             .cancel, .clear, .rewind => self.*,
@@ -96,7 +98,7 @@ pub const Command = union(enum) {
 
     fn deinit(self: *const Command, gpa: std.mem.Allocator) void {
         switch (self.*) {
-            .prompt => |text| gpa.free(text),
+            .prompt, .retry => |text| gpa.free(text),
             .aside => |*request| request.deinit(gpa),
             .configure => |*setup| setup.deinit(gpa),
             .cancel, .clear, .rewind => {},
@@ -340,6 +342,7 @@ fn serve(self: *Session) actor.Mailbox(Mail, mail_capacity).Error!void {
 fn handle(self: *Session, command: Command) void {
     switch (command) {
         .prompt => |text| self.prompt(text),
+        .retry => |text| self.retry(text),
         .aside => |request| self.ask(request),
         .cancel => self.mailbox.cancel(self.io),
         .configure => |setup| self.configure(setup),
@@ -349,11 +352,30 @@ fn handle(self: *Session, command: Command) void {
 }
 
 fn prompt(self: *Session, text: []const u8) void {
+    self.appendPrompt(self.turn_count, text) catch fatal.outOfMemory();
+    self.startTurn();
+}
+
+fn retry(self: *Session, text: []const u8) void {
+    if (self.endsWithAssistant()) {
+        self.conversation.append(self.gpa, .{ .message = .{ .role = .user, .text = text } }) catch
+            fatal.outOfMemory();
+    } else self.gpa.free(text);
+    self.startTurn();
+}
+
+fn endsWithAssistant(self: *const Session) bool {
+    return switch (self.conversation.items.getLast()) {
+        .message => |message| message.role == .assistant,
+        .tool_result => false,
+        .reasoning, .tool_call => unreachable,
+    };
+}
+
+fn startTurn(self: *Session) void {
     std.debug.assert(!self.mailbox.busy());
     std.debug.assert(self.setup != null);
-    const turn_index = self.turn_count;
     self.turn_count += 1;
-    self.appendPrompt(turn_index, text) catch fatal.outOfMemory();
     const turn: Turn = .{
         .gpa = self.gpa,
         .io = self.io,
@@ -434,12 +456,10 @@ fn clear(self: *Session) void {
 
 fn rewind(self: *Session, turn: usize) void {
     std.debug.assert(!self.mailbox.busy());
-    std.debug.assert(turn < self.turn_count);
     const kept = for (self.turn_starts.items, 0..) |turn_start, index| {
-        if (turn_start.turn >= turn) break index;
-    } else self.turn_starts.items.len;
-    if (kept < self.turn_starts.items.len)
-        self.conversation.truncate(self.gpa, self.turn_starts.items[kept].item);
+        if (turn_start.turn == turn) break index;
+    } else unreachable;
+    self.conversation.truncate(self.gpa, self.turn_starts.items[kept].item);
     self.turn_starts.shrinkRetainingCapacity(kept);
     self.turn_count = turn;
     self.forgetMeasured();
@@ -1283,6 +1303,35 @@ test "an aside sends each prompt with the agent texts of its turn and no tools o
         .{ .system = "Be brief.", .text = "The long answer." },
     };
     try testing.checkCopyAllocationFailures(Aside.Request, &requests);
+}
+
+test "an aside omits a retry text and keeps the retry output with its prompt" {
+    var harness: testing.Harness = undefined;
+    try harness.init(std.testing.allocator, std.testing.io, &.{});
+    defer harness.deinit();
+    harness.provider.load(&.{
+        .{ .done = &.{ .{ .text = "Par" }, .{ .failed = .{ .reason = .network } } } },
+        .{ .done = &.{.{ .failed = .{ .reason = .network } }} },
+        .{ .done = &.{ fixture.message("Done."), fixture.stop_complete } },
+        .{ .done = &.{ fixture.message("Gist."), fixture.stop_complete } },
+    });
+    try std.testing.expect(std.mem.endsWith(u8, try harness.turn("a"), "failed:network:"));
+    for (0..2) |_| {
+        try harness.session.send(&.{ .retry = "Continue." });
+        _ = try harness.until("turn_ended");
+    }
+    try harness.session.send(&.{ .aside = fixture.gist });
+    _ = try harness.until("aside_ended");
+
+    const provider = &harness.provider;
+    try std.testing.expectEqualStrings(
+        "model-a|user:a|assistant:Par|user:Continue.",
+        provider.requests.items[2],
+    );
+    try std.testing.expectEqualStrings(
+        "model-a|user:a|assistant:Par|assistant:Done.|user:Write the gist.",
+        provider.requests.items[3],
+    );
 }
 
 test "an aside rejects a reply that contains only whitespace" {
