@@ -234,6 +234,7 @@ fn startupReport(value: *const application.Record.Event) bool {
         .key_check_canceled,
         .models_fetched,
         .models_unfetched,
+        .conversation_resent,
         .attempt_failed,
         .model_substituted,
         .reply_truncated,
@@ -257,6 +258,7 @@ fn severity(value: *const application.Record.Event) ui.Message.Severity {
         .signed_out,
         .credential_reloaded,
         .key_check_canceled,
+        .conversation_resent,
         .attempt_failed,
         .turn_canceled,
         => .information,
@@ -465,6 +467,7 @@ fn writeEvent(
             const cause = unfetched.metadata_save_error orelse return;
             try writer.print(metadata_unsaved ++ " The metadata serves this session.", .{cause});
         },
+        .conversation_resent => try writer.writeAll("Drinky sent the conversation again."),
         .attempt_failed => |attempt| {
             var buffer: [24]u8 = undefined;
             const delay = application.support.duration(&buffer, @intCast(@min(

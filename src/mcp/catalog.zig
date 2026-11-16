@@ -204,7 +204,8 @@ pub const definitions = [_]Definition{
     },
     .{
         .name = "retry",
-        .description = "Ask the model to continue a failed turn from the committed work. The " ++
+        .description = "Send the conversation of a failed turn again. When the conversation " ++
+            "ends with model text, ask the model to continue from the committed work. The " ++
             "offer of get_state must be retry. Acceptance returns the operation id.",
         .hints = .{ .read_only = false, .destructive = true, .open_world = true },
     },

@@ -1127,8 +1127,6 @@ fn retry(self: *Controller) !void {
     };
     if (try self.refusePrerequisite()) return;
     const start = self.surface.transcript.entries().len;
-    try self.surface.appendRetryNote();
-    errdefer self.surface.transcript.truncate(start);
     try self.runTurn(&.{ .text = request, .start = start, .prompt = null });
 }
 
@@ -1258,6 +1256,7 @@ fn applySessionEvent(self: *Controller, event: *const core.Session.Event) !void 
         .model_served,
         .attempt_failed,
         .skill_loaded,
+        .retry_started,
         .turn_ended,
         => {},
     }
@@ -2444,7 +2443,7 @@ test "a new turn publishes no previous retry or removal offer" {
     }
 }
 
-test "a retry adds one continue request only after a committed model message" {
+test "a retry asks to continue only after a model message and reports a resend otherwise" {
     const failure: providers.testing.FakeTransport.Reply = .{ .status = .bad_request };
     const done: providers.testing.FakeTransport.Reply = .{
         .body = providers.testing.reply_stream,
@@ -2487,6 +2486,17 @@ test "a retry adds one continue request only after a committed model message" {
         );
         if (!case.continued)
             try std.testing.expectEqualStrings(requests[retried - 1], requests[retried]);
+        const ended = try rig.snapshot();
+        defer ended.deinit(std.testing.allocator);
+        var notes: usize = 0;
+        var resends: usize = 0;
+        for (ended.records) |*record| switch (record.content) {
+            .user_note => notes += 1,
+            .event => |event| resends += @intFromBool(event == .conversation_resent),
+            .user, .thinking, .model, .tool_result, .authorization => {},
+        };
+        try std.testing.expectEqual(@as(usize, @intFromBool(case.continued)), notes);
+        try std.testing.expectEqual(2 - notes, resends);
     }
 }
 

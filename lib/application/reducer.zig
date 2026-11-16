@@ -88,6 +88,13 @@ pub fn apply(
             try self.transcript.append(&.{ .user_note = .{ .skill = loaded.* } }, .{});
             self.transcript.closeWork(&.{ .time_ms = time.awake_ms, .status = .complete });
         },
+        .retry_started => |start| {
+            const source: Record.Source = switch (start) {
+                .resent => .{ .event = .conversation_resent },
+                .continue_requested => .{ .user_note = .retry },
+            };
+            try self.transcript.append(&source, .{});
+        },
         .turn_ended => |outcome| {
             const status: Record.Work.Status = switch (outcome) {
                 .stopped => |reason| switch (reason) {
@@ -313,6 +320,7 @@ fn checkReductionAllocations(gpa: std.mem.Allocator) error{OutOfMemory}!void {
         .arguments = "{\"path\":\"a.zig\"}",
     };
     const events = [_]core.Session.Event{
+        .{ .retry_started = .continue_requested },
         .reasoning_started,
         .{ .reasoning = "first" },
         .reasoning_started,
@@ -339,6 +347,7 @@ fn checkReductionAllocations(gpa: std.mem.Allocator) error{OutOfMemory}!void {
     for (&events) |*event| _ = try reduction.apply(event, .{ .awake_ms = 1, .boot_ms = 1 });
     try reduction.start("next");
     const canceled = [_]core.Session.Event{
+        .{ .retry_started = .resent },
         .reasoning_started,
         .{ .reasoning = "partial" },
         .{ .tail_discarded = 1 },

@@ -1689,7 +1689,6 @@ const sign_in_titles = blk: {
     break :blk titles;
 };
 
-const retry_note = "Drinky asked the model to continue from the committed work.";
 const removal_warning = "Press Ctrl+N again to remove the canceled turn. Tool changes stay.";
 const rewind_warning = "Press Enter again to rewind. Tool changes stay.";
 
@@ -2064,6 +2063,7 @@ fn expectRequested(rig: *const Rig, needle: []const u8) !void {
 const retry_caption_row = retry_caption.title ++ " · " ++ retry_caption.controls;
 const removal_caption_row = removal_caption.title ++ " · " ++ removal_caption.controls;
 const canceled_turn_event = "You canceled the turn.";
+const resent_event = "ℹ Drinky sent the conversation again.";
 const overloaded_event = "⚠ The provider is overloaded. Details: 500 Internal Server Error: down";
 
 test "a failed turn ends at the prompt with its event, and the message stays" {
@@ -2143,7 +2143,7 @@ test "a failed turn or retry offers a retry that Esc dismisses and Ctrl+N sends 
 
     try rig.keys("draft\x0e");
     try rig.waitFor(&.{
-        .{ .rows = &.{ "second", overloaded_event, retry_note, overloaded_event } },
+        .{ .rows = &.{ "second", overloaded_event, resent_event, overloaded_event } },
         .{ .text = retry_caption_row },
         .{ .activity = false },
         .{ .editor = "draft" },
@@ -2151,7 +2151,7 @@ test "a failed turn or retry offers a retry that Esc dismisses and Ctrl+N sends 
     try std.testing.expectEqual(@as(usize, 6), rig.transport.requests.items.len);
     try rig.keys("\x0e");
     try rig.waitFor(&.{
-        .{ .rows = &.{ retry_note, retry_note, "done" } },
+        .{ .rows = &.{ resent_event, resent_event, "done" } },
         .{ .absent = retry_caption_row },
         .{ .activity = false },
         .{ .editor = "draft" },
@@ -2258,7 +2258,7 @@ test "a canceled retry offers no removal, and a new turn and /new drop the offer
     try stalls[0].reached.wait(std.testing.io);
     try rig.keys("\x04");
     try rig.waitFor(&.{
-        .{ .rows = &.{ retry_note, canceled_turn_event } },
+        .{ .rows = &.{ resent_event, canceled_turn_event } },
         .{ .activity = false },
         .{ .absent = removal_caption_row },
         .{ .absent = retry_caption_row },

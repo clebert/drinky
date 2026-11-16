@@ -130,7 +130,10 @@ pub const Event = union(enum) {
     model_served: ModelServed,
     attempt_failed: Attempt,
     skill_loaded: SkillLoaded,
+    retry_started: RetryStart,
     turn_ended: Outcome,
+
+    pub const RetryStart = enum { resent, continue_requested };
 
     pub const ToolResult = struct {
         call: Tool.Call,
@@ -205,6 +208,7 @@ pub const Event = union(enum) {
             .quota,
             .credits,
             .context,
+            .retry_started,
             => self.*,
         };
     }
@@ -244,6 +248,7 @@ pub const Event = union(enum) {
             .quota,
             .credits,
             .context,
+            .retry_started,
             => {},
         }
     }
@@ -357,10 +362,17 @@ fn prompt(self: *Session, text: []const u8) void {
 }
 
 fn retry(self: *Session, text: []const u8) void {
-    if (self.endsWithAssistant()) {
-        self.conversation.append(self.gpa, .{ .message = .{ .role = .user, .text = text } }) catch
-            fatal.outOfMemory();
-    } else self.gpa.free(text);
+    const retry_start: Event.RetryStart = if (self.endsWithAssistant())
+        .continue_requested
+    else
+        .resent;
+    switch (retry_start) {
+        .resent => self.gpa.free(text),
+        .continue_requested => self.conversation.append(self.gpa, .{
+            .message = .{ .role = .user, .text = text },
+        }) catch fatal.outOfMemory(),
+    }
+    self.emit(&.{ .retry_started = retry_start });
     self.startTurn();
 }
 

@@ -87,6 +87,7 @@ pub const Event = union(enum) {
     key_check_canceled: usize,
     models_fetched: Fetch,
     models_unfetched: FetchFailure,
+    conversation_resent,
     attempt_failed: Attempt,
     model_substituted: Substitution,
     reply_truncated,

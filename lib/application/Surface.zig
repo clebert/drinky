@@ -92,6 +92,7 @@ pub const Statistics = struct {
             .model_served,
             .attempt_failed,
             .skill_loaded,
+            .retry_started,
             .turn_ended,
             => {},
         }
@@ -379,9 +380,6 @@ pub fn appendAuthorization(self: *Surface, authorization: *const Record.Authoriz
 }
 pub fn appendUser(self: *Surface, text: []const u8) !void {
     try self.transcript.append(&.{ .user = text }, .{});
-}
-pub fn appendRetryNote(self: *Surface) !void {
-    try self.transcript.append(&.{ .user_note = .retry }, .{});
 }
 pub fn appendSkillNote(self: *Surface, skill: *const core.Session.Event.SkillLoaded) !void {
     try self.transcript.append(&.{ .user_note = .{ .skill = skill.* } }, .{});

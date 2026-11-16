@@ -245,7 +245,8 @@ fn writeKeys(writer: *std.Io.Writer) !void {
         \\- Within {d} milliseconds after a Ctrl+D that ended a step, a page, a sign-in, a model
         \\  fetch, or a turn, Ctrl+D warns first.
         \\- Ctrl+N acts on the offer that the caption above the editor names. Under `Failed turn`,
-        \\  Ctrl+N asks the model to continue from the committed work. The draft stays. Under
+        \\  Ctrl+N sends the conversation again. When the conversation ends with model text, Ctrl+N
+        \\  also asks the model to continue from the committed work. The draft stays. Under
         \\  `Canceled turn`, Ctrl+N removes the canceled turn from the conversation and returns its
         \\  line to the editor as editable text. An applied gist returns no line. Tool changes
         \\  stay. After a turn that ran `write`, `edit`, or `bash`, Ctrl+N warns first and removes
@@ -430,11 +431,11 @@ fn writeAccess(writer: *std.Io.Writer) std.Io.Writer.Error!void {
         \\with MCP access, so the client needs one entry for all instances.
         \\
         \\A client can read the state and the prompts. It can send a message, load a skill, cancel
-        \\work, and continue a failed turn. It can also clear the conversation, fetch a model list,
-        \\and select a saved model and the effort. The terminal shows a notice when a client clears
-        \\the conversation. A client cannot rewind the conversation or remove a turn. It cannot
-        \\write, apply, or delete a gist, and it cannot sign in or out. A remote request that
-        \\changes the instance fails while the terminal shows a picker, a page, or a sign-in.
+        \\work, and try a failed turn again. It can also clear the conversation, fetch a model
+        \\list, and select a saved model and the effort. The terminal shows a notice when a client
+        \\clears the conversation. A client cannot rewind the conversation or remove a turn. It
+        \\cannot write, apply, or delete a gist, and it cannot sign in or out. A remote request
+        \\that changes the instance fails while the terminal shows a picker, a page, or a sign-in.
         \\
         \\MCP access lets another agent submit work to this agent. Drinky has no permission gate, so
         \\access is as powerful as the terminal.
