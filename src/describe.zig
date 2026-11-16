@@ -168,9 +168,9 @@ fn writeCommands(writer: *std.Io.Writer) !void {
         \\`/rewind` lists the prompts of the conversation, with the oldest prompt first. A row
         \\holds a user message, the typed line of a skill command, or an applied gist. A retry
         \\gets no row. Enter drops the chosen turn and every later turn. It returns the line of a
-        \\message or a skill command to the editor as editable text. Tool changes and the cost
-        \\stay. When a turn that the rewind drops ran `write`, `edit`, or `bash`, Enter warns
-        \\first and rewinds on the second press.
+        \\message or a skill command to the editor as editable text. It returns an applied gist
+        \\to the page of `/gist`. Tool changes and the cost stay. When a turn that the rewind
+        \\drops ran `write`, `edit`, or `bash`, Enter warns first and rewinds on the second press.
         \\
         \\`/gist` writes a gist of the current task with the current model. A gist is a
         \\compressed summary that lets a new conversation continue the work. Drinky saves no
@@ -195,9 +195,9 @@ fn writeCommands(writer: *std.Io.Writer) !void {
         \\The cost of the request joins the session cost.
         \\The first line of the gist that holds text is its title, without heading marks.
         \\Enter saves a complete gist, closes the page, and shows a notice.
-        \\A saves a complete gist and applies it at once.
+        \\A applies a complete gist at once and does not save it.
         \\Each save creates a new gist.
-        \\A failed save shows its failure on the page, and Enter or A tries again.
+        \\A failed save shows its failure on the page, and Enter tries again.
         \\Esc, Ctrl+C, and Ctrl+D cancel generation or discard the preview. Each exit closes only
         \\the page and restores the original command with its instruction to the editor.
         \\Drinky cannot save a failed or truncated gist.
@@ -220,8 +220,8 @@ fn writeCommands(writer: *std.Io.Writer) !void {
         \\the task and asks for any user decision that still blocks it.
         \\In `/rewind`, the row of an applied gist shows `Gist:` with the title.
         \\A rewind to that row and the removal of that canceled turn return no text to the
-        \\editor.
-        \\`/gists` can apply a gist again.
+        \\editor. They open the page of `/gist` with the applied gist. That page takes the same
+        \\keys, and the draft stays.
         \\Rewind cannot recover the old conversation after an apply.
         \\Backspace warns first and deletes the selected gist on the second press.
         \\Drinky keeps each gist until a deletion.
@@ -248,9 +248,9 @@ fn writeKeys(writer: *std.Io.Writer) !void {
         \\  Ctrl+N sends the conversation again. When the conversation ends with model text, Ctrl+N
         \\  also asks the model to continue from the committed work. The draft stays. Under
         \\  `Canceled turn`, Ctrl+N removes the canceled turn from the conversation and returns its
-        \\  line to the editor as editable text. An applied gist returns no line. Tool changes
-        \\  stay. After a turn that ran `write`, `edit`, or `bash`, Ctrl+N warns first and removes
-        \\  the turn on the second press.
+        \\  line to the editor as editable text. An applied gist returns to the page of `/gist`.
+        \\  Tool changes stay. After a turn that ran `write`, `edit`, or `bash`, Ctrl+N warns
+        \\  first and removes the turn on the second press.
         \\- Esc dismisses a waiting offer. A dismissed canceled turn stays in the conversation. A
         \\  new turn, `/new`, and a rewind with `/rewind` dismiss the offer too.
         \\

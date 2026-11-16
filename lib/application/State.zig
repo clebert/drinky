@@ -1,6 +1,7 @@
 const std = @import("std");
 const Choice = @import("Choice.zig");
 const Record = @import("Record.zig");
+const Turns = @import("Turns.zig");
 
 const State = @This();
 
@@ -35,7 +36,11 @@ pub const Offer = union(enum) {
     retry,
     removal: Removal,
 
-    pub const Removal = struct { turn: u64, mutated: bool, returns_line: bool };
+    pub const Removal = struct {
+        turn: u64,
+        mutated: bool,
+        prompt: std.meta.Tag(Turns.Prompt),
+    };
 };
 pub const Result = struct {
     id: u64,

@@ -37,7 +37,7 @@ const removal_caption: ui.Caption = .{
 };
 const gist_removal_caption: ui.Caption = .{
     .title = removal_caption.title,
-    .controls = "Ctrl+N: Remove · Esc: Keep turn",
+    .controls = "Ctrl+N: Remove and review · Esc: Keep turn",
     .rows_max = Screen.editor_caption_rows_max,
 };
 const intro_text = blk: {
@@ -77,6 +77,7 @@ confirmation: ?Confirmation = null,
 flow: ?Flow = null,
 key_step: ?KeyStep = null,
 preview: ?Preview = null,
+command_result: ?u64 = null,
 pending: [pending_max]Transition = undefined,
 pending_count: usize = 0,
 edits: u64 = 0,
@@ -721,10 +722,10 @@ fn caption(self: *const App) ?ui.Caption {
         .prompt => switch (self.offer) {
             .none => null,
             .retry => retry_caption,
-            .removal => |removal| if (removal.returns_line)
-                removal_caption
-            else
-                gist_removal_caption,
+            .removal => |removal| switch (removal.prompt) {
+                .line => removal_caption,
+                .gist => gist_removal_caption,
+            },
         },
         .turn, .picker, .picker_fetch, .page => null,
     };
@@ -1038,7 +1039,7 @@ fn runCommand(
         },
         .gist => {
             self.closeFlow();
-            _ = try self.send(&.{ .prepare_gist = tail });
+            self.command_result = (try self.send(&.{ .prepare_gist = tail })).operation;
             if (origin == .help) try self.screen.setDraft(reference.line(.gist));
         },
         .gists => try self.presentGists(.{ .open = origin }),
@@ -1377,13 +1378,18 @@ fn closePage(self: *App) !void {
     _ = try self.send(&.{ .discard_result = shown.id });
 }
 fn saveResult(self: *App) !void {
-    if (!try self.submitOnPage(&.{ .save_result = self.screen.result_page.?.id })) return;
-    self.clearDraft();
+    const id = self.screen.result_page.?.id;
+    if (!try self.submitOnPage(&.{ .save_result = id })) return;
+    self.clearCommandLine(id);
     try self.reportNotice(.information, "Drinky saved the gist.", .{});
 }
 fn applyResult(self: *App) !void {
-    if (!try self.submitOnPage(&.{ .apply_result = self.screen.result_page.?.id })) return;
-    self.clearDraft();
+    const id = self.screen.result_page.?.id;
+    if (!try self.submitOnPage(&.{ .apply_result = id })) return;
+    self.clearCommandLine(id);
+}
+fn clearCommandLine(self: *App, result: u64) void {
+    if (self.command_result == result) self.clearDraft();
 }
 fn submitOnPage(self: *App, value: *const application.Command) !bool {
     const response = self.controller.submit(value);
@@ -3668,7 +3674,7 @@ test "a page on the alternate screen scrolls, toggles the source, and closes on 
 }
 
 const gist_wait_caption = "Gist · Esc: Discard";
-const gist_page_caption = "Gist · Enter: Save · A: Save and apply · Esc: Discard";
+const gist_page_caption = "Gist · Enter: Save · A: Apply · Esc: Discard";
 const gist_preview_caption = "Gist · A: Apply · Esc: Back";
 const gist_picker = "Gist · ↑/↓: Move · Enter: Select · Backspace: Delete · Esc: Cancel";
 const wait_line = "Agent: work (waiting) · Time: 0s · Received: 0 B";
@@ -3831,7 +3837,7 @@ test "/gist restores its command after a discard and saves the gist with Enter" 
     try rig.waitFor(&.{ .{ .text = gist_picker }, .{ .line = " > Resume the task. (0m)" } });
 }
 
-test "/gists previews a gist, returns with Esc, and applies it with A" {
+test "/gists previews a gist, applies it with A, and a rewind returns it to the gist page" {
     var rig: Rig = undefined;
     try rig.init(&.{
         .keys = &.{.{ "openai-api-key", "sk-openai" }},
@@ -3878,6 +3884,13 @@ test "/gists previews a gist, returns with Esc, and applies it with A" {
     try rig.waitFor(&.{ .{ .text = rewind_picker }, .{ .line = " > Gist: Resume the task" } });
     try rig.keys("\r");
     try rig.waitFor(&.{
+        .{ .alternate_screen = true },
+        .{ .text = gist_page_caption },
+        .{ .text = "Keep the tests." },
+    });
+    try rig.keys("\x1b");
+    try rig.waitFor(&.{
+        .{ .alternate_screen = false },
         .{ .editor = "" },
         .{ .absent = "Gist: Resume the task" },
         .{ .absent = "Continued." },
@@ -4094,7 +4107,7 @@ test "a failed, truncated, or non-text gist cannot save, and its command survive
     try std.testing.expectEqual(@as(usize, 4), rig.transport.requests.items.len);
 }
 
-test "the removal of a canceled gist turn leaves the editor empty" {
+test "the removal of a canceled gist turn returns the gist to its page and keeps the draft" {
     var stall: providers.testing.FakeTransport.Stall = .{ .io = std.testing.io };
     var rig: Rig = undefined;
     try rig.init(&.{
@@ -4115,10 +4128,21 @@ test "the removal of a canceled gist turn leaves the editor empty" {
     try rig.keys("a");
     try stall.reached.wait(std.testing.io);
     try rig.keys("\x1b");
-    try rig.waitFor(&.{.{ .text = "Canceled turn · Ctrl+N: Remove · Esc: Keep turn" }});
-    try rig.keys("\x0e");
     try rig.waitFor(&.{
+        .{ .text = "Canceled turn · Ctrl+N: Remove and review · Esc: Keep turn" },
         .{ .editor = "" },
+    });
+    try rig.keys("Draft.\x0e");
+    try rig.waitFor(&.{
+        .{ .alternate_screen = true },
+        .{ .text = gist_page_caption },
+        .{ .text = "Resume this task." },
+    });
+    try rig.keys("\r");
+    try rig.waitFor(&.{
+        .{ .alternate_screen = false },
+        .{ .status = "Drinky saved the gist." },
+        .{ .editor = "Draft." },
         .{ .absent = "Gist: Resume this task." },
         .{ .absent = "Original task." },
         .{ .absent = "Canceled turn" },

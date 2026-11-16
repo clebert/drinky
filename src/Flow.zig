@@ -323,7 +323,7 @@ pub fn show(
             for (turns) |turn| {
                 const copy = switch (turn.prompt) {
                     .line => |line| try self.gpa.dupe(u8, line),
-                    .gist => |title| try format.gistLabel(self.gpa, title),
+                    .gist => |gist| try format.gistLabel(self.gpa, gist.title),
                 };
                 defer self.gpa.free(copy);
                 try self.addRow(

@@ -247,7 +247,7 @@ fn controls(self: *const Page) []const u8 {
             inline else => |presentation| (switch (action) {
                 .close => "Esc: Close",
                 .discard => "Esc: Discard",
-                .save => "Enter: Save · A: Save and apply · Esc: Discard",
+                .save => "Enter: Save · A: Apply · Esc: Discard",
                 .apply => "A: Apply · Esc: Back",
             }) ++ " · " ++ (switch (presentation) {
                 .markdown => "M: Source",

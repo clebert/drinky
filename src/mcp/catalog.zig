@@ -149,7 +149,7 @@ pub const definitions = [_]Definition{
     .{
         .name = "list_turns",
         .description = "List the prompts of the conversation, with the oldest prompt first. " ++
-            "Each prompt has the operation id of its turn. A turn that applied a saved gist " ++
+            "Each prompt has the operation id of its turn. A turn that applied a gist " ++
             "has the gist title as its prompt and gist set to true.",
         .hints = read_only,
     },
@@ -561,7 +561,8 @@ fn writeTurns(
     try json.beginArray();
     for (shown) |*turn| {
         const text = switch (turn.prompt) {
-            .line, .gist => |value| value,
+            .line => |line| line,
+            .gist => |gist| gist.title,
         };
         const prompt = clip(text, prompt_bytes_max);
         try json.beginObject();

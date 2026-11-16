@@ -1149,13 +1149,34 @@ fn rewindTo(self: *Controller, id: u64) !void {
 fn rewind(self: *Controller, turn: usize) !void {
     try self.session.send(&.{ .rewind = turn });
     self.surface.rewind(self.turns.all()[turn..]);
-    const line = self.turns.takeLine(turn);
-    if (self.recovered) |previous| self.gpa.free(previous);
-    self.recovered = line;
-    self.response.recovered = line;
+    const maybe_prompt = self.turns.takePrompt(turn);
     self.turns.truncate(turn);
     self.dropOffer();
     self.conversation +%= 1;
+    const prompt = maybe_prompt orelse return;
+    switch (prompt) {
+        .line => |line| {
+            if (self.recovered) |previous| self.gpa.free(previous);
+            self.recovered = line;
+            self.response.recovered = line;
+        },
+        .gist => |gist| {
+            defer prompt.deinit(self.gpa);
+            try self.restoreResult(gist.text);
+        },
+    }
+}
+
+fn restoreResult(self: *Controller, text: []const u8) !void {
+    var restored: Result = .{
+        .id = self.nextOperation(),
+        .conversation = self.conversation,
+        .phase = .complete,
+    };
+    try restored.text.appendSlice(self.gpa, text);
+    self.dropResult();
+    self.result = restored;
+    self.changed();
 }
 
 fn startUserTurn(self: *Controller, text: []const u8) !void {
@@ -1665,7 +1686,6 @@ fn applyResult(self: *Controller, id: u64) !void {
     if (self.refuseBusy()) return;
     const result_text = self.completeResult(id) orelse return self.refuse(.stale);
     if (try self.refusePrerequisite()) return;
-    self.gists.save(self.io, result_text) catch |err| return self.refuseGist(null, err);
     const text = try self.gpa.dupe(u8, result_text);
     defer self.gpa.free(text);
     try self.applyText(text, &(Gists.parse(text) orelse unreachable));
@@ -1699,7 +1719,11 @@ fn applyText(self: *Controller, text: []const u8, parsed: *const Gists.Parsed) !
     self.clearConversation();
     try self.surface.appendGistNote(parsed.title);
     if (parsed.body.len > 0) try self.surface.appendUser(parsed.body);
-    try self.runTurn(&.{ .text = message, .start = 0, .prompt = .{ .gist = parsed.title } });
+    try self.runTurn(&.{
+        .text = message,
+        .start = 0,
+        .prompt = .{ .gist = .{ .title = parsed.title, .text = text } },
+    });
 }
 
 fn deleteGist(self: *Controller, id: *const Gists.Id) !void {
@@ -1784,11 +1808,10 @@ fn currentOffer(self: *const Controller) State.Offer {
         .removal => removal: {
             const turns = self.turns.all();
             const last = turns[turns.len - 1];
-            const returns_line = if (last.prompt) |prompt| prompt == .line else false;
             break :removal .{ .removal = .{
                 .turn = last.id,
                 .mutated = last.mutated,
-                .returns_line = returns_line,
+                .prompt = std.meta.activeTag(last.prompt.?),
             } };
         },
     };
@@ -2517,6 +2540,7 @@ test "a notice dismissal keeps the removal offer, and a removal recovers the lin
     defer noticed.deinit(std.testing.allocator);
     const offer = noticed.state.offer.removal;
     try std.testing.expect(!offer.mutated);
+    try std.testing.expectEqual(.line, offer.prompt);
     try expectRefusal(
         rig.send(&.{ .dismiss_notice = noticed.state.notice_id - 1 }),
         .stale,
@@ -3541,13 +3565,16 @@ fn lessText(_: void, left: []const u8, right: []const u8) bool {
     return std.mem.lessThan(u8, left, right);
 }
 
-test "an apply of a result saves it and continues in a new conversation with the marked text" {
+test "an applied result saves no gist, and a rewind restores the result for another apply" {
     const gpa = std.testing.allocator;
+    const gist_text = "Resume the task.\nKeep the tests.";
+    const applied_request = "\"text\":\"<gist>\\nResume the task.\\nKeep the tests.\\n</gist>\"";
     var rig: testing.Rig = undefined;
     try rig.init(&.{ .replies = &.{
         .{ .body = providers.testing.reply_stream },
         .{ .body = providers.testing.replyStream("Resume the task.\\nKeep the tests.") },
         .{ .body = providers.testing.replyStream("Continued.") },
+        .{ .body = providers.testing.reply_stream },
     } });
     defer rig.deinit();
     _ = rig.send(&.{ .send_message = "Original task." });
@@ -3567,23 +3594,32 @@ test "an apply of a result saves it and continues in a new conversation with the
         continued.records[0].content.user_note,
     );
     const turn = rig.controller.listTurns()[0];
-    try std.testing.expectEqualDeep(Turns.Prompt{ .gist = "Resume the task." }, turn.prompt);
-    try expectRequest(
-        &rig,
-        2,
-        "\"text\":\"<gist>\\nResume the task.\\nKeep the tests.\\n</gist>\"",
+    try std.testing.expectEqualDeep(
+        Turns.Prompt{ .gist = .{ .title = "Resume the task.", .text = gist_text } },
+        turn.prompt,
     );
+    try expectRequest(&rig, 2, applied_request);
     try std.testing.expect(std.mem.find(
         u8,
         rig.transport.requests.items[2],
         "Original task.",
     ) == null);
-    const entries = rig.controller.listGists().listing.listed.entries;
-    try std.testing.expectEqual(@as(usize, 1), entries.len);
-    try std.testing.expectEqualStrings("Resume the task.", entries[0].title);
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        rig.controller.listGists().listing.listed.entries.len,
+    );
     const rewound = rig.send(&.{ .rewind = turn.id });
     try std.testing.expect(rewound.accepted());
     try std.testing.expect(rewound.recovered == null);
+    try std.testing.expectEqual(@as(usize, 0), rig.controller.listTurns().len);
+    const restored = rig.controller.state().result.?;
+    try std.testing.expect(restored.phase == .complete);
+    try std.testing.expectEqualStrings(gist_text, restored.text);
+
+    try std.testing.expect(rig.send(&.{ .apply_result = restored.id }).accepted());
+    try rig.expectTurn(.stopped);
+    try expectRequest(&rig, 3, applied_request);
+    try std.testing.expect(rig.controller.state().result == null);
 }
 
 test "an applied gist file reads its text, and a title alone shows only the note" {
@@ -3725,14 +3761,11 @@ test "a failed save keeps the result and the conversation for another attempt" {
     const id = rig.send(&.{ .prepare_gist = "" }).operation.?;
     const ready = try rig.result();
     ready.deinit(gpa);
-    const directory = try rig.tree.path(".drinky/gists");
-    for ([_]Command{ .{ .save_result = id }, .{ .apply_result = id } }) |value| {
-        const refused = rig.send(&value);
-        try std.testing.expectEqualDeep(Refusal{ .gist_failed = .{
-            .path = directory,
-            .cause = error.NotDir,
-        } }, refused.refusal.?);
-    }
+    const refused = rig.send(&.{ .save_result = id });
+    try std.testing.expectEqualDeep(Refusal{ .gist_failed = .{
+        .path = try rig.tree.path(".drinky/gists"),
+        .cause = error.NotDir,
+    } }, refused.refusal.?);
     const kept = try rig.snapshot();
     defer kept.deinit(gpa);
     try std.testing.expect(kept.state.result.?.phase == .complete);

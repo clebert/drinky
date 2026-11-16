@@ -19,12 +19,29 @@ pub const Turn = struct {
 
 pub const Prompt = union(enum) {
     line: []const u8,
-    gist: []const u8,
+    gist: Gist,
 
-    fn text(self: *const Prompt) []const u8 {
+    pub const Gist = struct { title: []const u8, text: []const u8 };
+
+    fn dupe(self: *const Prompt, gpa: std.mem.Allocator) error{OutOfMemory}!Prompt {
         return switch (self.*) {
-            inline else => |value| value,
+            .line => |line| .{ .line = try gpa.dupe(u8, line) },
+            .gist => |gist| {
+                const title = try gpa.dupe(u8, gist.title);
+                errdefer gpa.free(title);
+                return .{ .gist = .{ .title = title, .text = try gpa.dupe(u8, gist.text) } };
+            },
         };
+    }
+
+    pub fn deinit(self: *const Prompt, gpa: std.mem.Allocator) void {
+        switch (self.*) {
+            .line => |line| gpa.free(line),
+            .gist => |gist| {
+                gpa.free(gist.title);
+                gpa.free(gist.text);
+            },
+        }
     }
 };
 
@@ -58,9 +75,7 @@ pub fn begin(
     options: *const struct { id: u64, start: usize, prompt: ?Prompt },
 ) error{OutOfMemory}!void {
     try self.list.ensureUnusedCapacity(self.gpa, 1);
-    const prompt: ?Prompt = if (options.prompt) |value| switch (value) {
-        inline else => |text, tag| @unionInit(Prompt, @tagName(tag), try self.gpa.dupe(u8, text)),
-    } else null;
+    const prompt: ?Prompt = if (options.prompt) |*value| try value.dupe(self.gpa) else null;
     self.list.appendAssumeCapacity(.{
         .id = options.id,
         .range = .{ .start = options.start, .end = options.start },
@@ -83,20 +98,16 @@ pub fn end(self: *Turns, block_count: usize, ended: *const End) error{OutOfMemor
     turn.range.end = block_count;
 }
 
-pub fn takeLine(self: *Turns, index: usize) ?[]const u8 {
+pub fn takePrompt(self: *Turns, index: usize) ?Prompt {
     const turn = &self.list.items[index];
-    const line = switch (turn.prompt orelse return null) {
-        .line => |line| line,
-        .gist => return null,
-    };
-    turn.prompt = null;
-    return line;
+    defer turn.prompt = null;
+    return turn.prompt;
 }
 
 pub fn truncate(self: *Turns, count: usize) void {
     std.debug.assert(count <= self.list.items.len);
     for (self.list.items[count..]) |turn| {
-        if (turn.prompt) |prompt| self.gpa.free(prompt.text());
+        if (turn.prompt) |*prompt| prompt.deinit(self.gpa);
         const ended = turn.end orelse continue;
         ended.outcome.deinit(self.gpa);
         self.gpa.free(ended.answer);

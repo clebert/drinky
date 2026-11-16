@@ -124,7 +124,7 @@ fn gistFailure(
     const facts = .{ failure.path, failure.cause };
     const because = " because of error {t}.";
     return switch (command.*) {
-        .save_result, .apply_result => ui.Message.print(
+        .save_result => ui.Message.print(
             gpa,
             .failure,
             "Drinky could not save the gist in {s}" ++ because,
@@ -151,6 +151,7 @@ fn gistFailure(
         .remove_canceled_turn,
         .rewind,
         .prepare_gist,
+        .apply_result,
         .discard_result,
         .cancel,
         .dismiss_offer,
@@ -1272,11 +1273,6 @@ test "a refusal names the action of its command, and a silent refusal holds no t
             .command = .{ .save_result = 1 },
             .refusal = .{ .gist_failed = .{ .path = "/g", .cause = error.AccessDenied } },
             .text = "Drinky could not save the gist in /g because of error AccessDenied.",
-        },
-        .{
-            .command = .{ .apply_result = 1 },
-            .refusal = .{ .gist_failed = .{ .path = "/g", .cause = error.NotDir } },
-            .text = "Drinky could not save the gist in /g because of error NotDir.",
         },
         .{
             .command = .{ .apply_result = 1 },
