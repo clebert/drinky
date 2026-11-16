@@ -95,20 +95,20 @@ const Lap = struct {
                 .hit, .dead => true,
                 .wait, .rise, .alert, .run, .stop => false,
             },
-            .hunt, .love, .nap, .hole, .music => false,
+            .hunt, .love, .nap, .hole, .music, .slot, .mirror => false,
         };
     }
 };
 
 const Cells = std.StaticBitSet(columns_max);
 
-const Kind = enum { hunt, chase, love, nap, hole, music };
+const Kind = enum { hunt, chase, love, nap, hole, music, slot, mirror };
 
-const kinds = [_]Kind{ .hunt, .chase, .love, .nap, .hole, .music };
+const kinds = [_]Kind{ .hunt, .chase, .love, .nap, .hole, .music, .slot, .mirror };
 
-const ItemKind = enum { pellet, heart, hole, note, moon };
+const ItemKind = enum { pellet, heart, hole, note, moon, coin, mirror };
 
-const item_kinds = [_]ItemKind{ .pellet, .heart, .note, .hole, .moon };
+const box_kinds = [_]ItemKind{ .pellet, .heart, .note, .hole, .moon, .coin };
 
 const Item = struct { column: isize, kind: ItemKind, box: bool };
 
@@ -149,6 +149,8 @@ const Event = union(Kind) {
     nap: Nap,
     hole: Hole,
     music: Music,
+    slot: Slot,
+    mirror: Mirror,
 };
 
 const Hunt = union(enum) {
@@ -229,7 +231,49 @@ const Music = union(enum) {
     };
 };
 
-const game_ms_median = 5 * std.time.ms_per_min;
+const Slot = union(enum) {
+    wait,
+    spin: Spin,
+    win: Reels,
+    lose: Reels,
+
+    const Outcome = enum { win, near, miss };
+
+    const Spin = struct {
+        reels: Reels,
+        symbols: [reel_count]usize,
+        waits: [reel_count]u32 = @splat(0),
+
+        fn suspense(self: *const Spin) bool {
+            return self.symbols[0] == self.symbols[1];
+        }
+
+        fn stop(self: *const Spin, reel: usize) u32 {
+            if (reel == reel_count - 1 and self.suspense()) return reel_suspense_stop_frames;
+            return reel_stop_frames[reel];
+        }
+
+        fn period(self: *const Spin, reel: usize) u32 {
+            const slowing = reel == reel_count - 1 and self.suspense();
+            if (!slowing) return reel_period_frames;
+            const late = self.reels.frames -| reel_stop_frames[reel_count - 2];
+            return reel_period_frames + @divFloor(late, reel_slowing_frames);
+        }
+    };
+
+    const Reels = struct { start: ?isize, shown: [reel_count]usize, frames: u32 = 0 };
+};
+
+const Mirror = union(enum) {
+    wait,
+    face: Glass,
+    look: Glass,
+    crack: Glass,
+
+    const Glass = struct { column: isize, frames: u32 = 0 };
+};
+
+const catch_ms_median = @divExact(9 * std.time.ms_per_min, 2);
 const danger_exponent = 2;
 
 const credit_per_frame = 2;
@@ -275,6 +319,22 @@ const crumble_cells_per_frame = 2;
 const crumble_dot_frames = 8;
 const power_flash_frames = 4;
 const trail_slots = 12;
+const reel_count = 3;
+const reel_stop_frames = [reel_count]u32{ 24, 44, 64 };
+const reel_suspense_stop_frames = 108;
+const reel_period_frames = 2;
+const reel_slowing_frames = 10;
+const reel_settle_frames = 12;
+const win_dance_frames = 48;
+const win_blink_frames = 6;
+const win_symbol_frames = 36;
+const win_frames = 84;
+const reels_fade_frames = 40;
+const lose_frames = 30;
+const mirror_reach = 12;
+const face_frames = 36;
+const look_frames = 40;
+const crack_frames = 16;
 const trail_spacing = 2;
 const note_bright_frames = 18;
 const note_fade_frames = 30;
@@ -283,6 +343,7 @@ const score_fade_frames = 60;
 
 const anchor_top = [_]isize{0};
 const nap_top = [_]isize{ 0, 2, 3 };
+const mirror_top = [_]isize{ -1, 1 };
 const word_top = offsets: {
     var offsets: [word_columns]isize = undefined;
     for (&offsets, 0..) |*offset, index| offset.* = index;
@@ -292,6 +353,7 @@ const word_top = offsets: {
 const word_columns = 3;
 const score_text: *const [word_columns]u8 = "200";
 const rip_text: *const [word_columns]u8 = "RIP";
+const jackpot_text: *const [word_columns]u8 = "1UP";
 const curse_texts = [_]*const [word_columns]u8{ "#@!", "@#$" };
 
 const level_prefix = " Level ";
@@ -313,6 +375,10 @@ const glyph_ghost = "ᗣ";
 const glyph_sleep = "ᶻ";
 const glyph_moon = "☾";
 const glyph_grave = "✝";
+const glyph_coin = "$";
+const glyph_mirror = "│";
+
+const reel_glyphs = [_][]const u8{ glyph_shut, glyph_heart, glyph_note, glyph_moon, glyph_coin };
 
 const frame_cell: Cell = .{ .glyph = "─", .role = .input_frame };
 const blank_cell: Cell = .{ .glyph = " ", .role = .text };
@@ -322,6 +388,7 @@ const pellet_cell: Cell = .{ .glyph = glyph_shut, .role = .text };
 const pellet_small_cell: Cell = .{ .glyph = glyph_small, .role = .text };
 const moon_cell: Cell = .{ .glyph = glyph_moon, .role = .text };
 const grave_cell: Cell = .{ .glyph = glyph_grave, .role = .text };
+const mirror_cell: Cell = .{ .glyph = glyph_mirror, .role = .text };
 
 pub fn init(seed: u64) Chomp {
     return .{ .prng = .init(seed) };
@@ -391,7 +458,7 @@ pub fn cell(self: *const Chomp, edge: Edge, column: usize) Cell {
 }
 
 fn catchChance(frames: *const struct { previous: u64, now: u64 }) f64 {
-    const median: f64 = @divExact(game_ms_median, paint.frame_ms);
+    const median: f64 = @divExact(catch_ms_median, paint.frame_ms);
     const previous = @as(f64, @floatFromInt(frames.previous)) / median;
     const now = @as(f64, @floatFromInt(frames.now)) / median;
     const exponent = std.math.pow(f64, now, danger_exponent) -
@@ -445,8 +512,8 @@ fn resetGame(self: *Chomp) void {
 fn chooseEvent(self: *Chomp, layout: *const Layout, lap: *Lap) ?Event {
     const kind = self.nextKind();
     const boxable = switch (kind) {
-        .hunt, .love, .nap, .hole, .music => true,
-        .chase => false,
+        .hunt, .love, .nap, .hole, .music, .slot => true,
+        .chase, .mirror => false,
     };
     const box = boxable and !self.box_last and self.random().uintLessThan(u8, box_odds) == 0;
     self.box_last = box;
@@ -460,6 +527,11 @@ fn chooseEvent(self: *Chomp, layout: *const Layout, lap: *Lap) ?Event {
         .nap => if (self.placeItem(layout, lap, .moon, box)) |_| .{ .nap = .wait } else null,
         .hole => if (self.placeItem(layout, lap, .hole, box)) |_| .{ .hole = .wait } else null,
         .music => if (self.placeItem(layout, lap, .note, box)) |_| .{ .music = .wait } else null,
+        .slot => if (self.placeItem(layout, lap, .coin, box)) |_| .{ .slot = .wait } else null,
+        .mirror => if (self.placeItem(layout, lap, .mirror, false)) |_|
+            .{ .mirror = .wait }
+        else
+            null,
     };
 }
 
@@ -492,13 +564,15 @@ fn placeItem(self: *Chomp, layout: *const Layout, lap: *Lap, kind: ItemKind, box
     const low = layout.laneStartSigned() + item_offset_min;
     const offsets: []const isize = switch (kind) {
         .moon => &nap_top,
-        .pellet, .heart, .hole, .note => &anchor_top,
+        .mirror => &mirror_top,
+        .pellet, .heart, .hole, .note, .coin => &anchor_top,
     };
     const fraction: f64 = switch (kind) {
         .pellet => 0.3,
         .heart => 0.35,
         .moon => 0.6,
-        .hole, .note => 0.4,
+        .hole, .note, .coin => 0.4,
+        .mirror => 0.45,
     };
     const column = self.pickClear(layout, .{
         .low = low,
@@ -576,8 +650,9 @@ fn enter(self: *Chomp, layout: *const Layout, lap: *Lap) void {
         if (item.column == position) {
             lap.item = null;
             const collected = switch (item.kind) {
-                .pellet, .heart, .note, .moon => true,
+                .pellet, .heart, .note, .moon, .coin => true,
                 .hole => item.box,
+                .mirror => false,
             };
             if (collected) {
                 lap.pickup = .{ .kind = item.kind, .frames = if (item.box) 0 else spin_frames };
@@ -586,10 +661,11 @@ fn enter(self: *Chomp, layout: *const Layout, lap: *Lap) void {
     }
     const event = if (lap.event) |*event| event else return;
     const step: LapStep = switch (event.*) {
-        .hunt, .love, .hole => .walks,
+        .hunt, .love, .hole, .slot => .walks,
         .chase => |*chase| enterChase(layout, lap, chase),
         .nap => |*nap| enterNap(nap),
         .music => |*music| self.enterMusic(music, position),
+        .mirror => |*mirror| enterMirror(lap, mirror),
     };
     settleLap(lap, step);
 }
@@ -621,7 +697,8 @@ fn trigger(self: *Chomp, layout: *const Layout, lap: *Lap) LapStep {
         },
         .music => |*music| music.* = .{ .trail = .{ .column = lap.chomper.position } },
         .nap => |*nap| nap.* = .{ .yawn = 0 },
-        .chase => {},
+        .slot => |*slot| slot.* = .{ .spin = self.planSlot(layout, lap) },
+        .chase, .mirror => {},
     }
     return .walks;
 }
@@ -662,6 +739,8 @@ fn tickEvent(self: *Chomp, board: *Board, lap: *Lap) bool {
         .nap => |*nap| self.tickNap(nap),
         .hole => |*hole| self.tickHole(layout, lap, hole),
         .music => .walks,
+        .slot => |*slot| tickSlot(slot),
+        .mirror => |*mirror| tickMirror(mirror),
     };
     return self.settle(board, lap, step);
 }
@@ -682,7 +761,7 @@ fn stepCost(lap: *const Lap) u32 {
             .hurry => cost_fast,
             .yawn, .sleep, .wake => cost_walk,
         },
-        .love, .hole, .music => cost_walk,
+        .love, .hole, .music, .slot, .mirror => cost_walk,
     };
 }
 
@@ -698,7 +777,108 @@ fn eventBusy(lap: *const Lap) bool {
     return switch (event.*) {
         .hunt => |*hunt| hunt.* == .burst,
         .chase => |*chase| chase.* == .stop,
-        .love, .nap, .hole, .music => false,
+        .slot => |*slot| switch (slot.*) {
+            .win, .lose => true,
+            .wait, .spin => false,
+        },
+        .love, .nap, .hole, .music, .mirror => false,
+    };
+}
+
+fn planSlot(self: *Chomp, layout: *const Layout, lap: *const Lap) Slot.Spin {
+    const outcome = self.random().enumValue(Slot.Outcome);
+    const first = self.random().uintLessThan(usize, reel_glyphs.len);
+    const other = (first + 1 + self.random().uintLessThan(usize, reel_glyphs.len - 1)) %
+        reel_glyphs.len;
+    const symbols: [reel_count]usize = switch (outcome) {
+        .win => .{ first, first, first },
+        .near => .{ first, first, other },
+        .miss => .{ first, other, self.random().uintLessThan(usize, reel_glyphs.len) },
+    };
+    return .{
+        .reels = .{
+            .start = self.nearestClear(layout, lap.chomper.position - 1, &word_top),
+            .shown = .{ 0, 2, 4 },
+        },
+        .symbols = symbols,
+    };
+}
+
+fn tickSlot(slot: *Slot) Step {
+    switch (slot.*) {
+        .wait => return .walks,
+        .spin => |*spin| {
+            spin.reels.frames += 1;
+            for (0..reel_count) |reel| {
+                if (spin.reels.frames >= spin.stop(reel)) {
+                    spin.reels.shown[reel] = spin.symbols[reel];
+                } else if (spin.waits[reel] > 0) {
+                    spin.waits[reel] -= 1;
+                } else {
+                    spin.reels.shown[reel] = (spin.reels.shown[reel] + 1) % reel_glyphs.len;
+                    spin.waits[reel] = spin.period(reel);
+                }
+            }
+            if (spin.reels.frames < spin.stop(reel_count - 1) + reel_settle_frames) return .waits;
+            const reels: Slot.Reels = .{ .start = spin.reels.start, .shown = spin.symbols };
+            const won = spin.symbols[0] == spin.symbols[1] and spin.symbols[1] == spin.symbols[2];
+            slot.* = if (won) .{ .win = reels } else .{ .lose = reels };
+            return .waits;
+        },
+        .win => |*reels| {
+            reels.frames += 1;
+            if (reels.frames >= win_frames + reels_fade_frames) return .ends;
+            return if (reels.frames < win_dance_frames) .waits else .walks;
+        },
+        .lose => |*reels| {
+            reels.frames += 1;
+            return if (reels.frames >= lose_frames) .ends else .walks;
+        },
+    }
+}
+
+fn enterMirror(lap: *Lap, mirror: *Mirror) LapStep {
+    switch (mirror.*) {
+        .wait => {
+            const item = lap.item orelse return .walks;
+            if (item.column != lap.chomper.position + 1) return .walks;
+            lap.item = null;
+            mirror.* = .{ .face = .{ .column = item.column } };
+        },
+        .face, .look, .crack => {},
+    }
+    return .walks;
+}
+
+fn tickMirror(mirror: *Mirror) Step {
+    switch (mirror.*) {
+        .wait => return .walks,
+        .face => |*glass| {
+            glass.frames += 1;
+            if (glass.frames >= face_frames) mirror.* = .{ .look = .{ .column = glass.column } };
+            return .waits;
+        },
+        .look => |*glass| {
+            glass.frames += 1;
+            if (glass.frames >= look_frames) mirror.* = .{ .crack = .{ .column = glass.column } };
+            return .waits;
+        },
+        .crack => |*glass| {
+            glass.frames += 1;
+            return if (glass.frames >= crack_frames) .ends else .walks;
+        },
+    }
+}
+
+fn reflectionColumn(lap: *const Lap, mirror: *const Mirror) ?isize {
+    return switch (mirror.*) {
+        .wait => {
+            const item = lap.item orelse return null;
+            const distance = item.column - lap.chomper.position;
+            if (distance < 1 or distance > mirror_reach) return null;
+            return item.column + distance;
+        },
+        .face, .look, .crack => |*glass| glass.column + 1,
     };
 }
 
@@ -1018,7 +1198,80 @@ fn chomperLook(self: *const Chomp, lap: *const Lap) Look {
             .crumble, .pop => .{ .cell = hole_cell },
         },
         .music => .default,
+        .slot => |*slot| switch (slot.*) {
+            .spin => lookOf(glyph_right),
+            .win => |*reels| if (reels.frames < win_dance_frames) lookOf(alternate(&.{
+                .frames = reels.frames,
+                .period = 6,
+                .odd = glyph_left,
+                .even = glyph_right,
+            })) else .default,
+            .wait, .lose => .default,
+        },
+        .mirror => |*mirror| switch (mirror.*) {
+            .face => lookOf(glyph_right),
+            .look => |*glass| lookOf(lookGlyph(glass.frames, &.{
+                .odd = glyph_left,
+                .even = glyph_right,
+            })),
+            .wait, .crack => .default,
+        },
     };
+}
+
+fn lookGlyph(frames: u32, faces: *const struct { odd: []const u8, even: []const u8 }) []const u8 {
+    return alternate(&.{ .frames = frames, .period = 8, .odd = faces.odd, .even = faces.even });
+}
+
+fn paleCell(glyph: []const u8) Cell {
+    return .{ .glyph = glyph, .role = .muted };
+}
+
+fn mirrorBottom(self: *const Chomp, lap: *const Lap, mirror: *const Mirror, column: isize) ?Cell {
+    switch (mirror.*) {
+        .face, .look => |*glass| if (column == glass.column) return mirror_cell,
+        .crack => |*glass| if (column == glass.column) return paleCell(glyph_spark),
+        .wait => {},
+    }
+    if (reflectionColumn(lap, mirror) != column) return null;
+    return switch (mirror.*) {
+        .wait => {
+            const item = lap.item orelse return null;
+            const distance = item.column - lap.chomper.position;
+            if (distance > mirror_reach - 2) return paleCell(glyph_spark);
+            if (distance > mirror_reach - 4) return paleCell(glyph_dot);
+            return paleCell(if (self.mouthOpen()) glyph_left else glyph_shut);
+        },
+        .face => paleCell(glyph_left),
+        .look => |*glass| paleCell(lookGlyph(glass.frames, &.{
+            .odd = glyph_right,
+            .even = glyph_left,
+        })),
+        .crack => |*glass| paleCell(if (glass.frames < 8) glyph_dot else glyph_spark),
+    };
+}
+
+fn winCell(reels: *const Slot.Reels, column: isize) ?Cell {
+    const frames = reels.frames;
+    if (frames < win_symbol_frames) {
+        const blink: role.Name = if (@divFloor(frames, win_blink_frames) % 2 == 0)
+            .score
+        else
+            .text;
+        return reelCell(reels, column, blink);
+    }
+    return wordCell(&.{
+        .text = jackpot_text,
+        .start = reels.start,
+        .role = if (frames < win_frames) .score else .score_fading,
+    }, column);
+}
+
+fn reelCell(reels: *const Slot.Reels, column: isize, reel_role: role.Name) ?Cell {
+    const start = reels.start orelse return null;
+    if (column < start or column >= start + reel_count) return null;
+    const index: usize = @intCast(column - start);
+    return .{ .glyph = reel_glyphs[reels.shown[index]], .role = reel_role };
 }
 
 fn chaseChomper(chase: *const Chase) Look {
@@ -1110,6 +1363,8 @@ fn eventBottom(self: *const Chomp, lap: *const Lap, column: isize) ?Cell {
             .trail => |*trail| return self.trailCell(trail, column),
             .wait => {},
         },
+        .mirror => |*mirror| return self.mirrorBottom(lap, mirror, column),
+        .slot => {},
     }
     return null;
 }
@@ -1202,6 +1457,19 @@ fn eventTop(lap: *const Lap, column: isize) ?Cell {
             .roam, .power, .recover => {},
         },
         .love, .hole, .music => {},
+        .slot => |*slot| switch (slot.*) {
+            .wait => {},
+            .spin => |*spin| return reelCell(&spin.reels, column, .text),
+            .win => |*reels| return winCell(reels, column),
+            .lose => |*reels| return reelCell(reels, column, .muted),
+        },
+        .mirror => |*mirror| switch (mirror.*) {
+            .face => |*glass| if (glass.frames < 28) {
+                if (column == glass.column - 1) return .{ .glyph = "!", .role = .chomper };
+                if (column == glass.column + 1) return paleCell("!");
+            },
+            .wait, .look, .crack => {},
+        },
     }
     return null;
 }
@@ -1242,6 +1510,8 @@ fn itemGlyph(kind: ItemKind) []const u8 {
         .hole => glyph_hole,
         .note => glyph_note,
         .moon => glyph_moon,
+        .coin => glyph_coin,
+        .mirror => glyph_mirror,
     };
 }
 
@@ -1249,7 +1519,10 @@ fn itemCell(self: *const Chomp, item: Item) Cell {
     if (item.box) return .{ .glyph = "?", .role = .text };
     return switch (item.kind) {
         .pellet => self.pelletCell(),
-        .heart, .hole, .note, .moon => .{ .glyph = itemGlyph(item.kind), .role = .text },
+        .heart, .hole, .note, .moon, .coin, .mirror => .{
+            .glyph = itemGlyph(item.kind),
+            .role = .text,
+        },
     };
 }
 
@@ -1330,7 +1603,7 @@ fn topProjection(lap: *const Lap, position: isize) ?Cell {
     if (lap.pickup) |pickup| {
         if (position == lap.chomper.position) {
             if (pickup.frames < spin_frames) return .{
-                .glyph = itemGlyph(item_kinds[@divFloor(pickup.frames, 4) % item_kinds.len]),
+                .glyph = itemGlyph(box_kinds[@divFloor(pickup.frames, 4) % box_kinds.len]),
                 .role = .text,
             };
             if (@divFloor(pickup.frames - spin_frames, 6) % 2 == 1) return null;
@@ -1417,6 +1690,8 @@ const item_glyphs = [_]struct { kind: ItemKind, glyph: []const u8 }{
     .{ .kind = .moon, .glyph = glyph_moon },
     .{ .kind = .hole, .glyph = glyph_hole },
     .{ .kind = .note, .glyph = glyph_note },
+    .{ .kind = .coin, .glyph = glyph_coin },
+    .{ .kind = .mirror, .glyph = glyph_mirror },
 };
 
 fn shownKind(glyph: []const u8) ?ItemKind {
@@ -1465,7 +1740,10 @@ test "a hidden label keeps the line cell behind it, and the chomper starts after
 test "a new hidden label keeps the eaten cells and the place of the chomper" {
     var chomp: Chomp = .init(1);
     chomp.fit(&.{ .columns = 80 });
-    for (0..20) |_| chomp.advance();
+    for (0..4000) |_| {
+        chomp.advance();
+        if (chomperColumn(&chomp, 80) == 12) break;
+    } else return error.TestExpectedChomper;
     var lane: [30]Cell = undefined;
     for (&lane, 0..) |*slot, column| slot.* = chomp.cell(.bottom, column);
     try std.testing.expectEqualStrings(" ", lane[8].glyph);
@@ -1477,9 +1755,9 @@ test "a new hidden label keeps the eaten cells and the place of the chomper" {
     }
 }
 
-test "every lap starts an event, no event repeats directly, and a box never follows a box" {
+test "every lap starts an event unlike the last, and a box never follows a box or hides a mirror" {
     var chomp: Chomp = .init(7);
-    var items: [2100]?LapItem = undefined;
+    var items: [2400]?LapItem = undefined;
     for (&items, 0..) |*slot, lap| {
         const columns = 80 + lap % 2;
         chomp.fit(&.{ .columns = columns });
@@ -1498,10 +1776,11 @@ test "every lap starts an event, no event repeats directly, and a box never foll
         };
         counts.getPtr(item.kind).* += 1;
         boxes += @intFromBool(item.box);
+        if (item.box) try std.testing.expect(item.kind != .mirror);
     }
-    try std.testing.expectEqual(@as(usize, 350), chases);
+    try std.testing.expectEqual(@as(usize, 300), chases);
     for (std.enums.values(ItemKind)) |kind| {
-        try std.testing.expectEqual(@as(usize, 350), counts.get(kind));
+        try std.testing.expectEqual(@as(usize, 300), counts.get(kind));
     }
     try std.testing.expect(boxes > 150 and boxes < 350);
 }
@@ -1644,7 +1923,7 @@ test "a note trail reaches the right end of the bottom edge" {
 }
 
 test "an eaten item blinks above the waiting chomper, but a hole without a box shows nothing" {
-    for ([_][]const u8{ glyph_shut, glyph_heart, glyph_note, glyph_moon }) |glyph| {
+    for ([_][]const u8{ glyph_shut, glyph_heart, glyph_note, glyph_moon, glyph_coin }) |glyph| {
         var lap = try lapWith(glyph);
         const chomp = &lap.chomp;
         for (0..4000) |_| {
@@ -1675,6 +1954,97 @@ test "an eaten item blinks above the waiting chomper, but a hole without a box s
         try std.testing.expectEqualStrings(frame_cell.glyph, shown);
         chomp.advance();
     }
+}
+
+test "the chomper waits on the coin while the reels spin, and only three equal reels show 1UP" {
+    var chomp: Chomp = .init(11);
+    var wins: usize = 0;
+    var losses: usize = 0;
+    for (0..2000) |lap| {
+        if (wins > 0 and losses > 0) break;
+        const columns = 80 + lap % 2;
+        chomp.fit(&.{ .columns = columns });
+        const coin = glyphColumn(&chomp, &.{
+            .edge = .bottom,
+            .columns = columns,
+            .glyph = glyph_coin,
+        }) orelse continue;
+        const reels = for (0..1000) |_| {
+            chomp.advance();
+            const slot = slotEvent(&chomp) orelse return error.TestExpectedSlot;
+            switch (slot.*) {
+                .wait => {},
+                .spin => {
+                    const column = chomperColumn(&chomp, columns);
+                    try std.testing.expectEqual(@as(?usize, coin), column);
+                },
+                .win, .lose => |*reels| break reels,
+            }
+        } else return error.TestExpectedReels;
+        const start: usize = @intCast(reels.start orelse return error.TestExpectedReels);
+        const shown = [_][]const u8{
+            chomp.cell(.top, start).glyph,
+            chomp.cell(.top, start + 1).glyph,
+            chomp.cell(.top, start + 2).glyph,
+        };
+        const equal = std.mem.eql(u8, shown[0], shown[1]) and std.mem.eql(u8, shown[1], shown[2]);
+        var jackpot = false;
+        for (0..win_frames) |_| {
+            chomp.advance();
+            if (edgeShows(&chomp, &.{ .edge = .top, .columns = columns, .text = jackpot_text }))
+                jackpot = true;
+        }
+        try std.testing.expectEqual(equal, jackpot);
+        wins += @intFromBool(equal);
+        losses += @intFromBool(!equal);
+    }
+    try std.testing.expect(wins > 0 and losses > 0);
+}
+
+fn slotEvent(chomp: *const Chomp) ?*const Slot {
+    const event = lapEvent(chomp) orelse return null;
+    return switch (event.*) {
+        .slot => |*slot| slot,
+        .hunt, .chase, .love, .nap, .hole, .music, .mirror => null,
+    };
+}
+
+fn lapEvent(chomp: *const Chomp) ?*const Event {
+    const board = if (chomp.maybe_board) |*board| board else return null;
+    const lap = switch (board.phase) {
+        .lap => |*lap| lap,
+        .flash, .game_over => return null,
+    };
+    return if (lap.event) |*event| event else null;
+}
+
+test "a pale reflection meets the chomper at the mirror, and the chomper then breaks the mirror" {
+    var lap = try lapWith(glyph_mirror);
+    const chomp = &lap.chomp;
+    const mirror = lap.column;
+    for (0..4000) |_| {
+        chomp.advance();
+        if (chomperColumn(chomp, 80) == mirror - 4) break;
+    } else return error.TestExpectedChomper;
+    const reflection = chomp.cell(.bottom, mirror + 4);
+    try std.testing.expectEqual(role.Name.muted, reflection.role);
+    try std.testing.expect(std.mem.eql(u8, reflection.glyph, glyph_left) or
+        std.mem.eql(u8, reflection.glyph, glyph_shut));
+    for (0..4000) |_| {
+        chomp.advance();
+        if (std.mem.eql(u8, chomp.cell(.top, mirror - 1).glyph, "!")) break;
+    } else return error.TestExpectedAlert;
+    try std.testing.expectEqual(@as(?usize, mirror - 1), chomperColumn(chomp, 80));
+    try std.testing.expectEqualStrings(glyph_mirror, chomp.cell(.bottom, mirror).glyph);
+    try std.testing.expectEqualStrings(glyph_left, chomp.cell(.bottom, mirror + 1).glyph);
+    try std.testing.expectEqual(role.Name.muted, chomp.cell(.bottom, mirror + 1).role);
+    try std.testing.expectEqualStrings("!", chomp.cell(.top, mirror + 1).glyph);
+    for (0..4000) |_| {
+        chomp.advance();
+        if (chomperColumn(chomp, 80) == mirror + 10) break;
+    } else return error.TestExpectedChomper;
+    for (mirror..mirror + 10) |column|
+        try std.testing.expectEqualStrings(" ", chomp.cell(.bottom, column).glyph);
 }
 
 test "an eaten ghost shows the score on the top edge" {
@@ -1760,15 +2130,16 @@ fn lapWith(glyph: []const u8) !struct { chomp: Chomp, column: usize } {
     return error.TestExpectedItem;
 }
 
-test "the catch chance follows a survival curve whose median is five minutes" {
-    const median: u64 = @divExact(game_ms_median, paint.frame_ms);
+test "the catch chance follows a survival curve whose median is four and a half minutes" {
+    const median: u64 = @divExact(catch_ms_median, paint.frame_ms);
     try std.testing.expectApproxEqAbs(
         @as(f64, 0.5),
         catchChance(&.{ .previous = 0, .now = median }),
         1e-9,
     );
-    const first = catchChance(&.{ .previous = 0, .now = @divExact(median, 2) });
-    const second = catchChance(&.{ .previous = @divExact(median, 2), .now = median });
+    const half = @divFloor(median, 2);
+    const first = catchChance(&.{ .previous = 0, .now = half });
+    const second = catchChance(&.{ .previous = half, .now = median });
     try std.testing.expect(first < second);
     try std.testing.expectApproxEqAbs(@as(f64, 0.5), (1 - first) * (1 - second), 1e-9);
     try std.testing.expectEqual(@as(f64, 1), catchChance(&.{ .previous = 0, .now = median * 100 }));
@@ -1850,15 +2221,10 @@ test "a change of the width after a catch starts the next game at level 1" {
 }
 
 fn chaseStage(chomp: *const Chomp) ?std.meta.Tag(Chase) {
-    const board = if (chomp.maybe_board) |*board| board else return null;
-    const lap = switch (board.phase) {
-        .lap => |*lap| lap,
-        .flash, .game_over => return null,
-    };
-    const event = if (lap.event) |*event| event else return null;
+    const event = lapEvent(chomp) orelse return null;
     return switch (event.*) {
         .chase => |*chase| std.meta.activeTag(chase.*),
-        .hunt, .love, .nap, .hole, .music => null,
+        .hunt, .love, .nap, .hole, .music, .slot, .mirror => null,
     };
 }
 

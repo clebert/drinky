@@ -334,33 +334,12 @@ fn writePreferences(writer: *std.Io.Writer) std.Io.Writer.Error!void {
             "The context gauge and quota windows use those thresholds.\n\n" ++
             "The frame of the editor or a picker animates while Drinky works. " ++
             "The config key `" ++ config_keys.animation ++ "` selects the animation. " ++
-            "The default animation `chomp` is a small game on the frame. " ++
-            "A chomper eats the bottom edge from left to right. " ++
-            "It starts at once, and new data does not stop it. " ++
-            "At the right end, the chomper goes through a tunnel, and the next level starts. " ++
-            "The top edge shows the level. " ++
-            "Each lap along the bottom edge has at most one event. " ++
-            "A power pellet makes a ghost flee. " ++
-            "An eaten ghost shows the score 200 on the top edge. " ++
-            "In another event, a ghost chases the chomper. " ++
-            "A heart calls a partner. " ++
-            "A moon makes the chomper sleep on the cell of the moon. " ++
-            "A hole moves the chomper ahead. " ++
-            "A note makes the chomper leave a trail of notes to the right end. " ++
-            "A bottom edge with fewer than 40 free columns has no events. " ++
-            "An eaten power pellet, heart, note, or moon blinks on the top edge " ++
-            "before its event starts. " ++
-            "A box can hide the item of an event. " ++
-            "An eaten box also shows its item on the top edge. " ++
-            "A chased chomper escapes, or the ghost catches it. " ++
-            "After an escape, the ghost curses on the top edge. " ++
-            "A catch leaves a grave on the bottom edge and RIP on the top edge. " ++
-            "A catch ends the game, and the next game starts at level 1. " ++
-            "A change of the terminal width starts a new lap at the same level. " ++
-            "A change of the width after a catch starts the next game at once. " ++
-            "The chance of a catch rises with the time of the game. " ++
+            "The default animation `chomp` is a small arcade game on the frame. " ++
+            "A chomper eats the bottom edge, and each lap can hold a random event. " ++
+            "A ghost chase can end the game. " ++
             "At the median, a game lasts about five minutes of animation. " ++
-            "The game continues from one turn to the next until Drinky stops. " ++
+            "The game continues across turns until Drinky stops. " ++
+            "Unlike the other animations, it does not show stalled turns. " ++
             "The animations `orbit` and `sweep` move a heavy segment. " ++
             "An orbit segment circles the frame. " ++
             "A sweep segment crosses the top edge, then the bottom edge. " ++
