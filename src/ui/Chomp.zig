@@ -76,7 +76,7 @@ const Lap = struct {
     hold: u32 = 0,
     eaten: Cells = .empty,
     item: ?Item = null,
-    roll: ?Roll = null,
+    pickup: ?Pickup = null,
     event: ?Event = null,
 
     fn inTunnel(self: *const Lap, layout: *const Layout) bool {
@@ -112,7 +112,7 @@ const item_kinds = [_]ItemKind{ .pellet, .heart, .note, .hole, .moon };
 
 const Item = struct { column: isize, kind: ItemKind, box: bool };
 
-const Roll = struct { kind: ItemKind, frames: u32 = 0 };
+const Pickup = struct { kind: ItemKind, frames: u32 };
 
 const Mover = struct {
     position: isize,
@@ -189,7 +189,6 @@ const Chase = union(enum) {
 
 const Love = union(enum) {
     wait,
-    struck: u32,
     partner: Mover,
     meet: Meet,
 
@@ -225,7 +224,7 @@ const Music = union(enum) {
 
     const Trail = struct {
         column: isize,
-        born: [trail_notes]u64 = undefined,
+        born: [trail_slots]u64 = undefined,
         count: usize = 0,
     };
 };
@@ -253,8 +252,8 @@ const mouth_frames = 4;
 const flash_frames = 56;
 const flash_blink_start = 24;
 const game_over_frames = 150;
-const roll_frames = 48;
-const roll_reveal_frames = 14;
+const spin_frames = 34;
+const pickup_frames = 30;
 const catch_hold_frames = 28;
 const fade_frames = 40;
 const fade_blink_frames = 6;
@@ -266,18 +265,16 @@ const curse_swap_frames = 10;
 const dead_frames = 130;
 const grave_frames = 48;
 const rip_frames = 60;
-const struck_frames = 30;
 const meet_frames = 120;
 const yawn_frames = 40;
 const wake_frames = 44;
 const sleep_cycle_frames = 96;
-const moon_rise_frames = 20;
 const drowsy_cells = 4;
 const sink_frames = 14;
 const crumble_cells_per_frame = 2;
 const crumble_dot_frames = 8;
 const power_flash_frames = 4;
-const trail_notes = 12;
+const trail_slots = 12;
 const trail_spacing = 2;
 const note_bright_frames = 18;
 const note_fade_frames = 30;
@@ -404,10 +401,10 @@ fn catchChance(frames: *const struct { previous: u64, now: u64 }) f64 {
 
 fn advanceLap(self: *Chomp, board: *Board, lap: *Lap) void {
     const layout = &board.layout;
-    if (lap.roll) |*roll| {
-        roll.frames += 1;
-        if (roll.frames >= roll_frames) {
-            lap.roll = null;
+    if (lap.pickup) |*pickup| {
+        pickup.frames += 1;
+        if (pickup.frames >= spin_frames + pickup_frames) {
+            lap.pickup = null;
             settleLap(lap, self.trigger(layout, lap));
         }
         return;
@@ -578,8 +575,12 @@ fn enter(self: *Chomp, layout: *const Layout, lap: *Lap) void {
     if (lap.item) |item| {
         if (item.column == position) {
             lap.item = null;
-            if (item.box) {
-                lap.roll = .{ .kind = item.kind };
+            const collected = switch (item.kind) {
+                .pellet, .heart, .note, .moon => true,
+                .hole => item.box,
+            };
+            if (collected) {
+                lap.pickup = .{ .kind = item.kind, .frames = if (item.box) 0 else spin_frames };
             } else settleLap(lap, self.trigger(layout, lap));
         }
     }
@@ -607,7 +608,7 @@ fn trigger(self: *Chomp, layout: *const Layout, lap: *Lap) LapStep {
             const frames = self.random().intRangeAtMost(u32, 210, 330);
             hunt.* = .{ .power = .{ .ghost = ghost, .frames = frames } };
         },
-        .love => |*love| love.* = .{ .struck = 0 },
+        .love => |*love| love.* = .{ .partner = .{ .position = layout.columnsSigned() } },
         .hole => |*hole| {
             const entry = lap.chomper.position;
             const distance = self.pick(.{
@@ -836,12 +837,6 @@ fn tickChase(self: *Chomp, layout: *const Layout, lap: *const Lap, chase: *Chase
 fn tickLove(layout: *const Layout, lap: *Lap, love: *Love) Step {
     switch (love.*) {
         .wait => return .walks,
-        .struck => |*frames| {
-            frames.* += 1;
-            if (frames.* >= struck_frames)
-                love.* = .{ .partner = .{ .position = layout.columnsSigned() } };
-            return .waits;
-        },
         .partner => |*partner| {
             if (partner.moves(cost_walk)) {
                 partner.position -= 1;
@@ -937,8 +932,8 @@ fn enterMusic(self: *const Chomp, music: *Music, position: isize) LapStep {
         .wait => {},
         .trail => |*trail| {
             const next: isize = @intCast(trail.count * trail_spacing);
-            if (trail.count < trail_notes and position - 1 >= trail.column + next) {
-                trail.born[trail.count] = self.frame;
+            if (position - 1 >= trail.column + next) {
+                trail.born[trail.count % trail_slots] = self.frame;
                 trail.count += 1;
             }
         },
@@ -976,7 +971,15 @@ fn fading(fade: Fade) bool {
 }
 
 fn chomperLook(self: *const Chomp, lap: *const Lap) Look {
-    if (lap.roll != null) return lookOf(glyph_right);
+    if (lap.pickup) |pickup| {
+        if (pickup.frames < spin_frames) return lookOf(glyph_right);
+        return lookOf(alternate(&.{
+            .frames = pickup.frames - spin_frames,
+            .period = 5,
+            .odd = glyph_shut,
+            .even = glyph_right,
+        }));
+    }
     const event = if (lap.event) |*event| event else return .default;
     return switch (event.*) {
         .hunt => |*hunt| switch (hunt.*) {
@@ -989,10 +992,6 @@ fn chomperLook(self: *const Chomp, lap: *const Lap) Look {
         },
         .chase => |*chase| chaseChomper(chase),
         .love => |*love| switch (love.*) {
-            .struck => |frames| .{ .cell = .{
-                .glyph = if (@divFloor(frames, 5) % 2 == 1) glyph_shut else glyph_right,
-                .role = .partner,
-            } },
             .meet => |*meet| if (meetCell(meet, lap.chomper.position)) |found|
                 .{ .cell = found }
             else
@@ -1083,10 +1082,10 @@ fn eventBottom(self: *const Chomp, lap: *const Lap, column: isize) ?Cell {
         .love => |*love| switch (love.*) {
             .partner => |*partner| if (partner.position == column) return .{
                 .glyph = if (self.mouthOpen()) glyph_left else glyph_shut,
-                .role = .partner,
+                .role = .text,
             },
             .meet => |*meet| return meetCell(meet, column),
-            .wait, .struck => {},
+            .wait => {},
         },
         .nap => |*nap| switch (nap.*) {
             .sleep => |*sleep| if (column == lap.chomper.position + 1 and
@@ -1129,8 +1128,8 @@ fn trailCell(self: *const Chomp, trail: *const Music.Trail, column: isize) ?Cell
     const offset = column - trail.column;
     if (offset < 0 or @mod(offset, trail_spacing) != 0) return null;
     const index: usize = @intCast(@divExact(offset, trail_spacing));
-    if (index >= trail.count) return null;
-    const age = self.frame -% trail.born[index];
+    if (index >= trail.count or trail.count - index > trail_slots) return null;
+    const age = self.frame -% trail.born[index % trail_slots];
     if (age >= note_fade_frames) return null;
     return .{
         .glyph = if (index % 2 == 1) glyph_notes else glyph_note,
@@ -1180,14 +1179,8 @@ fn eventTop(lap: *const Lap, column: isize) ?Cell {
             }, column),
             .wait, .rise, .run, .hit => {},
         },
-        .love => |*love| switch (love.*) {
-            .struck => |frames| if (column == chomper_position and @divFloor(frames, 6) % 2 == 0)
-                return .{ .glyph = glyph_heart, .role = .partner },
-            .wait, .partner, .meet => {},
-        },
         .nap => |*nap| switch (nap.*) {
-            .yawn => |frames| if (column == chomper_position and frames >= moon_rise_frames)
-                return moon_cell,
+            .yawn => if (column == chomper_position) return moon_cell,
             .sleep => |*sleep| {
                 if (column == chomper_position) return moon_cell;
                 const phase = sleep.frames % sleep_cycle_frames;
@@ -1208,7 +1201,7 @@ fn eventTop(lap: *const Lap, column: isize) ?Cell {
             }, column),
             .roam, .power, .recover => {},
         },
-        .hole, .music => {},
+        .love, .hole, .music => {},
     }
     return null;
 }
@@ -1224,22 +1217,22 @@ fn meetCell(meet: *const Love.Meet, column: isize) ?Cell {
     const frames = meet.frames;
     if (frames < 18) {
         if (column == meet.position) return .{ .glyph = glyph_shut, .role = .chomper };
-        if (column == meet.other) return .{ .glyph = glyph_shut, .role = .partner };
+        if (column == meet.other) return .{ .glyph = glyph_shut, .role = .text };
         return null;
     }
     if (frames < 95) {
         if (column == meet.position) return .{
             .glyph = glyph_heart,
-            .role = if (@divFloor(frames, 12) % 2 == 1) .love else .partner,
+            .role = if (@divFloor(frames, 12) % 2 == 1) .love else .text,
         };
         if (column + 2 == meet.position or column == meet.position + 2) return .{
             .glyph = if (@divFloor(frames, 8) % 2 == 1) glyph_spark else glyph_dot,
-            .role = .partner,
+            .role = .text,
         };
         return null;
     }
     if (column != meet.position) return null;
-    return .{ .glyph = if (frames < 108) glyph_heart_hollow else glyph_dot, .role = .partner };
+    return .{ .glyph = if (frames < 108) glyph_heart_hollow else glyph_dot, .role = .text };
 }
 
 fn itemGlyph(kind: ItemKind) []const u8 {
@@ -1253,13 +1246,10 @@ fn itemGlyph(kind: ItemKind) []const u8 {
 }
 
 fn itemCell(self: *const Chomp, item: Item) Cell {
-    if (item.box) return .{ .glyph = "?", .role = .chomper };
+    if (item.box) return .{ .glyph = "?", .role = .text };
     return switch (item.kind) {
         .pellet => self.pelletCell(),
-        .heart => .{ .glyph = glyph_heart, .role = .partner },
-        .hole => hole_cell,
-        .note => .{ .glyph = glyph_note, .role = .text },
-        .moon => moon_cell,
+        .heart, .hole, .note, .moon => .{ .glyph = itemGlyph(item.kind), .role = .text },
     };
 }
 
@@ -1337,13 +1327,14 @@ fn topCell(self: *const Chomp, board: *const Board, column: usize) Cell {
 }
 
 fn topProjection(lap: *const Lap, position: isize) ?Cell {
-    if (lap.roll) |roll| {
+    if (lap.pickup) |pickup| {
         if (position == lap.chomper.position) {
-            if (roll.frames < roll_frames - roll_reveal_frames) return .{
-                .glyph = itemGlyph(item_kinds[@divFloor(roll.frames, 4) % item_kinds.len]),
+            if (pickup.frames < spin_frames) return .{
+                .glyph = itemGlyph(item_kinds[@divFloor(pickup.frames, 4) % item_kinds.len]),
                 .role = .text,
             };
-            return .{ .glyph = itemGlyph(roll.kind), .role = .chomper };
+            if (@divFloor(pickup.frames - spin_frames, 6) % 2 == 1) return null;
+            return .{ .glyph = itemGlyph(pickup.kind), .role = .text };
         }
     }
     return eventTop(lap, position);
@@ -1448,9 +1439,9 @@ fn lapItem(chomp: *Chomp, columns: usize) !?LapItem {
 fn boxKind(chomp: *Chomp, column: usize) !ItemKind {
     for (0..1000) |_| {
         chomp.advance();
-        const shown = chomp.cell(.top, column);
-        if (shown.role != .chomper) continue;
-        return shownKind(shown.glyph) orelse continue;
+        if (std.mem.eql(u8, chomp.cell(.top, column).glyph, frame_cell.glyph)) continue;
+        for (0..spin_frames) |_| chomp.advance();
+        return shownKind(chomp.cell(.top, column).glyph) orelse error.TestExpectedRevealedItem;
     }
     return error.TestExpectedRevealedItem;
 }
@@ -1632,6 +1623,58 @@ test "a note leaves a fading note in every second cell behind the chomper" {
     for (0..note_fade_frames) |_| chomp.advance();
     for (lap.column..lap.column + notes.len) |column|
         try std.testing.expectEqualStrings(" ", chomp.cell(.bottom, column).glyph);
+}
+
+test "a note trail reaches the right end of the bottom edge" {
+    var lap = try lapWith(glyph_note);
+    const chomp = &lap.chomp;
+    for (0..4000) |_| {
+        chomp.advance();
+        if (chomperColumn(chomp, 80) == 79) break;
+    } else return error.TestExpectedChomper;
+    const last_notes = [_][]const u8{
+        chomp.cell(.bottom, 77).glyph,
+        chomp.cell(.bottom, 78).glyph,
+    };
+    const found = for (last_notes) |glyph| {
+        if (std.mem.eql(u8, glyph, glyph_note) or std.mem.eql(u8, glyph, glyph_notes))
+            break true;
+    } else false;
+    try std.testing.expect(found);
+}
+
+test "an eaten item blinks above the waiting chomper, but a hole without a box shows nothing" {
+    for ([_][]const u8{ glyph_shut, glyph_heart, glyph_note, glyph_moon }) |glyph| {
+        var lap = try lapWith(glyph);
+        const chomp = &lap.chomp;
+        for (0..4000) |_| {
+            chomp.advance();
+            if (!std.mem.eql(u8, chomp.cell(.top, lap.column).glyph, frame_cell.glyph)) break;
+        } else return error.TestExpectedPickup;
+        var blinks = false;
+        for (0..pickup_frames - 1) |_| {
+            const shown = chomp.cell(.top, lap.column).glyph;
+            if (std.mem.eql(u8, shown, frame_cell.glyph))
+                blinks = true
+            else
+                try std.testing.expectEqualStrings(glyph, shown);
+            const ahead = chomp.cell(.bottom, lap.column + 1).glyph;
+            try std.testing.expectEqualStrings(frame_cell.glyph, ahead);
+            chomp.advance();
+        }
+        try std.testing.expect(blinks);
+    }
+    var lap = try lapWith(glyph_hole);
+    const chomp = &lap.chomp;
+    for (0..4000) |_| {
+        chomp.advance();
+        if (chomperColumn(chomp, 80) == lap.column) break;
+    } else return error.TestExpectedChomper;
+    for (0..pickup_frames) |_| {
+        const shown = chomp.cell(.top, lap.column).glyph;
+        try std.testing.expectEqualStrings(frame_cell.glyph, shown);
+        chomp.advance();
+    }
 }
 
 test "an eaten ghost shows the score on the top edge" {

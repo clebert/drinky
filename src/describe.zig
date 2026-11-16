@@ -346,9 +346,12 @@ fn writePreferences(writer: *std.Io.Writer) std.Io.Writer.Error!void {
             "A heart calls a partner. " ++
             "A moon makes the chomper sleep on the cell of the moon. " ++
             "A hole moves the chomper ahead. " ++
-            "A note makes the chomper leave a trail of notes. " ++
+            "A note makes the chomper leave a trail of notes to the right end. " ++
             "A bottom edge with fewer than 40 free columns has no events. " ++
+            "An eaten power pellet, heart, note, or moon blinks on the top edge " ++
+            "before its event starts. " ++
             "A box can hide the item of an event. " ++
+            "An eaten box also shows its item on the top edge. " ++
             "A chased chomper escapes, or the ghost catches it. " ++
             "After an escape, the ghost curses on the top edge. " ++
             "A catch leaves a grave on the bottom edge and RIP on the top edge. " ++
