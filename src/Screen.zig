@@ -103,7 +103,7 @@ pub const Turn = struct {
     calls: std.ArrayList(application.Live.Call),
     thinking: bool,
     work_line: std.ArrayList(u8),
-    work_ends: [ui.Block.Work.Summary.segment_count]usize,
+    work_layout: ui.Block.Work.Layout,
     work_hash: ?u64,
     work_track: layout.Track,
 
@@ -113,7 +113,7 @@ pub const Turn = struct {
         .calls = .empty,
         .thinking = false,
         .work_line = .empty,
-        .work_ends = undefined,
+        .work_layout = .{},
         .work_hash = null,
         .work_track = .{},
     };
@@ -178,9 +178,9 @@ pub const Turn = struct {
         summary.write(&out.writer, &.{
             .activity = activity_text.items,
             .command = self.runningCommand(&command_buffer),
-            .ends = &self.work_ends,
+            .layout = &self.work_layout,
         }) catch return error.OutOfMemory;
-        return ui.Block.Work.box(out.written(), &self.work_ends, null);
+        return ui.Block.Work.box(out.written(), &self.work_layout, null);
     }
 
     fn runningCommand(self: *const Turn, buffer: []u8) ?[]const u8 {
@@ -393,7 +393,10 @@ fn skillBlock(self: *Screen, skill: *const application.SkillLoaded) !ui.Block {
     defer self.gpa.free(text);
     return .init(self.gpa, &.{ .user_note = .{
         .text = text,
-        .segment_ends = &.{ "Skill: ".len + shown_name.len, text.len },
+        .metadata = .{
+            .identity = .{ .end = "Skill: ".len + shown_name.len },
+            .fields = &.{.{ .end = text.len }},
+        },
     } });
 }
 
@@ -416,9 +419,7 @@ fn toolBlock(self: *Screen, result: *const application.Record.Result) !ui.Block 
     defer line.deinit(self.gpa);
     return .init(self.gpa, &.{ .tool_result = .{
         .text = line.text,
-        .segment_ends = line.segment_ends,
-        .status = line.status,
-        .qualifiers = line.qualifiers,
+        .metadata = line.metadata,
         .command = line.command,
         .started_ms = result.started_ms,
         .received_bytes = result.received_bytes,
@@ -1872,7 +1873,7 @@ test "a work row folds thinking and finished calls across steps until agent text
     defer gpa.free(running);
     try expectSummary(
         running,
-        "Agent: work (bash) · Time: 4s · Tools: 2 · $ zig build · Received: 20 B",
+        "Agent: work (bash) · Time: 4s · Tools: 2 · Received: 20 B · $ zig build",
     );
     try std.testing.expect(std.mem.find(u8, running, "Tool:") == null);
 
@@ -2100,7 +2101,7 @@ test "work activities keep the closing parenthesis for a single overwide graphem
         const painted = try rig.paintPlain(15);
         defer gpa.free(painted);
         try expectSummary(painted, "Agent: work (…)");
-        try testing.expectContains(rig.out.written(), "\x1b[36m\x1b[2m…)");
+        try testing.expectContains(rig.out.written(), "\x1b[36m\x1b[2mAgent: work (…)");
     }
 }
 
@@ -2290,7 +2291,7 @@ test "a verbose tool call streams and runs in the work row and ends as a block" 
     defer gpa.free(running);
     try expectSummary(
         running,
-        "Agent: work (bash) · Time: 13s · Tools: 1 · $ zig build · Received: 27 B",
+        "Agent: work (bash) · Time: 13s · Tools: 1 · Received: 27 B · $ zig build",
     );
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, running, "$ zig build"));
 
@@ -2308,7 +2309,7 @@ test "a verbose tool call streams and runs in the work row and ends as a block" 
         "Tool: bash (complete) · Time: 1.5s · Exit code: 0 · Lines: 1\nzig build",
         block.text.items,
     );
-    try std.testing.expect(block.status.role == .success);
+    try std.testing.expectEqual(.success, block.metadata.identity.role);
     const done = try rig.paintPlain(80);
     defer gpa.free(done);
     try std.testing.expect(std.mem.find(u8, done, "Agent: work") == null);
@@ -2339,7 +2340,7 @@ test "a failed tool result keeps its sentence below the call row" {
         "Tool: read (failed) · File: a.txt\nError: " ++ sentence,
         block.text.items,
     );
-    try std.testing.expect(block.status.role == .@"error");
+    try std.testing.expectEqual(.@"error", block.metadata.identity.role);
 
     try rig.apply(&.{ .tool_call_started = "describe_drinky" });
     const describe: core.Tool.Call = .{ .id = "c2", .name = "describe_drinky", .arguments = "{}" };
@@ -2417,7 +2418,7 @@ test "verbose off shows the main command in the work row, and verbose on shows t
         defer gpa.free(running);
         try expectSummary(
             running,
-            "Agent: work (bash) · Time: 0s · Tools: 1 · $ echo · Received: 0 B",
+            "Agent: work (bash) · Time: 0s · Tools: 1 · Received: 0 B · $ echo",
         );
         try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, running, "$ echo"));
         try std.testing.expect(std.mem.find(u8, running, case.hidden) == null);
@@ -2791,7 +2792,7 @@ test "a served model records one warning per turn, and a skill a note" {
     try std.testing.expectEqual(.warning, rig.blocks()[1].content.event.severity);
     try std.testing.expectEqualStrings(
         "Skill: zig-style · File: skills/SKILL.md",
-        rig.blocks()[2].content.user_note.items,
+        rig.blocks()[2].content.user_note.text.items,
     );
     try rig.end(&.{ .stopped = .complete });
 }
@@ -3066,7 +3067,7 @@ test "the work row names the main command of the running bash call alone" {
     try rig.apply(&.{ .tool_call_arguments = call.arguments });
     try expectWorkCommand(&rig, null);
     try rig.apply(&.{ .tool_started = call });
-    try expectWorkCommand(&rig, "· $ git push · Received: 44 B");
+    try expectWorkCommand(&rig, "· Received: 44 B · $ git push");
     try rig.apply(&.{ .tool_result = .{ .call = call, .output = .{ .content = "ok" } } });
     const read: core.Tool.Call = .{
         .id = "c2",
@@ -3076,6 +3077,35 @@ test "the work row names the main command of the running bash call alone" {
     try rig.apply(&.{ .tool_call_started = read.name });
     try rig.apply(&.{ .tool_started = read });
     try expectWorkCommand(&rig, null);
+}
+
+test "the work row shows the command last but drops the received bytes before it" {
+    const gpa = std.testing.allocator;
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    try rig.start("prompt");
+    const call: core.Tool.Call = .{
+        .id = "c1",
+        .name = "bash",
+        .arguments = "{\"command\":\"zig build test\"}",
+    };
+    try rig.apply(&.{ .tool_call_started = call.name });
+    try rig.apply(&.{ .tool_call_arguments = call.arguments });
+    try rig.apply(&.{ .tool_started = call });
+    const head = "Agent: work (bash) · Time: 0s · Tools: 1";
+    const cases = [_]struct { columns: usize, expected: []const u8 }{
+        .{ .columns = 76, .expected = head ++ " · Received: 28 B · $ zig build test" },
+        .{ .columns = 75, .expected = head ++ " · $ zig build test" },
+        .{ .columns = 59, .expected = head ++ " · $ zig build test" },
+        .{ .columns = 58, .expected = head },
+        .{ .columns = 39, .expected = "Agent: work (bash) · Time: 0s" },
+    };
+    for (cases) |case| {
+        const painted = try rig.paintPlain(case.columns);
+        defer gpa.free(painted);
+        try expectSummary(painted, case.expected);
+    }
 }
 
 fn expectWorkCommand(rig: *Rig, maybe_segment: ?[]const u8) !void {

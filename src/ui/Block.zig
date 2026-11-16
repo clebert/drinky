@@ -18,7 +18,6 @@ record_id: ?u64 = null,
 cache: Cache = .{},
 verbose: bool = true,
 work: ?Work = null,
-segment_ends: std.ArrayList(usize) = .empty,
 
 pub const Work = struct {
     started_ms: i64,
@@ -39,35 +38,37 @@ pub const Work = struct {
         received_bytes: usize,
         status: ?application.Record.Work.Status,
 
-        pub const segment_count = 5;
-
         pub fn write(
             self: *const Summary,
             writer: *std.Io.Writer,
             options: *const struct {
                 activity: []const u8,
                 command: ?[]const u8,
-                ends: *[segment_count]usize,
+                layout: *Layout,
             },
         ) std.Io.Writer.Error!void {
+            const layout = options.layout;
             const value = if (self.status) |status|
                 @tagName(status)
             else if (options.activity.len > 0) options.activity else "waiting";
             try writer.print("{s}{s})", .{ identity_prefix, value });
-            options.ends[0] = writer.buffered().len;
+            layout.* = .{ .identity_end = writer.buffered().len };
             var time_buffer: [24]u8 = undefined;
             const time = format.durationSeconds(&time_buffer, self.elapsed_ms);
             try writer.print("{s}Time: {s}", .{ paint.separator, time });
-            options.ends[1] = writer.buffered().len;
-            if (self.tools) |tools| try writer.print("{s}Tools: {d}", .{ paint.separator, tools });
-            options.ends[2] = writer.buffered().len;
-            if (options.command) |command|
-                try writer.print("{s}{s}{s}", .{ paint.separator, paint.command_marker, command });
-            options.ends[3] = writer.buffered().len;
+            layout.add(.{ .end = writer.buffered().len });
+            if (self.tools) |tools| {
+                try writer.print("{s}Tools: {d}", .{ paint.separator, tools });
+                layout.add(.{ .end = writer.buffered().len });
+            }
             var bytes_buffer: [16]u8 = undefined;
             const bytes = format.bytes(&bytes_buffer, self.received_bytes);
             try writer.print("{s}Received: {s}", .{ paint.separator, bytes });
-            options.ends[4] = writer.buffered().len;
+            layout.add(.{ .end = writer.buffered().len, .priority = .low });
+            if (options.command) |command| {
+                try writer.print("{s}{s}{s}", .{ paint.separator, paint.command_marker, command });
+                layout.add(.{ .end = writer.buffered().len });
+            }
         }
 
         pub fn row(self: *const Summary, options: *const struct { thinking: bool }) Row {
@@ -76,17 +77,30 @@ pub const Work = struct {
             self.write(&writer, &.{
                 .activity = if (options.thinking) "thinking" else "",
                 .command = null,
-                .ends = &result.ends,
+                .layout = &result.layout,
             }) catch unreachable;
             result.length = writer.buffered().len;
             return result;
         }
     };
 
+    pub const Layout = struct {
+        identity_end: usize = 0,
+        fields: [field_capacity]paint.Metadata.Field = undefined,
+        field_count: usize = 0,
+
+        const field_capacity = 4;
+
+        fn add(self: *Layout, field: paint.Metadata.Field) void {
+            self.fields[self.field_count] = field;
+            self.field_count += 1;
+        }
+    };
+
     pub const Row = struct {
         buffer: [128]u8 = undefined,
         length: usize = 0,
-        ends: [Summary.segment_count]usize = @splat(0),
+        layout: Layout = .{},
         status: ?application.Record.Work.Status = null,
 
         fn text(self: *const Row) []const u8 {
@@ -94,28 +108,28 @@ pub const Work = struct {
         }
 
         pub fn box(self: *const Row) paint.Box {
-            return Work.box(self.text(), &self.ends, self.status);
+            return Work.box(self.text(), &self.layout, self.status);
         }
     };
 
     pub fn box(
         text: []const u8,
-        ends: []const usize,
+        layout: *const Layout,
         maybe_status: ?application.Record.Work.Status,
     ) paint.Box {
         return .{
             .text = text,
-            .segment_ends = ends,
-            .identity_value = .{ .start = identity_prefix.len, .end = ends[0] - 1 },
-            .status = .{
-                .start = 0,
-                .end = ends[0],
-                .dim = true,
-                .role = if (maybe_status) |status| switch (status) {
-                    .complete => .success,
-                    .canceled, .truncated => .warning,
-                    .failed => .@"error",
-                } else .activity,
+            .metadata = .{
+                .identity = .{
+                    .end = layout.identity_end,
+                    .value = .{ .start = identity_prefix.len, .end = layout.identity_end - 1 },
+                    .role = if (maybe_status) |status| switch (status) {
+                        .complete => .success,
+                        .canceled, .truncated => .warning,
+                        .failed => .@"error",
+                    } else .activity,
+                },
+                .fields = layout.fields[0..layout.field_count],
             },
         };
     }
@@ -124,7 +138,7 @@ pub const Work = struct {
 const Content = union(enum) {
     intro: std.ArrayList(u8),
     user: std.ArrayList(u8),
-    user_note: std.ArrayList(u8),
+    user_note: UserNote,
     thinking: std.ArrayList(u8),
     model: std.ArrayList(u8),
     tool_result: ToolResult,
@@ -145,21 +159,23 @@ pub const Source = union(Kind) {
 
 pub const Note = struct {
     text: []const u8,
-    segment_ends: []const usize = &.{},
+    metadata: ?paint.Metadata = null,
+};
+
+const UserNote = struct {
+    text: std.ArrayList(u8),
+    metadata: ?paint.Metadata,
 };
 
 const ToolResult = struct {
     text: std.ArrayList(u8),
-    status: paint.Mark,
-    qualifiers: std.ArrayList(paint.Mark),
+    metadata: paint.Metadata,
     command: ?paint.Box.Range,
     received_bytes: usize,
 
     const Payload = struct {
         text: []const u8,
-        segment_ends: []const usize = &.{},
-        status: paint.Mark = .{ .start = 0, .end = 0, .role = .text },
-        qualifiers: []const paint.Mark = &.{},
+        metadata: paint.Metadata,
         command: ?paint.Box.Range = null,
         started_ms: i64 = 0,
         received_bytes: usize = 0,
@@ -224,34 +240,34 @@ const Cache = struct {
 };
 
 pub fn init(gpa: std.mem.Allocator, source: *const Source) !Block {
-    var ends: std.ArrayList(usize) = .empty;
-    errdefer ends.deinit(gpa);
-    var qualifiers: std.ArrayList(paint.Mark) = .empty;
-    errdefer qualifiers.deinit(gpa);
-    switch (source.*) {
-        .tool_result => |*result| {
-            try ends.appendSlice(gpa, result.segment_ends);
-            try qualifiers.appendSlice(gpa, result.qualifiers);
-        },
-        .user_note => |*note| try ends.appendSlice(gpa, note.segment_ends),
-        .intro, .user, .thinking, .model, .event => {},
-    }
     return .{
         .work = switch (source.*) {
             .thinking => .{ .started_ms = 0 },
             .tool_result => |*result| .{ .started_ms = result.started_ms },
             .intro, .user, .user_note, .model, .event => null,
         },
-        .segment_ends = ends,
         .content = switch (source.*) {
-            .tool_result => |*result| .{ .tool_result = .{
-                .text = try copy(gpa, result.text),
-                .status = result.status,
-                .qualifiers = qualifiers,
-                .command = result.command,
-                .received_bytes = result.received_bytes,
-            } },
-            .user_note => |*note| .{ .user_note = try copy(gpa, note.text) },
+            .tool_result => |*result| tool_result: {
+                const metadata = try copyMetadata(gpa, &result.metadata);
+                errdefer gpa.free(metadata.fields);
+                break :tool_result .{ .tool_result = .{
+                    .text = try copy(gpa, result.text),
+                    .metadata = metadata,
+                    .command = result.command,
+                    .received_bytes = result.received_bytes,
+                } };
+            },
+            .user_note => |*note| user_note: {
+                const maybe_metadata = if (note.metadata) |*metadata|
+                    try copyMetadata(gpa, metadata)
+                else
+                    null;
+                errdefer if (maybe_metadata) |metadata| gpa.free(metadata.fields);
+                break :user_note .{ .user_note = .{
+                    .text = try copy(gpa, note.text),
+                    .metadata = maybe_metadata,
+                } };
+            },
             .event => |*event| .{ .event = try Event.init(gpa, event) },
             inline else => |text, tag| @unionInit(Content, @tagName(tag), try copy(gpa, text)),
         },
@@ -264,17 +280,27 @@ fn copy(gpa: std.mem.Allocator, text: []const u8) !std.ArrayList(u8) {
     return list;
 }
 
+fn copyMetadata(gpa: std.mem.Allocator, metadata: *const paint.Metadata) !paint.Metadata {
+    return .{
+        .identity = metadata.identity,
+        .fields = try gpa.dupe(paint.Metadata.Field, metadata.fields),
+    };
+}
+
 pub fn deinit(self: *Block, gpa: std.mem.Allocator) void {
     switch (self.content) {
-        .intro, .user, .user_note, .thinking, .model => |*text| text.deinit(gpa),
+        .intro, .user, .thinking, .model => |*text| text.deinit(gpa),
+        .user_note => |*note| {
+            note.text.deinit(gpa);
+            if (note.metadata) |metadata| gpa.free(metadata.fields);
+        },
         .tool_result => |*result| {
             result.text.deinit(gpa);
-            result.qualifiers.deinit(gpa);
+            gpa.free(result.metadata.fields);
         },
         .event => |*event| event.text.deinit(gpa),
     }
     self.cache.deinit(gpa);
-    self.segment_ends.deinit(gpa);
 }
 
 pub fn appendText(self: *Block, gpa: std.mem.Allocator, delta: []const u8) !void {
@@ -292,6 +318,11 @@ pub fn sameContent(self: *const Block, other: *const Block) bool {
             u8,
             result.text.items,
             other.content.tool_result.text.items,
+        ),
+        .user_note => |*note| std.mem.eql(
+            u8,
+            note.text.items,
+            other.content.user_note.text.items,
         ),
         .event => |*event| event.severity == other.content.event.severity and
             std.mem.eql(u8, event.text.items, other.content.event.text.items),
@@ -360,14 +391,13 @@ fn look(self: *const Block) Look {
             .role = .user,
             .body = .{ .text = list.items, .padded = true },
         } },
-        .user_note => |list| .{ .notice = .{
+        .user_note => |*note| .{ .notice = .{
             .style = .{
                 .role = paint.NoticeStyle.note.role,
                 .prefix = paint.NoticeStyle.note.prefix,
-                .fit = .head,
-                .segment_ends = self.segment_ends.items,
+                .fit = .{ .head = note.metadata },
             },
-            .text = list.items,
+            .text = note.text.items,
         } },
         .thinking => |list| .{ .markdown = .{ .role = .muted, .text = trimBlank(list.items) } },
         .model => |list| .{ .markdown = .{ .role = null, .text = trimBlank(list.items) } },
@@ -375,9 +405,7 @@ fn look(self: *const Block) Look {
             .role = .text,
             .body = .{
                 .text = result.text.items,
-                .segment_ends = self.segment_ends.items,
-                .status = result.status,
-                .qualifiers = result.qualifiers.items,
+                .metadata = result.metadata,
                 .command = result.command,
             },
         } },
@@ -470,17 +498,23 @@ test "each block variant renders exactly the rows it counts" {
         .{ .thinking = markdown_reply },
         .{ .tool_result = .{
             .text = "Tool: read (failed)\nError: Drinky could not read foo.zig.",
+            .metadata = .{ .identity = .{ .end = "Tool: read (failed)".len, .role = .@"error" } },
         } },
         .{ .tool_result = .{
             .text = bash_head ++ "\n" ++ bash_command,
-            .segment_ends = &.{ bash_identity.len, bash_head.len },
-            .status = .{ .start = 0, .end = bash_identity.len, .role = .success, .dim = true },
+            .metadata = .{
+                .identity = .{ .end = bash_identity.len, .role = .success },
+                .fields = &.{.{ .end = bash_head.len }},
+            },
             .command = .{
                 .start = bash_head.len + 1,
                 .end = bash_head.len + 1 + bash_command.len,
             },
         } },
-        .{ .tool_result = .{ .text = "Tool: describe_drinky" } },
+        .{ .tool_result = .{
+            .text = "Tool: describe_drinky",
+            .metadata = .{ .identity = .{ .end = "Tool: describe_drinky".len } },
+        } },
         .{ .user = "你好世界" },
     };
     const widths = [_]usize{ 16, 3, 2 };
@@ -638,8 +672,10 @@ test "command ranges keep the gutter and every detail through wrapping replay an
         defer gpa.free(text);
         const source: Block.Source = .{ .tool_result = .{
             .text = text,
-            .segment_ends = &.{ identity.len, head.len },
-            .status = .{ .start = 0, .end = identity.len, .role = .success, .dim = true },
+            .metadata = .{
+                .identity = .{ .end = identity.len, .role = .success },
+                .fields = &.{.{ .end = head.len }},
+            },
             .command = .{ .start = head.len + 1, .end = head.len + 1 + command.len },
         } };
         var block = try Block.init(gpa, &source);
@@ -729,7 +765,7 @@ test "a tool box removes optional metadata and wraps its complete error" {
     const detail = "Error: Drinky found old_text more than once. Add more text around it.";
     var block = try Block.init(gpa, &.{ .tool_result = .{
         .text = head ++ "\n" ++ detail,
-        .segment_ends = &.{ identity.len, head.len },
+        .metadata = .{ .identity = .{ .end = identity.len }, .fields = &.{.{ .end = head.len }} },
     } });
     defer block.deinit(gpa);
     const painted = try rendered(gpa, &block, columns, 0);
@@ -751,8 +787,10 @@ test "tool errors stay dim with red identities and complete text across terminal
         defer gpa.free(text);
         var block = try Block.init(gpa, &.{ .tool_result = .{
             .text = text,
-            .segment_ends = &.{ identity.len, head.len },
-            .status = .{ .start = 0, .end = identity.len, .role = .@"error", .dim = true },
+            .metadata = .{
+                .identity = .{ .end = identity.len, .role = .@"error" },
+                .fields = &.{.{ .end = head.len }},
+            },
         } });
         defer block.deinit(gpa);
         for ([_]usize{ 80, 40, 20, 1 }) |columns| {
@@ -873,9 +911,11 @@ test "each block kind paints in the role of its kind" {
             .role = .@"error",
         },
         .{ .source = .{ .user = "one line" }, .role = .user },
-        .{ .source = .{ .tool_result = .{ .text = "one line" } }, .role = .text },
         .{
-            .source = .{ .tool_result = .{ .text = "one line" } },
+            .source = .{ .tool_result = .{
+                .text = "one line",
+                .metadata = .{ .identity = .{ .end = "one line".len } },
+            } },
             .role = .text,
         },
         .{ .source = .{ .thinking = "one line" }, .role = .muted },
@@ -969,7 +1009,10 @@ test "each notice paints the symbol of its kind in its role" {
 
 test "work summaries keep time before tools and bytes and reduce to one row" {
     const gpa = std.testing.allocator;
-    var block = try Block.init(gpa, &.{ .tool_result = .{ .text = "Tool: read (complete)" } });
+    var block = try Block.init(gpa, &.{ .tool_result = .{
+        .text = "Tool: read (complete)",
+        .metadata = .{ .identity = .{ .end = "Tool: read (complete)".len } },
+    } });
     defer block.deinit(gpa);
     block.present(false);
     block.presentWork(&.{
@@ -1024,7 +1067,7 @@ test "user notes keep one row while session events can use multiple rows" {
     const text = identity ++ " · File: a long path · with a separator/SKILL.md";
     var note = try Block.init(gpa, &.{ .user_note = .{
         .text = text,
-        .segment_ends = &.{ identity.len, text.len },
+        .metadata = .{ .identity = .{ .end = identity.len }, .fields = &.{.{ .end = text.len }} },
     } });
     defer note.deinit(gpa);
     var sentence = try Block.init(gpa, &.{ .user_note = .{
@@ -1064,7 +1107,10 @@ test "metadata truncates only its mandatory segment across narrow Unicode widths
     const text = file ++ " · Lines: 3";
     var block = try Block.init(gpa, &.{ .tool_result = .{
         .text = text,
-        .segment_ends = &.{ identity.len, file.len, text.len },
+        .metadata = .{
+            .identity = .{ .end = identity.len },
+            .fields = &.{ .{ .end = file.len }, .{ .end = text.len } },
+        },
     } });
     defer block.deinit(gpa);
     for (1..80) |columns| {

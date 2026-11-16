@@ -110,7 +110,7 @@ fn writeCommands(writer: *std.Io.Writer) !void {
         \\The open work row counts finished and unfinished calls.
         \\The open work row updates these values while the run continues.
         \\While a `bash` call runs, the open work row shows the main command of the call after the
-        \\tool count.
+        \\received bytes.
         \\An example is `$ zig build test` for `cd lib && zig build test --summary all`.
         \\The main command has the program and at most two words after it.
         \\Other tools and commands without a main command show no command.
@@ -156,6 +156,7 @@ fn writeCommands(writer: *std.Io.Writer) !void {
         \\completion.
         \\The time has the next priority, followed by the tool count, the command, and the received
         \\bytes.
+        \\The row removes the received bytes before the command, although the command comes last.
         \\A work row truncates the value in parentheses only when its complete identity
         \\does not fit.
         \\It keeps the complete prefix and closing parenthesis when at least 15 columns remain.

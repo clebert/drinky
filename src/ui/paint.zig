@@ -21,11 +21,14 @@ pub const NoticeStyle = struct {
     role: role.Name,
     prefix: []const u8 = "",
     fit: Fit = .wrap,
-    segment_ends: ?[]const usize = null,
 
-    const Fit = enum { wrap, head };
+    const Fit = union(enum) { wrap, head: ?Metadata };
 
-    pub const note: NoticeStyle = .{ .role = .user_note, .prefix = "→ ", .fit = .head };
+    pub const note: NoticeStyle = .{
+        .role = .user_note,
+        .prefix = "→ ",
+        .fit = .{ .head = null },
+    };
 
     pub fn of(severity: Message.Severity) NoticeStyle {
         return switch (severity) {
@@ -116,17 +119,12 @@ const BoxRow = struct {
     content: []const u8,
     marker: []const u8 = "",
     role: role.Name = .text,
-    segment_ends: ?[]const usize = null,
-    identity_value: ?Box.Range = null,
-    status: ?Mark = null,
-    marks: []const Mark = &.{},
 };
 
 pub const Mark = struct {
     start: usize,
     end: usize,
     role: role.Name,
-    dim: bool = false,
     underline: bool = false,
 };
 
@@ -152,13 +150,35 @@ pub const Placement = struct {
 pub const Box = struct {
     text: []const u8,
     padded: bool = false,
-    segment_ends: ?[]const usize = null,
-    identity_value: ?Range = null,
-    status: ?Mark = null,
-    qualifiers: []const Mark = &.{},
+    metadata: ?Metadata = null,
     command: ?Range = null,
 
     pub const Range = struct { start: usize, end: usize };
+};
+
+pub const Metadata = struct {
+    identity: Identity,
+    fields: []const Field = &.{},
+
+    pub const Identity = struct {
+        end: usize,
+        value: ?Box.Range = null,
+        role: ?role.Name = null,
+    };
+
+    pub const Field = struct {
+        end: usize,
+        priority: Priority = .normal,
+        warning: bool = false,
+    };
+
+    pub const Priority = enum { normal, low };
+
+    const Kept = std.EnumArray(Priority, usize);
+
+    fn fieldStart(self: *const Metadata, index: usize) usize {
+        return if (index == 0) self.identity.end else self.fields[index - 1].end;
+    }
 };
 
 const BoxLines = struct {
@@ -330,8 +350,6 @@ const Cut = struct {
     }
 };
 
-const Head = struct { label: []const u8, shown: Cut };
-
 pub const RenderOptions = struct {
     viewport_rows: usize,
     activity: ?Activity = null,
@@ -459,7 +477,10 @@ pub fn packRow(line: []const u8, room: usize, overwide: Overwide) Row {
 }
 
 pub fn noticeRows(style: *const NoticeStyle, text: []const u8, columns: usize) usize {
-    if (style.fit == .head) return 1;
+    switch (style.fit) {
+        .wrap => {},
+        .head => return 1,
+    }
     var wrap = noticeWrap(style, text, columns);
     var count: usize = 0;
     while (wrap.next()) |_| count += 1;
@@ -478,7 +499,7 @@ pub fn boxRows(body: *const Box, columns: usize) usize {
     var count: usize = if (body.padded) 2 else 0;
     var lines = BoxLines.init(body);
     while (lines.next()) |line| {
-        if (line.offset == 0 and body.segment_ends != null) {
+        if (line.offset == 0 and body.metadata != null) {
             count += 1;
             continue;
         }
@@ -488,36 +509,86 @@ pub fn boxRows(body: *const Box, columns: usize) usize {
     return count;
 }
 
-fn segmentCut(
+fn keptFields(text: []const u8, metadata: *const Metadata, columns: usize) ?Metadata.Kept {
+    const identity_columns = terminal.width.ofText(text[0..metadata.identity.end]);
+    if (identity_columns > columns) return null;
+    var room = columns - identity_columns;
+    var kept: Metadata.Kept = .initFill(0);
+    for (std.enums.values(Metadata.Priority)) |priority| {
+        for (metadata.fields, 0..) |field, index| {
+            if (field.priority != priority) continue;
+            const field_text = text[metadata.fieldStart(index)..field.end];
+            const field_columns = terminal.width.ofText(field_text);
+            if (field_columns > room) return kept;
+            room -= field_columns;
+            kept.getPtr(priority).* += 1;
+        }
+    }
+    return kept;
+}
+
+fn identityCut(text: []const u8, identity: *const Metadata.Identity, columns: usize) Cut {
+    const first = text[0..identity.end];
+    if (identity.value) |value| {
+        const prefix = first[0..value.start];
+        const suffix = first[value.end..];
+        const fixed_columns = terminal.width.ofText(prefix) + terminal.width.ofText(suffix);
+        if (columns > fixed_columns) {
+            const shown = cut(first[value.start..value.end], columns - fixed_columns);
+            return .{
+                .kept = first[0 .. value.start + shown.kept.len],
+                .shortened = shown.shortened,
+                .suffix = suffix,
+            };
+        }
+    }
+    return cut(first, columns);
+}
+
+fn metadataCells(sink: *terminal.View.Sink, metadata: *const Metadata, options: *const struct {
     text: []const u8,
     columns: usize,
-    ends: []const usize,
-    maybe_value: ?Box.Range,
-) Cut {
-    if (ends.len == 0) return headCut(text, columns);
-    const first = text[0..ends[0]];
-    if (terminal.width.ofText(first) > columns) {
-        if (maybe_value) |value| {
-            const prefix = first[0..value.start];
-            const suffix = first[value.end..];
-            const fixed_columns = terminal.width.ofText(prefix) + terminal.width.ofText(suffix);
-            if (columns > fixed_columns) {
-                const shown = cut(first[value.start..value.end], columns - fixed_columns);
-                return .{
-                    .kept = first[0 .. value.start + shown.kept.len],
-                    .shortened = shown.shortened,
-                    .suffix = suffix,
-                };
-            }
+    role: role.Name,
+}) !void {
+    const text = options.text;
+    const identity = &metadata.identity;
+    const kept = keptFields(text, metadata, options.columns) orelse {
+        const shown = identityCut(text, identity, options.columns);
+        return dimCut(sink, &shown, &.{ .role = identity.role, .base = options.role });
+    };
+    const whole: Cut = .{ .kept = text[0..identity.end], .shortened = false };
+    try dimCut(sink, &whole, &.{ .role = identity.role, .base = options.role });
+    var seen: Metadata.Kept = .initFill(0);
+    for (metadata.fields, 0..) |field, index| {
+        const position = seen.get(field.priority);
+        seen.getPtr(field.priority).* += 1;
+        if (position >= kept.get(field.priority)) continue;
+        const field_text = text[metadata.fieldStart(index)..field.end];
+        if (!field.warning) {
+            try sink.text(field_text);
+            continue;
         }
-        return cut(first, columns);
+        std.debug.assert(std.mem.startsWith(u8, field_text, separator));
+        try sink.text(separator);
+        const warning: Cut = .{ .kept = field_text[separator.len..], .shortened = false };
+        try dimCut(sink, &warning, &.{ .role = .warning, .base = options.role });
     }
-    var end = ends[0];
-    for (ends[1..]) |next| {
-        if (terminal.width.ofText(text[0..next]) > columns) break;
-        end = next;
-    }
-    return .{ .kept = text[0..end], .shortened = false };
+}
+
+fn dimCut(sink: *terminal.View.Sink, shown: *const Cut, options: *const struct {
+    role: ?role.Name,
+    base: role.Name,
+}) !void {
+    const name = options.role orelse {
+        try sink.text(shown.kept);
+        return shown.writeEllipsis(sink);
+    };
+    try role.apply(sink, name);
+    try attribute.apply(sink, .dim);
+    try sink.text(shown.kept);
+    try shown.writeEllipsis(sink);
+    try attribute.apply(sink, .reset);
+    try role.apply(sink, options.base);
 }
 
 pub const ellipsis = "…";
@@ -537,7 +608,13 @@ fn lineText(line: []const u8) []const u8 {
 }
 
 pub fn notice(placement: *const Placement, style: *const NoticeStyle, text: []const u8) !void {
-    if (style.fit == .head) return noticeHead(placement, style, text);
+    switch (style.fit) {
+        .wrap => {},
+        .head => |*maybe_metadata| return noticeHead(placement, style, &.{
+            .text = text,
+            .metadata = maybe_metadata,
+        }),
+    }
     const shown_prefix = terminal.width.truncate(style.prefix, placement.columns);
     var wrap = noticeWrap(style, text, placement.columns);
     var index: usize = 0;
@@ -576,67 +653,57 @@ pub fn headCut(text: []const u8, columns_max: usize) Cut {
     return .{ .kept = terminal.width.truncate(line, columns_max -| 1), .shortened = true };
 }
 
-fn headRow(parts: *const struct {
-    label: []const u8,
+fn noticeHead(placement: *const Placement, style: *const NoticeStyle, options: *const struct {
     text: []const u8,
-    columns: usize,
-    segment_ends: ?[]const usize = null,
-}) Head {
-    const columns = parts.columns;
-    const shown_label = terminal.width.truncate(parts.label, columns);
-    const room = columns -| terminal.width.ofText(shown_label);
-    const shown = if (parts.segment_ends) |ends|
-        segmentCut(parts.text, room, ends, null)
-    else
-        headCut(parts.text, room);
-    if (room > 0 or !shown.shortened) return .{ .label = shown_label, .shown = shown };
-    return .{
-        .label = terminal.width.truncate(shown_label, columns -| 1),
-        .shown = .{ .kept = "", .shortened = true },
-    };
-}
-
-fn noticeHead(placement: *const Placement, style: *const NoticeStyle, text: []const u8) !void {
+    metadata: *const ?Metadata,
+}) !void {
     if (!placement.begin(placement.base)) return;
-    const row = headRow(&.{
-        .label = style.prefix,
-        .text = text,
-        .columns = placement.columns,
-        .segment_ends = style.segment_ends,
-    });
-    try noticePrefix(placement.sink, style, row.label);
-    try noticeBody(placement.sink, style, row.shown.kept, row.label.len > 0);
-    try row.shown.writeEllipsis(placement.sink);
-    try attribute.apply(placement.sink, .reset);
+    const sink = placement.sink;
+    const columns = placement.columns;
+    const text = options.text;
+    const label = terminal.width.truncate(style.prefix, columns);
+    const room = columns -| terminal.width.ofText(label);
+    const overflows = if (options.metadata.*) |*metadata|
+        keptFields(text, metadata, 0) == null
+    else
+        headCut(text, 0).shortened;
+    const filled = room == 0 and overflows;
+    const shown_label = if (filled) terminal.width.truncate(label, columns -| 1) else label;
+    try noticePrefix(sink, style, shown_label);
+    if (shown_label.len == 0) try role.apply(sink, style.role);
+    if (filled) {
+        try sink.text(ellipsis);
+    } else if (options.metadata.*) |*metadata| {
+        try metadataCells(sink, metadata, &.{ .text = text, .columns = room, .role = style.role });
+    } else {
+        const shown = headCut(text, room);
+        try sink.text(shown.kept);
+        try shown.writeEllipsis(sink);
+    }
+    try attribute.apply(sink, .reset);
     placement.end(placement.base);
 }
 
 pub fn box(placement: *const Placement, name: role.Name, body: *const Box) !void {
     var line = placement.base;
     if (body.padded) try boxEdge(placement, &line, name);
-    const plain = body.status != null;
+    const plain = body.metadata != null;
     const base_role: role.Name = if (plain) .muted else name;
     var lines = BoxLines.init(body);
     while (lines.next()) |source| {
-        const content = source.text;
-        if (source.offset == 0 and body.segment_ends != null) {
-            try boxRow(placement, &line, &.{
-                .content = content,
-                .role = base_role,
-                .segment_ends = body.segment_ends,
-                .identity_value = body.identity_value,
-                .status = body.status,
-                .marks = body.qualifiers,
-            });
-        } else {
-            var wrap = BoxWrap.init(&source, placement.columns);
-            while (wrap.next()) |shown| {
-                try boxRow(placement, &line, &.{
-                    .content = shown.text,
-                    .marker = shown.marker,
-                    .role = if (plain or source.part != .detail) .muted else base_role,
-                });
+        if (source.offset == 0) {
+            if (body.metadata) |*metadata| {
+                try metadataRow(placement, &line, metadata, source.text);
+                continue;
             }
+        }
+        var wrap = BoxWrap.init(&source, placement.columns);
+        while (wrap.next()) |shown| {
+            try boxRow(placement, &line, &.{
+                .content = shown.text,
+                .marker = shown.marker,
+                .role = if (plain or source.part != .detail) .muted else base_role,
+            });
         }
     }
     if (body.padded) try boxEdge(placement, &line, name);
@@ -654,45 +721,34 @@ fn boxEdge(placement: *const Placement, line: *usize, name: role.Name) !void {
 fn boxRow(placement: *const Placement, line: *usize, row: *const BoxRow) !void {
     defer line.* += 1;
     if (!placement.begin(line.*)) return;
-    try role.apply(placement.sink, row.role);
-    try boxRowCells(placement.sink, placement.columns, row);
-    try attribute.apply(placement.sink, .reset);
+    const sink = placement.sink;
+    try role.apply(sink, row.role);
+    try sink.text(row.marker);
+    const room = placement.columns - terminal.width.ofText(row.marker);
+    try sink.text(terminal.width.truncate(row.content, room));
+    try sink.spaces(placement.columns -| sink.columns_written);
+    try attribute.apply(sink, .reset);
     placement.end(line.*);
 }
 
-fn boxRowCells(sink: *terminal.View.Sink, columns: usize, row: *const BoxRow) !void {
-    try sink.text(row.marker);
-    const room = columns - terminal.width.ofText(row.marker);
-    if (row.segment_ends) |ends| {
-        const shown = segmentCut(row.content, room, ends, row.identity_value);
-        try boxRowText(sink, shown.kept, row);
-        if (shown.shortened) {
-            if (row.status) |status| {
-                if (shown.kept.len >= status.start and shown.kept.len < status.end)
-                    try markStyle(sink, &status);
-            }
-        }
-        try shown.writeEllipsis(sink);
-    } else {
-        try boxRowText(sink, terminal.width.truncate(row.content, room), row);
-    }
-    try sink.spaces(columns -| sink.columns_written);
-}
-
-fn boxRowText(sink: *terminal.View.Sink, text: []const u8, row: *const BoxRow) !void {
-    var end: usize = 0;
-    if (row.status) |status| {
-        end = @min(status.end, text.len);
-        try markedText(sink, text[0..end], &.{
-            .role = row.role,
-            .marks = &.{status},
-        });
-    }
-    try markedText(sink, text[end..], &.{
-        .offset = end,
-        .role = row.role,
-        .marks = row.marks,
+fn metadataRow(
+    placement: *const Placement,
+    line: *usize,
+    metadata: *const Metadata,
+    text: []const u8,
+) !void {
+    defer line.* += 1;
+    if (!placement.begin(line.*)) return;
+    const sink = placement.sink;
+    try role.apply(sink, .muted);
+    try metadataCells(sink, metadata, &.{
+        .text = text,
+        .columns = placement.columns,
+        .role = .muted,
     });
+    try sink.spaces(placement.columns -| sink.columns_written);
+    try attribute.apply(sink, .reset);
+    placement.end(line.*);
 }
 
 pub const frame_edge_rows = 2;
@@ -782,7 +838,6 @@ fn markedText(sink: *terminal.View.Sink, text: []const u8, options: *const struc
 
 fn markStyle(sink: *terminal.View.Sink, mark: *const Mark) !void {
     try role.apply(sink, mark.role);
-    if (mark.dim) try attribute.apply(sink, .dim);
     if (mark.underline) try attribute.apply(sink, .underline);
 }
 
@@ -983,8 +1038,7 @@ test "the command gutter narrows with the row and keeps one column for text" {
     const command = "ab\ncd";
     const body: Box = .{
         .text = identity ++ "\n" ++ command,
-        .segment_ends = &.{identity.len},
-        .status = .{ .start = 0, .end = identity.len, .role = .success, .dim = true },
+        .metadata = .{ .identity = .{ .end = identity.len, .role = .success } },
         .command = .{ .start = identity.len + 1, .end = identity.len + 1 + command.len },
     };
     const cases = [_]struct { columns: usize, rows: []const []const u8 }{
@@ -1013,8 +1067,7 @@ test "a command row starts in the gutter, and a detail row starts at the edge" {
     const command = "git diff --check -- paint.zig\n  echo short";
     const body: Box = .{
         .text = identity ++ "\n" ++ command ++ "\nError: Drinky could not run the command.",
-        .segment_ends = &.{identity.len},
-        .status = .{ .start = 0, .end = identity.len, .role = .success, .dim = true },
+        .metadata = .{ .identity = .{ .end = identity.len, .role = .success } },
         .command = .{ .start = identity.len + 1, .end = identity.len + 1 + command.len },
     };
     var rig: testing.Rig = undefined;
@@ -1470,7 +1523,7 @@ test "a notice prefix opens its first row alone" {
 
 test "a head notice keeps one row and marks its cut" {
     const gpa = std.testing.allocator;
-    const style: NoticeStyle = .{ .role = .muted, .fit = .head };
+    const style: NoticeStyle = .{ .role = .muted, .fit = .{ .head = null } };
     const text = "Drinky sends no message while a turn runs.\nnot another row";
     try std.testing.expectEqual(@as(usize, 1), noticeRows(&style, text, 16));
 
@@ -1490,7 +1543,11 @@ test "a head notice keeps one row and marks its cut" {
     defer gpa.free(wide);
     try std.testing.expectEqualStrings(ellipsis, wide);
 
-    const tagged: NoticeStyle = .{ .role = .@"error", .prefix = "Error: ", .fit = .head };
+    const tagged: NoticeStyle = .{
+        .role = .@"error",
+        .prefix = "Error: ",
+        .fit = .{ .head = null },
+    };
     const filled = try paintedNotice(gpa, &tagged, "boom", 7);
     defer gpa.free(filled);
     try std.testing.expectEqualStrings("Error:" ++ ellipsis, filled);

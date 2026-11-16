@@ -194,7 +194,7 @@ pub fn directoryLabel(gpa: std.mem.Allocator, directory: *const Directory) ![]co
 pub fn render(placement: *const paint.Placement, info: *const Info) !void {
     if (info.notice) |notice| {
         var style: paint.NoticeStyle = .of(notice.severity);
-        style.fit = .head;
+        style.fit = .{ .head = null };
         const text = if (info.confirmation) |confirmation| switch (confirmation) {
             .message => message: {
                 style.prefix = switch (notice.severity) {
@@ -1007,7 +1007,7 @@ test "semantic confirmations keep the terminal text, roles, and width reductions
             expected.init(std.testing.allocator);
             defer expected.deinit();
             var style: paint.NoticeStyle = .of(severity);
-            style.fit = .head;
+            style.fit = .{ .head = null };
             const placement = try expected.begin(&.{ .columns = columns, .rows = 1 });
             try paint.notice(&placement, &style, case.expected);
             try std.testing.expectEqualStrings(try expected.painted(), try actual.painted());

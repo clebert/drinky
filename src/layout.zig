@@ -347,6 +347,11 @@ test "user messages keep the gap before a model answer" {
         try std.testing.expectEqualStrings(expected, std.mem.trim(u8, rows.next().?, "\r "));
 }
 
+const work_box: ui.paint.Box = .{
+    .text = "workbox",
+    .metadata = .{ .identity = .{ .end = "workbox".len } },
+};
+
 const test_status: ui.status.Info = .{
     .directory = "~/work",
     .branch = "main",
@@ -440,7 +445,7 @@ test "a turn tail shows its work row above the active editor" {
     try rig.add(&.{ .user = "useryy" });
     var track: Track = .{};
     const scene = rig.turn(&.{
-        .work = .{ .box = .{ .text = "workbox", .segment_ends = &.{} }, .track = &track },
+        .work = .{ .box = work_box, .track = &track },
     });
     const painted = try projected(gpa, .{ .columns = 40, .rows = 24 }, &scene);
     defer gpa.free(painted);
@@ -699,7 +704,7 @@ test "a work row rewrite above the window repaints the complete transcript" {
     var track: Track = .{};
     const scene = rig.turn(&.{
         .window_pages = application.Settings.window_pages_min,
-        .work = .{ .box = .{ .text = "workbox", .segment_ends = &.{} }, .track = &track },
+        .work = .{ .box = work_box, .track = &track },
     });
     for ([_]struct { rows: usize, above: bool }{
         .{ .rows = 12, .above = false },

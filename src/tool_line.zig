@@ -9,15 +9,12 @@ const ui = @import("ui/root.zig");
 
 pub const Line = struct {
     text: []u8,
-    segment_ends: []usize,
-    status: ui.paint.Mark,
-    qualifiers: []ui.paint.Mark,
+    metadata: ui.paint.Metadata,
     command: ?ui.paint.Box.Range,
 
     pub fn deinit(self: *const Line, gpa: std.mem.Allocator) void {
         gpa.free(self.text);
-        gpa.free(self.segment_ends);
-        gpa.free(self.qualifiers);
+        gpa.free(self.metadata.fields);
     }
 };
 
@@ -34,26 +31,23 @@ pub const Options = struct {
 const Parts = struct {
     gpa: std.mem.Allocator,
     writer: *std.Io.Writer,
-    segment_ends: *std.ArrayList(usize),
-    qualifiers: *std.ArrayList(ui.paint.Mark),
-    status: ui.paint.Mark = undefined,
+    fields: *std.ArrayList(ui.paint.Metadata.Field),
     command: ?ui.paint.Box.Range = null,
 
     fn print(self: *Parts, comptime template: []const u8, args: anytype) !void {
-        if (self.segment_ends.items.len > 0) try self.writer.writeAll(ui.paint.separator);
-        try self.writer.print(template, args);
-        try self.segment_ends.append(self.gpa, self.writer.buffered().len);
+        try self.field(template, args, false);
     }
 
     fn warn(self: *Parts, comptime template: []const u8, args: anytype) !void {
-        const start = self.writer.buffered().len +
-            if (self.segment_ends.items.len > 0) ui.paint.separator.len else 0;
-        try self.print(template, args);
-        try self.qualifiers.append(self.gpa, .{
-            .start = start,
+        try self.field(template, args, true);
+    }
+
+    fn field(self: *Parts, comptime template: []const u8, args: anytype, warning: bool) !void {
+        try self.writer.writeAll(ui.paint.separator);
+        try self.writer.print(template, args);
+        try self.fields.append(self.gpa, .{
             .end = self.writer.buffered().len,
-            .role = .warning,
-            .dim = true,
+            .warning = warning,
         });
     }
 };
@@ -86,31 +80,20 @@ pub fn subject(
 pub fn render(gpa: std.mem.Allocator, options: *const Options) error{OutOfMemory}!Line {
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    var ends: std.ArrayList(usize) = .empty;
-    defer ends.deinit(gpa);
-    var qualifiers: std.ArrayList(ui.paint.Mark) = .empty;
-    defer qualifiers.deinit(gpa);
-    var parts: Parts = .{
-        .gpa = gpa,
-        .writer = &out.writer,
-        .segment_ends = &ends,
-        .qualifiers = &qualifiers,
-    };
-    write(&parts, options) catch return error.OutOfMemory;
+    var fields: std.ArrayList(ui.paint.Metadata.Field) = .empty;
+    defer fields.deinit(gpa);
+    var parts: Parts = .{ .gpa = gpa, .writer = &out.writer, .fields = &fields };
+    const identity = write(&parts, options) catch return error.OutOfMemory;
     const text = try out.toOwnedSlice();
     errdefer gpa.free(text);
-    const segment_ends = try ends.toOwnedSlice(gpa);
-    errdefer gpa.free(segment_ends);
     return .{
         .text = text,
-        .segment_ends = segment_ends,
-        .status = parts.status,
-        .qualifiers = try qualifiers.toOwnedSlice(gpa),
+        .metadata = .{ .identity = identity, .fields = try fields.toOwnedSlice(gpa) },
         .command = parts.command,
     };
 }
 
-fn write(parts: *Parts, options: *const Options) !void {
+fn write(parts: *Parts, options: *const Options) !ui.paint.Metadata.Identity {
     const output = options.output;
     const state: State = if (output.conditions.contains(.canceled))
         .canceled
@@ -120,11 +103,9 @@ fn write(parts: *Parts, options: *const Options) !void {
     const name = try parts.gpa.dupe(u8, options.name);
     defer parts.gpa.free(name);
     const shown_name = format.singleLine(name);
-    try parts.print("Tool: {s} ({s})", .{ shown_name, @tagName(state) });
-    parts.status = .{
-        .start = 0,
+    try parts.writer.print("Tool: {s} ({s})", .{ shown_name, @tagName(state) });
+    const identity: ui.paint.Metadata.Identity = .{
         .end = parts.writer.buffered().len,
-        .dim = true,
         .role = switch (state) {
             .complete => .success,
             .partial, .canceled => .warning,
@@ -171,6 +152,7 @@ fn write(parts: *Parts, options: *const Options) !void {
     if (state == .failed and output.measures.count() == 0) {
         try parts.writer.print("\nError: {s}", .{output.content});
     }
+    return identity;
 }
 
 const stops = [_]struct { condition: application.ToolCondition, name: []const u8 }{
@@ -338,7 +320,7 @@ test "a search that stops early names its state in yellow" {
             "Unreadable: 3 entries · Matches: 0",
         line.text,
     );
-    try std.testing.expectEqual(.warning, line.status.role);
+    try std.testing.expectEqual(.warning, line.metadata.identity.role);
 }
 
 test "a command reports its time, its exit code or its status, and its output" {
@@ -389,7 +371,7 @@ test "a canceled call names its state in yellow and shows no error sentence" {
     });
     defer line.deinit(gpa);
     try std.testing.expectEqualStrings("Tool: grep (canceled) · Pattern: x", line.text);
-    try std.testing.expectEqual(.warning, line.status.role);
+    try std.testing.expectEqual(.warning, line.metadata.identity.role);
 }
 
 test "a failed output keeps its error sentence and a bare output only its completed identity" {
