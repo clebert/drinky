@@ -336,8 +336,10 @@ fn writePreferences(writer: *std.Io.Writer) std.Io.Writer.Error!void {
             "The frame of the editor or a picker animates while Drinky works. " ++
             "The config key `" ++ config_keys.animation ++ "` selects the animation. " ++
             "The default animation `chomp` is a small arcade game on the frame. " ++
-            "A chomper eats the bottom edge, and each lap can hold a random event. " ++
+            "A chomper eats the bottom edge. " ++
+            "Each lap can hold a random event. " ++
             "A ghost chase can end the game. " ++
+            "A slot jackpot adds a level. " ++
             "At the median, a game lasts about five minutes of animation. " ++
             "The game continues across turns until Drinky stops. " ++
             "Unlike the other animations, it does not show stalled turns. " ++

@@ -98,6 +98,17 @@ const Lap = struct {
             .hunt, .love, .nap, .hole, .music, .slot, .mirror => false,
         };
     }
+
+    fn jackpotBright(self: *const Lap) bool {
+        const event = if (self.event) |*event| event else return false;
+        return switch (event.*) {
+            .slot => |*slot| switch (slot.*) {
+                .win => |*reels| reels.frames >= win_symbol_frames and reels.frames < win_frames,
+                .wait, .spin, .lose => false,
+            },
+            .hunt, .chase, .love, .nap, .hole, .music, .mirror => false,
+        };
+    }
 };
 
 const Cells = std.StaticBitSet(columns_max);
@@ -626,8 +637,11 @@ fn topFree(self: *const Chomp, layout: *const Layout, column: isize) bool {
     if (layout.top_label_end) |end| {
         if (position < end + label_gap) return false;
     }
-    const span = layout.titleSpan(self.levelLabelColumns()) orelse return true;
-    return position + 1 < span.start or position > span.end;
+    for ([_]u32{ self.level, self.level +| 1 }) |level| {
+        const span = layout.titleSpan(levelLabelColumns(level)) orelse continue;
+        if (position + 1 >= span.start and position <= span.end) return false;
+    }
+    return true;
 }
 
 fn random(self: *Chomp) std.Random {
@@ -739,7 +753,7 @@ fn tickEvent(self: *Chomp, board: *Board, lap: *Lap) bool {
         .nap => |*nap| self.tickNap(nap),
         .hole => |*hole| self.tickHole(layout, lap, hole),
         .music => .walks,
-        .slot => |*slot| tickSlot(slot),
+        .slot => |*slot| self.tickSlot(slot),
         .mirror => |*mirror| tickMirror(mirror),
     };
     return self.settle(board, lap, step);
@@ -804,7 +818,7 @@ fn planSlot(self: *Chomp, layout: *const Layout, lap: *const Lap) Slot.Spin {
     };
 }
 
-fn tickSlot(slot: *Slot) Step {
+fn tickSlot(self: *Chomp, slot: *Slot) Step {
     switch (slot.*) {
         .wait => return .walks,
         .spin => |*spin| {
@@ -827,6 +841,7 @@ fn tickSlot(slot: *Slot) Step {
         },
         .win => |*reels| {
             reels.frames += 1;
+            if (reels.frames == win_symbol_frames) self.level +|= 1;
             if (reels.frames >= win_frames + reels_fade_frames) return .ends;
             return if (reels.frames < win_dance_frames) .waits else .walks;
         },
@@ -1545,14 +1560,14 @@ fn blinking(frames: u32) bool {
         @divFloor(frames - flash_blink_start, 8) % 2 == 0;
 }
 
-fn levelLabelColumns(self: *const Chomp) usize {
-    return level_prefix.len + digitCount(self.level) + 1;
+fn levelLabelColumns(level: u32) usize {
+    return level_prefix.len + digitCount(level) + 1;
 }
 
 fn labelSpan(self: *const Chomp, board: *const Board) ?Span {
     return board.layout.titleSpan(switch (board.phase) {
         .game_over => game_over_text.len,
-        .lap, .flash => self.levelLabelColumns(),
+        .lap, .flash => levelLabelColumns(self.level),
     });
 }
 
@@ -1569,7 +1584,7 @@ fn labelCell(self: *const Chomp, board: *const Board, column: usize) ?Cell {
             };
         },
         .flash => |frames| if (blinking(frames)) .text else .chomper,
-        .lap => .chomper,
+        .lap => |*lap| if (lap.jackpotBright()) .score else .chomper,
     };
     if (index < level_prefix.len)
         return .{ .glyph = level_prefix[index..][0..1], .role = level_role };
@@ -1956,7 +1971,7 @@ test "an eaten item blinks above the waiting chomper, but a hole without a box s
     }
 }
 
-test "the chomper waits on the coin while the reels spin, and only three equal reels show 1UP" {
+test "the chomper waits on the coin, and only three equal reels show 1UP and add a level" {
     var chomp: Chomp = .init(11);
     var wins: usize = 0;
     var losses: usize = 0;
@@ -1988,17 +2003,54 @@ test "the chomper waits on the coin while the reels spin, and only three equal r
             chomp.cell(.top, start + 2).glyph,
         };
         const equal = std.mem.eql(u8, shown[0], shown[1]) and std.mem.eql(u8, shown[1], shown[2]);
+        const level = chomp.level;
         var jackpot = false;
-        for (0..win_frames) |_| {
+        for (0..win_frames - 1) |_| {
             chomp.advance();
-            if (edgeShows(&chomp, &.{ .edge = .top, .columns = columns, .text = jackpot_text }))
-                jackpot = true;
+            if (!edgeShows(&chomp, &.{ .edge = .top, .columns = columns, .text = jackpot_text }))
+                continue;
+            jackpot = true;
+            try expectLevelLabel(&chomp, &.{ .columns = columns, .level = level + 1 });
+            const label = glyphColumn(&chomp, &.{
+                .edge = .top,
+                .columns = columns,
+                .glyph = "L",
+            }) orelse return error.TestExpectedLabel;
+            try std.testing.expectEqual(role.Name.score, chomp.cell(.top, label).role);
         }
         try std.testing.expectEqual(equal, jackpot);
+        const cleared = level + @intFromBool(equal) + 1;
+        for (0..4000) |_| {
+            chomp.advance();
+            if (chomp.maybe_board.?.phase == .flash) break;
+        } else return error.TestExpectedFlash;
+        try expectLevelLabel(&chomp, &.{ .columns = columns, .level = cleared });
         wins += @intFromBool(equal);
         losses += @intFromBool(!equal);
     }
     try std.testing.expect(wins > 0 and losses > 0);
+}
+
+fn expectLevelLabel(chomp: *const Chomp, options: *const struct {
+    columns: usize,
+    level: u32,
+}) !void {
+    var buffer: [32]u8 = undefined;
+    const text = try std.fmt.bufPrint(&buffer, "─ Level {d} ─", .{options.level});
+    try std.testing.expect(edgeShows(chomp, &.{
+        .edge = .top,
+        .columns = options.columns,
+        .text = text,
+    }));
+}
+
+test "the top edge keeps a gap to the wider label that a jackpot at level 9 brings" {
+    var chomp: Chomp = .init(1);
+    chomp.level = 9;
+    const layout: Layout = .{ .columns = 51 };
+    try std.testing.expect(chomp.topFree(&layout, 18));
+    try std.testing.expect(!chomp.topFree(&layout, 19));
+    try std.testing.expect(chomp.topFree(&layout, 31));
 }
 
 fn slotEvent(chomp: *const Chomp) ?*const Slot {
