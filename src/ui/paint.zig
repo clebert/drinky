@@ -298,6 +298,13 @@ pub const Animation = union(enum) {
         }
     }
 
+    pub fn reset(self: *Animation) void {
+        switch (self.*) {
+            .segment => self.restart(),
+            .chomp => |*chomp| chomp.reset(),
+        }
+    }
+
     pub fn fit(self: *Animation, layout: *const Chomp.Layout) void {
         switch (self.*) {
             .segment => {},

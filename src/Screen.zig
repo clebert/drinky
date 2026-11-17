@@ -452,6 +452,7 @@ fn clearConversation(self: *Screen) !void {
     self.transcript.truncate(0);
     try self.appendIntro();
     self.view.resetScreen();
+    self.animation.reset();
 }
 
 pub fn addStartupFailure(self: *Screen, text: []const u8) error{OutOfMemory}!void {
@@ -3185,15 +3186,39 @@ test "the game keeps its level from one turn to the next" {
     for (0..6000) |_| _ = rig.screen.advanceFrame(0);
     const first = try rig.paintPlain(80);
     defer std.testing.allocator.free(first);
-    const start = std.mem.find(u8, first, " Level ") orelse return error.TestExpectedLevel;
-    const end = std.mem.findPos(u8, first, start, "─") orelse return error.TestExpectedLevel;
-    const label = first[start..end];
+    const label = try shownLevel(first);
     try rig.apply(&.committed);
     try rig.end(&.{ .stopped = .complete });
     try rig.start("second");
     const second = try rig.paintPlain(80);
     defer std.testing.allocator.free(second);
     try testing.expectContains(second, label);
+}
+
+fn shownLevel(painted: []const u8) ![]const u8 {
+    const start = std.mem.find(u8, painted, " Level ") orelse return error.TestExpectedLevel;
+    const end = std.mem.findPos(u8, painted, start, "─") orelse return error.TestExpectedLevel;
+    return painted[start..end];
+}
+
+test "a conversation clear starts a new game at level 1" {
+    var rig: Rig = undefined;
+    rig.init();
+    defer rig.deinit();
+    try rig.start("first");
+    std.testing.allocator.free(try rig.paintPlain(80));
+    for (0..6000) |_| _ = rig.screen.advanceFrame(0);
+    const first = try rig.paintPlain(80);
+    defer std.testing.allocator.free(first);
+    try std.testing.expect(!std.mem.eql(u8, try shownLevel(first), " Level 1 "));
+    try rig.apply(&.committed);
+    try rig.end(&.{ .stopped = .complete });
+    rig.reduction.surface.clearConversation();
+    try rig.forward();
+    try rig.start("second");
+    const second = try rig.paintPlain(80);
+    defer std.testing.allocator.free(second);
+    try std.testing.expectEqualStrings(" Level 1 ", try shownLevel(second));
 }
 
 test "a turn segment grows without an update and an update returns it to its base length" {

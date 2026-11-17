@@ -341,7 +341,8 @@ fn writePreferences(writer: *std.Io.Writer) std.Io.Writer.Error!void {
             "A ghost chase can end the game. " ++
             "A slot jackpot adds a level. " ++
             "At the median, a game lasts about five minutes of animation. " ++
-            "The game continues across turns until Drinky stops. " ++
+            "The game continues across turns. " ++
+            "A start of Drinky and a clear of the conversation start a new game. " ++
             "Unlike the other animations, it does not show stalled turns. " ++
             "The animations `orbit` and `sweep` move a heavy segment. " ++
             "An orbit segment circles the frame. " ++

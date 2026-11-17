@@ -437,6 +437,12 @@ pub fn fit(self: *Chomp, layout: *const Layout) void {
     }
 }
 
+pub fn reset(self: *Chomp) void {
+    self.resetGame();
+    const board = if (self.maybe_board) |*board| board else return;
+    board.phase = .{ .lap = self.startLap(&board.layout) };
+}
+
 pub fn advance(self: *Chomp) void {
     const board = if (self.maybe_board) |*board| board else return;
     self.frame +%= 1;
@@ -453,8 +459,7 @@ pub fn advance(self: *Chomp) void {
         .game_over => |*frames| {
             frames.* += 1;
             if (frames.* < game_over_frames) return;
-            self.resetGame();
-            board.phase = .{ .lap = self.startLap(&board.layout) };
+            self.reset();
         },
     }
 }
