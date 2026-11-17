@@ -99,14 +99,16 @@ const Lap = struct {
         };
     }
 
-    fn jackpotBright(self: *const Lap) bool {
-        const event = if (self.event) |*event| event else return false;
+    fn jackpotRole(self: *const Lap) ?role.Name {
+        const event = if (self.event) |*event| event else return null;
         return switch (event.*) {
             .slot => |*slot| switch (slot.*) {
-                .win => |*reels| reels.frames >= win_symbol_frames and reels.frames < win_frames,
-                .wait, .spin, .lose => false,
+                .win => |*reels| if (reels.frames < win_symbol_frames)
+                    winBlink(reels.frames)
+                else if (reels.frames < win_frames) .score else null,
+                .wait, .spin, .lose => null,
             },
-            .hunt, .chase, .love, .nap, .hole, .music, .mirror => false,
+            .hunt, .chase, .love, .nap, .hole, .music, .mirror => null,
         };
     }
 };
@@ -1273,18 +1275,16 @@ fn mirrorBottom(self: *const Chomp, lap: *const Lap, mirror: *const Mirror, colu
 
 fn winCell(reels: *const Slot.Reels, column: isize) ?Cell {
     const frames = reels.frames;
-    if (frames < win_symbol_frames) {
-        const blink: role.Name = if (@divFloor(frames, win_blink_frames) % 2 == 0)
-            .score
-        else
-            .text;
-        return reelCell(reels, column, blink);
-    }
+    if (frames < win_symbol_frames) return reelCell(reels, column, winBlink(frames));
     return wordCell(&.{
         .text = jackpot_text,
         .start = reels.start,
         .role = if (frames < win_frames) .score else .score_fading,
     }, column);
+}
+
+fn winBlink(frames: u32) role.Name {
+    return if (@divFloor(frames, win_blink_frames) % 2 == 0) .score else .text;
 }
 
 fn reelCell(reels: *const Slot.Reels, column: isize, reel_role: role.Name) ?Cell {
@@ -1589,7 +1589,7 @@ fn labelCell(self: *const Chomp, board: *const Board, column: usize) ?Cell {
             };
         },
         .flash => |frames| if (blinking(frames)) .text else .chomper,
-        .lap => |*lap| if (lap.jackpotBright()) .score else .chomper,
+        .lap => |*lap| lap.jackpotRole() orelse .chomper,
     };
     if (index < level_prefix.len)
         return .{ .glyph = level_prefix[index..][0..1], .role = level_role };
@@ -1976,7 +1976,7 @@ test "an eaten item blinks above the waiting chomper, but a hole without a box s
     }
 }
 
-test "the chomper waits on the coin, and only three equal reels show 1UP and add a level" {
+test "the chomper waits on the coin, and only equal reels blink with the level and show 1UP" {
     var chomp: Chomp = .init(11);
     var wins: usize = 0;
     var losses: usize = 0;
@@ -2010,19 +2010,25 @@ test "the chomper waits on the coin, and only three equal reels show 1UP and add
         const equal = std.mem.eql(u8, shown[0], shown[1]) and std.mem.eql(u8, shown[1], shown[2]);
         const level = chomp.level;
         var jackpot = false;
+        var blinks: usize = 0;
         for (0..win_frames - 1) |_| {
             chomp.advance();
-            if (!edgeShows(&chomp, &.{ .edge = .top, .columns = columns, .text = jackpot_text }))
-                continue;
-            jackpot = true;
-            try expectLevelLabel(&chomp, &.{ .columns = columns, .level = level + 1 });
             const label = glyphColumn(&chomp, &.{
                 .edge = .top,
                 .columns = columns,
                 .glyph = "L",
             }) orelse return error.TestExpectedLabel;
-            try std.testing.expectEqual(role.Name.score, chomp.cell(.top, label).role);
+            const label_role = chomp.cell(.top, label).role;
+            if (!edgeShows(&chomp, &.{ .edge = .top, .columns = columns, .text = jackpot_text })) {
+                if (equal) try std.testing.expectEqual(chomp.cell(.top, start).role, label_role);
+                blinks += @intFromBool(label_role == .text);
+                continue;
+            }
+            jackpot = true;
+            try expectLevelLabel(&chomp, &.{ .columns = columns, .level = level + 1 });
+            try std.testing.expectEqual(role.Name.score, label_role);
         }
+        try std.testing.expectEqual(equal, blinks > 0);
         try std.testing.expectEqual(equal, jackpot);
         const cleared = level + @intFromBool(equal) + 1;
         for (0..4000) |_| {
