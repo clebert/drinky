@@ -84,12 +84,6 @@ when the user drops it.
   the limit. Anthropic accepts at most 8000×8000 px. Above 20 images in one request, a stricter
   limit applies. Drinky sends every image again with each request, so a long session reaches that
   limit. Source: <https://platform.claude.com/docs/en/build-with-claude/vision>.
-- The `edit` tool replaces one unique span in each call. A rename or a change at several places
-  takes one call for each place, or a rewrite of the whole file. A list of replacements or a flag
-  for every occurrence can save model steps and tokens. A flag works with the current parameter
-  types `string`, `integer`, and `boolean`. A list of replacements needs an array type in
-  `core.Tool.Parameter.Type`, the shared schema writer `json.writeParametersSchema`, and the input
-  check of the tools.
 - Drinky reads the config file, the instruction files, and the skill list only at startup. A new
   skill or a config change takes effect only after a restart. A clear of the conversation can read
   them again. The clears are `/new`, a clear through MCP, and the apply of a gist. A change of the
