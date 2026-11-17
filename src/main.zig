@@ -29,11 +29,8 @@ fn run(init: *const std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
     const home = init.environ_map.get("HOME") orelse return error.NoHomeDir;
-    const cwd_source = try std.process.currentPathAlloc(io, gpa);
-    defer gpa.free(cwd_source);
-    const cwd = try std.Io.Dir.realPathFileAbsoluteAlloc(io, cwd_source, gpa);
+    const cwd = try workingDirectory(gpa, io);
     defer gpa.free(cwd);
-    try validateWorkingDirectory(gpa, cwd);
 
     const arguments = try init.minimal.args.toSlice(init.arena.allocator());
     const parsed = command_line.parse(arguments[@min(1, arguments.len)..]);
@@ -115,8 +112,10 @@ fn runTerminal(
     try app.run();
 }
 
-fn validateWorkingDirectory(gpa: std.mem.Allocator, path: []const u8) !void {
-    if (std.unicode.utf8ValidateSlice(path)) return;
+fn workingDirectory(gpa: std.mem.Allocator, io: std.Io) ![:0]u8 {
+    const path = try std.process.currentPathAlloc(io, gpa);
+    errdefer gpa.free(path);
+    if (std.unicode.utf8ValidateSlice(path)) return path;
     const safe_path = try application.support.diagnostic(gpa, path);
     defer gpa.free(safe_path);
     std.debug.print(
@@ -139,3 +138,44 @@ fn restoreAndTerminate(signal: std.posix.SIG) callconv(.c) void {
 test {
     std.testing.refAllDecls(@This());
 }
+
+test "the working directory is the current path when a sandbox denies its parent directories" {
+    const gpa = std.testing.allocator;
+    const sandboxed: SandboxedIo = .init();
+
+    const working_directory = try workingDirectory(gpa, sandboxed.io());
+    defer gpa.free(working_directory);
+
+    try std.testing.expectEqualStrings(SandboxedIo.current_path, working_directory);
+}
+
+const SandboxedIo = struct {
+    vtable: std.Io.VTable,
+
+    const current_path = "/private/tmp/evaluation/work";
+
+    fn init() SandboxedIo {
+        var vtable = std.testing.io.vtable.*;
+        vtable.processCurrentPath = currentPath;
+        vtable.dirRealPathFile = realPathFile;
+        return .{ .vtable = vtable };
+    }
+
+    fn io(self: *const SandboxedIo) std.Io {
+        return .{ .userdata = std.testing.io.userdata, .vtable = &self.vtable };
+    }
+
+    fn currentPath(_: ?*anyopaque, buffer: []u8) std.process.CurrentPathError!usize {
+        @memcpy(buffer[0..current_path.len], current_path);
+        return current_path.len;
+    }
+
+    fn realPathFile(
+        _: ?*anyopaque,
+        _: std.Io.Dir,
+        _: []const u8,
+        _: []u8,
+    ) std.Io.Dir.RealPathFileError!usize {
+        return error.Unexpected;
+    }
+};

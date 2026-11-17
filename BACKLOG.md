@@ -99,14 +99,6 @@ when the user drops it.
   after the turn, so its confirmation must list the changed files. Each snapshot writes the large
   untracked files that `.gitignore` does not cover into `.git/objects`. The snapshot needs a size
   limit.
-- Drinky does not start when a sandbox denies the metadata of a parent directory of the working
-  directory. The start in `src/main.zig` calls `std.Io.Dir.realPathFileAbsoluteAlloc`, which then
-  returns `error.Unexpected`. Drinky prints only `error: Unexpected`, without a path or a cause.
-  `std.process.currentPathAlloc` and `pwd -P` still return the canonical path. A `sandbox-exec`
-  profile reproduces the defect. It denies `file-read*` for `/private/tmp` and allows it again for
-  the working directory below. A `file-read-metadata` rule for each parent directory lets Drinky
-  start. A rule for the `.git` path of each parent directory does not. An isolated evaluation folder
-  or the sandbox of another tool causes such a denial.
 
 ## Ideas
 
