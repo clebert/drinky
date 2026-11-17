@@ -334,12 +334,20 @@ pub fn show(
             if (self.targets.items.len > 0) shown.preselected = self.targets.items.len - 1;
         },
         .gists => {
-            try self.setTitle("Gist", .{});
             shown.deletes = true;
-            const entries = switch (controller.listGists().listing) {
-                .listed => |listed| listed.entries,
-                .unreadable => &.{},
-            };
+            const entries: []const application.GistEntry, const older: usize, const files: usize =
+                switch (controller.listGists().listing) {
+                    .listed => |listed| .{
+                        listed.entries,
+                        listed.older,
+                        listed.entries.len + listed.older + listed.invalid + listed.unreadable,
+                    },
+                    .unreadable => .{ &.{}, 0, 0 },
+                };
+            if (older > 0)
+                try self.setTitle("Gist: newest {d} of {d} files", .{ entries.len, files })
+            else
+                try self.setTitle("Gist", .{});
             const now_ms = std.Io.Timestamp.now(self.io, .real).toMilliseconds();
             for (entries) |*gist| try self.addGistRow(gist, now_ms);
         },

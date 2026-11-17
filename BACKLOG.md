@@ -35,12 +35,6 @@ when the user drops it.
   directories without a time limit. A file system call that does not return stops the start. A
   pending macOS privacy prompt causes such a call. The tools and the skill file reads already stop
   such a call after their time limit when the call accepts a cancel.
-- `/gists` does not always list the newest gists. The list sorts only the gists that its scan reads.
-  The scan stops after 4096 entries of `~/.drinky/gists/` in directory order. The file names are
-  random ids, so the directory order has no relation to age. With 8202 gists, the list held only 3
-  to 5 of the 10 newest gists. Past the limit, gists leave the list without a notice. Each save
-  creates a file, and a gist stays until a deletion, so the count only grows. The list must stay
-  shared across all repositories and show the newest gists first.
 - Drinky has no QwenCloud account. QwenCloud offers the OpenAI Responses protocol at
   `/compatible-mode/v1/responses`, the Anthropic Messages protocol at `/apps/anthropic`, and a model
   list at `/compatible-mode/v1/models`. QwenCloud has no OAuth, so each account takes a key in the

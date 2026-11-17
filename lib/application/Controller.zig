@@ -580,7 +580,7 @@ fn init(self: *Controller, gpa: std.mem.Allocator, io: std.Io, options: *const O
     errdefer self.account_registry.deinit();
     self.home_directory = try homeDirectory(gpa, io, directories);
     errdefer gpa.free(self.home_directory);
-    self.gists = try .init(gpa, self.home_directory);
+    self.gists = try .init(gpa, self.home_directory, .{});
     errdefer self.gists.deinit();
     if (options.startup == .session) {
         const maybe_root = self.harness.project_instructions.projectRoot();
@@ -3693,8 +3693,10 @@ test "a listing sorts newest first, counts hidden gists, and a read names its fa
             .{ .id = sample_gist, .title = "Kept", .saved_ms = 2_000_000 },
             .{ .id = @splat(0xee), .title = "Older", .saved_ms = 1_000_000 },
         },
+        .older = 0,
         .unreadable = 1,
         .invalid = 3,
+        .scan_limit = null,
     };
     try std.testing.expectEqualDeep(expected, rig.controller.listGists().listing.listed);
 

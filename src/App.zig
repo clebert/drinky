@@ -1102,10 +1102,16 @@ fn presentGists(self: *App, view: GistsView) !void {
     defer self.gpa.free(directory);
     const unreadable = listed.unreadable;
     const invalid = listed.invalid;
+    const scan_limit = listed.scan_limit;
     if (listed.entries.len == 0) self.closeFlow() else switch (view) {
         .open => |origin| try self.openCommandStep(.gists, origin),
         .reopen => |row| try self.showStep(.gists, .{ .cursor = row }),
     }
+    if (scan_limit) |limit| return self.reportNotice(
+        .warning,
+        "Drinky stopped the scan of {s} after {d} entries. The list can miss newer gists.",
+        .{ directory, limit },
+    );
     if (unreadable > 0 and invalid > 0) return self.reportNotice(
         .warning,
         "Drinky could not read {d} gist{s} and found {d} invalid gist{s} in {s}.",
@@ -3947,6 +3953,35 @@ test "/gists hides invalid and unreadable gists, counts them, and deletes after 
         .{ .status = "Drinky deleted the gist." },
         .{ .absent = gist_picker },
         .{ .editor = "" },
+    });
+}
+
+test "/gists titles a full list with the listed count and the count of all gist files" {
+    var rig: Rig = undefined;
+    try rig.init(&.{
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
+        .files = &.{.{ ".drinky/gists/0000000000ff.md", "Gist" }},
+        .model = "gpt-5.6-sol",
+    });
+    defer rig.deinit();
+    for (1..101) |number| {
+        var buffer: [32]u8 = undefined;
+        const sub_path = try std.mem.print(&buffer, ".drinky/gists/{x:0>12}.md", .{number});
+        try rig.tmp.dir.writeFile(std.testing.io, .{ .sub_path = sub_path, .data = "Gist" });
+    }
+    try rig.tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = ".drinky/gists/000000000000.md",
+        .data = " \n",
+    });
+    try rig.keys("/gists\r");
+    try rig.waitFor(&.{
+        .{ .text = "Gist: newest 100 of 102 files · ↑/↓: Move" },
+        .{ .status = "Drinky found 1 invalid gist in " },
+    });
+    try rig.keys("\x7f\x7f");
+    try rig.waitFor(&.{
+        .{ .status = "Drinky deleted the gist." },
+        .{ .text = gist_picker },
     });
 }
 

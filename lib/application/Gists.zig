@@ -9,7 +9,7 @@ const testing = @import("testing.zig");
 const Gists = @This();
 
 const id_bytes = 6;
-const names_scanned_max = 4096;
+const listed_max = 100;
 const text_bytes_max = 1024 * 1024;
 const name_suffix = ".md";
 const name_length = id_bytes * 2 + name_suffix.len;
@@ -17,8 +17,12 @@ const file_mode = 0o600;
 
 gpa: std.mem.Allocator,
 directory: []const u8,
+names_scanned_max: usize,
 arena: std.heap.ArenaAllocator,
+candidates: std.ArrayList(Candidate),
 entries: std.ArrayList(Entry),
+
+pub const Options = struct { names_scanned_max: usize = 1 << 16 };
 
 pub const Id = [id_bytes]u8;
 pub const ListError = std.Io.Dir.OpenError || std.Io.Dir.Iterator.Error || error{OutOfMemory};
@@ -33,25 +37,40 @@ pub const Error = ListError || ReadError || SaveError || DeleteError;
 
 pub const Entry = struct { id: Id, title: []const u8, saved_ms: i64 };
 
-pub const Listing = struct { entries: []const Entry, unreadable: usize, invalid: usize };
+pub const Listing = struct {
+    entries: []const Entry,
+    older: usize,
+    unreadable: usize,
+    invalid: usize,
+    scan_limit: ?usize,
+};
 
 pub const Parsed = struct { title: []const u8, body: []const u8 };
 
 pub const Failure = struct { path: []const u8, cause: Error };
 
-const Found = union(enum) { gist: Entry, invalid, unreadable };
+const Candidate = struct { id: Id, saved_ms: i64 };
 
-pub fn init(gpa: std.mem.Allocator, home_directory: []const u8) error{OutOfMemory}!Gists {
+const Found = union(enum) { gist: Entry, deleted, invalid, unreadable };
+
+pub fn init(
+    gpa: std.mem.Allocator,
+    home_directory: []const u8,
+    options: Options,
+) error{OutOfMemory}!Gists {
     return .{
         .gpa = gpa,
         .directory = try std.Io.Dir.path.join(gpa, &.{ home_directory, ".drinky", "gists" }),
+        .names_scanned_max = options.names_scanned_max,
         .arena = .init(gpa),
+        .candidates = .empty,
         .entries = .empty,
     };
 }
 
 pub fn deinit(self: *Gists) void {
     self.entries.deinit(self.gpa);
+    self.candidates.deinit(self.gpa);
     self.arena.deinit();
     self.gpa.free(self.directory);
 }
@@ -62,27 +81,56 @@ pub fn path(self: *const Gists, gpa: std.mem.Allocator, id: *const Id) error{Out
 
 pub fn list(self: *Gists, io: std.Io) ListError!Listing {
     _ = self.arena.reset(.retain_capacity);
+    self.candidates.clearRetainingCapacity();
     self.entries.clearRetainingCapacity();
     var dir = std.Io.Dir.cwd().openDir(io, self.directory, .{ .iterate = true }) catch |err|
         switch (err) {
-            error.FileNotFound => return .{ .entries = &.{}, .unreadable = 0, .invalid = 0 },
+            error.FileNotFound => return .{
+                .entries = &.{},
+                .older = 0,
+                .unreadable = 0,
+                .invalid = 0,
+                .scan_limit = null,
+            },
             else => |other| return other,
         };
     defer dir.close(io);
     var unreadable: usize = 0;
     var invalid: usize = 0;
     var iterator = dir.iterate();
-    for (0..names_scanned_max) |_| {
-        const entry = try iterator.next(io) orelse break;
+    const scanned_all = for (0..self.names_scanned_max) |_| {
+        const entry = try iterator.next(io) orelse break true;
         const id = parseName(entry.name) orelse continue;
-        switch (try self.readEntry(io, dir, &id, entry.name)) {
+        const stat = dir.statFile(io, entry.name, .{}) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            error.FileNotFound => continue,
+            else => {
+                unreadable += 1;
+                continue;
+            },
+        };
+        try self.candidates.append(self.gpa, .{
+            .id = id,
+            .saved_ms = stat.mtime.toMilliseconds(),
+        });
+    } else try iterator.next(io) == null;
+    std.mem.sortUnstable(Candidate, self.candidates.items, {}, newerFirst);
+    const older = for (self.candidates.items, 0..) |*candidate, index| {
+        if (self.entries.items.len == listed_max) break self.candidates.items.len - index;
+        switch (try self.readEntry(io, dir, candidate)) {
             .gist => |gist| try self.entries.append(self.gpa, gist),
+            .deleted => {},
             .invalid => invalid += 1,
             .unreadable => unreadable += 1,
         }
-    }
-    std.mem.sortUnstable(Entry, self.entries.items, {}, newerFirst);
-    return .{ .entries = self.entries.items, .unreadable = unreadable, .invalid = invalid };
+    } else 0;
+    return .{
+        .entries = self.entries.items,
+        .older = older,
+        .unreadable = unreadable,
+        .invalid = invalid,
+        .scan_limit = if (scanned_all) null else self.names_scanned_max,
+    };
 }
 
 pub fn read(self: *const Gists, gpa: std.mem.Allocator, io: std.Io, id: *const Id) ReadError![]u8 {
@@ -140,24 +188,21 @@ fn readEntry(
     self: *Gists,
     io: std.Io,
     dir: std.Io.Dir,
-    id: *const Id,
-    name: []const u8,
+    candidate: *const Candidate,
 ) error{ OutOfMemory, Canceled }!Found {
-    const stat = dir.statFile(io, name, .{}) catch |err| switch (err) {
-        error.Canceled => return error.Canceled,
-        else => return .unreadable,
-    };
     const arena = self.arena.allocator();
-    const text = dir.readFileAlloc(io, name, arena, .limited(text_bytes_max)) catch |err|
+    const name = fileName(&candidate.id);
+    const text = dir.readFileAlloc(io, &name, arena, .limited(text_bytes_max)) catch |err|
         switch (err) {
             error.OutOfMemory, error.Canceled => |known| return known,
+            error.FileNotFound => return .deleted,
             else => return .unreadable,
         };
     const parsed = parse(text) orelse return .invalid;
     return .{ .gist = .{
-        .id = id.*,
+        .id = candidate.id,
         .title = parsed.title,
-        .saved_ms = stat.mtime.toMilliseconds(),
+        .saved_ms = candidate.saved_ms,
     } };
 }
 
@@ -177,7 +222,7 @@ fn parseName(name: []const u8) ?Id {
     return id;
 }
 
-fn newerFirst(_: void, left: Entry, right: Entry) bool {
+fn newerFirst(_: void, left: Candidate, right: Candidate) bool {
     if (left.saved_ms != right.saved_ms) return left.saved_ms > right.saved_ms;
     return std.mem.lessThan(u8, &left.id, &right.id);
 }
@@ -205,7 +250,7 @@ test "the first line with text titles a gist, and a text without visible charact
 test "gist listings and reads release every partial allocation" {
     var tree: testing.Tree = try .init();
     defer tree.deinit();
-    var gists: Gists = try .init(std.testing.allocator, tree.root);
+    var gists: Gists = try .init(std.testing.allocator, tree.root, .{});
     defer gists.deinit();
     try gists.save(std.testing.io, "Title");
     try std.testing.checkAllAllocationFailures(
@@ -217,10 +262,60 @@ test "gist listings and reads release every partial allocation" {
 
 fn checkStore(gpa: std.mem.Allocator, root: []const u8) !void {
     const io = std.testing.io;
-    var gists: Gists = try .init(gpa, root);
+    var gists: Gists = try .init(gpa, root, .{});
     defer gists.deinit();
     const listing = try gists.list(io);
     try std.testing.expectEqual(@as(usize, 1), listing.entries.len);
     const text = try gists.read(gpa, io, &listing.entries[0].id);
     defer gpa.free(text);
+}
+
+test "a listing reads the newest gists until the list is full and counts the older gists" {
+    var tree: testing.Tree = try .init();
+    defer tree.deinit();
+    for (1..listed_max + 3) |seconds| try writeGist(&tree, seconds, "Gist");
+    try writeGist(&tree, 1000, " \n");
+    var gists: Gists = try .init(std.testing.allocator, tree.root, .{});
+    defer gists.deinit();
+    const listing = try gists.list(std.testing.io);
+    try std.testing.expectEqual(@as(usize, listed_max), listing.entries.len);
+    for (listing.entries, 0..) |entry, index| {
+        const seconds: i64 = @intCast(listed_max + 2 - index);
+        try std.testing.expectEqual(seconds * std.time.ms_per_s, entry.saved_ms);
+    }
+    try std.testing.expectEqual(@as(usize, 2), listing.older);
+    try std.testing.expectEqual(@as(usize, 1), listing.invalid);
+    try std.testing.expectEqual(@as(usize, 0), listing.unreadable);
+    try std.testing.expectEqual(@as(?usize, null), listing.scan_limit);
+}
+
+test "a listing reports the scan limit only when the directory holds more entries" {
+    var tree: testing.Tree = try .init();
+    defer tree.deinit();
+    for (1..4) |seconds| try writeGist(&tree, seconds, "Gist");
+    const cases = [_]struct { names_scanned_max: usize, listed: usize, scan_limit: ?usize }{
+        .{ .names_scanned_max = 3, .listed = 3, .scan_limit = null },
+        .{ .names_scanned_max = 2, .listed = 2, .scan_limit = 2 },
+    };
+    for (cases) |case| {
+        var gists: Gists = try .init(std.testing.allocator, tree.root, .{
+            .names_scanned_max = case.names_scanned_max,
+        });
+        defer gists.deinit();
+        const listing = try gists.list(std.testing.io);
+        try std.testing.expectEqual(case.listed, listing.entries.len);
+        try std.testing.expectEqual(case.scan_limit, listing.scan_limit);
+    }
+}
+
+fn writeGist(tree: *testing.Tree, seconds: usize, text: []const u8) !void {
+    const io = std.testing.io;
+    var buffer: [32]u8 = undefined;
+    const sub_path = try std.mem.print(&buffer, ".drinky/gists/{x:0>12}.md", .{seconds});
+    try tree.write(sub_path, text);
+    var file = try tree.tmp.dir.openFile(io, sub_path, .{ .mode = .read_write });
+    defer file.close(io);
+    try file.setTimestamps(io, .{ .modify_timestamp = .{
+        .new = .fromNanoseconds(@as(i96, seconds) * std.time.ns_per_s),
+    } });
 }

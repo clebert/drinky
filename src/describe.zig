@@ -206,12 +206,15 @@ fn writeCommands(writer: *std.Io.Writer) !void {
         \\decisions, the learnings, the completed and remaining work, and the pending user
         \\decisions. It describes the current state of the work, not its history.
         \\
-        \\`/gists` lists the gists in `~/.drinky/gists/`, with the newest gist first. All
-        \\repositories and working directories share these gists. A row shows the title and the
-        \\age of the gist. The list hides each invalid gist file. An invalid file holds only
-        \\spaces, tabs, and line breaks, or it holds invalid UTF-8 or a NUL byte. The list also
-        \\hides the gist files that Drinky cannot read. A notice gives the count of each kind and
-        \\the directory.
+        \\`/gists` lists the newest gists in `~/.drinky/gists/`, with the newest gist first. All
+        \\repositories and working directories share these gists. When the list leaves out older
+        \\gist files, the title shows the count of the listed gists and of the gist files that the
+        \\scan finds. A row shows the title and the age of the gist. The list hides each invalid
+        \\gist file. An invalid file holds only spaces, tabs, and line breaks, or it holds invalid
+        \\UTF-8 or a NUL byte. The list also hides the gist files that Drinky cannot read. A notice
+        \\gives the count of each kind and the directory. The list checks the text only of the gist
+        \\files that it reads. A warning tells when the directory holds too many entries for a
+        \\complete scan. This warning replaces the notice with the counts.
         \\Enter opens the selected gist in a read-only page. A applies the gist. Esc, Ctrl+C, and
         \\Ctrl+D close only the page and return to the list.
         \\An apply clears the conversation as /new does and sends the gist inside `<gist>` tags
