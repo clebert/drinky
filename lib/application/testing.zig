@@ -459,7 +459,10 @@ pub const Reduction = struct {
 
     pub fn flush(self: *Reduction) void {
         const value: State = .{
-            .work = if (self.surface.turn == null) .idle else .{ .turn = 1 },
+            .work = if (self.surface.turn == null)
+                .idle
+            else
+                .{ .turn = .{ .operation = 1, .waiting = 0 } },
             .choice = self.surface.choice,
         };
         const unchanged = std.meta.eql(self.published.work, value.work) and

@@ -15,7 +15,7 @@ branch: ?[]const u8 = null,
 
 pub const Work = union(enum) {
     idle,
-    turn: u64,
+    turn: Turn,
     aside: u64,
     sign_in: SignIn,
     fetch: Fetch,
@@ -23,12 +23,14 @@ pub const Work = union(enum) {
     pub fn operation(self: *const Work) ?u64 {
         return switch (self.*) {
             .idle => null,
-            .turn, .aside => |id| id,
+            .turn => |turn| turn.operation,
+            .aside => |id| id,
             .sign_in => |sign_in| sign_in.operation,
             .fetch => |fetch| fetch.operation,
         };
     }
 };
+pub const Turn = struct { operation: u64, waiting: usize };
 pub const SignIn = struct { operation: u64, account: usize, callback: bool };
 pub const Fetch = struct { operation: u64, account: usize };
 pub const Offer = union(enum) {

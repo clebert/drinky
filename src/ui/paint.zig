@@ -1531,7 +1531,7 @@ test "a notice prefix opens its first row alone" {
 test "a head notice keeps one row and marks its cut" {
     const gpa = std.testing.allocator;
     const style: NoticeStyle = .{ .role = .muted, .fit = .{ .head = null } };
-    const text = "Drinky sends no message while a turn runs.\nnot another row";
+    const text = "Drinky sends no message until the canceled turn ends.\nnot another row";
     try std.testing.expectEqual(@as(usize, 1), noticeRows(&style, text, 16));
 
     const plain = try paintedNotice(gpa, &style, text, 16);

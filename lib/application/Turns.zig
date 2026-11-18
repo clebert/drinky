@@ -14,6 +14,7 @@ pub const Turn = struct {
     range: Transcript.Range,
     prompt: ?Prompt,
     mutated: bool,
+    joined: std.ArrayList([]const u8) = .empty,
     end: ?End = null,
 };
 
@@ -98,16 +99,35 @@ pub fn end(self: *Turns, block_count: usize, ended: *const End) error{OutOfMemor
     turn.range.end = block_count;
 }
 
+pub fn join(self: *Turns, text: []const u8) error{OutOfMemory}!void {
+    const joined = &self.last().joined;
+    try joined.ensureUnusedCapacity(self.gpa, 1);
+    joined.appendAssumeCapacity(try self.gpa.dupe(u8, text));
+}
+
 pub fn takePrompt(self: *Turns, index: usize) ?Prompt {
     const turn = &self.list.items[index];
     defer turn.prompt = null;
     return turn.prompt;
 }
 
+pub fn takeJoined(self: *Turns, index: usize) std.ArrayList([]const u8) {
+    const turn = &self.list.items[index];
+    defer turn.joined = .empty;
+    return turn.joined;
+}
+
+pub fn releaseJoined(gpa: std.mem.Allocator, joined: *std.ArrayList([]const u8)) void {
+    for (joined.items) |text| gpa.free(text);
+    joined.deinit(gpa);
+    joined.* = .empty;
+}
+
 pub fn truncate(self: *Turns, count: usize) void {
     std.debug.assert(count <= self.list.items.len);
-    for (self.list.items[count..]) |turn| {
+    for (self.list.items[count..]) |*turn| {
         if (turn.prompt) |*prompt| prompt.deinit(self.gpa);
+        releaseJoined(self.gpa, &turn.joined);
         const ended = turn.end orelse continue;
         ended.outcome.deinit(self.gpa);
         self.gpa.free(ended.answer);
@@ -117,4 +137,23 @@ pub fn truncate(self: *Turns, count: usize) void {
 
 fn last(self: *Turns) *Turn {
     return self.list.lastPtr().?;
+}
+
+test "each joined message is freed after a take or a truncate, and a failed copy leaks nothing" {
+    try std.testing.checkAllAllocationFailures(
+        core.testing.no_resize_allocator,
+        checkJoinAllocations,
+        .{},
+    );
+}
+
+fn checkJoinAllocations(gpa: std.mem.Allocator) error{OutOfMemory}!void {
+    var turns: Turns = .init(gpa);
+    defer turns.deinit();
+    try turns.begin(&.{ .id = 1, .start = 0, .prompt = .{ .line = "First." } });
+    try turns.join("Also.");
+    var taken = turns.takeJoined(0);
+    releaseJoined(gpa, &taken);
+    try turns.begin(&.{ .id = 2, .start = 0, .prompt = .{ .line = "Second." } });
+    try turns.join("More.");
 }

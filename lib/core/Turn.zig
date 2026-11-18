@@ -22,6 +22,8 @@ gpa: std.mem.Allocator,
 io: std.Io,
 options: Session.Options,
 conversation: *Conversation,
+prompts: *std.ArrayList(Session.Prompt),
+waiting: *Session.Waiting,
 setup: *const Session.Setup,
 measured: ?Measured,
 
@@ -346,6 +348,7 @@ fn rounds(self: *Turn) Session.Outcome {
             error.OutOfMemory => fatal.outOfMemory(),
         };
         if (!calls and !loaded) return .{ .stopped = reason };
+        if (round + 1 < rounds_max) self.joinWaiting();
     }
     return .exhausted;
 }
@@ -633,6 +636,19 @@ fn loadSkills(self: *Turn) Runner.Error!bool {
         loaded = true;
     }
     return loaded;
+}
+
+fn joinWaiting(self: *Turn) void {
+    var texts = self.waiting.take(self.io);
+    defer texts.deinit(self.gpa);
+    const items = &self.conversation.items;
+    items.ensureUnusedCapacity(self.gpa, texts.items.len) catch fatal.outOfMemory();
+    self.prompts.ensureUnusedCapacity(self.gpa, texts.items.len) catch fatal.outOfMemory();
+    for (texts.items) |text| {
+        self.prompts.appendAssumeCapacity(.{ .item = items.items.len, .turn = null });
+        items.appendAssumeCapacity(.{ .message = .{ .role = .user, .text = text } });
+        self.emit(&.{ .message_joined = text });
+    }
 }
 
 fn commit(self: *Turn, staging: *Staging) error{OutOfMemory}!void {

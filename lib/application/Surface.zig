@@ -92,6 +92,7 @@ pub const Statistics = struct {
             .model_served,
             .attempt_failed,
             .skill_loaded,
+            .message_joined,
             .retry_started,
             .turn_ended,
             => {},

@@ -88,6 +88,12 @@ pub fn apply(
             try self.transcript.append(&.{ .user_note = .{ .skill = loaded.* } }, .{});
             self.transcript.closeWork(&.{ .time_ms = time.awake_ms, .status = .complete });
         },
+        .message_joined => |text| {
+            finishThinking(self);
+            self.transcript.endMessage();
+            self.transcript.closeWork(&.{ .time_ms = time.awake_ms, .status = .complete });
+            try self.transcript.append(&.{ .user = text }, .{});
+        },
         .retry_started => |start| {
             const source: Record.Source = switch (start) {
                 .resent => .{ .event = .conversation_resent },
@@ -301,6 +307,43 @@ fn lastLive(reduction: *const testing.Reduction) ?*const Live {
     return null;
 }
 
+test "a joined message stays in the transcript when a later attempt fails" {
+    var reduction: testing.Reduction = undefined;
+    reduction.init(std.testing.allocator, .{ .effort = .high });
+    defer reduction.deinit();
+    try reduction.start("prompt");
+    const events = [_]core.Session.Event{
+        .{ .tool_call_started = "read" },
+        .{ .tool_started = .{ .id = "call", .name = "read", .arguments = "{}" } },
+        .{ .tool_result = .{
+            .call = .{ .id = "call", .name = "read", .arguments = "{}" },
+            .output = .{ .content = "text" },
+        } },
+        .committed,
+        .{ .message_joined = "Also." },
+        .reasoning_started,
+        .{ .reasoning = "lost" },
+        .{ .tail_discarded = 1 },
+        .{ .attempt_failed = .{
+            .attempt = 1,
+            .failure = .{ .reason = .overloaded },
+            .delay_ms = 0,
+        } },
+        .text_started,
+        .{ .text = "answer" },
+        .committed,
+    };
+    for (&events) |*event| _ = try reduction.apply(event, .{ .awake_ms = 1, .boot_ms = 1 });
+    var records: [16]Record = undefined;
+    const entries = reduction.surface.transcript.entries();
+    for (entries, records[0..entries.len]) |*entry, *record| record.* = entry.record;
+    try testing.expectUsers(records[0..entries.len], &.{ "prompt", "Also." });
+    const joined = for (entries, 0..) |*entry, index| {
+        if (entry.record.content == .user and index > 0) break index;
+    } else unreachable;
+    try std.testing.expect(entries[joined - 1].record.work.?.end != null);
+}
+
 test "a turn reduction frees each partial allocation" {
     try std.testing.checkAllAllocationFailures(
         core.testing.no_resize_allocator,
@@ -332,6 +375,8 @@ fn checkReductionAllocations(gpa: std.mem.Allocator) error{OutOfMemory}!void {
         .{ .tool_call_arguments = call.arguments },
         .{ .tool_started = call },
         .{ .tool_result = .{ .call = call, .output = .{ .content = "text" } } },
+        .committed,
+        .{ .message_joined = "Also." },
         .text_started,
         .{ .text = "answer" },
         .{ .model_served = .{ .requested = "requested", .served = "served" } },

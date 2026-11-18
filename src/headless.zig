@@ -97,6 +97,7 @@ const Listener = struct {
             .state,
             .clear_conversation,
             .paste_replayed,
+            .messages_returned,
             .sign_in_ended,
             .fetch_ended,
             .no_account,

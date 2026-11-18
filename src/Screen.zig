@@ -298,6 +298,7 @@ pub fn changeOf(event: *const application.Event) ?Change {
         .state,
         .paste_replayed,
         .turn_ended,
+        .messages_returned,
         .sign_in_ended,
         .fetch_ended,
         .no_account,
@@ -800,6 +801,7 @@ pub fn paint(
                 .turn = .{
                     .work = work,
                     .activity = self.animation.activity(&.{ .grows = true }),
+                    .caption = caption.*,
                     .editor = &self.editor,
                 },
             };

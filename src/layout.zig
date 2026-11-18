@@ -43,6 +43,7 @@ pub const Tail = union(enum) {
     const Turn = struct {
         work: ?Work,
         activity: ui.paint.Activity,
+        caption: ?ui.Caption,
         editor: *const ui.Editor,
     };
 };
@@ -298,7 +299,7 @@ fn tailSlot(tail: *const Tail, offset: usize) Slot {
             return editorSlot(&.{
                 .editor = turn.editor,
                 .activity = turn.activity,
-                .caption = null,
+                .caption = turn.caption,
             });
         },
     }
@@ -387,6 +388,7 @@ const Rig = struct {
     const TurnOptions = struct {
         window_pages: usize = application.Settings.window_pages_default,
         work: ?Work = null,
+        caption: ?ui.Caption = null,
     };
 
     fn init() Rig {
@@ -430,6 +432,7 @@ const Rig = struct {
             .tail = .{ .turn = .{
                 .work = options.work,
                 .activity = .{ .motion = .{ .segment = .{ .style = .sweep, .tick = 0 } } },
+                .caption = options.caption,
                 .editor = &self.editor,
             } },
             .status = &test_status,
@@ -478,7 +481,7 @@ test "frame edge activity does not change the input tail height" {
     );
 }
 
-test "a prompt tail shows its input caption above the editor" {
+test "the prompt and turn tails show the editor caption above the editor" {
     const gpa = std.testing.allocator;
     var rig: Rig = .init();
     defer rig.deinit();
@@ -489,52 +492,60 @@ test "a prompt tail shows its input caption above the editor" {
         .severity = .failure,
     } });
 
-    const scene = rig.prompt(&.{ .caption = .{
-        .title = "Sign in: anthropic-plan",
-        .controls = "Enter: Replay callback URL · Esc: Cancel",
-    } });
-    const painted = try projected(gpa, .{ .columns = 80, .rows = 24 }, &scene);
-    defer gpa.free(painted);
+    const scenes = [_][2]Scene{
+        .{ rig.prompt(&.{ .caption = editor_caption }), rig.prompt(&.{}) },
+        .{ rig.turn(&.{ .caption = editor_caption }), rig.turn(&.{}) },
+    };
+    for (&scenes) |*pair| {
+        const painted = try projected(gpa, .{ .columns = 80, .rows = 24 }, &pair[0]);
+        defer gpa.free(painted);
 
-    const failure = std.mem.find(u8, painted, "the turn failed").?;
-    const title = std.mem.find(u8, painted, "Sign in: anthropic-plan").?;
-    const control = std.mem.find(u8, painted, "Enter: Replay callback URL").?;
-    const draft = std.mem.find(u8, painted, "draft text").?;
-    const footer = std.mem.find(u8, painted, "footerqq").?;
-    try std.testing.expect(failure < title);
-    try std.testing.expect(title < control);
-    try std.testing.expect(control < draft);
-    try std.testing.expect(draft < footer);
+        const failure = std.mem.find(u8, painted, "the turn failed").?;
+        const title = std.mem.find(u8, painted, "Sign in: anthropic-plan").?;
+        const control = std.mem.find(u8, painted, "Enter: Replay callback URL").?;
+        const draft = std.mem.find(u8, painted, "draft text").?;
+        const footer = std.mem.find(u8, painted, "footerqq").?;
+        try std.testing.expect(failure < title);
+        try std.testing.expect(title < control);
+        try std.testing.expect(control < draft);
+        try std.testing.expect(draft < footer);
 
-    const bare = rig.prompt(&.{});
-    const without = try projected(gpa, .{ .columns = 80, .rows = 24 }, &bare);
-    defer gpa.free(without);
-    try ui.testing.expectHides(without, &.{"Sign in"});
-    try std.testing.expectEqual(
-        ui.testing.paintedRows(painted),
-        ui.testing.paintedRows(without) + 1,
-    );
+        const without = try projected(gpa, .{ .columns = 80, .rows = 24 }, &pair[1]);
+        defer gpa.free(without);
+        try ui.testing.expectHides(without, &.{"Sign in"});
+        try std.testing.expectEqual(
+            ui.testing.paintedRows(painted),
+            ui.testing.paintedRows(without) + 1,
+        );
+    }
 }
 
-test "a narrow editor caption keeps every row inside the window" {
+const editor_caption: ui.Caption = .{
+    .title = "Sign in: anthropic-plan",
+    .controls = "Enter: Replay callback URL · Esc: Cancel",
+};
+
+test "a narrow editor caption keeps every row inside the window in both tails" {
     const gpa = std.testing.allocator;
     var rig: Rig = .init();
     defer rig.deinit();
 
-    const scene = rig.prompt(&.{ .caption = .{
-        .title = "Sign in: anthropic-plan",
-        .controls = "Enter: Replay callback URL · Esc: Cancel",
-    } });
-    const painted = try projected(gpa, .{ .columns = 8, .rows = 24 }, &scene);
-    defer gpa.free(painted);
-    const plain = try terminal.testing.plainText(gpa, painted);
-    defer gpa.free(plain);
-    var lines = std.mem.splitSequence(u8, plain, "\r\n");
-    while (lines.next()) |row| {
-        const line = std.mem.trimEnd(u8, row, "\r");
-        try std.testing.expect(terminal.width.ofText(line) <= 8);
+    const scenes = [_]Scene{
+        rig.prompt(&.{ .caption = editor_caption }),
+        rig.turn(&.{ .caption = editor_caption }),
+    };
+    for (&scenes) |*scene| {
+        const painted = try projected(gpa, .{ .columns = 8, .rows = 24 }, scene);
+        defer gpa.free(painted);
+        const plain = try terminal.testing.plainText(gpa, painted);
+        defer gpa.free(plain);
+        var lines = std.mem.splitSequence(u8, plain, "\r\n");
+        while (lines.next()) |row| {
+            const line = std.mem.trimEnd(u8, row, "\r");
+            try std.testing.expect(terminal.width.ofText(line) <= 8);
+        }
+        try ui.testing.expectShows(plain, &.{ui.paint.ellipsis});
     }
-    try ui.testing.expectShows(plain, &.{ui.paint.ellipsis});
 }
 
 test "projection clips the oldest block to fill the window exactly" {

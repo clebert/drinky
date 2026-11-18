@@ -150,7 +150,8 @@ pub const definitions = [_]Definition{
         .name = "list_turns",
         .description = "List the prompts of the conversation, with the oldest prompt first. " ++
             "Each prompt has the operation id of its turn. A turn that applied a gist " ++
-            "has the gist title as its prompt and gist set to true.",
+            "has the gist title as its prompt and gist set to true. A message that joined " ++
+            "a running turn gets no entry.",
         .hints = read_only,
     },
     .{

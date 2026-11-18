@@ -544,6 +544,7 @@ const Changes = struct {
             .clear_conversation,
             .paste_replayed,
             .turn_ended,
+            .messages_returned,
             .sign_in_ended,
             .fetch_ended,
             .no_account,

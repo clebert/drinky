@@ -614,6 +614,7 @@ fn writeEvent(writer: *std.Io.Writer, event: *const Session.Event) std.Io.Writer
             skill.name,
             skill.source,
         }),
+        .message_joined => |text| try writer.print("message_joined:{s}", .{text}),
         .retry_started => |start| try writer.print("retry_started:{t}", .{start}),
         .turn_ended => |*outcome| {
             try writer.writeAll("turn_ended:");

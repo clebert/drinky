@@ -20,7 +20,8 @@ io: std.Io,
 options: Options,
 conversation: Conversation,
 turn_count: usize,
-turn_starts: std.ArrayList(TurnStart),
+prompts: std.ArrayList(Prompt),
+waiting: Waiting,
 setup: ?Setup,
 clear_pending: bool,
 measured: ?Turn.Measured,
@@ -37,9 +38,44 @@ pub const Options = struct {
 
 pub const Sink = actor.Sink(Event);
 
-pub const TurnStart = struct {
-    turn: usize,
+pub const Prompt = struct {
     item: usize,
+    turn: ?usize,
+};
+
+pub const Waiting = struct {
+    mutex: std.Io.Mutex,
+    texts: std.ArrayList([]const u8),
+
+    const init: Waiting = .{ .mutex = .init, .texts = .empty };
+
+    pub fn release(gpa: std.mem.Allocator, texts: *std.ArrayList([]const u8)) void {
+        for (texts.items) |text| gpa.free(text);
+        texts.deinit(gpa);
+    }
+
+    pub fn take(self: *Waiting, io: std.Io) std.ArrayList([]const u8) {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        const texts = self.texts;
+        self.texts = .empty;
+        return texts;
+    }
+
+    fn put(
+        self: *Waiting,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        text: []const u8,
+    ) error{OutOfMemory}!void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        try self.texts.append(gpa, text);
+    }
+
+    fn deinit(self: *Waiting, gpa: std.mem.Allocator) void {
+        release(gpa, &self.texts);
+    }
 };
 
 pub const Setup = struct {
@@ -130,6 +166,7 @@ pub const Event = union(enum) {
     model_served: ModelServed,
     attempt_failed: Attempt,
     skill_loaded: SkillLoaded,
+    message_joined: []const u8,
     retry_started: RetryStart,
     turn_ended: Outcome,
 
@@ -197,6 +234,7 @@ pub const Event = union(enum) {
                     .source = try gpa.dupe(u8, skill.source),
                 } };
             },
+            .message_joined => |text| .{ .message_joined = try gpa.dupe(u8, text) },
             .turn_ended => |*outcome| .{ .turn_ended = try outcome.dupe(gpa) },
             .setup_dropped,
             .text_started,
@@ -221,6 +259,7 @@ pub const Event = union(enum) {
             .reasoning,
             .tool_call_started,
             .tool_call_arguments,
+            .message_joined,
             => |bytes| gpa.free(bytes),
             .aside_ended => |*outcome| outcome.deinit(gpa),
             .tool_started => |*call| call.deinit(gpa),
@@ -296,7 +335,8 @@ pub fn init(gpa: std.mem.Allocator, io: std.Io, options: *const Options) Session
         .options = options.*,
         .conversation = .init(io),
         .turn_count = 0,
-        .turn_starts = .empty,
+        .prompts = .empty,
+        .waiting = .init,
         .setup = null,
         .clear_pending = false,
         .measured = null,
@@ -318,13 +358,24 @@ pub fn deinit(self: *Session) void {
     if (self.setup) |*setup| setup.deinit(self.gpa);
     if (self.measured) |*measured| measured.deinit(self.gpa);
     self.dropAside();
-    self.turn_starts.deinit(self.gpa);
+    self.waiting.deinit(self.gpa);
+    self.prompts.deinit(self.gpa);
     self.conversation.deinit(self.gpa);
 }
 
 pub fn send(self: *Session, command: *const Command) error{OutOfMemory}!void {
     const mail: Mail = .{ .command = try command.dupe(self.gpa) };
     self.mailbox.send(self.io, mail) catch mail.deinit(self.gpa);
+}
+
+pub fn putWaiting(self: *Session, text: []const u8) error{OutOfMemory}!void {
+    const copy = try self.gpa.dupe(u8, text);
+    errdefer self.gpa.free(copy);
+    try self.waiting.put(self.gpa, self.io, copy);
+}
+
+pub fn takeWaiting(self: *Session) std.ArrayList([]const u8) {
+    return self.waiting.take(self.io);
 }
 
 fn run(self: *Session) void {
@@ -393,6 +444,8 @@ fn startTurn(self: *Session) void {
         .io = self.io,
         .options = self.options,
         .conversation = &self.conversation,
+        .prompts = &self.prompts,
+        .waiting = &self.waiting,
         .setup = &self.setup.?,
         .measured = null,
     };
@@ -401,10 +454,10 @@ fn startTurn(self: *Session) void {
 }
 
 fn appendPrompt(self: *Session, turn: usize, text: []const u8) error{OutOfMemory}!void {
-    try self.turn_starts.ensureUnusedCapacity(self.gpa, 1);
+    try self.prompts.ensureUnusedCapacity(self.gpa, 1);
     const item = self.conversation.items.items.len;
     try self.conversation.append(self.gpa, .{ .message = .{ .role = .user, .text = text } });
-    self.turn_starts.appendAssumeCapacity(.{ .turn = turn, .item = item });
+    self.prompts.appendAssumeCapacity(.{ .item = item, .turn = turn });
 }
 
 fn runTurn(lent: Turn) Mail {
@@ -423,7 +476,7 @@ fn ask(self: *Session, request: Aside.Request) void {
         .setup = &self.setup.?,
         .request = &self.aside.?,
         .conversation = &self.conversation,
-        .turn_starts = self.turn_starts.items,
+        .prompts = self.prompts.items,
     };
     self.mailbox.start(self.io, runAside, .{aside}) catch {
         self.dropAside();
@@ -460,7 +513,7 @@ fn requestClear(self: *Session) void {
 fn clear(self: *Session) void {
     self.conversation.clear(self.gpa, self.io);
     self.turn_count = 0;
-    self.turn_starts.clearRetainingCapacity();
+    self.prompts.clearRetainingCapacity();
     self.forgetMeasured();
     self.options.runner.reset();
     self.emit(&.{ .context = 0 });
@@ -468,11 +521,11 @@ fn clear(self: *Session) void {
 
 fn rewind(self: *Session, turn: usize) void {
     std.debug.assert(!self.mailbox.busy());
-    const kept = for (self.turn_starts.items, 0..) |turn_start, index| {
-        if (turn_start.turn == turn) break index;
+    const kept = for (self.prompts.items, 0..) |entry, index| {
+        if (entry.turn == turn) break index;
     } else unreachable;
-    self.conversation.truncate(self.gpa, self.turn_starts.items[kept].item);
-    self.turn_starts.shrinkRetainingCapacity(kept);
+    self.conversation.truncate(self.gpa, self.prompts.items[kept].item);
+    self.prompts.shrinkRetainingCapacity(kept);
     self.turn_count = turn;
     self.forgetMeasured();
     self.options.runner.reset();
@@ -633,6 +686,13 @@ const fixture = struct {
 
     fn message(text: []const u8) Provider.Event {
         return .{ .output = .{ .message = text } };
+    }
+
+    fn expectWaiting(session: *Session, expected: []const []const u8) !void {
+        var texts = session.takeWaiting();
+        defer Waiting.release(session.gpa, &texts);
+        try std.testing.expectEqual(expected.len, texts.items.len);
+        for (expected, texts.items) |text, taken| try std.testing.expectEqualStrings(text, taken);
     }
 
     fn toolCall(value: Tool.Call) Provider.Event {
@@ -1940,6 +2000,77 @@ test "a queued skill joins the conversation at the round boundary and starts a r
     try std.testing.expectEqual(@as(usize, 3), harness.runner.history_items);
 }
 
+test "a waiting message joins after tool results and stays after a final reply or a cancel" {
+    var harness: testing.Harness = undefined;
+    try harness.init(std.testing.allocator, std.testing.io, &.{});
+    defer harness.deinit();
+
+    harness.provider.load(&.{
+        .{ .done = &.{ fixture.toolCall(fixture.call), fixture.stop_complete } },
+        .{ .done = &.{ fixture.message("one"), fixture.stop_complete } },
+        .{ .done = &.{ fixture.message("two"), fixture.stop_complete } },
+        .{ .open = &.{.{ .text = "I read " }} },
+    });
+    try harness.session.putWaiting("Also.");
+    try std.testing.expectEqualStrings(
+        \\tool_call_started:read
+        \\tool_started:c1
+        \\tool_result:c1:done
+        \\committed
+        \\message_joined:Also.
+        \\text_started
+        \\text:one
+        \\committed
+        \\turn_ended:complete
+    , try harness.turn("hi"));
+    try harness.session.putWaiting("Late.");
+    _ = try harness.turn("next");
+    try fixture.expectWaiting(&harness.session, &.{"Late."});
+
+    try harness.prompt("again");
+    try harness.expect("text_started");
+    try harness.expect("text:I read ");
+    try harness.session.putWaiting("Canceled.");
+    try harness.session.send(&.cancel);
+    _ = try harness.until("turn_ended:canceled");
+    try fixture.expectWaiting(&harness.session, &.{"Canceled."});
+    try std.testing.expectEqualStrings(
+        "model-a|user:hi|call:c1:read:{\"path\":\"a.txt\"}|result:c1:done|user:Also.",
+        harness.provider.requests.items[1],
+    );
+    try std.testing.expectEqualStrings(
+        "model-a|user:hi|call:c1:read:{\"path\":\"a.txt\"}|result:c1:done|user:Also.|" ++
+            "assistant:one|user:next",
+        harness.provider.requests.items[2],
+    );
+}
+
+test "a rewind drops the messages that joined the dropped turns, and an aside keeps the others" {
+    var harness: testing.Harness = undefined;
+    try harness.init(std.testing.allocator, std.testing.io, &.{});
+    defer harness.deinit();
+
+    harness.provider.load(&.{
+        .{ .done = &.{ fixture.toolCall(fixture.call), fixture.stop_complete } },
+        .{ .done = &.{ fixture.message("one"), fixture.stop_complete } },
+        .{ .done = &.{ fixture.toolCall(fixture.next_call), fixture.stop_complete } },
+        .{ .done = &.{ fixture.message("two"), fixture.stop_complete } },
+        .{ .done = &.{ fixture.message("Gist."), fixture.stop_complete } },
+    });
+    try harness.session.putWaiting("a2");
+    _ = try harness.turn("a");
+    try harness.session.putWaiting("b2");
+    _ = try harness.turn("b");
+    try harness.session.send(&.{ .rewind = 1 });
+    try harness.expect("context:none");
+    try harness.session.send(&.{ .aside = fixture.gist });
+    _ = try harness.until("aside_ended");
+    try std.testing.expectEqualStrings(
+        "model-a|user:a|user:a2|assistant:one|user:Write the gist.",
+        harness.provider.requests.items[4],
+    );
+}
+
 test "every request carries the cache key of its conversation, and a clear takes a new one" {
     var harness: testing.Harness = undefined;
     try harness.init(std.testing.allocator, std.testing.io, &.{});
@@ -2135,6 +2266,7 @@ test "a copy of each event owns its bytes, and a failed copy leaks nothing" {
         .{ .tool_result = .{ .call = call, .output = .{ .content = "done" } } },
         .{ .model_served = .{ .requested = "a", .served = "b" } },
         .{ .skill_loaded = .{ .name = "zig-style", .source = "SKILL.md" } },
+        .{ .message_joined = "Also." },
         .{ .turn_ended = .canceled },
         .{ .turn_ended = .{ .failed = failure } },
         .{ .attempt_failed = .{ .attempt = 1, .failure = failure, .delay_ms = 0 } },

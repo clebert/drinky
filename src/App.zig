@@ -18,7 +18,9 @@ const ui = @import("ui/root.zig");
 const wording = @import("wording.zig");
 const App = @This();
 const turn_cancel_notice = "Press Esc again to cancel the turn. The draft stays.";
-const turn_message_notice = "Drinky sends no message while a turn runs. The draft stays.";
+const clear_notice = "Press Ctrl+C again to clear the editor.";
+const turn_message_notice =
+    "Drinky sends no message until the canceled turn ends. The draft stays.";
 const fetch_message_notice = "Drinky sends no message while a model fetch runs. The draft stays.";
 const fetch_cancel_notice = "You canceled the model fetch.";
 const access_failure = "Drinky could not turn on MCP access because of error {s}.";
@@ -40,6 +42,7 @@ const gist_removal_caption: ui.Caption = .{
     .controls = "Ctrl+N: Remove and review · Esc: Keep turn",
     .rows_max = Screen.editor_caption_rows_max,
 };
+const waiting_controls = "Ctrl+N: Edit · Esc: Cancel turn";
 const intro_text = blk: {
     var line: []const u8 = "";
     for (reference.key_hints) |hint| line = line ++ hint ++ ui.paint.separator;
@@ -62,6 +65,7 @@ running: bool = false,
 dirty: bool = false,
 ctrl_c_ms_last: i64 = -reference.repeat_window_ms,
 ctrl_d_ms_last: i64 = -reference.repeat_window_ms,
+waiting_end_ms: i64 = -reference.repeat_window_ms,
 escape: ?PendingEscape = null,
 queue: std.Io.Queue(UiEvent),
 queue_buffer: [queue_capacity]UiEvent = undefined,
@@ -193,6 +197,8 @@ const Transition = union(enum) {
 const Confirmation = union(enum) {
     message,
     quit,
+    clear,
+    retry,
     removal: u64,
     rewind: u64,
     delete_gist: application.GistId,
@@ -204,7 +210,8 @@ const Confirmation = union(enum) {
             .message, .rewind, .remove_key => event.* == .enter,
             .delete_gist => event.* == .backspace,
             .quit => event.* == .ctrl and event.ctrl == 'd',
-            .removal => event.* == .ctrl and event.ctrl == 'n',
+            .clear => event.* == .ctrl and event.ctrl == 'c',
+            .retry, .removal => event.* == .ctrl and event.ctrl == 'n',
             .cancel => event.* == .escape,
         };
     }
@@ -573,7 +580,7 @@ fn mode(self: *const App) Mode {
     if (self.flow) |*flow| return if (flow.fetch == null) .picker else .picker_fetch;
     return switch (self.work) {
         .idle => if (self.key_step) |*step| .{ .key = step.account } else .prompt,
-        .turn => |operation| .{ .turn = operation },
+        .turn => |turn| .{ .turn = turn.operation },
         .fetch => |fetch| .{ .fetch = fetch },
         .sign_in => |sign_in| .{ .sign_in = sign_in },
         .aside => .page,
@@ -593,11 +600,12 @@ fn disarm(self: *App, event: *const terminal.Input.Key) void {
 fn confirm(self: *App, confirmation: Confirmation, notice: ui.Message) void {
     self.screen.confirm(switch (confirmation) {
         .message => .message,
+        .retry => .retry,
         .removal => .removal,
         .rewind => .rewind,
         .delete_gist => .delete_gist,
         .remove_key => .remove_key,
-        .quit, .cancel => unreachable,
+        .quit, .clear, .cancel => unreachable,
     }, notice);
     self.confirmation = confirmation;
 }
@@ -616,6 +624,15 @@ fn clearDraft(self: *App) void {
 
 fn prependDraft(self: *App, text: []const u8) !void {
     try self.screen.editor.prependText(text);
+}
+
+fn returnDraft(self: *App, texts: []const []const u8) error{OutOfMemory}!void {
+    for (0..texts.len) |offset| {
+        self.prependDraft(texts[texts.len - 1 - offset]) catch |err| switch (err) {
+            error.OutOfMemory, error.Overflow => return error.OutOfMemory,
+            error.PasteAtomSplit => unreachable,
+        };
+    }
 }
 
 fn editKey(self: *App, event: *const terminal.Input.Key) !bool {
@@ -727,7 +744,18 @@ fn caption(self: *const App) ?ui.Caption {
                 .gist => gist_removal_caption,
             },
         },
-        .turn, .picker, .picker_fetch, .page => null,
+        .turn => if (waitingOf(&self.work) > 0) .{
+            .title = self.work_title[0..self.work_title_length],
+            .controls = waiting_controls,
+            .rows_max = Screen.editor_caption_rows_max,
+        } else null,
+        .picker, .picker_fetch, .page => null,
+    };
+}
+fn waitingOf(work: *const application.State.Work) usize {
+    return switch (work.*) {
+        .turn => |turn| turn.waiting,
+        .idle, .aside, .sign_in, .fetch => 0,
     };
 }
 fn applyBatch(self: *App, events: []const UiEvent) !bool {
@@ -790,6 +818,7 @@ fn applyEvent(self: *App, event: *const application.Event) !void {
         .no_account => self.postpone(.no_account),
         .clear_conversation => if (self.serving_remote) self.postpone(.remote_clear),
         .turn_ended => |*ended| self.unseen = unseenOfTurn(ended),
+        .messages_returned => |texts| try self.returnDraft(texts),
         .append_record,
         .record_text,
         .replace_record,
@@ -892,6 +921,8 @@ fn adopt(self: *App, value: *const application.State) void {
     if (self.work == .aside and value.work != .aside) {
         self.unseen = if (value.result) |*result| unseenOfAside(&result.phase) else null;
     }
+    if (waitingOf(&self.work) > 0 and waitingOf(&value.work) == 0)
+        self.waiting_end_ms = self.nowMs();
     self.work = value.work;
     self.offer = value.offer;
     switch (value.work) {
@@ -904,7 +935,14 @@ fn adopt(self: *App, value: *const application.State) void {
             ) catch unreachable;
             self.work_title_length = title.len;
         },
-        .idle, .turn, .aside => {},
+        .turn => |turn| {
+            const title = if (turn.waiting == 1)
+                std.fmt.bufPrint(&self.work_title, "Waiting message", .{})
+            else
+                std.fmt.bufPrint(&self.work_title, "Waiting messages: {d}", .{turn.waiting});
+            self.work_title_length = (title catch unreachable).len;
+        },
+        .idle, .aside => {},
     }
 }
 fn setSignInTitle(self: *App, account: usize) void {
@@ -942,7 +980,10 @@ fn submit(self: *App) !void {
             } });
             if (response.accepted()) self.paste_edits = self.edits;
         },
-        .turn => try self.submitDuringWork(text, .turn),
+        .turn => if (confirmed)
+            try self.sendMessage(text)
+        else
+            try self.submitDuringWork(text, .turn),
         .fetch => try self.submitDuringWork(text, .fetch),
         .prompt => if (confirmed) try self.sendMessage(text) else try self.submitLine(text),
         .picker, .picker_fetch, .page, .key => unreachable,
@@ -1002,6 +1043,11 @@ fn submitLine(self: *App, line: []const u8) !void {
 }
 fn submitDuringWork(self: *App, line: []const u8, work: command.Work) !void {
     const skills = self.controller.listSkills();
+    switch (work) {
+        .turn => if (try command.check(self.gpa, line, skills)) |message|
+            return self.confirm(.message, message),
+        .fetch => {},
+    }
     if (try command.checkDuringWork(self.gpa, line, skills, work)) |message| {
         defer message.deinit(self.gpa);
         return self.showMessage(&message);
@@ -1010,7 +1056,11 @@ fn submitDuringWork(self: *App, line: []const u8, work: command.Work) !void {
     try self.runCommand(command.lookup(command_name).?, command.tail(line, command_name), .line);
 }
 fn sendMessage(self: *App, line: []const u8) !void {
-    const response = try self.send(&.{ .send_message = line });
+    const value: application.Command = switch (self.mode()) {
+        .turn => |operation| .{ .wait_message = .{ .operation = operation, .text = line } },
+        .prompt, .fetch, .picker, .picker_fetch, .page, .sign_in, .key => .{ .send_message = line },
+    };
+    const response = try self.send(&value);
     const refusal = response.refusal orelse return self.clearDraft();
     if (refusal != .busy) return;
     switch (self.mode()) {
@@ -1353,18 +1403,32 @@ fn deleteRow(self: *App) !void {
     try self.presentGists(.{ .reopen = row });
     try self.reportNotice(.information, "Drinky deleted the gist.", .{});
 }
+fn afterWaiting(self: *App) bool {
+    return self.nowMs() - self.waiting_end_ms < reference.repeat_window_ms;
+}
 fn takeOffer(self: *App) !void {
+    const after_waiting = self.afterWaiting();
     switch (self.offer) {
         .none => {},
-        .retry => _ = try self.send(&.retry),
+        .retry => {
+            if (after_waiting and !self.armed(.retry)) return self.confirmTurn(.retry);
+            self.confirmation = null;
+            _ = try self.send(&.retry);
+        },
         .removal => |removal| {
-            if (removal.mutated and !self.armed(.{ .removal = removal.turn }))
+            const warns = removal.mutated or after_waiting;
+            if (warns and !self.armed(.{ .removal = removal.turn }))
                 return self.confirmTurn(.{ .removal = removal.turn });
             self.confirmation = null;
             const response = try self.send(&.{ .remove_canceled_turn = removal.turn });
+            try self.returnDraft(response.joined);
             if (response.recovered) |text| try self.prependDraft(text);
         },
     }
+}
+fn returnMessages(self: *App, operation: u64) !void {
+    if (waitingOf(&self.work) == 0) return;
+    _ = try self.send(&.{ .return_messages = operation });
 }
 fn cancelWork(self: *App, operation: u64) !void {
     _ = try self.send(&.{ .cancel = operation });
@@ -1414,6 +1478,12 @@ fn handleExit(self: *App, exit: Exit, notice_shown: bool) !void {
         .picker, .picker_fetch, .page => false,
     };
     if (exit == .ctrl_c and editing and !self.draftEmpty()) {
+        if (self.afterWaiting() and !self.armed(.clear)) {
+            try self.reportNotice(.warning, clear_notice, .{});
+            self.confirmation = .clear;
+            return;
+        }
+        self.confirmation = null;
         if (current == .prompt) self.clearOrQuit() else self.clearDraft();
         return;
     }
@@ -1460,8 +1530,11 @@ fn handleKey(self: *App, event: *const terminal.Input.Key) !void {
             if (try self.editKey(event)) return;
             switch (event.*) {
                 .enter => try self.submit(),
-                .ctrl => |letter| if (letter == 'n' and self.mode() == .prompt) {
-                    try self.takeOffer();
+                .ctrl => |letter| if (letter == 'n') switch (self.mode()) {
+                    .prompt => try self.takeOffer(),
+                    .turn => |operation| try self.returnMessages(operation),
+                    .fetch, .sign_in, .key => {},
+                    .picker, .picker_fetch, .page => unreachable,
                 },
                 .char,
                 .paste,
@@ -2212,10 +2285,11 @@ test "Ctrl+N removes a canceled turn, keeps the later events, and returns its li
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, rig.lastRequest(), "fix it"));
 }
 
-test "Ctrl+N warns before it removes a canceled turn that ran a mutating tool" {
+test "Ctrl+N warns before it removes a mutating canceled turn, and returns each joined message" {
+    var hold: providers.testing.FakeTransport.Hold = .{ .io = std.testing.io };
     var stall: providers.testing.FakeTransport.Stall = .{ .io = std.testing.io };
     const replies = [_]providers.testing.FakeTransport.Reply{
-        .{ .body = application.testing.write_call_stream },
+        .{ .body = application.testing.write_call_stream, .hold = &hold },
         .{ .stall = &stall },
     };
     var rig: Rig = undefined;
@@ -2225,24 +2299,36 @@ test "Ctrl+N warns before it removes a canceled turn that ran a mutating tool" {
         .model = "gpt-5.6-sol",
     });
     defer rig.deinit();
+    defer hold.released.set(std.testing.io);
 
     try rig.keys("fix it\r");
+    try hold.reached.wait(std.testing.io);
+    try rig.keys("also\r");
+    try rig.waitFor(&.{.{ .text = "Waiting message · " }});
+    hold.released.set(std.testing.io);
     try stall.reached.wait(std.testing.io);
+    try rig.waitFor(&.{ .{ .rows = &.{ "fix it", "also" } }, .{ .absent = "Waiting message" } });
+    try rig.keys("later\r");
+    try rig.waitFor(&.{.{ .text = "Waiting message · " }});
     try rig.keys("\x04");
-    try rig.waitFor(&.{ .{ .text = removal_caption_row }, .{ .activity = false } });
+    try rig.waitFor(&.{
+        .{ .text = removal_caption_row },
+        .{ .activity = false },
+        .{ .editor = "later" },
+    });
     try rig.keys("\x0e");
     try rig.waitFor(&.{.{ .status = removal_warning }});
-    try rig.keys("x\x0e");
+    try rig.keys("\nx\x0e");
     try rig.waitFor(&.{
         .{ .status = removal_warning },
-        .{ .editor = "x" },
+        .{ .editor = "later\nx" },
         .{ .text = canceled_turn_event },
     });
     try rig.keys("\x0e");
     try rig.waitFor(&.{
         .{ .absent = canceled_turn_event },
         .{ .absent = removal_caption_row },
-        .{ .editor = "fix it\nx" },
+        .{ .editor = "fix it\nalso\nlater\nx" },
     });
 }
 
@@ -2825,7 +2911,7 @@ test "verbose uses the startup config and toggles during a turn without sending 
     );
 }
 
-test "command lines during a turn get a notice and keep the draft" {
+test "command lines during a turn get a notice, and a second Enter sends a refused line" {
     var hold: providers.testing.FakeTransport.Hold = .{ .io = std.testing.io };
     var rig: Rig = undefined;
     try rig.init(&.{
@@ -2855,9 +2941,13 @@ test "command lines during a turn get a notice and keep the draft" {
         .{ .editor = "/" },
         .{ .activity = true },
     });
+    try rig.keys("\x03/nope\r");
+    try rig.waitFor(&.{ .{ .status = refusal_offer }, .{ .editor = "/nope" } });
+    try rig.keys("\r");
+    try rig.waitFor(&.{ .{ .text = "Waiting message · " }, .{ .editor = "" } });
 }
 
-test "Enter during a turn keeps the text, and Ctrl+D with a draft warns before it quits" {
+test "a waiting message returns on Ctrl+N or at the turn end, and Ctrl+D with the draft warns" {
     var hold: providers.testing.FakeTransport.Hold = .{ .io = std.testing.io };
     const replies = [_]providers.testing.FakeTransport.Reply{
         .{ .body = providers.testing.reply_stream, .hold = &hold },
@@ -2869,20 +2959,32 @@ test "Enter during a turn keeps the text, and Ctrl+D with a draft warns before i
         .model = "gpt-5.6-sol",
     });
     defer rig.deinit();
+    defer hold.released.set(std.testing.io);
     try rig.keys("hello\r");
     try hold.reached.wait(std.testing.io);
     try rig.keys("more\r");
     try rig.waitFor(&.{
-        .{ .status = turn_message_notice },
-        .{ .editor = "more" },
+        .{ .text = "Waiting message · " ++ waiting_controls },
+        .{ .editor = "" },
         .{ .activity = true },
     });
+    try rig.keys("\x0e");
+    try rig.waitFor(&.{ .{ .absent = "Waiting message" }, .{ .editor = "more" } });
+    try rig.keys("\ragain\r");
+    try rig.waitFor(&.{
+        .{ .text = "Waiting messages: 2 · " ++ waiting_controls },
+        .{ .editor = "" },
+    });
+    try rig.keys("draft");
+    try rig.waitFor(&.{.{ .editor = "draft" }});
     hold.released.set(std.testing.io);
     try rig.waitFor(&.{
         .{ .rows = &.{ "hello", "done" } },
         .{ .activity = false },
-        .{ .editor = "more" },
+        .{ .absent = "Waiting message" },
+        .{ .editor = "more\nagain\ndraft" },
     });
+    try std.testing.expectEqual(@as(usize, 1), rig.transport.requests.items.len);
 
     try rig.keys("\x04");
     try rig.waitFor(&.{.{ .status = "Press Ctrl+D again to quit. The quit discards the draft." }});
@@ -3149,20 +3251,133 @@ test "Esc in a turn clears another notice first, and Ctrl+C clears a draft befor
 
     try rig.keys("hello\r");
     try stall.reached.wait(std.testing.io);
-    try rig.keys("more\r");
-    try rig.waitFor(&.{.{ .status = turn_message_notice }});
+    try rig.keys("/nope\r");
+    try rig.waitFor(&.{.{ .status = refusal_offer }});
     try rig.keys("\x1b");
     try rig.waitFor(&.{ .{ .status = "Model: openai-api-key/" }, .{ .activity = true } });
     try rig.keys("\x1b");
     try rig.waitFor(&.{.{ .status = turn_cancel_notice }});
     try rig.keys("x\x1b");
-    try rig.waitFor(&.{ .{ .status = turn_cancel_notice }, .{ .editor = "morex" } });
+    try rig.waitFor(&.{ .{ .status = turn_cancel_notice }, .{ .editor = "/nopex" } });
 
     try rig.keys("\x03");
     try rig.waitFor(&.{ .{ .editor = "" }, .{ .activity = true } });
     try rig.keys("\x03");
     try rig.waitFor(&.{ .{ .text = canceled_turn_event }, .{ .activity = false } });
     try std.testing.expect(stall.canceled);
+}
+
+test "a cancel returns the waiting message, and Ctrl+N warns first right after that end" {
+    var stalls = [_]providers.testing.FakeTransport.Stall{
+        .{ .io = std.testing.io },
+        .{ .io = std.testing.io },
+    };
+    var rig: Rig = undefined;
+    try rig.init(&.{
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
+        .replies = &.{ .{ .stall = &stalls[0] }, .{ .stall = &stalls[1] } },
+        .model = "gpt-5.6-sol",
+    });
+    defer rig.deinit();
+
+    try rig.keys("hello\r");
+    try stalls[0].reached.wait(std.testing.io);
+    try rig.keys("more\r");
+    try rig.waitFor(&.{.{ .text = "Waiting message · " }});
+    try rig.keys("\x1b");
+    try rig.waitFor(&.{
+        .{ .text = canceled_turn_event },
+        .{ .text = removal_caption_row },
+        .{ .editor = "more" },
+        .{ .activity = false },
+    });
+    try rig.keys("\x0e");
+    try rig.waitFor(&.{ .{ .status = removal_warning }, .{ .editor = "more" } });
+    try rig.keys("\x0e");
+    try rig.waitFor(&.{ .{ .absent = canceled_turn_event }, .{ .editor = "hello\nmore" } });
+
+    try rig.keys("\r");
+    try stalls[1].reached.wait(std.testing.io);
+    try rig.keys("next\r");
+    try rig.waitFor(&.{.{ .text = "Waiting message · " }});
+    try rig.keys("\x1b");
+    try rig.waitFor(&.{ .{ .text = removal_caption_row }, .{ .editor = "next" } });
+    rig.clock.advance(reference.repeat_window_ms);
+    try rig.keys("\x0e");
+    try rig.waitFor(&.{ .{ .absent = canceled_turn_event }, .{ .editor = "hello\nmore\nnext" } });
+}
+
+test "Ctrl+N warns before it retries a failed turn right after the waiting caption closes" {
+    var hold: providers.testing.FakeTransport.Hold = .{ .io = std.testing.io };
+    var rig: Rig = undefined;
+    try rig.init(&.{
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
+        .replies = &.{
+            .{ .status = failed_reply.status, .body = failed_reply.body, .hold = &hold },
+            failed_reply,
+            .{ .body = providers.testing.reply_stream },
+        },
+        .model = "gpt-5.6-sol",
+    });
+    defer rig.deinit();
+    defer hold.released.set(std.testing.io);
+
+    try rig.keys("hello\r");
+    try hold.reached.wait(std.testing.io);
+    try rig.keys("more\r");
+    try rig.waitFor(&.{.{ .text = "Waiting message · " }});
+    hold.released.set(std.testing.io);
+    try rig.waitFor(&.{
+        .{ .text = retry_caption_row },
+        .{ .editor = "more" },
+        .{ .activity = false },
+    });
+    try rig.keys("\x0e");
+    try rig.waitFor(&.{
+        .{ .status = "Press Ctrl+N again to try the turn again." },
+        .{ .text = retry_caption_row },
+    });
+    try std.testing.expectEqual(@as(usize, 2), rig.transport.requests.items.len);
+    try rig.keys("\x0e");
+    try rig.waitFor(&.{ .{ .text = "done" }, .{ .activity = false }, .{ .editor = "more" } });
+    try std.testing.expectEqual(@as(usize, 3), rig.transport.requests.items.len);
+}
+
+test "Ctrl+C warns before it clears messages that a cancel or the turn end just returned" {
+    var stall: providers.testing.FakeTransport.Stall = .{ .io = std.testing.io };
+    var hold: providers.testing.FakeTransport.Hold = .{ .io = std.testing.io };
+    var rig: Rig = undefined;
+    try rig.init(&.{
+        .keys = &.{.{ "openai-api-key", "sk-openai" }},
+        .replies = &.{
+            .{ .stall = &stall },
+            .{ .body = providers.testing.reply_stream, .hold = &hold },
+        },
+        .model = "gpt-5.6-sol",
+    });
+    defer rig.deinit();
+    defer hold.released.set(std.testing.io);
+    const clear_warning = "Press Ctrl+C again to clear the editor.";
+
+    try rig.keys("hello\r");
+    try stall.reached.wait(std.testing.io);
+    try rig.keys("more\r");
+    try rig.waitFor(&.{.{ .text = "Waiting message · " }});
+    try rig.keys("\x03");
+    try rig.waitFor(&.{.{ .editor = "more" }});
+    try rig.keys("\x03");
+    try rig.waitFor(&.{ .{ .status = clear_warning }, .{ .editor = "more" } });
+    try rig.keys("\x03");
+    try rig.waitFor(&.{ .{ .editor = "" }, .{ .activity = false } });
+
+    try rig.keys("again\r");
+    try hold.reached.wait(std.testing.io);
+    try rig.keys("later\r");
+    try rig.waitFor(&.{.{ .text = "Waiting message · " }});
+    hold.released.set(std.testing.io);
+    try rig.waitFor(&.{ .{ .activity = false }, .{ .editor = "later" } });
+    try rig.keys("\x03");
+    try rig.waitFor(&.{ .{ .status = clear_warning }, .{ .editor = "later" } });
 }
 
 test "Esc and Ctrl+D cancel a sign-in and keep the draft" {

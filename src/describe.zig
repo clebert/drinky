@@ -167,7 +167,8 @@ fn writeCommands(writer: *std.Io.Writer) !void {
         \\
         \\`/rewind` lists the prompts of the conversation, with the oldest prompt first. A row
         \\holds a user message, the typed line of a skill command, or an applied gist. A retry
-        \\gets no row. Enter drops the chosen turn and every later turn. It returns the line of a
+        \\gets no row. A message that joined a running turn gets no row, and a rewind drops it with
+        \\its turn. Enter drops the chosen turn and every later turn. It returns the line of a
         \\message or a skill command to the editor as editable text. It returns an applied gist
         \\to the page of `/gist`. Tool changes and the cost stay. When a turn that the rewind
         \\drops ran `write`, `edit`, or `bash`, Enter warns first and rewinds on the second press.
@@ -176,6 +177,7 @@ fn writeCommands(writer: *std.Io.Writer) !void {
         \\compressed summary that lets a new conversation continue the work. Drinky saves no
         \\transcript. The request holds each user prompt, the agent texts between tool calls, and
         \\the final answer of each turn. A skill that the user invoked counts as a user prompt.
+        \\A message that joined a running turn counts as a user prompt too.
         \\The request omits tool calls, tool results, reasoning, and the skills that the model
         \\loaded, so it stays small. A request that exceeds the context window fails. The request
         \\offers no tools and uses the effort of normal turns. A last user message asks for the
@@ -222,9 +224,9 @@ fn writeCommands(writer: *std.Io.Writer) !void {
         \\style of a skill note. The rest of the gist follows as a user message. The model resumes
         \\the task and asks for any user decision that still blocks it.
         \\In `/rewind`, the row of an applied gist shows `Gist:` with the title.
-        \\A rewind to that row and the removal of that canceled turn return no text to the
-        \\editor. They open the page of `/gist` with the applied gist. That page takes the same
-        \\keys, and the draft stays.
+        \\A rewind to that row returns no text to the editor. The removal of that canceled turn
+        \\returns only each message that joined the turn. Both open the page of `/gist` with the
+        \\applied gist. That page takes the same keys, and the draft stays.
         \\Rewind cannot recover the old conversation after an apply.
         \\Backspace warns first and deletes the selected gist on the second press.
         \\Drinky keeps each gist until a deletion.
@@ -250,10 +252,14 @@ fn writeKeys(writer: *std.Io.Writer) !void {
         \\- Ctrl+N acts on the offer that the caption above the editor names. Under `Failed turn`,
         \\  Ctrl+N sends the conversation again. When the conversation ends with model text, Ctrl+N
         \\  also asks the model to continue from the committed work. The draft stays. Under
-        \\  `Canceled turn`, Ctrl+N removes the canceled turn from the conversation and returns its
-        \\  line to the editor as editable text. An applied gist returns to the page of `/gist`.
-        \\  Tool changes stay. After a turn that ran `write`, `edit`, or `bash`, Ctrl+N warns
-        \\  first and removes the turn on the second press.
+        \\  `Canceled turn`, Ctrl+N removes the canceled turn from the conversation. It returns the
+        \\  line of the turn and each message that joined the turn to the editor before the draft,
+        \\  as editable text. An applied gist returns to the page of `/gist` instead of a line.
+        \\  Tool changes stay. After a turn that ran `write`, `edit`, or `bash`, Ctrl+N warns first
+        \\  and removes the turn on the second press.
+        \\- Within {d} milliseconds after the caption `Waiting message` closes, Ctrl+N warns first
+        \\  and acts on the offer on the second press. In that time, Ctrl+C with a draft warns first
+        \\  and clears the editor on the second press.
         \\- Esc dismisses a waiting offer. A dismissed canceled turn stays in the conversation. A
         \\  new turn, `/new`, and a rewind with `/rewind` dismiss the offer too.
         \\
@@ -292,15 +298,25 @@ fn writeKeys(writer: *std.Io.Writer) !void {
         \\
         \\A running turn takes these keys:
         \\
+        \\- Enter sends the line as a waiting message and clears the editor. The caption above the
+        \\  editor shows `Waiting message`, or `Waiting messages:` with the count.
+        \\- The turn adds each waiting message to the conversation when it continues after tool
+        \\  calls or a loaded skill. The transcript shows the message at that point.
+        \\- When the turn ends, each waiting message that did not join returns to the editor before
+        \\  the draft. After a final reply, the user can read the answer first.
+        \\- After a cancel, Enter sends no message until the turn ends. The draft stays.
         \\- Enter runs `/mcp` or `/verbose` and clears its command line. Enter on `/` or `/help`
         \\  lists the commands that work during a turn and keeps the line. Other slash commands
-        \\  get a refusal. Enter sends no message. Drinky shows the notice `Drinky sends no
-        \\  message while a turn runs. The draft stays.` and keeps the line.
+        \\  get a refusal. After the refusal of an unknown command, an unknown skill, or an
+        \\  argument, a second Enter sends the line as a waiting message.
+        \\- Ctrl+N returns every waiting message to the editor before the draft.
         \\- Esc cancels the turn. Esc with a draft warns first and cancels on the second press.
         \\- When a notice other than that warning replaces the status line, Esc first clears the
         \\  notice.
         \\- Ctrl+D cancels the turn at once.
-        \\- Ctrl+C clears a draft, and it cancels the turn at an empty editor.
+        \\- Ctrl+C clears a draft, and it cancels the turn at an empty editor. Right after the
+        \\  caption `Waiting message` closes, Ctrl+C with a draft warns first, as at the prompt.
+        \\- A cancel returns each waiting message to the editor at once, before the draft.
         \\
         \\A picker takes the mouse wheel. Each wheel step turns the option list by one row. The
         \\selection row stays in place, so the option under it becomes the selection. The list is
@@ -315,7 +331,7 @@ fn writeKeys(writer: *std.Io.Writer) !void {
         \\and a picker. A full-window page states its own keys in its header, and the editor
         \\carries the movement keys of a text field.
         \\
-    , .{ reference.repeat_window_ms, reference.repeat_window_ms });
+    , .{ reference.repeat_window_ms, reference.repeat_window_ms, reference.repeat_window_ms });
 }
 
 fn writePreferences(writer: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -483,7 +499,7 @@ fn checkReference(gpa: std.mem.Allocator) !void {
         try std.testing.expect(std.mem.find(u8, text[keys..preferences], hint) != null);
     const repeat = try gpa.print("{d} milliseconds", .{reference.repeat_window_ms});
     defer gpa.free(repeat);
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, text[keys..preferences], repeat));
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, text[keys..preferences], repeat));
     for ([_][]const u8{
         config_keys.verbose,             config_keys.mcp_access,
         config_keys.window_pages,        config_keys.gauge_percent_warning,

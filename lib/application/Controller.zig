@@ -88,6 +88,7 @@ fetch_end: ?Event.FetchEnd = null,
 paste_pending: bool = false,
 response: Response = .{},
 recovered: ?[]const u8 = null,
+joined: std.ArrayList([]const u8) = .empty,
 failed_path: ?[]u8 = null,
 gist_read: ?[]u8 = null,
 key_read: ?[]u8 = null,
@@ -215,6 +216,8 @@ pub const Options = struct {
 };
 pub const Command = union(enum) {
     send_message: []const u8,
+    wait_message: Waiting,
+    return_messages: u64,
     invoke_skill: Skill,
     new_conversation,
     select_account: usize,
@@ -239,6 +242,7 @@ pub const Command = union(enum) {
     refresh_project,
     snapshot,
 
+    pub const Waiting = struct { operation: u64, text: []const u8 };
     pub const Skill = struct { name: []const u8, arguments: []const u8, line: []const u8 };
     pub const Callback = struct { operation: u64, line: []const u8 };
     pub const Key = struct { account: usize, value: []const u8 };
@@ -248,6 +252,7 @@ pub const Response = struct {
     refusal: ?Refusal = null,
     operation: ?u64 = null,
     recovered: ?[]const u8 = null,
+    joined: []const []const u8 = &.{},
 
     pub fn accepted(self: *const Response) bool {
         return self.refusal == null;
@@ -336,11 +341,12 @@ pub const Sink = core.actor.Sink(Event);
 
 const Work = union(enum) {
     idle,
-    turn: u64,
+    turn: Turn,
     aside: Aside,
     sign_in: SignIn,
     fetch: Fetch,
 
+    const Turn = struct { id: u64, waiting: usize = 0 };
     const Aside = struct { id: u64, canceled: bool = false };
     const SignIn = struct {
         id: u64,
@@ -354,7 +360,7 @@ const Work = union(enum) {
     fn view(self: *const Work) State.Work {
         return switch (self.*) {
             .idle => .idle,
-            .turn => |id| .{ .turn = id },
+            .turn => |turn| .{ .turn = .{ .operation = turn.id, .waiting = turn.waiting } },
             .aside => |aside| .{ .aside = aside.id },
             .sign_in => |sign_in| .{ .sign_in = .{
                 .operation = sign_in.id,
@@ -418,6 +424,7 @@ pub const Event = union(enum) {
     clear_conversation,
     paste_replayed,
     turn_ended: TurnEnd,
+    messages_returned: []const []const u8,
     sign_in_ended: SignInEnd,
     fetch_ended: FetchEnd,
     no_account,
@@ -455,6 +462,7 @@ pub const Event = union(enum) {
                 };
             },
             .startup_refused => |*value| .{ .startup_refused = try value.dupe(gpa) },
+            .messages_returned => |texts| .{ .messages_returned = try dupeTexts(gpa, texts) },
             .statistics,
             .clear_conversation,
             .paste_replayed,
@@ -482,6 +490,7 @@ pub const Event = union(enum) {
                 gpa.free(value.answer);
             },
             .startup_refused => |*value| value.deinit(gpa),
+            .messages_returned => |texts| freeTexts(gpa, texts),
             .statistics,
             .clear_conversation,
             .paste_replayed,
@@ -493,6 +502,28 @@ pub const Event = union(enum) {
         }
     }
 };
+
+fn dupeTexts(
+    gpa: std.mem.Allocator,
+    texts: []const []const u8,
+) error{OutOfMemory}![]const []const u8 {
+    const copies = try gpa.alloc([]const u8, texts.len);
+    var count: usize = 0;
+    errdefer {
+        for (copies[0..count]) |copy| gpa.free(copy);
+        gpa.free(copies);
+    }
+    for (texts, copies) |text, *copy| {
+        copy.* = try gpa.dupe(u8, text);
+        count += 1;
+    }
+    return copies;
+}
+
+fn freeTexts(gpa: std.mem.Allocator, texts: []const []const u8) void {
+    for (texts) |text| gpa.free(text);
+    gpa.free(texts);
+}
 
 const surface_sink_vtable: Sink.VTable = .{ .emit = emitSurfaceEvent };
 const session_sink_vtable: core.Session.Sink.VTable = .{ .emit = emitSessionEvent };
@@ -946,6 +977,7 @@ fn nextOperation(self: *Controller) u64 {
 fn releaseResponse(self: *Controller) void {
     if (self.recovered) |text| self.gpa.free(text);
     self.recovered = null;
+    Turns.releaseJoined(self.gpa, &self.joined);
     if (self.failed_path) |path| self.gpa.free(path);
     self.failed_path = null;
     self.response = .{};
@@ -979,6 +1011,34 @@ fn sendMessage(self: *Controller, text: []const u8) !void {
     if (self.refuseBusy()) return;
     if (try self.refusePrerequisite()) return;
     try self.startUserTurn(text);
+}
+
+fn waitMessage(self: *Controller, waiting: *const Command.Waiting) !void {
+    const turn = self.targetTurn(waiting.operation) orelse return self.refuse(.stale);
+    if (self.surface.activeTurn().?.canceled) return self.refuse(.busy);
+    try self.session.putWaiting(waiting.text);
+    turn.waiting += 1;
+}
+
+fn returnMessages(self: *Controller, id: u64) void {
+    const turn = self.targetTurn(id) orelse return self.refuse(.stale);
+    if (turn.waiting == 0) return self.refuse(.stale);
+    self.returnWaiting(turn);
+}
+
+fn targetTurn(self: *Controller, id: u64) ?*Work.Turn {
+    const turn = switch (self.work) {
+        .turn => |*turn| turn,
+        .idle, .aside, .sign_in, .fetch => return null,
+    };
+    return if (turn.id == id) turn else null;
+}
+
+fn returnWaiting(self: *Controller, turn: *Work.Turn) void {
+    var texts = self.session.takeWaiting();
+    defer core.Session.Waiting.release(self.gpa, &texts);
+    turn.waiting -= texts.items.len;
+    if (texts.items.len > 0) self.emit(&.{ .messages_returned = texts.items });
 }
 
 fn invokeSkill(self: *Controller, skill: *const Command.Skill) !void {
@@ -1135,6 +1195,8 @@ fn removeCanceledTurn(self: *Controller, id: u64) !void {
     const offer = self.offer orelse return self.refuse(.stale);
     const last = self.turns.all().len - 1;
     if (offer != .removal or self.turns.all()[last].id != id) return self.refuse(.stale);
+    self.joined = self.turns.takeJoined(last);
+    self.response.joined = self.joined.items;
     try self.rewind(last);
 }
 
@@ -1199,7 +1261,7 @@ fn runTurn(self: *Controller, turn: *const TurnStart) !void {
     self.dropOffer();
     self.surface.beginTurn();
     self.conversation +%= 1;
-    self.work = .{ .turn = id };
+    self.work = .{ .turn = .{ .id = id } };
     self.response.operation = id;
 }
 
@@ -1207,11 +1269,12 @@ fn cancelWork(self: *Controller, id: u64) !void {
     if (self.work.view().operation() != id) return self.refuse(.stale);
     switch (self.work) {
         .idle => unreachable,
-        .turn => {
-            const turn = self.surface.activeTurn().?;
-            if (turn.canceled) return;
-            turn.canceled = true;
+        .turn => |*turn| {
+            const active = self.surface.activeTurn().?;
+            if (active.canceled) return;
+            active.canceled = true;
             try self.session.send(&.cancel);
+            self.returnWaiting(turn);
         },
         .aside => |*aside| {
             if (aside.canceled) return;
@@ -1260,6 +1323,11 @@ fn applySessionEvent(self: *Controller, event: *const core.Session.Event) !void 
             return self.changed();
         },
         .aside_ended => |*outcome| return self.endAside(outcome),
+        .message_joined => |text| {
+            self.activeTurn().waiting -= 1;
+            try self.turns.join(text);
+        },
+        .turn_ended => return self.applyTurnEnd(event),
         .text_started,
         .text,
         .reasoning_started,
@@ -1278,16 +1346,27 @@ fn applySessionEvent(self: *Controller, event: *const core.Session.Event) !void 
         .attempt_failed,
         .skill_loaded,
         .retry_started,
-        .turn_ended,
         => {},
     }
-    if (event.* == .turn_ended) {
-        std.debug.assert(self.work == .turn);
-        self.work = .idle;
-        if (self.notice != null) self.clearNotice();
-    }
-    const outcome = try self.surface.apply(event, self.surfaceTime()) orelse return;
+    _ = try self.surface.apply(event, self.surfaceTime());
+}
+
+fn applyTurnEnd(self: *Controller, event: *const core.Session.Event) !void {
+    var returned = self.session.takeWaiting();
+    defer core.Session.Waiting.release(self.gpa, &returned);
+    std.debug.assert(returned.items.len == self.activeTurn().waiting);
+    self.work = .idle;
+    if (self.notice != null) self.clearNotice();
+    const outcome = try self.surface.apply(event, self.surfaceTime()) orelse unreachable;
     try self.endTurn(&outcome);
+    if (returned.items.len > 0) self.emit(&.{ .messages_returned = returned.items });
+}
+
+fn activeTurn(self: *Controller) *Work.Turn {
+    return switch (self.work) {
+        .turn => |*turn| turn,
+        .idle, .aside, .sign_in, .fetch => unreachable,
+    };
 }
 
 fn activeAside(self: *Controller) *Work.Aside {
@@ -1845,6 +1924,8 @@ fn execute(self: *Controller, value: *const Command) !void {
             .cancel => |id| try self.cancelWork(id),
             .snapshot => try self.sendSnapshot(),
             .send_message,
+            .wait_message,
+            .return_messages,
             .invoke_skill,
             .new_conversation,
             .select_account,
@@ -1875,6 +1956,8 @@ fn execute(self: *Controller, value: *const Command) !void {
         .snapshot => return self.sendSnapshot(),
         .dismiss_notice => |id| if (id != self.notice_id) return self.refuse(.stale),
         .send_message,
+        .wait_message,
+        .return_messages,
         .invoke_skill,
         .new_conversation,
         .select_account,
@@ -1903,6 +1986,8 @@ fn execute(self: *Controller, value: *const Command) !void {
         .dismiss_offer => self.dropOffer(),
         .dismiss_notice => {},
         .send_message => |text| try self.sendMessage(text),
+        .wait_message => |*waiting| try self.waitMessage(waiting),
+        .return_messages => |id| self.returnMessages(id),
         .invoke_skill => |*skill| try self.invokeSkill(skill),
         .new_conversation => try self.newConversation(),
         .select_account => |account| try self.selectAccount(account),
@@ -2216,6 +2301,68 @@ test "an account that failed to load refuses its selection and names the account
     );
 }
 
+test "a turn refuses send_message, and a waiting message joins after tool results or returns" {
+    var hold: providers.testing.FakeTransport.Hold = .{ .io = std.testing.io };
+    var stall: providers.testing.FakeTransport.Stall = .{ .io = std.testing.io };
+    var rig: testing.Rig = undefined;
+    try rig.init(&.{ .replies = &.{
+        .{ .body = testing.write_call_stream, .hold = &hold },
+        .{ .body = providers.testing.reply_stream },
+        .{ .stall = &stall },
+    } });
+    defer rig.deinit();
+    defer hold.released.set(std.testing.io);
+    const operation = rig.send(&.{ .send_message = "Task." }).operation.?;
+    try hold.reached.wait(std.testing.io);
+    try expectRefusal(rig.send(&.{ .send_message = "More." }), .busy);
+    try std.testing.expect(sendWaiting(&rig, operation, "Also.").accepted());
+    try expectRefusal(sendWaiting(&rig, operation + 1, "Other."), .stale);
+    try expectWaiting(&rig, operation, 1);
+    try expectRefusal(rig.send(&.{ .return_messages = operation + 1 }), .stale);
+    try std.testing.expect(rig.send(&.{ .return_messages = operation }).accepted());
+    try expectReturned(&rig, &.{"Also."});
+    try expectWaiting(&rig, operation, 0);
+    try expectRefusal(rig.send(&.{ .return_messages = operation }), .stale);
+    try std.testing.expect(sendWaiting(&rig, operation, "Again.").accepted());
+    hold.released.set(std.testing.io);
+    try rig.expectTurn(.stopped);
+    const ended = try rig.snapshot();
+    defer ended.deinit(std.testing.allocator);
+    try testing.expectUsers(ended.records, &.{ "Task.", "Again." });
+    try testing.expectContains(rig.transport.requests.items[1], "Again.");
+    try expectRefusal(sendWaiting(&rig, operation, "Late."), .stale);
+
+    const next = rig.send(&.{ .send_message = "Next." }).operation.?;
+    try stall.reached.wait(std.testing.io);
+    try std.testing.expect(sendWaiting(&rig, next, "Later.").accepted());
+    try std.testing.expect(rig.send(&.{ .cancel = next }).accepted());
+    const canceled: State.Work = .{ .turn = .{ .operation = next, .waiting = 0 } };
+    try std.testing.expectEqual(canceled, rig.controller.state().work);
+    try expectReturned(&rig, &.{"Later."});
+    try expectRefusal(sendWaiting(&rig, next, "Blocked."), .busy);
+    try rig.expectTurn(.canceled);
+    try expectRefusal(rig.send(&.{ .return_messages = next }), .stale);
+}
+
+fn sendWaiting(rig: *testing.Rig, operation: u64, text: []const u8) Response {
+    return rig.send(&.{ .wait_message = .{ .operation = operation, .text = text } });
+}
+
+fn expectWaiting(rig: *testing.Rig, operation: u64, waiting: usize) !void {
+    const current = try rig.snapshot();
+    defer current.deinit(std.testing.allocator);
+    const expected: State.Work = .{ .turn = .{ .operation = operation, .waiting = waiting } };
+    try std.testing.expectEqual(expected, current.state.work);
+}
+
+fn expectReturned(rig: *testing.Rig, expected: []const []const u8) !void {
+    const event = try rig.eventOf(.messages_returned);
+    defer event.deinit(std.testing.allocator);
+    const texts = event.messages_returned;
+    try std.testing.expectEqual(expected.len, texts.len);
+    for (expected, texts) |text, returned| try std.testing.expectEqualStrings(text, returned);
+}
+
 test "model and effort changes during a turn are refused as busy and keep the choice" {
     var stall: providers.testing.FakeTransport.Stall = .{ .io = std.testing.io };
     var rig: testing.Rig = undefined;
@@ -2233,7 +2380,6 @@ test "model and effort changes during a turn are refused as busy and keep the ch
         .account = accounts.testing.openai_api_key,
         .model = "gpt-5.6-sol",
     } }), .busy);
-    try expectRefusal(rig.send(&.{ .send_message = "More." }), .busy);
     const current = try rig.snapshot();
     defer current.deinit(std.testing.allocator);
     try std.testing.expectEqual(.turn, std.meta.activeTag(current.state.work));
@@ -2563,6 +2709,43 @@ test "a notice dismissal keeps the removal offer, and a removal recovers the lin
     try std.testing.expect(empty.state.offer == .none);
 }
 
+test "a removal recovers the line and each joined message, and a rewind recovers the line alone" {
+    var holds: [2]providers.testing.FakeTransport.Hold = @splat(.{ .io = std.testing.io });
+    var stall: providers.testing.FakeTransport.Stall = .{ .io = std.testing.io };
+    var rig: testing.Rig = undefined;
+    try rig.init(&.{ .replies = &.{
+        .{ .body = testing.write_call_stream, .hold = &holds[0] },
+        .{ .body = providers.testing.reply_stream },
+        .{ .body = testing.write_call_stream, .hold = &holds[1] },
+        .{ .stall = &stall },
+    } });
+    defer rig.deinit();
+    defer for (&holds) |*hold| hold.released.set(std.testing.io);
+    const first = rig.send(&.{ .send_message = "First." }).operation.?;
+    try holds[0].reached.wait(std.testing.io);
+    try std.testing.expect(sendWaiting(&rig, first, "Also.").accepted());
+    holds[0].released.set(std.testing.io);
+    try rig.expectTurn(.stopped);
+    const second = rig.send(&.{ .send_message = "Second." }).operation.?;
+    try holds[1].reached.wait(std.testing.io);
+    try std.testing.expect(sendWaiting(&rig, second, "More.").accepted());
+    holds[1].released.set(std.testing.io);
+    try stall.reached.wait(std.testing.io);
+    _ = rig.send(&.{ .cancel = second });
+    try rig.expectTurn(.canceled);
+
+    const removed = rig.send(&.{ .remove_canceled_turn = second });
+    try std.testing.expectEqualStrings("Second.", removed.recovered.?);
+    try std.testing.expectEqual(@as(usize, 1), removed.joined.len);
+    try std.testing.expectEqualStrings("More.", removed.joined[0]);
+    const kept = try rig.snapshot();
+    defer kept.deinit(std.testing.allocator);
+    try testing.expectUsers(kept.records, &.{ "First.", "Also." });
+    const rewound = rig.send(&.{ .rewind = first });
+    try std.testing.expectEqualStrings("First.", rewound.recovered.?);
+    try std.testing.expectEqual(@as(usize, 0), rewound.joined.len);
+}
+
 test "turn facts mark mutating work, and a rewind applies at once through a stable id" {
     var rig: testing.Rig = undefined;
     try rig.init(&.{ .replies = &.{
@@ -2609,7 +2792,8 @@ test "a turn keeps its outcome and answer under its operation id until a rewind 
     const started = rig.send(&.{ .send_message = "First task." });
     const id = started.operation.?;
     try stall.reached.wait(std.testing.io);
-    try std.testing.expectEqual(State.Work{ .turn = id }, rig.controller.state().work);
+    const running: State.Work = .{ .turn = .{ .operation = id, .waiting = 0 } };
+    try std.testing.expectEqual(running, rig.controller.state().work);
     try std.testing.expect(rig.controller.operation(id) == .running);
     _ = rig.send(&.{ .cancel = id });
     try rig.expectTurn(.canceled);
@@ -2926,6 +3110,11 @@ fn checkSnapshotCopy(gpa: std.mem.Allocator, event: *const Event) !void {
         event.snapshot.state.branch.?,
         copy.snapshot.state.branch.?,
     );
+}
+
+test "a copy of the returned messages releases every partial allocation" {
+    const texts = [_][]const u8{ "Also.", "Again." };
+    try core.testing.checkCopyAllocationFailures(Event, &.{.{ .messages_returned = &texts }});
 }
 
 const rejected_reply: providers.testing.FakeTransport.Reply = .{

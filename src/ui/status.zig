@@ -30,7 +30,7 @@ pub const Info = struct {
     confirmation: ?Confirmation = null,
 };
 
-pub const Confirmation = enum { message, removal, rewind, delete_gist, remove_key };
+pub const Confirmation = enum { message, retry, removal, rewind, delete_gist, remove_key };
 
 pub const Quota = struct {
     windows: application.Quota,
@@ -203,6 +203,7 @@ pub fn render(placement: *const paint.Placement, info: *const Info) !void {
                 };
                 break :message notice.content;
             },
+            .retry => "Press Ctrl+N again to try the turn again.",
             .removal => "Press Ctrl+N again to remove the canceled turn. Tool changes stay.",
             .rewind => "Press Enter again to rewind. Tool changes stay.",
             .delete_gist => "Press Backspace again to delete the gist.",
@@ -971,6 +972,11 @@ test "semantic confirmations keep the terminal text, roles, and width reductions
             .content = "Drinky does not recognize the command /unknown.",
             .expected = "Enter: Send as a message · " ++
                 "Drinky does not recognize the command /unknown.",
+        },
+        .{
+            .kind = .retry,
+            .content = "",
+            .expected = "Press Ctrl+N again to try the turn again.",
         },
         .{
             .kind = .removal,

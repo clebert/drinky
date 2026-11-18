@@ -30,11 +30,6 @@ when the user drops it.
   directories without a time limit. A file system call that does not return stops the start. A
   pending macOS privacy prompt causes such a call. The tools and the skill file reads already stop
   such a call after their time limit when the call accepts a cancel.
-- Drinky sends no message while a turn runs. The controller refuses the message as `busy`, and the
-  draft stays. The MCP tool `send_message` gets the same refusal. A message cannot steer the running
-  turn or wait for the next turn. `Turn` already adds a queued required skill as a user message at a
-  round boundary. A user message can join the conversation at the same point. A waiting message must
-  survive a cancel. The design must define how Esc, `/rewind`, and Ctrl+N treat a waiting message.
 - Drinky reads the config file, the instruction files, and the skill list only at startup. A new
   skill or a config change takes effect only after a restart. A clear of the conversation can read
   them again. The clears are `/new`, a clear through MCP, and the apply of a gist. A change of the

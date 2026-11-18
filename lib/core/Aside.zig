@@ -14,7 +14,7 @@ options: Session.Options,
 setup: *const Session.Setup,
 request: *const Request,
 conversation: *const Conversation,
-turn_starts: []const Session.TurnStart,
+prompts: []const Session.Prompt,
 
 pub const Request = struct {
     system: []const u8,
@@ -76,15 +76,12 @@ fn requestItems(self: *const Aside) error{OutOfMemory}![]Conversation.Item {
     var items: std.ArrayList(Conversation.Item) = .empty;
     errdefer items.deinit(self.gpa);
     const history = self.conversation.items.items;
-    for (self.turn_starts, 0..) |turn_start, index| {
-        const end = if (index + 1 < self.turn_starts.len)
-            self.turn_starts[index + 1].item
-        else
-            history.len;
-        const prompt = history[turn_start.item];
-        std.debug.assert(prompt == .message and prompt.message.role == .user);
-        try items.append(self.gpa, prompt);
-        for (history[turn_start.item + 1 .. end]) |item| switch (item) {
+    for (self.prompts, 0..) |prompt, index| {
+        const end = if (index + 1 < self.prompts.len) self.prompts[index + 1].item else history.len;
+        const user = history[prompt.item];
+        std.debug.assert(user == .message and user.message.role == .user);
+        try items.append(self.gpa, user);
+        for (history[prompt.item + 1 .. end]) |item| switch (item) {
             .message => |message| switch (message.role) {
                 .assistant => try items.append(self.gpa, item),
                 .user => {},
